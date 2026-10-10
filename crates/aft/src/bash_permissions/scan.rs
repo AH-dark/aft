@@ -132,6 +132,10 @@ fn scan_with_read_exemption(
     let mut asks = Vec::new();
     let mut seen = HashSet::new();
     let mut scan_cwd = cwd.clone();
+    // Directories pushed by `pushd` earlier in this command line. The shell's
+    // own stack from before the command is unknown, so a `popd` past these
+    // entries leaves the tracked directory unchanged.
+    let mut directory_stack = Vec::new();
     for node in command_nodes {
         let parts = command_parts(command, node);
         if parts.is_empty() {
@@ -141,7 +145,7 @@ fn scan_with_read_exemption(
         let tokens: Vec<String> = parts.iter().map(|part| part.text.clone()).collect();
         let head = tokens[0].as_str();
 
-        if head == "cd" {
+        if CWD_COMMANDS.contains(&head) {
             collect_redirection_targets(command, node, &scan_cwd, |target| match target {
                 RedirectTarget::Path { path, input_only } => {
                     let exemption = if input_only { read_exemption } else { None };
@@ -149,11 +153,14 @@ fn scan_with_read_exemption(
                 }
                 RedirectTarget::Dynamic => {}
             });
-            if let Some(arg) = path_args(&parts).next() {
-                if let Some(path) = arg_path(arg, &scan_cwd) {
-                    scan_cwd = path;
-                }
-            }
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            track_cwd_change(
+                head,
+                &parts,
+                home.as_deref(),
+                &mut scan_cwd,
+                &mut directory_stack,
+            );
             continue;
         }
 
@@ -391,6 +398,60 @@ fn is_dynamic_node(node: Node<'_>) -> bool {
     )
 }
 
+/// Follow the literal forms of `cd`, `pushd` and `popd` so later relative
+/// paths resolve where the shell will actually be. Forms whose target is not
+/// known here (`cd -`, a dynamic directory, stack rotation with `+N`/`-N`)
+/// leave the tracked directory unchanged.
+fn track_cwd_change(
+    head: &str,
+    parts: &[Part],
+    home: Option<&Path>,
+    scan_cwd: &mut PathBuf,
+    directory_stack: &mut Vec<PathBuf>,
+) {
+    let args = parts.iter().skip(1).map(|part| part.text.as_str());
+    let options_only = args.clone().all(|arg| arg.starts_with('-') && arg != "-");
+    match head {
+        "cd" => {
+            if options_only {
+                // A bare `cd` goes to the home directory.
+                if let Some(home) = home {
+                    *scan_cwd = resolve_existing(home);
+                }
+            } else if !args.clone().any(|arg| arg == "-") {
+                if let Some(path) = path_args(parts)
+                    .next()
+                    .and_then(|arg| arg_path(arg, scan_cwd))
+                {
+                    *scan_cwd = path;
+                }
+            }
+        }
+        "pushd" => {
+            if args
+                .clone()
+                .any(|arg| arg.starts_with('+') || arg.starts_with('-'))
+            {
+                return;
+            }
+            if let Some(path) = path_args(parts)
+                .next()
+                .and_then(|arg| arg_path(arg, scan_cwd))
+            {
+                directory_stack.push(std::mem::replace(scan_cwd, path));
+            }
+        }
+        "popd" => {
+            if options_only {
+                if let Some(previous) = directory_stack.pop() {
+                    *scan_cwd = previous;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn path_args(parts: &[Part]) -> impl Iterator<Item = &str> {
     let head = parts.first().map(|part| part.text.as_str()).unwrap_or("");
     parts.iter().skip(1).filter_map(move |part| {
@@ -439,18 +500,21 @@ fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
     PathArgTarget::Path(resolve_existing(&resolved))
 }
 
+/// Remove shell quotes from one word, including words built from several
+/// quoted and unquoted segments such as `"/etc"/passwd`. Backslashes are kept
+/// as typed: the same scanner sees Windows paths, where they separate
+/// components rather than escape the next character.
 fn unquote(text: &str) -> String {
-    if text.len() < 2 {
-        return text.to_string();
+    let mut out = String::with_capacity(text.len());
+    let mut quote = None;
+    for ch in text.chars() {
+        match quote {
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            Some(open) if ch == open => quote = None,
+            _ => out.push(ch),
+        }
     }
-    let bytes = text.as_bytes();
-    let first = bytes[0];
-    let last = bytes[bytes.len() - 1];
-    if (first == b'\'' || first == b'"') && first == last {
-        text[1..text.len() - 1].to_string()
-    } else {
-        text.to_string()
-    }
+    out
 }
 
 fn home(text: &str, cwd: &Path) -> String {
@@ -742,6 +806,70 @@ mod tests {
     // temp tree (tempfile roots live under the temp tree, which is exempt by
     // design), and /etc is the portable Unix path that satisfies both.
     #[cfg(unix)]
+    fn external_asks(command: &str, project: &Path) -> Vec<String> {
+        scan_with_project_root(command, project, project)
+            .into_iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .flat_map(|ask| ask.patterns)
+            .collect()
+    }
+
+    // Temporary directories never need an external-directory ask, so these
+    // tests point at `/usr`, which exists outside every test project.
+    #[cfg(unix)]
+    #[test]
+    fn partly_quoted_absolute_path_is_not_treated_as_relative() {
+        let project = tempfile::tempdir().unwrap();
+        let asks = external_asks(r#"rm "/usr"/aft-scan-probe"#, project.path());
+        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        assert_eq!(unquote(r#""/etc"/'pass'wd"#), "/etc/passwd");
+        assert_eq!(unquote(r#"'a"b'"c'd""#), "a\"bc'd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pushd_and_popd_move_the_scan_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let asks = external_asks("pushd /usr && rm aft-scan-probe", project.path());
+        assert_eq!(asks, vec!["/usr/*".to_string()]);
+        let asks = external_asks("pushd /usr && popd && rm aft-scan-probe", project.path());
+        assert!(asks.is_empty(), "{asks:?}");
+    }
+
+    #[test]
+    fn bare_cd_moves_the_scan_directory_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut scan_cwd = temp.path().to_path_buf();
+        let mut stack = Vec::new();
+        let parts = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| Part {
+                    text: word.to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        track_cwd_change(
+            "cd",
+            &parts(&["cd", "-P"]),
+            Some(&home),
+            &mut scan_cwd,
+            &mut stack,
+        );
+        assert_eq!(scan_cwd, resolve_existing(&home));
+        let before = scan_cwd.clone();
+        track_cwd_change(
+            "cd",
+            &parts(&["cd", "-"]),
+            Some(&home),
+            &mut scan_cwd,
+            &mut stack,
+        );
+        assert_eq!(scan_cwd, before, "cd - goes to an unknown directory");
+    }
+
     #[test]
     fn external_path_outside_the_project_still_asks() {
         let temp = tempfile::tempdir().unwrap();
