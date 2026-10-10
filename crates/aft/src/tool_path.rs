@@ -50,18 +50,18 @@ fn path_looks_like_tool(path: &Path) -> bool {
     }
 }
 
-/// Check `dir/<binary>` and, on Windows, `dir/<binary>.exe|.cmd|.bat|.com`.
+/// On Windows, prefer `dir/<binary>.exe|.cmd|.bat|.com` over an
+/// extensionless file, which may be a colocated POSIX package-manager shim.
 pub(crate) fn probe_tool_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
+    probe_tool_in_dir_for_platform(dir, binary, cfg!(windows))
+}
+
+fn probe_tool_in_dir_for_platform(dir: &Path, binary: &str, windows: bool) -> Option<PathBuf> {
     if !dir.is_dir() {
         return None;
     }
 
-    let direct = dir.join(binary);
-    if path_looks_like_tool(&direct) {
-        return Some(direct);
-    }
-
-    if cfg!(windows) {
+    if windows {
         for ext in ["exe", "cmd", "bat", "com"] {
             let candidate = dir.join(format!("{binary}.{ext}"));
             if path_looks_like_tool(&candidate) {
@@ -70,7 +70,8 @@ pub(crate) fn probe_tool_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {
         }
     }
 
-    None
+    let direct = dir.join(binary);
+    path_looks_like_tool(&direct).then_some(direct)
 }
 
 /// Extra bin directories GUI-launched hosts often omit from `PATH`.
@@ -160,6 +161,29 @@ mod tests {
         }
 
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn windows_tool_probe_prefers_runnable_wrapper_to_posix_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("prettier");
+        let cmd = dir.path().join("prettier.cmd");
+        for path in [&shim, &cmd] {
+            fs::write(path, "fixture").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        assert_eq!(
+            probe_tool_in_dir_for_platform(dir.path(), "prettier", true),
+            Some(cmd)
+        );
+        assert_eq!(
+            probe_tool_in_dir_for_platform(dir.path(), "prettier", false),
+            Some(shim)
+        );
     }
 
     #[cfg(windows)]
