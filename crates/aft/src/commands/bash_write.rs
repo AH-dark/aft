@@ -39,13 +39,33 @@ pub struct BashWriteParams {
     pub input: BashWriteInput,
 }
 
+#[derive(Debug)]
+enum InputError {
+    TooLarge,
+    InvalidKey(String),
+}
+
+impl InputError {
+    fn response(self, request_id: &str) -> Response {
+        match self {
+            Self::TooLarge => Response::error(
+                request_id,
+                "input_too_large",
+                "bash_write input exceeds 1 MiB limit",
+            ),
+            Self::InvalidKey(message) => Response::error(request_id, "invalid_request", message),
+        }
+    }
+}
+
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
-    let raw_params = req
-        .params
-        .get("params")
-        .cloned()
-        .unwrap_or_else(|| req.params.clone());
-    let params = match serde_json::from_value::<BashWriteParams>(raw_params) {
+    let raw_params = req.params.get("params").unwrap_or(&req.params);
+    // The transport has already parsed JSON, but oversized input must not be
+    // cloned into owned parameters before the write budget is checked.
+    if let Err(error) = validate_input_size(&raw_params["input"]) {
+        return error.response(&req.id);
+    }
+    let params = match serde_json::from_value::<BashWriteParams>(raw_params.clone()) {
         Ok(params) => params,
         Err(e) => {
             return Response::error(
@@ -58,18 +78,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let bytes = match expand_input(&params.input) {
         Ok(bytes) => bytes,
-        Err(message) => {
-            return Response::error(&req.id, "invalid_request", message);
+        Err(error) => {
+            return error.response(&req.id);
         }
     };
-
-    if bytes.len() > MAX_INPUT_BYTES {
-        return Response::error(
-            &req.id,
-            "input_too_large",
-            "bash_write input exceeds 1 MiB limit",
-        );
-    }
 
     match ctx
         .bash_background()
@@ -95,22 +107,64 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
-fn expand_input(input: &BashWriteInput) -> Result<Vec<u8>, String> {
+fn check_input_size(current: usize, additional: usize) -> Result<(), InputError> {
+    if additional > MAX_INPUT_BYTES.saturating_sub(current) {
+        Err(InputError::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_input_size(input: &serde_json::Value) -> Result<(), InputError> {
+    if let Some(text) = input.as_str() {
+        return check_input_size(0, text.len());
+    }
+    if let Some(items) = input.as_array() {
+        let mut total = 0;
+        for item in items {
+            let size = if let Some(text) = item.as_str() {
+                text.len()
+            } else if let Some(key) = item.get("key").and_then(serde_json::Value::as_str) {
+                // Key normalization can allocate too; bound the borrowed name
+                // before mapping it to its shorter terminal byte sequence.
+                check_input_size(0, key.len())?;
+                key_to_bytes(key).map_or(0, <[u8]>::len)
+            } else {
+                // Leave malformed shapes to serde's existing diagnostics.
+                0
+            };
+            check_input_size(total, size)?;
+            total += size;
+        }
+    }
+    Ok(())
+}
+
+fn append_input_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), InputError> {
+    check_input_size(out.len(), bytes.len())?;
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn expand_input(input: &BashWriteInput) -> Result<Vec<u8>, InputError> {
     match input {
-        BashWriteInput::Text(s) => Ok(s.as_bytes().to_vec()),
+        BashWriteInput::Text(s) => {
+            check_input_size(0, s.len())?;
+            Ok(s.as_bytes().to_vec())
+        }
         BashWriteInput::Sequence(items) => {
-            let mut out: Vec<u8> = Vec::with_capacity(items.len() * 4);
+            let mut out = Vec::new();
             for item in items {
                 match item {
-                    SequenceItem::Text(s) => out.extend_from_slice(s.as_bytes()),
+                    SequenceItem::Text(s) => append_input_bytes(&mut out, s.as_bytes())?,
                     SequenceItem::Key { key } => {
                         let bytes = key_to_bytes(key).ok_or_else(|| {
-                            format!(
+                            InputError::InvalidKey(format!(
                                 "bash_write: unknown key '{key}'; allowed keys: {}",
                                 allowed_keys_hint()
-                            )
+                            ))
                         })?;
-                        out.extend_from_slice(bytes);
+                        append_input_bytes(&mut out, bytes)?;
                     }
                 }
             }
@@ -224,6 +278,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn borrowed_input_budget_is_checked_before_deserializing_params() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project.path().into()),
+                storage_dir: Some(storage.path().into()),
+                ..crate::config::Config::default()
+            },
+        );
+        for wrapped in [false, true] {
+            let params = json!({ "task_id": false, "input": "x".repeat(MAX_INPUT_BYTES + 1) });
+            let request = RawRequest {
+                id: "write-preflight".into(),
+                command: "bash_write".into(),
+                session_id: Some("write-test".into()),
+                lsp_hints: None,
+                params: if wrapped {
+                    json!({ "params": params })
+                } else {
+                    params
+                },
+            };
+            let reply = handle(&request, &ctx);
+            assert_eq!(reply.data["code"], "input_too_large");
+            assert_eq!(
+                reply.data["message"],
+                "bash_write input exceeds 1 MiB limit"
+            );
+        }
+        assert!(matches!(
+            validate_input_size(&json!([
+                "x".repeat(MAX_INPUT_BYTES - 2), { "key": "up" }
+            ])),
+            Err(InputError::TooLarge)
+        ));
+        assert!(validate_input_size(&json!([
+            "x".repeat(MAX_INPUT_BYTES - 3), { "key": "up" }
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn rejected_append_does_not_grow_output_buffer() {
+        let mut bytes = vec![b'x'; MAX_INPUT_BYTES - 2];
+        assert!(matches!(
+            append_input_bytes(&mut bytes, b"\x1b[A"),
+            Err(InputError::TooLarge)
+        ));
+        assert_eq!(bytes.len(), MAX_INPUT_BYTES - 2);
+        assert!(bytes.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn expansion_rejects_oversized_text_and_aggregate_sequence() {
+        let text = BashWriteInput::Text("x".repeat(MAX_INPUT_BYTES + 1));
+        assert!(expand_input(&text).is_err(), "oversized text was copied");
+        let sequence = BashWriteInput::Sequence(vec![
+            SequenceItem::Text("x".repeat(MAX_INPUT_BYTES - 2)),
+            SequenceItem::Key { key: "up".into() },
+        ]);
+        assert!(
+            expand_input(&sequence).is_err(),
+            "oversized sequence was expanded"
+        );
+    }
+
+    #[test]
+    fn expansion_accepts_exact_byte_limit_with_multibyte_text_and_keys() {
+        let text = BashWriteInput::Text("é".repeat(MAX_INPUT_BYTES / 2));
+        assert_eq!(expand_input(&text).unwrap().len(), MAX_INPUT_BYTES);
+        let sequence = BashWriteInput::Sequence(vec![
+            SequenceItem::Text("x".repeat(MAX_INPUT_BYTES - 3)),
+            SequenceItem::Key { key: "up".into() },
+        ]);
+        assert_eq!(expand_input(&sequence).unwrap().len(), MAX_INPUT_BYTES);
+    }
+
+    #[test]
     fn text_form_passes_bytes_through_verbatim() {
         let input = BashWriteInput::Text("hello\n".into());
         let bytes = expand_input(&input).unwrap();
@@ -301,7 +435,9 @@ mod tests {
         let input = BashWriteInput::Sequence(vec![SequenceItem::Key {
             key: "windows-key".into(),
         }]);
-        let err = expand_input(&input).unwrap_err();
+        let InputError::InvalidKey(err) = expand_input(&input).unwrap_err() else {
+            panic!("unknown key must retain its diagnostic");
+        };
         assert!(err.contains("unknown key 'windows-key'"));
         assert!(err.contains("allowed keys:"));
     }

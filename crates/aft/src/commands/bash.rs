@@ -216,10 +216,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let workdir = params
-        .workdir
-        .clone()
-        .unwrap_or_else(|| default_workdir(ctx));
+    let workdir = resolve_workdir(params.workdir.as_deref(), ctx);
     let principal = crate::sandbox_spawn::current_authenticated_principal();
     let host_requested = matches!(params.sandbox, Some(BashSandbox::Host));
     if host_requested && !crate::sandbox_spawn::principal_is_first_party(&principal) {
@@ -248,9 +245,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     #[cfg(unix)]
-    let mut spawn_workdir = params.workdir.clone();
+    let mut spawn_workdir = Some(workdir.clone());
     #[cfg(not(unix))]
-    let spawn_workdir = params.workdir.clone();
+    let spawn_workdir = Some(workdir.clone());
     #[cfg(unix)]
     let mut host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
     #[cfg(not(unix))]
@@ -272,12 +269,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         };
-        let candidate_cwd = if workdir.is_absolute() {
-            workdir.clone()
-        } else {
-            root.join(&workdir)
-        };
-        let cwd = match std::fs::canonicalize(&candidate_cwd) {
+        let cwd = match std::fs::canonicalize(&workdir) {
             Ok(cwd) => cwd,
             Err(error) => {
                 return Response::error(
@@ -550,6 +542,17 @@ fn default_workdir(ctx: &AppContext) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn resolve_workdir(workdir: Option<&Path>, ctx: &AppContext) -> PathBuf {
+    let root = default_workdir(ctx);
+    match workdir {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        // Resolve once so permissions, rewriting, escalation, and the child
+        // all use the project-relative directory, not the daemon's cwd.
+        Some(path) => root.join(path),
+        None => root,
+    }
+}
+
 /// Generic retry loop for the Windows shell-fallback path. Walks the
 /// `candidates` list, calling `try_one(shell)` for each; on `NotFound`
 /// continues to the next candidate, on success returns the child, on
@@ -689,6 +692,24 @@ mod tests {
         ));
         // A real subdirectory must NOT match → rewrite is skipped, native bash runs.
         assert!(!workdir_matches_project_root(&sub, &ctx));
+    }
+
+    #[test]
+    fn resolved_workdir_preserves_absolute_paths_and_gates_rewrites() {
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("sub")).unwrap();
+        let ctx = ctx_with_root(project.path());
+        assert_eq!(resolve_workdir(None, &ctx), project.path());
+        assert_eq!(resolve_workdir(Some(other.path()), &ctx), other.path());
+        assert!(workdir_matches_project_root(
+            &resolve_workdir(Some(Path::new(".")), &ctx),
+            &ctx
+        ));
+        assert!(!workdir_matches_project_root(
+            &resolve_workdir(Some(Path::new("sub")), &ctx),
+            &ctx
+        ));
     }
 
     /// Issue #27: `WindowsShell::args` must produce shell-appropriate flags.
@@ -922,6 +943,55 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_workdir_executes_in_project_subdirectory() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let sub = project.path().join("bash-relative-workdir");
+        std::fs::create_dir(&sub).unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(project.path().into()),
+            storage_dir: Some(storage.path().into()),
+            ..crate::config::Config::default()
+        };
+        config.sandbox.enabled = false;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let mut request = spawn_test_request(
+            "relative-workdir",
+            "printf relative-cwd-ok > marker.txt",
+            false,
+        );
+        request.params["params"]["workdir"] = json!("bash-relative-workdir");
+        let launched = handle(&request, &ctx);
+        assert!(launched.success, "spawn failed: {:?}", launched.data);
+        let task_id = launched.data["task_id"].as_str().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = ctx
+                .bash_background()
+                .status(
+                    task_id,
+                    "sandbox-spawn-test",
+                    Some(project.path()),
+                    Some(storage.path()),
+                    0,
+                )
+                .unwrap();
+            if snapshot.info.status.is_terminal() {
+                assert_eq!(snapshot.exit_code, Some(0));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(sub.join("marker.txt")).unwrap(),
+            b"relative-cwd-ok"
+        );
+        assert!(!project.path().join("marker.txt").exists());
     }
 
     #[test]
