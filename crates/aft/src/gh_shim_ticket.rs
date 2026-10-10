@@ -32,10 +32,23 @@ pub struct Redeemed {
     pub project_root: String,
 }
 
+enum Owner {
+    Task(String),
+    Call(String),
+}
+
+impl Owner {
+    fn id(&self) -> &str {
+        match self {
+            Self::Task(id) | Self::Call(id) => id,
+        }
+    }
+}
+
 struct Entry {
     ticket: [u8; TICKET_BYTES],
     session_id: String,
-    task_id: String,
+    owner: Owner,
     project_root: String,
 }
 
@@ -77,7 +90,7 @@ fn constant_time_eq(left: &[u8; TICKET_BYTES], right: &[u8; TICKET_BYTES]) -> bo
     difference == 0
 }
 
-fn insert(session_id: &str, task_id: &str, project_root: &str) -> Option<String> {
+fn insert(session_id: &str, owner: Owner, project_root: &str) -> Option<String> {
     if !session_can_hold_ticket(session_id) {
         return None;
     }
@@ -89,7 +102,7 @@ fn insert(session_id: &str, task_id: &str, project_root: &str) -> Option<String>
     registry().push(Entry {
         ticket,
         session_id: session_id.to_string(),
-        task_id: task_id.to_string(),
+        owner,
         project_root: project_root.to_string(),
     });
     Some(encoded)
@@ -105,7 +118,7 @@ pub fn redeem(ticket: &str) -> Option<Redeemed> {
         if constant_time_eq(&entry.ticket, &candidate) {
             found = Some(Redeemed {
                 session_id: entry.session_id.clone(),
-                task_id: entry.task_id.clone(),
+                task_id: entry.owner.id().to_string(),
                 project_root: entry.project_root.clone(),
             });
         }
@@ -119,7 +132,7 @@ pub fn revoke_task(task_id: &str) {
     if task_id.is_empty() {
         return;
     }
-    registry().retain(|entry| entry.task_id != task_id);
+    registry().retain(|entry| !matches!(&entry.owner, Owner::Task(id) if id == task_id));
 }
 
 fn revoke(ticket: &str) {
@@ -134,7 +147,7 @@ fn revoke(ticket: &str) {
 pub(crate) fn live_count_for_task(task_id: &str) -> usize {
     registry()
         .iter()
-        .filter(|entry| entry.task_id == task_id)
+        .filter(|entry| matches!(&entry.owner, Owner::Task(id) if id == task_id))
         .count()
 }
 
@@ -150,7 +163,7 @@ impl PendingTicket {
     /// or the shared default namespace.
     pub fn issue(session_id: &str, project_root: &str) -> Self {
         Self {
-            ticket: insert(session_id, "", project_root),
+            ticket: insert(session_id, Owner::Task(String::new()), project_root),
         }
     }
 
@@ -171,7 +184,7 @@ impl PendingTicket {
         };
         for entry in registry().iter_mut() {
             if constant_time_eq(&entry.ticket, &candidate) {
-                entry.task_id = task_id.to_string();
+                entry.owner = Owner::Task(task_id.to_string());
             }
         }
     }
@@ -194,7 +207,7 @@ pub struct ScopedTicket {
 impl ScopedTicket {
     pub fn issue(session_id: &str, call_id: &str, project_root: &str) -> Self {
         Self {
-            ticket: insert(session_id, call_id, project_root),
+            ticket: insert(session_id, Owner::Call(call_id.to_string()), project_root),
         }
     }
 
@@ -280,5 +293,24 @@ mod tests {
             value
         };
         assert_eq!(redeem(&value), None);
+    }
+
+    #[test]
+    fn revoking_a_background_task_does_not_revoke_a_same_named_scoped_call() {
+        let scoped = ScopedTicket::issue("ses-collision", "task-call-collision", "/p");
+        let scoped_value = scoped.value().unwrap().to_string();
+        let pending = PendingTicket::issue("ses-collision", "/p");
+        let task_value = pending.value().unwrap().to_string();
+        pending.bind_task("task-call-collision");
+
+        revoke_task("task-call-collision");
+
+        assert_eq!(redeem(&task_value), None);
+        assert_eq!(
+            redeem(&scoped_value).unwrap().task_id,
+            "task-call-collision"
+        );
+        drop(scoped);
+        assert_eq!(redeem(&scoped_value), None);
     }
 }
