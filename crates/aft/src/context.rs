@@ -1704,6 +1704,7 @@ pub(crate) struct PreparedViewUpdate {
     pin: Option<Arc<crate::pins::QueryPin>>,
     retired: Option<ViewRuntimeState>,
     assembly: crate::views::assembly::PreparedAssembly,
+    _semantic_pin: Option<crate::pins::AssemblyPin>,
     pub(crate) content_generation: u64,
 }
 
@@ -6944,32 +6945,35 @@ impl AppContext {
         // semantic plane: its vectors came from the legacy semantic index,
         // which such a root no longer builds.
         let semantic_search = self.config().indexes.semantic && !self.checkout_semantic.active();
-        let semantic_keys =
-            if semantic_search && allow_semantic_blob_put && !self.shared_artifacts_read_only() {
-                let index = self
-                    .semantic_index
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone()
-                    .ok_or_else(|| {
-                        "semantic view publication is waiting for the semantic index".to_string()
-                    })?;
-                let fingerprint = index
-                    .fingerprint()
-                    .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
-                    .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
-                let mut request = crate::migration::SemanticMigrationRequest::for_root(
-                    snapshot.storage.clone(),
-                    root.clone(),
-                    fingerprint,
-                );
-                request.family.clone_from(&snapshot.family);
-                request.view.clone_from(&snapshot.scope);
-                crate::migration::store_live_semantic_blobs(&request, &index)
-                    .map_err(|error| error.to_string())?
-            } else {
-                BTreeMap::new()
-            };
+        let (semantic_keys, semantic_pin) = if semantic_search
+            && allow_semantic_blob_put
+            && !self.shared_artifacts_read_only()
+        {
+            let index = self
+                .semantic_index
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .ok_or_else(|| {
+                    "semantic view publication is waiting for the semantic index".to_string()
+                })?;
+            let fingerprint = index
+                .fingerprint()
+                .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
+                .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
+            let mut request = crate::migration::SemanticMigrationRequest::for_root(
+                snapshot.storage.clone(),
+                root.clone(),
+                fingerprint,
+            );
+            request.family.clone_from(&snapshot.family);
+            request.view.clone_from(&snapshot.scope);
+            let handoff = crate::migration::store_live_semantic_blobs(&request, &index)
+                .map_err(|error| error.to_string())?;
+            (handoff.keys, Some(handoff.pin))
+        } else {
+            (BTreeMap::new(), None)
+        };
         let assembly = crate::views::assembly::prepare_checkout(
             &crate::views::assembly::AssemblyRequest {
                 storage: snapshot.storage.clone(),
@@ -7023,6 +7027,9 @@ impl AppContext {
             pin: pin.map(Arc::new),
             retired: None,
             assembly,
+            // Reused semantic rows can already exceed the GC age floor. Keep
+            // their pin through publication, not merely through blob insertion.
+            _semantic_pin: semantic_pin,
             content_generation,
         })
     }

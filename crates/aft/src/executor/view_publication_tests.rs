@@ -534,6 +534,104 @@ fn publication_omits_file_deleted_after_head_listing() {
 }
 
 #[test]
+fn publication_keeps_reused_semantic_rows_pinned_during_handoff() {
+    let fixture = Fixture::new();
+    let root = std::fs::canonicalize(fixture.project.path()).unwrap();
+    let source = b"pub fn next_semantic() {}\n";
+    let path = root.join("tracked.rs");
+    std::fs::write(&path, source).unwrap();
+    let mut index = crate::semantic_index::SemanticIndex::build(
+        &root,
+        &[path],
+        &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+        64,
+    )
+    .unwrap();
+    let fingerprint = crate::semantic_index::SemanticIndexFingerprint {
+        dimension: 2,
+        chunking_version: 2,
+        ..Default::default()
+    };
+    index.set_fingerprint(fingerprint.clone());
+    let snapshot = fixture.ctx.view_runtime_snapshot().unwrap();
+    let mut request = crate::migration::SemanticMigrationRequest::for_root(
+        &snapshot.storage,
+        &root,
+        fingerprint.as_string(),
+    );
+    request.family.clone_from(&snapshot.family);
+    request.view.clone_from(&snapshot.scope);
+    let key = crate::blob_store::SemanticKey::from_bytes(
+        source,
+        b"tracked.rs",
+        &request.chunker_version,
+        &request.embed_template_version,
+        &request.configured_model_fingerprint,
+    )
+    .full_key();
+    drop(crate::migration::store_live_semantic_blobs(&request, &index).unwrap());
+    *fixture.ctx.semantic_index().write().unwrap() = Some(index);
+    let mut config = (*fixture.ctx.config()).clone();
+    config.indexes.semantic = true;
+    fixture.ctx.set_config(config);
+    let collect = || {
+        crate::gc::sweep_semantic_handoff_for_test(crate::gc::SweepRequest {
+            storage: &snapshot.storage,
+            family: &snapshot.family,
+            view_dir: &snapshot.view_dir,
+            byte_budget: 0,
+            now_ms: crate::pins::now_ms().saturating_add(crate::gc::BLOB_AGE_FLOOR_MS + 1),
+            references: crate::gc::SweepReferences::default(),
+        })
+        .unwrap()
+    };
+    let assert_semantic_present = || {
+        let store = crate::blob_store::BlobStore::open(
+            &snapshot.storage,
+            &snapshot.family,
+            crate::blob_store::BlobPlane::Semantic,
+        )
+        .unwrap();
+        assert!(
+            store.get(&key).unwrap().is_some(),
+            "publication dropped the semantic pin during handoff"
+        );
+    };
+    let mut swept_handoff = false;
+    let mut prepared = fixture
+        .ctx
+        .prepare_view_paths(
+            BTreeSet::from([b"tracked.rs".to_vec()]),
+            true,
+            &mut |phase| {
+                if phase == "working_tree_read" && !swept_handoff {
+                    swept_handoff = true;
+                    collect();
+                    assert_semantic_present();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(swept_handoff, "handoff sweep callback did not run");
+    collect();
+    {
+        let store = crate::blob_store::BlobStore::open(
+            &snapshot.storage,
+            &snapshot.family,
+            crate::blob_store::BlobPlane::Semantic,
+        )
+        .unwrap();
+        assert!(
+            store.get(&key).unwrap().is_some(),
+            "prepared publication dropped the semantic pin before commit"
+        );
+    }
+    let report = fixture.ctx.commit_view_update(&mut prepared).unwrap();
+    assert!(report.generation.is_some());
+}
+
+#[test]
 fn publication_retires_root_deleted_during_source_read() {
     let fixture = Fixture::new();
     let result = fixture

@@ -273,10 +273,15 @@ pub(crate) fn configured_fingerprint_for_legacy(
     )
 }
 
+pub(crate) struct LiveSemanticBlobs {
+    pub keys: BTreeMap<Vec<u8>, String>,
+    pub pin: AssemblyPin,
+}
+
 pub(crate) fn store_live_semantic_blobs(
     request: &SemanticMigrationRequest,
     index: &crate::semantic_index::SemanticIndex,
-) -> Result<BTreeMap<Vec<u8>, String>, MigrationError> {
+) -> Result<LiveSemanticBlobs, MigrationError> {
     let raw = index.to_bytes();
     let parsed = parse_legacy_snapshot(&raw, &request.configured_model_fingerprint)
         .map_err(MigrationError::InvalidLegacySnapshot)?;
@@ -313,7 +318,11 @@ pub(crate) fn store_live_semantic_blobs(
         .iter()
         .map(|candidate| candidate.key.clone())
         .collect::<Vec<_>>();
-    let generation = format!("semantic-live-{}", &blake3::hash(&raw).to_hex()[..16]);
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+    // Concurrent preparations may reuse exactly the same keys. Each needs its
+    // own pin file so dropping one preparation cannot release another's guard.
+    let generation = format!("semantic-live-{:032x}", u128::from_ne_bytes(nonce));
     let mut pin = AssemblyPin::create(
         view.view_dir(),
         request.family.clone(),
@@ -338,8 +347,10 @@ pub(crate) fn store_live_semantic_blobs(
             candidate.key.to_hex(),
         );
     }
-    pin.release();
-    Ok(semantic_keys)
+    Ok(LiveSemanticBlobs {
+        keys: semantic_keys,
+        pin,
+    })
 }
 
 /// Imports an eligible root's old `semantic.bin` without making embedding requests.
@@ -591,23 +602,15 @@ struct RebuildState {
 }
 
 fn write_rebuild_state(path: &Path, state: &RebuildState) -> Result<(), MigrationError> {
-    let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
-    let result = (|| -> Result<(), MigrationError> {
-        let mut file = crate::private_storage::create(&temporary)?;
-        serde_json::to_writer(&mut file, state)
-            .map_err(|error| MigrationError::InvalidLegacySnapshot(error.to_string()))?;
-        use std::io::Write as _;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        crate::fs_lock::rename_over(&temporary, path)?;
-        crate::fs_lock::sync_parent(path);
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    let mut bytes = serde_json::to_vec(state)
+        .map_err(|error| MigrationError::InvalidLegacySnapshot(error.to_string()))?;
+    bytes.push(b'\n');
+    crate::durability::atomic_write(
+        path,
+        &bytes,
+        crate::durability::AtomicWriteDurability::FileAndDirectory,
+    )?;
+    Ok(())
 }
 
 struct ImportCandidate {
@@ -980,6 +983,99 @@ impl<'a> LegacyReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuild_state_does_not_reuse_another_writers_fixed_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rebuild.json");
+        let fixed = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        fs::write(&fixed, b"another writer's temporary").unwrap();
+        write_rebuild_state(
+            &path,
+            &RebuildState {
+                disposition: "rebuild".into(),
+                reason: "missing snapshot".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(fixed).unwrap(), b"another writer's temporary");
+    }
+
+    #[test]
+    fn live_semantic_handoff_keeps_reused_blobs_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        let source_path = root.join("src/lib.rs");
+        let source = b"pub fn entry() {}\n";
+        fs::write(&source_path, source).unwrap();
+        let mut index = crate::semantic_index::SemanticIndex::build(
+            &root,
+            &[source_path],
+            &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            64,
+        )
+        .unwrap();
+        let fingerprint = crate::semantic_index::SemanticIndexFingerprint {
+            dimension: 2,
+            chunking_version: 2,
+            ..Default::default()
+        };
+        index.set_fingerprint(fingerprint.clone());
+        let request = SemanticMigrationRequest::for_root(
+            dir.path().join("storage"),
+            &root,
+            fingerprint.as_string(),
+        );
+        let key = SemanticKey::from_bytes(
+            source,
+            b"src/lib.rs",
+            &request.chunker_version,
+            &request.embed_template_version,
+            &request.configured_model_fingerprint,
+        )
+        .full_key();
+        drop(store_live_semantic_blobs(&request, &index).unwrap());
+        let first_handoff = store_live_semantic_blobs(&request, &index).unwrap();
+        let handoff = store_live_semantic_blobs(&request, &index).unwrap();
+        drop(first_handoff);
+        let view = ViewStore::open(&request.storage, &request.view).unwrap();
+        let sweep = || {
+            crate::gc::sweep(crate::gc::SweepRequest {
+                storage: &request.storage,
+                family: &request.family,
+                view_dir: view.view_dir(),
+                byte_budget: 0,
+                now_ms: crate::pins::now_ms().saturating_add(crate::gc::BLOB_AGE_FLOOR_MS + 1),
+                references: crate::gc::SweepReferences::default(),
+            })
+            .unwrap()
+        };
+        let report = sweep();
+        assert_eq!(
+            report.examined_blobs, 1,
+            "reused semantic key must reach the collector"
+        );
+        assert_eq!(
+            report.deleted_blobs, 0,
+            "semantic handoff released its pin before assembly"
+        );
+        {
+            let store = BlobStore::open(
+                &request.storage,
+                &request.family,
+                crate::blob_store::BlobPlane::Semantic,
+            )
+            .unwrap();
+            assert!(store.get(&key).unwrap().is_some());
+        }
+        drop(handoff);
+        assert_eq!(
+            sweep().deleted_blobs,
+            1,
+            "control: releasing the handoff must expose the otherwise unreferenced blob"
+        );
+    }
 
     #[test]
     fn compatible_fingerprint_requires_the_current_chunker() {

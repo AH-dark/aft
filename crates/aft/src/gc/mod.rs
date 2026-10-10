@@ -102,6 +102,28 @@ pub(crate) fn sweep_bounded(
     request: SweepRequest<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SweepReport, SweepError> {
+    sweep_planes_bounded(
+        request,
+        cancelled,
+        &[BlobPlane::Semantic, BlobPlane::Callgraph],
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn sweep_semantic_handoff_for_test(
+    request: SweepRequest<'_>,
+) -> Result<SweepReport, SweepError> {
+    // The view-publication test runs GC while its assembler holds a callgraph
+    // SQLite connection. Collect only semantic blobs so the test never opens a
+    // second descriptor on that live callgraph database.
+    sweep_planes_bounded(request, &|| false, &[BlobPlane::Semantic])
+}
+
+fn sweep_planes_bounded(
+    request: SweepRequest<'_>,
+    cancelled: &dyn Fn() -> bool,
+    planes: &[BlobPlane],
+) -> Result<SweepReport, SweepError> {
     let control = SweepControl {
         deadline: Instant::now() + Duration::from_secs(5),
         cancelled,
@@ -149,7 +171,7 @@ pub(crate) fn sweep_bounded(
     mark_live_assembly_pins(&request, &mut references, &mut report)?;
     mark_live_query_pins(&request, &mut references, &mut report);
 
-    for plane in [BlobPlane::Semantic, BlobPlane::Callgraph] {
+    for &plane in planes {
         control.check()?;
         let path = plane_path(request.storage, request.family, plane);
         if !path.exists() {
@@ -171,7 +193,7 @@ pub(crate) fn sweep_bounded(
         deadline: Instant::now() + Duration::from_secs(60),
         cancelled,
     };
-    for plane in [BlobPlane::Semantic, BlobPlane::Callgraph] {
+    for &plane in planes {
         let path = plane_path(request.storage, request.family, plane);
         let id = blake3::hash(path.to_string_lossy().as_bytes()).to_hex();
         let pending = request
@@ -369,6 +391,13 @@ fn sweep_plane(
         cursors.remove(path);
     }
     drop(cursors);
+    let tx = rusqlite::Transaction::new_unchecked(
+        &connection,
+        rusqlite::TransactionBehavior::Immediate,
+    )?;
+    let mut delete = tx.prepare("DELETE FROM blob_payloads WHERE full_key = ?1")?;
+    let mut deleted_blobs = 0;
+    let mut deleted_bytes = 0_u64;
     for (key, bytes, created_at_ms) in candidates {
         control.check()?;
         // This reference check is the safety boundary: retained manifests and
@@ -376,16 +405,23 @@ fn sweep_plane(
         if references.contains(&key) || now_ms.saturating_sub(created_at_ms) < BLOB_AGE_FLOOR_MS {
             continue;
         }
-        let deleted = connection.execute(
-            "DELETE FROM blob_payloads WHERE full_key = ?1",
-            params![key.as_slice()],
-        )?;
+        #[cfg(test)]
+        BEFORE_BLOB_DELETE.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(&connection);
+            }
+        });
+        let deleted = delete.execute(params![key.as_slice()])?;
         if deleted == 1 {
             total_bytes = total_bytes.saturating_sub(bytes);
-            report.deleted_blobs += 1;
-            report.deleted_bytes = report.deleted_bytes.saturating_add(bytes);
+            deleted_blobs += 1;
+            deleted_bytes = deleted_bytes.saturating_add(bytes);
         }
     }
+    drop(delete);
+    tx.commit()?;
+    report.deleted_blobs += deleted_blobs;
+    report.deleted_bytes = report.deleted_bytes.saturating_add(deleted_bytes);
     report.retained_bytes = report.retained_bytes.saturating_add(total_bytes);
     Ok(())
 }
@@ -423,8 +459,62 @@ fn plane_path(storage: &Path, family: &str, plane: BlobPlane) -> PathBuf {
 }
 
 #[cfg(test)]
+type BeforeBlobDelete = Box<dyn FnMut(&rusqlite::Connection)>;
+#[cfg(test)]
+thread_local! {
+    static BEFORE_BLOB_DELETE: std::cell::RefCell<Option<BeforeBlobDelete>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+
+    #[test]
+    fn blob_gc_deletes_a_bounded_batch_in_one_transaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = plane_path(temp.path(), "family", BlobPlane::Callgraph);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch("CREATE TABLE blob_payloads (full_key BLOB PRIMARY KEY, payload BLOB, created_at_ms INTEGER)").unwrap();
+            for key in [[1_u8; 32], [2_u8; 32], [3_u8; 32]] {
+                connection
+                    .execute(
+                        "INSERT INTO blob_payloads VALUES (?1, X'01020304', 0)",
+                        params![key.as_slice()],
+                    )
+                    .unwrap();
+            }
+        }
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let hook_calls = calls.clone();
+        BEFORE_BLOB_DELETE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |connection| {
+                assert!(
+                    !connection.is_autocommit(),
+                    "collector is deleting with per-row autocommit"
+                );
+                hook_calls.set(hook_calls.get() + 1);
+            }))
+        });
+        let report = sweep(SweepRequest {
+            storage: temp.path(),
+            family: "family",
+            view_dir: &temp.path().join("view"),
+            byte_budget: 1024,
+            now_ms: BLOB_AGE_FLOOR_MS + 1,
+            references: SweepReferences {
+                retained_keys: BTreeSet::from([[1_u8; 32]]),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        BEFORE_BLOB_DELETE.with(|slot| slot.borrow_mut().take());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(report.deleted_blobs, 2);
+        assert_eq!(report.deleted_bytes, 8);
+        assert_eq!(report.retained_bytes, 4);
+    }
 
     #[test]
     fn storage_retention_collects_unreferenced_blobs_below_budget() {
