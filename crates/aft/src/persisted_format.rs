@@ -374,9 +374,17 @@ pub fn gate(
     scope: &Path,
     found: Option<u64>,
 ) -> Result<(), UnsupportedPersistedFormat> {
-    if let Some(refusal) =
-        refusal_covering(store, path).filter(|refusal| refusal.source != RefusalSource::Artifact)
-    {
+    let floor = with_registry(|entries| {
+        entries
+            .iter()
+            .find(|entry| {
+                entry.refusal.store == store
+                    && path.starts_with(&entry.scope)
+                    && entry.refusal.source != RefusalSource::Artifact
+            })
+            .map(|entry| entry.refusal.clone())
+    });
+    if let Some(refusal) = floor {
         return Err(refusal);
     }
     match found.and_then(|found| UnsupportedPersistedFormat::check(store, path, found)) {
@@ -432,6 +440,27 @@ pub fn formats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_refusal_cannot_shadow_reader_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("index/k/cache.bin");
+        let store = PersistedStore::SearchIndex;
+        let current = u64::from(store.supported());
+        assert!(gate(store, &artifact, &artifact, Some(current + 1)).is_err());
+        let floor = UnsupportedPersistedFormat::floor(
+            store,
+            root.path().join(crate::reader_floor::FLOOR_FILE),
+            current + 2,
+        );
+        record(&floor, root.path());
+        assert_eq!(gate(store, &artifact, &artifact, Some(current)), Err(floor));
+        assert_eq!(
+            refusals_under(root.path()).len(),
+            2,
+            "floor gate must not clear artifact evidence"
+        );
+    }
 
     #[test]
     fn store_names_round_trip_and_are_unique() {

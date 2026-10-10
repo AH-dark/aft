@@ -195,7 +195,14 @@ pub fn claim_or_open_read_only(
                 }
             }
             Err(ReadManifestError::Malformed) => {
-                let _ = fs::remove_file(&path);
+                let _mutation = manifest_mutation_lock(&path)?;
+                if matches!(read_manifest(&path), Err(ReadManifestError::Malformed)) {
+                    match fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 continue;
             }
             // A manifest written by a newer build is left exactly as it is.
@@ -471,6 +478,7 @@ fn heartbeat_manifest(
     previous: &ArtifactOwnerManifest,
     next: &ArtifactOwnerManifest,
 ) -> io::Result<()> {
+    let _mutation = manifest_mutation_lock(path)?;
     let next_bytes = manifest_bytes(next)?;
     match OpenOptions::new().read(true).write(true).open(path) {
         Ok(mut file) => {
@@ -518,6 +526,7 @@ fn create_owner_manifest(
     git_common_dir: Option<&str>,
 ) -> io::Result<ArtifactOwnerClaim> {
     crate::production_storage::refuse_write(path)?;
+    let _mutation = manifest_mutation_lock(path)?;
     let manifest = new_manifest(project_scope_key, checkout_path, git_common_dir);
     let mut file = crate::private_storage::options()
         .write(true)
@@ -587,7 +596,7 @@ fn manifest_owner_alive(manifest: &ArtifactOwnerManifest) -> bool {
     if manifest.hostname != current_hostname() {
         return since_heartbeat <= fs_lock::STALE_HEARTBEAT_MS.saturating_mul(5);
     }
-    process_alive(manifest.pid)
+    protected_for_retention(manifest)
 }
 
 pub(crate) fn protected_for_retention(manifest: &ArtifactOwnerManifest) -> bool {
@@ -603,13 +612,23 @@ pub(crate) fn protected_for_retention(manifest: &ArtifactOwnerManifest) -> bool 
 
 fn reclaim_manifest_if_unchanged(path: &Path, judged: &ArtifactOwnerManifest) -> io::Result<bool> {
     match read_manifest(path) {
-        Ok(current)
-            if current.pid == judged.pid
-                && current.hostname == judged.hostname
-                && current.created_at_ms == judged.created_at_ms =>
-        {
-            fs::remove_file(path)?;
-            Ok(true)
+        Ok(current) if current == *judged => {
+            #[cfg(test)]
+            BEFORE_MANIFEST_RECLAIM.with(|slot| {
+                let hook = slot.borrow_mut().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            });
+            let _mutation = manifest_mutation_lock(path)?;
+            match read_manifest(path) {
+                Ok(current) if current == *judged => {
+                    fs::remove_file(path)?;
+                    Ok(true)
+                }
+                Err(ReadManifestError::Io(error)) => Err(error),
+                _ => Ok(false),
+            }
         }
         Ok(_)
         | Err(ReadManifestError::NotFound)
@@ -627,6 +646,11 @@ enum ReadManifestError {
     /// Written by a newer build (or refused by the storage root's reader
     /// floor). Never removed, rewritten or reclaimed.
     Newer(crate::persisted_format::UnsupportedPersistedFormat),
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MANIFEST_RECLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Parse an owner manifest. An empty or partial file (for example one left by
@@ -682,18 +706,55 @@ pub(crate) fn check_manifest_format(
 
 fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::Result<()> {
     crate::production_storage::refuse_write(path)?;
-    let tmp = temp_path(path);
-    let write_result = (|| -> io::Result<()> {
-        let mut file = crate::private_storage::create(&tmp)?;
-        fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
-        write_manifest_to_file(&mut file, manifest)?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    write_result
+    let _mutation = manifest_mutation_lock(path)?;
+    crate::durability::atomic_write(
+        path,
+        &manifest_bytes(manifest)?,
+        crate::durability::AtomicWriteDurability::None,
+    )?;
+    fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
+    Ok(())
+}
+
+fn manifest_mutation_lock(path: &Path) -> io::Result<std::fs::File> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing owner parent"))?;
+    let key = directory.file_name().unwrap_or_default();
+    let mut name = std::ffi::OsString::from(".");
+    name.push(key);
+    name.push(".owner-mutation.lock");
+    // Keep exclusion outside the key directory: orphan cleanup may remove that
+    // directory, but must not remove the identity of an in-flight claimant.
+    let owner_root = directory.parent().unwrap_or(directory);
+    let lock_dir = owner_root
+        .parent()
+        .unwrap_or(owner_root)
+        .join(".artifact-owner-locks");
+    crate::private_storage::create_dir_all(&lock_dir)?;
+    let lock_path = lock_dir.join(name);
+    let file = match crate::private_storage::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(file) => {
+            fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
+            file
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            crate::private_storage::options()
+                .read(true)
+                .write(true)
+                .open(&lock_path)?
+        }
+        Err(error) => return Err(error),
+    };
+    // The kernel releases exclusion when this handle closes, including after a
+    // crash. Keep the file in place so heartbeats need no new inode or fsync.
+    file.lock()?;
+    Ok(file)
 }
 
 fn manifest_bytes(manifest: &ArtifactOwnerManifest) -> io::Result<Vec<u8>> {
@@ -1091,6 +1152,42 @@ mod tests {
     use crate::path_identity::ProjectRootId;
     use crate::protocol::Response;
 
+    #[cfg(unix)]
+    #[test]
+    fn claim_rejects_recycled_live_pid() {
+        let mut manifest = new_manifest("old-scope", "/old-checkout", None);
+        let start =
+            crate::root_cache::process_start_time_ms(manifest.pid).expect("current process start");
+        manifest.created_at_ms = start.checked_sub(1001).unwrap();
+        assert!(
+            !manifest_owner_alive(&manifest),
+            "PID now belongs to a newer process"
+        );
+        assert!(!protected_for_retention(&manifest));
+    }
+
+    #[test]
+    fn manifest_reclaim_preserves_replacement_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let owners = dir.path().join("artifact-owners/key");
+        fs::create_dir_all(&owners).unwrap();
+        let path = owners.join("owner.json");
+        let judged = new_manifest("old-scope", "/old-checkout", None);
+        atomic_write_manifest(&path, &judged).unwrap();
+        let mut replacement = judged.clone();
+        replacement.project_scope_key = "new-scope".into();
+        replacement.created_at_ms += 1;
+        let replacement_path = path.clone();
+        let replacement_for_hook = replacement.clone();
+        BEFORE_MANIFEST_RECLAIM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                atomic_write_manifest(&replacement_path, &replacement_for_hook).unwrap();
+            }))
+        });
+        assert!(!reclaim_manifest_if_unchanged(&path, &judged).unwrap());
+        assert_eq!(read_manifest(&path).unwrap(), replacement);
+    }
+
     static HEARTBEAT_TEST_SERIAL: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
 
     struct EnvVarGuard {
@@ -1290,7 +1387,7 @@ mod tests {
         let created = fs_lock::io_ledger::take();
         assert_eq!(
             (created.file_syncs, created.dir_syncs, created.new_files),
-            (0, 0, 1),
+            (0, 0, 2),
             "first claim: {created:?}"
         );
 

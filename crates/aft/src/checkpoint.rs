@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -1537,29 +1537,12 @@ thread_local! {
 }
 
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, bytes: &[u8]) -> io::Result<()> {
-    let tmp_name = format!(
-        ".{}.{}.{}.tmp",
-        final_name,
-        std::process::id(),
-        current_timestamp_nanos()
-    );
-    let tmp_path = dir.join(tmp_name);
     let final_path = dir.join(final_name);
-    {
-        let mut options = crate::private_storage::options();
-        options.write(true).create_new(true);
-        // Checkpoint blobs are copies of user files (possibly secrets), so
-        // they are owner-only from creation, like undo backups.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(crate::backup::PRIVATE_FILE_MODE);
-        }
-        let mut file = options.open(&tmp_path)?;
-        file.write_all(bytes)?;
-        crate::durability::sync_file(&file, &final_path)?;
-    }
-    fs::rename(tmp_path, final_path)
+    crate::durability::atomic_write(
+        &final_path,
+        bytes,
+        crate::durability::AtomicWriteDurability::File,
+    )
 }
 
 #[cfg(unix)]
@@ -1962,6 +1945,17 @@ fn current_timestamp_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_checkpoint_atomic_replace_cleans_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("destination")).unwrap();
+        assert!(super::write_temp_fsync_rename(dir.path(), "destination", b"private").is_err());
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("destination")]);
+    }
     use super::*;
     use crate::protocol::DEFAULT_SESSION_ID;
     use std::fs;

@@ -2933,10 +2933,11 @@ impl BackupStore {
             "last_accessed": last_accessed,
         });
         if let Ok(s) = serde_json::to_string_pretty(&json) {
-            let tmp = session_dir.join("session.json.tmp");
-            if write_private_file(&tmp, s.as_bytes()).is_ok() {
-                let _ = std::fs::rename(&tmp, marker);
-            }
+            let _ = crate::durability::atomic_write(
+                &marker,
+                s.as_bytes(),
+                crate::durability::AtomicWriteDurability::FileAndDirectory,
+            );
         }
     }
 
@@ -3014,12 +3015,23 @@ impl BackupStore {
             if !session_dir.is_dir() || session_dir.join("meta.json").exists() {
                 continue;
             }
+            // Stack acquisition uses this stable gate too. While it is held no
+            // writer can create a new lease under the directory being collected.
+            let Ok(Some(_gate)) = session_gc_gate(&session_dir, false) else {
+                continue;
+            };
+            let Ok(Some(stack_leases)) = acquire_inactive_session_leases(&session_dir) else {
+                continue;
+            };
             let Some(last_accessed) = Self::read_session_last_accessed(&session_dir) else {
                 continue;
             };
             if last_accessed >= cutoff {
                 continue;
             }
+            // All stack leases were inactive. Release our probe leases before
+            // deletion; the stable gate still excludes new stack acquisitions.
+            drop(stack_leases);
             if let Err(e) = std::fs::remove_dir_all(&session_dir) {
                 crate::slog_warn!(
                     "failed to remove stale backup session {}: {}",
@@ -3120,12 +3132,19 @@ impl BackupStore {
                 "last_accessed": current_timestamp(),
             });
             if let Ok(s) = serde_json::to_string_pretty(&json) {
-                let _ = write_private_file(&marker, s.as_bytes());
+                let _ = crate::durability::atomic_write(
+                    &marker,
+                    s.as_bytes(),
+                    crate::durability::AtomicWriteDurability::FileAndDirectory,
+                );
             }
         }
     }
 
     fn upgrade_meta_file(meta_path: &Path, session_id: &str) {
+        if crate::production_storage::refuse_write(meta_path).is_err() {
+            return;
+        }
         let content = match std::fs::read_to_string(meta_path) {
             Ok(c) => c,
             Err(_) => return,
@@ -3160,10 +3179,11 @@ impl BackupStore {
             });
         }
         if let Ok(s) = serde_json::to_string_pretty(&parsed) {
-            let tmp = meta_path.with_extension("json.tmp");
-            if write_private_file(&tmp, s.as_bytes()).is_ok() {
-                let _ = std::fs::rename(&tmp, meta_path);
-            }
+            let _ = crate::durability::atomic_write(
+                meta_path,
+                s.as_bytes(),
+                crate::durability::AtomicWriteDurability::FileAndDirectory,
+            );
         }
     }
 
@@ -3441,6 +3461,16 @@ impl BackupStore {
             return Ok(None);
         };
         self.record_disk_io_for_tests();
+        let parent = session_dir.parent().unwrap();
+        create_private_durable_dir(parent).map_err(|error| AftError::IoError {
+            path: parent.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let gate_path = session_gc_lock_path(&session_dir);
+        let _gate = session_gc_gate(&session_dir, true).map_err(|error| AftError::IoError {
+            path: gate_path.display().to_string(),
+            message: error.to_string(),
+        })?;
         create_private_durable_dir(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
             message: error.to_string(),
@@ -5359,13 +5389,6 @@ fn trim_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) {
     drop(stack.drain(..overflow));
 }
 
-/// Unix mode for every file the backup store writes. Backups hold copies of
-/// user files (including secrets such as credential files), so they must never
-/// be readable by other users regardless of the source file's own mode or of
-/// the permissions on the configurable storage directory above the store.
-#[cfg(unix)]
-pub(crate) const PRIVATE_FILE_MODE: u32 = crate::private_storage::FILE_MODE;
-
 /// Creates `path` and any missing ancestors as owner-only directories (0700 on
 /// Unix). The mode is applied at creation, so a directory never exists with
 /// wider permissions. Existing directories are protected when their storage
@@ -5407,32 +5430,6 @@ pub(crate) fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Writes `content` to `path` (creating or truncating it) with owner-only
-/// permissions (0600 on Unix). A new file is created with that mode; a file
-/// left over from an earlier run keeps its old mode bits on open, so it is
-/// tightened through the open handle before any new content is written.
-fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    crate::production_storage::refuse_write(path)?;
-    let mut options = crate::private_storage::options();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(PRIVATE_FILE_MODE)
-            .custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if file.metadata()?.permissions().mode() & 0o777 != PRIVATE_FILE_MODE {
-            file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-        }
-    }
-    file.write_all(content)
-}
-
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std::io::Result<()> {
     write_temp_atomic_rename(dir, final_name, content, true)
 }
@@ -5444,36 +5441,72 @@ fn write_temp_atomic_rename(
     durable: bool,
 ) -> std::io::Result<()> {
     crate::production_storage::refuse_write(&dir.join(final_name))?;
-    let tmp_name = format!(
-        ".{}.{}.{}.tmp",
-        final_name,
-        std::process::id(),
-        current_timestamp_nanos()
-    );
-    let tmp_path = dir.join(tmp_name);
     let final_path = dir.join(final_name);
-    {
-        let mut options = crate::private_storage::options();
-        options.write(true).create_new(true);
-        // Owner-only from the moment the file exists: backup content is a copy
-        // of a user file and may be a secret even when stored under a
-        // world-readable storage directory.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(PRIVATE_FILE_MODE);
-        }
-        let mut file = options.open(&tmp_path)?;
-        file.write_all(content)?;
+    crate::durability::atomic_write(
+        &final_path,
+        content,
         if durable {
-            crate::durability::sync_file(&file, &final_path)?;
-        }
-    }
-    replace_file(&tmp_path, &final_path)?;
-    crate::durability::record(crate::durability::EventKind::AtomicReplace, &final_path);
-    Ok(())
+            crate::durability::AtomicWriteDurability::File
+        } else {
+            crate::durability::AtomicWriteDurability::None
+        },
+    )
 }
 
+fn session_gc_lock_path(session_dir: &Path) -> PathBuf {
+    session_dir.parent().unwrap().join(format!(
+        ".{}.session-gc.lock",
+        BackupStore::path_hash(session_dir)
+    ))
+}
+
+fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+    let path = session_gc_lock_path(session_dir);
+    crate::production_storage::refuse_write(&path)?;
+    let mut options = crate::private_storage::options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if wait {
+        file.lock()?;
+    } else {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Ok(Some(file))
+}
+
+fn acquire_inactive_session_leases(
+    session_dir: &Path,
+) -> std::io::Result<Option<Vec<crate::fs_lock::LockGuard>>> {
+    let entries = match std::fs::read_dir(session_dir.join(".locks")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+        Err(error) => return Err(error),
+    };
+    let mut guards = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "lock") {
+            continue;
+        }
+        match crate::fs_lock::try_acquire_once(&path) {
+            Ok(guard) => guards.push(guard),
+            Err(crate::fs_lock::AcquireError::Timeout) => return Ok(None),
+            Err(error) => return Err(std::io::Error::other(error)),
+        }
+    }
+    Ok(Some(guards))
+}
+
+#[cfg(test)]
 fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     // On Windows, std::fs::rename uses MoveFileExW replace-existing semantics,
     // so a single rename keeps meta.json atomic instead of deleting it first.
@@ -5556,6 +5589,70 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stale_session_gc_preserves_active_stack_lease() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut writer = BackupStore::new();
+        writer.set_storage_dir(storage.path().to_path_buf(), 1);
+        let session = "paused-writer";
+        let key = storage.path().join("source.txt");
+        let lock = writer.acquire_stack_disk_lock(session, &key).unwrap();
+        writer.write_session_marker(session, 1);
+        let session_dir = writer.session_dir(session).unwrap();
+        let lock_path = lock.as_ref().unwrap().path().to_path_buf();
+        let epoch = lock.as_ref().unwrap().writer_epoch().to_owned();
+        let mut collector = BackupStore::new();
+        collector.set_storage_dir(storage.path().to_path_buf(), 1);
+        collector.gc_stale_sessions(1);
+        assert!(
+            session_dir.exists(),
+            "collector removed the paused writer's session"
+        );
+        assert!(matches!(
+            crate::fs_lock::try_acquire_once(&lock_path),
+            Err(crate::fs_lock::AcquireError::Timeout)
+        ));
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&crate::fs_lock::read_lease_settled(&lock_path).unwrap())
+                .unwrap();
+        assert_eq!(metadata["writer_epoch"].as_str(), Some(epoch.as_str()));
+        drop(lock);
+        collector.gc_stale_sessions(1);
+        assert!(
+            !session_dir.exists(),
+            "inactive stale session should still be reclaimed"
+        );
+    }
+
+    #[test]
+    fn session_marker_does_not_reuse_fixed_temporary() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 1);
+        let session_dir = store.session_dir("marker-writer").unwrap();
+        fs::create_dir_all(&session_dir).unwrap();
+        let fixed = session_dir.join("session.json.tmp");
+        fs::write(&fixed, b"another writer's temporary").unwrap();
+        store.write_session_marker("marker-writer", 123);
+        assert_eq!(fs::read(&fixed).unwrap(), b"another writer's temporary");
+        assert_eq!(
+            BackupStore::read_session_last_accessed(&session_dir),
+            Some(123)
+        );
+    }
+    #[test]
+    fn failed_backup_atomic_replace_cleans_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("destination")).unwrap();
+        assert!(
+            super::write_temp_atomic_rename(dir.path(), "destination", b"private", true).is_err()
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("destination")]);
+    }
     use super::*;
     use crate::durability::{sync_count, take, EventKind};
 

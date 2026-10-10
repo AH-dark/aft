@@ -243,16 +243,15 @@ pub(crate) fn pin_barrier(view_dir: &Path) -> io::Result<Option<crate::fs_lock::
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
-    fs::create_dir_all(
+    crate::backup::create_private_durable_dir(
         path.parent()
             .ok_or_else(|| io::Error::other("missing retention parent"))?,
     )?;
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(
-        &temporary,
-        serde_json::to_vec(value).map_err(io::Error::other)?,
-    )?;
-    crate::fs_lock::rename_over(&temporary, path)
+    crate::durability::atomic_write(
+        path,
+        &serde_json::to_vec(value).map_err(io::Error::other)?,
+        crate::durability::AtomicWriteDurability::FileAndDirectory,
+    )
 }
 
 /// Called before cache acquisition, on every configure, even a same-key rebind.
@@ -276,7 +275,8 @@ pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io
             .join("retention/roots")
             .join(format!("{scope}.json")),
         &binding,
-    )
+    )?;
+    clear_unknown_observation(storage, artifact_key)
 }
 
 /// Only a verified linked-worktree Git layout gets the shorter retention age.
@@ -1253,6 +1253,7 @@ fn candidate(
             .min(new_bytes);
     }
     report.removed_roots += 1;
+    clear_unknown_observation(storage, key)?;
     drop(files_guard);
     drop(leases);
     Ok(())
@@ -1476,6 +1477,64 @@ fn collect_one_v2_family(
 #[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+
+    #[test]
+    fn retention_worker_panic_releases_running_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().to_path_buf();
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                storage.clone(),
+                State {
+                    running: true,
+                    last_run: Some(Instant::now()),
+                    ..State::default()
+                },
+            );
+        assert!(
+            std::panic::catch_unwind(|| scheduled_run(&storage, || panic!(
+                "injected retention panic"
+            )))
+            .is_err()
+        );
+        let states = states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!states[&storage].running, "panic stranded the running flag");
+        assert!(
+            states[&storage].last_run.is_none(),
+            "failed pass must permit rescheduling"
+        );
+    }
+
+    #[test]
+    fn retention_record_is_private_and_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binding.json");
+        crate::durability::take();
+        atomic_json(&path, &serde_json::json!({"bound": true})).unwrap();
+        let events = crate::durability::take();
+        assert!(events
+            .iter()
+            .any(|(kind, _)| *kind == crate::durability::EventKind::FileSync));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                events.last(),
+                Some(&(
+                    crate::durability::EventKind::DirectorySync,
+                    dir.path().to_path_buf()
+                ))
+            );
+        }
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, String) {
         let temp = tempfile::tempdir().unwrap();
@@ -2295,6 +2354,13 @@ mod storage_retention_tests {
         .unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 1);
         assert!(!path.exists());
+        assert!(
+            !temp
+                .path()
+                .join(format!("retention/unknown/{key}.json"))
+                .exists(),
+            "deleted cache retained its old observation grace"
+        );
     }
 
     #[test]
@@ -2650,17 +2716,14 @@ pub(crate) fn schedule(
     if let Err(error) = std::thread::Builder::new()
         .name("aft-storage-retention".into())
         .spawn(move || {
-            let report = run_pass(&storage, &|| !admission.is_current(&generation, expected));
-            crate::slog_info!(
-                "storage retention root={} report={}",
-                storage.display(),
-                serde_json::to_string(&report).unwrap_or_default()
-            );
-            if let Ok(mut states) = states().lock() {
-                if let Some(state) = states.get_mut(&storage) {
-                    state.running = false;
-                }
-            }
+            scheduled_run(&storage, || {
+                let report = run_pass(&storage, &|| !admission.is_current(&generation, expected));
+                crate::slog_info!(
+                    "storage retention root={} report={}",
+                    storage.display(),
+                    serde_json::to_string(&report).unwrap_or_default()
+                );
+            });
         })
     {
         if let Ok(mut states) = states().lock() {
@@ -2670,5 +2733,47 @@ pub(crate) fn schedule(
             }
         }
         crate::slog_warn!("storage retention worker could not start: {error}");
+    }
+}
+
+fn scheduled_run(storage: &Path, run: impl FnOnce()) {
+    let mut reset = RunningReset {
+        storage,
+        completed: false,
+    };
+    run();
+    reset.completed = true;
+}
+
+struct RunningReset<'a> {
+    storage: &'a Path,
+    completed: bool,
+}
+
+impl Drop for RunningReset<'_> {
+    fn drop(&mut self) {
+        let mut states = states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = states.get_mut(self.storage) {
+            state.running = false;
+            if !self.completed {
+                state.last_run = None;
+            }
+        }
+    }
+}
+
+fn clear_unknown_observation(storage: &Path, key: &str) -> io::Result<()> {
+    if !key_valid(key) {
+        return Ok(());
+    }
+    let path = storage
+        .join("retention/unknown")
+        .join(format!("{key}.json"));
+    match fs::remove_file(&path) {
+        Ok(()) => crate::durability::sync_dir(path.parent().unwrap()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }

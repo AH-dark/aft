@@ -386,8 +386,15 @@ fn acquire_with_config(
                     path.display(),
                     error
                 );
-                remove_lock_file(path)?;
-                immediate_retry_budget = 1;
+                let judged = fs::read(path)?;
+                if serde_json::from_slice::<LockMetadata>(&judged).is_ok() {
+                    continue;
+                }
+                #[cfg(test)]
+                run_acquisition_hook(&BEFORE_MALFORMED_RECLAIM);
+                if reclaim_malformed_lock(path, &judged)? {
+                    immediate_retry_budget = 1;
+                }
                 continue;
             }
         };
@@ -510,23 +517,26 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
     let heartbeat_metadata = metadata.clone();
     let heartbeat_shutdown = Arc::clone(&shutdown);
     let heartbeat_failed_for_thread = Arc::clone(&heartbeat_failed);
-    let heartbeat = thread::Builder::new()
-        .name("aft-fs-lock-heartbeat".to_string())
-        .spawn(move || {
-            let heartbeat_shutdown_for_run = Arc::clone(&heartbeat_shutdown);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_heartbeat(
-                    heartbeat_path,
-                    heartbeat_metadata,
-                    heartbeat_shutdown_for_run,
-                    config,
-                );
-            }));
-            if result.is_err() || !heartbeat_shutdown.load(Ordering::Acquire) {
-                heartbeat_failed_for_thread.store(true, Ordering::Release);
-            }
-            let _ = done_tx.send(());
-        })?;
+    let heartbeat = spawn_heartbeat(move || {
+        let heartbeat_shutdown_for_run = Arc::clone(&heartbeat_shutdown);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_heartbeat(
+                heartbeat_path,
+                heartbeat_metadata,
+                heartbeat_shutdown_for_run,
+                config,
+            );
+        }));
+        if result.is_err() || !heartbeat_shutdown.load(Ordering::Acquire) {
+            heartbeat_failed_for_thread.store(true, Ordering::Release);
+        }
+        let _ = done_tx.send(());
+    })
+    .inspect_err(|_| {
+        // Thread creation failed after publication; do not strand this PID's
+        // lease, or unlink a replacement that no longer has our epoch.
+        let _ = remove_lock_if_owned(path, &metadata);
+    })?;
 
     slog_debug!("acquired filesystem lock at {}", path.display());
 
@@ -538,6 +548,35 @@ fn create_new_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Resul
         heartbeat_done: done_rx,
         heartbeat: Some(heartbeat),
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MALFORMED_RECLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_HEARTBEAT_SPAWN_FAILURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_acquisition_hook(
+    hook: &'static std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>,
+) -> bool {
+    let action = hook.with(|slot| slot.borrow_mut().take());
+    if let Some(action) = action {
+        action();
+        true
+    } else {
+        false
+    }
+}
+
+fn spawn_heartbeat(run: impl FnOnce() + Send + 'static) -> io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if run_acquisition_hook(&BEFORE_HEARTBEAT_SPAWN_FAILURE) {
+        return Err(io::Error::other("injected heartbeat spawn failure"));
+    }
+    thread::Builder::new()
+        .name("aft-fs-lock-heartbeat".to_string())
+        .spawn(run)
 }
 
 fn run_heartbeat(
@@ -943,6 +982,24 @@ fn reclaim_lock_file(path: &Path, judged: &LockMetadata) -> io::Result<ReclaimRe
         // Malformed now (mid-write by a new owner) — don't delete; retry next poll.
         Err(ReadLockError::Malformed(_)) => Ok(ReclaimResult::Unchanged),
         Err(ReadLockError::Io(error)) => Err(error),
+    }
+}
+
+fn reclaim_malformed_lock(path: &Path, judged: &[u8]) -> io::Result<bool> {
+    let _token = match acquire_reclaim_token(path)? {
+        ReclaimTokenAcquire::Acquired(token) => token,
+        ReclaimTokenAcquire::Held(_) => return Ok(false),
+    };
+    match fs::read(path) {
+        Ok(current)
+            if current == judged && serde_json::from_slice::<LockMetadata>(&current).is_err() =>
+        {
+            remove_lock_file(path)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -1625,6 +1682,61 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
+
+    #[test]
+    fn malformed_reclaim_preserves_replacement_epoch() {
+        let (_dir, path) = test_lock_path();
+        fs::write(&path, b"malformed").unwrap();
+        let replacement = synthetic_metadata(std::process::id(), current_hostname(), now_ms());
+        let expected_epoch = replacement.writer_epoch.clone();
+        let replace_path = path.clone();
+        BEFORE_MALFORMED_RECLAIM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(&replace_path).unwrap();
+                write_synthetic_lock(&replace_path, &replacement);
+            }))
+        });
+        let result = acquire_with_config(&path, Some(Duration::from_millis(100)), test_config());
+        assert!(
+            matches!(result, Err(AcquireError::Timeout)),
+            "replacement owner must block acquisition"
+        );
+        assert_eq!(
+            read_lock_metadata(&path).unwrap().writer_epoch,
+            expected_epoch
+        );
+    }
+
+    #[test]
+    fn heartbeat_spawn_failure_removes_own_lock() {
+        let (_dir, path) = test_lock_path();
+        BEFORE_HEARTBEAT_SPAWN_FAILURE.with(|slot| *slot.borrow_mut() = Some(Box::new(|| {})));
+        assert!(create_new_lock(&path, &current_hostname(), test_config()).is_err());
+        assert!(
+            !path.exists(),
+            "failed acquisition must not leave a live-PID lock"
+        );
+        drop(create_new_lock(&path, &current_hostname(), test_config()).unwrap());
+    }
+
+    #[test]
+    fn heartbeat_spawn_failure_preserves_replacement_lock() {
+        let (_dir, path) = test_lock_path();
+        let replacement = synthetic_metadata(std::process::id(), current_hostname(), now_ms());
+        let expected_epoch = replacement.writer_epoch.clone();
+        let replace_path = path.clone();
+        BEFORE_HEARTBEAT_SPAWN_FAILURE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(&replace_path).unwrap();
+                write_synthetic_lock(&replace_path, &replacement);
+            }))
+        });
+        assert!(create_new_lock(&path, &current_hostname(), test_config()).is_err());
+        assert_eq!(
+            read_lock_metadata(&path).unwrap().writer_epoch,
+            expected_epoch
+        );
+    }
 
     /// A lock file whose metadata cannot be read because another actor is
     /// mid-create/delete is contention, not a failure. The create arm already
