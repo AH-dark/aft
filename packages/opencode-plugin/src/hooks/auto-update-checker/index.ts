@@ -208,17 +208,34 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
         }
       }
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      if (!isOrphanedCheckLock(lockPath)) return null;
-
-      // Replacing the orphan atomically avoids a remove/create interval in which
-      // another process could mistake the lock as available and start a second update.
-      const replacementPath = `${lockPath}.tmp.${process.pid}`;
-      writeFileSync(replacementPath, JSON.stringify(owner), { encoding: "utf-8", mode: 0o600 });
+      // Serialize stale-owner observation and removal. A contender can still win
+      // the primary path during reclamation, so admission always ends with wx.
+      const reclaimPath = `${lockPath}.reclaim`;
+      let reclaimFd: number;
       try {
-        renameSync(replacementPath, lockPath);
-      } catch (replaceError) {
-        rmSync(replacementPath, { force: true });
-        throw replaceError;
+        reclaimFd = openSync(reclaimPath, "wx");
+      } catch (reclaimError) {
+        if ((reclaimError as NodeJS.ErrnoException).code === "EEXIST") return null;
+        throw reclaimError;
+      }
+      try {
+        if (!isOrphanedCheckLock(lockPath)) return null;
+        rmSync(lockPath, { force: true });
+        try {
+          lockFd = openSync(lockPath, "wx");
+        } catch (claimError) {
+          if ((claimError as NodeJS.ErrnoException).code === "EEXIST") return null;
+          throw claimError;
+        }
+        try {
+          writeFileSync(lockFd, JSON.stringify(owner));
+        } finally {
+          closeSync(lockFd);
+          lockFd = null;
+        }
+      } finally {
+        closeSync(reclaimFd);
+        rmSync(reclaimPath, { force: true });
       }
     }
 
@@ -252,6 +269,7 @@ function claimCheckSlot(storageDir: string | null, intervalMs: number): CheckSlo
 
 function isOrphanedCheckLock(lockPath: string): boolean {
   const state = readCheckLockState(lockPath);
+  if (state === null) return true; // Released after EEXIST: retry exclusive creation.
   const ageMs = Date.now() - state.startedMs;
   if (ageMs >= CHECK_LOCK_STALE_MS) return true;
   if (state.pid === null) return false;
@@ -267,8 +285,14 @@ function isOrphanedCheckLock(lockPath: string): boolean {
   }
 }
 
-function readCheckLockState(lockPath: string): CheckLockState {
-  const fallbackStartedMs = statSync(lockPath).mtimeMs;
+function readCheckLockState(lockPath: string): CheckLockState | null {
+  let fallbackStartedMs: number;
+  try {
+    fallbackStartedMs = statSync(lockPath).mtimeMs;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
   try {
     const parsed = JSON.parse(readFileSync(lockPath, "utf-8")) as Partial<CheckLockOwner>;
     const pid =
@@ -278,7 +302,8 @@ function readCheckLockState(lockPath: string): CheckLockState {
         ? parsed.startedMs
         : fallbackStartedMs;
     return { pid, startedMs };
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     // A crash between exclusive creation and metadata write leaves an empty lock.
     return { pid: null, startedMs: fallbackStartedMs };
   }

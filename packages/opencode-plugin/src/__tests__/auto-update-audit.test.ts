@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -242,5 +243,61 @@ describe("auto-update audit regressions", () => {
 
     expect(existsSync(lockPath)).toBe(true);
     expect(JSON.parse(readFileSync(lockPath, "utf-8"))).toEqual(replacement);
+  });
+
+  test("concurrent orphan-lock reclaimers admit exactly one updater", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    const deadPid = 2147483647;
+    writeFileSync(lockPath, JSON.stringify({ pid: deadPid, startedMs: Date.now() }));
+    const { __test__ } = await freshIndexImport();
+    let nested: ReturnType<typeof __test__.claimCheckSlot> = null;
+    let raced = false;
+    const originalKill = process.kill;
+    const kill = spyOn(process, "kill").mockImplementation((pid, signal) => {
+      if (pid !== deadPid) return originalKill(pid, signal);
+      // Admit a second claimant between the first stale-owner observation and takeover.
+      if (!raced) {
+        raced = true;
+        nested = __test__.claimCheckSlot(storageDir, 0);
+      }
+      throw Object.assign(new Error("dead owner"), { code: "ESRCH" });
+    });
+    try {
+      const outer = __test__.claimCheckSlot(storageDir, 0);
+      expect(raced).toBe(true);
+      expect(Number(outer !== null) + Number(nested !== null)).toBe(1);
+      outer?.release();
+      (nested as ReturnType<typeof __test__.claimCheckSlot>)?.release();
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  test("updater retries when the orphan lock disappears before stat", async () => {
+    const storageDir = createStorageDir();
+    const lockPath = join(storageDir, "opencode", "last-update-check.json.lock");
+    mkdirSync(join(storageDir, "opencode"), { recursive: true });
+    writeFileSync(lockPath, "{}");
+    const { __test__ } = await freshIndexImport();
+    let disappeared = false;
+    const originalStat = fs.statSync;
+    const stat = spyOn(fs, "statSync").mockImplementation(((file: any, options: any) => {
+      if (file === lockPath && !disappeared) {
+        disappeared = true;
+        rmSync(lockPath);
+        throw Object.assign(new Error("released lock"), { code: "ENOENT" });
+      }
+      return originalStat(file, options);
+    }) as typeof fs.statSync);
+    try {
+      const lock = __test__.claimCheckSlot(storageDir, 0);
+      expect(disappeared).toBe(true);
+      expect(lock).not.toBeNull();
+      lock?.release();
+    } finally {
+      stat.mockRestore();
+    }
   });
 });
