@@ -3692,13 +3692,11 @@ async fn drive_s1_rejection_daemon(
     drop(stream);
 }
 
-/// The module registers not-ready and flips itself ready over its own
-/// connection. The fake daemon behaves like the one deployed today: it knows
-/// `catalog.update` but refuses `supervisor.live_roots`, and its first
-/// `catalog.update` fails, so the flip must be retried. Routes still bind
-/// normally afterwards.
+/// The no-op production warmer flips ready without a live-root round trip.
+/// The fake daemon advertises the query but refuses the first ready flip, so
+/// the retry and subsequent route bind must still work normally.
 #[test]
-fn subc_registers_not_ready_and_flips_ready_when_live_roots_is_refused() {
+fn subc_registers_not_ready_and_noop_warmer_flips_ready_without_live_roots_query() {
     let root = tempfile::tempdir().expect("root tempdir");
     let storage = tempfile::tempdir().expect("storage tempdir");
     let conn_dir = tempfile::tempdir().expect("connection tempdir");
@@ -3821,16 +3819,10 @@ async fn drive_readiness_daemon(
     )
     .await;
 
-    // The live-root query arrives first; refuse it as an unknown op.
-    let query = read_any_frame_timeout(&mut stream, "live_roots request").await;
-    assert_eq!(query.header.ty, FrameType::Request);
-    assert_eq!(query.header.channel, 0);
-    let query_body: ModuleControlRequestFromModule =
-        serde_json::from_slice(&query.body).expect("live_roots body");
-    assert_eq!(query_body, ModuleControlRequestFromModule::LiveRoots {});
-    send_channel_zero_error(&mut stream, query.header.corr, "unknown_op").await;
+    // With no artifact warmer installed, readiness starts with the ready flip.
+    // A live-root request here would waste a round trip without warming anything.
 
-    // The flip follows at once. Fail the first attempt; the retry must come.
+    // Fail the first flip attempt; the retry must come.
     let mut flip_corrs = Vec::new();
     for attempt in 0..2 {
         let flip = read_any_frame_timeout(&mut stream, "catalog.update request").await;

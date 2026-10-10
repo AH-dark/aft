@@ -4575,6 +4575,20 @@ mod lexical_parent_tests {
     use super::*;
 
     #[test]
+    fn hashline_native_arguments_are_consumed_without_a_temporary_map_clone() {
+        let source = include_str!("subc_translate.rs");
+        let branch = source
+            .split("if bare_name == \"edit\" && ctx.effective_hashline")
+            .nth(1)
+            .unwrap()
+            .split("let agent_args = normalize_path_arguments")
+            .next()
+            .unwrap();
+        assert!(branch.contains("let Value::Object(mut args) = translation.to_native_args()"));
+        assert!(!branch.contains(".cloned()"));
+    }
+
+    #[test]
     fn lexical_normalization_preserves_leading_parents() {
         assert_eq!(
             normalize_lexically(Path::new("../../x")),

@@ -18062,6 +18062,27 @@ mod admission_mechanism_tests {
     }
 
     #[test]
+    fn core_tool_membership_has_one_routing_source() {
+        for (source, signature) in [
+            (
+                include_str!("manifest.rs"),
+                "pub(super) fn is_subc_agent_core_tool",
+            ),
+            (include_str!("../subc_format.rs"), "fn is_core_agent_tool"),
+        ] {
+            let body = source
+                .split(signature)
+                .nth(1)
+                .unwrap()
+                .split('}')
+                .next()
+                .unwrap();
+            assert!(body.contains("crate::subc_translate::supports_tool"));
+            assert!(!body.contains("matches!"));
+        }
+    }
+
+    #[test]
     fn standing_selects_one_actor_before_cloning_its_configuration() {
         let source = include_str!("standing.rs");
         let body = source

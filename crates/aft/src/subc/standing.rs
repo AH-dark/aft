@@ -180,9 +180,10 @@ impl StandingActor {
                     *owned_here && owned_root == root_id && ctx.config().harness.is_none()
                 })
             })
-            .min_by(|(left, _), (right, _)| left.as_path().cmp(right.as_path()));
-        if let Some((_, ctx)) = snapshot {
-            *self.observed_config.lock() = ctx.config().as_ref().clone();
+            .min_by(|(left, _), (right, _)| left.as_path().cmp(right.as_path()))
+            .map(|(_, ctx)| ctx.config().as_ref().clone());
+        if let Some(snapshot) = snapshot {
+            *self.observed_config.lock() = snapshot;
         }
     }
 

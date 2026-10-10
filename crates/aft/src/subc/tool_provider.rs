@@ -419,8 +419,8 @@ pub(super) fn catalog(
 const WORKER_REPLY_MARGIN_MS: u64 = 30_000;
 const MAX_DECLARED_REPLY_MS: u64 = 86_400_000;
 
-/// Render from session policy and its resolved blocking wait limit. Only a
-/// session that may run commands remotely sees bash's `runon` argument.
+/// Render a catalog directly from arguments for catalog conformance fixtures.
+#[cfg(test)]
 pub(super) fn catalog_for_session(
     body: Value,
     disabled: &[String],
@@ -478,6 +478,8 @@ thread_local! {
     pub(super) static CATALOG_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Render validated arguments under the session's resolved remote policy and
+/// blocking wait limit. Only remotely enabled sessions see bash's `runon` argument.
 pub(super) fn catalog_for_request(
     request: CatalogRequest,
     preset: CatalogPreset,
@@ -1042,7 +1044,7 @@ impl LedgerEdge {
                         drop(waiting);
                         // Drain answered before admission completed. No tool was
                         // dispatched, so leave a durable not-started result for repeats.
-                        let _ = repeat_executor.submit_async(root, Lane::Mutating, "ledger-drained-admission".into(), Box::new(move |ctx| {
+                        drop(repeat_executor.submit_async(root, Lane::Mutating, "ledger-drained-admission".into(), Box::new(move |ctx| {
                             if let Some(db) = ctx.db() {
                                 if let Ok(conn) = db.lock() {
                                     let recorded = ledger::not_started(&response_key, "cancelled");
@@ -1052,7 +1054,7 @@ impl LedgerEdge {
                                 }
                             }
                             Response::success("ledger-drained-admission", json!({}))
-                        }));
+                        })));
                         return;
                     }
                     edge.calls.lock().unwrap().insert(
