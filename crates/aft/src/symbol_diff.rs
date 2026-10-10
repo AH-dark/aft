@@ -134,18 +134,40 @@ pub(crate) fn symbol_diff_file(
     let mut added = Vec::new();
     let mut modified = Vec::new();
 
-    for (identity, new_symbol) in new_by_identity {
-        match old_by_identity.remove(&identity) {
-            None => added.push(new_symbol.entry),
-            Some(old_symbol) if symbol_changed(&old_symbol, &new_symbol) => {
-                modified.push(new_symbol.entry)
+    for (identity, new_symbols) in new_by_identity {
+        let mut old_symbols = old_by_identity.remove(&identity).unwrap_or_default();
+        let mut changed = Vec::new();
+        // Match unchanged overloads first so adding or reordering an overload
+        // does not shift every later declaration into a false modification.
+        for new_symbol in new_symbols {
+            if let Some(index) = old_symbols
+                .iter()
+                .position(|old| !symbol_changed(old, &new_symbol))
+            {
+                old_symbols.remove(index);
+            } else {
+                changed.push(new_symbol);
             }
-            Some(_) => {}
+        }
+        for new_symbol in changed {
+            let index = old_symbols
+                .iter()
+                .position(|old| old.entry.signature_line == new_symbol.entry.signature_line)
+                .or_else(|| (!old_symbols.is_empty()).then_some(0));
+            if let Some(index) = index {
+                old_symbols.remove(index);
+                modified.push(new_symbol.entry);
+            } else {
+                added.push(new_symbol.entry);
+            }
+        }
+        if !old_symbols.is_empty() {
+            old_by_identity.insert(identity, old_symbols);
         }
     }
-
     let removed = old_by_identity
         .into_values()
+        .flatten()
         .map(|symbol| symbol.entry)
         .collect();
 
@@ -169,6 +191,7 @@ pub fn symbol_diff_range(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Ran
     let mut files = BTreeMap::new();
 
     if let Some(changes) = git_name_status(repo_root, base_sha, tip_sha) {
+        let mut blobs = GitBlobReader::new(repo_root);
         for change in changes {
             match change {
                 GitFileChange::Added(path) => {
@@ -177,7 +200,7 @@ pub fn symbol_diff_range(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Ran
                         repo_root,
                         &path,
                         None,
-                        read_git_blob(repo_root, tip_sha, &path),
+                        read_git_blob(repo_root, &mut blobs, tip_sha, &path),
                         FileChangeKind::Added,
                         None,
                         None,
@@ -188,7 +211,7 @@ pub fn symbol_diff_range(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Ran
                         &mut files,
                         repo_root,
                         &path,
-                        read_git_blob(repo_root, base_sha, &path),
+                        read_git_blob(repo_root, &mut blobs, base_sha, &path),
                         None,
                         FileChangeKind::Removed,
                         None,
@@ -200,8 +223,8 @@ pub fn symbol_diff_range(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Ran
                         &mut files,
                         repo_root,
                         &path,
-                        read_git_blob(repo_root, base_sha, &path),
-                        read_git_blob(repo_root, tip_sha, &path),
+                        read_git_blob(repo_root, &mut blobs, base_sha, &path),
+                        read_git_blob(repo_root, &mut blobs, tip_sha, &path),
                         FileChangeKind::Modified,
                         None,
                         None,
@@ -214,7 +237,7 @@ pub fn symbol_diff_range(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Ran
                         &mut files,
                         repo_root,
                         &old,
-                        read_git_blob(repo_root, base_sha, &old),
+                        read_git_blob(repo_root, &mut blobs, base_sha, &old),
                         None,
                         FileChangeKind::Removed,
                         None,
@@ -225,7 +248,7 @@ pub fn symbol_diff_range(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Ran
                         repo_root,
                         &new,
                         None,
-                        read_git_blob(repo_root, tip_sha, &new),
+                        read_git_blob(repo_root, &mut blobs, tip_sha, &new),
                         FileChangeKind::Added,
                         Some(old_display),
                         None,
@@ -237,7 +260,7 @@ pub fn symbol_diff_range(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Ran
                         repo_root,
                         &new,
                         None,
-                        read_git_blob(repo_root, tip_sha, &new),
+                        read_git_blob(repo_root, &mut blobs, tip_sha, &new),
                         FileChangeKind::Added,
                         Some(git_path_display(&old)),
                         None,
@@ -275,7 +298,7 @@ fn parse_symbols(
     path: &Path,
     source: &[u8],
     lang: LangId,
-) -> Option<BTreeMap<SymbolIdentity, ParsedSymbol>> {
+) -> Option<BTreeMap<SymbolIdentity, Vec<ParsedSymbol>>> {
     let source = std::str::from_utf8(source).ok()?;
     let tree = parse_source_with_cached_parser(path, source, lang).ok()?;
     let symbols = extract_symbols_from_tree(source, &tree, lang).ok()?;
@@ -284,9 +307,10 @@ fn parse_symbols(
     let mut parsed = BTreeMap::new();
     for symbol in symbols {
         let (identity, parsed_symbol) = parsed_symbol(source, &line_starts, symbol);
-        // Extractors already deduplicate outline entries. Keeping the first value makes
-        // an unexpected duplicate deterministic without inventing a new display key.
-        parsed.entry(identity).or_insert(parsed_symbol);
+        parsed
+            .entry(identity)
+            .or_insert_with(Vec::new)
+            .push(parsed_symbol);
     }
     Some(parsed)
 }
@@ -473,10 +497,118 @@ fn parse_name_status(output: &[u8]) -> Vec<GitFileChange> {
     changes
 }
 
-fn read_git_blob(repo_root: &Path, sha: &str, path_bytes: &[u8]) -> Option<Vec<u8>> {
+fn read_git_blob(
+    repo_root: &Path,
+    batch: &mut Option<GitBlobReader>,
+    sha: &str,
+    path: &[u8],
+) -> Option<Vec<u8>> {
+    if let Some(reader) = batch.as_mut() {
+        match reader.read(sha, path) {
+            Ok(content) => return content,
+            Err(_) => {
+                batch.take();
+            }
+        }
+    }
+    // Older Git versions or a failed batch transport retain the per-blob
+    // fallback, including its existing unreadable-blob behavior.
+    read_git_blob_fallback(repo_root, sha, path)
+}
+
+struct GitBlobReader {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+    output: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl GitBlobReader {
+    fn new(root: &Path) -> Option<Self> {
+        use std::process::Stdio;
+        if !crate::developer_tools::git_usable() {
+            return None;
+        }
+        let mut child = crate::effective_path::new_command("git")
+            .arg("-C")
+            .arg(root)
+            .args(["cat-file", "--batch", "-z"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        #[cfg(test)]
+        BLOB_READER_SPAWNS.with(|count| count.set(count.get() + 1));
+        let input = child.stdin.take();
+        let output = std::io::BufReader::new(child.stdout.take()?);
+        Some(Self {
+            child,
+            input,
+            output,
+        })
+    }
+
+    fn read(&mut self, sha: &str, path: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::{BufRead, Read, Write};
+        let object = git_object_spec(sha, path);
+        let request = object.as_encoded_bytes();
+        if request.contains(&0) {
+            return Ok(None);
+        }
+        let input = self.input.as_mut().expect("batch stdin is open");
+        input.write_all(request)?;
+        input.write_all(b"\0")?;
+        input.flush()?;
+        let mut header = Vec::new();
+        if self.output.read_until(b'\n', &mut header)? == 0 {
+            return Err(std::io::Error::other("git batch exited before response"));
+        }
+        let fields: Vec<&str> = std::str::from_utf8(&header)
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        if fields.len() == 3 && matches!(fields[1], "blob" | "tree" | "commit" | "tag") {
+            let size = fields[2].parse::<usize>().map_err(std::io::Error::other)?;
+            let mut bytes = vec![0; size];
+            self.output.read_exact(&mut bytes)?;
+            let mut separator = [0];
+            self.output.read_exact(&mut separator)?;
+            if separator != *b"\n" {
+                return Err(std::io::Error::other("invalid git batch separator"));
+            }
+            return Ok((fields[1] == "blob").then_some(bytes));
+        }
+        // Missing-object replies echo the request. Use its byte length to drain
+        // even a missing pathname containing embedded newlines before continuing.
+        let missing_len = request.len() + b" missing\n".len();
+        if header.len() <= missing_len {
+            let used = header.len();
+            header.resize(missing_len, 0);
+            self.output.read_exact(&mut header[used..])?;
+            if header.strip_suffix(b" missing\n") == Some(request) {
+                return Ok(None);
+            }
+        }
+        Err(std::io::Error::other("invalid git batch header"))
+    }
+}
+
+impl Drop for GitBlobReader {
+    fn drop(&mut self) {
+        self.input.take();
+        // Kill before waiting so a broken response cannot leave a child blocked
+        // writing unread bytes into its pipe during error cleanup.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn read_git_blob_fallback(repo_root: &Path, sha: &str, path_bytes: &[u8]) -> Option<Vec<u8>> {
     if !crate::developer_tools::git_usable() {
         return None;
     }
+    #[cfg(test)]
+    BLOB_READER_SPAWNS.with(|count| count.set(count.get() + 1));
     let object = git_object_spec(sha, path_bytes);
     let output = crate::effective_path::new_command("git")
         .arg("-C")
@@ -534,6 +666,59 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn audit11_overload_changes_do_not_collapse_into_first_identity() {
+        let old =
+            b"class Box {\n int run(int x) { return 1; }\n int run(String x) { return 2; }\n}\n";
+        let new =
+            b"class Box {\n int run(int x) { return 1; }\n int run(String x) { return 3; }\n}\n";
+        let diff = symbol_diff_file(LangId::Java, Path::new("Box.java"), Some(old), Some(new));
+        let methods: Vec<_> = diff
+            .modified
+            .iter()
+            .filter(|entry| entry.name == "run")
+            .collect();
+        assert_eq!(methods.len(), 1);
+        assert!(methods[0]
+            .signature_line
+            .as_ref()
+            .unwrap()
+            .contains("String"));
+    }
+
+    #[test]
+    fn audit11_git_blobs_share_one_process_per_range() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (temp, base, tip) = committed_range("src/lib.rs", RUST_BASE, RUST_TIP);
+        BLOB_READER_SPAWNS.with(|count| count.set(0));
+        let packet = symbol_diff_range(temp.path(), &base, &tip);
+        assert_eq!(packet.files.len(), 1);
+        assert!(!packet.files[0].diff.symbols_unavailable);
+        assert_eq!(BLOB_READER_SPAWNS.with(|count| count.get()), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit11_batch_blob_reads_preserve_bytes_and_newline_path_framing() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let temp = init_git_fixture();
+        let name = b"odd\nname\xff.bin";
+        let bytes = b"\xef\xbb\xbfline\r\n\xfftail";
+        fs::write(temp.path().join(path_from_git_bytes(name)), bytes).unwrap();
+        let revision = commit_all(temp.path(), "bytes");
+        let mut batch = GitBlobReader::new(temp.path());
+        assert!(batch.is_some());
+        assert_eq!(
+            read_git_blob(temp.path(), &mut batch, &revision, name).unwrap(),
+            bytes
+        );
+        assert!(read_git_blob(temp.path(), &mut batch, &revision, b"missing\nname").is_none());
+        assert_eq!(
+            read_git_blob(temp.path(), &mut batch, &revision, name).unwrap(),
+            bytes
+        );
+    }
 
     const RUST_BASE: &str = r#"
 pub fn unchanged() -> i32 { 0 }
@@ -779,4 +964,9 @@ export function added(): number { return 3; }
             .trim()
             .to_string()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BLOB_READER_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

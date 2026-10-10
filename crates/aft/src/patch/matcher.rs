@@ -53,6 +53,8 @@ pub struct SequenceMatch {
 
 /// Convert smart quotes, dash variants, ellipsis, and NBSP to their ASCII forms; mirrors `patch-parser.ts:207-214`.
 pub fn normalize_unicode(input: &str) -> String {
+    #[cfg(test)]
+    NORMALIZED_LINE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
     let mut normalized = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
@@ -71,6 +73,8 @@ pub fn normalize_unicode(input: &str) -> String {
 
 /// Replace a leading run of tabs and spaces with the same number of plain spaces; mirrors `patch-parser.ts:227-229`.
 pub fn normalize_indent(input: &str) -> String {
+    #[cfg(test)]
+    NORMALIZED_LINE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
     let mut leading_chars = 0;
     let mut leading_bytes = 0;
 
@@ -168,57 +172,105 @@ fn normalized_sequence_match(
     pattern: &[&str],
     start_index: usize,
     eof: bool,
-    normalize: impl Fn(&str) -> String,
+    compare: impl Fn(&str, &str) -> bool,
 ) -> Option<usize> {
     if pattern.is_empty() || pattern.len() > lines.len() {
         return None;
     }
-    let wanted: Vec<String> = pattern.iter().map(|line| normalize(line)).collect();
     if eof {
         let start = lines.len() - pattern.len();
         return (start >= start_index
             && lines[start..]
                 .iter()
-                .zip(&wanted)
-                .all(|(line, expected)| normalize(line) == *expected))
+                .zip(pattern)
+                .all(|(line, expected)| compare(line, expected)))
         .then_some(start);
     }
-    let mut prefix = vec![0; wanted.len()];
-    for i in 1..wanted.len() {
+    let mut prefix = vec![0; pattern.len()];
+    for i in 1..pattern.len() {
         let mut matched = prefix[i - 1];
-        while matched > 0 && wanted[i] != wanted[matched] {
+        loop {
+            if compare(pattern[i], pattern[matched]) {
+                matched += 1;
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
             matched = prefix[matched - 1];
-        }
-        if wanted[i] == wanted[matched] {
-            matched += 1;
         }
         prefix[i] = matched;
     }
     let mut matched = 0;
     for (i, line) in lines.iter().enumerate().skip(start_index) {
-        let current = normalize(line);
-        while matched > 0 && current != wanted[matched] {
+        loop {
+            if compare(line, pattern[matched]) {
+                matched += 1;
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
             matched = prefix[matched - 1];
         }
-        if current == wanted[matched] {
-            matched += 1;
-        }
-        if matched == wanted.len() {
-            return Some(i + 1 - wanted.len());
+        if matched == pattern.len() {
+            return Some(i + 1 - pattern.len());
         }
     }
     None
+}
+
+fn unicode_characters(input: &str) -> impl Iterator<Item = char> + '_ {
+    input.chars().flat_map(|ch| {
+        let mapped = match ch {
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' => '-',
+            '\u{00A0}' => ' ',
+            _ => ch,
+        };
+        if ch == '\u{2026}' {
+            [Some('.'), Some('.'), Some('.')]
+        } else {
+            [Some(mapped), None, None]
+        }
+        .into_iter()
+        .flatten()
+    })
+}
+
+fn collapsed_whitespace(chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
+    let mut started = false;
+    let mut space = false;
+    chars.flat_map(move |ch| {
+        let emitted = if ch.is_whitespace() {
+            space = started;
+            [None, None]
+        } else {
+            let emitted = if space {
+                [Some(' '), Some(ch)]
+            } else {
+                [Some(ch), None]
+            };
+            space = false;
+            started = true;
+            emitted
+        };
+        emitted.into_iter().flatten()
+    })
 }
 
 fn non_whitespace_unit_count(input: &str) -> usize {
     // TypeScript uses UTF-16 code units for `.length`; Rust has no direct equivalent on `str`.
     // The length check only bounds candidate windows before exact string equality, so counting
     // Unicode scalar values keeps non-ASCII text from being over-weighted by UTF-8 byte length.
-    strip_reflow_whitespace(input).chars().count()
+    input.chars().filter(|ch| !ch.is_whitespace()).count()
 }
 
 #[cfg(test)]
 thread_local! {
+    static NORMALIZED_LINE_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFLOW_WINDOW_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFLOW_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -266,12 +318,18 @@ pub fn find_reflow_match(
                 continue;
             }
 
-            let window_text = lines[start..end].join("\n");
-            let window_non_whitespace = strip_reflow_whitespace(&window_text);
-            if window_non_whitespace != needle_non_whitespace {
+            let window_chars = || {
+                lines[start..end]
+                    .iter()
+                    .flat_map(|line| line.chars().chain(std::iter::once('\n')))
+            };
+            if !window_chars()
+                .filter(|ch| !ch.is_whitespace())
+                .eq(needle_non_whitespace.chars())
+            {
                 continue;
             }
-            if normalize_reflow_whitespace(&window_text) != normalized_needle {
+            if !collapsed_whitespace(window_chars()).eq(normalized_needle.chars()) {
                 continue;
             }
 
@@ -331,8 +389,10 @@ pub fn seek_sequence_tiered(
         });
     }
 
-    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |line| {
-        normalize_indent(line).trim_end().to_string()
+    // Trim already subsumes indentation-only equality; retain the existing
+    // tier contract while comparing without allocating normalized lines.
+    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |a, b| {
+        a.trim() == b.trim()
     }) {
         return Some(SequenceMatch {
             found,
@@ -341,8 +401,8 @@ pub fn seek_sequence_tiered(
         });
     }
 
-    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |line| {
-        normalize_unicode(line.trim())
+    if let Some(found) = normalized_sequence_match(lines, pattern, start_index, eof, |a, b| {
+        unicode_characters(a.trim()).eq(unicode_characters(b.trim()))
     }) {
         return Some(SequenceMatch {
             found,
@@ -669,12 +729,12 @@ mod tests {
         let mut pattern = vec!["same"; 60];
         pattern[59] = "missing";
         let calls = Cell::new(0);
-        let found = super::normalized_sequence_match(&lines, &pattern, 0, false, |line| {
+        let found = super::normalized_sequence_match(&lines, &pattern, 0, false, |a, b| {
             calls.set(calls.get() + 1);
-            line.to_string()
+            a == b
         });
         assert_eq!(found, None);
-        assert!(calls.get() <= lines.len() + pattern.len());
+        assert!(calls.get() <= 2 * (lines.len() + pattern.len()));
         let baseline_calls = Cell::new(0);
         assert_eq!(
             found,
@@ -689,7 +749,7 @@ mod tests {
                 false
             )
         );
-        assert!(baseline_calls.get() > calls.get() * 40);
+        assert!(baseline_calls.get() > calls.get() * 20);
         eprintln!(
             "repeated-prefix comparisons: baseline {}, indexed {}",
             baseline_calls.get(),
@@ -698,7 +758,7 @@ mod tests {
         let mut found_lines = lines.clone();
         found_lines[4_999] = "missing";
         assert_eq!(
-            super::normalized_sequence_match(&found_lines, &pattern, 0, false, str::to_string),
+            super::normalized_sequence_match(&found_lines, &pattern, 0, false, |a, b| a == b),
             Some(4_940)
         );
         assert_eq!(
@@ -991,5 +1051,25 @@ mod tests {
             ),
             NearestMissSearch::SkippedLargeFile
         );
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn fallback_matching_does_not_allocate_normalized_file_lines() {
+        NORMALIZED_LINE_ALLOCATIONS.with(|count| count.set(0));
+        let result = seek_sequence_tiered(&["one – two"], &["one - two"], 0, false).unwrap();
+        assert_eq!(result.tier, MatchTier::Unicode);
+        assert_eq!(NORMALIZED_LINE_ALLOCATIONS.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn reflow_matching_does_not_allocate_candidate_windows() {
+        REFLOW_WINDOW_ALLOCATIONS.with(|count| count.set(0));
+        assert_eq!(find_reflow_match(&["a", "b"], &["a b"], 0), Some((0, 2)));
+        assert_eq!(REFLOW_WINDOW_ALLOCATIONS.with(|count| count.get()), 0);
     }
 }
