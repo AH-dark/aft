@@ -108,6 +108,10 @@ pub enum CallgraphReconcileAction {
     /// The comparison could not be completed or the change was too large, so
     /// a full rebuild was requested with this reason.
     ForcedRebuild(String),
+    /// The comparison met transient database lock contention. The request
+    /// stays pending and is retried by the next store access, instead of
+    /// discarding a still-valid store for a cold rebuild.
+    Deferred(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,49 +252,87 @@ impl CallgraphReconcileJob {
             }
             Err(error) => Err(error),
         };
-        let (report, action) = match report {
-            Ok(report) => {
-                let action = if report.truncated {
-                    let fallback = format!(
-                        "{reason}: reconcile stopped at its bound of {} files",
-                        report.max_examined
-                    );
-                    force.mark(&fallback);
-                    CallgraphReconcileAction::ForcedRebuild(fallback)
-                } else if report.changed_count() >= RECONCILE_REBUILD_MIN_CHANGED
-                    && report.changed_count().saturating_mul(2) > report.stored_files
-                {
-                    let fallback = format!(
-                        "{reason}: {} of {} stored files changed",
-                        report.changed_count(),
-                        report.stored_files
-                    );
-                    force.mark(&fallback);
-                    CallgraphReconcileAction::ForcedRebuild(fallback)
-                } else if report.changed_count() == 0 {
-                    CallgraphReconcileAction::Unchanged
-                } else {
-                    let paths = report.changed_paths();
-                    enqueue_refresh(paths.clone());
-                    CallgraphReconcileAction::Refreshed(paths)
-                };
-                (Some(report), action)
-            }
-            Err(error) => {
-                let fallback = format!("{reason}: reconcile failed ({error})");
-                force.mark(&fallback);
-                (None, CallgraphReconcileAction::ForcedRebuild(fallback))
-            }
-        };
-        let outcome = CallgraphReconcileOutcome {
+        settle_reconcile(
+            ownership,
             reason,
             report,
-            action,
-        };
-        log_outcome(&project_root, &outcome);
-        ownership.finish(outcome.clone());
-        outcome
+            &project_root,
+            &force,
+            enqueue_refresh,
+        )
     }
+}
+
+/// Act on a finished (or failed) disk comparison and record the outcome.
+fn settle_reconcile(
+    mut ownership: CallgraphReconcileOwnership,
+    reason: String,
+    report: crate::callgraph_store::Result<DiskReconcileReport>,
+    project_root: &std::path::Path,
+    force: &CallgraphForceDemand,
+    enqueue_refresh: Box<dyn FnOnce(Vec<PathBuf>) + Send>,
+) -> CallgraphReconcileOutcome {
+    if let Err(error) = &report {
+        if error.is_transient_lock_contention() {
+            // The readonly connection already waited out its busy timeout.
+            // Lock contention says nothing about whether the stored graph
+            // is valid, so keep the request pending rather than forcing a
+            // cold rebuild. Dropping the unfinished ownership restores the
+            // reasons, and the next store access starts another attempt.
+            let outcome = CallgraphReconcileOutcome {
+                reason: reason.clone(),
+                report: None,
+                action: CallgraphReconcileAction::Deferred(format!(
+                    "{reason}: reconcile deferred ({error})"
+                )),
+            };
+            log_outcome(project_root, &outcome);
+            drop(ownership);
+            return outcome;
+        }
+    }
+    let (report, action) = match report {
+        Ok(report) => {
+            let action = if report.truncated {
+                let fallback = format!(
+                    "{reason}: reconcile stopped at its bound of {} files",
+                    report.max_examined
+                );
+                force.mark(&fallback);
+                CallgraphReconcileAction::ForcedRebuild(fallback)
+            } else if report.changed_count() >= RECONCILE_REBUILD_MIN_CHANGED
+                && report.changed_count().saturating_mul(2) > report.stored_files
+            {
+                let fallback = format!(
+                    "{reason}: {} of {} stored files changed",
+                    report.changed_count(),
+                    report.stored_files
+                );
+                force.mark(&fallback);
+                CallgraphReconcileAction::ForcedRebuild(fallback)
+            } else if report.changed_count() == 0 {
+                CallgraphReconcileAction::Unchanged
+            } else {
+                let paths = report.changed_paths();
+                enqueue_refresh(paths.clone());
+                CallgraphReconcileAction::Refreshed(paths)
+            };
+            (Some(report), action)
+        }
+        Err(error) => {
+            let fallback = format!("{reason}: reconcile failed ({error})");
+            force.mark(&fallback);
+            (None, CallgraphReconcileAction::ForcedRebuild(fallback))
+        }
+    };
+    let outcome = CallgraphReconcileOutcome {
+        reason,
+        report,
+        action,
+    };
+    log_outcome(project_root, &outcome);
+    ownership.finish(outcome.clone());
+    outcome
 }
 
 fn log_outcome(project_root: &std::path::Path, outcome: &CallgraphReconcileOutcome) {
@@ -305,6 +347,7 @@ fn log_outcome(project_root: &std::path::Path, outcome: &CallgraphReconcileOutco
         CallgraphReconcileAction::ForcedRebuild(reason) => {
             format!("force rebuild ({reason})")
         }
+        CallgraphReconcileAction::Deferred(reason) => format!("retry later ({reason})"),
     };
     match &outcome.report {
         Some(report) => crate::slog_info!(
@@ -347,6 +390,63 @@ mod tests {
         assert!(reason.contains("watcher overflow"));
         assert!(state.begin().is_some(), "another job can start");
         assert_eq!(state.completed(), 0);
+    }
+
+    #[test]
+    fn busy_reconcile_keeps_demand_pending_instead_of_forcing_a_rebuild() {
+        let state = Arc::new(CallgraphReconcileState::default());
+        state.request("watcher overflow");
+        let ownership = state.begin().expect("pending demand");
+        let force = CallgraphForceDemand::default();
+        let busy =
+            crate::callgraph_store::CallGraphStoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            ));
+        let outcome = settle_reconcile(
+            ownership,
+            "watcher overflow".to_string(),
+            Err(busy),
+            std::path::Path::new("/workspace"),
+            &force,
+            Box::new(|_| panic!("no refresh for a failed comparison")),
+        );
+        assert!(matches!(
+            outcome.action,
+            CallgraphReconcileAction::Deferred(_)
+        ));
+        assert_eq!(force.pending(), None, "contention must not force a rebuild");
+        assert_eq!(
+            state.pending_reason().as_deref(),
+            Some("watcher overflow"),
+            "the request stays pending for the next attempt"
+        );
+        assert!(state.begin().is_some(), "running was released");
+    }
+
+    #[test]
+    fn non_transient_reconcile_failure_still_forces_a_rebuild() {
+        let state = Arc::new(CallgraphReconcileState::default());
+        state.request("watcher gap");
+        let ownership = state.begin().expect("pending demand");
+        let force = CallgraphForceDemand::default();
+        let outcome = settle_reconcile(
+            ownership,
+            "watcher gap".to_string(),
+            Err(crate::callgraph_store::CallGraphStoreError::Unavailable(
+                "corrupt".to_string(),
+            )),
+            std::path::Path::new("/workspace"),
+            &force,
+            Box::new(|_| panic!("no refresh for a failed comparison")),
+        );
+        assert!(matches!(
+            outcome.action,
+            CallgraphReconcileAction::ForcedRebuild(_)
+        ));
+        assert!(force.pending().is_some());
+        assert_eq!(state.pending_reason(), None);
+        assert_eq!(state.completed(), 1);
     }
 
     #[test]
