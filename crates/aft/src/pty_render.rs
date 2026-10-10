@@ -15,10 +15,12 @@ fn render_screen_inner(raw: &[u8], rows: u16, cols: u16) -> String {
     for y in 0..rows {
         let mut text = String::new();
         for x in 0..cols {
-            let c = screen
-                .cell(y, x)
-                .map(|cell| cell.contents())
-                .unwrap_or_default();
+            let cell = screen.cell(y, x);
+            // A wide glyph already occupies its continuation column.
+            if cell.is_some_and(vt100::Cell::is_wide_continuation) {
+                continue;
+            }
+            let c = cell.map(|cell| cell.contents()).unwrap_or_default();
             if c.is_empty() {
                 text.push(' ');
             } else {
@@ -50,6 +52,12 @@ pub fn render_raw_fallback(raw: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_glyphs_do_not_insert_spaces_before_following_text() {
+        assert_eq!(render_screen("界a 😀b".as_bytes(), 2, 20), "界a 😀b");
+        assert_eq!(render_screen("界\x1b[2Cx".as_bytes(), 2, 20), "界  x");
+    }
 
     const CASES: &[(&str, &[u8], &str)] = &[
         (

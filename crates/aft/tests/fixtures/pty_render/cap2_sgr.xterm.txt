@@ -1,5 +1,5 @@
 RED GRN BLU-BG
-wide: 日 本 語  OK
+wide: 日本語 OK
 
 
 
