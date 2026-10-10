@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// bash tasks. Extracted to avoid duplication between `commands/bash.rs` and
 /// `bash_background/registry.rs`.
 ///
-/// Termination is graceful-first: SIGTERM + 3-second grace period, then
+/// Termination is graceful-first: SIGTERM + 2-second grace period, then
 /// SIGKILL on Unix. On Windows, `taskkill /T /F` kills the entire process tree.
 use std::process::Child;
 #[cfg(windows)]
@@ -448,6 +448,17 @@ pub fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn documented_termination_grace_matches_policy() {
+        let comment = include_str!("process.rs")
+            .lines()
+            .find(|line| line.starts_with("/// Termination is graceful-first:"))
+            .unwrap();
+        assert!(comment.contains(&format!(
+            "{}-second grace period",
+            super::TERMINATE_GRACE.as_secs()
+        )));
+    }
     use super::*;
 
     #[cfg(target_os = "linux")]
