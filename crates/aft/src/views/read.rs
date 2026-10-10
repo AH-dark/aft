@@ -336,20 +336,18 @@ fn callgraph_paths_match_with_producer(
                 .map(|language| format!("{language:?}").to_lowercase())
         };
         let Some(language) = language else { continue };
-        let entry = manifest.get(&key);
+        // Untracked paths cannot change this published graph. In particular,
+        // do not read an untracked path that has become a directory.
+        let Some(entry) = manifest.get(&key) else {
+            continue;
+        };
         let source = match read_verification_source(path) {
             Ok(source) => source,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if entry.is_some() {
-                    return Ok(false);
-                }
-                continue;
+                return Ok(false);
             }
             Err(error) => return Err(error.into()),
         };
-        // Untracked paths are not members of the view; their contributions can
-        // still be scanned, but they cannot change this published graph.
-        let Some(entry) = entry else { continue };
         if let super::ManifestEntry::Regular { planes, .. } = entry {
             let current = verification_key(&source, language, producer);
             if planes.callgraph.as_deref() != Some(current.as_str()) {
@@ -392,6 +390,17 @@ pub fn open_foreign_generation(
 
 #[cfg(test)]
 mod producer_tests {
+
+    #[test]
+    fn untracked_language_paths_do_not_read_source() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("untracked.rs");
+        std::fs::create_dir(&path).unwrap();
+        let manifest = super::super::Manifest::new([]).unwrap();
+        super::take_verification_io();
+        assert!(super::callgraph_paths_match(&manifest, root.path(), &[path]).unwrap());
+        assert_eq!(super::take_verification_io().files_read, 0);
+    }
     use super::*;
     #[test]
     fn ruled_callgraph_content_match_accepts_unchanged_and_rejects_edit() {

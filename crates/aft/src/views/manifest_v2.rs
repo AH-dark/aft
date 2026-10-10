@@ -295,11 +295,43 @@ impl ManifestV2 {
     /// BLAKE3 over the canonical JSON encoding: equal manifests, equal
     /// fingerprints, whoever built them.
     pub fn content_fingerprint(&self) -> Result<[u8; 32]> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"aft/view-manifest/v2");
-        hasher.update(&self.to_json_bytes()?);
-        Ok(*hasher.finalize().as_bytes())
+        Ok(fingerprint_bytes(&self.to_json_bytes()?))
     }
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aft/view-manifest/v2");
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+#[derive(Serialize)]
+struct BorrowedEntry<'a> {
+    rel_path: &'a RelPath,
+    #[serde(flatten)]
+    entry: &'a EntryV2,
+}
+
+struct BorrowedEntries<'a>(&'a BTreeMap<RelPath, EntryV2>);
+
+impl Serialize for BorrowedEntries<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            self.0
+                .iter()
+                .map(|(rel_path, entry)| BorrowedEntry { rel_path, entry }),
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedManifest<'a> {
+    format_version: u8,
+    path_identity_version: u8,
+    #[serde(flatten)]
+    header: &'a ManifestHeader,
+    entries: BorrowedEntries<'a>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -320,21 +352,21 @@ struct JsonManifestV2 {
 
 impl Serialize for ManifestV2 {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        JsonManifestV2 {
+        #[cfg(test)]
+        SERIALIZATIONS.with(|count| count.set(count.get() + 1));
+        BorrowedManifest {
             format_version: MANIFEST_FORMAT_VERSION,
             path_identity_version: PATH_IDENTITY_VERSION,
-            header: self.header.clone(),
-            entries: self
-                .entries
-                .iter()
-                .map(|(rel_path, entry)| JsonEntry {
-                    rel_path: rel_path.clone(),
-                    entry: entry.clone(),
-                })
-                .collect(),
+            header: &self.header,
+            entries: BorrowedEntries(&self.entries),
         }
         .serialize(serializer)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SERIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<'de> Deserialize<'de> for ManifestV2 {
@@ -495,14 +527,15 @@ impl ViewStore {
         manifest: &ManifestV2,
         observer: Option<&dyn DurabilityObserver>,
     ) -> Result<PreparedV2> {
-        if manifest.content_fingerprint()? != generation.content {
+        let bytes = manifest.to_json_bytes()?;
+        if fingerprint_bytes(&bytes) != generation.content {
             return Err(ViewError::GenerationMismatch(format!(
                 "generation {generation} does not name this manifest's content"
             )));
         }
         let name = generation.to_string();
         let path = self.manifest_path(&name)?;
-        write_bytes_once(&path, &manifest.to_json_bytes()?)?;
+        write_bytes_once(&path, &bytes)?;
         observe(observer, DurabilityStep::ManifestWritten);
         sync_directory(self.view_dir())?;
         observe(observer, DurabilityStep::ManifestParentSynced);
@@ -669,6 +702,21 @@ mod tests {
             decoded.ensure_producers(&other),
             Err(ViewError::ProducerMismatch(_))
         ));
+    }
+
+    #[test]
+    fn preparation_hashes_the_bytes_it_writes_with_one_serialization() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "serialization").unwrap();
+        let manifest = manifest();
+        let canonical = manifest.to_json_bytes().unwrap();
+        let name = GenerationName::for_manifest(&manifest).unwrap();
+        SERIALIZATIONS.with(|count| count.set(0));
+        view.prepare_v2(&name, None, &manifest, None).unwrap();
+        assert_eq!(SERIALIZATIONS.with(|count| count.get()), 1);
+        let mut written = fs::read(view.manifest_path(&name.to_string()).unwrap()).unwrap();
+        assert_eq!(written.pop(), Some(b'\n'));
+        assert_eq!(written, canonical);
     }
 
     #[test]

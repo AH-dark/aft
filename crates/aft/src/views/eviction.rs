@@ -906,6 +906,17 @@ fn in_flight() -> &'static Mutex<BTreeSet<PathBuf>> {
     RUNNING.get_or_init(|| Mutex::new(BTreeSet::new()))
 }
 
+struct EnforcementFlight(PathBuf);
+
+impl Drop for EnforcementFlight {
+    fn drop(&mut self) {
+        in_flight()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
 fn is_running(key: &Path) -> bool {
     in_flight()
         .lock()
@@ -957,6 +968,9 @@ fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> bool {
         .spawn({
             let key = key.clone();
             move || {
+                // Unwinding must release the slot as well as normal completion,
+                // or this family's disk limits would never run again.
+                let _flight = EnforcementFlight(key);
                 let options = EnforceOptions {
                     deadline: Some(Instant::now() + ENFORCEMENT_DEADLINE),
                     observer: None,
@@ -969,10 +983,6 @@ fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> bool {
                         error
                     ),
                 }
-                in_flight()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&key);
             }
         });
     if let Err(error) = spawned {
@@ -1963,5 +1973,17 @@ mod tests {
         let report = enforce(&registry, EnforceOptions::default()).unwrap();
         assert!(evicted(&report).is_empty());
         assert!(report.over_hard.is_empty());
+    }
+    #[test]
+    fn enforcement_flight_is_released_when_worker_unwinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("registry.sqlite");
+        in_flight().lock().unwrap().insert(key.clone());
+        let result = std::panic::catch_unwind(|| {
+            let _flight = EnforcementFlight(key.clone());
+            panic!("injected enforcement failure");
+        });
+        assert!(result.is_err());
+        assert!(!is_running(&key));
     }
 }

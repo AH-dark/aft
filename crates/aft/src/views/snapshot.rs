@@ -247,6 +247,9 @@ impl LiveDelta {
     }
 
     pub fn set_watcher(&mut self, watcher: WatcherState) {
+        if self.watcher != watcher {
+            self.version += 1;
+        }
         self.watcher = watcher;
     }
 
@@ -259,14 +262,31 @@ impl LiveDelta {
     }
 
     /// Records an observed disk state. The entry is kept only while it
-    /// differs from the base generation; the journal records it either way.
+    /// differs from the base generation. Replay needs only the last changed
+    /// state or attachment per path, not repeated observations of one entry.
     pub fn apply(&mut self, rel_path: RelPath, entry: LiveEntry) -> u64 {
+        let previous = self
+            .entries
+            .get(&rel_path)
+            .map_or_else(|| self.base.disk_state(&rel_path), |entry| entry.disk);
         self.version += 1;
-        self.journal.push(JournalRecord {
-            version: self.version,
-            rel_path: rel_path.clone(),
-            disk: entry.disk,
+        let attachments_changed = self.entries.get(&rel_path).is_some_and(|previous| {
+            previous.attachments.len() != entry.attachments.len()
+                || previous.attachments.iter().any(|(plane, attachment)| {
+                    entry
+                        .attachments
+                        .get(plane)
+                        .is_none_or(|new| !Arc::ptr_eq(attachment, new))
+                })
         });
+        if previous != entry.disk || attachments_changed {
+            self.journal.retain(|record| record.rel_path != rel_path);
+            self.journal.push(JournalRecord {
+                version: self.version,
+                rel_path: rel_path.clone(),
+                disk: entry.disk,
+            });
+        }
         let entries = Arc::make_mut(&mut self.entries);
         if entry.disk == self.base.disk_state(&rel_path) {
             entries.remove(&rel_path);
@@ -293,6 +313,7 @@ impl LiveDelta {
             .is_some_and(|recorded| *recorded <= intent_version)
         {
             intent.remove(rel_path);
+            self.intent_version += 1;
         }
     }
 
@@ -375,6 +396,160 @@ impl LiveEntries for LiveDelta {
 
     fn live_state(&self, rel_path: &RelPath) -> Option<&DiskState> {
         self.entries.get(rel_path).map(|entry| &entry.disk)
+    }
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    use crate::views::manifest_v2::{ManifestHeader, Producers};
+
+    fn delta() -> LiveDelta {
+        LiveDelta::new(Arc::new(OpenGeneration::new(
+            "base",
+            ManifestV2::new(ManifestHeader {
+                producers: Producers {
+                    trigram: "test".into(),
+                    semantic: None,
+                    callgraph: "test".into(),
+                },
+                head_tree: None,
+                ignore_fingerprint: None,
+                segment: None,
+            }),
+            None,
+        )))
+    }
+
+    #[test]
+    fn unchanged_observations_do_not_grow_the_journal() {
+        let mut delta = delta();
+        let path = RelPath::new(b"a.rs".to_vec()).unwrap();
+        for _ in 0..128 {
+            delta.apply(path.clone(), LiveEntry::new(DiskState::Absent, 0));
+        }
+        assert!(delta.journal().is_empty());
+        let disk = DiskState::of_bytes(b"a");
+        delta.apply(path.clone(), LiveEntry::new(disk, 1));
+        for _ in 0..128 {
+            delta.apply(path.clone(), LiveEntry::new(disk, 1));
+        }
+        assert_eq!(delta.journal().len(), 1);
+    }
+
+    #[test]
+    fn repeated_path_changes_keep_one_replay_record() {
+        let mut delta = delta();
+        let path = RelPath::new(b"a.rs".to_vec()).unwrap();
+        let successor = delta.base().clone();
+        let draft = derive_successor(&delta.cut(), successor, &carry_disk_state_only);
+        for sequence in 0..128 {
+            delta.apply(
+                path.clone(),
+                LiveEntry::new(
+                    DiskState::of_bytes(sequence.to_string().as_bytes()),
+                    sequence,
+                ),
+            );
+        }
+        assert_eq!(delta.journal().len(), 1);
+        let expected = delta.snapshot().disk_state(&path);
+        delta
+            .replay_and_swap(draft, &carry_disk_state_only)
+            .unwrap();
+        assert_eq!(delta.snapshot().disk_state(&path), expected);
+    }
+
+    #[test]
+    fn same_content_attachment_updates_are_replayed() {
+        let mut delta = delta();
+        let path = RelPath::new(b"a.rs".to_vec()).unwrap();
+        let disk = DiskState::of_bytes(b"a");
+        let mut old = LiveEntry::new(disk, 1);
+        old.attachments
+            .insert(FamilyPlane::Trigram, Arc::new(1_usize));
+        delta.apply(path.clone(), old);
+        let draft = derive_successor(&delta.cut(), delta.base().clone(), &carry_disk_state_only);
+        let mut new = LiveEntry::new(disk, 2);
+        new.attachments
+            .insert(FamilyPlane::Trigram, Arc::new(2_usize));
+        delta.apply(path.clone(), new);
+        delta
+            .replay_and_swap(draft, &carry_disk_state_only)
+            .unwrap();
+        assert_eq!(
+            delta.entry(&path).unwrap().attachments[&FamilyPlane::Trigram].downcast_ref::<usize>(),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn watcher_and_intent_resolution_advance_the_revision_fence() {
+        let mut delta = delta();
+        let path = RelPath::new(b"a.rs".to_vec()).unwrap();
+        let before = delta.version() + delta.epoch() + delta.snapshot().intent_version();
+        delta.set_watcher(WatcherState::Overflowed);
+        assert!(delta.version() + delta.epoch() + delta.snapshot().intent_version() > before);
+        let intent = delta.record_intent(path.clone());
+        let before = delta.version() + delta.epoch() + delta.snapshot().intent_version();
+        delta.resolve_intent(&path, intent);
+        assert!(delta.version() + delta.epoch() + delta.snapshot().intent_version() > before);
+        assert!(delta.snapshot().pending_intent().next().is_none());
+    }
+
+    #[test]
+    fn retained_cut_installs_after_edit_traffic_pauses() {
+        let root = tempfile::tempdir().unwrap();
+        let delta = Arc::new(std::sync::Mutex::new(delta()));
+        let path = RelPath::new(b"a.rs".to_vec()).unwrap();
+        let successor = delta.lock().unwrap().base().clone();
+        let (edit_tx, edit_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_delta = delta.clone();
+        let worker_root = root.path().to_path_buf();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            for sequence in edit_rx {
+                std::fs::write(worker_root.join("a.rs"), format!("edit {sequence}")).unwrap();
+                crate::views::live_delta::apply_event(
+                    &mut worker_delta.lock().unwrap(),
+                    &worker_root,
+                    &worker_path,
+                    &crate::blob_store::v2::TrigramPolicy {
+                        max_file_size: 1 << 20,
+                    },
+                )
+                .unwrap();
+                done_tx.send(()).unwrap();
+            }
+        });
+        let mut epoch_changes = 0;
+        for sequence in 0..64 {
+            let draft = derive_successor(
+                &delta.lock().unwrap().cut(),
+                successor.clone(),
+                &carry_disk_state_only,
+            );
+            edit_tx.send(sequence).unwrap();
+            done_rx.recv().unwrap();
+            match delta
+                .lock()
+                .unwrap()
+                .replay_and_swap(draft, &carry_disk_state_only)
+            {
+                Err(SwitchError::EpochChanged { .. }) => epoch_changes += 1,
+                other => panic!("unexpected retained-cut result: {other:?}"),
+            }
+        }
+        drop(edit_tx);
+        worker.join().unwrap();
+        let mut delta = delta.lock().unwrap();
+        let draft = derive_successor(&delta.cut(), successor, &carry_disk_state_only);
+        delta
+            .replay_and_swap(draft, &carry_disk_state_only)
+            .unwrap();
+        assert_eq!(epoch_changes, 64);
+        eprintln!("retained-cut attempts: 64 EpochChanged, 0 obsolete-revision, 1 successful install after edits paused");
     }
 }
 

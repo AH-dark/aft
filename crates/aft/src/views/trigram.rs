@@ -35,6 +35,11 @@ pub struct GenerationIndex {
     policy: TrigramPolicy,
 }
 
+#[cfg(test)]
+thread_local! {
+    static CANDIDATE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl GenerationIndex {
     /// Load replacement payloads through the existing family-store connection.
     /// Unavailable or non-ready payloads remain direct-scan paths.
@@ -135,6 +140,8 @@ impl GenerationIndex {
         members: &BTreeSet<RelPath>,
         literal: &str,
     ) -> Candidates {
+        #[cfg(test)]
+        CANDIDATE_SCANS.with(|count| count.set(count.get() + 1));
         let required = crate::search_index::SearchIndex::query_trigrams_from_tokens(&[literal]);
         let intents = snapshot.pending_intent().cloned().collect::<BTreeSet<_>>();
         let live = snapshot
@@ -234,11 +241,14 @@ impl GenerationIndex {
         } else {
             (snapshot.membership().into_keys().collect(), Vec::new())
         };
-        let mut candidates = self.candidates(snapshot, &members, literal);
-        if active || snapshot.watcher() != WatcherState::Healthy {
-            candidates.indexed.clear();
-            candidates.direct = members.clone();
-        }
+        let candidates = if active || snapshot.watcher() != WatcherState::Healthy {
+            Candidates {
+                indexed: BTreeSet::new(),
+                direct: members.clone(),
+            }
+        } else {
+            self.candidates(snapshot, &members, literal)
+        };
         let mut result = QueryResult {
             membership: members,
             matches: Vec::new(),
@@ -673,6 +683,12 @@ pub struct TrigramAdapter {
     segments: std::sync::Mutex<BTreeMap<(String, [u8; 32]), std::sync::Weak<SegmentReader>>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SEGMENT_OPEN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_READINESS_SCAN: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 impl TrigramAdapter {
     pub fn new(storage: PathBuf, policy: TrigramPolicy) -> Self {
         Self {
@@ -706,15 +722,23 @@ impl TrigramAdapter {
             .as_ref()
             .and_then(|id| crate::blob_store::v2::parse_hex32(id))
             .ok_or_else(|| plane_error("generation has no trigram segment"))?;
-        let mut segments = self.segments.lock().unwrap_or_else(|e| e.into_inner());
-        segments.retain(|_, segment| segment.strong_count() != 0);
         let segment_key = (access.family().to_string(), id);
-        let segment = if let Some(segment) = segments
-            .get(&segment_key)
-            .and_then(|segment| segment.upgrade())
-        {
+        let cached = {
+            let mut segments = self.segments.lock().unwrap_or_else(|e| e.into_inner());
+            segments.retain(|_, segment| segment.strong_count() != 0);
+            segments
+                .get(&segment_key)
+                .and_then(|segment| segment.upgrade())
+        };
+        let segment = if let Some(segment) = cached {
             segment
         } else {
+            #[cfg(test)]
+            BEFORE_SEGMENT_OPEN.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook();
+                }
+            });
             let path = crate::blob_store::v2::segment_path(&self.storage, access.family(), &id)
                 .map_err(|e| plane_error(e.to_string()))?;
             let reader =
@@ -722,10 +746,19 @@ impl TrigramAdapter {
             if reader.id() != id {
                 return Err(plane_error("segment identity mismatch"));
             }
-            segments.insert(segment_key, Arc::downgrade(&reader));
-            reader
+            // Another opener may have admitted the same immutable segment
+            // while this one parsed it. Share that reader rather than replace it.
+            let mut segments = self.segments.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = segments
+                .get(&segment_key)
+                .and_then(|segment| segment.upgrade())
+            {
+                existing
+            } else {
+                segments.insert(segment_key, Arc::downgrade(&reader));
+                reader
+            }
         };
-        drop(segments);
         match access {
             super::contracts::ViewAccess::Owner(registration) => {
                 let store = registration
@@ -779,12 +812,22 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
         snapshot: &Snapshot,
     ) -> super::readiness::PlaneReadiness {
         let residents = self.residents.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(index) = residents.get(&(
-            access.scope().to_owned(),
-            snapshot.generation().name().to_owned(),
-        )) else {
+        let Some(index) = residents
+            .get(&(
+                access.scope().to_owned(),
+                snapshot.generation().name().to_owned(),
+            ))
+            .cloned()
+        else {
             return super::readiness::PlaneReadiness::Building;
         };
+        drop(residents);
+        #[cfg(test)]
+        BEFORE_READINESS_SCAN.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook();
+            }
+        });
         let members = snapshot.membership().into_keys().collect();
         let pending = index.candidates(snapshot, &members, "").direct.len();
         let failed = snapshot
@@ -800,5 +843,104 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
             })
             .count();
         super::readiness::PlaneReadiness::Ready { pending, failed }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::contracts::{PlaneAdapter, ViewAccess};
+    use super::super::manifest_v2::{ManifestHeader, ManifestV2, Producers};
+    use super::super::snapshot::{LiveDelta, OpenGeneration};
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ViewAccess,
+        Arc<TrigramAdapter>,
+        LiveDelta,
+    ) {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let owner = registry.register_view("scope", root.path()).unwrap();
+        let store = owner.open_store(FamilyPlane::Trigram).unwrap();
+        let policy = TrigramPolicy {
+            max_file_size: 1 << 20,
+        };
+        let segment = super::super::segment_store::assemble(&policy, []).unwrap();
+        let path =
+            crate::blob_store::v2::segment_path(storage.path(), "family", &segment.id).unwrap();
+        fs::write(path, &segment.bytes).unwrap();
+        drop(store);
+        let manifest = ManifestV2::new(ManifestHeader {
+            producers: Producers {
+                trigram: policy.fingerprint_hex(),
+                semantic: None,
+                callgraph: "test".into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: Some(crate::blob_store::v2::to_hex(&segment.id)),
+        });
+        let delta = LiveDelta::new(Arc::new(OpenGeneration::new("generation", manifest, None)));
+        let adapter = Arc::new(TrigramAdapter::new(storage.path().to_path_buf(), policy));
+        (storage, root, ViewAccess::Owner(owner), adapter, delta)
+    }
+
+    #[test]
+    fn segment_parsing_does_not_hold_the_cache_mutex() {
+        let (_storage, _root, access, adapter, delta) = fixture();
+        let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let count = checked.clone();
+        let weak = Arc::downgrade(&adapter);
+        BEFORE_SEGMENT_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(weak.upgrade().unwrap().segments.try_lock().is_ok());
+                count.store(true, std::sync::atomic::Ordering::SeqCst);
+            }))
+        });
+        let result = adapter.open_index(&access, &delta.snapshot());
+        BEFORE_SEGMENT_OPEN.with(|hook| hook.borrow_mut().take());
+        result.unwrap();
+        assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn readiness_scanning_does_not_hold_the_resident_mutex() {
+        let (_storage, _root, access, adapter, delta) = fixture();
+        adapter.open_generation(&access, delta.base()).unwrap();
+        let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let count = checked.clone();
+        let weak = Arc::downgrade(&adapter);
+        BEFORE_READINESS_SCAN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(weak.upgrade().unwrap().residents.try_lock().is_ok());
+                count.store(true, std::sync::atomic::Ordering::SeqCst);
+            }))
+        });
+        let ready = adapter.readiness(&access, &delta.snapshot());
+        BEFORE_READINESS_SCAN.with(|hook| hook.borrow_mut().take());
+        assert_eq!(
+            ready,
+            super::super::readiness::PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0
+            }
+        );
+        assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unhealthy_queries_bypass_indexed_candidate_selection() {
+        let (_storage, root, access, adapter, mut delta) = fixture();
+        fs::write(root.path().join("a.rs"), b"pub fn alpha() {}").unwrap();
+        let index = adapter.open_index(&access, &delta.snapshot()).unwrap();
+        delta.set_watcher(WatcherState::Overflowed);
+        CANDIDATE_SCANS.with(|count| count.set(0));
+        let result = index.query(root.path(), &delta.snapshot(), "alpha");
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(CANDIDATE_SCANS.with(|count| count.get()), 0);
     }
 }

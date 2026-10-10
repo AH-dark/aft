@@ -261,7 +261,7 @@ pub fn assemble(
     let mut postings_by_trigram: BTreeMap<u32, Vec<Posting>> = BTreeMap::new();
     for (file_id, (member, payload)) in sorted.values().enumerate() {
         let path = member.rel_path.as_bytes();
-        file_table.extend_from_slice(&(path.len() as u32).to_be_bytes());
+        file_table.extend_from_slice(&segment_u32(path.len())?.to_be_bytes());
         file_table.extend_from_slice(path);
         file_table.extend_from_slice(member.content.as_bytes());
         file_table.extend_from_slice(&member.size.to_be_bytes());
@@ -271,7 +271,7 @@ pub fn assemble(
                 .entry(record.trigram)
                 .or_default()
                 .push(Posting {
-                    file_id: file_id as u32,
+                    file_id: segment_u32(file_id)?,
                     next_mask: record.next_mask,
                     loc_mask: record.loc_mask,
                 });
@@ -292,15 +292,15 @@ pub fn assemble(
     bytes.extend_from_slice(SEGMENT_MAGIC);
     bytes.extend_from_slice(&SEGMENT_FORMAT.to_be_bytes());
     bytes.extend_from_slice(&policy_fingerprint);
-    bytes.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(&(postings_by_trigram.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&segment_u32(sorted.len())?.to_be_bytes());
+    bytes.extend_from_slice(&segment_u32(postings_by_trigram.len())?.to_be_bytes());
     bytes.extend_from_slice(&posting_count.to_be_bytes());
     bytes.extend_from_slice(&file_table);
     let mut first = 0_u64;
     for (trigram, postings) in &postings_by_trigram {
         bytes.extend_from_slice(&trigram.to_be_bytes());
         bytes.extend_from_slice(&first.to_be_bytes());
-        bytes.extend_from_slice(&(postings.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&segment_u32(postings.len())?.to_be_bytes());
         first += postings.len() as u64;
     }
     for postings in postings_by_trigram.values() {
@@ -422,8 +422,7 @@ pub fn write_segment(
         }
         result?;
     }
-    super::sync_directory(path.parent().unwrap_or(storage))
-        .map_err(|error| SegmentError::Malformed(error.to_string()))?;
+    sync_segment_directory(path.parent().unwrap_or(storage))?;
     observe(observer, DurabilityStep::SegmentFileSynced);
     if !store.finish_segment(&segment.id, segment.bytes.len() as u64)? {
         return Err(SegmentError::Malformed(
@@ -432,6 +431,20 @@ pub fn write_segment(
     }
     observe(observer, DurabilityStep::SegmentDurable);
     Ok(path)
+}
+
+fn segment_u32(value: usize) -> SegmentResult<u32> {
+    u32::try_from(value)
+        .map_err(|_| SegmentError::Malformed("segment count cannot fit u32".to_string()))
+}
+
+fn sync_segment_directory(path: &Path) -> SegmentResult<()> {
+    super::sync_directory(path).map_err(|error| match error {
+        super::ViewError::Io(source) | super::ViewError::IoAt { source, .. } => {
+            SegmentError::Io(source)
+        }
+        error => SegmentError::Malformed(error.to_string()),
+    })
 }
 
 /// A verified, in-memory segment.
@@ -471,9 +484,15 @@ impl SegmentReader {
         let policy_fingerprint: [u8; 32] = cursor.take(32)?.try_into().expect("32 bytes");
         let file_count = cursor.u32()? as usize;
         let trigram_count = cursor.u32()? as usize;
-        let posting_count = cursor.u64()? as usize;
+        let posting_count = usize::try_from(cursor.u64()?)
+            .map_err(|_| SegmentError::Malformed("posting count cannot fit".to_string()))?;
         let table_start = cursor.position;
-        let mut files = Vec::with_capacity(file_count.min(body.len()));
+        // A file row needs a path length, content hash, size and flag even
+        // before its path bytes. Reject impossible counts before reserving.
+        if file_count > (body.len() - table_start) / 45 {
+            return Err(SegmentError::Malformed("file count cannot fit".to_string()));
+        }
+        let mut files = Vec::with_capacity(file_count);
         for _ in 0..file_count {
             let path_len = cursor.u32()? as usize;
             let rel_path = RelPath::new(cursor.take(path_len)?.to_vec())
@@ -508,6 +527,29 @@ impl SegmentReader {
             });
         }
         cursor.finish()?;
+        if lookup.windows(2).any(|rows| rows[0].0 >= rows[1].0) {
+            return Err(SegmentError::Malformed(
+                "lookup keys are not strictly sorted".to_string(),
+            ));
+        }
+        for &(_, first, count) in &lookup {
+            if first
+                .checked_add(u64::from(count))
+                .is_none_or(|end| end > posting_count as u64)
+            {
+                return Err(SegmentError::Malformed(
+                    "posting range is out of bounds".to_string(),
+                ));
+            }
+        }
+        if postings
+            .iter()
+            .any(|posting| posting.file_id as usize >= files.len())
+        {
+            return Err(SegmentError::Malformed(
+                "posting file id is out of bounds".to_string(),
+            ));
+        }
         Ok(Self {
             id,
             policy_fingerprint,
@@ -619,8 +661,89 @@ mod tests {
     use super::*;
     use crate::blob_store::v2::StoreWriteAccess;
 
+    fn structural_fixture() -> Vec<u8> {
+        let root = checkout();
+        build_from_files(root.path(), &members(), &policy())
+            .unwrap()
+            .bytes
+    }
+
+    fn reseal(bytes: &mut [u8]) {
+        let end = bytes.len() - 32;
+        let digest = blake3::hash(&bytes[..end]);
+        bytes[end..].copy_from_slice(digest.as_bytes());
+    }
+
+    fn table_offsets(bytes: &[u8]) -> (usize, usize) {
+        let mut cursor = Cursor::new(bytes);
+        cursor.take(44).unwrap();
+        let files = cursor.u32().unwrap();
+        let trigrams = cursor.u32().unwrap() as usize;
+        cursor.u64().unwrap();
+        for _ in 0..files {
+            let len = cursor.u32().unwrap() as usize;
+            cursor.take(len + 41).unwrap();
+        }
+        (
+            cursor.position,
+            cursor.position + trigrams * LOOKUP_ENTRY_BYTES,
+        )
+    }
+
+    #[test]
+    fn rejects_unsorted_lookup_even_with_valid_checksum() {
+        let mut bytes = structural_fixture();
+        let (lookup, _) = table_offsets(&bytes);
+        let first = bytes[lookup..lookup + 4].to_vec();
+        bytes[lookup + LOOKUP_ENTRY_BYTES..lookup + LOOKUP_ENTRY_BYTES + 4].copy_from_slice(&first);
+        reseal(&mut bytes);
+        assert!(SegmentReader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_posting_range_even_with_valid_checksum() {
+        let mut bytes = structural_fixture();
+        let (lookup, _) = table_offsets(&bytes);
+        bytes[lookup + 4..lookup + 12].copy_from_slice(&u64::MAX.to_be_bytes());
+        reseal(&mut bytes);
+        assert!(SegmentReader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_file_id_even_with_valid_checksum() {
+        let mut bytes = structural_fixture();
+        let (_, postings) = table_offsets(&bytes);
+        bytes[postings..postings + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        reseal(&mut bytes);
+        assert!(SegmentReader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn impossible_file_count_is_rejected_before_allocation() {
+        let mut bytes = structural_fixture();
+        bytes[44..48].copy_from_slice(&u32::MAX.to_be_bytes());
+        reseal(&mut bytes);
+        let error = SegmentReader::from_bytes(&bytes).unwrap_err();
+        assert!(error.to_string().contains("file count cannot fit"));
+    }
+
     fn policy() -> TrigramPolicy {
         TrigramPolicy { max_file_size: 64 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failure_keeps_its_io_classification() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = sync_segment_directory(&directory.path().join("missing")).unwrap_err();
+        assert!(matches!(error, SegmentError::Io(_)));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn segment_counts_reject_values_that_cannot_fit_the_format() {
+        assert!(segment_u32(u32::MAX as usize + 1).is_err());
+        assert_eq!(segment_u32(u32::MAX as usize).unwrap(), u32::MAX);
     }
 
     fn checkout() -> tempfile::TempDir {

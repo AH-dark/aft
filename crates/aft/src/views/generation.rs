@@ -83,16 +83,7 @@ impl ViewStore {
             let manifest = self.load_manifest(generation)?;
             let keys = manifest
                 .plane_keys()
-                .filter_map(|(_, key)| {
-                    if key.len() != 64 {
-                        return None;
-                    }
-                    let bytes = (0..64)
-                        .step_by(2)
-                        .map(|offset| u8::from_str_radix(&key[offset..offset + 2], 16).ok())
-                        .collect::<Option<Vec<_>>>()?;
-                    bytes.try_into().ok()
-                })
+                .filter_map(|(_, key)| crate::blob_store::v2::parse_hex32(key))
                 .collect();
             result.insert(generation.to_owned(), keys);
         }
@@ -277,7 +268,15 @@ impl ViewStore {
                 // baseline. Its trigram is not referenced and can be reclaimed.
                 continue;
             }
-            for suffix in ["", "-wal", "-shm"] {
+            let suffixes = if path
+                .extension()
+                .is_some_and(|extension| extension == "sqlite")
+            {
+                &["", "-wal", "-shm"][..]
+            } else {
+                &[""][..]
+            };
+            for suffix in suffixes {
                 let mut name = path.as_os_str().to_owned();
                 name.push(suffix);
                 removed |= fs::remove_file(PathBuf::from(name)).is_ok();
@@ -618,6 +617,43 @@ pub(super) fn copy_all_pages(backup: &rusqlite::backup::Backup<'_, '_>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_scan_rejects_non_ascii_keys_without_panicking() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "bad-key").unwrap();
+        let manifest = crate::views::Manifest::new([(
+            crate::views::RelPath::new(b"a.rs".to_vec()).unwrap(),
+            crate::views::ManifestEntry::Regular {
+                mode: 0o100644,
+                resolution_input: false,
+                planes: crate::views::RegularPlanes {
+                    semantic: None,
+                    callgraph: Some(format!("aé{}", "0".repeat(61))),
+                },
+            },
+        )])
+        .unwrap();
+        fs::write(
+            view.manifest_path("bad").unwrap(),
+            manifest.to_json_bytes().unwrap(),
+        )
+        .unwrap();
+        assert!(view.blob_references_by_generation().unwrap()["bad"].is_empty());
+    }
+
+    #[test]
+    fn non_sqlite_artifacts_do_not_have_sqlite_sidecars_removed() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "sidecars").unwrap();
+        let trigram = view.trigram_path("old").unwrap();
+        let unrelated = view.view_dir().join("trigram-old.bin-wal");
+        fs::write(&trigram, []).unwrap();
+        fs::write(&unrelated, b"not a SQLite sidecar").unwrap();
+        assert!(view.try_remove_generation_files_policy("old", false));
+        assert!(!trigram.exists());
+        assert!(unrelated.exists());
+    }
 
     #[test]
     fn deferred_checkpoint_runs_after_the_publication_path_returns() {

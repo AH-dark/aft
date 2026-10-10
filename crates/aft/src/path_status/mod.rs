@@ -197,6 +197,24 @@ impl PathStatusStore {
         Ok(())
     }
 
+    /// Clears completed paths together, preserving annotations for paths that
+    /// still have outstanding work.
+    pub(crate) fn clear_many<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<(), PathStatusError> {
+        let transaction = self.connection.transaction()?;
+        {
+            let mut delete =
+                transaction.prepare_cached("DELETE FROM path_status WHERE rel_path = ?1")?;
+            for path in paths {
+                delete.execute(params![path])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn status_for(&self, rel_path: &[u8]) -> Result<Option<PathStatus>, PathStatusError> {
         let row = self
             .connection
@@ -434,5 +452,30 @@ mod tests {
             .status_for(b"src/lib.rs")
             .expect("read status")
             .is_none());
+    }
+    #[test]
+    fn completed_path_batch_is_atomic_and_preserves_pending_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = super::PathStatusStore::open(directory.path()).unwrap();
+        for path in [b"a".as_slice(), b"b", b"pending"] {
+            store.mark_pending(path, "queued", 1).unwrap();
+        }
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_b BEFORE DELETE ON path_status WHEN old.rel_path = x'62'
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        assert!(store.clear_many([b"a".as_slice(), b"b"]).is_err());
+        assert!(store.status_for(b"a").unwrap().is_some());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER refuse_b")
+            .unwrap();
+        store.clear_many([b"a".as_slice(), b"b"]).unwrap();
+        assert!(store.status_for(b"a").unwrap().is_none());
+        assert!(store.status_for(b"b").unwrap().is_none());
+        assert!(store.status_for(b"pending").unwrap().is_some());
     }
 }

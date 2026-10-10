@@ -67,6 +67,11 @@ struct Candidate {
     source: Option<Vec<u8>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static RETAINED_CANDIDATE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
     let mut hasher = blake3::Hasher::new();
     for entry in entries {
@@ -379,6 +384,9 @@ pub fn prepare_checkout(
                     .transpose()?
                     .map_or((None, None), |(key, payload)| (Some(key), payload));
                 let callgraph_key = key.as_ref().map(FullKey::to_hex);
+                // Only a new payload can seed an alias. Cached or read-only
+                // candidates need neither their source bytes nor tracked row.
+                let needs_source = payload.is_some() && request.allow_blob_put;
                 candidates.push(Candidate {
                     path: rel_path,
                     entry: ManifestEntry::Regular {
@@ -391,8 +399,8 @@ pub fn prepare_checkout(
                     },
                     key,
                     payload,
-                    tracked: Some(tracked),
-                    source: Some(source),
+                    tracked: needs_source.then_some(tracked),
+                    source: needs_source.then_some(source),
                 });
             }
             GitMode::Other(_) => {
@@ -472,8 +480,11 @@ pub fn prepare_checkout(
     prepared.profile.enter(1, phase)?;
     timing.phase("assembly_pin");
     let mut blob_puts = 0;
-    for candidate in &candidates {
-        let (Some(key), Some(payload)) = (&candidate.key, &candidate.payload) else {
+    for candidate in &mut candidates {
+        let payload = candidate.payload.take();
+        let source = candidate.source.take();
+        let tracked = candidate.tracked.take();
+        let (Some(key), Some(payload)) = (&candidate.key, payload) else {
             continue;
         };
         if request.allow_blob_put {
@@ -484,12 +495,12 @@ pub fn prepare_checkout(
                 .renew_if_due()
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
             let put = callgraph
-                .put(key, payload)
+                .put(key, &payload)
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
             blob_puts += usize::from(matches!(put.outcome, PutOutcome::Inserted));
-            if let (Some(tracked), Some(source)) = (&candidate.tracked, &candidate.source) {
+            if let (Some(tracked), Some(source)) = (tracked, source) {
                 aliases
-                    .seed_proven_alias(tracked, source)
+                    .seed_proven_alias(&tracked, &source)
                     .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
             }
         } else if !callgraph
@@ -507,6 +518,19 @@ pub fn prepare_checkout(
             blocking_paths.insert(candidate.path.as_bytes().to_vec());
         }
     }
+
+    #[cfg(test)]
+    RETAINED_CANDIDATE_BYTES.with(|count| {
+        count.set(
+            candidates
+                .iter()
+                .map(|candidate| {
+                    candidate.source.as_ref().map_or(0, Vec::len)
+                        + candidate.payload.as_ref().map_or(0, Vec::len)
+                })
+                .sum(),
+        )
+    });
 
     timing.phase("blob_and_alias_puts");
     prepared.profile.blob_puts = blob_puts;
@@ -532,13 +556,14 @@ pub fn prepare_checkout(
             .collect();
         return Ok(prepared);
     }
-    for candidate in &candidates {
-        if !semantic_pending_paths.contains(candidate.path.as_bytes()) {
-            status
-                .clear(candidate.path.as_bytes())
-                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-        }
-    }
+    status
+        .clear_many(
+            candidates
+                .iter()
+                .map(|candidate| candidate.path.as_bytes())
+                .filter(|path| !semantic_pending_paths.contains(*path)),
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     timing.phase("path_status");
     prepared.report.pending_paths = semantic_pending_paths;
 
@@ -564,7 +589,7 @@ pub fn prepare_checkout(
     // a pointer swap. Keep the current generation and report nothing published.
     if current_generation
         .as_deref()
-        .is_some_and(|generation| generation.ends_with(&request.desired_head))
+        .is_some_and(|generation| super::generation_matches_head(generation, &request.desired_head))
         && previous.as_ref() == Some(&manifest)
         && base_ready
     {
@@ -1561,13 +1586,17 @@ fn membership_query(count: usize) -> String {
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    if value.len() != 64 {
-        return None;
+    crate::blob_store::v2::parse_hex32(value).map(|bytes| bytes.to_vec())
+}
+
+#[cfg(test)]
+mod key_decode_tests {
+    #[test]
+    fn non_ascii_hex_is_rejected_without_panicking() {
+        let key = format!("aé{}", "0".repeat(61));
+        assert_eq!(key.len(), 64);
+        assert!(super::decode_hex(&key).is_none());
     }
-    (0..value.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
-        .collect()
 }
 
 fn path_from_bytes(bytes: &[u8]) -> PathBuf {

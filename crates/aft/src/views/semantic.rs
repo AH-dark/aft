@@ -366,6 +366,8 @@ pub struct SemanticPlane {
     /// reads, so source-reuse tests cannot miss a read on the embedding path.
     #[cfg(test)]
     source_reads: Mutex<BTreeMap<PathBuf, usize>>,
+    #[cfg(test)]
+    after_conflict: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 static NEXT_PLANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -415,6 +417,8 @@ impl SemanticPlane {
             separator: std::path::MAIN_SEPARATOR,
             #[cfg(test)]
             source_reads: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            after_conflict: Mutex::new(None),
         }
     }
 
@@ -521,13 +525,11 @@ impl SemanticPlane {
                                     &relative,
                                     &self.producer.payload(),
                                 )
-                                .ok()
-                                .flatten(),
+                                .map_err(plane_error)?,
                             _ => None,
                         };
-                        // A run that cannot be loaded leaves the path out of
-                        // the base, so it is queued and refilled like any
-                        // other path without current vectors.
+                        // Only a missing run is a cache miss. A failed read
+                        // must not silently turn into new embedding work.
                         if let Some(run) = loaded {
                             runs.push(run);
                             members.insert(path.clone(), content);
@@ -826,6 +828,10 @@ impl SemanticPlane {
                             // across calls); read the stored payload so every
                             // view uses the same vectors for the key.
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {
+                                #[cfg(test)]
+                                if let Some(hook) = lock(&self.after_conflict).take() {
+                                    hook();
+                                }
                                 if arena
                                     .load(&store.reader(), &key, &relative, &payload_producer)
                                     .map_err(plane_error)?
@@ -833,6 +839,12 @@ impl SemanticPlane {
                                 {
                                     report.stored_hits += 1;
                                     ready.push((item, key));
+                                } else {
+                                    // The winning row can disappear before the
+                                    // reload. Keep the work pending and visible
+                                    // to transient retry accounting.
+                                    report.deferred += 1;
+                                    transient.push(full_key);
                                 }
                             }
                             Err(error) if store_error_is_busy(&error) => {
@@ -1655,6 +1667,93 @@ mod tests {
             storage.to_path_buf(),
             SemanticProducer::current(model, EmbedTextCaps::default()),
         ))
+    }
+
+    #[test]
+    fn admission_propagates_semantic_payload_decode_errors() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model");
+        let checkout = Checkout::open(storage.path(), "bad-payload", root.path(), &plane);
+        let path = RelPath::new(b"a.rs".to_vec()).unwrap();
+        let bytes = b"pub fn alpha() {}";
+        let key = plane.producer.key(bytes, &path);
+        let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+        store
+            .put_or_touch(&key, b"invalid semantic payload")
+            .unwrap();
+        let mut manifest = ManifestV2::new(crate::views::manifest_v2::ManifestHeader {
+            producers: Producers {
+                trigram: "test".into(),
+                semantic: Some(plane.producer.id()),
+                callgraph: "test".into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        });
+        manifest
+            .insert(
+                path,
+                EntryV2::regular(
+                    ContentHash::of(bytes),
+                    bytes.len() as u64,
+                    crate::views::manifest_v2::EntryPlanes {
+                        semantic: Some(PlaneState::ready(&key)),
+                        trigram: None,
+                        callgraph: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let generation = OpenGeneration::new("bad", manifest, None);
+        assert!(plane.admit(&checkout.access, &generation).is_err());
+    }
+
+    #[test]
+    fn missing_conflict_winner_is_accounted_for_and_retried() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bytes = "pub fn alpha() -> u32 { 42 }";
+        write_tree(root.path(), &[("a.rs", bytes)]);
+        let plane = new_plane(storage.path(), "model");
+        let checkout = Checkout::open(storage.path(), "conflict", root.path(), &plane);
+        let snapshot = checkout.load();
+        let path = RelPath::new(b"a.rs".to_vec()).unwrap();
+        let key = plane.producer.key(bytes.as_bytes(), &path);
+        let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+        let store_path = store.path().to_path_buf();
+        *lock(&plane.after_conflict) = Some(Box::new(move || {
+            rusqlite::Connection::open(store_path)
+                .unwrap()
+                .execute(
+                    "DELETE FROM blob_payloads WHERE full_key = ?1",
+                    [key.as_bytes().as_slice()],
+                )
+                .unwrap();
+        }));
+        let report = plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |texts| {
+                    store
+                        .put_or_touch(&key, b"another process's payload")
+                        .unwrap();
+                    Ok(texts.iter().map(|text| vector("model", text)).collect())
+                },
+                &|| snapshot.clone(),
+            )
+            .unwrap();
+        assert_eq!(report.deferred, 1);
+        assert_eq!(report.embedded_keys + report.stored_hits + report.failed, 0);
+        assert_eq!(
+            checkout
+                .fill(&snapshot, &Model::default(), "model")
+                .embedded_keys,
+            1
+        );
     }
 
     struct Checkout {

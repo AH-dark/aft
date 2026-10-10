@@ -65,6 +65,35 @@ fn request(project: &Path, storage: &Path, head: &str, changed: &[String]) -> As
     }
 }
 
+#[test]
+fn empty_desired_head_does_not_take_the_no_op_path() {
+    let project = repository(2);
+    let storage = tempfile::tempdir().unwrap();
+    let first = publish_checkout(&request(project.path(), storage.path(), "head", &[])).unwrap();
+    assert!(first.published);
+    let second = publish_checkout(&request(project.path(), storage.path(), "", &[])).unwrap();
+    assert!(second.published);
+    assert_ne!(second.generation, first.generation);
+}
+
+#[test]
+fn candidate_bytes_are_released_before_derived_materialization() {
+    let project = repository(3);
+    let storage = tempfile::tempdir().unwrap();
+    let request = request(project.path(), storage.path(), "head", &[]);
+    let mut measured = false;
+    let mut prepared = prepare_checkout(&request, &mut |phase| {
+        if phase == "derived" {
+            assert_eq!(RETAINED_CANDIDATE_BYTES.with(|count| count.get()), 0);
+            measured = true;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(measured);
+    assert!(prepared.commit().unwrap().published);
+}
+
 /// Publish the initial generation and plant a marker table in its derived
 /// database. A patched clone keeps the marker; a cold build starts from an
 /// empty file and does not have it.

@@ -70,13 +70,36 @@ fn registrations() -> &'static Mutex<Vec<Registration>> {
     ROOTS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+// Resolve the existing prefix so a write to a not-yet-created file routes
+// through the same checkout identity as its symlinked parent directory.
+fn path_identity(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => path_identity(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLASSIFICATION_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn is_directory(path: &Path) -> bool {
+    #[cfg(test)]
+    CLASSIFICATION_STATS.with(|count| count.set(count.get() + 1));
+    path.is_dir()
+}
+
 /// Register only roots routed to the new view plane. Legacy command behavior
 /// and indexing remain unchanged when no view is registered.
 pub fn register(root: &Path, delta: &Arc<Mutex<LiveDelta>>) {
     let mut roots = registrations().lock().unwrap_or_else(|e| e.into_inner());
     roots.retain(|entry| entry.delta.strong_count() != 0);
     roots.push(Registration {
-        root: root.to_path_buf(),
+        root: path_identity(root),
         delta: Arc::downgrade(delta),
         active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
@@ -86,21 +109,36 @@ pub fn register(root: &Path, delta: &Arc<Mutex<LiveDelta>>) {
 /// Directory intents invalidate the whole watcher epoch: their descendants
 /// (including newly created names) cannot safely be enumerated from an index.
 pub fn record_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> IntentGuard {
-    let paths = paths.into_iter().collect::<Vec<_>>();
     let listener_snapshot = {
         let mut registered = listeners().lock().unwrap_or_else(|e| e.into_inner());
         registered.retain(|listener| listener.strong_count() != 0);
         registered.clone()
     };
+    let has_roots = {
+        let mut roots = registrations().lock().unwrap_or_else(|e| e.into_inner());
+        roots.retain(|entry| entry.delta.strong_count() != 0);
+        !roots.is_empty()
+    };
+    if listener_snapshot.is_empty() && !has_roots {
+        return IntentGuard {
+            entries: Vec::new(),
+            listeners: Vec::new(),
+            changes: Vec::new(),
+        };
+    }
+    let paths = paths
+        .into_iter()
+        .map(|path| (path, is_directory(path)))
+        .collect::<Vec<_>>();
     let mut changes = paths
         .iter()
-        .filter(|path| path.is_dir())
-        .map(|path| WriteIntent::Directory(path.to_path_buf()))
+        .filter(|(_, is_dir)| *is_dir)
+        .map(|(path, _)| WriteIntent::Directory(path.to_path_buf()))
         .collect::<Vec<_>>();
     let files = paths
         .iter()
-        .filter(|path| !path.is_dir())
-        .map(|path| path.to_path_buf())
+        .filter(|(_, is_dir)| !*is_dir)
+        .map(|(path, _)| path.to_path_buf())
         .collect::<Vec<_>>();
     if !files.is_empty() {
         changes.push(WriteIntent::Paths(files));
@@ -116,14 +154,18 @@ pub fn record_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> IntentGuar
         listeners: listener_snapshot,
         changes,
     };
+    let normalized = paths
+        .iter()
+        .map(|(path, is_dir)| (path_identity(path), *is_dir))
+        .collect::<Vec<_>>();
     for entry in entries {
         let Some(delta) = entry.delta.upgrade() else {
             continue;
         };
-        let relevant = paths
+        let relevant = normalized
             .iter()
-            .filter(|path| path.starts_with(&entry.root))
-            .map(|path| path.to_path_buf())
+            .filter(|(path, _)| path.starts_with(&entry.root))
+            .map(|(path, _)| path.to_path_buf())
             .collect::<Vec<_>>();
         if relevant.is_empty() {
             continue;
@@ -133,11 +175,11 @@ pub fn record_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> IntentGuar
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         guard.entries.push((entry.clone(), relevant));
         let mut delta = delta.lock().unwrap_or_else(|e| e.into_inner());
-        for path in &paths {
+        for (path, is_dir) in &normalized {
             let Ok(relative) = path.strip_prefix(&entry.root) else {
                 continue;
             };
-            if relative.as_os_str().is_empty() || path.is_dir() {
+            if relative.as_os_str().is_empty() || *is_dir {
                 delta.bump_epoch();
                 delta.set_watcher(super::snapshot::WatcherState::Reconciling);
             } else if let Ok(relative) = RelPath::from_os_path(relative) {
@@ -158,6 +200,7 @@ pub struct IntentGuard {
 }
 
 pub fn active(root: &Path) -> bool {
+    let root = path_identity(root);
     registrations()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -197,6 +240,49 @@ impl Drop for IntentGuard {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn symlink_roots_route_intents_for_not_yet_created_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let manifest =
+            crate::views::manifest_v2::ManifestV2::new(crate::views::manifest_v2::ManifestHeader {
+                producers: crate::views::manifest_v2::Producers {
+                    trigram: "test".into(),
+                    semantic: None,
+                    callgraph: "test".into(),
+                },
+                head_tree: None,
+                ignore_fingerprint: None,
+                segment: None,
+            });
+        let delta = Arc::new(Mutex::new(LiveDelta::new(Arc::new(
+            crate::views::snapshot::OpenGeneration::new("base", manifest, None),
+        ))));
+        register(&real, &delta);
+        let path = alias.join("new.rs");
+        let guard = record_paths([path.as_path()]);
+        assert!(active(&real));
+        assert!(active(&alias));
+        assert_eq!(
+            delta
+                .lock()
+                .unwrap()
+                .snapshot()
+                .pending_intent()
+                .next()
+                .unwrap()
+                .as_bytes(),
+            b"new.rs"
+        );
+        drop(guard);
+        assert!(!active(&real));
+        assert!(!active(&alias));
+    }
+
     type Events = Arc<Mutex<Vec<(WriteIntent, WritePhase, Vec<u8>)>>>;
     struct Listener {
         root: PathBuf,
@@ -219,6 +305,21 @@ mod tests {
                     .push((change.clone(), phase, bytes));
             }
         }
+    }
+
+    #[test]
+    fn intent_paths_are_classified_once() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new.rs");
+        let listener: Arc<dyn WriteIntentListener> = Arc::new(Listener {
+            root: root.path().to_path_buf(),
+            events: Arc::new(Mutex::new(Vec::new())),
+        });
+        register_listener(&listener);
+        CLASSIFICATION_STATS.with(|count| count.set(0));
+        let guard = record_paths([path.as_path()]);
+        assert_eq!(CLASSIFICATION_STATS.with(|count| count.get()), 1);
+        drop(guard);
     }
 
     #[test]
