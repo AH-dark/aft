@@ -467,7 +467,11 @@ pub fn build_bash_outcome(
     else {
         return DispatchOutcome::Immediate(spawn_response);
     };
-    if spawn_response.data.get("status").and_then(Value::as_str) != Some("running") {
+    // A local child may finish before the spawn reply is constructed. Foreground
+    // calls must still collect its output through the normal wait path.
+    if (params.background || params.pty)
+        && spawn_response.data.get("status").and_then(Value::as_str) != Some("running")
+    {
         return DispatchOutcome::Immediate(spawn_response);
     }
 

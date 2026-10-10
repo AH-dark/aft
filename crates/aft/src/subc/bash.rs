@@ -1413,7 +1413,11 @@ pub(super) fn submit_deferred_bash(
                             &mut repeat_for_spawn,
                         );
                     };
-                    if response.data.get("status").and_then(Value::as_str) != Some("running") {
+                    // A terminal spawn observation still needs foreground output
+                    // collection; only background launches can return it directly.
+                    if (settings.background || settings.pty)
+                        && response.data.get("status").and_then(Value::as_str) != Some("running")
+                    {
                         return finish_bash_spawn_immediate(
                             response,
                             ctx,
@@ -6320,6 +6324,58 @@ mod grant_path_tests {
             .as_str()
             .unwrap()
             .contains("committed-terminal"));
+    }
+
+    #[cfg(unix)]
+    fn terminal_bash_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let mut response = running_bash_stub(req, ctx);
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap().to_string();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(&task_id, DEADLINE_SESSION, 0)
+                .unwrap();
+            if snapshot.info.status.is_terminal() {
+                // Deliver a terminal launch observation deterministically, rather
+                // than racing the child against spawn-response construction.
+                response.data["status"] = serde_json::to_value(snapshot.info.status).unwrap();
+                return response;
+            }
+            assert!(Instant::now() < deadline, "task {task_id} did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_spawn_observation_keeps_foreground_output() {
+        let (_dir, root) = super::super::test_support::test_root("terminal-spawn-output");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.as_path().into());
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let mut replies = deadline_test_call(
+            &executor,
+            &root,
+            terminal_bash_stub,
+            json!({"command": "printf terminal-spawn-output", "wait": true}),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert!(response.data["output"]
+            .as_str()
+            .expect("foreground reply includes output")
+            .contains("terminal-spawn-output"));
     }
 
     #[cfg(unix)]

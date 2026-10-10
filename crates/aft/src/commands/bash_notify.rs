@@ -63,10 +63,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     };
 
-    match ctx
+    // Task ownership is immutable. Check it before registration can mark the
+    // owner's delivery session live or consume its watch quota.
+    let registration = if ctx
         .bash_background()
-        .register_watch(params.task_id.clone(), pattern, params.once)
+        .observed_status(&params.task_id, req.session(), 0)
+        .is_some()
     {
+        ctx.bash_background()
+            .register_watch(params.task_id.clone(), pattern, params.once)
+    } else {
+        Err("task_not_found")
+    };
+    match registration {
         Ok(watch_id) => Response::success(&req.id, json!({ "watch_id": watch_id })),
         Err("too_many_watches") => Response::error(
             &req.id,
@@ -106,4 +115,71 @@ pub fn handle_unnotify(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.bash_background()
         .unregister_watch(&params.task_id, &params.watch_id);
     Response::success(&req.id, json!({ "unregistered": true }))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_rejects_other_session_without_consuming_owner_quota() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(project.path().into()),
+            storage_dir: Some(storage.path().into()),
+            ..crate::config::Config::default()
+        };
+        config.sandbox.profile.head = crate::config::SandboxMode::Off;
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let spawn = serde_json::from_value(json!({
+            "id": "notify-owner-task",
+            "command": "bash",
+            "session_id": "owner",
+            "params": { "command": "sleep 30" },
+        }))
+        .unwrap();
+        let launched = crate::commands::bash::handle(&spawn, &ctx);
+        assert!(launched.success, "{:?}", launched.data);
+        let task_id = launched.data["task_id"].as_str().unwrap().to_string();
+        struct Cleanup<'a>(&'a AppContext, String);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.bash_background().kill(&self.1, "owner");
+            }
+        }
+        let _cleanup = Cleanup(&ctx, task_id.clone());
+        let request = |session: &str| {
+            serde_json::from_value(json!({
+                "id": "notify-session-test",
+                "command": "bash_notify",
+                "session_id": session,
+                "params": { "task_id": task_id, "pattern": "never-emitted" },
+            }))
+            .unwrap()
+        };
+
+        for _ in 0..8 {
+            let denied = handle(&request("other"), &ctx);
+            assert!(
+                !denied.success,
+                "another session registered a watch: {:?}",
+                denied.data
+            );
+            assert_eq!(denied.data["message"], "task_not_found");
+        }
+        for _ in 0..8 {
+            let allowed = handle(&request("owner"), &ctx);
+            assert!(
+                allowed.success,
+                "owner quota was consumed: {:?}",
+                allowed.data
+            );
+            assert!(allowed.data["watch_id"].as_str().is_some());
+        }
+        assert_eq!(
+            handle(&request("owner"), &ctx).data["code"],
+            "too_many_watches"
+        );
+    }
 }
