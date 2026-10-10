@@ -9813,7 +9813,9 @@ pub(crate) mod test_support {
             .recv_timeout(Duration::from_secs(5))
             .expect("producer starts");
         pending.cancellation.as_ref().unwrap().request_cancel();
-        release_tx.send(()).expect("release producer");
+        // Cancellation may unblock the navigation worker before this test sends
+        // on release_tx; the worker may already have dropped the release receiver.
+        let _ = release_tx.send(());
         tokio::time::timeout(Duration::from_secs(5), wake.notified())
             .await
             .expect("navigation completion wake");
