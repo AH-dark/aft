@@ -273,6 +273,11 @@ pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
     })
 }
 
+pub(crate) fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(watcher_path_is_infra_skip)
+}
+
 /// High-churn ignored directories that can be dropped from the raw event stream
 /// before paying for a `realpath` canonicalization.
 ///
@@ -342,7 +347,7 @@ impl WatcherBatchMetadata {
         self.external_ignore_paths.contains(path)
             || (path.starts_with(&config.project_root)
                 && watcher_path_is_ignore_file(path)
-                && !watcher_path_is_infra_skip(path))
+                && !watcher_path_is_infra_skip_under(&config.project_root, path))
     }
 }
 
@@ -361,8 +366,12 @@ pub fn canonicalize_watcher_path(path: PathBuf) -> PathBuf {
     }
 }
 
-pub(crate) fn watcher_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
-    if watcher_path_is_infra_skip(path) {
+pub(crate) fn watcher_path_is_ignored_by_matcher(
+    matcher: &SharedGitignore,
+    path: &Path,
+    root: &Path,
+) -> bool {
+    if watcher_path_is_infra_skip_under(root, path) {
         return true;
     }
 
@@ -1388,7 +1397,7 @@ fn filter_canonical_paths(
             if metadata.head_paths.contains(path) {
                 return true;
             }
-            if watcher_path_is_infra_skip(path) {
+            if watcher_path_is_infra_skip_under(&config.project_root, path) {
                 return false;
             }
 
@@ -1765,7 +1774,9 @@ impl WatcherFilterThread {
             // Operating-system metadata files are dropped here too: the check is
             // a pure name comparison, and dropping them before they enter the
             // batch keeps a lone `.DS_Store` write from arming a flush.
-            if watcher_path_is_high_churn_infra(&path)
+            if path
+                .strip_prefix(&self.config.project_root)
+                .is_ok_and(watcher_path_is_high_churn_infra)
                 || crate::os_metadata::is_os_metadata_path(&path)
             {
                 continue;
@@ -1802,6 +1813,12 @@ impl WatcherFilterThread {
     }
 
     fn flush_pending(&mut self) -> bool {
+        self.flush_pending_with_wait(Instant::now() + Duration::from_secs(2), || {
+            thread::sleep(GITIGNORE_REBUILD_POLL_INTERVAL)
+        })
+    }
+
+    fn flush_pending_with_wait(&mut self, deadline: Instant, pause: impl FnMut()) -> bool {
         if self.raw_paths.is_empty() {
             self.flush_deadline = None;
             return true;
@@ -1817,8 +1834,16 @@ impl WatcherFilterThread {
             }) {
                 return false;
             }
-            if !self.wait_for_gitignore_rebuild(observed_generation) {
+            if !self.wait_for_gitignore_rebuild_until(observed_generation, deadline, pause) {
                 return false;
+            }
+            if self.matcher_generation.load(Ordering::SeqCst) == observed_generation {
+                // Keep the batch until the ignore matcher is acknowledged; a
+                // lifecycle transition may have deferred the original rebuild.
+                self.raw_paths.extend(raw_paths);
+                self.flush_deadline = Some(Instant::now() + WATCHER_FLUSH_WINDOW);
+                return self
+                    .send_dispatch(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown));
             }
             filter_canonical_paths(&self.config, &self.matcher, raw_paths)
         } else {
@@ -1842,7 +1867,12 @@ impl WatcherFilterThread {
         true
     }
 
-    fn wait_for_gitignore_rebuild(&self, observed_generation: u64) -> bool {
+    fn wait_for_gitignore_rebuild_until(
+        &self,
+        observed_generation: u64,
+        deadline: Instant,
+        mut pause: impl FnMut(),
+    ) -> bool {
         while !self.shutdown.load(Ordering::SeqCst)
             && self.matcher_generation.load(Ordering::SeqCst) == observed_generation
         {
@@ -1850,7 +1880,10 @@ impl WatcherFilterThread {
                 let _ = self.send_dispatch(WatcherDispatchEvent::RootDeleted);
                 return false;
             }
-            thread::sleep(GITIGNORE_REBUILD_POLL_INTERVAL);
+            if Instant::now() >= deadline {
+                return true;
+            }
+            pause();
         }
         !self.shutdown.load(Ordering::SeqCst)
     }
@@ -1900,6 +1933,58 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expired_generation_wait_does_not_poll_forever() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let generation = Arc::new(AtomicU64::new(1));
+        let (tx, _rx) = crossbeam_channel::bounded(4);
+        let filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.path().to_path_buf(), None),
+            Arc::new(std::sync::RwLock::new(None)),
+            generation.clone(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut polls = 0;
+        assert!(
+            filter.wait_for_gitignore_rebuild_until(1, Instant::now(), || {
+                polls += 1;
+                generation.store(2, Ordering::SeqCst);
+            })
+        );
+        assert_eq!(
+            polls, 0,
+            "expired acknowledgement wait must return to the event loop"
+        );
+        let ignore_file = root.path().join(".gitignore");
+        std::fs::write(&ignore_file, "ignored.rs\n").unwrap();
+        let source = root.path().join("changed.rs");
+        std::fs::write(&source, "fn changed() {}\n").unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.path().to_path_buf(), None),
+            Arc::new(std::sync::RwLock::new(None)),
+            generation,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        filter.raw_paths.extend([ignore_file, source.clone()]);
+        assert!(filter
+            .flush_pending_with_wait(Instant::now(), || panic!("expired wait must not sleep")));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WatcherDispatchEvent::IgnoreRulesChanged { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            WatcherDispatchEvent::RescanRequired(_)
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(filter.raw_paths.contains(&source));
+        assert!(filter.flush_deadline.is_some());
+    }
+
     use super::*;
     use ignore::gitignore::GitignoreBuilder;
     use notify::event::{

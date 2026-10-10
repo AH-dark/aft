@@ -1978,7 +1978,11 @@ impl RefreshBatch {
     fn path_is_ignored(&self, path: &Path) -> bool {
         self.refresh_states.iter().any(|state| {
             state.matcher.as_ref().is_some_and(|matcher| {
-                crate::watcher_filter::watcher_path_is_ignored_by_matcher(matcher, path)
+                crate::watcher_filter::watcher_path_is_ignored_by_matcher(
+                    matcher,
+                    path,
+                    &self.root.project_root,
+                )
             })
         })
     }
@@ -2421,7 +2425,7 @@ pub(crate) fn retire_ignored_refresh_paths(
     {
         let before = batch.paths.len();
         batch.paths.retain(|path| {
-            !crate::watcher_filter::watcher_path_is_ignored_by_matcher(matcher, path)
+            !crate::watcher_filter::watcher_path_is_ignored_by_matcher(matcher, path, project_root)
         });
         dropped += before - batch.paths.len();
     }

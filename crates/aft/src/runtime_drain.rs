@@ -10,7 +10,7 @@ use crate::lsp::client::LspEvent;
 use crate::protocol::PushFrame;
 #[cfg(test)]
 use crate::watcher_filter::RescanReason;
-use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
+use crate::watcher_filter::{watcher_path_is_infra_skip_under, WatcherDispatchEvent};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::{BTreeSet, HashSet, VecDeque};
@@ -668,7 +668,12 @@ pub fn try_any_build_in_flight(ctx: &AppContext) -> Option<bool> {
 }
 
 pub fn watcher_path_is_ignored_by_current_matcher(ctx: &AppContext, path: &Path) -> bool {
-    if watcher_path_is_infra_skip(path) {
+    if ctx
+        .config()
+        .project_root
+        .as_ref()
+        .is_some_and(|root| watcher_path_is_infra_skip_under(root, path))
+    {
         return true;
     }
 

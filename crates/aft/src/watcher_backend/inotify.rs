@@ -130,26 +130,24 @@ impl ProjectWatcher {
                         let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
                         let desired =
                             collect_watch_directories(&root, &matcher, &replacement_paths);
-                        for directory in watched_directories.difference(&desired) {
-                            let _ = watcher.unwatch(directory);
-                        }
-                        let mut installed = watched_directories
-                            .intersection(&desired)
-                            .cloned()
-                            .collect::<BTreeSet<_>>();
-                        for directory in desired.difference(&watched_directories) {
-                            match watch_directory(&mut watcher, directory, &mut watch, &counters) {
-                                Ok(true) => {
-                                    installed.insert(directory.clone());
+                        watched_directories = match reconcile_watch_directories(
+                            &watched_directories,
+                            &desired,
+                            |directory, install| {
+                                if install {
+                                    watch_directory(&mut watcher, directory, &mut watch, &counters)
+                                } else {
+                                    let _ = watcher.unwatch(directory);
+                                    Ok(false)
                                 }
-                                Ok(false) => {}
-                                Err(error) => {
-                                    let _ = tx.send(Err(error));
-                                    return;
-                                }
+                            },
+                        ) {
+                            Ok(installed) => installed,
+                            Err(error) => {
+                                let _ = tx.send(Err(error));
+                                return;
                             }
-                        }
-                        watched_directories = installed;
+                        };
                         thread_count.store(watched_directories.len(), Ordering::Release);
                         observed_generation = generation;
 
@@ -171,6 +169,30 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
+                            if matches!(
+                                event.kind,
+                                EventKind::Remove(_)
+                                    | EventKind::Modify(ModifyKind::Name(
+                                        RenameMode::From | RenameMode::Both
+                                    ))
+                            ) {
+                                let removed = if matches!(
+                                    event.kind,
+                                    EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+                                ) {
+                                    &event.paths[..event.paths.len().min(1)]
+                                } else {
+                                    &event.paths[..]
+                                };
+                                forget_removed_watch_paths(
+                                    &mut watched_directories,
+                                    removed,
+                                    |directory| {
+                                        let _ = watcher.unwatch(directory);
+                                    },
+                                );
+                                thread_count.store(watched_directories.len(), Ordering::Release);
+                            }
                             // A move into the root is reported as Rename(To), not Create.
                             // Scan its descendants too so their later writes are watched.
                             if matches!(
@@ -183,6 +205,7 @@ impl ProjectWatcher {
                                 for path in &event.paths {
                                     match watch_new_tree(
                                         path,
+                                        &root,
                                         &matcher,
                                         &exclusion_paths,
                                         &mut watched_directories,
@@ -359,6 +382,7 @@ impl PendingNewDirectoryFiles {
 /// rescan instead of reporting a partial list.
 fn watch_new_tree(
     root: &Path,
+    project_root: &Path,
     matcher: &SharedGitignore,
     exclusions: &[PathBuf],
     watched: &mut BTreeSet<PathBuf>,
@@ -369,7 +393,7 @@ fn watch_new_tree(
 ) -> notify::Result<NewDirectoryScan> {
     let excluded = |path: &Path| {
         exclusions.iter().any(|excluded| path.starts_with(excluded))
-            || watcher_path_is_ignored_by_matcher(matcher, path)
+            || watcher_path_is_ignored_by_matcher(matcher, path, project_root)
     };
     let mut stack = vec![std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())];
     let mut found = 0usize;
@@ -415,6 +439,44 @@ fn watch_new_tree(
     Ok(scan)
 }
 
+fn forget_removed_watch_paths(
+    watched: &mut BTreeSet<PathBuf>,
+    paths: &[PathBuf],
+    mut unwatch: impl FnMut(&Path),
+) {
+    let removed = watched
+        .iter()
+        .filter(|directory| paths.iter().any(|path| directory.starts_with(path)))
+        .cloned()
+        .collect::<Vec<_>>();
+    for directory in removed {
+        unwatch(&directory);
+        watched.remove(&directory);
+    }
+}
+
+fn reconcile_watch_directories(
+    previous: &BTreeSet<PathBuf>,
+    desired: &BTreeSet<PathBuf>,
+    mut update: impl FnMut(&Path, bool) -> notify::Result<bool>,
+) -> notify::Result<BTreeSet<PathBuf>> {
+    // A retained path may now name a different inode after delete/recreate,
+    // so every desired path is watched again rather than trusted from the
+    // bookkeeping. Re-adding a watch on an unchanged inode only refreshes its
+    // mask, so retained directories are never unwatched and no event window
+    // opens during the rebuild.
+    for directory in previous.difference(desired) {
+        let _ = update(directory, false);
+    }
+    let mut installed = BTreeSet::new();
+    for directory in desired {
+        if update(directory, true)? {
+            installed.insert(directory.clone());
+        }
+    }
+    Ok(installed)
+}
+
 fn collect_watch_directories(
     root: &Path,
     matcher: &SharedGitignore,
@@ -422,13 +484,13 @@ fn collect_watch_directories(
 ) -> BTreeSet<PathBuf> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut directories = BTreeSet::new();
-    let mut stack = vec![root];
+    let mut stack = vec![root.clone()];
 
     while let Some(directory) = stack.pop() {
         if exclusions
             .iter()
             .any(|excluded| directory.starts_with(excluded))
-            || watcher_path_is_ignored_by_matcher(matcher, &directory)
+            || watcher_path_is_ignored_by_matcher(matcher, &directory, &root)
         {
             continue;
         }
@@ -454,6 +516,63 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use ignore::gitignore::GitignoreBuilder;
+
+    #[test]
+    fn removed_directory_prunes_descendant_watches() {
+        let mut watched = BTreeSet::from([
+            PathBuf::from("/root"),
+            PathBuf::from("/root/gone"),
+            PathBuf::from("/root/gone/nested"),
+            PathBuf::from("/root/keep"),
+        ]);
+        let mut removed = Vec::new();
+        forget_removed_watch_paths(&mut watched, &[PathBuf::from("/root/gone")], |path| {
+            removed.push(path.to_path_buf())
+        });
+        assert_eq!(
+            watched,
+            BTreeSet::from([PathBuf::from("/root"), PathBuf::from("/root/keep")])
+        );
+        assert_eq!(removed.len(), 2);
+    }
+
+    #[test]
+    fn rebuild_reinstalls_retained_watch_paths() {
+        let previous = BTreeSet::from([
+            PathBuf::from("/root/retained"),
+            PathBuf::from("/root/dropped"),
+        ]);
+        let desired = BTreeSet::from([PathBuf::from("/root/retained")]);
+        let mut watched = Vec::new();
+        let mut unwatched = Vec::new();
+        let rebuilt = reconcile_watch_directories(&previous, &desired, |path, install| {
+            if install {
+                watched.push(path.to_path_buf());
+            } else {
+                unwatched.push(path.to_path_buf());
+            }
+            Ok(install)
+        })
+        .unwrap();
+        assert_eq!(rebuilt, desired);
+        assert_eq!(watched, vec![PathBuf::from("/root/retained")]);
+        assert_eq!(unwatched, vec![PathBuf::from("/root/dropped")]);
+    }
+
+    #[test]
+    fn watch_root_below_infrastructure_ancestor_is_not_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("target/project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/generated")).unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(
+            GitignoreBuilder::new(&root).build().unwrap(),
+        ))));
+        assert_eq!(
+            collect_watch_directories(&root, &matcher, &[]),
+            BTreeSet::from([root.clone(), root.join("src")])
+        );
+    }
 
     use super::*;
 
@@ -705,6 +824,7 @@ mod tests {
         let mut watched = BTreeSet::new();
         let mut pending = PendingNewDirectoryFiles::default();
         let scan = watch_new_tree(
+            root,
             root,
             matcher,
             exclusions,
