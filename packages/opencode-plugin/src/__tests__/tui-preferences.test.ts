@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +14,7 @@ import {
   readTuiPreferencesFile,
   resolveAftPrefs,
   TUI_PREFS_FILE_ENV,
+  watchTuiPreferences,
 } from "../tui/preferences";
 
 let dir: string;
@@ -55,6 +58,34 @@ describe("getTuiPreferencesFile", () => {
 });
 
 describe("readTuiPreferencesFile", () => {
+  test("preference watcher handles asynchronous errors by closing the watcher", () => {
+    let closes = 0;
+    const watcher = Object.assign(new EventEmitter(), {
+      close: () => {
+        closes++;
+      },
+    });
+    const watchMock = spyOn(fs, "watch").mockReturnValue(watcher as unknown as fs.FSWatcher);
+    try {
+      const stop = watchTuiPreferences(() => {});
+      expect(() => watcher.emit("error", new Error("watch failed"))).not.toThrow();
+      expect(closes).toBe(1);
+      stop();
+    } finally {
+      watchMock.mockRestore();
+    }
+  });
+  test("preference writes preserve malformed and non-object shared files and reject", async () => {
+    for (const original of ['{"other": {', "[1, 2]", "null", ""]) {
+      await writeFile(file, original);
+      await expect(queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true)).rejects.toThrow();
+      expect(await readFile(file, "utf8")).toBe(original);
+    }
+    await writeFile(file, '{"other": {"order": 42}}');
+    await queueTuiPreferenceUpdate(PLUGIN_KEY, ["collapsed"], true);
+    expect((await readTuiPreferencesFile()).other).toEqual({ order: 42 });
+  });
+
   test("missing file returns empty object", async () => {
     expect(await readTuiPreferencesFile()).toEqual({});
   });
