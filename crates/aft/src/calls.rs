@@ -513,6 +513,52 @@ fn clean_type_reference_name(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Extract Go expression references, including callbacks and package variables.
+/// Resolution rejects identifiers that do not name indexed package symbols.
+pub fn extract_go_value_references(source: &str, root: tree_sitter::Node) -> Vec<CallTuple> {
+    fn visit(node: tree_sitter::Node, source: &str, results: &mut Vec<CallTuple>) {
+        let parent = node.parent();
+        let is_callee = parent.is_some_and(|p| {
+            p.kind() == "call_expression" && p.child_by_field_name("function") == Some(node)
+        });
+        let is_value = node.kind() == "selector_expression"
+            || (node.kind() == "identifier"
+                && parent.is_some_and(|p| {
+                    matches!(
+                        p.kind(),
+                        "argument_list"
+                            | "expression_list"
+                            | "return_statement"
+                            | "binary_expression"
+                            | "unary_expression"
+                            | "parenthesized_expression"
+                            | "keyed_element"
+                            | "literal_element"
+                    )
+                }));
+        if is_value && !is_callee {
+            let full = source[node.byte_range()].to_string();
+            let short = full.rsplit('.').next().unwrap_or(&full).to_string();
+            results.push((
+                full,
+                short,
+                node.start_position().row as u32 + 1,
+                node.start_byte(),
+                node.end_byte(),
+            ));
+        }
+        // A selector is one reference, not a second bare reference to its base.
+        if node.kind() != "selector_expression" {
+            for child in node.named_children(&mut node.walk()) {
+                visit(child, source, results);
+            }
+        }
+    }
+    let mut results = Vec::new();
+    visit(root, source, &mut results);
+    results
+}
+
 /// Extract Rust function paths used as values rather than called directly.
 ///
 /// The call graph stores these separately from calls so navigation remains
