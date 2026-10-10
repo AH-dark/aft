@@ -184,6 +184,9 @@ pub(super) struct RunScope {
     tasks: StdMutex<Vec<(crate::bash_background::BgTaskRegistry, String, String)>>,
     revoked: AtomicBool,
     closing: AtomicBool,
+    close_requested: AtomicBool,
+    hold_logged: AtomicBool,
+    close_runtime: OnceLock<tokio::runtime::Handle>,
 }
 
 impl RunScope {
@@ -260,15 +263,20 @@ impl RunScope {
     }
 
     pub(super) fn route_closed(self: &Arc<Self>) {
+        self.close_requested.store(true, Ordering::Release);
         if self.revoked.load(Ordering::Acquire) || self.closing.swap(true, Ordering::AcqRel) {
             return;
         }
+        let runtime = self
+            .close_runtime
+            .get_or_init(tokio::runtime::Handle::current);
         let scope = Arc::clone(self);
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             // A reconnect can close a route without ending its scope. Only
             // scope.describe confirming an end, a different live epoch, or a
             // synced owner's missing scope permits terminating the run's work.
-            for attempt in 0..3 {
+            let mut backoff = Duration::from_millis(250);
+            loop {
                 let reply = tokio::time::timeout(Duration::from_secs(3), async {
                     let _describe = scope.describe_lock.lock().await;
                     scope.control.describe(&scope.stamp).await
@@ -280,7 +288,7 @@ impl RunScope {
                         "scope close confirmation timed out",
                     ))
                 });
-                match reply {
+                let hold_reason = match reply {
                     Ok(reply) if scope.ended(&reply) => {
                         scope.revoked.store(true, Ordering::Release);
                         let scope_for_kill = Arc::clone(&scope);
@@ -303,17 +311,60 @@ impl RunScope {
                         .await;
                         break;
                     }
-                    Ok(_) => {}
-                    Err(error) => {
-                        log::warn!("run scope close confirmation held: {}", error.message)
-                    }
+                    Ok(_) => "scope.describe has not confirmed scope end".to_string(),
+                    Err(error) => error.message,
+                };
+                if !scope.keep_confirming().await {
+                    return;
                 }
-                if attempt != 2 {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                scope.hold_once(|| {
+                    log::warn!(
+                        "run scope close confirmation held run_id={} scope={} epoch={}: {hold_reason}",
+                        scope.stamp.attributes.run_id.as_deref().unwrap_or("unknown"),
+                        scope.stamp.scope_ref,
+                        scope.stamp.scope_epoch,
+                    );
+                });
+                tokio::time::sleep(backoff).await;
+                backoff = next_scope_confirmation_backoff(backoff);
+                if !scope.keep_confirming().await {
+                    return;
                 }
             }
             scope.closing.store(false, Ordering::Release);
         });
+    }
+
+    async fn has_live_tasks(self: &Arc<Self>) -> bool {
+        let scope = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let tasks = scope
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            tasks
+                .iter()
+                .any(|(registry, task, session)| registry.has_live_task_processes(task, session))
+        })
+        .await
+        .unwrap_or(true)
+    }
+
+    // Recheck after releasing the worker claim so a concurrent registration
+    // either restarts this confirmer or starts its own, never losing the close.
+    async fn keep_confirming(self: &Arc<Self>) -> bool {
+        if self.has_live_tasks().await {
+            return true;
+        }
+        self.closing.store(false, Ordering::Release);
+        self.has_live_tasks().await && !self.closing.swap(true, Ordering::AcqRel)
+    }
+
+    fn hold_once(&self, log_hold: impl FnOnce()) {
+        if !self.hold_logged.swap(true, Ordering::AcqRel) {
+            log_hold();
+        }
     }
 
     fn ended(&self, reply: &subc_protocol::session::ModuleControlResponseToModule) -> bool {
@@ -336,7 +387,7 @@ impl RunScope {
     }
 
     pub(super) fn track(
-        &self,
+        self: &Arc<Self>,
         registry: &crate::bash_background::BgTaskRegistry,
         task: &str,
         session: &str,
@@ -349,6 +400,8 @@ impl RunScope {
         // after revocation must be killed too, not missed by that snapshot.
         if self.revoked.load(Ordering::Acquire) {
             let _ = registry.kill_for_scope_revocation(task, session);
+        } else if self.close_requested.load(Ordering::Acquire) {
+            self.route_closed();
         }
     }
 }
@@ -403,6 +456,9 @@ impl RunScopes {
                             tasks: StdMutex::new(Vec::new()),
                             revoked: AtomicBool::new(false),
                             closing: AtomicBool::new(false),
+                            close_requested: AtomicBool::new(false),
+                            hold_logged: AtomicBool::new(false),
+                            close_runtime: OnceLock::new(),
                         })
                     }),
             )
@@ -548,6 +604,9 @@ impl RunScope {
             tasks: StdMutex::new(Vec::new()),
             revoked: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            close_requested: AtomicBool::new(false),
+            hold_logged: AtomicBool::new(false),
+            close_runtime: OnceLock::new(),
         })
     }
 }
@@ -604,5 +663,132 @@ mod lifetime_tests {
         assert!(!response.success);
         assert_eq!(response.data["code"], "run_deadline_expired");
         assert!(cancel.cancel_already_requested());
+    }
+}
+
+fn next_scope_confirmation_backoff(backoff: Duration) -> Duration {
+    backoff.saturating_mul(2).min(Duration::from_secs(30))
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn scope_confirmation_backoff_doubles_until_thirty_seconds() {
+        let mut backoff = Duration::from_millis(250);
+        for expected_ms in [250, 500, 1000, 2000, 4000, 8000, 16000, 30000, 30000] {
+            assert_eq!(backoff, Duration::from_millis(expected_ms));
+            backoff = next_scope_confirmation_backoff(backoff);
+        }
+    }
+
+    #[test]
+    fn scope_confirmation_logs_hold_once_across_workers() {
+        let scope = RunScope::for_test(None);
+        let mut emitted = 0;
+        for _ in 0..4 {
+            scope.hold_once(|| emitted += 1);
+        }
+        assert_eq!(emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn scope_confirmation_stops_when_no_work_is_tracked() {
+        let scope = RunScope::for_test(None);
+        let first_corr = scope.control.next_corr.load(Ordering::Relaxed);
+        scope.route_closed();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while scope.closing.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle scope confirmation did not stop");
+        assert_eq!(
+            scope.control.next_corr.load(Ordering::Relaxed),
+            first_corr + 1
+        );
+        assert!(!scope.hold_logged.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod late_confirmation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scope_confirmation_restarts_for_late_task_and_stops_after_finish() {
+        let scope = RunScope::for_test(None);
+        scope.route_closed();
+        wait_until_stopped(&scope).await;
+        let idle_corr = scope.control.next_corr.load(Ordering::Relaxed);
+        let ctx = test_support::test_ctx();
+        let response = crate::bash_background::spawn(
+            "late-scope-task",
+            "scope-retry-session",
+            "sleep 30",
+            crate::bash_background::BashShell::Bash,
+            PathBuf::from("/bin/bash"),
+            None,
+            None,
+            crate::bash_background::HardKill::from_timeout_ms(Some(5000)),
+            &ctx,
+            false,
+            false,
+            false,
+            false,
+            24,
+            80,
+            Vec::new(),
+            None,
+            None,
+        );
+        assert!(response.success, "{response:?}");
+        let task = response.data["task_id"].as_str().unwrap().to_string();
+        let registry = ctx.bash_background().clone();
+        let scope_for_track = Arc::clone(&scope);
+        let registry_for_track = registry.clone();
+        let task_for_track = task.clone();
+        std::thread::spawn(move || {
+            scope_for_track.track(&registry_for_track, &task_for_track, "scope-retry-session")
+        })
+        .join()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !scope.hold_logged.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late registration did not restart confirmation");
+        assert!(scope.control.next_corr.load(Ordering::Relaxed) > idle_corr);
+        let task_for_kill = task.clone();
+        let registry_for_kill = registry.clone();
+        tokio::task::spawn_blocking(move || {
+            registry_for_kill
+                .kill(&task_for_kill, "scope-retry-session")
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        wait_until_stopped(&scope).await;
+        assert!(!registry.has_live_task_processes(&task, "scope-retry-session"));
+        let stopped_corr = scope.control.next_corr.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert_eq!(
+            scope.control.next_corr.load(Ordering::Relaxed),
+            stopped_corr
+        );
+    }
+
+    async fn wait_until_stopped(scope: &RunScope) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while scope.closing.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finished scope work kept confirmation alive");
     }
 }

@@ -8080,6 +8080,37 @@ impl BgTaskRegistry {
             .and_then(|tasks| tasks.get(task_id).cloned())
     }
 
+    /// Check tracked work without recovering task records or reading output.
+    /// A terminal shell can leave descendants alive, so refresh a surviving or
+    /// unknown process-group sample before treating the whole task as finished.
+    /// Call off the frame loop: state locks and group sampling can wait.
+    pub(crate) fn has_live_task_processes(&self, task_id: &str, session_id: &str) -> bool {
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return false;
+        };
+        let needs_sample = {
+            let state = task
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.metadata.status.is_terminal() {
+                return true;
+            }
+            state.metadata.mode == BgMode::Pipes
+                && state.metadata.pgid.is_some()
+                && (state
+                    .metadata
+                    .live_descendants
+                    .as_ref()
+                    .is_none_or(|members| !members.is_empty())
+                    || state.metadata.live_descendants_omitted > 0)
+        };
+        needs_sample
+            && self
+                .sample_task_process_group(&task)
+                .is_none_or(|(members, omitted)| !members.is_empty() || omitted > 0)
+    }
+
     /// True when the task has reached a terminal state or is no longer in the
     /// registry at all.
     pub(crate) fn is_task_terminal(&self, task_id: &str) -> bool {

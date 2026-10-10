@@ -1244,11 +1244,13 @@ struct RouteIdentityData {
     /// Every tool call on the route is checked against this snapshot, so a
     /// config edit applies to the next bind, not mid-session.
     disabled_tools: Arc<Vec<String>>,
-    /// Daemon-authenticated work identity for this route: its owner, stable
-    /// reference and epoch, plus any agent/run attributes. The gh shim relay
-    /// uses the delegated identity for bot writes; run lifetime controls use
-    /// it to confirm scope end before terminating processes. Absent on routes
-    /// opened without a scope or by a daemon that predates scopes.
+    /// Work identity authenticated by the daemon when it binds this route.
+    /// `owner` publishes work under a stable `ref`; `scope_epoch` distinguishes
+    /// a new generation of that work from obsolete routes. Optional
+    /// `attributes.agent_id` and `attributes.run_id` identify the agent and its
+    /// codemode run. The gh shim relay uses this identity for delegated bot
+    /// writes; lifetime controls confirm its end before terminating processes.
+    /// Absent on routes opened without a scope or by a daemon predating scopes.
     scope: Option<subc_protocol::scope::ScopeStamp>,
     /// Shared lifetime state for all routes carrying the same run scope.
     run_scope: OnceLock<Arc<run_scope::RunScope>>,

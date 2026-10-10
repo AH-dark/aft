@@ -247,6 +247,7 @@ enum CloseCase {
     NewEpoch,
     NotLive,
     NotSynced,
+    SlowResync,
     Error,
     Timeout,
     Duplicate,
@@ -340,6 +341,40 @@ fn close_case(name: &'static str, case: CloseCase) {
                         answer(
                             &mut daemon.stream,
                             &retry,
+                            ScopeStatus::Ended,
+                            true,
+                            Some(1),
+                        )
+                        .await;
+                    }
+                    CloseCase::SlowResync => {
+                        let mut request = request;
+                        for attempt in 0..3 {
+                            answer(
+                                &mut daemon.stream,
+                                &request,
+                                ScopeStatus::NotLive,
+                                false,
+                                None,
+                            )
+                            .await;
+                            request = read_frame_within(
+                                &mut daemon.stream,
+                                Duration::from_secs(5),
+                                "confirmation after an inconclusive reply",
+                            )
+                            .await
+                            .expect("scope confirmation stopped after three inconclusive replies");
+                            assert_eq!(request.header.ty, FrameType::Request);
+                            assert_eq!(request.header.channel, 0);
+                            let body: Value = serde_json::from_slice(&request.body).unwrap();
+                            assert_eq!(body["op"], "scope.describe");
+                            assert!(alive(pid), "inconclusive reply {attempt} must hold work");
+                            assert_run_not_killing();
+                        }
+                        answer(
+                            &mut daemon.stream,
+                            &request,
                             ScopeStatus::Ended,
                             true,
                             Some(1),
@@ -643,4 +678,10 @@ fn scope_revocation_record_timeout_refuses_without_blocking_frames() {
         |_, _, _| {},
         bridge_dispatch,
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_revocation_three_inconclusive_then_ended_kills_group() {
+    close_case("scope-slow-owner-resync", CloseCase::SlowResync);
 }

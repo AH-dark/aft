@@ -424,26 +424,29 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // budget. A daemon that predates the field ignores it and treats the
     // module as ready, which is the behaviour before readiness existed.
     //
-    // `capabilities.provides` lists `tool-provider/v1`: that catalog entry is
-    // how a session starter discovers a tool provider before it builds a
-    // worker's fetch plan. Without it, no worker gets a plan, so its calls
-    // carry no preset and run as `head`.
+    // `capabilities.provides` lists `tool-provider/v1` so agent startup can
+    // discover AFT and build a worker's tool-fetch plan. Without that plan,
+    // worker calls name no preset and use the default `head` agent catalog.
     //
     // `agent-run-scopes/v1` tells the daemon to include run_id so AFT can
     // recognize run lifetimes. The daemon closes the route at the run's
     // deadline; AFT confirms that the scope ended before killing its processes.
     // Nothing goes in `requires`.
+    //
     // The builder leaves `self_signals` and `provenance` unset; `provenance`
     // is added at HELLO time by `declare_provenance`, because where the launch
     // nonce came from is a fact about the running process, not the build.
-    // `consumes` is descriptive (the
-    // daemon doesn't read it) and lists the modules AFT opens routes to: the
+    //
+    // `consumes` is descriptive:
+    // the daemon doesn't read it. It lists the modules AFT opens routes to: the
     // fleet status holder always, and synapse only when it is the configured
     // embedding backend. The manifest is static, so the config-dependent synapse
     // route is declared unconditionally. Neither is a `capabilities.requires`
     // entry, because a required capability with no provider would hold AFT
-    // not-ready. A subc daemon older than 0.17.20 refuses this manifest, so
-    // that version is the floor.
+    // not-ready.
+    //
+    // A subc daemon older than 0.17.20 refuses this manifest, so that version
+    // is the minimum supported daemon version.
     ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))

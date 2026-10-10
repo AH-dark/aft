@@ -191,7 +191,9 @@ fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
         // command's normal hard timeout still applies while confirmation waits.
     } else if target.server_completion
         && (cancelled
-            || !target.registry.is_remote_task(&target.task_id, &target.session_id))
+            || !target
+                .registry
+                .is_remote_task(&target.task_id, &target.session_id))
     {
         let _ = target.registry.kill(&target.task_id, &target.session_id);
     } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
@@ -2192,6 +2194,7 @@ mod grant_path_tests {
         let registry = ctx.bash_background();
         registry.register_foreground_task(session, &task_id);
         let target = drain::BashDetachTarget {
+            run_scoped: false,
             task_id: task_id.clone(),
             session_id: session.into(),
             wait_mode: false,
@@ -3894,8 +3897,9 @@ mod run_tests {
 
     #[tokio::test]
     async fn run_available_budget_reaches_spawn_and_kills_at_deadline() {
-        // Test the budget consumer independently of subc-protocol 0.30,
-        // whose scope.describe reply cannot yet carry a run deadline.
+        // Inject a local deadline to verify that spawn receives a clamped
+        // timeout and the child returns exit 124 instead of being promoted.
+        // subc-protocol 0.30 cannot supply that deadline in scope.describe.
         let started = Instant::now();
         let response = run("sleep 30", 5000, Some(started + Duration::from_millis(200))).await;
         assert!(started.elapsed() < Duration::from_secs(3));
