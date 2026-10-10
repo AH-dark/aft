@@ -11,7 +11,104 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::error::AftError;
 use crate::format;
-use crate::parser::{detect_language, grammar_for, FileParser};
+use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser};
+
+/// Use the dominant LF/CRLF convention for generated lines, without treating
+/// a lone carriage return inside source content as a line terminator.
+pub(crate) fn source_line_ending(source: &str) -> &'static str {
+    let lf = source.bytes().filter(|byte| *byte == b'\n').count();
+    let crlf = source
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| *pair == b"\r\n")
+        .count();
+    if crlf > 0 && crlf >= lf - crlf {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Write a source file through an exclusively created sibling, preserving its
+/// permissions. No target bytes change until the completed file is renamed.
+pub(crate) fn atomic_write_source(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_source_with(path, bytes, |file, bytes| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+fn atomic_write_source_with(
+    path: &Path,
+    bytes: &[u8],
+    writer: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io;
+    // Follow an existing symlink just as an in-place write would, rather than
+    // replacing the link itself with a regular file.
+    let destination = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let permissions = match fs::metadata(&destination) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if permissions.is_some() {
+        // Preserve the existing file's write-access checks even when its parent
+        // directory would permit replacing a read-only file by rename.
+        OpenOptions::new().write(true).open(&destination)?;
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(io::Error::other)?;
+    let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let temporary = parent.join(format!(".aft-source-{suffix}.tmp"));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(permissions) = permissions.as_ref() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(permissions.mode() & 0o777);
+    }
+    let file = options.open(&temporary)?;
+    struct RemoveTemporary {
+        path: std::path::PathBuf,
+        file: Option<fs::File>,
+    }
+    impl Drop for RemoveTemporary {
+        fn drop(&mut self) {
+            self.file.take();
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+    let mut cleanup = RemoveTemporary {
+        path: temporary.clone(),
+        file: Some(file),
+    };
+    let file = cleanup.file.as_mut().expect("temporary file is open");
+    writer(file, bytes)?;
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)?;
+    }
+    file.sync_all()
+        .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
+    cleanup.file.take();
+    crate::fs_lock::rename_over(&temporary, &destination)?;
+    // The replacement has already committed; a directory sync failure cannot
+    // be reported as a failed edit without implying the original still exists.
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
 
 /// Convert 0-indexed line/col to a byte offset within `source`.
 ///
@@ -39,9 +136,43 @@ pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {
             return line_start + (col as usize).min(line_text.len());
         }
         line_start += segment.len();
+        #[cfg(test)]
+        LINE_OFFSET_BYTES_SCANNED.with(|count| count.set(count.get() + segment.len()));
     }
 
     source.len()
+}
+
+/// Byte starts shared by all line-range edits against one captured source.
+pub(crate) struct LineOffsets {
+    starts: Vec<usize>,
+    source_len: usize,
+}
+
+impl LineOffsets {
+    pub(crate) fn new(source: &str) -> Self {
+        let mut start = 0;
+        let starts = source
+            .split_inclusive('\n')
+            .map(|segment| {
+                let offset = start;
+                start += segment.len();
+                #[cfg(test)]
+                LINE_OFFSET_BYTES_SCANNED.with(|count| count.set(count.get() + segment.len()));
+                offset
+            })
+            .collect();
+        Self {
+            starts,
+            source_len: source.len(),
+        }
+    }
+    pub(crate) fn line_count(&self) -> usize {
+        self.starts.len()
+    }
+    pub(crate) fn offset(&self, line: usize) -> usize {
+        self.starts.get(line).copied().unwrap_or(self.source_len)
+    }
 }
 
 pub(crate) fn validate_byte_range(source: &str, start: usize, end: usize) -> Result<(), AftError> {
@@ -129,17 +260,12 @@ pub fn validate_syntax_with_parser(
 
 /// Validate syntax of an in-memory string without touching disk.
 ///
-/// Uses `detect_language(path)` + `grammar_for(lang)` + `parser.parse()`
-/// to validate syntax of a proposed content string. Returns `None` for
+/// Uses a worker-local reusable parser to validate the proposed content.
+/// Returns `None` for
 /// unsupported languages, `Some(true)` for valid, `Some(false)` for invalid.
 pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
     let lang = detect_language(path)?;
-    let grammar = grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return None;
-    }
-    let tree = parser.parse(content.as_bytes(), None)?;
+    let tree = parse_source_with_cached_parser(path, content, lang).ok()?;
     Some(!tree.root_node().has_error())
 }
 
@@ -529,8 +655,6 @@ pub fn auto_backup(
     Ok(backup_id)
 }
 
-/// Persist a regular-file capture that was already freshness-checked while
-/// creating the operation's rollback checkpoint.
 /// Attach the stable reason when an automatic snapshot for this mutation was skipped.
 pub fn attach_backup_skipped_reason(
     result: &mut serde_json::Value,
@@ -551,6 +675,8 @@ pub fn attach_backup_skipped_reason(
     }
 }
 
+/// Persist a regular-file capture that was already freshness-checked while
+/// creating the operation's rollback checkpoint.
 pub(crate) fn auto_backup_from_capture(
     ctx: &AppContext,
     session: &str,
@@ -598,6 +724,20 @@ pub fn compute_reformatted_excerpt(
     let post_lines: Vec<&str> = post_format.lines().collect();
     let mut collected: Vec<String> = Vec::new();
     let mut last_post_idx: Option<usize> = None;
+    let mut byte_count = 0usize;
+    let mut append_line = |collected: &mut Vec<String>, line: &str| {
+        let next_bytes = byte_count.saturating_add(line.len()).saturating_add(1);
+        if collected.len() >= REFORMATTED_EXCERPT_MAX_LINES
+            || next_bytes > REFORMATTED_EXCERPT_MAX_BYTES
+        {
+            return false;
+        }
+        byte_count = next_bytes;
+        #[cfg(test)]
+        EXCERPT_COPIED_LINES.with(|count| count.set(count.get() + 1));
+        collected.push(line.to_string());
+        true
+    };
 
     for group in diff.grouped_ops(2) {
         let mut group_start: Option<usize> = None;
@@ -624,25 +764,26 @@ pub fn compute_reformatted_excerpt(
 
         if let Some(prev) = last_post_idx {
             if start > prev + 1 {
-                collected.push("…".to_string());
+                if !append_line(&mut collected, "…") {
+                    return Some(ReformattedExcerpt {
+                        text: String::new(),
+                        extensive: true,
+                    });
+                }
             }
         }
 
         for idx in start..=end {
             if idx < post_lines.len() {
-                collected.push(post_lines[idx].to_string());
+                if !append_line(&mut collected, post_lines[idx]) {
+                    return Some(ReformattedExcerpt {
+                        text: String::new(),
+                        extensive: true,
+                    });
+                }
             }
         }
         last_post_idx = Some(end);
-    }
-
-    let line_count = collected.len();
-    let byte_count: usize = collected.iter().map(|l| l.len() + 1).sum();
-    if line_count > REFORMATTED_EXCERPT_MAX_LINES || byte_count > REFORMATTED_EXCERPT_MAX_BYTES {
-        return Some(ReformattedExcerpt {
-            text: String::new(),
-            extensive: true,
-        });
     }
 
     Some(ReformattedExcerpt {
@@ -930,7 +1071,7 @@ fn write_format_validate_impl(
 
     let _view_intent = crate::views::intent::record_paths([path]);
     // Step 1: Write
-    std::fs::write(path, content).map_err(|e| AftError::InvalidRequest {
+    atomic_write_source(path, content.as_bytes()).map_err(|e| AftError::InvalidRequest {
         message: format!("failed to write file: {}", e),
     })?;
 
@@ -947,8 +1088,10 @@ fn write_format_validate_impl(
         .and_then(|source| validate_captured_syntax(path, source));
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
-            std::fs::write(path, original.as_bytes()).map_err(|e| AftError::InvalidRequest {
-                message: format!("failed to roll back invalid edit: {}", e),
+            atomic_write_source(path, original.as_bytes()).map_err(|e| {
+                AftError::InvalidRequest {
+                    message: format!("failed to roll back invalid edit: {}", e),
+                }
             })?;
             true
         } else {
@@ -1010,6 +1153,8 @@ fn validate_captured_syntax(path: &Path, source: &str) -> Option<bool> {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static LINE_OFFSET_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXCERPT_COPIED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WRITE_PIPELINE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static A03_DIFF_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static A03_LINE_INDEX_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1458,5 +1603,85 @@ mod tests {
         let mut_borrow = "fn main() {\n    let mut x = 5u32;\n    let _p = &raw mut x;\n}\n";
         assert_eq!(validate_syntax_str(const_borrow, path), Some(true));
         assert_eq!(validate_syntax_str(mut_borrow, path), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn excerpt_caps_bound_owned_line_construction() {
+        EXCERPT_COPIED_LINES.with(|count| count.set(0));
+        let before = "old\n".repeat(80);
+        let after = "new\n".repeat(80);
+        let excerpt = compute_reformatted_excerpt(&before, &after).unwrap();
+        assert!(excerpt.extensive);
+        assert!(excerpt.text.is_empty());
+        assert!(EXCERPT_COPIED_LINES.with(|count| count.get()) <= REFORMATTED_EXCERPT_MAX_LINES);
+    }
+
+    #[test]
+    fn atomic_source_write_failure_preserves_every_original_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let original = b"\xef\xbb\xbfexisting\r\n\xfflast";
+        std::fs::write(&path, original).unwrap();
+        let result = atomic_write_source_with(&path, b"new\r\n", |file, _| {
+            use std::io::Write;
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn syntax_validation_reuses_one_loaded_grammar() {
+        crate::parser::work_counters::GRAMMAR_LOADS.with(|count| count.set(0));
+        assert_eq!(
+            validate_syntax_str("let x = 1;", Path::new("a.ts")),
+            Some(true)
+        );
+        assert_eq!(
+            validate_syntax_str("function {", Path::new("a.ts")),
+            Some(false)
+        );
+        assert_eq!(crate::parser::work_counters::grammar_loads(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_and_syntax_rollback_replace_instead_of_truncating() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.ts");
+        let original = b"\xef\xbb\xbflet x = 1;\r\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let held_original = std::fs::File::open(&path).unwrap();
+        let inode = held_original.metadata().unwrap().ino();
+        let config = Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        let updated = "\u{feff}let x = 2;\r\n";
+        let result =
+            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+        assert!(!result.rolled_back);
+        assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        let held_updated = std::fs::File::open(&path).unwrap();
+        let inode = held_updated.metadata().unwrap().ino();
+        let result =
+            write_format_validate(&path, "function {", &config, &serde_json::json!({})).unwrap();
+        assert!(result.rolled_back);
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
     }
 }

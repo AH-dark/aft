@@ -236,6 +236,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     // bytes and must remain registered even though they are not list payloads.
     files_to_scan.push(src_dir.join("url_fetch.rs"));
     files_to_scan.push(src_dir.join("response_finalize.rs"));
+    files_to_scan.push(src_dir.join("edit.rs"));
     // 4. crates/aft/src/compress/**
     files_to_scan.extend(collect_rs_files(&src_dir.join("compress")));
 
@@ -250,6 +251,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         "skipped_foreign_mounts",
         "collection_truncated",
         "MAX_DISPLAY_",
+        "REFORMATTED_EXCERPT_MAX_",
     ];
 
     let mut discovered = Vec::new();
