@@ -2198,7 +2198,10 @@ impl RefreshWorker {
                 },
             );
         }
-        self.shared.wake.notify_one();
+        // The worker, drain waiters and shutdown share one condvar with
+        // different predicates; wake them all so a notification can never be
+        // consumed by a waiter that is not the one the change concerns.
+        self.shared.wake.notify_all();
         true
     }
 
@@ -2210,7 +2213,7 @@ impl RefreshWorker {
             .lock()
             .expect("callgraph refresh queue mutex poisoned");
         queue.shutdown_requested = true;
-        self.shared.wake.notify_one();
+        self.shared.wake.notify_all();
         while (queue.active.is_some() || !queue.order.is_empty()) && Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let (next, _) = self
@@ -2544,6 +2547,45 @@ fn idle_checkpoint_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= REFRESH_IDLE_CHECKPOINT_INTERVAL)
 }
 
+/// Clears the worker's active batch when processing ends, including during
+/// unwinding, so drain waiters and shutdown never wait on a batch that no
+/// thread is processing any more.
+struct ActiveRefreshBatchGuard<'a> {
+    shared: &'a RefreshWorkerShared,
+    released: bool,
+}
+
+impl ActiveRefreshBatchGuard<'_> {
+    fn release(&mut self) -> bool {
+        // This also runs while unwinding; panicking again on a poisoned queue
+        // would abort the process instead of releasing the batch.
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(active) = queue.active.take() {
+            if std::thread::panicking() {
+                active.defer();
+            }
+            // Release catch-up keepalives before publishing idle to waiters.
+            drop(active);
+        }
+        let became_idle = queue.order.is_empty();
+        self.shared.wake.notify_all();
+        self.released = true;
+        became_idle
+    }
+}
+
+impl Drop for ActiveRefreshBatchGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.release();
+        }
+    }
+}
+
 fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
     // The worker owns these caches so maps are shared only by refreshes for the
     // same canonical root and disappear when the worker shuts down.
@@ -2574,19 +2616,49 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
             }
         };
 
-        let store = process_callgraph_refresh_batch(&batch, &mut workspace_crate_prefixes);
+        let mut active = ActiveRefreshBatchGuard {
+            shared,
+            released: false,
+        };
+        let store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_callgraph_refresh_batch(&batch, &mut workspace_crate_prefixes)
+        }))
+        .unwrap_or_else(|_| {
+            batch.defer();
+            workspace_crate_prefixes.remove(&batch.root);
+            // The failed batch's store and transaction have unwound. Open a
+            // fresh connection rather than recovering its poisoned mutex.
+            crate::slog_warn!("callgraph refresh batch panicked; deferred paths for replay");
+            let store = CallGraphStore::open_ready(
+                batch.root.callgraph_dir.clone(),
+                batch.root.project_root.clone(),
+            )
+            .ok()
+            .flatten();
+            if let Some(store) = &store {
+                let paths = batch
+                    .paths
+                    .iter()
+                    .filter(|path| {
+                        crate::parser::detect_language(path).is_some()
+                            && !batch.path_is_ignored(path)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Err(error) = store.mark_files_stale(&paths) {
+                    crate::slog_warn!(
+                        "failed to mark callgraph store files stale after refresh panic: {}",
+                        error
+                    );
+                }
+            }
+            store
+        });
         let root = batch.root.clone();
         // Release catch-up tickets before publishing idle to event waiters.
         drop(batch);
 
-        let mut queue = shared
-            .queue
-            .lock()
-            .expect("callgraph refresh queue mutex poisoned");
-        queue.active = None;
-        let became_idle = queue.order.is_empty();
-        shared.wake.notify_all();
-        drop(queue);
+        let became_idle = active.release();
 
         if became_idle {
             let checkpoint_due =
@@ -2600,6 +2672,10 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
             }
         }
     }
+}
+
+pub(crate) fn invalidate_refresh_workspace_package_cache(project_root: &Path) {
+    callgraph::clear_workspace_package_cache_under(project_root);
 }
 
 fn process_callgraph_refresh_batch(
@@ -2621,7 +2697,7 @@ fn process_callgraph_refresh_batch(
         .iter()
         .any(|path| invalidates_workspace_package_cache(path))
     {
-        callgraph::clear_workspace_package_cache();
+        invalidate_refresh_workspace_package_cache(&batch.root.project_root);
     }
 
     let paths = batch
@@ -2681,6 +2757,19 @@ fn process_callgraph_refresh_batch(
             return None;
         }
     };
+    #[cfg(test)]
+    {
+        let panic_once = REFRESH_WORKER_TEST_SEAMS.get().is_some_and(|seams| {
+            let mut seams = seams.lock().unwrap();
+            seams
+                .get_mut(&batch.root.project_root)
+                .is_some_and(|seam| std::mem::take(&mut seam.panic_once))
+        });
+        if panic_once {
+            let _conn = store.conn.lock().unwrap();
+            panic!("injected refresh failure while holding the store connection");
+        }
+    }
     if !test_seam.delay.is_zero() {
         std::thread::sleep(test_seam.delay);
     }
@@ -2735,7 +2824,17 @@ fn process_callgraph_refresh_batch(
     }
     if let Err(error) = refresh_result {
         crate::slog_warn!("callgraph store refresh failed: {}", error);
-        match store.mark_files_stale(&paths) {
+        #[cfg(test)]
+        let marked = if test_seam.fail_stale_mark {
+            Err(CallGraphStoreError::Unavailable(
+                "injected stale-mark failure".to_string(),
+            ))
+        } else {
+            store.mark_files_stale(&paths)
+        };
+        #[cfg(not(test))]
+        let marked = store.mark_files_stale(&paths);
+        match marked {
             Ok(marked) => {
                 note_refresh_worker_stale_mark_for_test(&batch.root.project_root);
                 crate::slog_warn!(
@@ -2743,10 +2842,15 @@ fn process_callgraph_refresh_batch(
                     marked.len()
                 );
             }
-            Err(mark_error) => crate::slog_warn!(
-                "failed to mark callgraph store files stale after refresh failure: {}",
-                mark_error
-            ),
+            Err(mark_error) => {
+                crate::slog_warn!(
+                    "failed to mark callgraph store files stale after refresh failure: {}",
+                    mark_error
+                );
+                // Neither refreshed nor marked stale, the paths would otherwise
+                // vanish until another edit. Park them for replay instead.
+                batch.defer();
+            }
         }
     } else {
         crate::logging::note_callgraph_invalidations(paths.len());
@@ -2769,6 +2873,10 @@ fn workspace_crate_prefix_cache_for_root(
 
 #[derive(Clone, Default)]
 struct RefreshWorkerTestSeam {
+    #[cfg(test)]
+    panic_once: bool,
+    #[cfg(test)]
+    fail_stale_mark: bool,
     delay: Duration,
     fail_refresh: bool,
     fail_open: bool,
@@ -3297,6 +3405,13 @@ pub struct StoreNode {
     pub lang: LangId,
 }
 
+impl StoreNode {
+    /// The positional node identity, for request-local memo keys.
+    pub(crate) fn node_id(&self) -> &str {
+        &self.node_id
+    }
+}
+
 #[cfg(test)]
 impl StoreNode {
     pub(crate) fn for_test(file: &str, symbol: &str, is_entry_point: bool) -> Self {
@@ -3814,12 +3929,63 @@ struct DiskProjectIndex<'a> {
 #[derive(Default)]
 struct DiskIndexMemos {
     file_indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
+    file_index_order: RefCell<VecDeque<String>>,
     /// Target file -> first `(declaring file, module path)` naming it, in
     /// `(caller_file, module_path)` order, built by one scan of the module
     /// references on first use.
     module_parents: RefCell<Option<Rc<HashMap<String, (String, String)>>>>,
     /// Every stored Rust file, in path order.
     rust_files: RefCell<Option<Rc<Vec<String>>>>,
+    /// The first SQLite error a resolver lookup hit. Lookups run inside
+    /// resolution callbacks that cannot return errors, so the cold build
+    /// checks this before committing each window; otherwise a failed read
+    /// would be stored as "no target found" and published as ready.
+    lookup_error: RefCell<Option<rusqlite::Error>>,
+}
+
+impl DiskIndexMemos {
+    fn record<T>(&self, result: rusqlite::Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.lookup_error.borrow_mut().get_or_insert(error);
+                None
+            }
+        }
+    }
+
+    fn take_lookup_error(&self) -> Option<rusqlite::Error> {
+        self.lookup_error.borrow_mut().take()
+    }
+
+    /// Fail a resolution window whose lookups hit a database error.
+    fn ensure_lookups_succeeded(&self) -> Result<()> {
+        match self.take_lookup_error() {
+            Some(error) => Err(CallGraphStoreError::Sqlite(error)),
+            None => Ok(()),
+        }
+    }
+
+    fn cache_file_index(&self, caller_file: &str, rel_path: &str, loaded: Option<Rc<DbFileIndex>>) {
+        let mut memo = self.file_indexes.borrow_mut();
+        let mut order = self.file_index_order.borrow_mut();
+        if !memo.contains_key(rel_path) {
+            // Evict just the oldest target, keeping the active caller pinned.
+            // A broad resolution window must not discard the entire hot set.
+            while memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
+                let oldest = order
+                    .pop_front()
+                    .expect("full file-index memo has an entry");
+                if oldest == caller_file {
+                    order.push_back(oldest);
+                } else {
+                    memo.remove(&oldest);
+                }
+            }
+            order.push_back(rel_path.to_string());
+        }
+        memo.insert(rel_path.to_string(), loaded);
+    }
 }
 
 impl DiskProjectIndex<'_> {
@@ -3832,87 +3998,24 @@ impl DiskProjectIndex<'_> {
 
         let loaded = self.load_file_index(rel_path).map(Rc::new);
         if self.memoize_resolver_indexes {
-            let mut memo = self.memos.file_indexes.borrow_mut();
-            if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
-                // Keep the active caller's index hot even when an unusually broad
-                // resolution walk exhausts the bounded target-file memo.
-                let caller_index = memo.remove(self.caller_file);
-                memo.clear();
-                if let Some(caller_index) = caller_index {
-                    memo.insert(self.caller_file.to_string(), caller_index);
-                }
-            }
-            memo.insert(rel_path.to_string(), loaded.clone());
+            self.memos
+                .cache_file_index(self.caller_file, rel_path, loaded.clone());
         }
         loaded
     }
 
     fn load_file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
-        let lang: String = self
-            .conn
-            .prepare_cached("SELECT lang FROM files WHERE path = ?1")
-            .ok()?
-            .query_row(params![rel_path], |row| row.get(0))
-            .optional()
-            .ok()??;
+        let (lang, node_rows, ref_rows) =
+            self.memos.record(self.read_file_index_rows(rel_path))??;
         let mut index = DbFileIndex::empty(lang_from_label(&lang));
-        let mut nodes = self
-            .conn
-            .prepare_cached(
-                "SELECT id, name, scoped_name, kind, exported, is_default_export
-                 FROM nodes WHERE file_path = ?1 ORDER BY scoped_name, id",
-            )
-            .ok()?;
-        let rows = nodes
-            .query_map(params![rel_path], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, i64>(5)? != 0,
-                ))
-            })
-            .ok()?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .ok()?;
-        drop(nodes);
-        for (id, name, scoped_name, kind, exported, is_default_export) in rows {
+        for (id, name, scoped_name, kind, exported, is_default_export) in node_rows {
             index.note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
         }
-
-        let mut refs = self
-            .conn
-            .prepare_cached(
-                "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
-                  FROM refs
-                  WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')
-                  ORDER BY byte_start, byte_end, ref_id",
-            )
-            .ok()?;
-        let rows = refs
-            .query_map(params![rel_path], |row| {
-                Ok(module_index_ref(
-                    row.get::<_, String>(0)?,
-                    rel_path.to_string(),
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)? != 0,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })
-            .ok()?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .ok()?;
-        drop(refs);
         let facts = FactPaths {
             root: self.project_root,
             facts: &DiskFacts::new(self.project_root),
         };
-        for raw in rows {
+        for raw in ref_rows {
             index.note_module_ref(
                 self.project_root,
                 rel_path,
@@ -3925,20 +4028,83 @@ impl DiskProjectIndex<'_> {
         Some(index)
     }
 
+    #[allow(clippy::type_complexity)]
+    fn read_file_index_rows(
+        &self,
+        rel_path: &str,
+    ) -> rusqlite::Result<
+        Option<(
+            String,
+            Vec<(String, String, String, String, bool, bool)>,
+            Vec<RawRef>,
+        )>,
+    > {
+        let Some(lang) = self
+            .conn
+            .prepare_cached("SELECT lang FROM files WHERE path = ?1")?
+            .query_row(params![rel_path], |row| row.get::<_, String>(0))
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let node_rows = self
+            .conn
+            .prepare_cached(
+                "SELECT id, name, scoped_name, kind, exported, is_default_export
+                 FROM nodes WHERE file_path = ?1 ORDER BY scoped_name, id",
+            )?
+            .query_map(params![rel_path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let ref_rows = self
+            .conn
+            .prepare_cached(
+                "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
+                  FROM refs
+                  WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')
+                  ORDER BY byte_start, byte_end, ref_id",
+            )?
+            .query_map(params![rel_path], |row| {
+                Ok(module_index_ref(
+                    row.get::<_, String>(0)?,
+                    rel_path.to_string(),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Some((lang, node_rows, ref_rows)))
+    }
+
     fn module_refs(&self) -> Vec<(String, String)> {
-        let Ok(mut stmt) = self.conn.prepare_cached(
-            "SELECT caller_file, module_path FROM refs
-             WHERE kind = 'module' AND module_path IS NOT NULL
-             ORDER BY caller_file, module_path",
-        ) else {
-            return Vec::new();
-        };
-        let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }) else {
-            return Vec::new();
-        };
-        rows.flatten().collect()
+        self.memos
+            .record(
+                self.conn
+                    .prepare_cached(
+                        "SELECT caller_file, module_path FROM refs
+                         WHERE kind = 'module' AND module_path IS NOT NULL
+                         ORDER BY caller_file, module_path",
+                    )
+                    .and_then(|mut stmt| {
+                        stmt.query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                    }),
+            )
+            .unwrap_or_default()
     }
 
     fn load_module_parent(&self, target_file: &str) -> Option<(String, String)> {
@@ -3969,13 +4135,16 @@ impl DiskProjectIndex<'_> {
             return Rc::clone(files);
         }
         let files = self
-            .conn
-            .prepare_cached("SELECT path FROM files WHERE lang = 'rust' ORDER BY path")
-            .and_then(|mut statement| {
-                statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            })
+            .memos
+            .record(
+                self.conn
+                    .prepare_cached("SELECT path FROM files WHERE lang = 'rust' ORDER BY path")
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map([], |row| row.get::<_, String>(0))?
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    }),
+            )
             .unwrap_or_default();
         let files = Rc::new(files);
         *self.memos.rust_files.borrow_mut() = Some(Rc::clone(&files));
@@ -4042,9 +4211,12 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
 
     fn contains_file(&self, file: &str) -> bool {
-        self.conn
-            .prepare_cached("SELECT 1 FROM files WHERE path = ?1 LIMIT 1")
-            .and_then(|mut statement| statement.exists(params![file]))
+        self.memos
+            .record(
+                self.conn
+                    .prepare_cached("SELECT 1 FROM files WHERE path = ?1 LIMIT 1")
+                    .and_then(|mut statement| statement.exists(params![file])),
+            )
             .unwrap_or(false)
     }
 
@@ -4113,21 +4285,18 @@ impl ResolverIndex for DiskProjectIndex<'_> {
                 .filter(|path| path.as_str() != caller_file)
                 .find_map(|path| check(path.clone()));
         }
-        let mut statement = self
-            .conn
-            .prepare_cached(
-                "SELECT path FROM files WHERE lang = 'rust' AND path <> ?1 ORDER BY path",
-            )
-            .ok()?;
-        let rows = statement
-            .query_map(params![caller_file], |row| row.get::<_, String>(0))
-            .ok()?;
-        for path in rows.flatten() {
-            if let Some(target) = check(path) {
-                return Some(target);
-            }
-        }
-        None
+        let paths = self.memos.record(
+            self.conn
+                .prepare_cached(
+                    "SELECT path FROM files WHERE lang = 'rust' AND path <> ?1 ORDER BY path",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_map(params![caller_file], |row| row.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                }),
+        )?;
+        paths.into_iter().find_map(check)
     }
 }
 
@@ -5492,6 +5661,7 @@ impl CallGraphStore {
                     offset = end;
                 }
             }
+            index_memos.ensure_lookups_succeeded()?;
             set_staged_u64(&tx, STAGED_RESOLVE_CURSOR, last_rowid)?;
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
@@ -5890,9 +6060,12 @@ impl CallGraphStore {
             }
             resolution_importers = importers;
         }
+        // Time only the created-file scan here; the configuration selection
+        // above belongs to dependency selection, which `started` still covers.
+        let created_started = Instant::now();
         let (created_importers, created_reexporters) =
             importers_of_created_files(&conn, &self.project_root, &created)?;
-        profile.created_file_scan = started.elapsed();
+        profile.created_file_scan = created_started.elapsed();
         for (file, importers) in &created_importers {
             for importer in importers {
                 record_dependent_refs(
@@ -6263,10 +6436,6 @@ impl CallGraphStore {
         ))
     }
 
-    pub fn refresh_corpus(&self, current_files: &[PathBuf]) -> Result<ColdBuildStats> {
-        self.cold_build(current_files)
-    }
-
     pub fn mark_files_stale(&self, files: &[PathBuf]) -> Result<Vec<String>> {
         self.verify_writer_lease()?;
         let _writer = self
@@ -6494,10 +6663,9 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
         let effective_depth = depth.max(1);
-        let mut visited = HashSet::new();
+        let mut visited = HashMap::new();
         let mut callers = Vec::new();
-        let mut depth_limited = false;
-        let mut truncated = 0usize;
+        let mut boundary = BTreeSet::new();
         collect_callers_recursive(
             &conn,
             &target.file,
@@ -6506,9 +6674,18 @@ impl CallGraphStore {
             0,
             &mut visited,
             &mut callers,
-            &mut depth_limited,
-            &mut truncated,
+            &mut boundary,
         )?;
+        // `boundary` holds the callers found at the depth limit, whose own
+        // callers were not listed. Count those omitted callers once per
+        // boundary symbol (the batched count merges edges that share a caller
+        // file and line), skipping symbols a shorter path did expand.
+        boundary.retain(|key| !visited.contains_key(key));
+        let boundary = boundary.into_iter().collect::<Vec<_>>();
+        let truncated = direct_caller_counts_for_tuples(&conn, &boundary)?
+            .into_values()
+            .sum::<usize>();
+        let depth_limited = truncated > 0;
         Ok(StoreCallersResult {
             target,
             callers,
@@ -6674,6 +6851,16 @@ impl CallGraphStore {
         symbol: &str,
         max_depth: usize,
     ) -> Result<callgraph::TraceToResult> {
+        self.trace_to_with_budget(file_rel, symbol, max_depth, STORE_TRACE_TO_EXPANSION_BUDGET)
+    }
+
+    fn trace_to_with_budget(
+        &self,
+        file_rel: &Path,
+        symbol: &str,
+        max_depth: usize,
+        expansion_budget: usize,
+    ) -> Result<callgraph::TraceToResult> {
         let target = self.node_for(file_rel, symbol)?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         self.ensure_ready(&conn)?;
@@ -6695,12 +6882,21 @@ impl CallGraphStore {
         let mut queue = vec![(initial, 0usize)];
         let mut max_depth_reached = false;
         let mut truncated_paths = 0usize;
+        let mut expansions = 0usize;
 
         while let Some((path, depth)) = queue.pop() {
             if depth >= effective_max {
                 max_depth_reached = true;
                 continue;
             }
+            if expansions >= expansion_budget {
+                // Simple-path enumeration is exponential in a dense graph.
+                // Paths left unexpanded never reached an entry point, so they
+                // are reported as truncated rather than silently dropped.
+                truncated_paths += 1 + queue.len();
+                break;
+            }
+            expansions += 1;
             let Some(current) = path.last() else {
                 continue;
             };
@@ -7777,27 +7973,29 @@ fn collect_callers_recursive(
     symbol: &str,
     max_depth: usize,
     current_depth: usize,
-    visited: &mut HashSet<(String, String)>,
+    visited: &mut HashMap<(String, String), usize>,
     result: &mut Vec<StoreCallSite>,
-    depth_limited: &mut bool,
-    truncated: &mut usize,
+    boundary: &mut BTreeSet<(String, String)>,
 ) -> Result<()> {
+    let key = (file.to_string(), symbol.to_string());
     if current_depth >= max_depth {
-        let omitted = direct_caller_count_for_tuple(conn, file, symbol)?;
-        if omitted > 0 {
-            *depth_limited = true;
-            *truncated += omitted;
-        }
+        boundary.insert(key);
         return Ok(());
     }
 
-    if !visited.insert((file.to_string(), symbol.to_string())) {
+    if visited.get(&key).is_some_and(|best| *best <= current_depth) {
         return Ok(());
     }
+    // A symbol reached again by a shorter path has more depth left before the
+    // limit than on its first visit. List its call sites only once, but walk
+    // its callers again so the extra depth is not lost.
+    let first_visit = visited.insert(key, current_depth).is_none();
 
     let sites = direct_callers_for_tuple(conn, file, symbol)?;
     for site in sites {
-        result.push(site.clone());
+        if first_visit {
+            result.push(site.clone());
+        }
         if current_depth + 1 < max_depth {
             collect_callers_recursive(
                 conn,
@@ -7807,20 +8005,22 @@ fn collect_callers_recursive(
                 current_depth + 1,
                 visited,
                 result,
-                depth_limited,
-                truncated,
+                boundary,
             )?;
         } else {
-            let omitted =
-                direct_caller_count_for_tuple(conn, &site.caller.file, &site.caller.symbol)?;
-            if omitted > 0 {
-                *depth_limited = true;
-                *truncated += omitted;
-            }
+            // This caller sits at the depth limit, so its own callers are
+            // omitted. Record it; the omitted callers are counted after the
+            // traversal, once it is known whether a shorter path expanded it.
+            boundary.insert((site.caller.file.clone(), site.caller.symbol.clone()));
         }
     }
     Ok(())
 }
+
+/// How many paths one store `trace_to` may extend by a caller lookup before it
+/// stops; the same limit as the command adapter's trace, so both enumerations
+/// of caller paths do at most the same amount of work.
+const STORE_TRACE_TO_EXPANSION_BUDGET: usize = 10_000;
 
 // Each target uses two parameters; 499 stays below SQLite's legacy 999-variable limit.
 const DIRECT_CALLER_BATCH_SIZE: usize = 499;
@@ -7879,6 +8079,9 @@ fn direct_caller_counts_for_tuples(
     Ok(counts)
 }
 
+/// Raw per-edge count, kept for the test that checks it against the full
+/// direct-caller fetch; depth boundaries use the grouped batch count.
+#[cfg(test)]
 fn direct_caller_count_for_tuple(
     conn: &Connection,
     target_file: &str,
@@ -8089,16 +8292,21 @@ fn outgoing_calls_for_symbol_tuples(
         calls_by_source.insert(source.clone(), calls);
     }
 
-    // Resolve each logical target once for the whole frontier. Keeping this separate
-    // preserves positional-symbol representatives without a correlated lookup per edge.
+    // The query already joined each edge to the exact node it targets; keep
+    // that node. Only edges with no joined node fall back to the first node
+    // found by target file and symbol name.
     let target_tuples = calls_by_source
         .values()
         .flatten()
+        .filter(|call| call.target.is_none())
         .map(|call| (call.target_file.clone(), call.target_symbol.clone()))
         .collect::<Vec<_>>();
     let target_nodes = nodes_for_symbol_tuples(conn, &target_tuples)?;
     for calls in calls_by_source.values_mut() {
         for call in calls {
+            if call.target.is_some() {
+                continue;
+            }
             if let Some(target) = target_nodes
                 .get(&(call.target_file.clone(), call.target_symbol.clone()))
                 .and_then(|nodes| nodes.first())
@@ -9631,9 +9839,6 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             provenance                 TEXT NOT NULL,
             UNIQUE(file_path, start_line, start_col, end_line, end_col, range_ordinal)
         );
-        CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
-        CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
-        CREATE INDEX IF NOT EXISTS idx_nodes_scoped ON nodes(scoped_name);
 
         CREATE TABLE IF NOT EXISTS refs (
             ref_id          TEXT PRIMARY KEY,
@@ -9657,18 +9862,12 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             target_symbol   TEXT,
             provenance      TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_refs_short_name ON refs(short_name);
-        CREATE INDEX IF NOT EXISTS idx_refs_kind_caller_file ON refs(kind, caller_file);
-        CREATE INDEX IF NOT EXISTS idx_refs_caller_file ON refs(caller_file);
-        CREATE INDEX IF NOT EXISTS idx_refs_caller_node_kind ON refs(caller_node, kind, status);
-        CREATE INDEX IF NOT EXISTS idx_refs_target_file ON refs(target_file);
 
         CREATE TABLE IF NOT EXISTS file_dependencies (
             file_path   TEXT NOT NULL,
             dep_file    TEXT NOT NULL,
             PRIMARY KEY(file_path, dep_file)
         );
-        CREATE INDEX IF NOT EXISTS idx_file_dependencies_dep_file ON file_dependencies(dep_file);
 
         CREATE TABLE IF NOT EXISTS edges (
             edge_id       TEXT PRIMARY KEY,
@@ -9681,10 +9880,6 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             line          INTEGER NOT NULL,
             provenance    TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_node, kind);
-        CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_node, kind);
-        CREATE INDEX IF NOT EXISTS idx_edges_target_file_symbol ON edges(target_file, target_symbol, kind);
-        CREATE INDEX IF NOT EXISTS idx_edges_ref_id ON edges(ref_id, kind);
 
         CREATE TABLE IF NOT EXISTS dispatch_hints (
             id           TEXT PRIMARY KEY,
@@ -9696,8 +9891,6 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             byte_end     INTEGER NOT NULL,
             provenance   TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_dispatch_hints_method ON dispatch_hints(method_name);
-        CREATE INDEX IF NOT EXISTS idx_dispatch_hints_file ON dispatch_hints(file);
 
         CREATE TABLE IF NOT EXISTS type_ref_names (
             name TEXT PRIMARY KEY
@@ -9720,7 +9913,6 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             updated_at     INTEGER NOT NULL,
             PRIMARY KEY(backend, workspace_root, file_path, content_hash)
         );
-        CREATE INDEX IF NOT EXISTS idx_backend_file_state_file ON backend_file_state(file_path, backend);
 
         CREATE TABLE IF NOT EXISTS meta (
             k TEXT PRIMARY KEY,
@@ -9742,6 +9934,7 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             caller_symbol TEXT
         );",
     )?;
+    conn.execute_batch(&create_secondary_indexes_sql())?;
     insert_meta(conn)?;
     Ok(())
 }
@@ -10304,47 +10497,60 @@ fn staged_files_with_status(conn: &Connection, status: &str) -> Result<Vec<Strin
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+/// Secondary indexes of the store, as `(name, target)`. Schema setup creates
+/// them, and a cold build drops them before its bulk insert and recreates them
+/// afterwards; one list keeps all three in agreement.
+const SECONDARY_INDEXES: &[(&str, &str)] = &[
+    ("idx_nodes_file", "nodes(file_path)"),
+    ("idx_nodes_name", "nodes(name)"),
+    ("idx_nodes_scoped", "nodes(scoped_name)"),
+    ("idx_refs_short_name", "refs(short_name)"),
+    ("idx_refs_kind_caller_file", "refs(kind, caller_file)"),
+    ("idx_refs_caller_file", "refs(caller_file)"),
+    (
+        "idx_refs_caller_node_kind",
+        "refs(caller_node, kind, status)",
+    ),
+    ("idx_refs_target_file", "refs(target_file)"),
+    (
+        "idx_file_dependencies_dep_file",
+        "file_dependencies(dep_file)",
+    ),
+    ("idx_edges_source_kind", "edges(source_node, kind)"),
+    ("idx_edges_target_kind", "edges(target_node, kind)"),
+    (
+        "idx_edges_target_file_symbol",
+        "edges(target_file, target_symbol, kind)",
+    ),
+    ("idx_edges_ref_id", "edges(ref_id, kind)"),
+    ("idx_dispatch_hints_method", "dispatch_hints(method_name)"),
+    ("idx_dispatch_hints_file", "dispatch_hints(file)"),
+    (
+        "idx_backend_file_state_file",
+        "backend_file_state(file_path, backend)",
+    ),
+];
+
+fn create_secondary_indexes_sql() -> String {
+    SECONDARY_INDEXES
+        .iter()
+        .map(|(name, target)| format!("CREATE INDEX IF NOT EXISTS {name} ON {target};"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        "DROP INDEX IF EXISTS idx_nodes_file;
-         DROP INDEX IF EXISTS idx_nodes_name;
-         DROP INDEX IF EXISTS idx_nodes_scoped;
-         DROP INDEX IF EXISTS idx_refs_short_name;
-         DROP INDEX IF EXISTS idx_refs_kind_caller_file;
-         DROP INDEX IF EXISTS idx_refs_caller_file;
-         DROP INDEX IF EXISTS idx_refs_caller_node_kind;
-         DROP INDEX IF EXISTS idx_refs_target_file;
-         DROP INDEX IF EXISTS idx_file_dependencies_dep_file;
-         DROP INDEX IF EXISTS idx_edges_source_kind;
-         DROP INDEX IF EXISTS idx_edges_target_kind;
-         DROP INDEX IF EXISTS idx_edges_target_file_symbol;
-         DROP INDEX IF EXISTS idx_edges_ref_id;
-         DROP INDEX IF EXISTS idx_dispatch_hints_method;
-         DROP INDEX IF EXISTS idx_dispatch_hints_file;
-         DROP INDEX IF EXISTS idx_backend_file_state_file;",
-    )?;
+    let sql = SECONDARY_INDEXES
+        .iter()
+        .map(|(name, _)| format!("DROP INDEX IF EXISTS {name};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tx.execute_batch(&sql)?;
     Ok(())
 }
 
 fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
-    tx.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
-         CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
-         CREATE INDEX IF NOT EXISTS idx_nodes_scoped ON nodes(scoped_name);
-         CREATE INDEX IF NOT EXISTS idx_refs_short_name ON refs(short_name);
-         CREATE INDEX IF NOT EXISTS idx_refs_kind_caller_file ON refs(kind, caller_file);
-         CREATE INDEX IF NOT EXISTS idx_refs_caller_file ON refs(caller_file);
-         CREATE INDEX IF NOT EXISTS idx_refs_caller_node_kind ON refs(caller_node, kind, status);
-         CREATE INDEX IF NOT EXISTS idx_refs_target_file ON refs(target_file);
-         CREATE INDEX IF NOT EXISTS idx_file_dependencies_dep_file ON file_dependencies(dep_file);
-         CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_node, kind);
-         CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_node, kind);
-         CREATE INDEX IF NOT EXISTS idx_edges_target_file_symbol ON edges(target_file, target_symbol, kind);
-         CREATE INDEX IF NOT EXISTS idx_edges_ref_id ON edges(ref_id, kind);
-         CREATE INDEX IF NOT EXISTS idx_dispatch_hints_method ON dispatch_hints(method_name);
-         CREATE INDEX IF NOT EXISTS idx_dispatch_hints_file ON dispatch_hints(file);
-         CREATE INDEX IF NOT EXISTS idx_backend_file_state_file ON backend_file_state(file_path, backend);",
-    )?;
+    tx.execute_batch(&create_secondary_indexes_sql())?;
     Ok(())
 }
 
@@ -20194,6 +20400,339 @@ mod refresh_worker_tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn schema_and_cold_build_share_one_secondary_index_list() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let index_names = |conn: &rusqlite::Connection| {
+            conn.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap()
+        };
+        let expected = SECONDARY_INDEXES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(index_names(&conn), expected);
+        let tx = conn.transaction().unwrap();
+        drop_cold_build_secondary_indexes(&tx).unwrap();
+        tx.commit().unwrap();
+        assert!(index_names(&conn).is_empty());
+        let tx = conn.transaction().unwrap();
+        create_cold_build_secondary_indexes(&tx).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(index_names(&conn), expected);
+    }
+
+    #[test]
+    fn disk_index_lookup_failure_fails_the_resolution_window() {
+        // No schema: every resolver lookup fails with a SQLite error.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let memos = DiskIndexMemos::default();
+        let module_memo = callgraph::ModuleResolutionMemo::default();
+        let caller_data = FileCallData {
+            calls_by_symbol: HashMap::new(),
+            value_refs_by_symbol: HashMap::new(),
+            macro_body_calls_by_macro: HashMap::new(),
+            macro_mentions_by_symbol: HashMap::new(),
+            exported_symbols: Vec::new(),
+            symbol_metadata: HashMap::new(),
+            default_export_symbol: None,
+            import_block: crate::imports::ImportBlock::empty(),
+            lang: LangId::TypeScript,
+        };
+        let index = DiskProjectIndex {
+            project_root: Path::new("/workspace"),
+            conn: &conn,
+            caller_file: "main.ts",
+            caller_data: &caller_data,
+            workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
+            module_resolution_memo: &module_memo,
+            memos: &memos,
+            memoize_resolver_indexes: true,
+        };
+        assert_eq!(index.module_target("main.ts", "./dep"), None);
+        assert!(
+            matches!(
+                memos.ensure_lookups_succeeded(),
+                Err(CallGraphStoreError::Sqlite(_))
+            ),
+            "a failed lookup must fail the window, not resolve as missing"
+        );
+        assert!(memos.ensure_lookups_succeeded().is_ok());
+        assert!(!index.contains_file("main.ts"));
+        assert!(memos.ensure_lookups_succeeded().is_err());
+    }
+
+    #[test]
+    fn admitting_one_disk_index_preserves_other_cached_targets() {
+        let memos = DiskIndexMemos::default();
+        memos.cache_file_index("caller.rs", "caller.rs", None);
+        for index in 1..DISK_FILE_INDEX_MEMO_CAPACITY {
+            memos.cache_file_index("caller.rs", &format!("target-{index}.rs"), None);
+        }
+        memos.cache_file_index("caller.rs", "new-target.rs", None);
+        let memo = memos.file_indexes.borrow();
+        assert_eq!(memo.len(), DISK_FILE_INDEX_MEMO_CAPACITY);
+        assert!(memo.contains_key("caller.rs"));
+        assert!(memo.contains_key("new-target.rs"));
+        assert!(memo.contains_key("target-2.rs"));
+    }
+
+    #[test]
+    fn batched_outgoing_preserves_joined_positional_target() {
+        let (_temp, root, callgraph_dir, _source) = ready_store_fixture();
+        let store = CallGraphStore::open_ready(callgraph_dir, root)
+            .unwrap()
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO nodes SELECT 'positional-target', file_path, name, scoped_name, kind,
+                 start_line + 100, start_col, end_line + 100, end_col, range_ordinal,
+                 signature, exported, is_default_export, is_type_like, is_callgraph_entry_point,
+                 provenance FROM nodes WHERE name = 'old_leaf';",
+            )
+            .unwrap();
+        }
+        let targets = store.nodes_for(Path::new("main.rs"), "old_leaf").unwrap();
+        assert_eq!(targets.len(), 2, "fixture has two positional targets");
+        let joined = &targets[1];
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE edges SET target_node = ?1 WHERE target_symbol = 'old_leaf'",
+                params![joined.node_id],
+            )
+            .unwrap();
+        }
+        let calls = store
+            .outgoing_calls_for_symbols(&[("main.rs".to_string(), "entry".to_string())])
+            .unwrap();
+        let sites = &calls[&("main.rs".to_string(), "entry".to_string())];
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].target.as_ref().unwrap().node_id, joined.node_id);
+    }
+
+    #[test]
+    fn refresh_failure_whose_stale_mark_fails_keeps_paths_for_replay() {
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, true);
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .fail_stale_mark = true;
+        let pending = pending_paths();
+        let worker = RefreshWorker::spawn();
+        worker.enqueue(
+            RefreshRoot {
+                callgraph_dir,
+                project_root: root.clone(),
+            },
+            vec![source.clone()],
+            pending.clone(),
+            vec![],
+            None,
+            None,
+        );
+        assert!(worker.shutdown_with_budget(Duration::from_secs(12)));
+        clear_callgraph_refresh_worker_test_seam(&root);
+        assert!(
+            pending.lock().contains(&source),
+            "a path neither refreshed nor marked stale must stay replayable"
+        );
+    }
+
+    #[test]
+    fn refresh_worker_recovers_after_a_batch_panics_with_a_poisoned_store() {
+        let (_first_temp, first_root, first_dir, first_source) = ready_store_fixture();
+        let (_second_temp, second_root, second_dir, second_source) = ready_store_fixture();
+        fs::write(
+            &second_source,
+            "fn entry() { new_leaf(); }\nfn new_leaf() {}\n",
+        )
+        .unwrap();
+        set_callgraph_refresh_worker_test_seam(first_root.clone(), Duration::ZERO, false);
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&first_root)
+            .unwrap()
+            .panic_once = true;
+        let (held, release) = install_callgraph_refresh_worker_test_gate(first_root.clone());
+        let pending = pending_paths();
+        let worker = RefreshWorker::spawn();
+        worker.enqueue(
+            RefreshRoot {
+                callgraph_dir: first_dir,
+                project_root: first_root.clone(),
+            },
+            vec![first_source.clone()],
+            pending.clone(),
+            vec![],
+            None,
+            None,
+        );
+        held.recv_timeout(Duration::from_secs(12))
+            .expect("first batch opened its store");
+        worker.enqueue(
+            RefreshRoot {
+                callgraph_dir: second_dir.clone(),
+                project_root: second_root.clone(),
+            },
+            vec![second_source],
+            pending_paths(),
+            vec![],
+            None,
+            None,
+        );
+        release.send(()).unwrap();
+        assert!(
+            worker.shutdown_with_budget(Duration::from_secs(12)),
+            "a panic must not strand the active batch or prevent draining the next batch"
+        );
+        assert!(worker.shared.queue.lock().unwrap().active.is_none());
+        assert!(
+            pending.lock().contains(&first_source),
+            "failed work remains replayable"
+        );
+        let store = CallGraphStore::open_readonly(second_dir, second_root)
+            .unwrap()
+            .unwrap();
+        let tree = store.call_tree(Path::new("main.rs"), "entry", 1).unwrap();
+        assert_eq!(tree.children[0].name, "new_leaf");
+        clear_callgraph_refresh_worker_test_seam(&first_root);
+    }
+
+    #[test]
+    fn trace_data_same_file_hops_spend_depth() {
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        fs::write(
+            &source,
+            "fn entry() {\n    let x = 1;\n    first(x);\n}\nfn first(p: i32) {\n    second(p);\n}\nfn second(q: i32) {\n    let _ = q;\n}\n",
+        )
+        .unwrap();
+        let store = CallGraphStore::open_ready(callgraph_dir, root)
+            .unwrap()
+            .unwrap();
+        store.refresh_files(std::slice::from_ref(&source)).unwrap();
+        let trace = |depth| {
+            crate::commands::callgraph_store_adapter::trace_data_result(
+                &store,
+                &source,
+                "entry",
+                "x",
+                depth,
+                Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+            )
+            .unwrap()
+        };
+        let reached = |result: &callgraph::TraceDataResult, variable: &str| {
+            result.hops.iter().any(|hop| hop.variable == variable)
+        };
+        let parses = &crate::commands::callgraph_store_adapter::TRACE_FILE_PARSES;
+        parses.with(|count| count.set(0));
+        let deep = trace(5);
+        assert!(
+            reached(&deep, "p") && reached(&deep, "q"),
+            "{:?}",
+            deep.hops
+        );
+        parses.with(|count| assert_eq!(count.get(), 1, "three hops in one file parse it once"));
+        assert!(!deep.depth_limited);
+        let shallow = trace(1);
+        assert!(reached(&shallow, "p"), "{:?}", shallow.hops);
+        assert!(
+            !reached(&shallow, "q"),
+            "the second local hop exceeds depth 1: {:?}",
+            shallow.hops
+        );
+        assert!(shallow.depth_limited);
+    }
+
+    #[test]
+    fn store_trace_to_stops_at_its_expansion_budget() {
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        fs::write(
+            &source,
+            "fn leaf() {}\nfn a() { leaf(); }\nfn b() { a(); }\nfn main() { b(); }\n",
+        )
+        .unwrap();
+        let store = CallGraphStore::open_ready(callgraph_dir, root)
+            .unwrap()
+            .unwrap();
+        store.refresh_files(std::slice::from_ref(&source)).unwrap();
+        let unbounded = store
+            .trace_to_with_budget(Path::new("main.rs"), "leaf", 10, usize::MAX)
+            .unwrap();
+        assert_eq!(unbounded.total_paths, 1, "{unbounded:?}");
+        let bounded = store
+            .trace_to_with_budget(Path::new("main.rs"), "leaf", 10, 1)
+            .unwrap();
+        assert_eq!(bounded.total_paths, 0);
+        assert_eq!(
+            bounded.truncated_paths, 1,
+            "the unexpanded path is reported"
+        );
+    }
+
+    #[test]
+    fn store_callers_count_each_boundary_caller_once() {
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        fs::write(
+            &source,
+            "fn target() {}\nfn shared() {\n    target();\n    target();\n}\nfn upstream() { shared(); }\n",
+        )
+        .unwrap();
+        let store = CallGraphStore::open_ready(callgraph_dir, root)
+            .unwrap()
+            .unwrap();
+        store.refresh_files(&[source]).unwrap();
+        let result = store.callers_of(Path::new("main.rs"), "target", 1).unwrap();
+        assert_eq!(result.callers.len(), 2, "both call sites are listed");
+        assert!(result.depth_limited);
+        assert_eq!(
+            result.truncated, 1,
+            "the single omitted caller of `shared` is counted once, not once per site"
+        );
+    }
+
+    #[test]
+    fn store_callers_reexpand_a_shallower_revisit_without_duplicate_sites() {
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
+        fs::write(&source, "fn target() {}\nfn deep() { target(); }\nfn middle() { deep(); }\nfn shared() { middle(); target(); }\nfn upstream() { shared(); }\nfn entry() { upstream(); }\n").unwrap();
+        let store = CallGraphStore::open_ready(callgraph_dir, root)
+            .unwrap()
+            .unwrap();
+        store.refresh_files(&[source]).unwrap();
+        let result = store.callers_of(Path::new("main.rs"), "target", 4).unwrap();
+        assert_eq!(
+            result
+                .callers
+                .iter()
+                .filter(|site| site.caller.symbol == "entry")
+                .count(),
+            1
+        );
+        let sites = result
+            .callers
+            .iter()
+            .map(|site| (&site.caller.file, site.line, site.byte_start))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(sites.len(), result.callers.len());
+    }
 
     fn ready_store_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let temp = tempdir().unwrap();

@@ -66,6 +66,55 @@ const RUST_DECLARED_MODULE_MEMO_MAX_RETAINED_BYTES: usize = 2 * 1024 * 1024;
 const MEMO_ENTRY_OVERHEAD_BYTES: usize = 128;
 
 type ModuleResolutionKey = (PathBuf, String);
+
+trait ModuleKeyParts {
+    fn parts(&self) -> (&Path, &str);
+}
+
+impl ModuleKeyParts for ModuleResolutionKey {
+    fn parts(&self) -> (&Path, &str) {
+        (&self.0, &self.1)
+    }
+}
+
+impl ModuleKeyParts for (&Path, &str) {
+    fn parts(&self) -> (&Path, &str) {
+        *self
+    }
+}
+
+// Owned and borrowed compound keys must hash the same path/string pair. The
+// borrowed trait object lets HashMap probe without constructing either owner.
+impl std::hash::Hash for dyn ModuleKeyParts + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.parts(), state);
+    }
+}
+
+impl PartialEq for dyn ModuleKeyParts + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn ModuleKeyParts + '_ {}
+
+impl<'a> std::borrow::Borrow<dyn ModuleKeyParts + 'a> for ModuleResolutionKey {
+    fn borrow(&self) -> &(dyn ModuleKeyParts + 'a) {
+        self
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWNED_MODULE_KEY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn owned_module_key(from_dir: &Path, module_path: &str) -> ModuleResolutionKey {
+    #[cfg(test)]
+    OWNED_MODULE_KEY_COUNT.with(|count| count.set(count.get() + 1));
+    (from_dir.to_path_buf(), module_path.to_string())
+}
 type WorkspacePackageKey = (PathBuf, String);
 type RustDeclaredModuleMap = HashMap<String, Option<String>>;
 
@@ -104,16 +153,42 @@ pub(crate) struct RustCrateRootMemo {
 }
 
 struct BoundedMemo<K, V> {
-    entries: HashMap<K, V>,
+    entries: HashMap<K, (V, usize)>,
+    order: std::collections::VecDeque<K>,
     retained_weight: usize,
     max_entries: usize,
     max_retained_weight: usize,
 }
 
-impl<K: Eq + std::hash::Hash, V> BoundedMemo<K, V> {
+/// Heap bytes of a memo key, charged once more for the copy the eviction
+/// order keeps alongside the map entry.
+trait MemoKeyWeight {
+    fn key_weight(&self) -> usize;
+}
+
+impl MemoKeyWeight for (PathBuf, String) {
+    fn key_weight(&self) -> usize {
+        path_retained_weight(&self.0) + self.1.len()
+    }
+}
+
+impl MemoKeyWeight for PathBuf {
+    fn key_weight(&self) -> usize {
+        path_retained_weight(self)
+    }
+}
+
+impl MemoKeyWeight for String {
+    fn key_weight(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<K: Eq + std::hash::Hash + Clone + MemoKeyWeight, V> BoundedMemo<K, V> {
     fn new(max_entries: usize, max_retained_weight: usize) -> Self {
         Self {
             entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
             retained_weight: 0,
             max_entries,
             max_retained_weight,
@@ -125,18 +200,31 @@ impl<K: Eq + std::hash::Hash, V> BoundedMemo<K, V> {
         K: std::borrow::Borrow<Q>,
         Q: Eq + std::hash::Hash + ?Sized,
     {
-        self.entries.get(key)
+        self.entries.get(key).map(|(value, _)| value)
     }
 
     fn insert(&mut self, key: K, value: V, retained_weight: usize) {
+        // The eviction order owns a second copy of the key, so charge its bytes
+        // too; the retained-byte ceiling then still covers everything held.
+        let retained_weight = retained_weight.saturating_add(key.key_weight());
         if self.entries.contains_key(&key)
-            || self.entries.len() >= self.max_entries
-            || self.retained_weight.saturating_add(retained_weight) > self.max_retained_weight
+            || self.max_entries == 0
+            || retained_weight > self.max_retained_weight
         {
             return;
         }
+        // FIFO eviction keeps later resolution windows cacheable without
+        // relaxing either bound or flushing unrelated entries together.
+        while self.entries.len() >= self.max_entries
+            || self.retained_weight.saturating_add(retained_weight) > self.max_retained_weight
+        {
+            let oldest = self.order.pop_front().expect("full memo has an entry");
+            let (_, weight) = self.entries.remove(&oldest).expect("ordered memo entry");
+            self.retained_weight -= weight;
+        }
         self.retained_weight += retained_weight;
-        self.entries.insert(key, value);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (value, retained_weight));
     }
 }
 
@@ -201,14 +289,19 @@ impl ModuleResolutionMemo {
         module_path: &str,
         facts: &FactPaths<'_>,
     ) -> Option<PathBuf> {
-        let key = (from_dir.to_path_buf(), module_path.to_string());
         if self.enabled {
-            if let Some(cached) = self.module_paths.borrow().get(&key) {
+            let borrowed = (from_dir, module_path);
+            if let Some(cached) = self
+                .module_paths
+                .borrow()
+                .get(&borrowed as &dyn ModuleKeyParts)
+            {
                 facts.facts.memo_replay(from_dir, "module", module_path);
                 return cached.clone();
             }
         }
 
+        let key = owned_module_key(from_dir, module_path);
         self.note_module_computation(&key);
         facts.facts.memo_start(from_dir, "module", module_path);
         let resolved = resolve_module_path_uncached(from_dir, module_path, Some(self), facts);
@@ -644,8 +737,20 @@ pub struct CallTreeNode {
     pub work_gap: Option<CallTreeWorkGap>,
 }
 
-pub const CALL_TREE_NODE_BUDGET: usize = 1000;
-pub const CALL_TREE_WORK_GAP: &str = "Call tree cut short: examined 1000 call nodes (work budget); additional nodes not examined · narrow: symbol, depth";
+/// The call-tree node budget as a literal, so the work-gap text below is built
+/// from the same number as the budget instead of repeating it.
+macro_rules! call_tree_node_budget {
+    () => {
+        1000
+    };
+}
+
+pub const CALL_TREE_NODE_BUDGET: usize = call_tree_node_budget!();
+pub const CALL_TREE_WORK_GAP: &str = concat!(
+    "Call tree cut short: examined ",
+    call_tree_node_budget!(),
+    " call nodes (work budget); additional nodes not examined · narrow: symbol, depth"
+);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CallTreeWorkGap {
@@ -3383,6 +3488,20 @@ where
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static REEXPORT_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn parse_reexport_source(source: &str, lang: LangId) -> Option<tree_sitter::Tree> {
+    #[cfg(test)]
+    REEXPORT_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+    let grammar = grammar_for(lang);
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    parser.parse(source, None)
+}
+
 fn resolve_reexported_symbol_inner<F, D>(
     file: &Path,
     symbol_name: &str,
@@ -3414,10 +3533,7 @@ where
         });
     }
 
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(&source, None)?;
+    let tree = parse_reexport_source(&source, lang)?;
     let from_dir = canon.parent().unwrap_or_else(|| Path::new("."));
 
     let mut cursor = tree.root_node().walk();
@@ -3455,7 +3571,7 @@ where
         }
     }
 
-    if let Some(symbol) = resolve_local_export_alias(&source, &canon, symbol_name) {
+    if let Some(symbol) = resolve_local_export_alias(&source, tree.root_node(), symbol_name) {
         return Some(ResolvedSymbol {
             file: canon,
             symbol,
@@ -3520,14 +3636,12 @@ where
     None
 }
 
-fn resolve_local_export_alias(source: &str, file: &Path, requested_export: &str) -> Option<String> {
-    let lang = detect_language(file)?;
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(source, None)?;
-
-    let mut cursor = tree.root_node().walk();
+fn resolve_local_export_alias(
+    source: &str,
+    root: tree_sitter::Node,
+    requested_export: &str,
+) -> Option<String> {
+    let mut cursor = root.walk();
     if !cursor.goto_first_child() {
         return None;
     }
@@ -3745,6 +3859,78 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn call_tree_work_gap_text_names_the_node_budget() {
+        assert_eq!(
+            CALL_TREE_WORK_GAP,
+            "Call tree cut short: examined 1000 call nodes (work budget); additional nodes not examined · narrow: symbol, depth"
+        );
+        assert!(
+            CALL_TREE_WORK_GAP.contains(&format!("examined {CALL_TREE_NODE_BUDGET} call nodes"))
+        );
+    }
+
+    #[test]
+    fn bounded_memo_admits_later_keys_without_exceeding_either_bound() {
+        let mut memo = BoundedMemo::<String, i32>::new(2, 30);
+        memo.insert("a".to_string(), 1, 3);
+        memo.insert("b".to_string(), 2, 3);
+        // A full memo evicts its oldest key instead of refusing new ones.
+        memo.insert("c".to_string(), 3, 3);
+        assert_eq!(memo.get("c"), Some(&3));
+        assert_eq!(memo.get("b"), Some(&2));
+        assert_eq!(memo.get("a"), None);
+        memo.insert("heavy".to_string(), 4, 8);
+        assert_eq!(memo.get("heavy"), Some(&4));
+        assert!(memo.retained_weight <= 30);
+        assert!(memo.entries.len() <= 2);
+        // An entry larger than the whole byte bound is never admitted, and
+        // refusing it leaves the existing entries in place.
+        memo.insert("x".to_string(), 5, 30);
+        assert_eq!(memo.get("x"), None);
+        assert_eq!(memo.get("heavy"), Some(&4));
+        // Each admitted entry is charged its weight plus the ordered key copy.
+        assert_eq!(memo.retained_weight, (3 + 1) + (8 + 5));
+    }
+
+    #[test]
+    fn local_reexport_alias_uses_the_already_parsed_file() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("barrel.ts");
+        fs::write(
+            &file,
+            "const actual = () => 1; export { actual as alias };\n",
+        )
+        .unwrap();
+        REEXPORT_PARSE_COUNT.with(|count| count.set(0));
+        let resolved =
+            resolve_reexported_symbol(&file, "alias", &mut |_, _| false, &mut |_| None).unwrap();
+        assert_eq!(resolved.symbol, "actual");
+        REEXPORT_PARSE_COUNT.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn module_resolution_hits_do_not_allocate_owned_compound_keys() {
+        let temp = TempDir::new().unwrap();
+        let root = canonicalize_path(temp.path());
+        fs::write(root.join("target.ts"), "export function target() {}\n").unwrap();
+        let disk = DiskFacts::new(&root);
+        let facts = FactPaths {
+            root: &root,
+            facts: &disk,
+        };
+        let memo = ModuleResolutionMemo::default();
+        OWNED_MODULE_KEY_COUNT.with(|count| count.set(0));
+        let first = memo.resolve_module_path(&root, "./target", &facts).unwrap();
+        let admitted = OWNED_MODULE_KEY_COUNT.with(|count| count.get());
+        assert!(admitted > 0);
+        assert_eq!(
+            memo.resolve_module_path(&root, "./target", &facts),
+            Some(first)
+        );
+        OWNED_MODULE_KEY_COUNT.with(|count| assert_eq!(count.get(), admitted));
+    }
 
     struct CountingFacts {
         inner: DiskFacts,
@@ -4904,6 +5090,18 @@ function hidden() {}
             counting.list_dir_calls.get(),
             walked,
             "clearing under another root must not drop this workspace's entries"
+        );
+        crate::callgraph_store::invalidate_refresh_workspace_package_cache(other.path());
+        resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(
+            counting.list_dir_calls.get(),
+            walked,
+            "another root's manifest refresh must not drop this workspace's entries"
         );
         // A configure of THIS root drops them.
         clear_workspace_package_cache_under(&root);

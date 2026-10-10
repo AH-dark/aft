@@ -2276,7 +2276,7 @@ pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_chang
             // Do NOT cold-build the callgraph store synchronously here. This function
             // runs on the single-threaded dispatch loop from `drain_watcher_events`,
             // which fires before EVERY request (and on idle ticks). A full O(repo)
-            // `refresh_corpus` (= `cold_build`: parse all files + resolve refs +
+            // `cold_build` (parse all files + resolve refs +
             // rewrite SQLite) blocks ALL queued requests — including `configure` and
             // `bash` — for its entire duration, which exceeds the 30s transport
             // timeout on a large repo.

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde::Serialize;
 use tree_sitter::{Node, Parser};
@@ -533,7 +534,7 @@ pub fn callers_result(
 ) -> StoreAdapterResult<StoreCallersResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
-    let mut visited = HashSet::new();
+    let mut visited = HashMap::new();
     let mut sites = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
@@ -802,7 +803,7 @@ pub fn call_tree_result(
 ) -> StoreAdapterResult<StoreCallTreeNode> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let mut visited = HashSet::new();
-    let mut adjacency_cache = HashMap::new();
+    let mut memo = CallTreeMemo::default();
     let mut remaining = crate::callgraph::CALL_TREE_NODE_BUDGET;
     let mut tree = call_tree_inner(
         store,
@@ -810,7 +811,7 @@ pub fn call_tree_result(
         depth.min(100),
         0,
         &mut visited,
-        &mut adjacency_cache,
+        &mut memo,
         true,
         &mut remaining,
     )?;
@@ -858,7 +859,7 @@ pub fn impact_result(
 ) -> StoreAdapterResult<StoreImpactResult> {
     let target = resolve_symbol_query(store, file, symbol)?;
     let effective_depth = depth.max(1);
-    let mut visited = HashSet::new();
+    let mut visited = HashMap::new();
     let mut sites = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
@@ -949,12 +950,24 @@ pub fn impact_result(
         .unwrap_or_default();
 
     let mut callers = Vec::new();
-    // Each caller file is read once, however many of its call sites are shown.
-    let mut source_lines: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    // Each caller file is read once, however many of its call sites are shown,
+    // and only up to the last shown line; only the shown lines are retained.
+    let mut wanted_lines: HashMap<&str, BTreeSet<usize>> = HashMap::new();
+    for site in &visible_sites {
+        wanted_lines
+            .entry(site.caller.file.as_str())
+            .or_default()
+            .insert(site.line.saturating_sub(1) as usize);
+    }
+    let source_lines = wanted_lines
+        .into_iter()
+        .map(|(file, wanted)| {
+            let lines = read_source_lines_at(&store.project_root().join(file), &wanted);
+            (file.to_string(), lines)
+        })
+        .collect::<HashMap<_, _>>();
     for site in visible_sites {
-        let lines = source_lines
-            .entry(site.caller.file.clone())
-            .or_insert_with(|| read_source_lines(&store.project_root().join(&site.caller.file)));
+        let lines = source_lines.get(&site.caller.file).and_then(Option::as_ref);
         callers.push(StoreImpactCaller {
             caller_symbol: site.caller.symbol.clone(),
             caller_file: site.caller.file.clone(),
@@ -962,8 +975,7 @@ pub fn impact_result(
             signature: site.caller.signature.clone(),
             is_entry_point: site.caller.is_entry_point,
             call_expression: lines
-                .as_ref()
-                .and_then(|lines| lines.get(site.line.saturating_sub(1) as usize))
+                .and_then(|lines| lines.get(&(site.line.saturating_sub(1) as usize)))
                 .cloned(),
             parameters: site
                 .caller
@@ -1001,6 +1013,17 @@ pub fn impact_result(
         truncated,
         sites_list_envelope,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRACE_ENDPOINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn trace_endpoint_key(node: &StoreNode) -> (String, String) {
+    #[cfg(test)]
+    TRACE_ENDPOINT_READS.with(|count| count.set(count.get() + 1));
+    (node.file.clone(), node.symbol.clone())
 }
 
 pub fn trace_to_result(
@@ -1056,6 +1079,7 @@ fn trace_to_result_with_budget(
     let mut expansions = 0usize;
     let mut budget_exhausted = false;
     let mut callers_by_symbol: HashMap<(String, String), Vec<StoreCallSite>> = HashMap::new();
+    let mut pending_endpoints = BTreeSet::new();
 
     'traversal: while let Some((path, depth)) = queue.pop() {
         if expansions >= expansion_budget {
@@ -1070,23 +1094,12 @@ fn trace_to_result_with_budget(
         let Some(current) = path.last() else {
             continue;
         };
-        let caller_key = (current.node.file.clone(), current.node.symbol.clone());
+        let caller_key = trace_endpoint_key(&current.node);
         if !callers_by_symbol.contains_key(&caller_key) {
-            // Fetch this node's callers together with those of every other
-            // queued path end that will still be expanded, in one batched
-            // query, instead of one query per node.
-            let mut wanted = BTreeSet::from([caller_key.clone()]);
-            for (queued, queued_depth) in &queue {
-                if *queued_depth >= effective_max {
-                    continue;
-                }
-                if let Some(end) = queued.last() {
-                    let key = (end.node.file.clone(), end.node.symbol.clone());
-                    if !callers_by_symbol.contains_key(&key) {
-                        wanted.insert(key);
-                    }
-                }
-            }
+            // Track unfetched endpoints when pushing paths, instead of
+            // rescanning every pending path on each adjacency miss.
+            let mut wanted = std::mem::take(&mut pending_endpoints);
+            wanted.insert(caller_key.clone());
             let wanted = wanted.into_iter().collect::<Vec<_>>();
             let mut fetched = store.direct_callers_for_symbols(&wanted)?;
             for key in wanted {
@@ -1136,6 +1149,12 @@ fn trace_to_result_with_budget(
             if expansions.saturating_add(queue.len()) >= expansion_budget {
                 budget_exhausted = true;
                 break 'traversal;
+            }
+            if depth + 1 < effective_max {
+                let key = trace_endpoint_key(&site.caller);
+                if !callers_by_symbol.contains_key(&key) {
+                    pending_endpoints.insert(key);
+                }
             }
             queue.push((next_path, depth + 1));
         }
@@ -1271,10 +1290,12 @@ pub fn trace_to_symbol_result(
             let callees = forward_resolved_callees(calls);
 
             if depth >= effective_max {
-                if callees
-                    .iter()
-                    .any(|(node, _)| !visited.contains(&(node.file.clone(), node.symbol.clone())))
-                {
+                // Hidden test callees would never be traversed, so they cannot
+                // make an unfinished search incomplete either.
+                if callees.iter().any(|(node, _)| {
+                    (include_tests || !is_test_file(&node.file))
+                        && !visited.contains(&(node.file.clone(), node.symbol.clone()))
+                }) {
                     max_depth_exhausted = true;
                 }
                 continue;
@@ -1379,9 +1400,11 @@ pub fn trace_data_result(
     let mut hops = Vec::new();
     let mut depth_limited = false;
     let mut visited = HashSet::new();
+    let trace_files = TraceFileFacts::default();
     trace_data_inner(
         store,
         &symbol_cache,
+        &trace_files,
         &origin_path,
         &origin_symbol,
         expression,
@@ -1402,10 +1425,69 @@ pub fn trace_data_result(
     })
 }
 
+/// Source, tree and symbols of each file one `trace_data` request walks.
+/// Hops that return to a file (local calls, or several parameters flowing
+/// into the same callee) reuse them instead of reading and parsing again.
+#[derive(Default)]
+struct TraceFileFacts {
+    files: std::cell::RefCell<HashMap<PathBuf, Option<Rc<TraceFile>>>>,
+}
+
+struct TraceFile {
+    source: String,
+    tree: tree_sitter::Tree,
+    symbols: Vec<Symbol>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TRACE_FILE_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl TraceFileFacts {
+    /// The parsed file, or None for a language without a grammar.
+    fn load(&self, file: &Path) -> StoreAdapterResult<Option<Rc<TraceFile>>> {
+        if let Some(cached) = self.files.borrow().get(file) {
+            return Ok(cached.clone());
+        }
+        let source = std::fs::read_to_string(file)?;
+        let parsed = match detect_language(file) {
+            Some(lang) => {
+                #[cfg(test)]
+                TRACE_FILE_PARSES.with(|count| count.set(count.get() + 1));
+                let grammar = grammar_for(lang);
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&grammar)
+                    .map_err(|error| AftError::ParseError {
+                        message: format!("grammar init failed for {:?}: {}", lang, error),
+                    })?;
+                let tree = parser
+                    .parse(&source, None)
+                    .ok_or_else(|| AftError::ParseError {
+                        message: format!("parse failed for {}", file.display()),
+                    })?;
+                let symbols = extract_symbols_from_tree(&source, &tree, lang)?;
+                Some(Rc::new(TraceFile {
+                    source,
+                    tree,
+                    symbols,
+                }))
+            }
+            None => None,
+        };
+        self.files
+            .borrow_mut()
+            .insert(file.to_path_buf(), parsed.clone());
+        Ok(parsed)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn trace_data_inner(
     store: &impl CallGraphRead,
     symbol_cache: &SharedSymbolCache,
+    files: &TraceFileFacts,
     file: &Path,
     symbol: &str,
     tracking_name: &str,
@@ -1434,32 +1516,21 @@ fn trace_data_inner(
 
     // Keep the legacy value-flow posture: parse the current source for body walks
     // and use the store only for cross-hop call facts.
-    let source = std::fs::read_to_string(file)?;
-    let Some(lang) = detect_language(file) else {
+    let Some(facts) = files.load(file)? else {
         return Ok(());
     };
-    let grammar = grammar_for(lang);
-    let mut parser = Parser::new();
-    parser
-        .set_language(&grammar)
-        .map_err(|error| AftError::ParseError {
-            message: format!("grammar init failed for {:?}: {}", lang, error),
-        })?;
-    let tree = parser
-        .parse(&source, None)
-        .ok_or_else(|| AftError::ParseError {
-            message: format!("parse failed for {}", file.display()),
-        })?;
-    let symbols = extract_symbols_from_tree(&source, &tree, lang)?;
-    let sym_info = symbols
+    let source = &facts.source;
+    let tree = &facts.tree;
+    let sym_info = facts
+        .symbols
         .iter()
         .find(|candidate| {
             symbol_identity_from_cache(candidate) == symbol || candidate.name == symbol
         })
         .ok_or_else(|| CallGraphStoreError::StaleFiles(vec![rel_file.clone()]))?;
 
-    let body_start = line_col_to_byte(&source, sym_info.range.start_line, sym_info.range.start_col);
-    let body_end = line_col_to_byte(&source, sym_info.range.end_line, sym_info.range.end_col);
+    let body_start = line_col_to_byte(source, sym_info.range.start_line, sym_info.range.start_col);
+    let body_end = line_col_to_byte(source, sym_info.range.end_line, sym_info.range.end_col);
     let Some(body_node) = find_node_covering_range(tree.root_node(), body_start, body_end) else {
         return Ok(());
     };
@@ -1468,8 +1539,9 @@ fn trace_data_inner(
     walk_for_data_flow(
         store,
         symbol_cache,
+        files,
         body_node,
-        &source,
+        source,
         &current_calls,
         &mut tracked,
         symbol,
@@ -1488,6 +1560,7 @@ fn trace_data_inner(
 fn walk_for_data_flow(
     store: &impl CallGraphRead,
     symbol_cache: &SharedSymbolCache,
+    files: &TraceFileFacts,
     node: Node<'_>,
     source: &str,
     current_calls: &[TraceForwardCall],
@@ -1545,6 +1618,7 @@ fn walk_for_data_flow(
         check_call_for_data_flow(
             store,
             symbol_cache,
+            files,
             node,
             source,
             current_calls,
@@ -1570,6 +1644,7 @@ fn walk_for_data_flow(
             walk_for_data_flow(
                 store,
                 symbol_cache,
+                files,
                 cursor.node(),
                 source,
                 current_calls,
@@ -1750,6 +1825,7 @@ fn function_container(kind: &str) -> bool {
 fn check_call_for_data_flow(
     store: &impl CallGraphRead,
     symbol_cache: &SharedSymbolCache,
+    files: &TraceFileFacts,
     node: Node<'_>,
     source: &str,
     current_calls: &[TraceForwardCall],
@@ -1825,7 +1901,9 @@ fn check_call_for_data_flow(
             let Some(target) = trace_target_node(store, site)? else {
                 return Ok(());
             };
-            if target.file != rel_file && current_depth + 1 > max_depth {
+            // Every followed hop, same-file ones included, spends depth;
+            // otherwise a chain of local calls would ignore the limit.
+            if current_depth + 1 > max_depth {
                 *depth_limited = true;
                 return Ok(());
             }
@@ -1848,6 +1926,7 @@ fn check_call_for_data_flow(
                     trace_data_inner(
                         store,
                         symbol_cache,
+                        files,
                         &target_file,
                         &target.symbol,
                         param_name,
@@ -2587,7 +2666,7 @@ fn collect_callers_recursive(
     symbol: &str,
     max_depth: usize,
     current_depth: usize,
-    visited: &mut HashSet<(String, String)>,
+    visited: &mut HashMap<(String, String), usize>,
     result: &mut Vec<StoreCallSite>,
     depth_limited: &mut bool,
     truncated: &mut usize,
@@ -2603,9 +2682,12 @@ fn collect_callers_recursive(
         return Ok(());
     }
 
-    if !visited.insert((file.to_string(), symbol.to_string())) {
+    let key = (file.to_string(), symbol.to_string());
+    if visited.get(&key).is_some_and(|best| *best <= current_depth) {
         return Ok(());
     }
+    // A shallow revisit can reach callers omitted by an earlier deeper path.
+    let first_visit = visited.insert(key, current_depth).is_none();
 
     let Some(sites) = callers_by_symbol.get(&(file.to_string(), symbol.to_string())) else {
         return Ok(());
@@ -2615,7 +2697,9 @@ fn collect_callers_recursive(
     }
     if current_depth + 1 < max_depth {
         for site in sites {
-            result.push(site.clone());
+            if first_visit {
+                result.push(site.clone());
+            }
             collect_callers_recursive(
                 store,
                 callers_by_symbol,
@@ -2638,7 +2722,9 @@ fn collect_callers_recursive(
             .collect::<Vec<_>>();
         let boundary_counts = store.direct_caller_counts_of(&boundary_targets)?;
         for site in sites {
-            result.push(site.clone());
+            if first_visit {
+                result.push(site.clone());
+            }
             let key = (site.caller.file.clone(), site.caller.symbol.clone());
             let omitted = boundary_counts.get(&key).copied().unwrap_or_default();
             if omitted > 0 {
@@ -2656,7 +2742,7 @@ fn call_tree_inner(
     max_depth: usize,
     current_depth: usize,
     visited: &mut HashSet<(String, String)>,
-    adjacency_cache: &mut HashMap<(String, String), Vec<ForwardCall>>,
+    memo: &mut CallTreeMemo,
     memoize_adjacency: bool,
     remaining: &mut usize,
 ) -> StoreAdapterResult<StoreCallTreeNode> {
@@ -2684,35 +2770,20 @@ fn call_tree_inner(
 
     // Only adjacency rows are shared across converging paths. The visited set remains
     // path-local so repeated nodes still render independently with correct cycle guards.
-    let calls = if memoize_adjacency {
-        if let Some(calls) = adjacency_cache.get(&visit_key) {
-            calls.clone()
-        } else {
-            let calls = forward_calls_for_nodes(store, &current.nodes)?;
-            adjacency_cache.insert(visit_key.clone(), calls.clone());
-            calls
-        }
-    } else {
-        forward_calls_for_nodes(store, &current.nodes)?
-    };
+    let calls = forward_calls_cached(store, current, &mut memo.adjacency, memoize_adjacency)?;
     let mut children = Vec::new();
     let mut depth_limited = false;
     let mut truncated = 0usize;
 
     if current_depth < max_depth {
-        for call in calls {
+        for call in calls.iter() {
             if *remaining == 0 {
                 truncated += 1;
                 break;
             }
             match call {
                 ForwardCall::Resolved(site) => {
-                    let resolved = resolve_exact_symbol(
-                        store,
-                        &site.target_file,
-                        &site.target_symbol,
-                        site.target.clone(),
-                    )?;
+                    let resolved = resolve_call_tree_target(store, site, memo, memoize_adjacency)?;
                     if let Some(child_symbol) = resolved {
                         let mut child = call_tree_inner(
                             store,
@@ -2720,12 +2791,12 @@ fn call_tree_inner(
                             max_depth,
                             current_depth + 1,
                             visited,
-                            adjacency_cache,
+                            memo,
                             memoize_adjacency,
                             remaining,
                         )?;
-                        child.approximate = edge_approximate(&site);
-                        child.resolved_by = edge_resolved_by(&site);
+                        child.approximate = edge_approximate(site);
+                        child.resolved_by = edge_resolved_by(site);
                         depth_limited |= child.depth_limited;
                         truncated += child.truncated;
                         children.push(child);
@@ -2737,8 +2808,8 @@ fn call_tree_inner(
                             line: site.line,
                             signature: None,
                             resolved: false,
-                            approximate: edge_approximate(&site),
-                            resolved_by: edge_resolved_by(&site),
+                            approximate: edge_approximate(site),
+                            resolved_by: edge_resolved_by(site),
                             children: Vec::new(),
                             depth_limited: false,
                             truncated: 0,
@@ -2751,8 +2822,8 @@ fn call_tree_inner(
                 ForwardCall::Unresolved(call) => {
                     *remaining -= 1;
                     children.push(StoreCallTreeNode {
-                        name: call.symbol,
-                        file: call.caller.file,
+                        name: call.symbol.clone(),
+                        file: call.caller.file.clone(),
                         line: call.line,
                         signature: None,
                         resolved: false,
@@ -2789,6 +2860,68 @@ fn call_tree_inner(
         tree_list_envelope: None,
         work_gap: None,
     })
+}
+
+/// Store reads shared by the converging paths of one call-tree request. The
+/// rendered tree still walks every path; only adjacency rows and edge-target
+/// resolutions are fetched once.
+#[derive(Default)]
+struct CallTreeMemo {
+    adjacency: HashMap<(String, String), Rc<[ForwardCall]>>,
+    targets: HashMap<(String, String, Option<String>), Option<Rc<ResolvedStoreSymbol>>>,
+}
+
+fn resolve_call_tree_target(
+    store: &impl CallGraphRead,
+    site: &StoreCallSite,
+    memo: &mut CallTreeMemo,
+    memoize: bool,
+) -> StoreAdapterResult<Option<Rc<ResolvedStoreSymbol>>> {
+    // The stored target node is part of the key: resolution falls back to it
+    // when the exact lookup finds nothing.
+    let key = (
+        site.target_file.clone(),
+        site.target_symbol.clone(),
+        site.target.as_ref().map(|node| node.node_id().to_string()),
+    );
+    if memoize {
+        if let Some(resolved) = memo.targets.get(&key) {
+            return Ok(resolved.clone());
+        }
+    }
+    let resolved = resolve_exact_symbol(
+        store,
+        &site.target_file,
+        &site.target_symbol,
+        site.target.clone(),
+    )?
+    .map(Rc::new);
+    if memoize {
+        memo.targets.insert(key, resolved.clone());
+    }
+    Ok(resolved)
+}
+
+fn forward_calls_cached(
+    store: &impl CallGraphRead,
+    current: &ResolvedStoreSymbol,
+    cache: &mut HashMap<(String, String), Rc<[ForwardCall]>>,
+    memoize: bool,
+) -> StoreAdapterResult<Rc<[ForwardCall]>> {
+    let key = (
+        current.representative.file.clone(),
+        current.representative.symbol.clone(),
+    );
+    if memoize {
+        if let Some(calls) = cache.get(&key) {
+            return Ok(Rc::clone(calls));
+        }
+    }
+    let calls: Rc<[ForwardCall]> = forward_calls_for_nodes(store, &current.nodes)?.into();
+    if memoize {
+        cache.insert(key, Rc::clone(&calls));
+    }
+    Ok(calls)
 }
 
 fn forward_calls_for_nodes(
@@ -2899,10 +3032,25 @@ fn unqualified_name(symbol: &str) -> &str {
     symbol.rsplit("::").next().unwrap_or(symbol)
 }
 
-/// The file's lines, trimmed.
-fn read_source_lines(path: &Path) -> Option<Vec<String>> {
-    let source = std::fs::read_to_string(path).ok()?;
-    Some(source.lines().map(|line| line.trim().to_string()).collect())
+/// The requested zero-based lines of a file, trimmed. Reading stops after the
+/// last requested line, so a large file is not loaded whole to show a few call
+/// sites. Like a whole-file UTF-8 read, a decoding error in the lines read
+/// yields None.
+fn read_source_lines_at(path: &Path, wanted: &BTreeSet<usize>) -> Option<HashMap<usize, String>> {
+    use std::io::BufRead;
+    let last = *wanted.last()?;
+    let reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut lines = HashMap::with_capacity(wanted.len());
+    for (index, line) in reader.lines().enumerate() {
+        if index > last {
+            break;
+        }
+        let line = line.ok()?;
+        if wanted.contains(&index) {
+            lines.insert(index, line.trim().to_string());
+        }
+    }
+    Some(lines)
 }
 
 fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
@@ -2949,6 +3097,7 @@ mod trace_to_tests {
         frontier_query_count: RefCell<usize>,
         caller_count_queries: RefCell<usize>,
         caller_count_targets: RefCell<usize>,
+        node_lookups: RefCell<usize>,
     }
 
     impl CountingStore {
@@ -2966,6 +3115,7 @@ mod trace_to_tests {
                 frontier_query_count: RefCell::new(0),
                 caller_count_queries: RefCell::new(0),
                 caller_count_targets: RefCell::new(0),
+                node_lookups: RefCell::new(0),
             }
         }
 
@@ -3087,6 +3237,7 @@ mod trace_to_tests {
         }
 
         fn nodes_for(&self, file_rel: &Path, symbol: &str) -> CallGraphResult<Vec<StoreNode>> {
+            *self.node_lookups.borrow_mut() += 1;
             let key = (
                 file_rel.to_string_lossy().replace('\\', "/"),
                 symbol.to_string(),
@@ -3315,7 +3466,7 @@ mod trace_to_tests {
             nodes: vec![root],
         };
         let mut visited = HashSet::new();
-        let mut unused_cache = HashMap::new();
+        let mut unused_cache = CallTreeMemo::default();
         let mut remaining = crate::callgraph::CALL_TREE_NODE_BUDGET;
         let mut uncached = call_tree_inner(
             &store,
@@ -3349,6 +3500,105 @@ mod trace_to_tests {
     }
 
     #[test]
+    fn call_tree_resolves_each_shared_edge_target_once() {
+        let (store, root) = converging_call_tree_store(200);
+        let resolved_root = ResolvedStoreSymbol {
+            representative: root.clone(),
+            nodes: vec![root.clone()],
+        };
+        let lookups_for = |memoize: bool| {
+            *store.node_lookups.borrow_mut() = 0;
+            let mut remaining = crate::callgraph::CALL_TREE_NODE_BUDGET;
+            call_tree_inner(
+                &store,
+                &resolved_root,
+                3,
+                0,
+                &mut HashSet::new(),
+                &mut CallTreeMemo::default(),
+                memoize,
+                &mut remaining,
+            )
+            .expect("call tree");
+            *store.node_lookups.borrow()
+        };
+        // 200 handlers, each reached once, all calling the same helper, which
+        // calls the same leaf: 200 + 200 + 200 lookups without the memo.
+        assert_eq!(lookups_for(false), 600);
+        // With it: each handler once, plus helper and leaf once each.
+        assert_eq!(lookups_for(true), 202);
+    }
+
+    #[test]
+    fn impact_source_lines_stop_after_the_last_shown_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("caller.ts");
+        let mut bytes = b"first()\n   second();  \nthird()\n".to_vec();
+        // Bytes past the last shown line are never read, so an undecodable
+        // tail no longer hides the call expressions above it.
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        std::fs::write(&path, bytes).unwrap();
+        let lines = read_source_lines_at(&path, &BTreeSet::from([1])).unwrap();
+        assert_eq!(lines, HashMap::from([(1, "second();".to_string())]));
+        assert_eq!(read_source_lines_at(&path, &BTreeSet::from([3])), None);
+    }
+
+    #[test]
+    fn call_tree_adjacency_hits_share_the_same_allocation() {
+        let (store, root) = converging_call_tree_store(2);
+        let current = ResolvedStoreSymbol {
+            representative: root.clone(),
+            nodes: vec![root],
+        };
+        let mut cache = HashMap::new();
+        let first = forward_calls_cached(&store, &current, &mut cache, true).unwrap();
+        let second = forward_calls_cached(&store, &current, &mut cache, true).unwrap();
+        assert!(!first.is_empty());
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "an adjacency hit must not deep-clone rows"
+        );
+    }
+
+    #[test]
+    fn trace_pending_endpoint_index_bounds_path_end_reads() {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        store.add_node(target.clone());
+        let mut branch = target.clone();
+        for index in 0..200 {
+            let caller = node(&format!("wide_{index}"), false);
+            store.add_node(caller.clone());
+            store.add_caller(&target, &caller);
+            branch = caller;
+        }
+        for index in 0..12 {
+            let caller = node(&format!("deep_{index}"), index == 11);
+            store.add_node(caller.clone());
+            store.add_caller(&branch, &caller);
+            branch = caller;
+        }
+        TRACE_ENDPOINT_READS.with(|count| count.set(0));
+        let (result, expansions) = trace_to_result_with_budget(
+            &store,
+            Path::new(&target.file),
+            &target.symbol,
+            20,
+            true,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(result.total_paths, 1);
+        TRACE_ENDPOINT_READS.with(|count| {
+            assert!(
+                count.get() <= expansions * 2 + 1,
+                "{} endpoint reads for {expansions} expansions",
+                count.get()
+            )
+        });
+    }
+
+    #[test]
     fn reverse_frontiers_batch_caller_fetches_by_depth() {
         let (store, target) = layered_store(20, 6);
 
@@ -3361,6 +3611,29 @@ mod trace_to_tests {
         assert_eq!(result.total_callers, 1_620);
         assert_eq!(result.callers.len(), 15);
         assert!(result.depth_limited);
+    }
+
+    #[test]
+    fn callers_reexpand_a_symbol_reached_later_at_a_shallower_depth() {
+        let mut store = CountingStore::new();
+        let target = node("target", false);
+        let deep = node("deep", false);
+        let middle = node("middle", false);
+        let shared = node("shared", false);
+        let upstream = node("upstream", false);
+        let entry = node("entry", true);
+        for item in [&target, &deep, &middle, &shared, &upstream, &entry] {
+            store.add_node(item.clone());
+        }
+        store.add_caller(&target, &deep);
+        store.add_caller(&deep, &middle);
+        store.add_caller(&middle, &shared);
+        store.add_caller(&target, &shared);
+        store.add_caller(&shared, &upstream);
+        store.add_caller(&upstream, &entry);
+        let result =
+            callers_result(&store, Path::new(&target.file), &target.symbol, 4, true).unwrap();
+        assert!(result.callers.iter().any(|group| group.file == entry.file));
     }
 
     #[test]
@@ -3442,6 +3715,48 @@ mod trace_to_tests {
         assert_eq!(symbols, vec!["origin", "fast", "target"]);
         assert_eq!(store.total_frontier_queries(), 2);
         assert_eq!(store.total_forward_queries(), 0);
+    }
+
+    #[test]
+    fn trace_to_symbol_ignores_hidden_test_callees_at_the_depth_limit() {
+        let mut store = CountingStore::new();
+        let origin = node("origin", false);
+        let leaf = node("leaf", false);
+        let helper = StoreNode::for_test("leaf.test.ts", "testHelper", false);
+        for fixture_node in [&origin, &leaf, &helper] {
+            store.add_node(fixture_node.clone());
+        }
+        store.add_outgoing(&origin, &leaf);
+        store.add_outgoing(&leaf, &helper);
+
+        let hidden = trace_to_symbol_result(
+            &store,
+            Path::new(&origin.file),
+            &origin.symbol,
+            "missing",
+            None,
+            1,
+            false,
+        )
+        .expect("trace-to-symbol result");
+        assert!(
+            hidden.complete,
+            "only a hidden test callee lies past the limit"
+        );
+        assert_eq!(hidden.reason.as_deref(), Some("no_path_found"));
+
+        let included = trace_to_symbol_result(
+            &store,
+            Path::new(&origin.file),
+            &origin.symbol,
+            "missing",
+            None,
+            1,
+            true,
+        )
+        .expect("trace-to-symbol result");
+        assert!(!included.complete);
+        assert_eq!(included.reason.as_deref(), Some("max_depth_exhausted"));
     }
 
     #[test]
