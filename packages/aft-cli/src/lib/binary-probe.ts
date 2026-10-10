@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  platformKey as bridgePlatformKey,
   compareSemver,
   findExecutablesOnPath,
   isNativeExecutable,
@@ -182,12 +183,11 @@ export function platformKey(
   platform: string = process.platform,
   arch: string = process.arch,
 ): string | null {
-  const table: Record<string, Record<string, string>> = {
-    darwin: { arm64: "darwin-arm64", x64: "darwin-x64" },
-    linux: { arm64: "linux-arm64", x64: "linux-x64" },
-    win32: { x64: "win32-x64" },
-  };
-  return table[platform]?.[arch] ?? null;
+  try {
+    return bridgePlatformKey(platform, arch);
+  } catch {
+    return null;
+  }
 }
 
 /** The `v<semver>` directory names `aft doctor --fix` creates in the binary cache. */
