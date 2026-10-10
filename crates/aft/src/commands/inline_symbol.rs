@@ -1058,7 +1058,7 @@ fn strip_braces(text: &str) -> String {
         let min_indent = inner
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| l.len() - l.trim_start().len())
+            .map(|l| l.chars().take_while(|ch| ch.is_whitespace()).count())
             .min()
             .unwrap_or(0);
 
@@ -1067,10 +1067,8 @@ fn strip_braces(text: &str) -> String {
             .map(|l| {
                 if l.trim().is_empty() {
                     String::new()
-                } else if l.len() >= min_indent {
-                    l[min_indent..].to_string()
                 } else {
-                    l.to_string()
+                    l.chars().skip(min_indent).collect::<String>()
                 }
             })
             .collect::<Vec<_>>()
@@ -1797,6 +1795,17 @@ mod tests {
             !conflicting.is_empty(),
             "should report at least one conflict: {:?}",
             conflicting
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    #[test]
+    fn mixed_unicode_indent_is_stripped_on_character_boundaries() {
+        assert_eq!(
+            super::strip_braces("{\n first();\n\u{3000}second();\n}"),
+            "first();\nsecond();"
         );
     }
 }

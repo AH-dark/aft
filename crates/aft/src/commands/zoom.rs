@@ -1662,27 +1662,29 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
     let len1 = s1_chars.len();
     let len2 = s2_chars.len();
 
-    let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
-
-    for i in 0..=len1 {
-        dp[i][0] = i;
-    }
-    for j in 0..=len2 {
-        dp[0][j] = j;
-    }
+    let mut previous: Vec<usize> = (0..=len2).collect();
+    let mut current = vec![0; len2 + 1];
+    #[cfg(test)]
+    DISTANCE_CELLS.with(|count| count.set(previous.len() + current.len()));
 
     for i in 1..=len1 {
+        current[0] = i;
         for j in 1..=len2 {
             if s1_chars[i - 1] == s2_chars[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1];
+                current[j] = previous[j - 1];
             } else {
-                dp[i][j] =
-                    1 + std::cmp::min(dp[i - 1][j], std::cmp::min(dp[i][j - 1], dp[i - 1][j - 1]));
+                current[j] = 1 + previous[j].min(current[j - 1]).min(previous[j - 1]);
             }
         }
+        std::mem::swap(&mut previous, &mut current);
     }
 
-    dp[len1][len2]
+    previous[len2]
+}
+
+#[cfg(test)]
+thread_local! {
+    static DISTANCE_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn suggest_close_symbols(query: &str, available: &[String], k: usize) -> Vec<String> {
@@ -4337,5 +4339,20 @@ def local():
         assert_eq!(parse_json_segment("servers[0]"), (Some("servers"), Some(0)));
         assert_eq!(parse_json_segment("[0]"), (None, Some(0)));
         assert_eq!(parse_json_segment("host"), (Some("host"), None));
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn unicode_distance_uses_linear_workspace() {
+        let source = "é".repeat(128);
+        let target = format!("{}x", "é".repeat(127));
+        assert_eq!(levenshtein_distance(&source, &target), 1);
+        assert_eq!(DISTANCE_CELLS.with(|count| count.get()), 2 * (128 + 1));
+        assert_eq!(levenshtein_distance("é", "e"), 1);
+        assert_eq!(levenshtein_distance("", "猫"), 1);
     }
 }
