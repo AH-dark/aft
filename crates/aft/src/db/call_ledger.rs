@@ -158,7 +158,7 @@ pub fn admit(
     scope: Option<&ScopeIdentity>,
     state: State,
 ) -> rusqlite::Result<Admission> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     if let Some(row) = get(&tx, key)? {
         return Ok(if row.digest == digest && row.scope.as_ref() == scope {
             Admission::Repeat(row)
@@ -166,6 +166,8 @@ pub fn admit(
             Admission::Conflict
         });
     }
+    #[cfg(test)]
+    run_after_ledger_read(&tx);
     tx.execute("INSERT INTO call_ledger (carrier,call_key,digest,state,owner,scope_ref,scope_epoch,custodian,event_id)
         VALUES (?1,?2,?3,?4,?5,?6,?7,?5,?8)",
         params![key.carrier,key.call_key,digest,state.as_str(),scope.map(|s| &s.owner),scope.map(|s| &s.scope_ref),scope.map(|s| s.scope_epoch),new_event_id()])?;
@@ -234,13 +236,15 @@ pub fn settle(
     reason: Option<&str>,
     now: i64,
 ) -> rusqlite::Result<bool> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let Some(row) = get(&tx, key)? else {
         return Ok(false);
     };
     if row.state == State::Settled {
         return Ok(false);
     }
+    #[cfg(test)]
+    run_after_ledger_read(&tx);
     let mut seq = None;
     let mut entry = None;
     if let Some(scope) = &row.scope {
@@ -276,21 +280,35 @@ pub fn reduce_expired(conn: &Connection, key: &Key, now: i64) -> rusqlite::Resul
         return Ok(());
     }
     let frame = not_retained(key, row.outcome.as_deref().unwrap_or("unknown"));
-    let entry = row.late_entry.map(|entry| {
-        let mut v: Value = serde_json::from_str(&entry).unwrap();
-        v["kind"] = json!("expired");
-        v["reduced"] = json!(true);
-        v.as_object_mut().unwrap().remove("result");
-        v.as_object_mut().unwrap().remove("reason");
-        v.to_string()
-    });
+    let entry = row
+        .late_entry
+        .map(|entry| -> rusqlite::Result<String> {
+            let corrupt = |error: Box<dyn std::error::Error + Send + Sync>| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error)
+            };
+            let mut value: Value =
+                serde_json::from_str(&entry).map_err(|error| corrupt(Box::new(error)))?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                corrupt(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "call ledger late entry is not an object",
+                )))
+            })?;
+            object.insert("kind".into(), json!("expired"));
+            object.insert("reduced".into(), json!(true));
+            object.remove("result");
+            object.remove("reason");
+            Ok(value.to_string())
+        })
+        .transpose()?;
     conn.execute("UPDATE call_ledger SET frame_type='Error',frame_body=?3,late_entry=?4 WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key,frame.body,entry])?;
     Ok(())
 }
 
 /// A SQL LIMIT bounds the work before collecting any rows.
 pub fn sweep(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
-    let mut stmt = conn.prepare("SELECT carrier,call_key FROM call_ledger WHERE state='Settled' AND (acked=1 OR (settled_at<=?1 AND (owner IS NULL OR json_extract(late_entry,'$.kind')!='expired'))) ORDER BY settled_at,carrier,call_key LIMIT ?2")?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut stmt = tx.prepare("SELECT carrier,call_key FROM call_ledger WHERE state='Settled' AND (acked=1 OR (settled_at<=?1 AND (owner IS NULL OR json_extract(late_entry,'$.kind')!='expired'))) ORDER BY settled_at,carrier,call_key LIMIT ?2")?;
     let keys = stmt
         .query_map(params![now - RETENTION_MS, SWEEP_BATCH], |r| {
             Ok(Key {
@@ -299,10 +317,16 @@ pub fn sweep(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut delete = tx.prepare(
+        "DELETE FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND (acked=1 OR owner IS NULL)",
+    )?;
     for key in &keys {
-        conn.execute("DELETE FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND (acked=1 OR owner IS NULL)", params![key.carrier,key.call_key])?;
-        reduce_expired(conn, &key, now)?;
+        delete.execute(params![key.carrier, key.call_key])?;
+        reduce_expired(&tx, key, now)?;
     }
+    drop(delete);
+    tx.commit()?;
     Ok(keys.len())
 }
 
@@ -340,7 +364,11 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for key in keys {
-        let row = get(conn, &key)?.unwrap();
+        #[cfg(test)]
+        run_before_recovery_read(conn, &key);
+        let Some(row) = get(conn, &key)? else {
+            continue;
+        };
         if matches!(row.state, State::Prepared | State::Authorized) {
             settle(
                 conn,
@@ -470,8 +498,192 @@ fn new_event_id() -> String {
 }
 
 #[cfg(test)]
+type LedgerReadHook = Box<dyn FnOnce(&Connection)>;
+#[cfg(test)]
+type RecoveryReadHook = Box<dyn FnOnce(&Connection, &Key)>;
+#[cfg(test)]
+thread_local! {
+    static AFTER_LEDGER_READ: std::cell::RefCell<Option<LedgerReadHook>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_RECOVERY_READ: std::cell::RefCell<Option<RecoveryReadHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_ledger_read(conn: &Connection) {
+    let hook = AFTER_LEDGER_READ.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(conn);
+    }
+}
+
+#[cfg(test)]
+fn run_before_recovery_read(conn: &Connection, key: &Key) {
+    let hook = BEFORE_RECOVERY_READ.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(conn, key);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_ledger_writers_do_not_upgrade_stale_snapshots() {
+        const CHILD_DB: &str = "AFT_LEDGER_RACE_DB";
+        const CHILD_OP: &str = "AFT_LEDGER_RACE_OPERATION";
+        const CHILD_RETRY: &str = "AFT_LEDGER_RACE_RETRY";
+        let competitor = |path: &std::path::Path, operation: &str, retry: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["db::call_ledger::tests::concurrent_ledger_writers_do_not_upgrade_stale_snapshots", "--exact", "--nocapture"])
+                .env(CHILD_DB, path).env(CHILD_OP, operation);
+            if retry {
+                command.env(CHILD_RETRY, "1");
+            } else {
+                command.env_remove(CHILD_RETRY);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "competitor: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        if let Some(path) = std::env::var_os(CHILD_DB) {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let retry = std::env::var_os(CHILD_RETRY).is_some();
+            let result = if std::env::var(CHILD_OP).unwrap() == "admit" {
+                admit(&conn, &key("race"), "digest", None, State::DispatchStarted).map(
+                    |admission| {
+                        if retry {
+                            matches!(admission, Admission::Repeat(_))
+                        } else {
+                            !matches!(admission, Admission::Conflict)
+                        }
+                    },
+                )
+            } else {
+                settle(&conn, &key("race"), &success(), "ok", None, 100)
+                    .map(|changed| !retry || !changed)
+            };
+            match result {
+                Ok(expected) => {
+                    assert!(expected, "competitor did not repeat or settle idempotently")
+                }
+                Err(error) => assert!(
+                    !retry
+                        && matches!(error, rusqlite::Error::SqliteFailure(ref code, _) if code.code == rusqlite::ErrorCode::DatabaseBusy),
+                    "unexpected competitor error: {error}"
+                ),
+            }
+            return;
+        }
+        let mut failures = Vec::new();
+        for operation in ["admit", "settle"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.sqlite");
+            let mut conn = Connection::open(&path).unwrap();
+            crate::db::run_migrations(&mut conn).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+            if operation == "settle" {
+                admit(&conn, &key("race"), "digest", None, State::DispatchStarted).unwrap();
+            }
+            let competed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_competed = competed.clone();
+            let hook_path = path.clone();
+            AFTER_LEDGER_READ.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |_| {
+                    hook_competed.set(true);
+                    competitor(&hook_path, operation, false);
+                }))
+            });
+            if operation == "admit" {
+                let result = admit(&conn, &key("race"), "digest", None, State::DispatchStarted);
+                assert!(competed.get(), "admission competitor did not run");
+                if let Err(error) = &result {
+                    failures.push(format!("admit: {error}"));
+                    continue;
+                }
+                assert!(matches!(result.unwrap(), Admission::New));
+                assert!(matches!(
+                    admit(&conn, &key("race"), "digest", None, State::DispatchStarted).unwrap(),
+                    Admission::Repeat(_)
+                ));
+            } else {
+                let result = settle(&conn, &key("race"), &success(), "ok", None, 100);
+                assert!(competed.get(), "settlement competitor did not run");
+                if let Err(error) = &result {
+                    failures.push(format!("settle: {error}"));
+                    continue;
+                }
+                assert!(result.unwrap());
+                assert!(!settle(&conn, &key("race"), &success(), "ok", None, 100).unwrap());
+            }
+            competitor(&path, operation, true);
+        }
+        assert!(
+            failures.is_empty(),
+            "stale transaction upgrades: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn corrupt_expired_ledger_entry_returns_error_without_mutation() {
+        for damaged in ["{", "[]", "null"] {
+            let conn = database();
+            let key = key("corrupt");
+            admit(
+                &conn,
+                &key,
+                "digest",
+                Some(&scope("owner")),
+                State::DispatchStarted,
+            )
+            .unwrap();
+            settle(&conn, &key, &success(), "ok", None, 100).unwrap();
+            conn.execute("UPDATE call_ledger SET late_entry=?1", [damaged])
+                .unwrap();
+            assert!(reduce_expired(&conn, &key, 100 + RETENTION_MS).is_err());
+            let row = get(&conn, &key).unwrap().unwrap();
+            assert_eq!(row.late_entry.as_deref(), Some(damaged));
+            assert_eq!(row.frame.unwrap().body, success().body);
+        }
+    }
+
+    #[test]
+    fn ledger_recovery_tolerates_concurrent_row_removal() {
+        let conn = database();
+        let key = key("disappearing");
+        admit(&conn, &key, "digest", None, State::Prepared).unwrap();
+        BEFORE_RECOVERY_READ.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|conn, key| {
+                conn.execute(
+                    "DELETE FROM call_ledger WHERE carrier=?1 AND call_key=?2",
+                    params![key.carrier, key.call_key],
+                )
+                .unwrap();
+            }))
+        });
+        recover(&conn).unwrap();
+        assert!(get(&conn, &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn ledger_sweep_rolls_back_earlier_deletes_on_failure() {
+        let conn = database();
+        for carrier in ["a", "b"] {
+            admit(&conn, &key(carrier), "digest", None, State::DispatchStarted).unwrap();
+            settle(&conn, &key(carrier), &success(), "ok", None, 100).unwrap();
+        }
+        conn.execute_batch("CREATE TRIGGER fail_second_delete BEFORE DELETE ON call_ledger WHEN OLD.carrier='b' BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END").unwrap();
+        assert!(sweep(&conn, 100 + RETENTION_MS).is_err());
+        assert!(
+            get(&conn, &key("a")).unwrap().is_some(),
+            "earlier batch deletion was not rolled back"
+        );
+        assert!(get(&conn, &key("b")).unwrap().is_some());
+    }
     fn database() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::db::run_migrations(&mut conn).unwrap();

@@ -576,16 +576,14 @@ fn migrate_whole(
         crate::private_storage::create_dir_all(parent)?;
     }
 
-    let copy_result = match item.entry {
+    let bytes = match item.entry {
         EntryKind::Directory => copy_dir_recursive(source, &staging),
-        EntryKind::File => copy_file(source, &staging).map(|_| ()),
-    };
-    if let Err(error) = copy_result {
-        return Err(error);
-    }
+        EntryKind::File => copy_file(source, &staging),
+    }?;
 
     fs::rename(&staging, &final_path)?;
-    let bytes = source_size(source)?;
+    #[cfg(test)]
+    after_publish(source, &final_path);
     log.write(serde_json::json!({
         "level": "info",
         "step": "copy",
@@ -626,12 +624,14 @@ fn migrate_child_union(
         let result = if child_source.is_dir() {
             copy_dir_recursive(&child_source, &child_staging)
         } else {
-            copy_file(&child_source, &child_staging).map(|_| ())
+            copy_file(&child_source, &child_staging)
         };
         match result {
-            Ok(()) => {
+            Ok(bytes) => {
                 fs::rename(&child_staging, &child_final)?;
-                copied_bytes = copied_bytes.saturating_add(source_size(&child_final)?);
+                #[cfg(test)]
+                after_publish(&child_source, &child_final);
+                copied_bytes = copied_bytes.saturating_add(bytes);
             }
             Err(error) => {
                 failed = true;
@@ -717,19 +717,21 @@ fn staging_path(final_path: &Path, subtree: &str) -> PathBuf {
     ))
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
+fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<u64> {
     crate::private_storage::create_dir_all(target)?;
+    let mut bytes = 0_u64;
     for entry in sorted_read_dir(source)? {
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
-        if source_path.is_dir() {
-            copy_dir_recursive(&source_path, &target_path)?;
+        let copied = if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?
         } else {
-            copy_file(&source_path, &target_path)?;
-        }
+            copy_file(&source_path, &target_path)?
+        };
+        bytes = bytes.saturating_add(copied);
     }
     sync_path(target);
-    Ok(())
+    Ok(bytes)
 }
 
 fn copy_file(source: &Path, target: &Path) -> io::Result<u64> {
@@ -846,30 +848,13 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         crate::private_storage::create_dir_all(parent)?;
     }
-    let tmp = path.with_file_name(format!(
-        ".{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("marker"),
-        std::process::id(),
-        now_millis()
-    ));
-    let result = (|| {
-        let mut file = crate::private_storage::create(&tmp)?;
-        serde_json::to_writer(&mut file, value).map_err(io::Error::other)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent() {
-            sync_path(parent);
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    crate::durability::atomic_write(
+        path,
+        &bytes,
+        crate::durability::AtomicWriteDurability::FileAndDirectory,
+    )
 }
 
 fn sync_path(path: &Path) {
@@ -944,4 +929,94 @@ pub fn help_text() -> String {
 Blocking one-shot migration from legacy AFT storage into the CortexKit-rooted layout.\n\n\
 Exit codes:\n  0  success (including idempotent already-migrated/no-op; missing legacy source is a no-op)\n  1  source unreadable\n  2  insufficient disk space during preflight\n  3  migration lock contention\n  4  migration in progress / partial marker state\n  5  migration failed; inspect the log file"
         .to_string()
+}
+
+#[cfg(test)]
+type AfterPublish = Box<dyn FnOnce(&Path, &Path)>;
+#[cfg(test)]
+thread_local! {
+    static AFTER_PUBLISH: std::cell::RefCell<Option<AfterPublish>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_publish(source: &Path, target: &Path) {
+    let hook = AFTER_PUBLISH.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(source, target);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_marker_does_not_truncate_a_colliding_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker.json");
+        fs::write(&path, b"old marker").unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_collision = collision.clone();
+        crate::durability::BEFORE_TEMP_CREATE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |temporary| {
+                fs::write(temporary, b"another writer's temporary").unwrap();
+                *hook_collision.borrow_mut() = Some(temporary.to_path_buf());
+            }))
+        });
+        assert!(
+            atomic_write_json(&path, &serde_json::json!({"state": "new"})).is_err(),
+            "colliding temp was opened with truncate instead of exclusive creation"
+        );
+        let temporary = collision.borrow().clone().expect("creation hook must run");
+        assert_eq!(fs::read(temporary).unwrap(), b"another writer's temporary");
+        assert_eq!(fs::read(path).unwrap(), b"old marker");
+    }
+
+    #[test]
+    fn published_migration_uses_copy_bytes_not_late_tree_reads() {
+        for merge in [MergeKind::Whole, MergeKind::ChildUnion] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source/symbols");
+            fs::create_dir_all(source.join("child")).unwrap();
+            fs::write(source.join("child/payload"), b"copied!").unwrap();
+            let args = MigrationArgs {
+                from: dir.path().join("source"),
+                to: dir.path().join("target"),
+                harness: Harness::Opencode,
+                log: dir.path().join("migration.jsonl"),
+            };
+            let item = MigrationItem {
+                name: "symbols",
+                source_name: "symbols",
+                target: TargetKind::Root,
+                entry: EntryKind::Directory,
+                merge,
+            };
+            AFTER_PUBLISH.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|source, target| {
+                    fs::remove_dir_all(source).unwrap();
+                    fs::create_dir_all(source).unwrap();
+                    fs::write(
+                        source.join("changed"),
+                        b"different source after publication",
+                    )
+                    .unwrap();
+                    fs::write(target.join("concurrent"), b"another writer").unwrap();
+                }))
+            });
+            let mut log = JsonLogger::open(&args.log, args.harness.clone());
+            migrate_item(&args, item, &mut log).unwrap();
+            drop(log);
+            let records: Vec<serde_json::Value> = fs::read_to_string(&args.log)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                records.last().unwrap()["bytes"],
+                7,
+                "published copy was sized from mutable paths"
+            );
+        }
+    }
 }
