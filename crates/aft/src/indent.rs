@@ -80,7 +80,9 @@ pub fn detect_indent(source: &str, lang: LangId) -> IndentStyle {
     let mut indent_widths: [u32; 9] = [0; 9]; // index 1..8
 
     for line in source.lines() {
-        if line.is_empty() {
+        // The leading space in a block comment's ` *` decoration is not
+        // evidence of the surrounding code's indentation unit.
+        if line.trim().is_empty() || line.trim_start().starts_with('*') {
             continue;
         }
         let first = line.as_bytes()[0];
@@ -153,7 +155,7 @@ fn determine_space_width(widths: &[u32; 9]) -> u8 {
                 }
             }
         }
-        if matching > 0 && non_matching == 0 {
+        if matching > non_matching {
             return candidate;
         }
     }
@@ -238,5 +240,45 @@ mod tests {
         // Lines indented at 4 and 8 should detect 4-space indent
         let source = "impl Foo {\n    fn bar() {\n        let x = 1;\n    }\n}\n";
         assert_eq!(detect_indent(source, LangId::Rust), IndentStyle::Spaces(4));
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn block_comment_decoration_does_not_override_code_indent() {
+        let source = "/**\r\n * documentation\r\n */\r\nfunction run() {\r\n    one();\r\n    two();\r\n}\r\n";
+        assert_eq!(
+            detect_indent(source, LangId::TypeScript),
+            IndentStyle::Spaces(4)
+        );
+        let mut widths = [0; 9];
+        widths[1] = 1;
+        widths[4] = 5;
+        widths[8] = 2;
+        assert_eq!(determine_space_width(&widths), 4);
+        let generated = crate::extract::generate_extracted_function(
+            "helper",
+            &[],
+            &crate::extract::ReturnKind::Void,
+            "    one();\r\n    two();",
+            "",
+            LangId::TypeScript,
+            detect_indent(source, LangId::TypeScript),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        crate::edit::write_format_validate(&path, &generated, &config, &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"function helper() {\r\n    one();\r\n    two();\r\n}"
+        );
     }
 }

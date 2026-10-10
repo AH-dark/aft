@@ -250,7 +250,10 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // --- Extract body text ---
     let body_text = &source[start_byte..end_byte];
-    let body_text = body_text.trim_end_matches('\n');
+    let body_text = body_text
+        .strip_suffix("\r\n")
+        .or_else(|| body_text.strip_suffix('\n'))
+        .unwrap_or(body_text);
 
     // --- Generate function and call site ---
     let extracted_fn = generate_extracted_function(
@@ -476,7 +479,9 @@ fn build_new_source(
 
     // The extracted function + blank line
     result.push_str(extracted_fn);
-    result.push_str("\n\n");
+    let ending = edit::source_line_ending(source);
+    result.push_str(ending);
+    result.push_str(ending);
 
     // Everything between insert point and the range start (the original function
     // declaration up to where extraction begins)
@@ -484,7 +489,7 @@ fn build_new_source(
 
     // The call site replacing the original range
     result.push_str(call_site);
-    result.push('\n');
+    result.push_str(ending);
 
     // Everything after the range
     result.push_str(&source[range_end..]);
@@ -723,5 +728,33 @@ mod approved_contract_tests {
             std::fs::read_to_string(file).unwrap(),
             "function outer() { return 1; }\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit11_regressions {
+    use super::*;
+
+    #[test]
+    fn extraction_assembly_preserves_crlf_and_bom() {
+        let source = "\u{feff}function outer() {\r\n  run();\r\n}\r\n";
+        let start = source.find("  run();").unwrap();
+        let end = start + "  run();\r\n".len();
+        let content = build_new_source(
+            source,
+            3,
+            start,
+            end,
+            "function helper() {\r\n  run();\r\n}",
+            "  helper();",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.txt");
+        let config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        edit::write_format_validate(&path, &content, &config, &serde_json::json!({})).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), "\u{feff}function helper() {\r\n  run();\r\n}\r\n\r\nfunction outer() {\r\n  helper();\r\n}\r\n".as_bytes());
     }
 }
