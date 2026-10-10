@@ -67,7 +67,8 @@ const CLANGD: GithubServerSpec = {
   id: "clangd",
   githubRepo: "clangd/clangd",
   binary: "clangd",
-  resolveAsset: (platform, _arch, version) => {
+  resolveAsset: (platform, arch, version) => {
+    if (platform === "linux" && arch === "arm64") return null;
     const platformName = platform === "darwin" ? "mac" : platform === "linux" ? "linux" : "windows";
     return { name: `clangd-${platformName}-${version}.zip`, archive: "zip" };
   },

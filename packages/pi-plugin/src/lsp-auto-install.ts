@@ -279,6 +279,8 @@ function runInstall(
   cwd: string,
   installLock: InstallLockLease,
   signal?: AbortSignal,
+  deadlineMs = 120_000,
+  runtime = { spawn, terminate: terminateNpmProcessTree },
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const target = `${spec.npm}@${version}`;
@@ -312,7 +314,7 @@ function runInstall(
       "--silent",
       target,
     ]);
-    const child = spawn(invocation.command, invocation.args, {
+    const child = runtime.spawn(invocation.command, invocation.args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
       env: { ...npmSpawnEnv(npm), ...invocation.env },
@@ -323,9 +325,11 @@ function runInstall(
     let stderrBuf = "";
     let settled = false;
     let terminationPromise: Promise<void> | null = null;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
 
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
+      clearTimeout(deadline);
     };
     const finish = (ok: boolean) => {
       if (settled) return;
@@ -339,13 +343,13 @@ function runInstall(
       if (completedSuccessfully) log(`[lsp] installed ${target}`);
       finish(completedSuccessfully);
     };
-    const onAbort = () => {
+    const terminateInstall = (reason: string) => {
       if (childCompletedSuccessfully()) {
         finishAfterConfirmedTermination();
         return;
       }
-      warn(`[lsp] install ${target} aborted during shutdown`);
-      terminationPromise ??= terminateNpmProcessTree(child, invocation);
+      warn(`[lsp] install ${target} ${reason}`);
+      terminationPromise ??= runtime.terminate(child, invocation);
       void terminationPromise.then(finishAfterConfirmedTermination, (terminationError) => {
         // A child with no PID never spawned, so it cannot still be mutating the
         // cache and does not need cross-process quarantine.
@@ -362,6 +366,8 @@ function runInstall(
         finish(false);
       });
     };
+    const onAbort = () => terminateInstall("aborted during shutdown");
+    deadline = setTimeout(() => terminateInstall("exceeded its installation deadline"), deadlineMs);
 
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
@@ -723,3 +729,5 @@ export async function pushLspPathsAfterAutoInstall(
   pool.setConfigureOverride("lsp_paths_extra", paths);
   await pool.reconfigure(projectRoot, { lsp_paths_extra: paths });
 }
+
+export { runInstall as _runInstallForTesting };

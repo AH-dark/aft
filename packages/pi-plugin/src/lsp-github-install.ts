@@ -31,6 +31,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   copyFileSync,
   createReadStream,
@@ -61,8 +62,10 @@ import {
   windowsTarExecutable,
   writeStampedFileDigest,
 } from "@cortexkit/aft-bridge";
+import { writeAtomicFile } from "./atomic-file.js";
 import { error, log, warn } from "./logger.js";
 import {
+  acquireInstallLock,
   readInstalledMetaIn,
   readVersionCheck,
   shouldRecheckVersion,
@@ -246,7 +249,7 @@ function writeGithubInstalledMetaIn(
       binarySha256,
       ...(archiveSha256 ? { archiveSha256 } : {}),
     };
-    writeFileSync(join(installDir, INSTALLED_META_FILE), JSON.stringify(meta), "utf8");
+    writeAtomicFile(join(installDir, INSTALLED_META_FILE), JSON.stringify(meta));
   } catch (err) {
     warn(`[lsp] failed to write github installed metadata in ${installDir}: ${err}`);
   }
@@ -395,7 +398,7 @@ async function fetchReleaseByTag(
 
   const headers: Record<string, string> = {
     accept: "application/vnd.github+json",
-    "user-agent": "aft-opencode",
+    "user-agent": "aft-pi",
     "x-github-api-version": "2022-11-28",
   };
   if (process.env.GITHUB_TOKEN) {
@@ -450,9 +453,17 @@ async function fetchJsonFollowingRedirects(
 ): Promise<Response> {
   const maxRedirects = 5;
   let currentUrl = url;
+  const requestHeaders = { ...headers };
   for (let i = 0; i <= maxRedirects; i += 1) {
     assertAllowedDownloadUrl(currentUrl);
-    const res = await fetchImpl(currentUrl, { headers, redirect: "manual", signal });
+    if (new URL(currentUrl).origin !== "https://api.github.com") {
+      delete requestHeaders.authorization;
+    }
+    const res = await fetchImpl(currentUrl, {
+      headers: { ...requestHeaders },
+      redirect: "manual",
+      signal,
+    });
     if (res.status >= 300 && res.status < 400) {
       const location = res.headers.get("location");
       if (!location) throw new Error(`redirect status ${res.status} without Location`);
@@ -534,7 +545,12 @@ async function resolveTargetTag(
   const cachedTag = cached?.latest_eligible ?? null;
   const cachedSafe = isSafeVersion(cachedTag);
   if (cached && !shouldRecheckVersion(cached, weeklyMs) && cachedSafe) {
-    const release = await fetchReleaseByTag(spec.githubRepo, cachedTag as string, fetchImpl);
+    const release = await fetchReleaseByTag(
+      spec.githubRepo,
+      cachedTag as string,
+      fetchImpl,
+      signal,
+    );
     if (release) {
       return {
         tag: release.tag,
@@ -545,7 +561,7 @@ async function resolveTargetTag(
   }
 
   // 3. Live probe.
-  const probe = await probeGithubReleases(spec.githubRepo, config.graceDays, fetchImpl);
+  const probe = await probeGithubReleases(spec.githubRepo, config.graceDays, fetchImpl, signal);
   if (!probe) {
     // Return tag:null on probe failure so the caller
     // skips cleanly instead of trying to install with empty assets.
@@ -555,6 +571,9 @@ async function resolveTargetTag(
       blockedByGrace: false,
       reason: "github releases probe failed",
     };
+  }
+  if (probe.tag !== null && !isSafeVersion(probe.tag)) {
+    return { tag: null, assets: [], blockedByGrace: false, reason: "invalid GitHub release tag" };
   }
   writeVersionCheck(spec.githubRepo, probe.tag);
   return { tag: probe.tag, assets: probe.assets, blockedByGrace: probe.blockedByGrace };
@@ -896,13 +915,15 @@ async function precheckWithTar(archivePath: string, command: string): Promise<nu
     if (line.startsWith("h")) {
       throw new Error(`archive contains hardlink entry: ${line.trim()}`);
     }
+    if (!line.trim()) continue;
+    // GNU tar: mode owner/group size date time name.
+    // bsdtar: mode links owner group size month day time/year name.
     const parts = line.trim().split(/\s+/);
-    if (parts.length >= 6) {
-      const numeric = parts
-        .map((part) => Number.parseInt(part, 10))
-        .filter((value) => Number.isFinite(value) && value >= 0);
-      if (numeric.length > 0) totalBytes += Math.max(...numeric);
+    const size = parts[1]?.includes("/") ? parts[2] : parts[4];
+    if (!size || !/^\d+$/.test(size) || !Number.isSafeInteger(Number(size))) {
+      throw new Error(`unrecognized tar size listing: ${line.trim()}`);
     }
+    totalBytes += Number(size);
   }
 
   const names = await runArchiveTool(command, ["-tf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
@@ -1030,6 +1051,16 @@ function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform)
     return false;
   }
   return true;
+}
+
+function validateCachedGithubInstallWithLock(spec: GithubServerSpec, platform: Platform): boolean {
+  const lease = acquireInstallLock(spec.githubRepo);
+  if (!lease) return false;
+  try {
+    return validateCachedGithubInstall(spec, platform);
+  } finally {
+    lease.release();
+  }
 }
 
 /**
@@ -1173,16 +1204,19 @@ async function downloadAndInstall(
 
   const targetBinary = ghBinaryPath(spec, platform);
   mkdirSync(dirname(targetBinary), { recursive: true });
+  const temporaryBinary = `${targetBinary}.tmp-${randomBytes(8).toString("hex")}`;
   try {
-    copyFileSync(innerBinaryPath, targetBinary);
+    copyFileSync(innerBinaryPath, temporaryBinary);
     if (platform !== "win32") {
-      const { chmodSync } = await import("node:fs");
-      chmodSync(targetBinary, 0o755);
+      chmodSync(temporaryBinary, 0o755);
     }
+    renameSync(temporaryBinary, targetBinary);
   } catch (err) {
     const message = `failed to place binary at ${targetBinary}: ${err instanceof Error ? err.message : String(err)}`;
     error(`[lsp] ${spec.id}: ${message}`);
     return { ok: false, sha256: archiveSha256, error: message };
+  } finally {
+    rmSync(temporaryBinary, { force: true });
   }
 
   try {
@@ -1215,6 +1249,7 @@ async function ensureGithubInstalled(
   signal?: AbortSignal,
 ): Promise<{ started: boolean; reason?: string }> {
   const outcome = await withInstallLock(spec.githubRepo, async () => {
+    if (isGithubInstalled(spec, platform)) validateCachedGithubInstall(spec, platform);
     const failureMarker = readInstallFailureMarker(spec);
     const pinnedRelease = config.versions[spec.githubRepo];
     if (failureMarker) {
@@ -1395,7 +1430,7 @@ export function runGithubAutoInstall(
   for (const spec of GITHUB_LSP_TABLE) {
     if (
       isGithubInstalled(spec, host.platform) &&
-      validateCachedGithubInstall(spec, host.platform)
+      validateCachedGithubInstallWithLock(spec, host.platform)
     ) {
       cachedBinDirs.push(ghBinDir(spec));
     }
@@ -1455,7 +1490,7 @@ export function runGithubAutoInstall(
       return GITHUB_LSP_TABLE.filter(
         (spec) =>
           isGithubInstalled(spec, currentHost.platform) &&
-          validateCachedGithubInstall(spec, currentHost.platform),
+          validateCachedGithubInstallWithLock(spec, currentHost.platform),
       ).map((spec) => ghBinDir(spec));
     },
   };
@@ -1520,10 +1555,14 @@ export {
   detectHostPlatform,
   downloadFile as _downloadFileForTesting,
   extractArchiveSafely as _extractArchiveSafelyForTesting,
+  fetchReleaseByTag as _fetchReleaseByTagForTesting,
   findGithubServerById,
   GITHUB_LSP_TABLE,
   type GithubServerSpec,
   type Platform,
   precheckArchiveContents as _precheckArchiveSizeForTesting,
   runArchiveTool as _runArchiveToolForTesting,
+  precheckWithTar as _precheckTarForTesting,
+  resolveTargetTag as _resolveTargetTagForTesting,
+  writeGithubInstalledMetaIn as _writeGithubInstalledMetaForTesting,
 };
