@@ -162,6 +162,7 @@ struct ImportedExportLiveness {
 
 #[derive(Debug, Default)]
 struct FileAnalysis {
+    freshness: Option<crate::cache_freshness::FileFreshness>,
     rust_api: Option<RustApiFacts>,
     go_dispatch: Option<GoDispatchFacts>,
     raw_imports: Vec<RawImportContribution>,
@@ -250,6 +251,7 @@ impl DeadCodeFileAnalyzer {
             return FileAnalysis::default();
         }
 
+        let metadata = fs::metadata(file).ok();
         let Ok(source) = fs::read_to_string(file) else {
             return FileAnalysis::default();
         };
@@ -346,7 +348,12 @@ impl DeadCodeFileAnalyzer {
             Vec::new()
         };
 
-        FileAnalysis {
+        let analysis = FileAnalysis {
+            freshness: metadata.map(|metadata| crate::cache_freshness::FileFreshness {
+                mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                size: source.len() as u64,
+                content_hash: cache_freshness::hash_bytes(source.as_bytes()),
+            }),
             rust_api: (lang == LangId::Rust).then(|| {
                 tree.as_ref()
                     .map(|tree| rust_api_facts(&source, tree.root_node(), relative_file))
@@ -384,7 +391,14 @@ impl DeadCodeFileAnalyzer {
             globs_parent_module,
             trait_impl_methods,
             type_ref_names,
-        }
+        };
+        #[cfg(test)]
+        AFTER_ANALYSIS.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        analysis
     }
 
     fn parse_source(&mut self, lang: LangId, source: &str) -> Option<tree_sitter::Tree> {
@@ -627,6 +641,7 @@ fn gather_file_contribution(
                 .unwrap_or_default()
         });
     let FileAnalysis {
+        freshness,
         rust_api,
         go_dispatch,
         raw_imports,
@@ -724,10 +739,25 @@ fn gather_file_contribution(
         payload["skipped_files"] = Value::Array(oxc_skipped_files.to_vec());
     }
 
+    // OXC facts may have been parsed before this scan. Without metadata tied
+    // to that buffer, force content verification rather than blessing the
+    // facts with metadata from a later save.
+    let freshness = oxc_facts
+        .and_then(|facts| blake3::Hash::from_hex(&facts.content_hash).ok())
+        .map(|hash| match freshness.as_ref() {
+            Some(freshness) if freshness.content_hash == hash => *freshness,
+            _ => crate::cache_freshness::FileFreshness {
+                mtime: std::time::UNIX_EPOCH,
+                size: 0,
+                content_hash: hash,
+            },
+        })
+        .or(freshness);
+
     FileContribution::new(
         InspectCategory::DeadCode,
         file.to_path_buf(),
-        collect_freshness(file),
+        freshness.unwrap_or_else(|| collect_freshness(file)),
         payload,
     )
     .with_type_ref_names(type_ref_names)
@@ -1204,6 +1234,24 @@ fn callgraph_hashes(
     changed_files: &BTreeSet<String>,
     previous_initializer_files: Option<&BTreeSet<String>>,
 ) -> BTreeMap<String, String> {
+    let normalized_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let callers = snapshot
+        .outbound_calls
+        .iter()
+        .map(|call| call.caller_file.clone())
+        .collect::<BTreeSet<_>>();
+    let files_by_caller = callers
+        .into_iter()
+        .map(|caller| {
+            let normalized = canonical_or_normalized(&normalized_root, &caller);
+            let relative = normalized
+                .strip_prefix(&normalized_root)
+                .unwrap_or(&normalized)
+                .to_string_lossy()
+                .replace('\\', "/");
+            (caller, relative)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut hashes = previous.cloned().unwrap_or_default();
     let mut files = if previous.is_some() {
         for file in changed_files {
@@ -1211,11 +1259,7 @@ fn callgraph_hashes(
         }
         changed_files.clone()
     } else {
-        snapshot
-            .outbound_calls
-            .iter()
-            .map(|call| relative_path(project_root, &call.caller_file))
-            .collect()
+        files_by_caller.values().cloned().collect()
     };
     // A package's variables can change without changing the files that import
     // it. Rehash compact initializer groups even on an incremental scan.
@@ -1235,7 +1279,10 @@ fn callgraph_hashes(
         .collect::<BTreeMap<_, _>>();
     let mut hashers = BTreeMap::<String, blake3::Hasher>::new();
     for call in &snapshot.outbound_calls {
-        let Some(file) = absolute_files.get(&call.caller_file) else {
+        let Some(file) = files_by_caller
+            .get(&call.caller_file)
+            .filter(|file| files.contains(*file))
+        else {
             continue;
         };
         let hasher = hashers.entry((*file).clone()).or_default();
@@ -1283,8 +1330,12 @@ fn changed_map_keys(
 
 fn reachable_symbols_for_file(reachable: &BTreeSet<ExportNode>, file: &str) -> BTreeSet<String> {
     reachable
-        .iter()
-        .filter(|node| node.0 == file)
+        .range((file.to_string(), String::new())..)
+        .take_while(|node| {
+            #[cfg(test)]
+            REACHABLE_VISITS.with(|visits| visits.set(visits.get() + 1));
+            node.0 == file
+        })
         .map(|node| node.1.clone())
         .collect()
 }
@@ -1299,19 +1350,40 @@ fn fragments_from_aggregate(
     production_reachable: &BTreeSet<ExportNode>,
     aggregate: &Value,
 ) -> BTreeMap<String, DeadCodeFileFragment> {
-    let items_for_file = |key: &str, file: &str| {
-        aggregate[key]
-            .as_array()
+    let groups = [
+        "items",
+        "generated_items",
+        "test_only_items",
+        "uncertain_items",
+    ]
+    .map(|key| {
+        let mut grouped = BTreeMap::<&str, Vec<&Value>>::new();
+        for item in aggregate[key].as_array().into_iter().flatten() {
+            #[cfg(test)]
+            FRAGMENT_ITEM_VISITS.with(|visits| visits.set(visits.get() + 1));
+            if let Some(file) = item["file"].as_str() {
+                grouped.entry(file).or_default().push(item);
+            }
+        }
+        grouped
+    });
+    let items_for_file = |index: usize, file: &str| {
+        groups[index]
+            .get(file)
             .into_iter()
             .flatten()
-            .filter(|item| item["file"].as_str() == Some(file))
-            .cloned()
+            .map(|item| (*item).clone())
             .collect::<Vec<_>>()
     };
     materialized
         .iter()
         .map(|contribution| {
             let file = contribution.file.clone();
+            let headline_items = items_for_file(0, &file)
+                .into_iter()
+                .filter(|item| item.get("generated").is_none())
+                .collect::<Vec<_>>();
+            let headline_count = headline_items.len();
             (
                 file.clone(),
                 DeadCodeFileFragment {
@@ -1323,28 +1395,14 @@ fn fragments_from_aggregate(
                     ),
                     public_api: public_api_files.contains(&file),
                     roles_fingerprint: roles_fingerprint.to_string(),
-                    headline_items: items_for_file("items", &file)
+                    headline_items,
+                    generated_items: items_for_file(1, &file),
+                    test_only_items: items_for_file(2, &file),
+                    uncertain_items: items_for_file(3, &file),
+                    by_language: [(language_for_file(&file).to_string(), headline_count)]
                         .into_iter()
-                        .filter(|item| item.get("generated").is_none())
+                        .filter(|(_, count)| *count > 0)
                         .collect(),
-                    generated_items: items_for_file("generated_items", &file),
-                    test_only_items: items_for_file("test_only_items", &file),
-                    uncertain_items: items_for_file("uncertain_items", &file),
-                    by_language: [(
-                        language_for_file(&file).to_string(),
-                        aggregate["items"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter(|item| {
-                                item["file"].as_str() == Some(file.as_str())
-                                    && item.get("generated").is_none()
-                            })
-                            .count(),
-                    )]
-                    .into_iter()
-                    .filter(|(_, count)| *count > 0)
-                    .collect(),
                     excluded_test_findings: aggregate["excluded_test_by_file"][file.as_str()]
                         .as_u64()
                         .unwrap_or(0) as usize,
@@ -1360,16 +1418,15 @@ fn rank_dead_code_items(
     mut items: Vec<Value>,
     roles: &crate::inspect::entry_points::ProjectRoles,
 ) -> Vec<Value> {
-    items.sort_by(|a, b| {
-        let key = |item: &Value| {
-            (
-                roles.role_for(item["file"].as_str().unwrap_or("")),
-                item["file"].as_str().unwrap_or("").to_string(),
-                item["line"].as_u64().unwrap_or(0),
-                item["symbol"].as_str().unwrap_or("").to_string(),
-            )
-        };
-        key(a).cmp(&key(b))
+    items.sort_by_cached_key(|item| {
+        #[cfg(test)]
+        SORT_KEY_EVALUATIONS.with(|count| count.set(count.get() + 1));
+        (
+            roles.role_for(item["file"].as_str().unwrap_or("")),
+            item["file"].as_str().unwrap_or("").to_string(),
+            item["line"].as_u64().unwrap_or(0),
+            item["symbol"].as_str().unwrap_or("").to_string(),
+        )
     });
     items
 }
@@ -4052,26 +4109,13 @@ fn rust_mod_scope_chain(node: &tree_sitter::Node<'_>, source: &str) -> Vec<Strin
 }
 
 fn rust_impl_scope_name(impl_node: &tree_sitter::Node<'_>, source: &str) -> String {
-    let mut type_names: Vec<String> = Vec::new();
-    let mut child_cursor = impl_node.walk();
-    if child_cursor.goto_first_child() {
-        loop {
-            let child = child_cursor.node();
-            if child.kind() == "type_identifier" || child.kind() == "generic_type" {
-                type_names.push(node_text(source, child).to_string());
-            }
-            if !child_cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    if type_names.len() >= 2 {
-        format!("{} for {}", type_names[0], type_names[1])
-    } else if type_names.len() == 1 {
-        type_names[0].clone()
-    } else {
-        String::new()
+    let Some(self_type) = impl_node.child_by_field_name("type") else {
+        return String::new();
+    };
+    let self_name = node_text(source, self_type);
+    match impl_node.child_by_field_name("trait") {
+        Some(trait_type) => format!("{} for {self_name}", node_text(source, trait_type)),
+        None => self_name.to_string(),
     }
 }
 
@@ -6242,6 +6286,14 @@ struct ParsedTarget {
 }
 
 #[cfg(test)]
+thread_local! {
+    static AFTER_ANALYSIS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static REACHABLE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SORT_KEY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FRAGMENT_ITEM_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
@@ -6278,6 +6330,108 @@ mod tests {
     }
 
     #[test]
+    fn audit05_fragments_group_each_item_once() {
+        let files = ["a.rs", "b.rs", "c.rs"];
+        let contributions = files
+            .iter()
+            .map(|file| dispatch_contribution(file, &[]))
+            .collect::<Vec<_>>();
+        let items = files
+            .iter()
+            .map(|file| json!({"file": file, "symbol": "f", "line": 1}))
+            .collect::<Vec<_>>();
+        let aggregate = json!({"items": items, "generated_items": items, "test_only_items": items, "uncertain_items": items});
+        FRAGMENT_ITEM_VISITS.with(|visits| visits.set(0));
+        let fragments = fragments_from_aggregate(
+            &contributions,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            "roles",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &aggregate,
+        );
+        for file in files {
+            let fragment = &fragments[file];
+            assert_eq!(fragment.headline_items.len(), 1);
+            assert_eq!(fragment.generated_items.len(), 1);
+            assert_eq!(fragment.test_only_items.len(), 1);
+            assert_eq!(fragment.uncertain_items.len(), 1);
+            assert_eq!(fragment.by_language["rust"], 1);
+        }
+        assert_eq!(FRAGMENT_ITEM_VISITS.with(|visits| visits.get()), 12);
+    }
+
+    #[test]
+    fn audit05_reachability_query_visits_only_the_requested_file() {
+        let mut reachable = BTreeSet::new();
+        for i in 0..100 {
+            reachable.insert(("a.ts".to_string(), format!("symbol{i}")));
+            reachable.insert(("z.ts".to_string(), format!("symbol{i}")));
+        }
+        reachable.insert(("middle.ts".to_string(), "one".to_string()));
+        reachable.insert(("middle.ts".to_string(), "two".to_string()));
+        REACHABLE_VISITS.with(|visits| visits.set(0));
+        assert_eq!(
+            reachable_symbols_for_file(&reachable, "middle.ts"),
+            ["one".to_string(), "two".to_string()].into_iter().collect()
+        );
+        assert_eq!(REACHABLE_VISITS.with(|visits| visits.get()), 3);
+    }
+
+    #[test]
+    fn audit05_ranking_computes_one_key_per_item() {
+        let items = (0..100)
+            .rev()
+            .map(|line| json!({"file": "src/file.rs", "line": line, "symbol": "function"}))
+            .collect();
+        SORT_KEY_EVALUATIONS.with(|count| count.set(0));
+        let ranked = rank_dead_code_items(
+            items,
+            &crate::inspect::entry_points::ProjectRoles::default(),
+        );
+        assert_eq!(ranked[0]["line"], 0);
+        assert_eq!(ranked[99]["line"], 99);
+        assert_eq!(SORT_KEY_EVALUATIONS.with(|count| count.get()), 100);
+    }
+
+    #[test]
+    fn audit05_freshness_hashes_the_analyzed_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        let source = "pub fn old() {}\n";
+        fs::write(&path, source).unwrap();
+        let save_path = path.clone();
+        AFTER_ANALYSIS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(save_path, "pub fn new() {}\n").unwrap();
+            }))
+        });
+        let job = job(
+            dir.path(),
+            vec![path.clone()],
+            snapshot(vec![], vec![], vec![]),
+        );
+        let contribution = gather_file_contribution(
+            &job,
+            &path,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &mut DeadCodeFileAnalyzer::default(),
+        );
+        assert_eq!(
+            contribution.freshness.content_hash,
+            cache_freshness::hash_bytes(source.as_bytes())
+        );
+        assert_ne!(
+            contribution.freshness.content_hash,
+            cache_freshness::collect(&path).unwrap().content_hash
+        );
+    }
+
+    #[test]
     fn caller_comparison_keys_keep_and_count_missing_file_edges() {
         let (_temp, root, _) = fixture_project(&[("src/present.rs", "pub fn run() {}\n")]);
         let calls = vec![
@@ -6288,6 +6442,82 @@ mod tests {
         assert_eq!(grouped.canonicalization_attempts, 1);
         assert_eq!(grouped.lexical_fallbacks, 1);
         assert_eq!(grouped.by_file["src/missing.rs"].len(), 2);
+    }
+
+    #[test]
+    fn audit05_oxc_contribution_freshness_uses_facts_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.ts");
+        let source = "export const old = 1;\n";
+        fs::write(&path, source).unwrap();
+        let result = crate::inspect::oxc_engine::analyze_files(
+            dir.path(),
+            std::slice::from_ref(&path),
+            Default::default(),
+        )
+        .unwrap();
+        fs::write(&path, "export const new = 1;\n").unwrap();
+        let job = job(
+            dir.path(),
+            vec![path.clone()],
+            snapshot(vec![], vec![], vec![]),
+        );
+        let facts = result
+            .facts
+            .into_iter()
+            .map(|facts| ("file.ts".to_string(), facts))
+            .collect();
+        let contribution = gather_file_contribution(
+            &job,
+            &path,
+            &BTreeMap::new(),
+            &facts,
+            &BTreeMap::new(),
+            &[],
+            &mut DeadCodeFileAnalyzer::default(),
+        );
+        assert_eq!(
+            contribution.freshness.content_hash,
+            cache_freshness::hash_bytes(source.as_bytes())
+        );
+        assert_eq!(
+            cache_freshness::verify_file(&path, &contribution.freshness),
+            crate::cache_freshness::FreshnessVerdict::Stale
+        );
+    }
+
+    #[test]
+    fn audit05_rust_impl_scope_includes_scoped_and_reference_types() {
+        let source = "impl crate::Trait for &crate::Widget { fn run(&self) {} }";
+        let tree = DeadCodeFileAnalyzer::default()
+            .parse_source(LangId::Rust, source)
+            .unwrap();
+        let node = tree.root_node().named_child(0).unwrap();
+        assert_eq!(
+            rust_impl_scope_name(&node, source),
+            "crate::Trait for &crate::Widget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit05_callgraph_hashes_accept_symlink_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("real");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("lib.rs"), "fn caller() {}\n").unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let snapshot = snapshot(
+            vec![],
+            vec![],
+            vec![outbound(&root, "lib.rs", "caller", "target")],
+        );
+        let expected = callgraph_hashes(&root, &snapshot, None, &BTreeSet::new());
+        let actual = callgraph_hashes(&alias, &snapshot, None, &BTreeSet::new());
+        assert_eq!(expected.len(), 1);
+        assert_eq!(actual, expected);
     }
 
     fn reachability_fixture(edges: &[(&str, &str)], roots: &[&str]) -> ReachabilityState {

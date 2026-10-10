@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -235,12 +236,14 @@ pub struct ContributionRecord {
 
 #[derive(Debug, Clone)]
 struct MemoryAggregate {
+    touched: u64,
     payload: serde_json::Value,
     generated_at: i64,
     contribution_set_hash: Option<String>,
 }
 
 const TIER1_FILE_MEMO_MAX_ENTRIES: usize = 4_096;
+const MAX_SCOPED_MEMORY_AGGREGATES: usize = 128;
 
 #[derive(Debug, Clone)]
 struct Tier1MemoEntry<T> {
@@ -443,44 +446,61 @@ impl<T: Clone> Tier1FileMemo<T> {
     }
 
     fn cached_value(&self, path: &Path) -> Option<T> {
-        let mut cached = self
+        let cached = self
             .state
             .lock()
             .ok()
             .and_then(|state| state.entries.get(path).cloned())?;
 
-        match crate::cache_freshness::verify_file(path, &cached.freshness) {
+        let verdict = crate::cache_freshness::verify_file(path, &cached.freshness);
+        self.finish_cached_read(path, cached, verdict)
+    }
+
+    fn finish_cached_read(
+        &self,
+        path: &Path,
+        cached: Tier1MemoEntry<T>,
+        verdict: FreshnessVerdict,
+    ) -> Option<T> {
+        let mut state = self.state.lock().ok()?;
+        let current = state.entries.get_mut(path)?;
+        // Verification performs I/O outside the lock. A rescan may have
+        // replaced this entry in the meantime; do not publish its old value.
+        if current.generation != cached.generation {
+            return None;
+        }
+        match verdict {
             FreshnessVerdict::HotFresh => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.touch(path);
-                }
+                state.touch(path);
                 Some(cached.value)
             }
             FreshnessVerdict::ContentFresh {
                 new_mtime,
                 new_size,
             } => {
-                cached.freshness.mtime = new_mtime;
-                cached.freshness.size = new_size;
-                let value = cached.value.clone();
-                if let Ok(mut state) = self.state.lock() {
-                    state.insert(path.to_path_buf(), cached);
-                }
-                Some(value)
+                current.freshness.mtime = new_mtime;
+                current.freshness.size = new_size;
+                state.touch(path);
+                Some(cached.value)
             }
             FreshnessVerdict::Stale => None,
             FreshnessVerdict::Deleted => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.remove(path);
-                }
+                state.remove(path);
                 None
             }
         }
     }
 }
 
+fn is_scoped_memory_key(key: &JobKey) -> bool {
+    key.scope_hash
+        .as_deref()
+        .is_some_and(|scope| scope != "project")
+}
+
 #[derive(Debug)]
 pub struct InspectCache {
+    memory_clock: AtomicU64,
     project_root: PathBuf,
     project_key: String,
     sqlite_path: PathBuf,
@@ -673,6 +693,7 @@ impl InspectCache {
         conn: TrackedConnection,
     ) -> Self {
         Self {
+            memory_clock: AtomicU64::new(0),
             project_root,
             project_key,
             sqlite_path,
@@ -747,17 +768,36 @@ impl InspectCache {
         payload: serde_json::Value,
         contribution_set_hash: Option<String>,
     ) -> Result<(), InspectCacheError> {
-        self.memory
+        let mut memory = self
+            .memory
             .write()
-            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
-            .insert(
-                key,
-                MemoryAggregate {
-                    payload,
-                    generated_at: unix_seconds_now(),
-                    contribution_set_hash,
-                },
-            );
+            .map_err(|_| InspectCacheError::LockPoisoned("memory"))?;
+        memory.insert(
+            key,
+            MemoryAggregate {
+                touched: self.memory_clock.fetch_add(1, Ordering::Relaxed),
+                payload,
+                generated_at: unix_seconds_now(),
+                contribution_set_hash,
+            },
+        );
+        // Project totals are reused by status views. Only ad-hoc scoped
+        // responses compete for this budget, with recently read scopes kept.
+        while memory
+            .keys()
+            .filter(|key| is_scoped_memory_key(key))
+            .count()
+            > MAX_SCOPED_MEMORY_AGGREGATES
+        {
+            let oldest = memory
+                .iter()
+                .filter(|(key, _)| is_scoped_memory_key(key))
+                .min_by_key(|(key, entry)| (entry.touched, (*key).clone()))
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                memory.remove(&oldest);
+            }
+        }
         Ok(())
     }
 
@@ -785,10 +825,13 @@ impl InspectCache {
         if !key.category.is_tier2() {
             return Ok(self
                 .memory
-                .read()
+                .write()
                 .map_err(|_| InspectCacheError::LockPoisoned("memory"))?
-                .get(key)
-                .map(|entry| entry.payload.clone()));
+                .get_mut(key)
+                .map(|entry| {
+                    entry.touched = self.memory_clock.fetch_add(1, Ordering::Relaxed);
+                    entry.payload.clone()
+                }));
         }
 
         let current_hash = {
@@ -2578,6 +2621,75 @@ fn now_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audit05_memo_refresh_does_not_replace_a_newer_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("file.rs");
+        fs::write(&path, "old").unwrap();
+        let memo = Tier1FileMemo::<String>::default();
+        memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), "old".into()));
+        let old = memo.state.lock().unwrap().entries[&path].clone();
+        fs::write(&path, "new contents").unwrap();
+        memo.get_or_insert_with(&path, |path| (Some(collect_freshness(path)), "new".into()));
+        let result = memo.finish_cached_read(
+            &path,
+            old,
+            FreshnessVerdict::ContentFresh {
+                new_mtime: UNIX_EPOCH,
+                new_size: 3,
+            },
+        );
+        assert!(result.is_none(), "a raced read must be retried");
+        assert_eq!(memo.state.lock().unwrap().entries[&path].value, "new");
+    }
+
+    #[test]
+    fn audit05_scoped_aggregates_are_bounded_and_keep_project_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            InspectCache::open(dir.path().join("inspect"), dir.path().to_path_buf()).unwrap();
+        let project = JobKey::for_project_category(InspectCategory::Todos);
+        cache
+            .store_aggregated(project.clone(), serde_json::json!({"count": 42}))
+            .unwrap();
+        for i in 0..=MAX_SCOPED_MEMORY_AGGREGATES {
+            let key = JobKey {
+                category: InspectCategory::Todos,
+                scope_hash: Some(format!("scope-{i}")),
+            };
+            cache
+                .store_aggregated(key, serde_json::json!({"count": i}))
+                .unwrap();
+        }
+        assert_eq!(
+            cache.memory.read().unwrap().len(),
+            MAX_SCOPED_MEMORY_AGGREGATES + 1
+        );
+        assert_eq!(
+            cache.get_aggregated(&project).unwrap().unwrap()["count"],
+            42
+        );
+        let recent = JobKey {
+            category: InspectCategory::Todos,
+            scope_hash: Some("scope-1".into()),
+        };
+        assert!(cache.get_aggregated(&recent).unwrap().is_some());
+        cache
+            .store_aggregated(
+                JobKey {
+                    category: InspectCategory::Todos,
+                    scope_hash: Some("newest".into()),
+                },
+                serde_json::json!({"count": 1}),
+            )
+            .unwrap();
+        let memory = cache.memory.read().unwrap();
+        assert!(memory.contains_key(&recent));
+        assert!(!memory.contains_key(&JobKey {
+            category: InspectCategory::Todos,
+            scope_hash: Some("scope-2".into())
+        }));
+    }
     #[test]
     fn durability_inspect_pointer_count() {
         let dir = tempfile::tempdir().unwrap();
