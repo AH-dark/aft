@@ -97,7 +97,10 @@ async function bootLocation(context, location, dependencies) {
   // config switch that turns it off.
   const isProjectEnabled = createProjectAcceptance(directory, dependencies);
   // getPool is only called on a version mismatch, after the pool exists.
-  const pool = await dependencies.acquireBridge(canonicalDirectory, {
+  let pool;
+  let liveConfigReload;
+  try {
+  pool = await dependencies.acquireBridge(canonicalDirectory, {
     harness: "opencode",
     binaryPath: environment.binaryPath,
     poolOptions: {
@@ -143,7 +146,7 @@ async function bootLocation(context, location, dependencies) {
   const hintsBlock = hints === null ? null : renameV2ToolReferences(hints);
   // Keep this Location's live config keys current when a config file changes.
   // The finalizer that releases the bridge also stops the watch.
-  const liveConfigReload = dependencies.startLiveConfigReload({
+  liveConfigReload = dependencies.startLiveConfigReload({
     directory,
     initialSources: bootstrap.sources ?? [],
     initialSourceTexts: bootstrap.sourceTexts,
@@ -155,6 +158,15 @@ async function bootLocation(context, location, dependencies) {
     notify,
   });
   return { consumers, pool, tools, liveConfigReload, toolContext, directory, hintsBlock };
+  } catch (error) {
+    // Boot failures occur before the Location owns a finalizer; unwind every acquired resource.
+    await Promise.allSettled([
+      Promise.resolve().then(() => liveConfigReload?.stop()),
+      Promise.resolve().then(() => consumers.dispose?.()),
+      Promise.resolve().then(() => pool && dependencies.releaseBridge(pool)),
+    ]);
+    throw error;
+  }
 }
 
 /**
@@ -214,7 +226,20 @@ export function makeServerEffect(overrides = {}) {
       // finalizer logs when the host disposes the Location.
       const logRuntimeStop = logRuntimeStart(location);
       yield* Effect.addFinalizer(() => Effect.sync(logRuntimeStop));
-      const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies));
+      const runtime = yield* Effect.acquireRelease(
+        Effect.promise(() => bootLocation(context, location, dependencies)),
+        (runtime) => Effect.promise(async () => {
+          try {
+            runtime.liveConfigReload?.stop();
+          } finally {
+            try {
+              runtime.consumers.dispose?.();
+            } finally {
+              if (runtime.pool) await dependencies.releaseBridge(runtime.pool);
+            }
+          }
+        }),
+      );
       if (!runtime) return;
 
       if (runtime.configError !== undefined) {
@@ -224,13 +249,6 @@ export function makeServerEffect(overrides = {}) {
         return;
       }
 
-      yield* Effect.addFinalizer(() =>
-        Effect.promise(async () => {
-          runtime.liveConfigReload?.stop();
-          runtime.consumers.dispose?.();
-          await dependencies.releaseBridge(runtime.pool);
-        }),
-      );
       const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
       yield* registerV2SessionLifecycle(context, runtime.toolContext);
