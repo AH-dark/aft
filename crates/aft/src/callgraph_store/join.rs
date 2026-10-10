@@ -174,6 +174,7 @@ pub struct BlobImport {
 /// Path-free parse output stored for a regular source file.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ParseBlob {
+    pub entry_point_symbols: Vec<String>,
     #[serde(default)]
     pub dispatch: dispatch::DispatchFacts,
     pub extractor_version: String,
@@ -326,6 +327,12 @@ impl CallgraphBlob {
         });
 
         let mut parse = ParseBlob {
+            entry_point_symbols: data
+                .symbol_metadata
+                .iter()
+                .filter(|(_, meta)| meta.entry_point_attribute.is_some())
+                .map(|(name, _)| name.clone())
+                .collect(),
             dispatch: dispatch::DispatchFacts::default(),
             extractor_version,
             language: language.to_string(),
@@ -337,6 +344,7 @@ impl CallgraphBlob {
             imports,
             refs,
         };
+        parse.entry_point_symbols.sort();
         dispatch::complete_members(source, lang, root, &mut parse)?;
         parse.dispatch = dispatch::extract(source, lang, root, &parse)?;
         Ok(Self::Parse(parse))
@@ -647,6 +655,11 @@ fn blob_refs(line_index: &super::LineIndex, data: &FileCallData) -> Vec<BlobRef>
             refs.push(call_ref(caller_symbol, call, BlobRefKind::ValueRef));
         }
     }
+    for (caller_symbol, calls) in ordered_symbol_sites(&data.macro_body_calls_by_macro) {
+        for call in calls {
+            refs.push(call_ref(caller_symbol, call, BlobRefKind::Call));
+        }
+    }
     for import in &data.import_block.imports {
         refs.push(BlobRef {
             ordinal: 0,
@@ -953,8 +966,18 @@ impl ParseBlob {
             .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(self.language.clone()))?;
         let mut calls_by_symbol: HashMap<String, Vec<callgraph::CallSite>> = HashMap::new();
         let mut value_refs_by_symbol: HashMap<String, Vec<callgraph::CallSite>> = HashMap::new();
+        let mut macro_body_calls_by_macro: HashMap<String, Vec<callgraph::CallSite>> =
+            HashMap::new();
         for raw in &self.refs {
             let map = match raw.kind {
+                BlobRefKind::Call
+                    if raw
+                        .caller_symbol
+                        .as_deref()
+                        .is_some_and(|s| s.ends_with('!')) =>
+                {
+                    &mut macro_body_calls_by_macro
+                }
                 BlobRefKind::Call => &mut calls_by_symbol,
                 BlobRefKind::ValueRef => &mut value_refs_by_symbol,
                 _ => continue,
@@ -1002,7 +1025,10 @@ impl ParseBlob {
                         end_line: symbol.end_line,
                         end_col: symbol.end_col,
                     },
-                    entry_point_attribute: None,
+                    entry_point_attribute: self
+                        .entry_point_symbols
+                        .contains(&symbol.scoped_name)
+                        .then(|| "initializer_or_attribute".to_string()),
                 },
             );
         }
@@ -1045,9 +1071,7 @@ impl ParseBlob {
         Ok(FileCallData {
             calls_by_symbol,
             value_refs_by_symbol,
-            // Blobs carry no macro-template calls or unparsed macro mentions
-            // yet, so blob-backed stores answer `callers` without them.
-            macro_body_calls_by_macro: HashMap::new(),
+            macro_body_calls_by_macro,
             macro_mentions_by_symbol: HashMap::new(),
             symbol_metadata,
             exported_symbols: self
@@ -1104,7 +1128,9 @@ impl ParseBlob {
                     exported: symbol.exported,
                     is_default_export: symbol.is_default_export,
                     is_type_like: false,
-                    is_callgraph_entry_point: false,
+                    is_callgraph_entry_point: self
+                        .entry_point_symbols
+                        .contains(&symbol.scoped_name),
                 }
             })
             .collect::<Vec<_>>();
@@ -1164,6 +1190,14 @@ impl ParseBlob {
                 caller_symbol,
                 caller_file: path.to_string(),
                 kind: match raw.kind {
+                    BlobRefKind::Call
+                        if raw
+                            .caller_symbol
+                            .as_deref()
+                            .is_some_and(|s| s.ends_with('!')) =>
+                    {
+                        super::MACRO_BODY_CALL_REF_KIND
+                    }
                     BlobRefKind::Call => "call",
                     BlobRefKind::ValueRef => "value_ref",
                     BlobRefKind::Import => "import",
@@ -1687,7 +1721,9 @@ impl ViewFileSurface {
 pub(crate) fn view_resolution_config(path: &[u8]) -> bool {
     matches!(
         path.rsplit(|byte| *byte == b'/').next(),
-        Some(b"package.json" | b"tsconfig.json" | b"pnpm-workspace.yaml" | b"Cargo.toml")
+        Some(
+            b"package.json" | b"tsconfig.json" | b"pnpm-workspace.yaml" | b"Cargo.toml" | b"go.mod"
+        )
     )
 }
 
@@ -2485,6 +2521,9 @@ impl<I> ViewSurfaceIndex<'_, I> {
 }
 
 impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
+    fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        self.inner.go_package_files(caller_file, module)
+    }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         // resolve_ref reads only its own caller data; changed callers never reuse
         // surface answers, so the immutable blob itself guards this input.

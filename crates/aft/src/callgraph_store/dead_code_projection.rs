@@ -430,6 +430,12 @@ pub(super) fn extend_projection_dependents(
     for row in statement.query_map([file], |row| row.get::<_, String>(0))? {
         callers.insert(row?);
     }
+    if file.ends_with(".go") || file.ends_with("go.mod") {
+        let mut go_files = conn.prepare_cached("SELECT path FROM files WHERE lang='go'")?;
+        for path in go_files.query_map([], |row| row.get::<_, String>(0))? {
+            callers.insert(path?);
+        }
+    }
     Ok(())
 }
 
@@ -772,7 +778,8 @@ const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
             COALESCE(r.target_file, e.target_file),
             COALESCE(tn.name, r.target_symbol, e.target_symbol),
             r.line,
-            COALESCE(e.provenance, r.provenance),
+            CASE WHEN r.kind = 'value_ref' THEN 'value_ref'
+                 ELSE COALESCE(e.provenance, r.provenance) END,
             r.byte_start,
             r.byte_end,
             r.ref_id
@@ -780,7 +787,7 @@ const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
      LEFT JOIN nodes n ON n.id = r.caller_node
      LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = r.kind
      LEFT JOIN nodes tn ON tn.id = e.target_node
-     WHERE r.kind IN ('call', 'value_ref')";
+     WHERE r.kind IN ('call', 'value_ref', 'macro_body_call')";
 
 fn outbound_calls_from_store(
     conn: &Connection,
@@ -856,7 +863,7 @@ fn outbound_calls_query(
             && row
                 .full_ref
                 .as_deref()
-                .is_some_and(|full_ref| full_ref.contains("::"));
+                .is_some_and(|full_ref| full_ref.contains("::") || full_ref.contains('.'));
         if row.provenance == PROVENANCE_VALUE_REF
             && !matches!(row.status.as_str(), "resolved" | "resolved_local")
             && !unresolved_value_path
@@ -888,7 +895,8 @@ fn outbound_calls_query(
             short_name.to_string()
         };
 
-        if !row.ref_id.starts_with("view:")
+        if row.provenance != PROVENANCE_VALUE_REF
+            && !row.ref_id.starts_with("view:")
             && row
                 .full_ref
                 .as_deref()
@@ -918,9 +926,74 @@ fn outbound_calls_query(
             stale_caller_nodes
         );
     }
+    calls.extend(go_initializer_edges(conn, paths, file)?);
     calls.sort_by(|left, right| {
         projection_path_key(&left.caller_file).cmp(projection_path_key(&right.caller_file))
     });
+    Ok(calls)
+}
+
+fn go_initializer_edges(
+    conn: &Connection,
+    paths: &mut SnapshotPathResolver<'_>,
+    file: Option<&str>,
+) -> Result<Vec<CallgraphOutboundCall>> {
+    let disk = super::DiskFacts::new(paths.project_root);
+    let facts = super::facts::FactPaths {
+        root: paths.project_root,
+        facts: &disk,
+    };
+    let cache = super::WorkspaceCratePrefixCache::default();
+    let mut query = conn.prepare("SELECT n.file_path, n.scoped_name FROM nodes n JOIN files f ON f.path=n.file_path WHERE f.lang='go' AND (?1 IS NULL OR n.file_path=?1) ORDER BY n.file_path, n.scoped_name")?;
+    let callers = query
+        .query_map([file], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut vars = conn.prepare("SELECT scoped_name FROM nodes WHERE file_path=?1 AND (kind='variable' OR scoped_name='<go-package-init>')")?;
+    let mut imports = conn.prepare("SELECT DISTINCT module_path FROM refs WHERE caller_file=?1 AND kind='import' AND module_path IS NOT NULL")?;
+    let mut targets_by_file = BTreeMap::new();
+    let mut calls = Vec::new();
+    for (caller_file, caller_symbol) in callers {
+        if !targets_by_file.contains_key(&caller_file) {
+            let mut packages = super::go_package_files(&facts, &cache, &caller_file, None);
+            let modules = imports
+                .query_map([&caller_file], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for module in modules {
+                packages.extend(super::go_package_files(
+                    &facts,
+                    &cache,
+                    &caller_file,
+                    Some(&module),
+                ));
+            }
+            packages.sort();
+            packages.dedup();
+            let mut targets = Vec::new();
+            for target_file in packages {
+                for symbol in vars.query_map([&target_file], |row| row.get::<_, String>(0))? {
+                    targets.push((target_file.clone(), symbol?));
+                }
+            }
+            targets_by_file.insert(caller_file.clone(), targets);
+        }
+        // A reached Go file initializes its entire package and every imported
+        // package, including blank imports. Edges, rather than unconditional
+        // roots, leave packages imported only by dead code unreachable.
+        for (target_file, target_symbol) in &targets_by_file[&caller_file] {
+            if target_file == &caller_file && target_symbol == &caller_symbol {
+                continue;
+            }
+            calls.push(CallgraphOutboundCall {
+                caller_file: paths.resolve(&caller_file),
+                caller_symbol: caller_symbol.clone(),
+                target: format!("{}::{target_symbol}", paths.resolve(target_file).display()),
+                line: 1,
+                provenance: "go_package_initializer".to_string(),
+            });
+        }
+    }
     Ok(calls)
 }
 

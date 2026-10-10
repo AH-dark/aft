@@ -1151,6 +1151,7 @@ pub(super) fn is_resolution_input(path: &[u8]) -> bool {
     let name = path.rsplit(|byte| *byte == b'/').next().unwrap_or(path);
     name == b"package.json"
         || name == b"Cargo.toml"
+        || name == b"go.mod"
         || name == b".gitignore"
         || name.starts_with(b"tsconfig") && name.ends_with(b".json")
 }

@@ -1900,12 +1900,18 @@ impl CallgraphRefreshState {
 type WorkspaceCratePrefixes = HashMap<String, String>;
 
 #[derive(Clone, Debug, Default)]
-struct WorkspaceCratePrefixCache(Arc<OnceLock<WorkspaceCratePrefixes>>);
+struct WorkspaceCratePrefixCache(
+    Arc<OnceLock<WorkspaceCratePrefixes>>,
+    Arc<OnceLock<HashMap<String, String>>>,
+);
 
 const REFRESH_WORKSPACE_CACHE_ROOT_CAP: usize = 128;
 
 pub(crate) fn invalidates_workspace_crate_prefix_cache(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("Cargo.toml" | "go.mod")
+    )
 }
 
 /// A JS workspace manifest change can add or remove members, so the
@@ -2708,7 +2714,9 @@ fn process_callgraph_refresh_batch(
         .paths
         .iter()
         .filter(|path| {
-            crate::parser::detect_language(path).is_some() && !batch.path_is_ignored(path)
+            (crate::parser::detect_language(path).is_some()
+                || path.file_name().and_then(|s| s.to_str()) == Some("go.mod"))
+                && !batch.path_is_ignored(path)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -3740,6 +3748,7 @@ struct ProjectIndex<'a> {
 /// refreshes use the in-memory index, while cold builds query only the rows
 /// needed by the active caller from SQLite.
 trait ResolverIndex {
+    fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String>;
     fn caller_data(&self, file: &str) -> Option<&FileCallData>;
     fn lang_for(&self, file: &str) -> Option<LangId>;
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
@@ -3762,6 +3771,16 @@ trait ResolverIndex {
 }
 
 impl ResolverIndex for ProjectIndex<'_> {
+    fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        let paths = FactPaths {
+            root: &self.project_root,
+            facts: self.facts.as_ref(),
+        };
+        go_package_files(&paths, &self.workspace_crate_prefixes, caller_file, module)
+            .into_iter()
+            .filter(|file| self.contains_file(file))
+            .collect()
+    }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         self.caller_data.get(file).copied()
     }
@@ -4157,6 +4176,17 @@ impl DiskProjectIndex<'_> {
 }
 
 impl ResolverIndex for DiskProjectIndex<'_> {
+    fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        let disk = DiskFacts::new(self.project_root);
+        let paths = FactPaths {
+            root: self.project_root,
+            facts: &disk,
+        };
+        go_package_files(&paths, &self.workspace_crate_prefixes, caller_file, module)
+            .into_iter()
+            .filter(|file| self.contains_file(file))
+            .collect()
+    }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         (file == self.caller_file).then_some(self.caller_data)
     }
@@ -5840,6 +5870,20 @@ impl CallGraphStore {
                 }
             };
             changed.push(rel_path.clone());
+            if abs_path.file_name().and_then(|s| s.to_str()) == Some("go.mod") {
+                let mut query = conn.prepare("SELECT path FROM files WHERE lang = 'go'")?;
+                let files = query
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for file in files {
+                    record_dependent_refs(
+                        &mut selected_ref_ids,
+                        &mut selected_refs_by_caller,
+                        all_refs_of_caller(&conn, &file)?,
+                    );
+                }
+                continue;
+            }
             let old_row = load_file_row(&conn, &rel_path)?;
             if !abs_path.exists() {
                 if old_row.is_some() && deleted.insert(rel_path.clone()) {
@@ -10166,7 +10210,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v13-typed-dispatch-precision";
+const BUILD_OUTPUT_VERSION: &str = "v14-go-package-initializers-rust-aliases";
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
@@ -13036,7 +13080,10 @@ fn surface_fingerprint(
 }
 
 fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> {
-    if !matches!(raw.kind.as_str(), "call" | "value_ref") {
+    if !matches!(
+        raw.kind.as_str(),
+        "call" | "value_ref" | MACRO_BODY_CALL_REF_KIND
+    ) {
         return Ok(ResolvedRef {
             dependencies: raw.dependencies.clone(),
             raw,
@@ -13063,6 +13110,9 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         Some(LangId::Rust) => {
             resolve_rust_target(index, &caller_file, full_ref, short_name, caller_data, &raw)
         }
+        Some(LangId::Go) => {
+            resolve_go_target(index, &caller_file, full_ref, short_name, caller_data)
+        }
         Some(LangId::TypeScript | LangId::Tsx | LangId::JavaScript) => {
             resolve_js_ts_target(index, &caller_file, full_ref, short_name, caller_data)
         }
@@ -13084,6 +13134,7 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     dependencies.insert(target_file.clone());
     let target_node = index.node_for_symbol(&target_file, &target_symbol);
     if raw.kind == "value_ref"
+        && index.lang_for(&caller_file) != Some(LangId::Go)
         && !target_node
             .as_deref()
             .is_some_and(|node_id| index.node_is_callable(&target_file, node_id))
@@ -13128,6 +13179,131 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
         dependencies,
         edge,
     })
+}
+
+fn go_package_files(
+    facts: &FactPaths<'_>,
+    cache: &WorkspaceCratePrefixCache,
+    caller_file: &str,
+    module: Option<&str>,
+) -> Vec<String> {
+    let dir = if let Some(module) = module {
+        let modules = cache.1.get_or_init(|| {
+            let mut modules = HashMap::new();
+            let mut stack = vec![facts.root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                if matches!(
+                    dir.file_name().and_then(|s| s.to_str()),
+                    Some("target" | "node_modules" | ".git")
+                ) {
+                    continue;
+                }
+                let manifest = dir.join("go.mod");
+                facts.config_fact(&manifest, "module");
+                if let Some(bytes) = facts.attributed_bytes(&manifest) {
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        for line in text.lines() {
+                            let mut words = line.split_whitespace();
+                            if words.next() == Some("module") {
+                                if let Some(name) = words.next() {
+                                    modules.insert(
+                                        name.trim_matches('"').to_string(),
+                                        relative_path(facts.root, &dir),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                for entry in facts.list_dir(&dir) {
+                    if entry.kind == EntryKind::Directory {
+                        stack.push(dir.join(byte_path(&entry.name)));
+                    }
+                }
+            }
+            modules
+        });
+        let Some((prefix, dir)) = modules
+            .iter()
+            .filter(|(prefix, _)| {
+                module == prefix.as_str()
+                    || module
+                        .strip_prefix(prefix.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .max_by_key(|(prefix, _)| prefix.len())
+        else {
+            return Vec::new();
+        };
+        facts
+            .root
+            .join(dir)
+            .join(module[prefix.len()..].trim_start_matches('/'))
+    } else {
+        facts
+            .root
+            .join(caller_file)
+            .parent()
+            .unwrap_or(facts.root)
+            .to_path_buf()
+    };
+    let mut files = facts
+        .list_dir(&dir)
+        .into_iter()
+        .filter_map(|entry| {
+            let path = dir.join(byte_path(&entry.name));
+            (entry.kind == EntryKind::Regular
+                && path.extension().and_then(|s| s.to_str()) == Some("go")
+                && (caller_file.ends_with("_test.go")
+                    || !path.to_string_lossy().ends_with("_test.go")))
+            .then(|| relative_path(facts.root, &path))
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn resolve_go_target<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    full_ref: &str,
+    short_name: &str,
+    caller_data: &FileCallData,
+) -> Option<(String, String, String)> {
+    let module = if let Some((alias, member)) = full_ref.split_once('.') {
+        if member != short_name || member.contains('.') {
+            return None;
+        }
+        caller_data
+            .import_block
+            .imports
+            .iter()
+            .find(|import| {
+                let raw_alias = import.raw_text.split('"').next().unwrap_or("").trim();
+                import.default_import.as_deref().unwrap_or_else(|| {
+                    if !raw_alias.is_empty() {
+                        raw_alias
+                    } else {
+                        import.module_path.rsplit('/').next().unwrap_or("")
+                    }
+                }) == alias
+            })
+            .map(|import| import.module_path.as_str())
+    } else {
+        None
+    };
+    let mut targets = index
+        .go_package_files(caller_file, module)
+        .into_iter()
+        .filter(|file| {
+            index.node_for_symbol(file, short_name).is_some()
+                && (module.is_none() || index.has_export(file, short_name))
+        });
+    let target = targets.next()?;
+    if targets.next().is_some() {
+        return None;
+    }
+    Some(("resolved".to_string(), target, short_name.to_string()))
 }
 
 fn resolve_js_ts_target<I: ResolverIndex>(
@@ -13568,6 +13744,15 @@ fn rust_target_for_use<I: ResolverIndex>(
         });
         if let Some(imported) = imported {
             let prefix_segments: Vec<&str> = prefix.split("::").collect();
+            let inline_segments = prefix_segments
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            if let Some(target) =
+                index.inline_scoped_target(caller_file, &inline_segments, &imported)
+            {
+                return Some(target);
+            }
             let file = rust_use_module_file(index, caller_file, &prefix_segments, imports)?;
             // The module may only re-export the item (`pub use inner::{f};`);
             // follow that to the definition, as qualified paths already do.
@@ -13589,6 +13774,17 @@ fn rust_target_for_use<I: ResolverIndex>(
     }
     if segments.len() < 2 {
         return None;
+    }
+    let module_segments = segments[..segments.len() - 1]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    if let Some(target) = index.inline_scoped_target(
+        caller_file,
+        &module_segments,
+        segments.last().copied().unwrap_or(short_name),
+    ) {
+        return Some(target);
     }
     let file = rust_use_module_file(index, caller_file, &segments[..segments.len() - 1], imports)?;
     Some(rust_resolve_reexport_if_symbol_missing(
@@ -24801,6 +24997,448 @@ edition = "2021"
 
         let (store, _) = cold_build_twice(root);
         assert_direct_caller(&store, "src/db.rs", "helper", "src/commands.rs", "run");
+    }
+
+    fn callgraph_fixture_scan(root: &Path, snapshot: CallgraphSnapshot) -> serde_json::Value {
+        use crate::inspect::job::{InspectCategory, InspectJob, JobKey};
+        let job = InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files: snapshot.files.clone(),
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join(".inspect"),
+            config: Arc::new(crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..Default::default()
+            }),
+            symbol_cache: Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: Some(Arc::new(snapshot)),
+        };
+        crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+            .outcome
+            .unwrap()
+            .aggregate
+    }
+
+    fn callgraph_fixture_has(payload: &serde_json::Value, key: &str, symbol: &str) -> bool {
+        payload[key]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["symbol"] == symbol))
+    }
+
+    fn go_fixture_store(root: &Path, files: &[PathBuf]) -> (CallGraphStore, CallgraphSnapshot) {
+        let store = CallGraphStore::open(root.join(".store"), root.to_path_buf()).unwrap();
+        store.cold_build(files).unwrap();
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        (store, snapshot)
+    }
+
+    fn callgraph_fixture_view(root: &Path, inputs: &[PathBuf]) -> CallgraphSnapshot {
+        use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+        let blobs_path = root.join("view-blobs.sqlite");
+        let blobs = Connection::open(&blobs_path).unwrap();
+        blobs.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)").unwrap();
+        let mut entries = Vec::new();
+        for path in inputs {
+            let bytes = fs::read(path).unwrap();
+            let config = path
+                .file_name()
+                .is_some_and(|s| s == "go.mod" || s == "Cargo.toml");
+            let blob = if config {
+                join::CallgraphBlob::config(bytes, crate::views::callgraph::PRODUCER)
+            } else {
+                join::CallgraphBlob::extract(
+                    std::str::from_utf8(&bytes).unwrap(),
+                    lang_label(crate::parser::detect_language(path).unwrap()),
+                    crate::views::callgraph::PRODUCER,
+                )
+                .unwrap()
+            };
+            let payload = blob.to_bytes().unwrap();
+            let key = blake3::hash(&payload);
+            let digest = blake3::hash(&payload);
+            blobs
+                .execute(
+                    "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                    params![
+                        key.as_bytes().as_slice(),
+                        payload,
+                        digest.as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            entries.push((
+                RelPath::new(relative_path(root, path).into_bytes()).unwrap(),
+                ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: RegularPlanes {
+                        semantic: None,
+                        callgraph: Some(key.to_hex().to_string()),
+                    },
+                    resolution_input: config,
+                },
+            ));
+        }
+        let manifest = Manifest::new(entries).unwrap();
+        let views = root.join("views");
+        fs::create_dir_all(&views).unwrap();
+        let database = manifest_view_database_path(&views, "parity").unwrap();
+        crate::views::materialization::materialize_manifest_view_database(
+            &database,
+            &blobs_path,
+            &manifest,
+        )
+        .unwrap();
+        let view = ReadonlyCallGraphStore::open_manifest_view(
+            root.to_path_buf(),
+            "parity".into(),
+            views,
+            "parity",
+            None,
+        )
+        .unwrap();
+        project_dead_code_snapshot_from_view(&view).unwrap().1
+    }
+
+    #[test]
+    fn callgraph_view_macro_and_go_initializer_equal_cold_legacy() {
+        for language in [LangId::Go, LangId::Rust] {
+            let dir = tempdir().unwrap();
+            let root = dir.path();
+            let (files, manifest) = if language == LangId::Go {
+                let manifest = write_file(root, "go.mod", "module example.com/app\n");
+                let main = write_file(root, "main.go", "package main\nimport (\n \"net/http\"\n c \"example.com/app/cmd\"\n)\nvar Boot = Register()\nfunc Register() int { return 1 }\nfunc main() { _ = http.HandlerFunc(c.F) }\n");
+                let cmd = write_file(root, "cmd/f.go", "package cmd\nvar Command = func() int { InitBackendContext(); return 1 }()\nfunc InitBackendContext() {}\nfunc F() {}\nfunc Spare() {}\n");
+                (vec![main, cmd], manifest)
+            } else {
+                write_rust_manifest(root, "macro-view-bin");
+                let main = write_file(root, "src/main.rs", "pub(crate) fn helper() {}\npub(crate) fn spare() {}\nmacro_rules! m { () => { helper(); } }\nfn main() { m!(); }\n");
+                (vec![main], root.join("Cargo.toml"))
+            };
+            let (_, legacy) = go_fixture_store(root, &files);
+            let mut inputs = files;
+            inputs.push(manifest);
+            let view = callgraph_fixture_view(root, &inputs);
+            let owner = if language == LangId::Go {
+                "Command"
+            } else {
+                "m!"
+            };
+            let callee = if language == LangId::Go {
+                "InitBackendContext"
+            } else {
+                "helper"
+            };
+            for snapshot in [&legacy, &view] {
+                if language == LangId::Go {
+                    assert!(
+                        snapshot
+                            .outbound_calls
+                            .iter()
+                            .any(|call| call.provenance == "value_ref"
+                                && call.target.ends_with("cmd/f.go::F")),
+                        "Go view must resolve callback paths through go.mod: {:?}",
+                        snapshot.outbound_calls
+                    );
+                }
+                assert!(
+                    snapshot
+                        .outbound_calls
+                        .iter()
+                        .any(|c| c.caller_symbol == owner && c.target.ends_with(callee)),
+                    "missing {owner} -> {callee}"
+                );
+            }
+            let cold = callgraph_fixture_scan(root, legacy);
+            let viewed = callgraph_fixture_scan(root, view);
+            assert_eq!(cold["items"], viewed["items"]);
+            assert_eq!(cold["test_only_items"], viewed["test_only_items"]);
+            assert!(!callgraph_fixture_has(&viewed, "items", callee), "{viewed}");
+            assert!(
+                callgraph_fixture_has(
+                    &viewed,
+                    "items",
+                    if language == LangId::Go {
+                        "Spare"
+                    } else {
+                        "spare"
+                    }
+                ),
+                "{viewed}"
+            );
+        }
+    }
+
+    #[test]
+    fn callgraph_previous_producer_blobs_are_lookup_misses() {
+        use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey};
+        let dir = tempdir().unwrap();
+        let mut store =
+            BlobStore::open(dir.path(), "version-fixture", BlobPlane::Callgraph).unwrap();
+        let source = b"package main\nvar Boot = Register()\n";
+        for (old_version, current_version) in [
+            (
+                "callgraph-v2",
+                crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
+            ),
+            ("ruled-callgraph-v3", crate::views::callgraph::PRODUCER),
+        ] {
+            let old = CallgraphKey::from_bytes(source, "go", old_version).full_key();
+            store
+                .put(&old, b"old parse output without vars or macro refs")
+                .unwrap();
+            assert!(store.get(&old).unwrap().is_some());
+            let current = CallgraphKey::from_bytes(source, "go", current_version).full_key();
+            assert!(
+                store.get(&current).unwrap().is_none(),
+                "old parse output reused by {current_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn callgraph_go_cobra_imported_initializer_live_unimported_dead() {
+        for imported in [true, false] {
+            let dir = tempdir().unwrap();
+            let root = dir.path();
+            write_file(root, "go.mod", "module example.com/app\n");
+            let import = if imported {
+                "import _ \"example.com/app/cmd\"\n"
+            } else {
+                ""
+            };
+            let main = write_file(
+                root,
+                "main.go",
+                &format!("package main\n{import}func main() {{}}\n"),
+            );
+            let cmd = write_file(root, "cmd/command.go", "package cmd\nimport \"github.com/spf13/cobra\"\nvar Command = &cobra.Command{RunE: func() error { InitBackendContext(); return nil }}\nfunc InitBackendContext() {}\n");
+            let (_, snapshot) = go_fixture_store(root, &[main, cmd]);
+            let has_var_owner = snapshot.outbound_calls.iter().any(|call| {
+                call.caller_symbol == "Command" && call.target.ends_with("::InitBackendContext")
+            });
+            let payload = callgraph_fixture_scan(root, snapshot);
+            assert_eq!(
+                callgraph_fixture_has(&payload, "items", "InitBackendContext"),
+                !imported,
+                "{payload}"
+            );
+            assert!(has_var_owner);
+            assert!(!callgraph_fixture_has(
+                &payload,
+                "test_only_items",
+                "InitBackendContext"
+            ));
+        }
+    }
+
+    #[test]
+    fn callgraph_go_main_boot_register_and_function_values() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_file(root, "go.mod", "module example.com/app\n");
+        let main = write_file(root, "main.go", "package main\nimport (\n \"net/http\"\n c \"example.com/app/cmd\"\n)\nvar Boot = Register()\nfunc Register() int { return 1 }\nfunc Local() {}\nfunc main() { _ = http.HandlerFunc(Local); _ = c.F }\n");
+        let cmd = write_file(
+            root,
+            "cmd/f.go",
+            "package cmd\nfunc F() {}\nfunc Spare() {}\n",
+        );
+        let (_, snapshot) = go_fixture_store(root, &[main, cmd]);
+        for name in ["Local", "F"] {
+            assert!(
+                snapshot
+                    .outbound_calls
+                    .iter()
+                    .any(|call| call.provenance == "value_ref"
+                        && call.target.ends_with(&format!("::{name}"))),
+                "missing {name}: {:?}",
+                snapshot.outbound_calls
+            );
+        }
+        let payload = callgraph_fixture_scan(root, snapshot);
+        for name in ["Register", "Local", "F"] {
+            assert!(!callgraph_fixture_has(&payload, "items", name), "{payload}");
+        }
+        assert!(
+            callgraph_fixture_has(&payload, "items", "Spare"),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn callgraph_rust_inline_use_alias_keeps_bin_function_live() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "alias-bin");
+        write_file(
+            root,
+            "src/main.rs",
+            "mod a { pub fn f() {} }\nuse a::f as g;\nfn main() { g(); }\n",
+        );
+        let (store, snapshot) = cold_build_twice(root);
+        assert_direct_caller(&store, "src/main.rs", "a::f", "src/main.rs", "main");
+        let payload = callgraph_fixture_scan(root, snapshot);
+        assert!(!callgraph_fixture_has(&payload, "items", "f"), "{payload}");
+    }
+
+    #[test]
+    fn callgraph_go_mod_edit_re_resolves_and_invalidates_warmed_aggregate() {
+        use crate::inspect::cache::InspectCache;
+        use crate::inspect::job::{InspectCategory, JobKey};
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let manifest = write_file(root, "go.mod", "module example.com/before\n");
+        let main = write_file(root, "main.go", "package main\nimport (\n _ \"example.com/after/cmd\"\n \"example.com/after/util\"\n)\nfunc main() { util.Run() }\n");
+        let cmd = write_file(root, "cmd/f.go", "package cmd\nvar Command = func() int { InitBackendContext(); return 1 }()\nfunc InitBackendContext() {}\nfunc F() {}\n");
+        let util = write_file(root, "util/run.go", "package util\nfunc Run() {}\n");
+        let files = vec![main, cmd, util];
+        let (store, snapshot) = go_fixture_store(root, &files);
+        let before = callgraph_fixture_scan(root, snapshot);
+        assert!(
+            callgraph_fixture_has(&before, "items", "InitBackendContext"),
+            "{before}"
+        );
+        let category = InspectCategory::DeadCode;
+        let key = JobKey::for_project_category(category);
+        let cache = InspectCache::open(root.join(".inspect-cache"), root.to_path_buf()).unwrap();
+        let hash = cache.contribution_set_hash(category).unwrap();
+        cache
+            .store_tier2_aggregate(key.clone(), &hash, before)
+            .unwrap();
+        assert!(cache.get_aggregated(&key).unwrap().is_some());
+        write_file(root, "go.mod", "module example.com/after\n");
+        store.refresh_files(&[manifest]).unwrap();
+        assert_direct_caller(&store, "util/run.go", "Run", "main.go", "main");
+        assert!(
+            cache.get_aggregated(&key).unwrap().is_none(),
+            "go.mod edit reused the old aggregate"
+        );
+        let warmed = callgraph_fixture_scan(
+            root,
+            project_dead_code_snapshot(store.sqlite_path()).unwrap(),
+        );
+        assert!(
+            !callgraph_fixture_has(&warmed, "items", "InitBackendContext"),
+            "{warmed}"
+        );
+        let clean = CallGraphStore::open(root.join(".clean-store"), root.to_path_buf()).unwrap();
+        clean.cold_build(&files).unwrap();
+        let fresh = callgraph_fixture_scan(
+            root,
+            project_dead_code_snapshot(clean.sqlite_path()).unwrap(),
+        );
+        assert_eq!(warmed["items"], fresh["items"]);
+        assert_eq!(warmed["test_only_items"], fresh["test_only_items"]);
+        let next_hash = cache.contribution_set_hash(category).unwrap();
+        assert_ne!(hash, next_hash);
+        cache
+            .store_tier2_aggregate(key.clone(), &next_hash, warmed.clone())
+            .unwrap();
+        assert_eq!(cache.get_aggregated(&key).unwrap().unwrap(), warmed);
+    }
+
+    #[test]
+    fn callgraph_rust_macro_body_live_only_with_invocation() {
+        for invoked in [true, false] {
+            let dir = tempdir().unwrap();
+            let root = dir.path();
+            write_rust_manifest(root, "macro-bin");
+            let invocation = if invoked { "m!();" } else { "" };
+            write_file(root, "src/main.rs", &format!("pub(crate) fn helper() {{}}\nmacro_rules! m {{ () => {{ helper(); }} }}\nfn main() {{ {invocation} }}\n"));
+            let (_, snapshot) = cold_build_twice(root);
+            assert!(snapshot
+                .outbound_calls
+                .iter()
+                .any(|call| call.caller_symbol == "m!" && call.target.ends_with("helper")));
+            let payload = callgraph_fixture_scan(root, snapshot);
+            assert_eq!(
+                callgraph_fixture_has(&payload, "items", "helper"),
+                !invoked,
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn callgraph_rust_qualified_reexport_alias_lands_on_definition() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "qualified-alias-bin");
+        write_file(
+            root,
+            "src/main.rs",
+            "mod flags;\nfn main() { flags::generate_complete_bash(); }\n",
+        );
+        write_file(
+            root,
+            "src/flags.rs",
+            "mod bash;\npub use bash::generate as generate_complete_bash;\n",
+        );
+        write_file(root, "src/flags/bash.rs", "pub fn generate() {}\n");
+        let (store, _) = cold_build_twice(root);
+        assert_direct_caller(
+            &store,
+            "src/flags/bash.rs",
+            "generate",
+            "src/main.rs",
+            "main",
+        );
+    }
+
+    #[test]
+    fn callgraph_go_mod_refresh_drops_warmed_module_map() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let manifest = write_file(root, "go.mod", "module example.com/before\n");
+        let main = write_file(
+            root,
+            "main.go",
+            "package main\nimport \"example.com/after/util\"\nfunc main() { util.Run() }\n",
+        );
+        let util = write_file(root, "util/run.go", "package util\nfunc Run() {}\n");
+        let (store, _) = go_fixture_store(root, &[main.clone(), util]);
+        drop(store);
+        let refresh_root = RefreshRoot {
+            callgraph_dir: root.join(".store"),
+            project_root: root.to_path_buf(),
+        };
+        let mut caches = HashMap::new();
+        let batch = |paths: BTreeSet<PathBuf>| RefreshBatch {
+            root: refresh_root.clone(),
+            paths,
+            pending_sinks: Vec::new(),
+            refresh_states: Vec::new(),
+            ticket: None,
+            keepalive: Vec::new(),
+        };
+        write_file(root, "main.go", "package main\nimport \"example.com/after/util\"\nfunc main() { util.Run() }\n// warm resolver\n");
+        let primed =
+            process_callgraph_refresh_batch(&batch([main].into_iter().collect()), &mut caches)
+                .unwrap();
+        assert!(caches[&refresh_root].1.get().is_some());
+        drop(primed);
+        write_file(root, "go.mod", "module example.com/after\n");
+        let refreshed =
+            process_callgraph_refresh_batch(&batch([manifest].into_iter().collect()), &mut caches)
+                .unwrap();
+        assert_direct_caller(&refreshed, "util/run.go", "Run", "main.go", "main");
+        let status: String = refreshed
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM refs WHERE kind='call' AND full_ref='util.Run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "resolved",
+            "name-match edges are not module resolution"
+        );
     }
 
     #[test]
