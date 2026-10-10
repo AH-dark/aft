@@ -1479,7 +1479,7 @@ fn now_nanos() -> u128 {
 }
 
 #[cfg(unix)]
-fn current_hostname() -> String {
+pub(crate) fn current_hostname() -> String {
     let mut buffer = [0u8; 256];
     let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
     if result == 0 {
@@ -1496,14 +1496,14 @@ fn current_hostname() -> String {
 }
 
 #[cfg(windows)]
-fn current_hostname() -> String {
+pub(crate) fn current_hostname() -> String {
     crate::environment::non_empty_var("COMPUTERNAME")
         .or_else(|| crate::environment::non_empty_var("HOSTNAME"))
         .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn current_hostname() -> String {
+pub(crate) fn current_hostname() -> String {
     crate::environment::non_empty_var("HOSTNAME").unwrap_or_else(|| "unknown-host".to_string())
 }
 
@@ -1600,11 +1600,14 @@ fn process_identity(pid: u32) -> Option<ProcessIdentity> {
 }
 
 #[cfg(windows)]
-fn process_identity(_pid: u32) -> Option<ProcessIdentity> {
-    // Windows keeps PID-only liveness for now. Querying creation time requires a
-    // process handle and new FFI/error policy; Linux PID namespaces are the
-    // environment where reused PIDs otherwise persistently deadlock leases.
-    None
+fn process_identity(pid: u32) -> Option<ProcessIdentity> {
+    windows_process_creation_time(pid)
+        .ok()
+        .flatten()
+        .map(|start_time| ProcessIdentity {
+            start_time,
+            boot_id: None,
+        })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -1639,37 +1642,81 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub(crate) fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let filter = format!("PID eq {pid}");
-    let Ok(output) = std::process::Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .output()
-    else {
-        return true;
+    // A denied or inconclusive probe must not permit reclaiming a live owner.
+    windows_process_creation_time(pid).map_or(true, |created| created.is_some())
+}
+
+#[cfg(windows)]
+fn windows_process_creation_time(pid: u32) -> io::Result<Option<u64>> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
-
-    if !output.status.success() {
-        return true;
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return Ok(None);
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // `tasklist /NH /FO CSV` emits a single line per matching process with
-    // every field quoted, e.g. `"image","7420","Console","1","12,345 K"`.
-    // When the filter matches nothing, the literal text
-    // `INFO: No tasks are running which match the specified criteria.`
-    // is written to stdout. The previous matcher was too strict — it looked
-    // for `","{pid}",` patterns mid-line, which works on most Windows builds
-    // but missed Windows runners that emit slightly different quoting (e.g.
-    // a trailing CRLF leaves the pid token at end-of-line as `"7420"\r\n`).
-    // The robust check: confirm the "no tasks" sentinel is absent AND any
-    // PID-quoted form is present.
-    if stdout.contains("No tasks are running") {
-        return false;
+    const SYNCHRONIZE_RIGHT: u32 = 0x0010_0000;
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_RIGHT,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
     }
-    stdout.contains(&format!("\"{pid}\""))
+    struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    let handle = ProcessHandle(handle);
+    // Waiting on the process object distinguishes exit from liveness even when
+    // an application exits with 259, the ambiguous STILL_ACTIVE exit-code value.
+    match unsafe { WaitForSingleObject(handle.0, 0) } {
+        WAIT_OBJECT_0 => return Ok(None),
+        WAIT_TIMEOUT => {}
+        _ => return Err(io::Error::last_os_error()),
+    }
+    let mut created = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exited = created;
+    let mut kernel = created;
+    let mut user = created;
+    if unsafe { GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_process_start_time_ms(pid: u32) -> Option<u64> {
+    windows_creation_ticks_to_unix_ms(windows_process_creation_time(pid).ok().flatten()?)
+}
+
+#[cfg(windows)]
+fn windows_creation_ticks_to_unix_ms(ticks: u64) -> Option<u64> {
+    // FILETIME counts 100-nanosecond intervals since 1601; manifests use Unix ms.
+    const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+    ticks
+        .checked_sub(UNIX_EPOCH_FILETIME)
+        .map(|ticks| ticks / 10_000)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1682,6 +1729,48 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_process_probe_records_creation_identity() {
+        let pid = std::process::id();
+        let identity = process_identity(pid).expect("current Windows process creation identity");
+        assert!(identity.start_time > 0);
+        assert!(windows_process_start_time_ms(pid).unwrap() > 0);
+        assert_eq!(
+            windows_creation_ticks_to_unix_ms(116_444_736_000_000_000),
+            Some(0)
+        );
+        assert_eq!(
+            windows_creation_ticks_to_unix_ms(116_444_736_010_000_000),
+            Some(1000)
+        );
+        assert_eq!(windows_creation_ticks_to_unix_ms(0), None);
+        assert!(process_alive(pid));
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+        let mut metadata = current_process_metadata();
+        metadata.process_start_time = Some(identity.start_time.saturating_add(1));
+        assert!(
+            !lock_owner_is_alive(&metadata),
+            "recycled PID must not keep an old lease alive"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_process_probe_recognizes_exited_status_259() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 259"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(child.wait().unwrap().code(), Some(259));
+        assert!(
+            !process_alive(pid),
+            "a signaled process object is exited even when its exit code is STILL_ACTIVE"
+        );
+    }
 
     #[test]
     fn malformed_reclaim_preserves_replacement_epoch() {
@@ -2513,7 +2602,7 @@ mod tests {
         remove_lock_file(&path).expect("cleanup synthetic lock");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn live_pid_with_wrong_start_time_is_reclaimed() {
         let (_dir, path) = test_lock_path();

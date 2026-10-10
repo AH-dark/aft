@@ -1235,8 +1235,15 @@ pub(crate) fn process_start_time_ms(pid: u32) -> Option<u64> {
     if let Some(override_value) = process_start_time_override(pid) {
         return override_value;
     }
-    let _ = pid;
-    None
+    #[cfg(windows)]
+    {
+        crate::fs_lock::windows_process_start_time_ms(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 #[cfg(unix)]

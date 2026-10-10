@@ -498,18 +498,12 @@ fn heartbeat_manifest(
 }
 
 fn replace_manifest_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = temp_path(path);
-    let write_result = (|| -> io::Result<()> {
-        let mut file = crate::private_storage::create(&tmp)?;
-        fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
-        write_manifest_bytes(&mut file, bytes)?;
-        drop(file);
-        fs::rename(&tmp, path)
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    write_result
+    crate::durability::atomic_write(path, bytes, crate::durability::AtomicWriteDurability::None)?;
+    fs_lock::io_ledger::record(|ledger| {
+        ledger.new_files += 1;
+        ledger.bytes_written += bytes.len() as u64;
+    });
+    Ok(())
 }
 
 /// Human-facing note for a read-only borrow of another checkout's index family.
@@ -707,13 +701,7 @@ pub(crate) fn check_manifest_format(
 fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::Result<()> {
     crate::production_storage::refuse_write(path)?;
     let _mutation = manifest_mutation_lock(path)?;
-    crate::durability::atomic_write(
-        path,
-        &manifest_bytes(manifest)?,
-        crate::durability::AtomicWriteDurability::None,
-    )?;
-    fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
-    Ok(())
+    replace_manifest_unsynced(path, &manifest_bytes(manifest)?)
 }
 
 fn manifest_mutation_lock(path: &Path) -> io::Result<std::fs::File> {
@@ -721,9 +709,15 @@ fn manifest_mutation_lock(path: &Path) -> io::Result<std::fs::File> {
         .parent()
         .ok_or_else(|| io::Error::other("missing owner parent"))?;
     let key = directory.file_name().unwrap_or_default();
-    let mut name = std::ffi::OsString::from(".");
-    name.push(key);
-    name.push(".owner-mutation.lock");
+    // Gate files outlive their owners because unlinking a waited-on lock can
+    // split its inode identity. Bound the permanent coordination files instead.
+    let normalized_key = key
+        .as_encoded_bytes()
+        .iter()
+        .map(u8::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let stripe = blake3::hash(&normalized_key).as_bytes()[0] % 64;
+    let name = format!(".owner-mutation-{stripe:02}.lock");
     // Keep exclusion outside the key directory: orphan cleanup may remove that
     // directory, but must not remove the identity of an in-flight claimant.
     let owner_root = directory.parent().unwrap_or(directory);
@@ -771,14 +765,6 @@ fn write_manifest_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     fs_lock::io_ledger::record(|ledger| ledger.bytes_written += bytes.len() as u64);
     Ok(())
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos();
-    path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now))
 }
 
 fn resolve_manifest_dir(
@@ -973,85 +959,13 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[cfg(unix)]
 fn current_hostname() -> String {
-    let mut buffer = [0u8; 256];
-    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
-    if result == 0 {
-        let len = buffer
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(buffer.len());
-        if len > 0 {
-            return String::from_utf8_lossy(&buffer[..len]).into_owned();
-        }
-    }
-    crate::environment::non_empty_var("HOSTNAME").unwrap_or_else(|| "unknown-host".to_string())
+    fs_lock::current_hostname()
 }
 
-#[cfg(windows)]
-fn current_hostname() -> String {
-    crate::environment::non_empty_var("COMPUTERNAME")
-        .or_else(|| crate::environment::non_empty_var("HOSTNAME"))
-        .unwrap_or_else(|| "unknown-host".to_string())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn current_hostname() -> String {
-    crate::environment::non_empty_var("HOSTNAME").unwrap_or_else(|| "unknown-host".to_string())
-}
-
-#[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    if pid == std::process::id() {
-        // Our own process: trivially alive. This is a real production case
-        // (the daemon serves sibling checkouts of one repo as two roots in
-        // one process) and probing our own PID through the OS is where the
-        // probe can flake.
-        return true;
-    }
-    if pid == 0 || pid > i32::MAX as u32 {
-        return false;
-    }
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if result == 0 {
-        return true;
-    }
-    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
-    if pid == std::process::id() {
-        // Our own process: trivially alive. Also avoids the tasklist probe,
-        // which can return empty output under loaded-runner contention and
-        // misreport a live owner as dead (observed as sibling checkouts
-        // stealing the artifact lease in CI).
-        return true;
-    }
-    // PID 0 is the System Idle Process on Windows, so tasklist reports it as
-    // running; treat it as dead like the Unix path does (it can never be an
-    // AFT bridge).
-    if pid == 0 {
-        return false;
-    }
-    let filter = format!("PID eq {pid}");
-    let Ok(output) = std::process::Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .output()
-    else {
-        return true;
-    };
-    if !output.status.success() {
-        return true;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    !stdout.contains("No tasks are running") && stdout.contains(&format!("\"{pid}\""))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn process_alive(_pid: u32) -> bool {
-    true
+    // A daemon can own several checkout contexts; its own PID is always alive.
+    pid == std::process::id() || fs_lock::process_alive(pid)
 }
 
 #[cfg(test)]
@@ -1172,9 +1086,11 @@ mod tests {
         let owners = dir.path().join("artifact-owners/key");
         fs::create_dir_all(&owners).unwrap();
         let path = owners.join("owner.json");
-        let judged = new_manifest("old-scope", "/old-checkout", None);
+        let mut judged = new_manifest("old-scope", "/old-checkout", None);
+        judged.pid = 0;
         atomic_write_manifest(&path, &judged).unwrap();
         let mut replacement = judged.clone();
+        replacement.pid = std::process::id();
         replacement.project_scope_key = "new-scope".into();
         replacement.created_at_ms += 1;
         let replacement_path = path.clone();
