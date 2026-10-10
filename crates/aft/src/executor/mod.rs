@@ -2110,12 +2110,18 @@ impl Drop for ExecutorInner {
         let _ = self.event_tx.send(SchedulerEvent::Shutdown);
 
         if let Some(handle) = self.scheduler_handle.lock().take() {
-            let _ = handle.join();
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
         }
 
         let mut workers = self.worker_handles.lock();
         for handle in workers.drain(..) {
-            let _ = handle.join();
+            // A job can own the last Executor handle. Its worker will exit once
+            // this job returns; joining that same thread would panic.
+            if handle.thread().id() != std::thread::current().id() {
+                let _ = handle.join();
+            }
         }
     }
 }

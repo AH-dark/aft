@@ -24,6 +24,41 @@ static SETTLED: LazyLock<Mutex<HashMap<PathBuf, Sender<u64>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 type Failure = (Instant, Duration, usize, bool);
+
+#[test]
+fn standalone_queued_writer_blocks_new_readers_but_not_nested_dispatch() {
+    let outer = standalone_request_gate();
+    let (writer_tx, writer_rx) = crossbeam_channel::bounded(1);
+    let writer = std::thread::spawn(move || {
+        let _write = STANDALONE_EPOCH.epoch.write();
+        writer_tx.send(()).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while STANDALONE_EPOCH.epoch.try_read().is_some() {
+        assert!(Instant::now() < deadline, "writer must reach the read gate");
+        std::thread::yield_now();
+    }
+    let nested = standalone_request_gate();
+    let admitted_new_reader = std::thread::spawn(|| {
+        if standalone_read_is_nested() {
+            STANDALONE_EPOCH.epoch.try_read_recursive().is_some()
+        } else {
+            STANDALONE_EPOCH.epoch.try_read().is_some()
+        }
+    })
+    .join()
+    .unwrap();
+    drop(nested);
+    drop(outer);
+    writer_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("writer progress after readers finish");
+    writer.join().unwrap();
+    assert!(
+        !admitted_new_reader,
+        "an unrelated deferred reader must not bypass a queued publication writer"
+    );
+}
 static FAILURES: LazyLock<Mutex<HashMap<PathBuf, Sender<Failure>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

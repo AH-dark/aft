@@ -116,6 +116,34 @@ fn test_executor(
     })
 }
 
+#[test]
+fn last_executor_owner_can_drop_on_worker() {
+    let owner = Arc::new(parking_lot::Mutex::new(Some(test_executor(2, 1, 1, 1))));
+    let (_dir, root) = test_root("last-owner");
+    owner
+        .lock()
+        .as_ref()
+        .unwrap()
+        .register_actor(root.clone(), test_ctx());
+    let worker_owner = Arc::clone(&owner);
+    let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+    let response = owner.lock().as_ref().unwrap().submit_async(
+        root,
+        Lane::PureRead,
+        "last-owner".into(),
+        Box::new(move |_| {
+            let last = worker_owner.lock().take().unwrap();
+            drop(last);
+            finished_tx.send(()).unwrap();
+            ok("last-owner")
+        }),
+    );
+    finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dropping on a worker must return without self-join");
+    assert!(recv_async(response, "last owner drop").success);
+}
+
 fn observe_max(max_seen: &AtomicUsize, value: usize) {
     let mut current = max_seen.load(Ordering::Acquire);
     while value > current {

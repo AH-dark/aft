@@ -219,16 +219,34 @@ static STANDALONE_EPOCH: LazyLock<StandaloneEpoch> = LazyLock::new(|| Standalone
 
 /// Held while a standalone request or maintenance unit runs. The read is
 /// recursive because a request can dispatch a nested request (`tool_call`).
-/// The writer is never starved: requests and maintenance run one at a time on
-/// the standalone thread, so between two of them no read is held and a waiting
-/// publication commits; at most it waits for the one request in flight.
+/// Deferred workers can overlap, so only nested reads on the same thread bypass
+/// a queued writer. New requests use the task-fair read and cannot prolong a
+/// publication's wait by continually joining the in-flight readers.
 pub struct StandaloneGate {
     _read: parking_lot::RwLockReadGuard<'static, ()>,
 }
 
 pub fn standalone_request_gate() -> StandaloneGate {
-    StandaloneGate {
-        _read: STANDALONE_EPOCH.epoch.read_recursive(),
+    let read = if standalone_read_is_nested() {
+        STANDALONE_EPOCH.epoch.read_recursive()
+    } else {
+        STANDALONE_EPOCH.epoch.read()
+    };
+    STANDALONE_READ_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    StandaloneGate { _read: read }
+}
+
+thread_local! {
+    static STANDALONE_READ_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn standalone_read_is_nested() -> bool {
+    STANDALONE_READ_DEPTH.with(|depth| depth.get() > 0)
+}
+
+impl Drop for StandaloneGate {
+    fn drop(&mut self) {
+        STANDALONE_READ_DEPTH.with(|depth| depth.set(depth.get() - 1));
     }
 }
 
