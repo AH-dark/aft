@@ -168,7 +168,7 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
 
         assert_eq!(
             manifest["provenance"]["wire_crate_version"],
-            json!("0.29.0")
+            json!("0.30.0")
         );
         assert_eq!(
             manifest["provenance"]["build_git_sha"]

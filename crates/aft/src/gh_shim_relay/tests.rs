@@ -722,11 +722,9 @@ fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeS
         kind: subc_protocol::scope::ScopeKind::Head,
         parent: None,
         parent_state: None,
-        attributes: subc_protocol::scope::ScopeAttributes {
-            agent_id: agent.map(str::to_string),
-            delegates,
-            flow_id: None,
-        },
+        attributes: subc_protocol::scope::ScopeAttributes::new()
+            .with_agent_id(agent.map(str::to_string))
+            .with_delegates(delegates),
         owner_authorized,
     }
 }
