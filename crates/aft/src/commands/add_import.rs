@@ -345,6 +345,12 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    let block = if matches!(lang, LangId::C | LangId::Cpp) {
+        imports::c_insertion_block(&source, &tree, &block)
+    } else {
+        block
+    };
+
     if lang == LangId::Vue {
         if let Err(err) = imports::vue_single_script_content_range(&tree) {
             return Response::error(&req.id, err.code(), err.message("add_import"));
@@ -640,60 +646,10 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             true,
         )
     } else {
-        // Fall through to the original "find insertion point and insert a new
-        // statement" behavior, with two empty-block special cases that would
-        // otherwise place the import at offset 0:
-        //
-        //  - Vue: offset 0 lands before `<template>`, outside the `<script>`
-        //    block. Insert at the start of the script body instead.
-        //  - Header languages (Go/Java/.../PHP): offset 0 lands before the
-        //    `package`/`namespace`/`pragma`/`<?php` header — invalid code.
-        //    Insert just after the header prologue instead.
-        let bytes = source.as_bytes();
-        let skip_one_newline = |mut at: usize| {
-            if at < bytes.len() && bytes[at] == b'\r' {
-                at += 1;
-            }
-            if at < bytes.len() && bytes[at] == b'\n' {
-                at += 1;
-            }
-            at
-        };
-        let (insert_offset, needs_blank_before, needs_blank_after) = if !block.imports.is_empty() {
-            let (off, blank_before, blank_after) =
-                imports::find_insertion_point(&source, &block, group, module, type_only);
-            // C/C++ `#include`s form one contiguous block (system group then
-            // local group, no blank line between) — matching organize. Suppress
-            // the cross-group blank lines find_insertion_point inserts for
-            // languages like TS/Python/Rust where groups are blank-separated.
-            if matches!(lang, LangId::C | LangId::Cpp) {
-                (off, false, false)
-            } else {
-                (off, blank_before, blank_after)
-            }
-        } else if lang == LangId::Vue {
-            match imports::vue_script_content_range(&tree) {
-                Some((start, _end)) => (skip_one_newline(start), false, false),
-                None => imports::find_insertion_point(&source, &block, group, module, type_only),
-            }
-        } else if let Some(anchor) = shebang_anchor(lang, &source) {
-            let at = skip_one_newline(anchor);
-            let next_is_newline = at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
-            (at, false, !next_is_newline && at < source.len())
-        } else if let Some(anchor) = header_prologue_anchor(lang, &source, &tree) {
-            let at = skip_one_newline(anchor);
-            // Blank line before separates the import from the header. Blank line
-            // after only when the next byte isn't already a newline, so a header
-            // already followed by a blank line doesn't double up.
-            let next_is_newline = at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
-            (at, true, !next_is_newline && at < source.len())
-        } else if let Some(anchor) = spdx_license_anchor(lang, &source) {
-            let at = skip_one_newline(anchor);
-            let next_is_newline = at < bytes.len() && (bytes[at] == b'\n' || bytes[at] == b'\r');
-            (at, false, !next_is_newline && at < source.len())
-        } else {
-            imports::find_insertion_point(&source, &block, group, module, type_only)
-        };
+        let (insert_offset, needs_blank_before, needs_blank_after) =
+            imports::find_insertion_point_with_prologue(
+                &source, &tree, lang, &block, group, module, type_only,
+            );
 
         // For Go, check if we're inserting into a grouped import block
         let import_line = if matches!(lang, LangId::Go) {
@@ -734,16 +690,13 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
             imports::generate_import(lang, &import_request)
         };
 
-        // Build the text to insert
-        let mut insert_text = String::new();
-        if needs_blank_before {
-            insert_text.push('\n');
-        }
-        insert_text.push_str(&import_line);
-        insert_text.push('\n');
-        if needs_blank_after {
-            insert_text.push('\n');
-        }
+        let insert_text = imports::import_insertion_text(
+            &source,
+            insert_offset,
+            &import_line,
+            needs_blank_before,
+            needs_blank_after,
+        );
         (insert_offset, insert_offset, insert_text, false)
     };
 
@@ -836,81 +789,6 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, result)
 }
 
-fn shebang_anchor(lang: LangId, source: &str) -> Option<usize> {
-    if !matches!(
-        lang,
-        LangId::TypeScript
-            | LangId::JavaScript
-            | LangId::Python
-            | LangId::Ruby
-            | LangId::Perl
-            | LangId::Lua
-    ) || !source.starts_with("#!")
-    {
-        return None;
-    }
-
-    Some(source.find('\n').unwrap_or(source.len()))
-}
-
-fn spdx_license_anchor(lang: LangId, source: &str) -> Option<usize> {
-    if lang != LangId::Solidity {
-        return None;
-    }
-
-    let first_line_end = source.find('\n').unwrap_or(source.len());
-    let first_line = &source[..first_line_end];
-    first_line
-        .trim_start()
-        .starts_with("// SPDX-License-Identifier:")
-        .then_some(first_line_end)
-}
-
-/// For a file with a language-level header prologue (package/namespace/pragma
-/// declarations, optionally preceded by comments) but no existing imports,
-/// return the byte offset at the END of that prologue. A freshly added import
-/// is then placed after the header instead of at offset 0, which would produce
-/// invalid code (e.g. an import before a Go `package`, or before PHP's `<?php`).
-///
-/// Returns `None` for languages without a header-before-imports convention, or
-/// when the file does not begin with a recognized prologue node. C# is
-/// deliberately excluded: `using` directives before `namespace` are idiomatic.
-///
-/// `strong` kinds are header declarations whose end advances the anchor;
-/// `skippable` kinds (comments, PHP open tag) are stepped over without
-/// anchoring so a leading license comment alone never displaces the import.
-fn header_prologue_anchor(lang: LangId, source: &str, tree: &tree_sitter::Tree) -> Option<usize> {
-    let (strong, skippable): (&[&str], &[&str]) = match lang {
-        LangId::Go => (&["package_clause"], &["comment"]),
-        LangId::Java => (&["package_declaration"], &["comment"]),
-        LangId::Kotlin => (&["package_header"], &["comment"]),
-        LangId::Scala => (&["package_clause"], &["comment"]),
-        LangId::Solidity => (&["pragma_directive"], &["comment"]),
-        LangId::Php => (&["php_tag", "namespace_definition"], &["comment"]),
-        LangId::Perl => (&["package_statement"], &["comment"]),
-        _ => return None,
-    };
-
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    let mut anchor: Option<usize> = None;
-    for child in root.named_children(&mut cursor) {
-        let kind = child.kind();
-        if strong.contains(&kind) {
-            anchor = if lang == LangId::Php && kind == "namespace_definition" {
-                php_braced_namespace_anchor(source, child).or(Some(child.end_byte()))
-            } else {
-                Some(child.end_byte())
-            };
-        } else if skippable.contains(&kind) {
-            continue;
-        } else {
-            break;
-        }
-    }
-    anchor
-}
-
 fn validate_module_path_for_add(lang: LangId, module: &str) -> Result<(), &'static str> {
     let module = module.trim();
 
@@ -971,25 +849,6 @@ fn contains_parent_path_segment(module: &str) -> bool {
     module
         .split(|ch| ch == '/' || ch == '\\')
         .any(|segment| segment == "..")
-}
-
-fn php_braced_namespace_anchor(source: &str, node: tree_sitter::Node<'_>) -> Option<usize> {
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let child = cursor.node();
-            if child.kind() == "{" {
-                return Some(child.end_byte());
-            }
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-    }
-
-    source[node.start_byte()..node.end_byte()]
-        .find('{')
-        .map(|offset| node.start_byte() + offset + 1)
 }
 
 #[cfg(test)]

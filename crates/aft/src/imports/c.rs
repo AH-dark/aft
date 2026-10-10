@@ -33,25 +33,97 @@ pub(crate) fn parse_c_imports(source: &str, tree: &Tree) -> ImportBlock {
     let root = tree.root_node();
     let mut imports = Vec::new();
 
-    let mut cursor = root.walk();
-    if cursor.goto_first_child() {
-        loop {
-            let node = cursor.node();
-            if node.kind() == "preproc_include" {
-                if let Some(imp) = parse_c_include(source, &node) {
-                    imports.push(imp);
-                }
+    fn collect(source: &str, node: Node<'_>, imports: &mut Vec<ImportStatement>) {
+        if node.kind() == "preproc_include" {
+            if let Some(import) = parse_c_include(source, &node) {
+                imports.push(import);
             }
-            if !cursor.goto_next_sibling() {
-                break;
+        } else if node.parent().is_none()
+            || matches!(
+                node.kind(),
+                "preproc_if"
+                    | "preproc_ifdef"
+                    | "preproc_elif"
+                    | "preproc_else"
+                    | "preproc_elifdef"
+            )
+        {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect(source, child, imports);
             }
         }
     }
+    collect(source, root, &mut imports);
 
     let byte_range = import_byte_range(&imports);
     ImportBlock {
         imports,
         byte_range,
+    }
+}
+
+/// An include guard is the default insertion context, not an arbitrary feature
+/// conditional. Its matching define must precede newly added includes.
+pub(crate) fn default_include_context<'a>(
+    source: &str,
+    tree: &'a Tree,
+) -> (Node<'a>, Option<usize>) {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let first = root
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "comment");
+    if let Some(guard) = first.filter(|node| node.kind() == "preproc_ifdef") {
+        let text = crate::parser::node_text(source, &guard);
+        if let Some(macro_name) = text
+            .lines()
+            .next()
+            .and_then(|line| line.trim().strip_prefix('#'))
+            .and_then(|line| line.trim_start().strip_prefix("ifndef"))
+            .and_then(|line| line.split_whitespace().next())
+        {
+            let mut cursor = guard.walk();
+            for child in guard.named_children(&mut cursor) {
+                if child.kind() == "preproc_def" {
+                    let directive = crate::parser::node_text(source, &child)
+                        .trim_start()
+                        .strip_prefix('#')
+                        .unwrap_or("");
+                    let mut words = directive.split_whitespace();
+                    if words.next() == Some("define") && words.next() == Some(macro_name) {
+                        return (guard, Some(child.end_byte()));
+                    }
+                }
+            }
+        }
+    }
+    (root, None)
+}
+
+/// Keep feature-conditional includes visible to readers, but do not use them
+/// as duplicate or ordering anchors for a default-context addition.
+pub(crate) fn c_insertion_block(source: &str, tree: &Tree, block: &ImportBlock) -> ImportBlock {
+    let (context, _) = default_include_context(source, tree);
+    let imports = block
+        .imports
+        .iter()
+        .filter(|import| {
+            context
+                .named_descendant_for_byte_range(import.byte_range.start, import.byte_range.end)
+                .and_then(|mut node| {
+                    while node.kind() != "preproc_include" {
+                        node = node.parent()?;
+                    }
+                    node.parent()
+                })
+                .is_some_and(|parent| parent.id() == context.id())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    ImportBlock {
+        byte_range: import_byte_range(&imports),
+        imports,
     }
 }
 
