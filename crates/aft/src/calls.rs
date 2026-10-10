@@ -17,6 +17,15 @@ use crate::parser::LangId;
 const MAX_AST_WALK_DEPTH: u32 = 1_500;
 const MAX_RUST_MACRO_CALL_DEPTH: u32 = 32;
 
+thread_local! {
+    static RUST_FRAGMENT_PARSER: std::cell::RefCell<Option<tree_sitter::Parser>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUST_FRAGMENT_PARSER_INITIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Returns the tree-sitter node kind strings that represent call expressions
 /// for the given language.
 pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
@@ -65,7 +74,7 @@ pub fn call_node_kinds(lang: LangId) -> &'static [&'static str] {
 /// Recursively walk tree nodes looking for call expressions within a byte range.
 ///
 /// Collects `(callee_name, line_number)` pairs into `results`.
-pub fn walk_for_calls(
+fn walk_for_calls(
     node: tree_sitter::Node,
     source: &str,
     byte_start: usize,
@@ -230,8 +239,13 @@ fn strip_generic_callee_wrapper<'a>(node: tree_sitter::Node<'a>) -> tree_sitter:
 fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
     let index = node.child_by_field_name("index")?;
     let text = source[index.byte_range()].trim();
-    if (text.starts_with('"') && text.ends_with('"'))
-        || (text.starts_with('\'') && text.ends_with('\''))
+    computed_member_literal(text)
+}
+
+fn computed_member_literal(text: &str) -> Option<String> {
+    if text.len() >= 2
+        && ((text.starts_with('"') && text.ends_with('"'))
+            || (text.starts_with('\'') && text.ends_with('\'')))
     {
         return Some(text[1..text.len().saturating_sub(1)].to_string());
     }
@@ -239,7 +253,7 @@ fn extract_computed_member_name(node: &tree_sitter::Node, source: &str) -> Optio
 }
 
 /// Extract the last segment of a member expression (the method/property name).
-pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<String> {
+fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<String> {
     let node = strip_generic_callee_wrapper(*node);
     if let Some(name) = node.child_by_field_name("name") {
         if let Some(segment) = extract_last_segment(&name, source) {
@@ -274,7 +288,7 @@ pub fn extract_last_segment(node: &tree_sitter::Node, source: &str) -> Option<St
 /// This is intentionally separate from call extraction. The live call graph and
 /// `aft_callgraph` commands remain call-edge-only; dead-code analysis consumes
 /// these type-position names as a side channel.
-pub fn extract_type_references_in_range(
+fn extract_type_references_in_range(
     source: &str,
     root: tree_sitter::Node,
     byte_start: usize,
@@ -1098,11 +1112,44 @@ fn collect_rust_macro_calls(
     results: &mut Vec<CallTuple>,
     facts: &mut RustMacroFacts,
 ) {
+    // The reparse-depth bound does not bound ordinary AST nesting. A cursor
+    // keeps that traversal off the native stack without dropping nested facts.
+    let mut cursor = node.walk();
+    loop {
+        let descend = visit_rust_macro_node(
+            cursor.node(),
+            source,
+            byte_start,
+            byte_end,
+            depth,
+            results,
+            facts,
+        );
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
+    }
+}
+
+fn visit_rust_macro_node(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    byte_start: usize,
+    byte_end: usize,
+    depth: u32,
+    results: &mut Vec<CallTuple>,
+    facts: &mut RustMacroFacts,
+) -> bool {
     if depth >= MAX_RUST_MACRO_CALL_DEPTH
         || node.end_byte() <= byte_start
         || node.start_byte() >= byte_end
     {
-        return;
+        return false;
     }
 
     match node.kind() {
@@ -1120,7 +1167,7 @@ fn collect_rust_macro_calls(
                     }
                 }
             }
-            return;
+            return false;
         }
         // A `macro_rules!` template is code that runs wherever the macro is
         // expanded. Whole method families are sometimes written inside one,
@@ -1151,28 +1198,30 @@ fn collect_rust_macro_calls(
                 }
                 collect_rust_token_tree_calls(right, source, depth, results, facts);
             }
-            return;
+            return false;
         }
         _ => {}
     }
 
-    let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            collect_rust_macro_calls(
-                cursor.node(),
-                source,
-                byte_start,
-                byte_end,
-                depth,
-                results,
-                facts,
-            );
-            if !cursor.goto_next_sibling() {
-                break;
-            }
+    true
+}
+
+fn parse_rust_macro_fragment(fragment: &str) -> Option<tree_sitter::Tree> {
+    // Release the parser borrow before walking the owned tree: nested macros
+    // can then reuse the same parser without recursive RefCell borrowing.
+    RUST_FRAGMENT_PARSER.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.is_none() {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&crate::parser::grammar_for(LangId::Rust))
+                .ok()?;
+            #[cfg(test)]
+            RUST_FRAGMENT_PARSER_INITIALIZATIONS.with(|count| count.set(count.get() + 1));
+            *cached = Some(parser);
         }
-    }
+        cached.as_mut()?.parse(fragment, None)
+    })
 }
 
 fn collect_rust_token_tree_calls(
@@ -1192,12 +1241,7 @@ fn collect_rust_token_tree_calls(
         return;
     };
 
-    let grammar = crate::parser::grammar_for(LangId::Rust);
-    let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(&grammar).is_err() {
-        return;
-    }
-    let Some(tree) = parser.parse(fragment, None) else {
+    let Some(tree) = parse_rust_macro_fragment(fragment) else {
         return;
     };
 
@@ -1318,41 +1362,37 @@ fn collect_calls_full(
     call_kinds: &[&str],
     results: &mut Vec<(String, String, u32, usize, usize)>,
 ) {
-    let node_start = node.start_byte();
-    let node_end = node.end_byte();
-
-    if node_end <= byte_start || node_start >= byte_end {
-        return;
-    }
-
-    if call_kinds.contains(&node.kind()) && node_start >= byte_start && node_end <= byte_end {
-        if let (Some(full), Some(short)) = (
-            extract_full_callee(&node, source),
-            extract_callee_name(&node, source),
-        ) {
-            results.push((
-                full,
-                short,
-                node.start_position().row as u32 + 1,
-                node_start,
-                node_end,
-            ));
-        }
-    }
-
+    // Preserve preorder and range pruning while allowing generated expressions
+    // to nest beyond the refresh worker's native stack capacity.
     let mut cursor = node.walk();
-    if cursor.goto_first_child() {
-        loop {
-            collect_calls_full(
-                cursor.node(),
-                source,
-                byte_start,
-                byte_end,
-                call_kinds,
-                results,
-            );
-            if !cursor.goto_next_sibling() {
-                break;
+    loop {
+        let node = cursor.node();
+        let node_start = node.start_byte();
+        let node_end = node.end_byte();
+        let overlaps = node_end > byte_start && node_start < byte_end;
+        if overlaps {
+            if call_kinds.contains(&node.kind()) && node_start >= byte_start && node_end <= byte_end
+            {
+                if let (Some(full), Some(short)) = (
+                    extract_full_callee(&node, source),
+                    extract_callee_name(&node, source),
+                ) {
+                    results.push((
+                        full,
+                        short,
+                        node.start_position().row as u32 + 1,
+                        node_start,
+                        node_end,
+                    ));
+                }
+            }
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return;
             }
         }
     }
@@ -1386,6 +1426,155 @@ mod tests {
         assert!(
             after <= 10000,
             "{after} block binding operations for 1000 declarations"
+        );
+    }
+
+    #[test]
+    fn computed_member_literal_rejects_a_single_quote_without_panicking() {
+        assert_eq!(computed_member_literal("\""), None);
+        assert_eq!(computed_member_literal("'"), None);
+        assert_eq!(computed_member_literal("\"\""), Some(String::new()));
+        assert_eq!(
+            computed_member_literal("'method'"),
+            Some("method".to_string())
+        );
+        assert_eq!(
+            computed_member_literal("\"方法\""),
+            Some("方法".to_string())
+        );
+    }
+
+    #[test]
+    fn rust_macro_fragments_reuse_one_parser_per_thread() {
+        RUST_FRAGMENT_PARSER_INITIALIZATIONS.with(|count| count.set(0));
+        let source = "fn main() { check!(first()); check!(second()); check!(nested!(third())); }";
+        let tree = parse_source(LangId::Rust, source);
+        let (calls, _) =
+            extract_rust_calls_with_macro_facts(source, tree.root_node(), 0, source.len());
+        for name in ["first", "second", "third"] {
+            assert!(calls.iter().any(|call| call.0 == name));
+        }
+        RUST_FRAGMENT_PARSER_INITIALIZATIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    fn deep_calls_on_refresh_worker(lang: LangId, test_name: &str) {
+        const DEPTH: usize = 8_000;
+        if std::env::var_os("AFT_DEEP_CALLS_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env("AFT_DEEP_CALLS_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "refresh worker subprocess failed: {status}"
+            );
+            return;
+        }
+        if lang == LangId::Rust {
+            // Isolate the macro walker from other file-fact passes, using the
+            // same default thread stack as the production refresh worker.
+            let source = format!(
+                "fn entry() {{ {}check!(leaf()){}; }}",
+                "f(".repeat(DEPTH),
+                ")".repeat(DEPTH)
+            );
+            let tree = parse_source(lang, &source);
+            assert!(!tree.root_node().has_error());
+            std::thread::Builder::new()
+                .name("aft-callgraph-refresh".to_string())
+                .spawn(move || {
+                    let (calls, _) = extract_rust_calls_with_macro_facts(
+                        &source,
+                        tree.root_node(),
+                        0,
+                        source.len(),
+                    );
+                    assert!(calls.iter().any(|call| call.0 == "leaf"));
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let is_rust = lang == LangId::Rust;
+        let source_path = root.join(if is_rust { "main.rs" } else { "main.ts" });
+        std::fs::write(
+            &source_path,
+            if is_rust {
+                "fn entry() {}"
+            } else {
+                "function entry() {}"
+            },
+        )
+        .unwrap();
+        let artifact_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &artifact_key, false);
+        let store_dir = temp.path().join("storage/callgraph").join(artifact_key);
+        let (store, _) = crate::callgraph_store::CallGraphStore::cold_build_with_lease(
+            store_dir.clone(),
+            root.clone(),
+            std::slice::from_ref(&source_path),
+        )
+        .unwrap();
+        drop(store);
+        // The default export makes the independent export search finish at the
+        // declaration, isolating call collection on the refresh worker stack.
+        let mut source = if is_rust {
+            "fn entry() { ".to_string()
+        } else {
+            "export default function entry() { ".to_string()
+        };
+        source.push_str(&"f(".repeat(DEPTH));
+        source.push('0');
+        source.push_str(&")".repeat(DEPTH));
+        source.push_str("; }");
+        let tree = parse_source(lang, &source);
+        assert!(
+            !tree.root_node().has_error(),
+            "parser accepts the nested input"
+        );
+        eprintln!("parsed {DEPTH} nested {lang:?} calls without errors; entering refresh worker");
+        std::fs::write(&source_path, &source).unwrap();
+        crate::callgraph_store::enqueue_callgraph_store_refresh(
+            store_dir.clone(),
+            root.clone(),
+            vec![source_path],
+            std::sync::Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
+        );
+        assert!(
+            crate::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+                std::time::Duration::from_secs(30)
+            )
+        );
+        let store = crate::callgraph_store::CallGraphStore::open_readonly(store_dir, root)
+            .unwrap()
+            .unwrap();
+        let entry = store
+            .node_for(
+                std::path::Path::new(if is_rust { "main.rs" } else { "main.ts" }),
+                "entry",
+            )
+            .unwrap();
+        assert_eq!(store.unresolved_calls_of(&entry).unwrap().len(), DEPTH);
+    }
+
+    #[test]
+    fn deep_typescript_calls_survive_refresh_worker_stack() {
+        deep_calls_on_refresh_worker(
+            LangId::TypeScript,
+            "calls::tests::deep_typescript_calls_survive_refresh_worker_stack",
+        );
+    }
+
+    #[test]
+    fn deep_rust_macro_walk_survives_default_worker_stack() {
+        deep_calls_on_refresh_worker(
+            LangId::Rust,
+            "calls::tests::deep_rust_macro_walk_survives_default_worker_stack",
         );
     }
 
