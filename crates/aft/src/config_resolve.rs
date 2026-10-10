@@ -2846,6 +2846,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_merge_moves_owned_semantic_section_without_cloning() {
+        let mut base: RawAftConfig = serde_json::from_value(serde_json::json!({
+            "semantic": {"model": "owned-user-model"}
+        }))
+        .unwrap();
+        let model_allocation = base
+            .semantic
+            .as_ref()
+            .unwrap()
+            .model
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        merge_project_config(&mut base, RawAftConfig::default());
+        assert_eq!(
+            base.semantic
+                .as_ref()
+                .unwrap()
+                .model
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            model_allocation,
+            "an unspecified project override must retain the owned model allocation"
+        );
+    }
+
+    #[test]
     fn lsp_idle_default_never_and_project_tightening() {
         let default = serde_json::to_value(resolve_config(&[]).config).unwrap();
         assert_eq!(default["lsp_idle_minutes"], 60);

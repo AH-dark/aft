@@ -617,11 +617,13 @@ impl Response {
 }
 #[test]
 fn error_response_preserves_owned_extra_fields() {
-    let response = Response::error_with_data(
-        "extra",
-        "failure",
-        "message",
-        serde_json::json!({"nested":{"values":[1,2]}, "detail":"owned"}),
+    let extra = serde_json::json!({"nested":{"values":[1,2]}, "detail":"owned"});
+    let detail_allocation = extra["detail"].as_str().unwrap().as_ptr();
+    let response = Response::error_with_data("extra", "failure", "message", extra);
+    assert_eq!(
+        response.data["detail"].as_str().unwrap().as_ptr(),
+        detail_allocation,
+        "owned error extras must move without cloning their strings"
     );
     let value = serde_json::to_value(response).unwrap();
     assert_eq!(value["nested"]["values"], serde_json::json!([1, 2]));
