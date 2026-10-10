@@ -257,20 +257,18 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       let globPattern = expandTilde(String(args.pattern));
       let globPath = args.path ? String(args.path) : undefined;
 
-      if (!globPath && globPattern.startsWith("/")) {
+      if (!globPath && (path.isAbsolute(globPattern) || path.win32.isAbsolute(globPattern))) {
+        // Glob separators are forward slashes on both hosts, including native Windows paths.
+        globPattern = globPattern.replaceAll("\\", "/");
         // Find the last directory component before any glob metacharacters.
         // Exact absolute paths need the same split because the bridge matches
         // glob patterns relative to the search path.
         const metaIdx = globPattern.search(/[*?{}[\]]/);
-        if (metaIdx > 0) {
-          const lastSlash = globPattern.lastIndexOf("/", metaIdx);
-          if (lastSlash > 0) {
-            globPath = globPattern.slice(0, lastSlash);
-            globPattern = `**/${globPattern.slice(lastSlash + 1)}`;
-          }
-        } else if (metaIdx === -1) {
-          globPath = path.dirname(globPattern);
-          globPattern = path.basename(globPattern);
+        const lastSlash = globPattern.lastIndexOf("/", metaIdx < 0 ? globPattern.length : metaIdx);
+        if (lastSlash >= 0) {
+          const prefix = globPattern.slice(0, lastSlash);
+          globPath = /^[A-Za-z]:$/.test(prefix) ? `${prefix}/` : prefix || "/";
+          globPattern = globPattern.slice(lastSlash + 1);
         }
       }
 

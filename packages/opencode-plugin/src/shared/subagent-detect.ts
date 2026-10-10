@@ -225,7 +225,10 @@ async function resolveV2(
   let session: SessionInfo | undefined;
   try {
     session = await Effect.runPromise(
-      context.session.get({ sessionID: sessionId }) as Effect.Effect<SessionInfo | undefined>,
+      Effect.timeout(
+        context.session.get({ sessionID: sessionId }) as Effect.Effect<SessionInfo | undefined>,
+        LOOKUP_TIMEOUT_MS,
+      ),
     );
   } catch (err) {
     // Same policy as the V1 path: a failed lookup counts as primary only
