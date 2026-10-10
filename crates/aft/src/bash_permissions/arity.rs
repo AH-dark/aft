@@ -5,9 +5,17 @@
 //! command for reusable permission patterns.
 
 pub fn prefix(tokens: &[String]) -> Vec<String> {
-    for len in (1..=tokens.len()).rev() {
+    prefix_with_lookup(tokens, arity)
+}
+
+fn prefix_with_lookup(
+    tokens: &[String],
+    mut lookup: impl FnMut(&str) -> Option<usize>,
+) -> Vec<String> {
+    // Lookup keys contain at most two words; returned arities can be longer.
+    for len in (1..=tokens.len().min(2)).rev() {
         let candidate = tokens[..len].join(" ");
-        if let Some(arity) = arity(&candidate) {
+        if let Some(arity) = lookup(&candidate) {
             return tokens[..tokens.len().min(arity)].to_vec();
         }
     }
@@ -155,4 +163,33 @@ fn arity(command: &str) -> Option<usize> {
         "yarn run" => 3,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_work_is_bounded_by_key_words_not_returned_arity() {
+        let mut tokens = vec![
+            "docker".to_string(),
+            "compose".to_string(),
+            "up".to_string(),
+        ];
+        tokens.extend((0..1000).map(|i| format!("arg{i}")));
+        let mut candidates = Vec::new();
+        let result = prefix_with_lookup(&tokens, |candidate| {
+            candidates.push(candidate.to_string());
+            arity(candidate)
+        });
+        assert_eq!(result, ["docker", "compose", "up"]);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "only the longest table key should be tried"
+        );
+        assert_eq!(candidates, ["docker compose"]);
+        assert_eq!(prefix(&["custom".into(), "arg".into()]), ["custom"]);
+        assert!(prefix(&[]).is_empty());
+    }
 }
