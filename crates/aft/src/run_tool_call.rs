@@ -309,23 +309,34 @@ pub(crate) fn prepare_tool_call(
         ),
     };
     if let Some(response) = refusal {
-        if let Some(trace) = phase_trace.as_mut() {
-            trace.mark_translate_done();
-            trace.mark_execute_done();
-        }
-        let result = tool_call_result_from_response(bare_name, format_context, response, false);
-        if let Some(trace) = phase_trace.as_mut() {
-            trace.mark_format_done();
-            trace.mark_finalize_done();
-        }
-        return Err(result);
-    }
-    if let Some(response) = app_ctx.database_runtime_refusal(&ctx.request_id, bare_name) {
-        return Err(tool_call_result_from_response(
+        return Err(refusal_result(
             bare_name,
             format_context,
             response,
             false,
+            phase_trace,
+        ));
+    }
+    if let Some(response) = app_ctx.database_runtime_refusal(&ctx.request_id, bare_name) {
+        return Err(refusal_result(
+            bare_name,
+            format_context,
+            response,
+            false,
+            phase_trace,
+        ));
+    }
+    if !args.is_object() {
+        return Err(refusal_result(
+            bare_name,
+            format_context,
+            Response::error(
+                &ctx.request_id,
+                "invalid_request",
+                "tool arguments must be an object",
+            ),
+            false,
+            phase_trace,
         ));
     }
     let sanitized_args = strip_agent_preview_arg_owned(args);
@@ -366,22 +377,14 @@ pub(crate) fn prepare_tool_call(
         ) {
             Ok(translated) => (translated.command, translated.args),
             Err(err) => {
-                if let Some(trace) = phase_trace.as_mut() {
-                    trace.mark_translate_done();
-                    trace.mark_execute_done();
-                }
                 let response = Response::error(ctx.request_id.clone(), err.code, err.message);
-                let result = tool_call_result_from_response(
+                return Err(refusal_result(
                     bare_name,
                     format_context,
                     response,
                     surface_downgraded,
-                );
-                if let Some(trace) = phase_trace.as_mut() {
-                    trace.mark_format_done();
-                    trace.mark_finalize_done();
-                }
-                return Err(result);
+                    phase_trace,
+                ));
             }
         }
     } else {
@@ -395,26 +398,18 @@ pub(crate) fn prepare_tool_call(
     let request = match raw_request_from_translated(command, translated_args, ctx) {
         Ok(req) => req,
         Err(error) => {
-            if let Some(trace) = phase_trace.as_mut() {
-                trace.mark_translate_done();
-                trace.mark_execute_done();
-            }
             let response = Response::error(
                 ctx.request_id.clone(),
                 "invalid_request",
                 format!("failed to build request from tool call: {error}"),
             );
-            let result = tool_call_result_from_response(
+            return Err(refusal_result(
                 bare_name,
                 format_context,
                 response,
                 surface_downgraded,
-            );
-            if let Some(trace) = phase_trace.as_mut() {
-                trace.mark_format_done();
-                trace.mark_finalize_done();
-            }
-            return Err(result);
+                phase_trace,
+            ));
         }
     };
     if let Some(trace) = phase_trace.as_mut() {
@@ -707,6 +702,26 @@ fn tool_call_result_from_response(
     ToolCallResult { text, response }
 }
 
+fn refusal_result(
+    bare_name: &str,
+    format_context: &crate::subc_format::FormatContext,
+    response: Response,
+    surface_downgraded: bool,
+    mut phase_trace: Option<&mut PhaseTrace>,
+) -> ToolCallResult {
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_translate_done();
+        trace.mark_execute_done();
+    }
+    let result =
+        tool_call_result_from_response(bare_name, format_context, response, surface_downgraded);
+    if let Some(trace) = phase_trace.as_mut() {
+        trace.mark_format_done();
+        trace.mark_finalize_done();
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +850,71 @@ mod tests {
                 standard_edit_grammar: false,
                 disabled_tools: None,
                 worker_session: false,
+            }
+        }
+
+        #[test]
+        fn database_refusal_closes_every_trace_phase() {
+            let app = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            app.mark_database_runtime_initializing_for_test();
+            let mut trace = PhaseTrace::new(Instant::now());
+            trace.mark_executor_submitted();
+            trace.mark_job_admitted();
+            let result = prepare_tool_call(
+                "write",
+                json!({}),
+                &crate::subc_format::FormatContext::default(),
+                &context(false),
+                &app,
+                Some(&mut trace),
+            );
+            let result = match result {
+                Err(result) => result,
+                Ok(_) => panic!("database gate must refuse"),
+            };
+            assert_eq!(result.response.data["code"], "database_initializing");
+            let now = Instant::now();
+            assert!(
+                trace
+                    .finish(ToolCallEgressTiming {
+                        enqueued: now,
+                        dequeued: now,
+                        write_started: now,
+                        write_finished: now,
+                        frame_bytes: 0,
+                        queue_depth: 0,
+                        writer_active_at_enqueue: false,
+                        writer_queue_was_full: false,
+                        reserve_timeouts: 0,
+                    })
+                    .is_some(),
+                "database refusal must retain timing telemetry"
+            );
+        }
+
+        #[test]
+        fn non_object_tool_args_are_rejected_before_dispatch() {
+            let app = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            );
+            for args in [Value::Null, json!([1]), json!("text"), json!(5)] {
+                let result = prepare_tool_call(
+                    "ping",
+                    args,
+                    &crate::subc_format::FormatContext::default(),
+                    &context(false),
+                    &app,
+                    None,
+                );
+                let result = match result {
+                    Err(result) => result,
+                    Ok(_) => panic!("non-object arguments must not dispatch"),
+                };
+                assert_eq!(result.response.data["code"], "invalid_request");
             }
         }
 
