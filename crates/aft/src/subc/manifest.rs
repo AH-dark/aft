@@ -427,7 +427,12 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // `capabilities.provides` lists `tool-provider/v1`: that catalog entry is
     // how a session starter discovers a tool provider before it builds a
     // worker's fetch plan. Without it, no worker gets a plan, so its calls
-    // carry no preset and run as `head`. Nothing goes in `requires`.
+    // carry no preset and run as `head`.
+    //
+    // `agent-run-scopes/v1` tells the daemon to include run_id so AFT can
+    // recognize run lifetimes. The daemon closes the route at the run's
+    // deadline; AFT confirms that the scope ended before killing its processes.
+    // Nothing goes in `requires`.
     // The builder leaves `self_signals` and `provenance` unset; `provenance`
     // is added at HELLO time by `declare_provenance`, because where the launch
     // nonce came from is a fact about the running process, not the build.
@@ -444,7 +449,10 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
         .trust_tier(Some(TrustTier::FirstParty))
         .ready(false)
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
-            provides: vec![cortexkit_role_tool_provider::PROVIDES.to_string()],
+            provides: vec![
+                cortexkit_role_tool_provider::PROVIDES.to_string(),
+                subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY.to_string(),
+            ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
@@ -697,12 +705,21 @@ mod tests {
     fn build_manifest_lists_tool_provider_capability_without_requirements() {
         let manifest = build_manifest_for_host(true);
         let capabilities = manifest.capabilities.as_ref().expect("capabilities");
-        assert_eq!(capabilities.provides, vec!["tool-provider/v1".to_string()]);
+        assert_eq!(
+            capabilities.provides,
+            vec![
+                "tool-provider/v1".to_string(),
+                "agent-run-scopes/v1".to_string()
+            ]
+        );
         assert!(capabilities.requires.is_empty());
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire.pointer("/capabilities/provides"),
-            Some(&serde_json::json!(["tool-provider/v1"]))
+            Some(&serde_json::json!([
+                "tool-provider/v1",
+                "agent-run-scopes/v1"
+            ]))
         );
     }
 
@@ -969,7 +986,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "agent-run-scopes/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

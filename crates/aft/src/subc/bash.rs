@@ -4,6 +4,7 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct BashWaitCancel {
+    pub(super) run_scope: Option<Arc<super::run_scope::RunScope>>,
     pub(super) connection: PersistentCancelSignal,
     pub(super) route: PersistentCancelSignal,
     /// Open while the daemon drains this module; a foreground wait that sees it
@@ -184,11 +185,13 @@ pub(super) fn detach_held_bash_in_background(target: drain::BashDetachTarget, ca
 }
 
 fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
-    if target.server_completion
+    if target.run_scoped {
+        // A run's carrier can reconnect without ending the run. Leave its
+        // process alive until scope.describe confirms the run ended; the
+        // command's normal hard timeout still applies while confirmation waits.
+    } else if target.server_completion
         && (cancelled
-            || !target
-                .registry
-                .is_remote_task(&target.task_id, &target.session_id))
+            || !target.registry.is_remote_task(&target.task_id, &target.session_id))
     {
         let _ = target.registry.kill(&target.task_id, &target.session_id);
     } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
@@ -222,9 +225,10 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
     let answered = claimed.len();
     for (route, corr, target, reason) in claimed {
         log::info!(
-            "subc attach: answered held bash call {} on route {route} corr={corr} from the module loop (reason={reason:?}); task {} keeps running in the background",
+            "subc attach: answered held bash call {} on route {route} corr={corr} from the module loop (reason={reason:?}); task {} {}",
             target.request_id,
-            target.task_id
+            target.task_id,
+            if target.run_scoped { "remains governed by its run scope" } else { "keeps running in the background" }
         );
         let frame = match (reason, routes.get(&route)) {
             (_, None) => None,
@@ -538,6 +542,9 @@ pub(super) fn submit_deferred_bash(
     remote_source: super::remote_policy::RemoteSource,
     received_at: Instant,
 ) {
+    let run_scope = cancel.run_scope.clone();
+    let run_scoped = run_scope.is_some();
+    let server_completion = server_completion || run_scoped;
     // Leave room for writer queueing and the daemon relay under the shortest
     // supported client transport deadline (25 s). Explicit waits only extend
     // execution, never startup admission or control-file creation.
@@ -713,6 +720,15 @@ pub(super) fn submit_deferred_bash(
                             Value::Bool(true),
                         );
                     }
+                    if let Some(scope) = &run_scope {
+                        if let Err(error) = scope.cached_budget().and_then(|budget| budget.constrain_bash(&mut translated.args)) {
+                            return finish_bash_spawn_immediate(
+                                Response::error(&request_id_for_spawn, &error.code, error.message),
+                                ctx, &session_for_spawn, &format_context_for_spawn,
+                                &mut spawn_text_tx, &mut spawn_control_tx, true, &mut repeat_for_spawn,
+                            );
+                        }
+                    }
                     let settings = bash_settings_from_translated(&translated.args);
                     let raw_req = RawRequest {
                         id: request_id_for_spawn.clone(),
@@ -738,7 +754,15 @@ pub(super) fn submit_deferred_bash(
                                                                 ctx,
                                                                 &remote_source,
                                                             ),
-                                                            || dispatch(raw_req, ctx),
+                                                         || {
+                                                             let response = dispatch(raw_req, ctx);
+                                                             // Register before formatting or database work can
+                                                             // delay observation of a newly started command.
+                                                             if let (Some(scope), Some(task)) = (&run_scope, response.data.get("task_id").and_then(Value::as_str)) {
+                                                                 scope.track(ctx.bash_background(), task, &session_for_spawn);
+                                                             }
+                                                             response
+                                                         },
                                                         ),
                                                     )
                                                 },
@@ -839,10 +863,10 @@ pub(super) fn submit_deferred_bash(
                     // regardless of the route's cancellation policy. Reaching
                     // that cap hands back a task id without killing the command;
                     // the command's own timeout still governs its lifetime.
-                    let worker_cap_ms = crate::commands::bash_orchestrate::blocking_wait_cap_ms(
+                    let worker_cap_ms = if run_scoped { None } else { crate::commands::bash_orchestrate::blocking_wait_cap_ms(
                         settings.block_to_completion || settings.wait,
                         crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
-                    );
+                    ) };
                     let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
                         crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
                             ctx.config().foreground_wait_window_ms,
@@ -970,6 +994,7 @@ pub(super) fn submit_deferred_bash(
             {
                 detach_held_bash_in_background(
                     drain::BashDetachTarget {
+                        run_scoped,
                         task_id,
                         session_id,
                         wait_mode: detach_on_user_message,
@@ -1039,6 +1064,7 @@ pub(super) fn submit_deferred_bash(
                 task_metrics.held_bash_calls.set_phase(route, corr, phase);
                 let _deferred_wait = DeferredBashWaitGuard::new(&task_metrics);
                 let deadline_target = drain::BashDetachTarget {
+                    run_scoped,
                     task_id: task_id.clone(),
                     session_id: session_id.clone(),
                     wait_mode: detach_on_user_message,
@@ -1254,6 +1280,7 @@ async fn run_deferred_bash_wait(
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     server_completion: bool,
 ) {
+    let run_scoped = cancel.run_scope.is_some();
     let Some(wait_ctx) = executor.actor_context(&root) else {
         if claim.claimed_by_deadline() {
             return;
@@ -1280,6 +1307,7 @@ async fn run_deferred_bash_wait(
         route,
         corr,
         drain::BashDetachTarget {
+            run_scoped,
             task_id: task_id.clone(),
             session_id: session_id.clone(),
             wait_mode: detach_on_user_message,
@@ -1322,8 +1350,8 @@ async fn run_deferred_bash_wait(
                     let session_id = session_id.clone();
                     let task_id = task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        if server_completion && !registry.is_remote_task(&task_id,&session_id) { let _ = registry.kill(&task_id, &session_id); }
-                        else if registry.is_remote_task(&task_id,&session_id) { let _=registry.promote(&task_id,&session_id); }
+                        if !run_scoped && server_completion && !registry.is_remote_task(&task_id,&session_id) { let _ = registry.kill(&task_id, &session_id); }
+                        else if !run_scoped && registry.is_remote_task(&task_id,&session_id) { let _=registry.promote(&task_id,&session_id); }
                         release_wait_registration(
                             &registry,
                             &session_id,
@@ -2340,7 +2368,7 @@ mod grant_path_tests {
         assert!(submit.contains("with_authenticated_principal"));
     }
 
-    fn running_bash_stub(req: RawRequest, ctx: &AppContext) -> Response {
+    pub(super) fn running_bash_stub(req: RawRequest, ctx: &AppContext) -> Response {
         let raw_params = req
             .params
             .get("params")
@@ -2407,6 +2435,7 @@ mod grant_path_tests {
                 json!({"command":"sleep 0.2", "timeout":5000,"background":background,"pty":pty,"foreground_orchestrate":true,"block_to_completion":true}),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
+                    run_scope: None,
                     connection: PersistentCancelSignal::new(),
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
@@ -2504,6 +2533,7 @@ mod grant_path_tests {
             arguments,
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                run_scope: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -3533,6 +3563,7 @@ mod grant_path_tests {
                 }),
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
+                    run_scope: None,
                     connection,
                     route,
                     drain: drain::ModuleDrainWindow::default(),
@@ -3684,6 +3715,7 @@ mod grant_path_tests {
             }),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
+                run_scope: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -3766,5 +3798,108 @@ mod grant_path_tests {
                 .response
                 .success
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod run_tests {
+    use super::*;
+
+    async fn run(command: &str, timeout: u64, deadline: Option<Instant>) -> Value {
+        let (_dir, root) = super::super::test_support::test_root("run-bash-lifetime");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| config.foreground_wait_window_ms = 10);
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(8);
+        let (touch_tx, _touch_rx) = mpsc::channel(8);
+        submit_deferred_bash(
+            &executor,
+            &completion_tx,
+            &touch_tx,
+            &metrics,
+            super::grant_path_tests::running_bash_stub,
+            root.clone(),
+            root.as_path().into(),
+            "run-session".into(),
+            "run-call".into(),
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            1,
+            control_flags(),
+            PROTOCOL_VERSION,
+            json!({"command":command,"timeout":timeout}),
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                run_scope: Some(super::super::run_scope::RunScope::for_test(deadline)),
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            AuthenticatedPrincipal::FirstParty,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            super::super::remote_policy::RemoteSource::None,
+            Instant::now(),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        let ctx = executor.actor_context(&root).unwrap();
+        let tasks = ctx.bash_background().list(0);
+        assert_eq!(tasks.len(), 1);
+        assert!(
+            tasks[0].info.status.is_terminal(),
+            "no background promotion: {:?}",
+            tasks[0]
+        );
+        if let Some(task) = response.data.get("task_id").and_then(Value::as_str) {
+            if let Some(path) = ctx.bash_background().task_json_path(task, "run-session") {
+                let persisted: Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(
+                    persisted["notify_on_completion"], false,
+                    "promotion enables background completion delivery: {persisted}"
+                );
+            }
+        }
+        response.data.clone()
+    }
+
+    #[tokio::test]
+    async fn run_scoped_foreground_timeout_never_promotes() {
+        let response = run("sleep 30", 150, None).await;
+        assert_eq!(response["status"], "timed_out", "{response:?}");
+        assert_eq!(response["exit_code"], 124);
+    }
+
+    #[tokio::test]
+    async fn run_scoped_foreground_outlives_wait_window_without_promotion() {
+        let started = Instant::now();
+        let response = run("sleep 0.2; printf done", 5000, None).await;
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(response["status"], "completed", "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn run_available_budget_reaches_spawn_and_kills_at_deadline() {
+        // Test the budget consumer independently of subc-protocol 0.30,
+        // whose scope.describe reply cannot yet carry a run deadline.
+        let started = Instant::now();
+        let response = run("sleep 30", 5000, Some(started + Duration::from_millis(200))).await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(response["status"], "timed_out", "{response:?}");
+        assert_eq!(response["exit_code"], 124);
     }
 }

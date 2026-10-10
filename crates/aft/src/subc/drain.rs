@@ -253,6 +253,7 @@ impl BashCallClaim {
 /// otherwise keep the call open for as long as it stays busy.
 #[derive(Clone)]
 pub(super) struct BashDetachTarget {
+    pub(super) run_scoped: bool,
     pub(super) task_id: String,
     pub(super) session_id: String,
     /// `wait: true`: the session's wait-mode registration is ended rather than

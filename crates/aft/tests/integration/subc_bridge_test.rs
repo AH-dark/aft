@@ -14863,3 +14863,7 @@ async fn drive_read_after_external_restore_daemon(input: FakeDaemonInput) {
 
     send_connection_goodbye(&mut stream).await;
 }
+
+#[cfg(unix)]
+#[path = "scope_revocation_test.rs"]
+mod scope_revocation_test;

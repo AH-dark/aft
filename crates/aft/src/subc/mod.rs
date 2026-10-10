@@ -207,6 +207,7 @@ mod persistence;
 mod push;
 mod readiness;
 mod remote_policy;
+mod run_scope;
 mod stall_watchdog;
 mod standing;
 mod tool_provider;
@@ -1243,15 +1244,14 @@ struct RouteIdentityData {
     /// Every tool call on the route is checked against this snapshot, so a
     /// config edit applies to the next bind, not mid-session.
     disabled_tools: Arc<Vec<String>>,
-    /// The scope the daemon stamped on this route at bind: the owner and
-    /// session (`ref`, `scope_epoch`) of the work the route was opened for,
-    /// and whether providers may act as its agent. `None` for a route opened
-    /// without one, or by a daemon that predates scopes. The gh shim relay
-    /// reads it to decide whether a bot write from this session may go to
-    /// plexus under the scope instead of with a minted assertion. It is also
-    /// kept so that when the daemon ends that scope, the bash tasks started on
-    /// this route can be ended with it; that cleanup is not built yet.
+    /// Daemon-authenticated work identity for this route: its owner, stable
+    /// reference and epoch, plus any agent/run attributes. The gh shim relay
+    /// uses the delegated identity for bot writes; run lifetime controls use
+    /// it to confirm scope end before terminating processes. Absent on routes
+    /// opened without a scope or by a daemon that predates scopes.
     scope: Option<subc_protocol::scope::ScopeStamp>,
+    /// Shared lifetime state for all routes carrying the same run scope.
+    run_scope: OnceLock<Arc<run_scope::RunScope>>,
     /// Set by the route's first tool call, so the health counter of scoped
     /// routes that make tool calls counts each route once.
     made_tool_call: AtomicBool,
@@ -3371,6 +3371,12 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    if let Some(scope) = routes
+        .get(&channel)
+        .and_then(|identity| identity.run_scope.get())
+    {
+        scope.route_closed();
+    }
     remove_installed_route(installed_route_epochs, channel);
     management_routes.remove(&channel);
     let bg_end_cause = match cancellation_reason {
@@ -4442,6 +4448,15 @@ where
         Arc::clone(&dispatch_path_metrics),
     );
     let control_replies = readiness::PendingControlReplies::default();
+    let run_scopes = run_scope::RunScopes::new(
+        writer_tx.clone(),
+        Arc::clone(&dispatch_path_metrics),
+        control_replies.clone(),
+        hello_ack
+            .as_ref()
+            .map_or(PROTOCOL_VERSION, |ack| ack.negotiated_ver),
+    );
+    let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
     let readiness_task = spawn_readiness(
         hello_ack,
         &writer_tx,
@@ -4790,6 +4805,7 @@ where
             (maybe_frame, database_waited, ledger_waited) = async {
                 tokio::select! {
                     frame = reader_rx.recv() => (frame, false, false),
+                    frame = run_ready_rx.recv() => (frame.map(Ok), false, false),
                     frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
                     frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
                 }
@@ -4960,6 +4976,12 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace };
+                        let decoded = if let Some(identity) = routes.get(&route) {
+                            match run_scopes.defer(decoded, identity, &run_ready_tx) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else { decoded };
                         let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded.frame, &routes) {
                             match database_waits.defer(decoded, &routes, &executor) {
                                 Ok(()) => continue,
@@ -6730,6 +6752,7 @@ async fn handle_control_request(
                 },
                 consumer_elicitation_capable,
                 disabled_tools: bind_disabled_tools,
+                run_scope: OnceLock::new(),
                 scope,
                 made_tool_call: AtomicBool::new(false),
             }));
@@ -8164,6 +8187,7 @@ async fn handle_tool_call(
                     });
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
+                run_scope: identity.run_scope.get().cloned(),
                 connection: connection_cancel.clone(),
                 route: route_cancel.token.clone(),
                 drain: module_drain.clone(),
@@ -8215,6 +8239,7 @@ async fn handle_tool_call(
                 });
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
+            run_scope: identity.run_scope.get().cloned(),
             connection: connection_cancel.clone(),
             route: route_cancel.token.clone(),
             drain: module_drain.clone(),
@@ -8357,6 +8382,14 @@ async fn handle_tool_call(
                         };
                         match outcome {
                             DispatchOutcome::Deferred(pending) => {
+                                let pending = match identity_for_run
+                                    .run_scope
+                                    .get()
+                                    .and_then(|scope| scope.cached_budget().ok())
+                                {
+                                    Some(budget) => budget.guard_pending(pending),
+                                    None => pending,
+                                };
                                 let _ = setup_tx.send(DeferredSetupOutcome::Deferred {
                                     pending,
                                     surface_downgraded: prepared.surface_downgraded,
@@ -9850,6 +9883,7 @@ pub(crate) mod test_support {
             },
             consumer_elicitation_capable: false,
             disabled_tools: Arc::new(vec![]),
+            run_scope: OnceLock::new(),
             scope: Some(
                 serde_json::from_value(json!({
                     "owner": {"kind": "direct"}, "ref": "worker-scope", "scope_epoch": 1,
@@ -11023,6 +11057,7 @@ pub(crate) mod test_support {
             },
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
+            run_scope: OnceLock::new(),
             scope: None,
             made_tool_call: AtomicBool::new(false),
         }))
@@ -12983,6 +13018,7 @@ mod tests {
                     arguments: json!({"command": "printf must-not-run"}),
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
+                        run_scope: None,
                         connection: PersistentCancelSignal::new(),
                         route: PersistentCancelSignal::new(),
                         drain: drain::ModuleDrainWindow::default(),
@@ -15446,6 +15482,7 @@ mod tests {
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
+            run_scope: OnceLock::new(),
             scope: None,
             made_tool_call: AtomicBool::new(false),
         }));
@@ -15528,6 +15565,7 @@ mod tests {
             spawn_principal: AuthenticatedPrincipal::FirstParty,
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
+            run_scope: OnceLock::new(),
             scope: None,
             made_tool_call: AtomicBool::new(false),
         }));

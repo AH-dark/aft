@@ -46,6 +46,11 @@ pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
             ));
         }
     }
+    if snapshot.info.status == BgTaskStatus::Killed
+        && snapshot.info.status_reason.as_deref() == Some("scope revoked")
+    {
+        rendered.push_str("\n[killed (scope revoked)]");
+    }
     if snapshot.info.status == BgTaskStatus::TimedOut {
         rendered.push_str("\n[command timed out]");
         // Name the limit that killed it, so AFT's own default limit is not

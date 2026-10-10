@@ -2976,6 +2976,7 @@ mod route_tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::new(disabled),
             scope,
+            run_scope: OnceLock::new(),
             made_tool_call: AtomicBool::new(false),
         }));
         exchange_with_actor(body, identity, ctx, metrics, |request, _| {
@@ -3227,6 +3228,7 @@ mod route_tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            run_scope: OnceLock::new(),
             made_tool_call: AtomicBool::new(false),
         }));
         // Wait on filesystem evidence, not on the command's completion. The

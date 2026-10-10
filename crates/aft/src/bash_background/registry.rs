@@ -5414,6 +5414,19 @@ impl BgTaskRegistry {
         }
     }
 
+    pub(crate) fn kill_for_scope_revocation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::Killed,
+            Some("scope revoked".into()),
+        )
+    }
+
     pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
         self.kill_with_status(task_id, session_id, BgTaskStatus::Killed)
     }
@@ -6908,6 +6921,18 @@ impl BgTaskRegistry {
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         #[cfg(unix)]
         if task.state.lock().is_ok_and(|s| s.metadata.remote.is_some()) {
+            if reason.as_deref() == Some("scope revoked") {
+                let mut db = DeferredDbWrites::new(self, &task);
+                let mut state = task
+                    .state
+                    .lock()
+                    .map_err(|_| "background task lock poisoned")?;
+                if !state.metadata.is_terminal() {
+                    state.metadata.status_reason = reason.clone();
+                    self.persist_task_locked(&task, &state.metadata, &mut db)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             return self.kill_remote_task(&task);
         }
         let mut terminalized = false;

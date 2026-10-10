@@ -1148,6 +1148,7 @@ mod tests {
                 spawn_principal: AuthenticatedPrincipal::FirstParty,
                 consumer_elicitation_capable: false,
                 disabled_tools: Arc::default(),
+                run_scope: OnceLock::new(),
                 scope: None,
                 made_tool_call: AtomicBool::new(false),
             })),
