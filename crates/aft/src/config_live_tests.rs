@@ -77,6 +77,27 @@ fn write(path: &Path, text: &str) {
 }
 
 #[test]
+fn staged_sources_are_cleared_at_entry_and_on_unwind() {
+    // Observe staging directly rather than a later configure's successful overwrite.
+    let fixture = Fixture::new("{}", None);
+    let sources = fixture.ctx.config_live().sources.lock().clone().unwrap();
+    stage_configure_sources(sources.clone());
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _scope = configure_sources_scope();
+        assert!(
+            STAGED_SOURCES.with(|slot| slot.borrow().is_none()),
+            "new configure must discard old staging"
+        );
+        stage_configure_sources(sources);
+        panic!("configure after staging");
+    }));
+    assert!(
+        STAGED_SOURCES.with(|slot| slot.borrow().is_none()),
+        "unwind must discard staging"
+    );
+}
+
+#[test]
 fn inspect_categories_and_lsp_idle_reload_without_restart() {
     let fixture = Fixture::new(r#"{"lsp":{"idle_minutes":60}}"#, None);
     write(

@@ -1230,20 +1230,20 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     merge_formatter_map(&mut base.formatter, project.formatter);
     merge_checker_map(&mut base.checker, project.checker);
     merge_disabled_tools(&mut base.disabled_tools, project.disabled_tools);
-    base.semantic = merge_semantic_config(base.semantic.clone(), project.semantic);
-    base.search = merge_project_search(base.search.clone(), project.search);
-    base.lsp = merge_lsp_config(base.lsp.clone(), project.lsp);
-    base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
-    base.bash = merge_bash_config(base.bash.clone(), project_safe_bash(project.bash));
-    base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
-    base.idle = merge_idle_config(base.idle.clone(), project.idle);
-    base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
-    base.backup = merge_project_backup_config(base.backup.clone(), project.backup);
+    base.semantic = merge_semantic_config(base.semantic.take(), project.semantic);
+    base.search = merge_project_search(base.search.take(), project.search);
+    base.lsp = merge_lsp_config(base.lsp.take(), project.lsp);
+    base.experimental = merge_experimental_config(base.experimental.take(), project.experimental);
+    base.bash = merge_bash_config(base.bash.take(), project_safe_bash(project.bash));
+    base.inspect = merge_inspect_config(base.inspect.take(), project.inspect);
+    base.idle = merge_idle_config(base.idle.take(), project.idle);
+    base.worktree = merge_worktree_config(base.worktree.take(), project.worktree);
+    base.backup = merge_project_backup_config(base.backup.take(), project.backup);
     if project.git.is_some() {
         base.git = project.git;
     }
-    base.pi = merge_pi_config(base.pi.clone(), project.pi);
-    base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
+    base.pi = merge_pi_config(base.pi.take(), project.pi);
+    base.sandbox = merge_project_sandbox(base.sandbox.take(), project.sandbox);
     // A project may turn remote runs off for itself, never on: running a
     // repository's commands on a shared build server is the user's decision.
     if project

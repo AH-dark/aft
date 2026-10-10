@@ -218,6 +218,19 @@ pub fn stage_configure_sources(sources: ConfigSources) {
     STAGED_SOURCES.with(|staged| *staged.borrow_mut() = Some(sources));
 }
 
+pub(crate) struct ConfigureSourcesScope;
+
+pub(crate) fn configure_sources_scope() -> ConfigureSourcesScope {
+    STAGED_SOURCES.with(|staged| staged.borrow_mut().take());
+    ConfigureSourcesScope
+}
+
+impl Drop for ConfigureSourcesScope {
+    fn drop(&mut self) {
+        STAGED_SOURCES.with(|staged| staged.borrow_mut().take());
+    }
+}
+
 /// Called when configure returns. A successful configure applied everything
 /// in the files, so its sources replace the record and any pending reload for
 /// that content is moot. A failed one leaves the record as it was.
@@ -552,8 +565,8 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
         if live.applied.is_empty() {
             break (live.applied, live.deferred, dropped, held);
         }
-        if ctx.publish_config_if_current(&published, live.next.clone()) {
-            push_live_setters(ctx, &published, &live.next);
+        if let Some(next) = ctx.publish_config_if_current_retaining(&published, live.next) {
+            push_live_setters(ctx, &published, &next);
             break (live.applied, live.deferred, dropped, held);
         }
         if attempts >= 2 {

@@ -130,6 +130,14 @@ fn replace_pinned_config(key: usize, config: &Arc<Config>) {
     });
 }
 
+fn next_config_pin_identity() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    // A pin can survive moving or dropping its context. Addresses are reusable,
+    // whereas these identities never name a later context on the same thread.
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("context identity exhausted")
+}
+
 /// Releases a request's config pin; see [`AppContext::pin_config`].
 pub struct ConfigPinGuard {
     key: Option<usize>,
@@ -622,26 +630,33 @@ struct StatusBarCache {
 /// only when a value changes. It compares the omission-preserving values, so a
 /// category arriving (`?` becoming a number) counts as a change.
 #[derive(Debug, Default)]
-struct StatusBarEmission(RwLock<Option<StatusBarCountValues>>);
+struct StatusBarEmission(RwLock<std::collections::VecDeque<(String, StatusBarCountValues)>>);
 
 impl StatusBarEmission {
-    fn should_emit(&self, counts: &StatusBarCountValues) -> bool {
+    fn should_emit(&self, session_id: &str, counts: &StatusBarCountValues) -> bool {
         let mut last = self
             .0
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.as_ref() == Some(counts) {
-            return false;
+        if let Some(index) = last.iter().position(|(session, _)| session == session_id) {
+            let (_, previous) = last.remove(index).expect("located session");
+            let changed = previous != *counts;
+            last.push_back((session_id.to_string(), counts.clone()));
+            return changed;
         }
-        *last = Some(counts.clone());
+        // Eviction only repeats a bar for an idle session; it never hides a change.
+        if last.len() == 256 {
+            last.pop_front();
+        }
+        last.push_back((session_id.to_string(), counts.clone()));
         true
     }
 
     fn clear(&self) {
-        *self
-            .0
+        self.0
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 
@@ -3101,6 +3116,8 @@ pub struct AppContext {
     /// cross-process checkpoint file lock.
     checkpoint_namespace_request: crate::checkpoint::CheckpointNamespaceRequest,
     config: RwLock<Arc<Config>>,
+    config_publication: parking_lot::Mutex<()>,
+    config_pin_identity: usize,
     /// State for applying config file edits while the root stays bound: the
     /// config file texts the last configure applied, the pending-reload flag
     /// and the root's own config file watches.
@@ -3738,11 +3755,20 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
 impl AppContext {
     /// Register the owning handle without making the status worker retain a root.
     pub(crate) fn bind_status_context(self: &Arc<Self>) {
-        *self.status_emitter.context.lock().unwrap() = Arc::downgrade(self);
+        *self
+            .status_emitter
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(self);
     }
 
     pub fn signal_status_changed(&self) {
-        let context = self.status_emitter.context.lock().unwrap().clone();
+        let context = self
+            .status_emitter
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if context.strong_count() > 0 {
             self.status_emitter.signal_context(context);
         } else {
@@ -3814,6 +3840,8 @@ impl AppContext {
             checkpoint: parking_lot::Mutex::new(checkpoint_store),
             checkpoint_namespace_request,
             config: RwLock::new(Arc::new(config)),
+            config_publication: parking_lot::Mutex::new(()),
+            config_pin_identity: next_config_pin_identity(),
             config_live: crate::config_live::ConfigLiveState::default(),
             last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
@@ -4010,6 +4038,8 @@ impl AppContext {
     /// A busy manager is not a missing diagnostic producer. Publishers must
     /// leave their previous bar untouched and retry on a later signal.
     pub(crate) fn try_status_bar_count_values(&self) -> Option<StatusBarCountValues> {
+        #[cfg(test)]
+        STATUS_COUNT_PROBES.with(|count| count.set(count.get() + 1));
         let tier2 = self
             .status_bar_tier2
             .read()
@@ -4415,7 +4445,15 @@ impl AppContext {
     /// rendered into agent-visible text: a call that does not render would
     /// swallow the change.
     pub fn should_emit_status_bar(&self, counts: &StatusBarCountValues) -> bool {
-        self.status_bar_last_emitted.should_emit(counts)
+        self.should_emit_status_bar_for_session(crate::protocol::DEFAULT_SESSION_ID, counts)
+    }
+
+    pub fn should_emit_status_bar_for_session(
+        &self,
+        session_id: &str,
+        counts: &StatusBarCountValues,
+    ) -> bool {
+        self.status_bar_last_emitted.should_emit(session_id, counts)
     }
 
     /// Record an atomic batch of complete per-producer diagnostics observations.
@@ -4789,10 +4827,11 @@ impl AppContext {
         let new_registry = crate::compress::build_registry_for_context(self);
         self.filter_registry_rebuild_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        match self.filter_registry.write() {
-            Ok(mut slot) => *slot = new_registry,
-            Err(poisoned) => *poisoned.into_inner() = new_registry,
-        }
+        let mut slot = self
+            .filter_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = new_registry;
         self.filter_registry_loaded
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -4807,7 +4846,20 @@ impl AppContext {
         let new_registry = crate::compress::build_registry_for_context(self);
         self.filter_registry_rebuild_count
             .fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut slot) = self.filter_registry.write() {
+        self.install_lazy_filter_registry(new_registry);
+    }
+
+    fn install_lazy_filter_registry(
+        &self,
+        new_registry: crate::compress::toml_filter::FilterRegistry,
+    ) {
+        let mut slot = self
+            .filter_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A reset may have installed newer filters while the lazy build was parsing.
+        // Test and publish under the same lock as reset's loaded flag.
+        if !self.filter_registry_loaded.load(Ordering::Acquire) {
             *slot = new_registry;
             self.filter_registry_loaded.store(true, Ordering::Release);
         }
@@ -5953,7 +6005,12 @@ impl AppContext {
         // current status after releasing the open slot. Transport roots register
         // their Arc; do not build a synchronous snapshot here for library callers
         // that may still hold the process-shared connection or App slot.
-        let context = self.status_emitter.context.lock().unwrap().clone();
+        let context = self
+            .status_emitter
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if context.strong_count() > 0 {
             self.status_emitter.signal_context(context);
         }
@@ -6156,7 +6213,7 @@ impl AppContext {
     pub fn set_config(&self, config: Config) {
         // Configure publishes this way, and it runs inside a pinned request:
         // it must see its own publication for the rest of that request.
-        self.publish_config(|_| Some(config), true);
+        let _ = self.publish_config(|_| Some(config), true);
         let config = self.config();
         if let Some(root) = config.project_root.as_deref() {
             if let Ok(walk) = crate::lsp::manager::walk_applicable_area(root, None, &config, None) {
@@ -6171,6 +6228,15 @@ impl AppContext {
     /// A live config reload builds its snapshot from the one it read, so it
     /// must not overwrite a configure that published in between.
     pub fn publish_config_if_current(&self, expected: &Arc<Config>, config: Config) -> bool {
+        self.publish_config_if_current_retaining(expected, config)
+            .is_some()
+    }
+
+    pub(crate) fn publish_config_if_current_retaining(
+        &self,
+        expected: &Arc<Config>,
+        config: Config,
+    ) -> Option<Arc<Config>> {
         self.publish_config(
             |current| Arc::ptr_eq(expected, current).then_some(config),
             false,
@@ -6185,10 +6251,13 @@ impl AppContext {
         &self,
         build: impl FnOnce(&Arc<Config>) -> Option<Config>,
         replace_pin: bool,
-    ) -> bool {
+    ) -> Option<Arc<Config>> {
         // A publication from inside an `update_config` closure would wait on
         // the write lock this thread already holds.
         assert_config_write_lock_not_held();
+        // Keep derived backend, view and watcher state in the same order as snapshots.
+        // Acquire before the config lock; effects may read config after the swap.
+        let _publication = self.config_publication.lock();
         let (next, project_root_changed) = {
             let mut guard = self
                 .config
@@ -6199,8 +6268,10 @@ impl AppContext {
                 build(&guard)
             };
             let Some(next) = built else {
-                return false;
+                return None;
             };
+            let mut next = next;
+            next.aft_search_registered = next.tool_registered("aft_search");
             #[cfg(test)]
             let next = self.app.isolate_test_config(next);
             let next = Arc::new(next);
@@ -6214,6 +6285,12 @@ impl AppContext {
         if replace_pin {
             replace_pinned_config(self.config_pin_key(), &next);
         }
+        #[cfg(test)]
+        CONFIG_PUBLICATION_PROBE.with(|probe| {
+            if let Some(probe) = probe.borrow_mut().take() {
+                probe();
+            }
+        });
         self.reconcile_rerank_backend(&next);
         self.arm_view_disk_limits(next.views.enabled);
         if project_root_changed {
@@ -6227,7 +6304,7 @@ impl AppContext {
                 .map(watcher_counters_for_root)
                 .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
         }
-        true
+        Some(next)
     }
 
     /// Pin the published configuration for the rest of the calling request.
@@ -6267,7 +6344,7 @@ impl AppContext {
     }
 
     fn config_pin_key(&self) -> usize {
-        self as *const Self as usize
+        self.config_pin_identity
     }
 
     pub fn config_live(&self) -> &crate::config_live::ConfigLiveState {
@@ -6293,7 +6370,7 @@ impl AppContext {
     /// must not read the configuration itself. A request pin on the calling
     /// thread keeps its admitted snapshot.
     pub fn update_config(&self, update: impl FnOnce(&mut Config)) {
-        self.publish_config(
+        let _ = self.publish_config(
             |current| {
                 let mut next = current.as_ref().clone();
                 update(&mut next);
@@ -6341,6 +6418,11 @@ impl AppContext {
         self.harness.lock().clone()
     }
 
+    /// Return the harness chosen by configure.
+    ///
+    /// # Panics
+    /// Panics before configure has set a harness. Use [`Self::harness_opt`] when
+    /// working with a context that may not yet be configured.
     pub fn harness(&self) -> Harness {
         self.harness_opt()
             .expect("harness set by configure before any tool call")
@@ -6350,6 +6432,8 @@ impl AppContext {
         crate::bash_background::storage_dir(self.config().storage_dir.as_deref())
     }
 
+    /// Harness-scoped storage directory. Requires configure to have set a harness;
+    /// see [`Self::harness`] for the precondition and [`Self::harness_opt`] to check it.
     pub fn harness_dir(&self) -> PathBuf {
         self.storage_dir().join(self.harness().storage_segment())
     }
@@ -11674,6 +11758,133 @@ impl AppContext {
             crate::memory::MemorySnapshot::new_uncapped(roots_status, roots)
         }
     }
+}
+
+#[cfg(test)]
+mod core_regressions {
+    use super::*;
+
+    fn context() -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config::default(),
+        )
+    }
+
+    #[test]
+    fn lazy_filter_install_does_not_overwrite_reset() {
+        let ctx = context();
+        let stale = crate::compress::toml_filter::build_registry(
+            &[("stale", "[filter]\nmatches = [\"stale-command\"]\n")],
+            None,
+            None,
+        );
+        assert!(stale.lookup("stale-command").is_some());
+        ctx.reset_filter_registry();
+        ctx.install_lazy_filter_registry(stale);
+        assert!(ctx.filter_registry().lookup("stale-command").is_none());
+    }
+
+    #[test]
+    fn lazy_filter_load_recovers_poison_once() {
+        let ctx = context();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.filter_registry.write().unwrap();
+            panic!("poison registry");
+        }));
+        let _ = ctx.shared_filter_registry();
+        let _ = ctx.shared_filter_registry();
+        assert_eq!(ctx.filter_registry_rebuild_count_for_test(), 1);
+    }
+
+    #[test]
+    fn status_context_recovers_poison_for_binding_and_signal() {
+        let ctx = Arc::new(context());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.status_emitter.context.lock().unwrap();
+            panic!("poison weak context");
+        }));
+        ctx.bind_status_context();
+        ctx.signal_status_changed();
+    }
+
+    #[test]
+    fn config_pin_does_not_attach_to_reused_context_address() {
+        let mut slot = Box::new(Some(context()));
+        slot.as_ref()
+            .as_ref()
+            .unwrap()
+            .update_config(|config| config.restrict_to_project_root = true);
+        let pin = slot.as_ref().as_ref().unwrap().pin_config();
+        drop(slot.take());
+        *slot = Some(context());
+        assert!(
+            !slot
+                .as_ref()
+                .as_ref()
+                .unwrap()
+                .config()
+                .restrict_to_project_root
+        );
+        drop(pin);
+    }
+
+    #[test]
+    fn config_publication_refreshes_search_registration() {
+        let ctx = context();
+        ctx.update_config(|config| config.disabled_tools.push("aft_search".to_string()));
+        assert!(!ctx.config().aft_search_registered);
+    }
+
+    #[test]
+    fn concurrent_publication_keeps_effects_in_snapshot_order() {
+        let ctx = Arc::new(context());
+        let root_a = tempfile::TempDir::new().unwrap();
+        let root_b = tempfile::TempDir::new().unwrap();
+        let mut config_a = ctx.config().as_ref().clone();
+        config_a.project_root = Some(root_a.path().to_path_buf());
+        let mut config_b = ctx.config().as_ref().clone();
+        config_b.project_root = Some(root_b.path().to_path_buf());
+        let (swapped_tx, swapped_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker_ctx = Arc::clone(&ctx);
+        let first = std::thread::spawn(move || {
+            CONFIG_PUBLICATION_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some(Box::new(move || {
+                    swapped_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }))
+            });
+            worker_ctx.set_config(config_a);
+        });
+        swapped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let serialized = ctx.config_publication.try_lock().is_none();
+        if serialized {
+            // A publisher must finish its effects before the next snapshot lands.
+            resume_tx.send(()).unwrap();
+            first.join().unwrap();
+            ctx.set_config(config_b);
+        } else {
+            // Exercise the stale-effect interleaving when publication lacks exclusion.
+            ctx.set_config(config_b);
+            resume_tx.send(()).unwrap();
+            first.join().unwrap();
+        }
+        assert!(
+            Arc::ptr_eq(
+                &ctx.watcher_counters.read().unwrap(),
+                &watcher_counters_for_root(root_b.path())
+            ),
+            "watcher counters must follow the last snapshot"
+        );
+        assert!(serialized, "snapshot and effects must be one publication");
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONFIG_PUBLICATION_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static STATUS_COUNT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Which configure side effect a test counts per (root, session).

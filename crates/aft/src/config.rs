@@ -759,13 +759,13 @@ impl Default for BashConfig {
 pub struct Config {
     /// Root directory of the project being analyzed. `None` if not scoped.
     pub project_root: Option<PathBuf>,
-    /// How many levels of call-graph edges to follow during validation (default: 1).
+    /// Legacy serialized setting (default: 1); validation does not consume it.
     pub validation_depth: u32,
     /// Hours before legacy backup-session maintenance may collect inactive history
     /// (default: 24). Named checkpoint retention is intentionally fixed at fourteen
     /// days and is not controlled by configuration.
     pub checkpoint_ttl_hours: u32,
-    /// Maximum depth for recursive symbol resolution (default: 10).
+    /// Legacy serialized setting (default: 10); symbol resolution does not consume it.
     pub max_symbol_depth: u32,
     /// Seconds before killing a formatter subprocess (default: 10).
     pub formatter_timeout_secs: u32,
@@ -776,7 +776,7 @@ pub struct Config {
     /// Whether the hashline edit/read surface is enabled for eligible sessions.
     /// Resolved from the public `edit_mode` enum in aft.jsonc.
     pub hashline_enabled: bool,
-    /// Whether to auto-validate files after edits (default: false).
+    /// Optional automatic validation mode after edits (default: None, disabled).
     /// When "syntax", only tree-sitter parse check. When "full", runs type checker.
     pub validate_on_edit: Option<String>,
     /// Per-language formatter overrides. Keys: "typescript", "python", "rust", "go".

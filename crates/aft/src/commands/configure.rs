@@ -2791,6 +2791,7 @@ fn register_hashline_for_configure(
 /// Stderr log: `[aft] project root set: <path>`
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
+    let _sources_scope = crate::config_live::configure_sources_scope();
     // Configure can change the project root, search paths or server
     // overrides, and follows installs the file watcher may not report, so the
     // memoized TypeScript server choices are recomputed.
