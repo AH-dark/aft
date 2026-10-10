@@ -1,7 +1,7 @@
 //! Handler for the `batch` command: atomic multi-edit with rollback.
 //!
 //! Accepts an array of edits (string-match or line-range), validates all against
-//! the original content, then applies bottom-to-top to prevent line drift.
+//! the original content, then assembles the resolved spans without line drift.
 //! Takes a single auto-backup before applying. No file modification on failure.
 
 use std::path::Path;
@@ -174,6 +174,12 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if write_result.rolled_back {
+        ctx.backup()
+            .lock()
+            .discard_operation_entries(req.session(), &op_id);
+    }
+
     if let Some(final_content) = write_result.final_content(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, final_content, &req.params);
     }
@@ -244,7 +250,14 @@ fn build_batch_output(
         cursor = r.byte_end;
     }
     output.push_str(&source[cursor..]);
+    #[cfg(test)]
+    BYTES_COPIED.with(|count| count.set(count.get() + output.len()));
     Ok(output)
+}
+
+#[cfg(test)]
+thread_local! {
+    static BYTES_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Resolve a single edit object to byte offsets against the original source.
@@ -264,6 +277,13 @@ fn resolve_edit(
         .and_then(|v| v.as_str());
 
     if let Some(match_str) = match_str {
+        if match_str.is_empty() {
+            return Err(Response::error(
+                req_id,
+                "invalid_request",
+                format!("batch: edit[{}] 'match' must not be empty", index),
+            ));
+        }
         // String match-replace with progressive fuzzy matching (same as edit_match)
         let replacement = edit_val
             .get("replacement")
@@ -401,13 +421,13 @@ fn resolve_edit(
         }
 
         if fuzzy_matches.len() > 1 {
-            let line_index = edit::SourceLineIndex::new(source);
+            let contexts = super::edit_match::MatchContext::new(source);
             let occurrences: Vec<serde_json::Value> = fuzzy_matches
                 .iter()
                 .enumerate()
                 .map(|(occurrence_index, matched)| {
-                    let line = line_index.line_at(matched.byte_start);
-                    let context = line_index.context(line, 2);
+                    let line = contexts.line_index(matched.byte_start);
+                    let context = contexts.render(line, 2);
                     serde_json::json!({
                         "occurrence": occurrence_index + 1,
                         "line": line + 1,
@@ -1003,5 +1023,86 @@ mod a03_measurements {
             );
             eprintln!("A03 diff reversed={reversed} elapsed={elapsed:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn batch_many_edits_copy_the_file_once() {
+        let source = "abc\n".repeat(1000);
+        let edits: Vec<_> = (0..1000)
+            .rev()
+            .map(|line| ResolvedEdit {
+                byte_start: line * 4,
+                byte_end: line * 4 + 3,
+                replacement: "xyz".into(),
+                fuzzy_match: None,
+            })
+            .collect();
+        BYTES_COPIED.with(|count| count.set(0));
+        assert_eq!(
+            build_batch_output(&source, &edits).unwrap(),
+            "xyz\n".repeat(1000)
+        );
+        assert_eq!(BYTES_COPIED.with(|count| count.get()), source.len());
+    }
+
+    #[test]
+    fn batch_equal_position_insertions_preserve_splice_order() {
+        let edits = vec![
+            ResolvedEdit {
+                byte_start: 1,
+                byte_end: 1,
+                replacement: "second".into(),
+                fuzzy_match: None,
+            },
+            ResolvedEdit {
+                byte_start: 1,
+                byte_end: 1,
+                replacement: "first".into(),
+                fuzzy_match: None,
+            },
+        ];
+        assert_eq!(build_batch_output("ab", &edits).unwrap(), "afirstsecondb");
+    }
+
+    #[test]
+    fn empty_batch_match_is_rejected_before_expansion() {
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"replaceAll": true}),
+        ] {
+            let mut edit = serde_json::json!({"match": "", "replacement": "x"});
+            edit.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = resolve_edit("é\ntext\n", &edit, 0, "empty-match");
+            assert!(matches!(result, Err(response) if response.data["code"] == "invalid_request"));
+        }
+    }
+
+    #[test]
+    fn batch_rollback_discards_operation_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.ts");
+        let original = "export function ok() { return 1; }\n";
+        std::fs::write(&path, original).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "rollback", "command": "batch", "file": path, "edits": [{"match": original, "replacement": "function { broken"}]})).unwrap();
+        let response = handle_batch(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["rolled_back"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths(req.session())
+            .is_err());
     }
 }

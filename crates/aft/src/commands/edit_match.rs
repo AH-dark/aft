@@ -2,7 +2,6 @@
 //! disambiguation for multiple occurrences.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::backup::CapturedRegularFile;
@@ -264,8 +263,24 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         }
     };
 
-    if let Err(error) = file_handle.write_all(append_content.as_bytes()) {
-        if !existed {
+    let original_len = match file_handle.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return Response::error(&req.id, "write_error", error.to_string()),
+    };
+    if let Err((error, restore_error)) =
+        append_with_rollback(&mut file_handle, append_content.as_bytes(), |file| {
+            file.set_len(original_len)
+        })
+    {
+        let restored = restore_error.is_none();
+        drop(file_handle);
+        let removal_error = if !existed && restored {
+            std::fs::remove_file(path.as_path()).err()
+        } else {
+            None
+        };
+        let restore_error = restore_error.or(removal_error);
+        if restore_error.is_none() {
             ctx.backup()
                 .lock()
                 .discard_operation_entries(req.session(), op_id);
@@ -273,7 +288,14 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         return Response::error(
             &req.id,
             "write_error",
-            format!("edit_match append: failed to write {}: {}", file, error),
+            format!(
+                "edit_match append: failed to write {}: {}{}",
+                file,
+                error,
+                restore_error
+                    .map(|error| format!("; restore failed: {error}"))
+                    .unwrap_or_default()
+            ),
         );
     }
 
@@ -387,6 +409,16 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         &final_content,
     );
     Response::success(&req.id, result)
+}
+
+fn append_with_rollback<W: std::io::Write>(
+    writer: &mut W,
+    content: &[u8],
+    restore: impl FnOnce(&mut W) -> std::io::Result<()>,
+) -> Result<(), (std::io::Error, Option<std::io::Error>)> {
+    writer
+        .write_all(content)
+        .map_err(|error| (error, restore(writer).err()))
 }
 
 /// Returns true if the file path contains glob characters.
@@ -1226,13 +1258,13 @@ fn handle_single_file_edit_match(
 
     // Multiple matches without occurrence selector → disambiguation (unless replace_all)
     if positions.len() > 1 && occurrence.is_none() && !replace_all {
-        let line_index = edit::SourceLineIndex::new(&source);
+        let contexts = MatchContext::new(&source);
         let occurrences: Vec<serde_json::Value> = positions
             .iter()
             .enumerate()
             .map(|(idx, &byte_pos)| {
-                let line = line_index.line_at(byte_pos);
-                let context = line_index.context(line, 2);
+                let line = contexts.line_index(byte_pos);
+                let context = contexts.render(line, 2);
                 serde_json::json!({
                     "occurrence": idx + 1,
                     "line": line + 1,
@@ -1446,6 +1478,34 @@ fn handle_single_file_edit_match(
     Response::success(&req.id, result)
 }
 
+/// Build a context string showing the target line ± `margin` lines.
+pub(super) struct MatchContext<'a> {
+    index: edit::SourceLineIndex<'a>,
+}
+
+impl<'a> MatchContext<'a> {
+    pub(super) fn new(source: &'a str) -> Self {
+        #[cfg(test)]
+        CONTEXT_BYTES_SCANNED.with(|count| count.set(count.get() + source.len()));
+        Self {
+            index: edit::SourceLineIndex::new(source),
+        }
+    }
+
+    pub(super) fn line_index(&self, byte: usize) -> usize {
+        self.index.line_at(byte)
+    }
+
+    pub(super) fn render(&self, target_line: usize, margin: usize) -> String {
+        self.index.context(target_line, margin)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod replace_all_tests {
     use super::*;
@@ -1546,6 +1606,86 @@ mod audit_regressions {
         assert_eq!(
             super::apply_sorted_non_overlapping_fuzzy_matches(source, &matches, "x\ny\n").unwrap(),
             "x\ny\r\nc\r\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod append_regressions {
+    use super::*;
+
+    struct PartialWriter {
+        file: std::fs::File,
+        wrote: bool,
+    }
+
+    impl std::io::Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.wrote {
+                return Err(std::io::Error::other("injected partial write failure"));
+            }
+            self.wrote = true;
+            self.file.write(&bytes[..1])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    #[test]
+    fn failed_append_truncates_partial_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut writer = PartialWriter {
+            file: std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            wrote: false,
+        };
+        let error = append_with_rollback(&mut writer, b"after", |writer| writer.file.set_len(6))
+            .unwrap_err();
+        assert!(error.1.is_none());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn failed_append_reports_restore_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut writer = PartialWriter {
+            file: std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            wrote: false,
+        };
+        let error = append_with_rollback(&mut writer, b"after", |_| {
+            Err(std::io::Error::other("restore"))
+        })
+        .unwrap_err();
+        assert_eq!(error.1.unwrap().to_string(), "restore");
+    }
+}
+
+#[cfg(test)]
+mod context_regressions {
+    use super::*;
+
+    #[test]
+    fn ambiguity_context_indexes_the_source_once() {
+        let source = "é\r\n".repeat(1000);
+        CONTEXT_BYTES_SCANNED.with(|count| count.set(0));
+        let contexts = MatchContext::new(&source);
+        for line in 0..1000 {
+            assert_eq!(contexts.line_index(line * 4), line);
+            assert_eq!(contexts.render(line, 0), "é");
+        }
+        assert_eq!(
+            CONTEXT_BYTES_SCANNED.with(|count| count.get()),
+            source.len()
         );
     }
 }

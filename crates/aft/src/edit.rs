@@ -217,8 +217,11 @@ impl<'a> SourceLineIndex<'a> {
     }
 
     pub(crate) fn context(&self, line: usize, margin: usize) -> String {
-        let start = line.saturating_sub(margin);
-        let end = (line + margin + 1).min(self.lines.len());
+        let start = line.saturating_sub(margin).min(self.lines.len());
+        let end = line
+            .saturating_add(margin)
+            .saturating_add(1)
+            .min(self.lines.len());
         self.lines[start..end].join("\n")
     }
 }
