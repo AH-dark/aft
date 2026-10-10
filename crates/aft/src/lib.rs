@@ -33,18 +33,18 @@
 
 // ## Note on `.unwrap()` / `.expect()` usage
 //
-// The remaining `.unwrap()` and `.expect()` calls in `src/` are in:
+// Some `.unwrap()` and `.expect()` calls in `src/` protect internal invariants:
 // - **Tree-sitter query operations** (parser.rs, zoom.rs, extract.rs, inline.rs,
 //   outline.rs): These operate on AFT's own compiled grammars and query patterns, which
 //   are compile-time constants. Pattern captures and node kinds are guaranteed to exist.
 // - **Checkpoint serialization** (checkpoint.rs): serde_json::to_value on known-good
 //   HashMap<PathBuf, String> types cannot fail.
-// - **lib.rs main loop**: JSON parsing of stdin lines — a malformed line is logged and
-//   skipped, not unwrapped.
+// The stdin parse loop lives in main.rs and returns a correlated parse-error response
+// for malformed request shapes instead of unwrapping the parse result.
 //
-// All production command handlers that process user/agent input return Result or
-// Response::error instead of panicking. Confirmed zero .unwrap()/.expect() in
-// production error paths as of v0.6.3 audit.
+// User/agent input should be handled with Result or Response::error. This is not
+// a guarantee that every production path is panic-free; public accessors can
+// still require a configured context, and each invariant needs local review.
 
 pub mod agent_child_env;
 pub mod alert_records;

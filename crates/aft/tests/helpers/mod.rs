@@ -805,6 +805,15 @@ impl AftProcess {
         stdin.flush().expect("flush stdin");
     }
 
+    /// Send bytes as one protocol line, including deliberately invalid UTF-8.
+    pub fn send_bytes(&mut self, request: &[u8]) -> serde_json::Value {
+        let stdin = self.child.stdin.as_mut().expect("stdin handle");
+        stdin.write_all(request).expect("write protocol bytes");
+        stdin.write_all(b"\n").expect("write protocol delimiter");
+        stdin.flush().expect("flush stdin");
+        self.read_json_line()
+    }
+
     /// Send a raw line and collect response lines until `predicate` returns true.
     pub fn send_until<F>(&mut self, request: &str, mut predicate: F) -> Vec<serde_json::Value>
     where

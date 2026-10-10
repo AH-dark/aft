@@ -55,14 +55,12 @@ pub struct BashCompletedFrame {
     /// Empty string when no output was captured. Used by plugins to inline
     /// short results in the system-reminder so agents don't need a follow-up
     /// `bash_status` round-trip for typical short commands.
-    #[serde(default)]
     pub output_preview: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bash_output_list_envelope: Option<ListEnvelope>,
     /// True when the task produced more output than `output_preview` shows
     /// (rotated buffer, file > 300 bytes, etc). Plugins use this to render a
     /// `…` prefix and signal that `bash_status` would return more.
-    #[serde(default)]
     pub output_truncated: bool,
     /// Token count of raw stdout+stderr before compression. Omitted when the
     /// payload exceeded the 128 KiB per-stream tokenization cap.
@@ -73,17 +71,16 @@ pub struct BashCompletedFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compressed_tokens: Option<u32>,
     /// True when output exceeded the tokenization cap and was not measured.
-    #[serde(default)]
     pub tokens_skipped: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
     /// True when capture was incomplete; status still reflects the child exit.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "is_false")]
     pub output_incomplete: bool,
     pub live_descendants: Option<Vec<LiveDescendant>>,
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    #[serde(skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub live_descendants_summary: Option<String>,
 }
 
@@ -133,7 +130,6 @@ pub struct ConfigureWarningsFrame {
     /// Session id from the configure request that spawned the deferred walk.
     /// Project-shared bridges can serve multiple sessions, so plugins need this
     /// to route async warning notifications back to the initiating session.
-    #[serde(default)]
     pub session_id: Option<String>,
     /// Project root the warnings refer to. Plugins use this to scope the
     /// session-id deduplication of repeated identical warnings.
@@ -146,7 +142,6 @@ pub struct ConfigureWarningsFrame {
 pub struct StatusChangedFrame {
     #[serde(rename = "type")]
     pub frame_type: &'static str,
-    #[serde(default)]
     pub session_id: Option<String>,
     pub snapshot: StatusPayload,
 }
@@ -428,6 +423,8 @@ impl BashPatternMatchFrame {
         match_text: impl Into<String>,
         context: impl Into<String>,
     ) -> Self {
+        // Erasure ends the watch just like task exit. Keep the existing terminal
+        // reason because clients only accept pattern_match and task_exit.
         Self {
             frame_type: "bash_pattern_match",
             task_id: task_id.into(),
@@ -608,10 +605,8 @@ impl Response {
             "code": code,
             "message": message.into(),
         });
-        if let (Some(base), Some(ext)) = (data.as_object_mut(), extra.as_object()) {
-            for (k, v) in ext {
-                base.insert(k.clone(), v.clone());
-            }
+        if let (Some(base), serde_json::Value::Object(ext)) = (data.as_object_mut(), extra) {
+            base.extend(ext);
         }
         Response {
             id: id.into(),
@@ -619,4 +614,18 @@ impl Response {
             data,
         }
     }
+}
+#[test]
+fn error_response_preserves_owned_extra_fields() {
+    let response = Response::error_with_data(
+        "extra",
+        "failure",
+        "message",
+        serde_json::json!({"nested":{"values":[1,2]}, "detail":"owned"}),
+    );
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["nested"]["values"], serde_json::json!([1, 2]));
+    assert_eq!(value["detail"], "owned");
+    assert_eq!(value["code"], "failure");
+    assert_eq!(value["message"], "message");
 }

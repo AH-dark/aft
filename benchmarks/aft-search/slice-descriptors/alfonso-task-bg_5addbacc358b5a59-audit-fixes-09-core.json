@@ -1,0 +1,7 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["crates/aft/tests/integration/tool_call_parity_test.rs"],
+  "note": "The ranking-fenced lib.rs change corrects comments only. Core protocol, configuration publication and executor bookkeeping repairs do not change search ranking or routing. All benchmark rows must remain byte-identical to the reference."
+}

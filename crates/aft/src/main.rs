@@ -441,7 +441,7 @@ fn main() {
     // edit of the same file cannot start until the first one has finished.
     let mut validation_gate: Option<String> = None;
     let mut held_lines: VecDeque<io::Result<String>> = VecDeque::new();
-    const VALIDATION_GATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const VALIDATION_GATE_POLL_INTERVAL: Duration = DRAIN_INTERVAL;
     thread::spawn(move || {
         let stdin = io::stdin();
         let reader = stdin.lock();
@@ -506,7 +506,7 @@ fn main() {
                 LoopInput::Disconnected if gated => {
                     // Stdin closed with requests still held behind the edit:
                     // finish the edit and replay them before shutting down.
-                    thread::sleep(VALIDATION_GATE_POLL_INTERVAL);
+                    let _ = deferred_wake_rx.recv_timeout(VALIDATION_GATE_POLL_INTERVAL);
                     if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
                         aft::slog_error!("stdout write error: {}", e);
                         break;
@@ -550,6 +550,13 @@ fn main() {
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
+                if let Some(response) = recoverable_stdin_error(&e) {
+                    if let Err(error) = write_response(registry.current(), &response) {
+                        aft::slog_error!("stdout write error: {}", error);
+                        break;
+                    }
+                    continue;
+                }
                 aft::slog_error!("stdin read error: {}", e);
                 break;
             }
@@ -620,7 +627,7 @@ fn main() {
                         if gates_on_validation {
                             validation_gate = Some(request_id.clone());
                         }
-                        pending.register(pending_response);
+                        pending.register(pending_response.with_admitted_config(runtime.config()));
                         None
                     }
                     Err(payload) => {
@@ -646,7 +653,7 @@ fn main() {
                     aft::log_redact::unlogged_input_summary(trimmed)
                 );
                 Some(Response::error(
-                    "_parse_error",
+                    parse_error_request_id(trimmed),
                     "parse_error",
                     format!("failed to parse request: {}", e),
                 ))
@@ -700,7 +707,7 @@ fn main() {
         "shutdown phase=begin graceful_stdin={}",
         graceful_stdin_shutdown
     );
-    for mut resolved in pending.drain_on_shutdown_with(registry.current()) {
+    pending.drain_on_shutdown_delivering(registry.current(), |mut resolved| {
         aft::response_finalize::finalize_response(
             &mut resolved.response,
             registry.current(),
@@ -710,7 +717,7 @@ fn main() {
         if let Err(error) = write_response(registry.current(), &resolved.response) {
             aft::slog_error!("stdout write error while emitting shutdown terminal: {error}");
         }
-    }
+    });
     aft::slog_info!("shutdown phase=pending_responses_drained");
     // Everything from here to exit fits in the exit budget measured from this
     // point: the index flushes end by `flush_deadline`, then LSP shutdown
@@ -720,36 +727,7 @@ fn main() {
         // Only the natural stdin-EOF path flushes owner-side index deltas and
         // queued callgraph refreshes. Signal, stdout-error, and panic teardown
         // skip disk work so abrupt exits stay fast and avoid lock contention.
-        let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
-        let runtime = Arc::clone(registry.current());
-        aft::slog_info!("shutdown phase=search_index_flush_start");
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(runtime.flush_search_index_on_graceful_shutdown());
-        });
-        let search_wait = aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT
-            .min(flush_deadline.saturating_duration_since(Instant::now()));
-        let flushed = rx.recv_timeout(search_wait);
-        aft::slog_info!(
-            "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
-            flushed.is_ok(),
-            flushed.unwrap_or(false),
-            shutdown_started.elapsed().as_millis()
-        );
-        aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
-        let outcome = aft::callgraph_store::flush_callgraph_store_refreshes_before(flush_deadline);
-        aft::slog_info!(
-            "shutdown phase=callgraph_refresh_flush_done outcome={} drained={} elapsed_ms={}",
-            outcome.as_str(),
-            outcome == aft::callgraph_store::ExitCallgraphFlush::Drained,
-            shutdown_started.elapsed().as_millis()
-        );
-        if outcome == aft::callgraph_store::ExitCallgraphFlush::Abandoned {
-            aft::slog_warn!(
-                "shutdown: abandoned an unfinished call-graph refresh to exit within {}ms of drain; the next start refreshes the call graph",
-                aft::callgraph_store::EXIT_BUDGET_AFTER_DRAIN.as_millis()
-            );
-        }
+        flush_indexes_on_graceful_shutdown(&registry, shutdown_started, drained_at);
     }
     aft::slog_info!("shutdown phase=runtime_cleanup_start");
     let mut clients = Vec::new();
@@ -912,37 +890,47 @@ fn callgraph_refresh_worker_test_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-#[cfg(test)]
-fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
-    for (runtime_index, runtime) in registry.iter().enumerate() {
-        let started = Instant::now();
-        aft::slog_info!(
-            "shutdown phase=search_index_flush_start runtime={}",
-            runtime_index
-        );
-        let flushed = runtime.flush_search_index_on_graceful_shutdown();
-        aft::slog_info!(
-            "shutdown phase=search_index_flush_done runtime={} flushed={} elapsed_ms={}",
-            runtime_index,
-            flushed,
-            started.elapsed().as_millis()
-        );
-    }
-    // Tests run in parallel, but callgraph refreshes use one process-wide
-    // worker. Without this lock, one test's graceful shutdown can reject
-    // another test's pending refresh.
+/// Deadline-bounded EOF index flush, shared by the transport and its regression tests.
+fn flush_indexes_on_graceful_shutdown(
+    registry: &RuntimeRegistry,
+    shutdown_started: Instant,
+    drained_at: Instant,
+) {
+    // Tests share the callgraph refresh worker, so one test must not drain another's job.
     #[cfg(test)]
     let _callgraph_refresh_worker_guard = callgraph_refresh_worker_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let started = Instant::now();
-    aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
-    let drained = aft::callgraph_store::flush_callgraph_store_refreshes_on_graceful_shutdown();
+    let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
+    let runtime = Arc::clone(registry.current());
+    aft::slog_info!("shutdown phase=search_index_flush_start");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(runtime.flush_search_index_on_graceful_shutdown());
+    });
+    let search_wait = aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT
+        .min(flush_deadline.saturating_duration_since(Instant::now()));
+    let flushed = rx.recv_timeout(search_wait);
     aft::slog_info!(
-        "shutdown phase=callgraph_refresh_flush_done drained={} elapsed_ms={}",
-        drained,
-        started.elapsed().as_millis()
+        "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
+        flushed.is_ok(),
+        flushed.unwrap_or(false),
+        shutdown_started.elapsed().as_millis()
     );
+    aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
+    let outcome = aft::callgraph_store::flush_callgraph_store_refreshes_before(flush_deadline);
+    aft::slog_info!(
+        "shutdown phase=callgraph_refresh_flush_done outcome={} drained={} elapsed_ms={}",
+        outcome.as_str(),
+        outcome == aft::callgraph_store::ExitCallgraphFlush::Drained,
+        shutdown_started.elapsed().as_millis()
+    );
+    if outcome == aft::callgraph_store::ExitCallgraphFlush::Abandoned {
+        aft::slog_warn!(
+            "shutdown: abandoned an unfinished call-graph refresh to exit within {}ms of drain; the next start refreshes the call graph",
+            aft::callgraph_store::EXIT_BUDGET_AFTER_DRAIN.as_millis()
+        );
+    }
 }
 
 fn drain_runtime_events_and_write_pending_cooperatively(
@@ -991,18 +979,15 @@ fn finalize_ready_pending(
     pending: &mut PendingResponses,
     mut write: impl FnMut(&Response) -> io::Result<()>,
 ) -> io::Result<usize> {
-    let ready = pending.poll_ready(ctx);
-    let count = ready.len();
-    for mut resolved in ready {
+    pending.poll_ready_with(ctx, |mut resolved| {
         aft::response_finalize::finalize_response(
             &mut resolved.response,
             ctx,
             &resolved.session_id,
             &resolved.attach_command,
         );
-        write(&resolved.response)?;
-    }
-    Ok(count)
+        write(&resolved.response)
+    })
 }
 
 fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
@@ -1511,9 +1496,15 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
     thread::spawn(move || {
         let _cancellation = aft::executor::install_job_cancellation(worker_cancellation);
         let _config_pin = ctx.pin_config_to(admitted_config);
-        let response = log_ctx::with_session(worker_session_id, || dispatch(req, &ctx));
-        let _ = tx.send(response);
-        wake_standalone_loop_for_deferred_response();
+        let command = req.command.clone();
+        let id = req.id.clone();
+        complete_deferred_dispatch(
+            &id,
+            &command,
+            tx,
+            || log_ctx::with_session(worker_session_id, || dispatch(req, &ctx)),
+            wake_standalone_loop_for_deferred_response,
+        );
     });
 
     DispatchOutcome::Deferred(
@@ -1536,6 +1527,31 @@ fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOu
             cancelled_deferred_response(&shutdown_request_id, &shutdown_command)
         })),
     )
+}
+
+fn complete_deferred_dispatch(
+    id: &str,
+    command: &str,
+    tx: mpsc::SyncSender<Response>,
+    work: impl FnOnce() -> Response,
+    wake: impl FnOnce(),
+) {
+    let _wake = CompletionWake(Some(wake));
+    // Disconnect before waking if anything after dispatch unexpectedly unwinds.
+    let tx = tx;
+    let response = catch_unwind(AssertUnwindSafe(work))
+        .unwrap_or_else(|payload| dispatch_panic_response(id, command, payload.as_ref()));
+    let _ = tx.send(response);
+}
+
+struct CompletionWake<W: FnOnce()>(Option<W>);
+
+impl<W: FnOnce()> Drop for CompletionWake<W> {
+    fn drop(&mut self) {
+        if let Some(wake) = self.0.take() {
+            wake();
+        }
+    }
 }
 
 fn cancel_request_target(req: &RawRequest) -> Option<&str> {
@@ -1703,6 +1719,8 @@ fn dispatch_with_offloaded_validation(req: RawRequest, ctx: Arc<AppContext>) -> 
     let started_tx = tx.clone();
     let admitted_config = ctx.config();
     thread::spawn(move || {
+        let _wake = CompletionWake(Some(wake_standalone_loop_for_deferred_response));
+        let tx = tx;
         let _config_pin = ctx.pin_config_to(admitted_config);
         let result = catch_unwind(AssertUnwindSafe(|| {
             aft::edit::with_full_validation_start_hook(
@@ -1810,7 +1828,7 @@ fn offloaded_validation_pending(
 }
 
 fn handle_echo(req: &RawRequest) -> Response {
-    match serde_json::from_value::<EchoParams>(req.params.clone()) {
+    match <EchoParams as serde::Deserialize>::deserialize(&req.params) {
         Ok(params) => Response::success(&req.id, serde_json::json!({ "message": params.message })),
         Err(e) => Response::error(
             &req.id,
@@ -1820,10 +1838,7 @@ fn handle_echo(req: &RawRequest) -> Response {
     }
 }
 
-/// Test-only command: snapshot a file into the backup store.
-///
-/// Params: `file` (string, required) — path to snapshot.
-/// Returns: `{ backup_id }`.
+/// Optional readiness wait used by semantic-search test runs.
 fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> Option<Response> {
     if std::env::var_os("AFT_WAIT_FOR_SEMANTIC_READY").is_none() || !ctx.config().indexes.semantic {
         return None;
@@ -1878,6 +1893,10 @@ fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> 
     }
 }
 
+/// Test-only command: snapshot a file into the backup store.
+///
+/// Params: `file` (string, required) — path to snapshot.
+/// Returns: `{ backup_id }`.
 fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
@@ -1912,10 +1931,164 @@ fn write_response(ctx: &AppContext, response: &Response) -> io::Result<()> {
 }
 
 fn write_response_to_writer(writer: &mut impl Write, response: &Response) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, response)?;
+    // A serialization failure must not leave a prefix before the next NDJSON frame.
+    let bytes = serde_json::to_vec(response)?;
+    writer.write_all(&bytes)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn parse_error_request_id(line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "_parse_error".to_string())
+}
+
+fn recoverable_stdin_error(error: &io::Error) -> Option<Response> {
+    // BufRead::lines consumes the entire invalid line, so the next read is framed.
+    (error.kind() == io::ErrorKind::InvalidData)
+        .then(|| Response::error("_parse_error", "parse_error", "request is not valid UTF-8"))
+}
+
+#[cfg(test)]
+mod core_framing_tests {
+    use super::*;
+
+    #[test]
+    fn offloaded_worker_wakes_loop_after_finishing() {
+        let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
+        DEFERRED_RESPONSE_WAKER
+            .set(wake_tx)
+            .expect("only this test installs the standalone waker");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(aft::parser::TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        ));
+        let req: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"wake", "command":"echo", "message":"finished"}),
+        )
+        .unwrap();
+        let result = dispatch_with_offloaded_validation(req, ctx);
+        let DispatchOutcome::Immediate(response) = result else {
+            panic!("echo completes before validation")
+        };
+        assert_eq!(response.data["message"], "finished");
+        wake_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker completion must wake the loop");
+    }
+
+    #[test]
+    fn pending_finalization_retains_admission_config() {
+        let ctx = AppContext::new(
+            Box::new(aft::parser::TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        );
+        let mut pending = PendingResponses::default();
+        pending.register(
+            PendingResponse::polling(
+                "pinned".into(),
+                "s".into(),
+                "ping".into(),
+                Box::new(|_| Some(Response::success("pinned", serde_json::json!({})))),
+            )
+            .with_admitted_config(ctx.config()),
+        );
+        ctx.update_config(|config| config.restrict_to_project_root = true);
+        finalize_ready_pending(&ctx, &mut pending, |_| {
+            assert!(
+                !ctx.config().restrict_to_project_root,
+                "finalization must use admission config"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(ctx.config().restrict_to_project_root);
+    }
+
+    #[test]
+    fn deferred_panic_delivers_detail_and_wakes() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let woke = std::cell::Cell::new(false);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            complete_deferred_dispatch(
+                "panic-id",
+                "search",
+                tx,
+                || panic!("worker detail"),
+                || woke.set(true),
+            )
+        }));
+        assert!(woke.get(), "panic completion must wake the loop");
+        let response = rx
+            .try_recv()
+            .expect("panic must produce a correlated response");
+        assert_eq!(response.id, "panic-id");
+        assert_eq!(response.data["code"], "internal_error");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("worker detail"));
+    }
+
+    #[test]
+    fn serialization_failure_leaves_writer_untouched() {
+        let mut writer = b"previous\n".to_vec();
+        let response = Response::success("bad", serde_json::json!([1, 2]));
+        assert!(write_response_to_writer(&mut writer, &response).is_err());
+        assert_eq!(writer, b"previous\n");
+        write_response_to_writer(
+            &mut writer,
+            &Response::success("good", serde_json::json!({})),
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&writer).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn malformed_request_preserves_only_string_id() {
+        assert_eq!(parse_error_request_id(r#"{"id":"mine"}"#), "mine");
+        assert_eq!(parse_error_request_id(r#"{"id":4}"#), "_parse_error");
+        assert_eq!(parse_error_request_id(r#"{"id":"mine""#), "_parse_error");
+    }
+
+    #[test]
+    fn invalid_utf8_line_recovers_before_next_request() {
+        let mut lines = io::Cursor::new(b"\xff\n{\"id\":\"ok\",\"command\":\"ping\"}\n").lines();
+        let error = lines.next().unwrap().unwrap_err();
+        let response =
+            recoverable_stdin_error(&error).expect("invalid UTF-8 must not terminate the loop");
+        assert!(!response.success);
+        let next: RawRequest = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(next.id, "ok");
+        assert!(recoverable_stdin_error(&io::Error::from(io::ErrorKind::BrokenPipe)).is_none());
+    }
+
+    #[test]
+    fn flattened_values_reproduction() {
+        assert!(serde_json::to_vec(&Response::success("null", serde_json::Value::Null)).is_ok());
+        assert!(serde_json::to_vec(&Response::success("array", serde_json::json!([]))).is_err());
+        assert!(
+            serde_json::to_vec(&Response::success("string", serde_json::json!("text"))).is_err()
+        );
+        let encoded = serde_json::to_string(&Response::success(
+            "outer",
+            serde_json::json!({"id":"inner","success":false}),
+        ))
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(parsed["id"], "inner");
+        assert_eq!(parsed["success"], false);
+        let req: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"echo", "command":"echo", "message": {"id":"inner"}}),
+        )
+        .unwrap();
+        let response = handle_echo(&req);
+        assert!(!response.success);
+        assert!(serde_json::to_vec(&response).is_ok());
+    }
 }
 
 fn write_push_frame(writer: &mut impl Write, frame: &PushFrame) -> io::Result<()> {
@@ -3289,7 +3462,7 @@ mod graceful_shutdown_search_index_tests {
                 .update_file(&file);
         }
 
-        flush_indexes_on_graceful_shutdown(&registry);
+        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
 
         let mut restored =
             aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
@@ -3348,7 +3521,7 @@ mod graceful_shutdown_search_index_tests {
                 .send(())
                 .expect("release search rebuild publish gate");
         });
-        flush_indexes_on_graceful_shutdown(&registry);
+        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
         release.join().expect("publish gate release thread");
 
         let mut restored =
@@ -3420,7 +3593,7 @@ mod graceful_shutdown_search_index_tests {
 
         ctx.set_cache_role(true, None);
         wait_for_next_directory_write_mtime(&cache_dir, before);
-        flush_indexes_on_graceful_shutdown(&registry);
+        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
 
         let after = std::fs::metadata(&cache_path)
             .expect("cache metadata after shutdown")
@@ -3449,7 +3622,7 @@ mod graceful_shutdown_search_index_tests {
             .expect("cache mtime before shutdown");
 
         wait_for_next_directory_write_mtime(&cache_dir, before);
-        flush_indexes_on_graceful_shutdown(&registry);
+        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
 
         let after = std::fs::metadata(&cache_path)
             .expect("cache metadata after shutdown")

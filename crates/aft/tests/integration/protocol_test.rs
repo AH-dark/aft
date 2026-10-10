@@ -10,6 +10,45 @@
 use super::helpers::AftProcess;
 
 #[test]
+fn invalid_utf8_is_a_recoverable_protocol_line() {
+    let mut aft = AftProcess::spawn();
+    let response = aft.send_bytes(b"\xff");
+    assert_eq!(response["code"], "parse_error");
+    let next = aft.send(r#"{"id":"after-utf8","command":"ping"}"#);
+    assert_eq!(next["id"], "after-utf8");
+    assert_eq!(next["success"], true);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn shape_errors_preserve_supported_request_ids() {
+    let mut aft = AftProcess::spawn();
+    let response = aft.send(r#"{"id":"missing-command"}"#);
+    assert_eq!(response["id"], "missing-command");
+    assert_eq!(response["code"], "parse_error");
+    let unsupported = aft.send(r#"{"id":12}"#);
+    assert_eq!(unsupported["id"], "_parse_error");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn echo_inputs_cannot_inject_flattened_envelope_data() {
+    let mut aft = AftProcess::spawn();
+    for message in [
+        serde_json::Value::Null,
+        serde_json::json!([]),
+        serde_json::json!("text"),
+        serde_json::json!({"id":"inner", "success":false}),
+    ] {
+        let input = serde_json::json!({"id":"outer", "command":"echo", "message":message});
+        let response = aft.send(&input.to_string());
+        assert_eq!(response["id"], "outer");
+        assert_eq!(response["success"], message.is_string());
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn test_sequential_commands() {
     let mut aft = AftProcess::spawn();
     let total_commands = 120;

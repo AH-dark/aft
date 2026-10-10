@@ -123,14 +123,15 @@ pub fn finalize_response_with_bg_completions(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
-    acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
-    attach_checkout_query_gaps(response, ctx);
-    if allow_bg_completions {
-        attach_bg_completions(response, ctx, session_id, attach_command);
-    }
-    let publish = publish_fleet_status(response, ctx, session_id);
+    let (publish, counts) = finalize_prefix(
+        response,
+        ctx,
+        session_id,
+        attach_command,
+        allow_bg_completions,
+    );
     if response.data.get("text").is_some_and(Value::is_string) {
-        if let Some(line) = status_bar_line(ctx, publish, attach_command) {
+        if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
             if let Some(Value::String(text)) = response.data.get_mut("text") {
                 append_trailing_line(text, &line);
             }
@@ -150,13 +151,14 @@ pub fn finalize_tool_response(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
-    acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
-    attach_checkout_query_gaps(response, ctx);
-    if allow_bg_completions {
-        attach_bg_completions(response, ctx, session_id, attach_command);
-    }
-    let publish = publish_fleet_status(response, ctx, session_id);
-    if let Some(line) = status_bar_line(ctx, publish, attach_command) {
+    let (publish, counts) = finalize_prefix(
+        response,
+        ctx,
+        session_id,
+        attach_command,
+        allow_bg_completions,
+    );
+    if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
     }
     enforce_reply_ceiling(attach_command, text);
@@ -218,12 +220,13 @@ pub fn finalize_response_for_dispatch_root(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
-    acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
-    attach_checkout_query_gaps(response, ctx);
-    if allow_bg_completions {
-        attach_bg_completions(response, ctx, session_id, attach_command);
-    }
-    let _ = publish_fleet_status(response, ctx, session_id);
+    let _ = finalize_prefix(
+        response,
+        ctx,
+        session_id,
+        attach_command,
+        allow_bg_completions,
+    );
     attach_alert_block(response, alerts, session_id, dispatch_root, attach_command);
     enforce_response_ceiling(attach_command, response);
 }
@@ -400,6 +403,7 @@ pub struct PendingResponse {
     /// only agent-visible terminal frame.
     pub on_shutdown: Option<PendingResponseShutdown>,
     poll_interval: Option<std::time::Duration>,
+    admitted_config: Option<std::sync::Arc<crate::config::Config>>,
 }
 
 impl PendingResponse {
@@ -419,6 +423,7 @@ impl PendingResponse {
             cancellation: None,
             on_shutdown: None,
             poll_interval: Some(std::time::Duration::from_millis(100)),
+            admitted_config: None,
         }
     }
 
@@ -446,11 +451,18 @@ impl PendingResponse {
             cancellation: None,
             on_shutdown: None,
             poll_interval,
+            admitted_config: None,
         }
     }
 
     pub fn with_cancellation(mut self, cancellation: crate::executor::JobCancellation) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Retain the admission snapshot for response polling and finalization.
+    pub fn with_admitted_config(mut self, config: std::sync::Arc<crate::config::Config>) -> Self {
+        self.admitted_config = Some(config);
         self
     }
 
@@ -536,6 +548,36 @@ impl PendingResponses {
         ready
     }
 
+    /// Resolve each ready response within its admission pin. Unvisited entries
+    /// stay registered if delivery fails, rather than being lost with a batch.
+    pub fn poll_ready_with<E>(
+        &mut self,
+        ctx: &AppContext,
+        mut deliver: impl FnMut(ResolvedPending) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        let mut delivered = 0;
+        let mut index = 0;
+        while index < self.entries.len() {
+            let entry = &mut self.entries[index];
+            let _pin = entry
+                .admitted_config
+                .as_ref()
+                .map(|config| ctx.pin_config_to(std::sync::Arc::clone(config)));
+            if let Some(response) = (entry.poll)(ctx) {
+                let pending = self.entries.remove(index);
+                deliver(ResolvedPending {
+                    response,
+                    session_id: pending.session_id,
+                    attach_command: pending.attach_command,
+                })?;
+                delivered += 1;
+            } else {
+                index += 1;
+            }
+        }
+        Ok(delivered)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -559,20 +601,34 @@ impl PendingResponses {
     /// Resolve shutdown-aware entries before removing them from the registry.
     /// Entries without a shutdown terminal retain the legacy drop behavior.
     pub fn drain_on_shutdown_with(&mut self, ctx: &AppContext) -> Vec<ResolvedPending> {
-        self.entries
-            .drain(..)
-            .filter_map(|mut pending| {
-                if let Some(cancellation) = &pending.cancellation {
-                    cancellation.request_cancel();
-                }
-                let response = (pending.on_shutdown.as_mut()?)(ctx);
-                Some(ResolvedPending {
+        let mut resolved = Vec::new();
+        self.drain_on_shutdown_delivering(ctx, |response| resolved.push(response));
+        resolved
+    }
+
+    /// Deliver shutdown terminals while the request's admission snapshot is pinned.
+    pub fn drain_on_shutdown_delivering(
+        &mut self,
+        ctx: &AppContext,
+        mut deliver: impl FnMut(ResolvedPending),
+    ) {
+        for mut pending in self.entries.drain(..) {
+            let _pin = pending
+                .admitted_config
+                .as_ref()
+                .map(|config| ctx.pin_config_to(std::sync::Arc::clone(config)));
+            if let Some(cancellation) = &pending.cancellation {
+                cancellation.request_cancel();
+            }
+            if let Some(shutdown) = pending.on_shutdown.as_mut() {
+                let response = shutdown(ctx);
+                deliver(ResolvedPending {
                     response,
                     session_id: pending.session_id,
                     attach_command: pending.attach_command,
-                })
-            })
-            .collect()
+                });
+            }
+        }
     }
 }
 
@@ -687,6 +743,7 @@ fn publish_fleet_status(
     response: &mut Response,
     ctx: &AppContext,
     session_id: &str,
+    counts: &mut Option<crate::context::StatusBarCountValues>,
 ) -> FleetStatusPublish {
     // Cross-root indexed searches suppress status. Remove the private marker so it cannot
     // appear in a response envelope.
@@ -725,6 +782,7 @@ fn publish_fleet_status(
         .map(aft_status_segment)
         .unwrap_or_default();
     client.publish(project_root, &harness_label, session_id, &aft_text);
+    *counts = Some(values);
     FleetStatusPublish::Offered {
         reader_renders: fleet_reader_renders_bar(
             harness.as_ref(),
@@ -741,6 +799,8 @@ fn status_bar_line(
     ctx: &AppContext,
     publish: FleetStatusPublish,
     attach_command: &str,
+    session_id: &str,
+    counts: Option<crate::context::StatusBarCountValues>,
 ) -> Option<String> {
     if alert_render::is_excluded_finalization_command(attach_command) {
         return None;
@@ -754,7 +814,7 @@ fn status_bar_line(
             reader_renders: false,
         } => {}
     }
-    let values = ctx.try_status_bar_count_values()?;
+    let values = counts.or_else(|| ctx.try_status_bar_count_values())?;
     let nothing_known = [
         values.errors,
         values.warnings,
@@ -765,10 +825,32 @@ fn status_bar_line(
     ]
     .iter()
     .all(Option::is_none);
-    if nothing_known || !ctx.should_emit_status_bar(&values) {
+    if nothing_known || !ctx.should_emit_status_bar_for_session(session_id, &values) {
         return None;
     }
     Some(agent_status_bar(&values))
+}
+
+fn finalize_prefix(
+    response: &mut Response,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+    allow_bg_completions: bool,
+) -> (
+    FleetStatusPublish,
+    Option<crate::context::StatusBarCountValues>,
+) {
+    acknowledge_terminal_bash_reply(response, ctx, session_id, attach_command);
+    // Dispatch attaches these before tool text is rendered. Direct protocol
+    // callers also need them; attachment is idempotent for the pinned outcome.
+    attach_checkout_query_gaps(response, ctx);
+    if allow_bg_completions {
+        attach_bg_completions(response, ctx, session_id, attach_command);
+    }
+    let mut counts = None;
+    let publish = publish_fleet_status(response, ctx, session_id, &mut counts);
+    (publish, counts)
 }
 
 #[cfg(test)]
@@ -914,6 +996,42 @@ mod tests {
         assert_eq!(
             standalone.data["text"],
             "listing\n\n[AFT E? W? | D9 U2 C3 | T4]"
+        );
+    }
+
+    #[test]
+    fn status_bar_deduplicates_per_session() {
+        let ctx = standalone_ctx();
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        for session in ["first", "second"] {
+            let mut response = Response::success("bar", serde_json::json!({}));
+            let mut text = "contents".to_string();
+            finalize_tool_response(&mut response, &mut text, &ctx, session, "read", false);
+            assert!(text.contains("[AFT"), "first bar for {session}");
+            let mut repeat = "contents".to_string();
+            finalize_tool_response(&mut response, &mut repeat, &ctx, session, "read", false);
+            assert_eq!(repeat, "contents");
+        }
+    }
+
+    #[test]
+    fn fleet_and_agent_bar_share_one_count_sample() {
+        let ctx = standalone_ctx();
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        ctx.install_fleet_status_client(Some(client));
+        crate::context::STATUS_COUNT_PROBES.with(|count| count.set(0));
+        let mut response = Response::success("counts", serde_json::json!({}));
+        let mut text = "contents".to_string();
+        finalize_tool_response(&mut response, &mut text, &ctx, "counts", "read", false);
+        assert!(text.contains("[AFT"));
+        wire_rx
+            .try_recv()
+            .expect("fleet publication")
+            .complete_unavailable();
+        assert_eq!(
+            crate::context::STATUS_COUNT_PROBES.with(|count| count.get()),
+            1
         );
     }
 
