@@ -100,7 +100,17 @@ where
         command_line.push('%');
         command_line.push_str(&name);
         command_line.push_str("%\"");
-        argument_env.push((name, arg.to_owned()));
+        // The value is expanded just before a closing quote. A program that
+        // parses its command line with the C runtime rules reads 2n
+        // backslashes before a quote as n literal backslashes and then the
+        // quote; an odd run would escape the quote and merge this argument
+        // with the next one. Double only the trailing run: arguments contain
+        // no other quotes, so interior backslashes are already literal.
+        let trailing = arg.len() - arg.trim_end_matches('\\').len();
+        let mut value = String::with_capacity(arg.len() + trailing);
+        value.push_str(arg);
+        value.extend(std::iter::repeat_n('\\', trailing));
+        argument_env.push((name, value));
     }
     command_line.push('"');
 
@@ -123,6 +133,49 @@ where
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_shim_forwards_trailing_backslash_arguments_to_crt_programs() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("argv.rs");
+        let recorder = temp.path().join("argv.exe");
+        // Rust's Windows argument parser follows the Microsoft C runtime
+        // rules, so this program sees exactly what a CRT-built tool would.
+        std::fs::write(
+            &source,
+            "fn main() { for arg in std::env::args().skip(1) { println!(\"{arg}\"); } }\n",
+        )
+        .unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compile = std::process::Command::new(rustc)
+            .arg(&source)
+            .arg("-o")
+            .arg(&recorder)
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&compile.stdout),
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let shim = temp.path().join("forward.cmd");
+        std::fs::write(
+            &shim,
+            format!("@echo off\r\n\"{}\" %*\r\n", recorder.display()),
+        )
+        .unwrap();
+        let output = batch_command(&shim, ["C:\\space dir\\", "next", "two\\\\"])
+            .unwrap()
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n"),
+            "C:\\space dir\\\nnext\ntwo\\\\\n"
+        );
+    }
 
     #[test]
     fn cmd_compatible_path_only_converts_dos_and_unc_namespaces() {
