@@ -191,8 +191,13 @@ enum MoveOutcome {
 }
 
 fn move_file_on_disk(src_path: &Path, dst_path: &Path) -> MoveOutcome {
-    match fs::rename(src_path, dst_path) {
-        Ok(()) => MoveOutcome::Moved,
+    match rename_noreplace(src_path, dst_path) {
+        Ok(()) => {
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+            return remove_source_after_fallback(src_path);
+            #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+            MoveOutcome::Moved
+        }
         Err(rename_error) => {
             let source_is_symlink = fs::symlink_metadata(src_path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink());
@@ -200,11 +205,109 @@ fn move_file_on_disk(src_path: &Path, dst_path: &Path) -> MoveOutcome {
                 return move_symlink_after_rename_failure(src_path, dst_path, &rename_error);
             }
 
-            match fs::copy(src_path, dst_path) {
-                Ok(_) => remove_source_after_fallback(src_path),
-                Err(_) => MoveOutcome::Failed(rename_error.to_string()),
-            }
+            copy_regular_file_noreplace(src_path, dst_path)
         }
+    }
+}
+
+/// Install a completed copy without exposing partial bytes or replacing a
+/// destination created after preflight. The staging directory is private to
+/// this move and lives on the destination filesystem.
+fn copy_regular_file_noreplace(source: &Path, destination: &Path) -> MoveOutcome {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let staging = parent.join(format!(".aft-move-{}", crate::backup::new_op_id()));
+    let directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let directory = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut directory = directory;
+        directory.mode(0o700);
+        directory
+    };
+    if let Err(error) = directory.create(&staging) {
+        return MoveOutcome::Failed(error.to_string());
+    }
+    let staged_file = staging.join("file");
+    let installed =
+        fs::copy(source, &staged_file).and_then(|_| rename_noreplace(&staged_file, destination));
+    let _ = fs::remove_file(&staged_file);
+    let _ = fs::remove_dir(&staging);
+    match installed {
+        Ok(()) => remove_source_after_fallback(source),
+        Err(error) => MoveOutcome::Failed(error.to_string()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    };
+    let source = path(source)?;
+    let destination = path(destination)?;
+    // Both NUL-terminated path buffers remain live through the native call.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let path = |path: &Path| -> std::io::Result<Vec<u16>> {
+        let mut units: Vec<_> = path.as_os_str().encode_wide().collect();
+        if units.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        units.push(0);
+        Ok(units)
+    };
+    let source = path(source)?;
+    let destination = path(destination)?;
+    // A zero flag set forbids replacement and cross-volume copying; copies
+    // use the same staged, no-replace installation as the Unix paths.
+    let result = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            0,
+        )
+    };
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Without a native exclusive rename, install first and let the caller
+    // report source-deletion failure separately from installation failure.
+    if fs::symlink_metadata(source)?.file_type().is_symlink() {
+        create_symlink(&fs::read_link(source)?, source, destination)
+    } else {
+        fs::hard_link(source, destination)
     }
 }
 
@@ -222,22 +325,9 @@ fn move_symlink_after_rename_failure(
     // into a regular file. Recreate the link itself, preserving its target text:
     // a relative target stays relative and can legitimately dangle after a move.
     let create_result = create_symlink(&target, src_path, dst_path);
-    let create_result = if create_result
-        .as_ref()
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
-        && rename_error.kind() == std::io::ErrorKind::CrossesDevices
-    {
-        match fs::remove_file(dst_path) {
-            Ok(()) => create_symlink(&target, src_path, dst_path),
-            Err(error) => Err(error),
-        }
-    } else {
-        create_result
-    };
-
     match create_result {
         Ok(()) => remove_source_after_fallback(src_path),
-        Err(_) => MoveOutcome::Failed(rename_error.to_string()),
+        Err(error) => MoveOutcome::Failed(error.to_string()),
     }
 }
 
@@ -398,7 +488,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cross_device_symlink_fallback_replaces_existing_destination() {
+    fn cross_device_symlink_fallback_preserves_existing_destination() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("source-link");
         let destination = temp.path().join("destination-link");
@@ -412,20 +502,55 @@ mod tests {
             &Error::from(ErrorKind::CrossesDevices),
         );
 
-        assert_eq!(outcome, MoveOutcome::Moved);
-        assert!(std::fs::symlink_metadata(&destination)
-            .expect("destination metadata")
-            .file_type()
-            .is_symlink());
+        assert!(matches!(outcome, MoveOutcome::Failed(_)));
         assert_eq!(
-            std::fs::read_link(&destination).expect("link target"),
-            target
+            std::fs::read_to_string(&destination).unwrap(),
+            "stale destination\n"
         );
+        assert_eq!(std::fs::read_link(&source).unwrap(), target);
     }
 }
 
 #[cfg(test)]
 mod audit_regressions {
+    #[test]
+    fn copy_fallback_never_overwrites_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        std::fs::write(&source, "source").unwrap();
+        std::fs::write(&destination, "external").unwrap();
+        assert!(matches!(
+            super::copy_regular_file_noreplace(&source, &destination),
+            super::MoveOutcome::Failed(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "external");
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        std::fs::remove_file(&destination).unwrap();
+        assert_eq!(
+            super::copy_regular_file_noreplace(&source, &destination),
+            super::MoveOutcome::Moved
+        );
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "source");
+        assert!(!source.exists());
+    }
+    #[test]
+    fn move_install_never_overwrites_late_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        std::fs::write(&source, "source").unwrap();
+        // A creator can install the destination after the handler's preflight.
+        std::fs::write(&destination, "external").unwrap();
+        assert!(matches!(
+            super::move_file_on_disk(&source, &destination),
+            super::MoveOutcome::Failed(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "external");
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
+    }
+
     #[test]
     fn case_only_rename_preserves_contents() {
         let dir = tempfile::tempdir().unwrap();
