@@ -246,6 +246,64 @@ fn untrusted_binds_are_refused_even_with_a_live_ticket() {
     assert!(transport.calls().is_empty());
 }
 
+#[test]
+fn token_lookup_purges_expired_entries_without_evicting_live_tokens() {
+    let cache = TokenCache::default();
+    cache.store("agent", "expired", json!("expired"), NOW);
+    cache.store("agent", "live", json!("live"), NOW + 1_000);
+    assert_eq!(cache.fresh("agent", "live", NOW), Some(json!("live")));
+    let tokens = cache.lock();
+    assert!(!tokens.contains_key(&("agent".into(), "expired".into())));
+    assert_eq!(tokens.len(), 1);
+}
+
+#[test]
+fn relay_log_escapes_untrusted_fields_into_one_record() {
+    let transport = FakeTransport::default();
+    let cache = TokenCache::default();
+    let mut params = bot_params("", "nonce\nforged record");
+    params["request"]["action"] = json!("action\rforged");
+    params["request"]["repository"] = json!("owner/repo\u{001b}[31m");
+    let (_, lines) = run(&transport, &cache, BOT_REQUEST_OPERATION, params, NOW);
+    assert_eq!(lines.len(), 1);
+    assert!(!lines[0].chars().any(char::is_control), "{:?}", lines[0]);
+    assert!(transport.calls().is_empty());
+}
+
+#[tokio::test]
+async fn closing_one_route_blocks_its_key_but_not_other_route_keys() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let leases = Arc::new(RouteLeases::default());
+    leases.acquire("closing").await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let closing_leases = leases.clone();
+    let closing = tokio::spawn(async move {
+        closing_leases
+            .release_with("closing", |_| async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+            })
+            .await;
+    });
+    started_rx.await.unwrap();
+    let mut same_key = std::pin::pin!(leases.acquire("closing"));
+    let mut other_key = std::pin::pin!(leases.acquire("other"));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        same_key.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    assert!(
+        matches!(other_key.as_mut().poll(&mut context), Poll::Ready(())),
+        "closing a route must not hold the global lease mutex"
+    );
+    release_tx.send(()).unwrap();
+    closing.await.unwrap();
+    same_key.await;
+}
+
 /// A ticket issued to a background bash command spawned for an agent session
 /// relays as that session. The exact mint and plexus bodies are checked, and
 /// plexus's expected request and reply come from its own fixture file.
@@ -1090,6 +1148,26 @@ impl FakeDaemon {
         .expect("the fake daemon accepts the relay's connection");
         SubcRelayTransport::with_consumer(consumer, route_open_deadline)
     }
+}
+
+#[tokio::test]
+async fn stale_consumer_failure_does_not_clear_a_replacement_connection() {
+    let daemon = fake_daemon(DaemonScript::default()).await;
+    let transport = daemon.transport().await;
+    let failed = transport.consumer().await.unwrap();
+    let replacement_transport = daemon.transport().await;
+    let replacement = replacement_transport.consumer().await.unwrap();
+    assert!(!Arc::ptr_eq(&failed, &replacement));
+    *transport.consumer.lock().await = Some(Arc::clone(&replacement));
+    transport.clear_failed_consumer(&failed).await;
+    assert!(transport
+        .consumer
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &replacement)));
+    transport.clear_failed_consumer(&replacement).await;
+    assert!(transport.consumer.lock().await.is_none());
 }
 
 /// Serve one subc connection per accept on the current runtime, as `script`

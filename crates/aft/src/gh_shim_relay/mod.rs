@@ -211,7 +211,9 @@ impl TokenCache {
     }
 
     fn fresh(&self, agent: &str, session: &str, now: u64) -> Option<Value> {
-        self.lock()
+        let mut tokens = self.lock();
+        tokens.retain(|_, cached| cached.exp > now);
+        tokens
             .get(&(agent.to_string(), session.to_string()))
             .filter(|cached| now.saturating_add(TOKEN_REFRESH_MARGIN_SECS) < cached.exp)
             .map(|cached| cached.token.clone())
@@ -369,14 +371,14 @@ pub async fn relay<T: RelayTransport>(
 
     log(&format!(
         "gh_shim relay: op={} session={} task={} nonce={} action={} repository={} path={} outcome={}",
-        call.operation,
-        session,
-        task,
-        if nonce.is_empty() { "-" } else { nonce },
-        action,
-        repository,
+        call.operation.escape_debug(),
+        session.escape_debug(),
+        task.escape_debug(),
+        if nonce.is_empty() { "-" } else { nonce }.escape_debug(),
+        action.escape_debug(),
+        repository.escape_debug(),
         path,
-        reply.outcome_label(),
+        reply.outcome_label().escape_debug(),
     ));
     reply
 }
@@ -707,50 +709,73 @@ struct RouteLeases {
     /// Per route key: how many calls hold it, and every handle they were given.
     /// A route that died mid-call is replaced by a fresh one under the same
     /// key, so one key can have handed out more than one handle.
-    holders: tokio::sync::Mutex<HashMap<String, (usize, Vec<subc_client_rs::RouteHandle>)>>,
+    holders: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<LeaseHolders>>>>,
+}
+
+#[derive(Default)]
+struct LeaseHolders {
+    count: usize,
+    handles: Vec<subc_client_rs::RouteHandle>,
 }
 
 impl RouteLeases {
     /// Count a call as holding the route under `key`, before it opens it.
     async fn acquire(&self, key: &str) {
-        self.holders
-            .lock()
-            .await
-            .entry(key.to_string())
-            .or_default()
-            .0 += 1;
+        let entry = {
+            let mut holders = self.holders.lock().await;
+            Arc::clone(holders.entry(key.to_string()).or_default())
+        };
+        entry.lock().await.count += 1;
     }
 
     /// Record the handle the client gave a holder of `key`.
     async fn opened(&self, key: &str, route: subc_client_rs::RouteHandle) {
-        if let Some((_, handles)) = self.holders.lock().await.get_mut(key) {
-            if !handles.contains(&route) {
-                handles.push(route);
+        let entry = self.holders.lock().await.get(key).cloned();
+        if let Some(entry) = entry {
+            let mut holder = entry.lock().await;
+            if !holder.handles.contains(&route) {
+                holder.handles.push(route);
             }
         }
     }
 
     /// Stop counting a call as holding `key`. The last holder closes every
     /// handle given out under it, through the handle: the client's close by
-    /// route key only finds unscoped routes. The close runs under the lock, so
-    /// a call acquiring the key meanwhile opens after the route has left the
-    /// client's cache and gets a fresh one.
+    /// route key only finds unscoped routes. The close holds only the per-key
+    /// mutex: callers for the same key wait for its cached handles to close,
+    /// while unrelated keys can still acquire and release their routes.
     async fn release(&self, key: &str, consumer: &subc_client_rs::SubcConsumer) {
-        let mut holders = self.holders.lock().await;
-        let Some((count, _)) = holders.get_mut(key) else {
+        self.release_with(key, |handles| async move {
+            for route in handles {
+                let _ = consumer
+                    .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
+                    .await;
+            }
+        })
+        .await;
+    }
+
+    async fn release_with<F, Fut>(&self, key: &str, close: F)
+    where
+        F: FnOnce(Vec<subc_client_rs::RouteHandle>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let entry = self.holders.lock().await.get(key).cloned();
+        let Some(entry) = entry else {
             return;
         };
-        *count = count.saturating_sub(1);
-        if *count > 0 {
+        let mut holder = entry.lock().await;
+        holder.count = holder.count.saturating_sub(1);
+        if holder.count > 0 {
             return;
         }
-        let Some((_, handles)) = holders.remove(key) else {
-            return;
-        };
-        for route in handles {
-            let _ = consumer
-                .close_handle(&route, subc_client_rs::CloseRouteOptions::default())
-                .await;
+        close(std::mem::take(&mut holder.handles)).await;
+        let mut holders = self.holders.lock().await;
+        // With the map mutex held, only this releaser and the map own the entry
+        // unless an acquire has cloned it and is waiting for the per-key mutex.
+        // Keep that entry so the waiter cannot open a detached route lease.
+        if Arc::strong_count(&entry) == 2 {
+            holders.remove(key);
         }
     }
 }
@@ -974,10 +999,20 @@ impl SubcRelayTransport {
             Ok(reply) => Ok(reply),
             Err(failure) => {
                 if failure.reconnect {
-                    *self.consumer.lock().await = None;
+                    self.clear_failed_consumer(&consumer).await;
                 }
                 Err(failure.error)
             }
+        }
+    }
+
+    async fn clear_failed_consumer(&self, failed: &Arc<subc_client_rs::SubcConsumer>) {
+        let mut slot = self.consumer.lock().await;
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, failed))
+        {
+            *slot = None;
         }
     }
 }
