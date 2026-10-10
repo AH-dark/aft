@@ -505,17 +505,18 @@ fn rollback_written_changes(
     written_changes: &[(PathBuf, String)],
     attempted: Option<(&Path, &str)>,
 ) -> Option<String> {
+    let mut failures = Vec::new();
     if let Some((path, original)) = attempted {
         if let Err(e) = std::fs::write(path, original) {
-            return Some(format!("{}: {}", path.display(), e));
+            failures.push(format!("{}: {}", path.display(), e));
         }
     }
     for (path, original) in written_changes.iter().rev() {
         if let Err(e) = std::fs::write(path, original) {
-            return Some(format!("{}: {}", path.display(), e));
+            failures.push(format!("{}: {}", path.display(), e));
         }
     }
-    None
+    (!failures.is_empty()).then(|| failures.join("; "))
 }
 
 fn validate_matched_file_path(
@@ -826,5 +827,27 @@ mod apply_edits_tests {
             "{moved} bytes moved to rewrite a {} byte file",
             original.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn ast_rollback_attempts_every_file_after_restore_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let restored = dir.path().join("restored.txt");
+        std::fs::write(&restored, "after").unwrap();
+        let failed = dir.path().join("missing/failed.txt");
+        let attempted = dir.path().join("missing/attempted.txt");
+        let changes = vec![
+            (restored.clone(), "before".to_string()),
+            (failed.clone(), "before".to_string()),
+        ];
+        let error = rollback_written_changes(&changes, Some((&attempted, "before"))).unwrap();
+        assert_eq!(std::fs::read_to_string(&restored).unwrap(), "before");
+        assert!(error.contains(failed.to_str().unwrap()));
+        assert!(error.contains(attempted.to_str().unwrap()));
     }
 }
