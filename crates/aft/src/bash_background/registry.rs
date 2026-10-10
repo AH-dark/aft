@@ -10253,6 +10253,9 @@ fn spawn_detached_child(
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr));
                 crate::agent_child_env::apply_to_command(&mut cmd, env);
+                if let Some((key, value)) = shell.wrapper_environment(command) {
+                    cmd.env(key, value);
+                }
                 match cmd.spawn() {
                     Ok(child) => {
                         if idx > 0 {

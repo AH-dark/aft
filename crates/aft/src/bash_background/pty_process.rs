@@ -104,6 +104,16 @@ pub(crate) fn spawn_pty_for_command(
                 continue;
             }
 
+            let mut wrapper_env;
+            let env = match shell.wrapper_environment(user_command) {
+                Some((key, value)) => {
+                    wrapper_env = env.clone();
+                    wrapper_env.insert(key.to_string(), value.to_string());
+                    &wrapper_env
+                }
+                None => env,
+            };
+
             let args: Vec<OsString> = shell
                 .pty_wrapper_args(&wrapper_path)
                 .into_iter()

@@ -29,6 +29,10 @@ use std::sync::OnceLock;
 /// OpenCode's `POSIX` set in `packages/opencode/src/shell/shell.ts`.
 const POSIX_NAMES: &[&str] = &["bash", "sh", "zsh", "ksh", "dash"];
 
+/// Environment variable through which the cmd background wrapper receives the
+/// user command; see [`WindowsShell::wrapper_script`].
+pub(crate) const CMD_WRAPPER_COMMAND_ENV: &str = "AFT_CMD_WRAPPER_COMMAND";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WindowsShell {
     /// PowerShell 7+ (cross-platform). Supports `&&` pipeline operator.
@@ -189,21 +193,31 @@ impl WindowsShell {
             }
             WindowsShell::Cmd => {
                 // Written to a `.bat` invoked as `cmd /D /C <wrapper.bat>`.
-                // Batch expands `%ERRORLEVEL%` per line, so no `/V:ON` is
-                // needed; literal `!` in paths survives.
+                // The user command does not appear in the file: batch
+                // parsing would give `%1` and unmatched `%` batch-parameter
+                // meaning, and an `exit` in the command would end the
+                // wrapper before it records the exit marker. Instead the
+                // caller passes the command in `CMD_WRAPPER_COMMAND_ENV`
+                // and a child `cmd /D /S /C` runs it with the same
+                // command-line semantics as a foreground cmd command.
+                // Delayed expansion inserts the value after the wrapper
+                // line is parsed, so its `&`, `|`, `%` and quotes reach the
+                // child unchanged. It is switched off again before the
+                // marker lines so a literal `!` in their paths survives.
                 let tmp_path = format!("{}.tmp", exit_path.display());
                 format!(
                     concat!(
                         "@echo off\r\n",
-                        "{command}\r\n",
-                        "set CODE=%ERRORLEVEL%\r\n",
+                        "setlocal EnableDelayedExpansion\r\n",
+                        "cmd.exe /D /S /C \"!{env}!\"\r\n",
+                        "endlocal & set CODE=%ERRORLEVEL%\r\n",
                         "echo %CODE% > {tmp}\r\n",
                         "move /Y {tmp} {exit} > nul\r\n",
                         "exit /B %CODE%\r\n"
                     ),
-                    command = command,
-                    tmp = cmd_quote(&tmp_path),
-                    exit = cmd_quote(&exit_path.display().to_string())
+                    env = CMD_WRAPPER_COMMAND_ENV,
+                    tmp = batch_quote(&tmp_path),
+                    exit = batch_quote(&exit_path.display().to_string())
                 )
             }
             WindowsShell::Posix(shell_path) => {
@@ -221,6 +235,17 @@ impl WindowsShell {
                 )
             }
         }
+    }
+
+    /// Environment the wrapper written by [`Self::wrapper_script`] needs at
+    /// run time. Only the cmd wrapper reads its command from the environment;
+    /// callers apply this after the request environment so it cannot be
+    /// overridden.
+    pub(crate) fn wrapper_environment<'a>(
+        &self,
+        command: &'a str,
+    ) -> Option<(&'static str, &'a str)> {
+        matches!(self, WindowsShell::Cmd).then_some((CMD_WRAPPER_COMMAND_ENV, command))
     }
 
     pub(crate) fn wrapper_script_bytes(&self, command: &str, exit_path: &Path) -> Vec<u8> {
@@ -458,9 +483,90 @@ fn cmd_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
+/// Quote a literal path for a line of a `.bat` file. Batch files expand `%`
+/// even inside quotes, so a literal percent sign must be written as `%%`.
+fn batch_quote(value: &str) -> String {
+    cmd_quote(value).replace('%', "%%")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmd_wrapper_keeps_the_command_out_of_batch_parsing() {
+        let script = WindowsShell::Cmd
+            .wrapper_script("echo %1 & exit 3", Path::new(r"C:\Temp\100%\bash.exit"));
+        assert!(!script.contains("echo %1"), "{script}");
+        assert!(
+            script.contains(&format!("cmd.exe /D /S /C \"!{CMD_WRAPPER_COMMAND_ENV}!\"")),
+            "{script}"
+        );
+        assert!(script.contains(r"C:\Temp\100%%\bash.exit"), "{script}");
+        assert!(!script.contains(r"100%\"), "{script}");
+        assert_eq!(
+            WindowsShell::Cmd.wrapper_environment("echo hi"),
+            Some((CMD_WRAPPER_COMMAND_ENV, "echo hi"))
+        );
+        assert_eq!(WindowsShell::Pwsh.wrapper_environment("echo hi"), None);
+    }
+
+    /// The wrapper must run a command exactly as `cmd /D /S /C <command>`
+    /// would: batch-parameter text and unmatched percent signs stay literal,
+    /// and an `exit` in the command still lets the wrapper write its marker.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_wrapper_matches_direct_command_semantics_and_writes_marker() {
+        use std::process::Command;
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("wrapper.bat");
+        let marker = temp.path().join("exit%AFT_TEST_PERCENT%!.txt");
+        for command in [
+            "echo %1",
+            "echo 100%",
+            "exit 37",
+            "echo caret^^ bang! & echo second",
+        ] {
+            let _ = std::fs::remove_file(&marker);
+            let expected = Command::new("cmd.exe")
+                .args(["/D", "/S", "/C", command])
+                .env("AFT_TEST_PERCENT", "expanded")
+                .output()
+                .unwrap();
+            std::fs::write(
+                &wrapper,
+                WindowsShell::Cmd.wrapper_script_bytes(command, &marker),
+            )
+            .unwrap();
+            let (key, value) = WindowsShell::Cmd.wrapper_environment(command).unwrap();
+            let actual = Command::new("cmd.exe")
+                .args(["/D", "/C"])
+                .arg(&wrapper)
+                .env(key, value)
+                .env("AFT_TEST_PERCENT", "expanded")
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&actual.stdout),
+                String::from_utf8_lossy(&expected.stdout),
+                "direct command semantics: {command}"
+            );
+            assert_eq!(
+                actual.status.code(),
+                expected.status.code(),
+                "status: {command}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&marker)
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap(),
+                expected.status.code().unwrap(),
+                "marker: {command}"
+            );
+        }
+    }
 
     /// Helper: build a `which`-like closure that returns Some for the
     /// listed binaries (mapping each to a synthetic absolute path) and
