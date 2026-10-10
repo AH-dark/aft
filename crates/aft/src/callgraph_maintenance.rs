@@ -122,7 +122,7 @@ pub struct CallgraphReconcileOutcome {
 /// has not started, whether one is running, and the last finished outcome.
 #[derive(Debug, Default)]
 pub(crate) struct CallgraphReconcileState {
-    pending: parking_lot::Mutex<Option<String>>,
+    pending: parking_lot::Mutex<Vec<String>>,
     running: AtomicBool,
     last: parking_lot::Mutex<Option<CallgraphReconcileOutcome>>,
     completed: AtomicU64,
@@ -131,26 +131,24 @@ pub(crate) struct CallgraphReconcileState {
 impl CallgraphReconcileState {
     pub(crate) fn request(&self, reason: &str) {
         let mut pending = self.pending.lock();
-        match pending.as_mut() {
-            Some(existing) if !existing.split(", ").any(|known| known == reason) => {
-                existing.push_str(", ");
-                existing.push_str(reason);
-            }
-            Some(_) => {}
-            None => *pending = Some(reason.to_string()),
+        if !pending.iter().any(|known| known == reason) {
+            pending.push(reason.to_string());
         }
     }
 
     pub(crate) fn pending_reason(&self) -> Option<String> {
-        self.pending.lock().clone()
+        let pending = self.pending.lock();
+        (!pending.is_empty()).then(|| pending.join(", "))
     }
 
     /// Take the pending request and mark a reconcile as running. Returns None
     /// when nothing is pending or a reconcile is already running; a request
     /// made while one runs stays pending for the next start.
-    pub(crate) fn begin(&self) -> Option<String> {
+    pub(crate) fn begin(self: &Arc<Self>) -> Option<CallgraphReconcileOwnership> {
         let mut pending = self.pending.lock();
-        pending.as_ref()?;
+        if pending.is_empty() {
+            return None;
+        }
         if self
             .running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -158,17 +156,20 @@ impl CallgraphReconcileState {
         {
             return None;
         }
-        pending.take()
+        Some(CallgraphReconcileOwnership {
+            state: Arc::clone(self),
+            reasons: std::mem::take(&mut *pending),
+            finished: false,
+        })
     }
 
     pub(crate) fn clear_pending(&self) {
-        self.pending.lock().take();
+        self.pending.lock().clear();
     }
 
     fn finish(&self, outcome: CallgraphReconcileOutcome) {
         *self.last.lock() = Some(outcome);
         self.completed.fetch_add(1, Ordering::SeqCst);
-        self.running.store(false, Ordering::SeqCst);
     }
 
     pub(crate) fn last(&self) -> Option<CallgraphReconcileOutcome> {
@@ -180,14 +181,41 @@ impl CallgraphReconcileState {
     }
 }
 
+/// Owns the reconciliation running flag before thread spawn, so a failed spawn
+/// drops the ownership and allows another job to service the pending demand.
+pub(crate) struct CallgraphReconcileOwnership {
+    state: Arc<CallgraphReconcileState>,
+    reasons: Vec<String>,
+    finished: bool,
+}
+
+impl CallgraphReconcileOwnership {
+    fn finish(&mut self, outcome: CallgraphReconcileOutcome) {
+        self.state.finish(outcome);
+        self.finished = true;
+    }
+}
+
+impl Drop for CallgraphReconcileOwnership {
+    fn drop(&mut self) {
+        // Spawn failure and unwinding must preserve demand, not silently lose
+        // the watcher gap. Restore it before allowing another job to start.
+        if !self.finished {
+            for reason in &self.reasons {
+                self.state.request(reason);
+            }
+        }
+        self.state.running.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Everything a reconcile needs, captured on the requesting thread so the
 /// comparison can run off it.
 pub(crate) struct CallgraphReconcileJob {
-    pub(crate) reason: String,
+    pub(crate) ownership: CallgraphReconcileOwnership,
     pub(crate) callgraph_dir: PathBuf,
     pub(crate) project_root: PathBuf,
     pub(crate) max_examined: usize,
-    pub(crate) state: Arc<CallgraphReconcileState>,
     pub(crate) force: Arc<CallgraphForceDemand>,
     /// Hands the changed paths to the incremental refresh for the generation
     /// that requested the reconcile.
@@ -198,14 +226,14 @@ impl CallgraphReconcileJob {
     /// Compare the published store with the disk and act on the difference.
     pub(crate) fn run(self) -> CallgraphReconcileOutcome {
         let CallgraphReconcileJob {
-            reason,
+            mut ownership,
             callgraph_dir,
             project_root,
             max_examined,
-            state,
             force,
             enqueue_refresh,
         } = self;
+        let reason = ownership.reasons.join(", ");
         let report = match CallGraphStore::open_readonly(callgraph_dir, project_root.clone()) {
             Ok(Some(store)) => store.reconcile_with_disk(max_examined),
             Ok(None) => {
@@ -215,7 +243,7 @@ impl CallgraphReconcileJob {
                     action: CallgraphReconcileAction::NoPublishedStore,
                 };
                 log_outcome(&project_root, &outcome);
-                state.finish(outcome.clone());
+                ownership.finish(outcome.clone());
                 return outcome;
             }
             Err(error) => Err(error),
@@ -260,7 +288,7 @@ impl CallgraphReconcileJob {
             action,
         };
         log_outcome(&project_root, &outcome);
-        state.finish(outcome.clone());
+        ownership.finish(outcome.clone());
         outcome
     }
 }
@@ -299,5 +327,33 @@ fn log_outcome(project_root: &std::path::Path, outcome: &CallgraphReconcileOutco
             project_root.display(),
             action
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_reconcile_restores_demand_and_releases_running() {
+        let state = Arc::new(CallgraphReconcileState::default());
+        state.request("watcher gap");
+        let ownership = state.begin().expect("pending demand");
+        state.request("watcher overflow");
+        assert!(state.begin().is_none());
+        drop(ownership);
+        let reason = state.pending_reason().expect("abandoned demand retained");
+        assert!(reason.contains("watcher gap"));
+        assert!(reason.contains("watcher overflow"));
+        assert!(state.begin().is_some(), "another job can start");
+        assert_eq!(state.completed(), 0);
+    }
+
+    #[test]
+    fn reconcile_reason_with_separator_is_deduplicated_as_one_request() {
+        let state = CallgraphReconcileState::default();
+        state.request("custom, reason");
+        state.request("custom, reason");
+        assert_eq!(state.pending_reason().as_deref(), Some("custom, reason"));
     }
 }

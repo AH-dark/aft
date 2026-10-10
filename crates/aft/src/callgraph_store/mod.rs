@@ -8258,8 +8258,8 @@ fn ref_sites_named(
     short_name: &str,
     limit: usize,
 ) -> Result<Vec<StoreRefSite>> {
-    // The LIMIT bounds the work: the short-name index yields matching rows
-    // and SQLite stops once `limit` of them are sorted out.
+    // LIMIT bounds returned rows, not rows examined: the short-name index does
+    // not provide caller-file/line ordering, so SQLite may sort all matches.
     let mut stmt = conn.prepare_cached(
         "SELECT r.caller_file, n.scoped_name, r.line, r.local_name
          FROM refs r

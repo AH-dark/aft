@@ -7111,7 +7111,7 @@ impl AppContext {
         else {
             return false;
         };
-        let Some(reason) = self.callgraph_reconcile.begin() else {
+        let Some(ownership) = self.callgraph_reconcile.begin() else {
             return false;
         };
         // Until the reconcile's refresh settles, the store may miss edits the
@@ -7122,11 +7122,10 @@ impl AppContext {
         let enqueue_refresh: Box<dyn FnOnce(Vec<PathBuf>) + Send> =
             Box::new(move |paths| enqueue_refresh(paths, Some(catch_up)));
         let job = crate::callgraph_maintenance::CallgraphReconcileJob {
-            reason,
+            ownership,
             callgraph_dir: self.callgraph_store_dir(),
             project_root,
             max_examined: crate::callgraph_maintenance::RECONCILE_MAX_EXAMINED_FILES,
-            state: Arc::clone(&self.callgraph_reconcile),
             force: Arc::clone(&self.callgraph_force_demand),
             enqueue_refresh,
         };

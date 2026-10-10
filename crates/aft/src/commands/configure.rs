@@ -2784,7 +2784,7 @@ fn register_hashline_for_configure(
 /// Handle a `configure` request.
 ///
 /// Expects `project_root` (string, required) — absolute path to the project root.
-/// Sets the project root on `Config`, initializes the `CallGraph` with that root,
+/// Sets the project root on `Config`, warms the persistent callgraph store,
 /// spawns a file watcher for live invalidation, and returns success with the
 /// configured path.
 ///

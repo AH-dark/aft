@@ -356,8 +356,16 @@ fn splice_files<T: Clone>(
 ) -> Vec<T> {
     let mut result = Vec::with_capacity(previous.len());
     let mut old = previous.iter().peekable();
+    // Path component ordering puts a directory before a dotted sibling, unlike
+    // SQLite's byte ordering. Use the same byte key for full and delta reads.
+    let mut replacements = replacements.into_iter().collect::<Vec<_>>();
+    replacements
+        .sort_by(|(left, _), (right, _)| projection_path_key(left).cmp(projection_path_key(right)));
     for (path, replacement) in replacements {
-        while old.peek().is_some_and(|item| file(item) < &path) {
+        while old
+            .peek()
+            .is_some_and(|item| projection_path_key(file(item)) < projection_path_key(&path))
+        {
             result.push(old.next().expect("peeked item").clone());
         }
         while old.peek().is_some_and(|item| file(item) == &path) {
@@ -367,6 +375,10 @@ fn splice_files<T: Clone>(
     }
     result.extend(old.cloned());
     result
+}
+
+fn projection_path_key(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
 }
 
 // A bounded durable journal lets a reader bridge multiple watcher transactions.
@@ -617,6 +629,7 @@ fn project_files_from_store(
         ensure_projection_not_cancelled()?;
         files.push(paths.resolve(&path?));
     }
+    files.sort_by(|left, right| projection_path_key(left).cmp(projection_path_key(right)));
     Ok(files)
 }
 
@@ -669,6 +682,9 @@ fn exported_symbols_from_store(
             });
         }
     }
+    exports.sort_by(|left, right| {
+        projection_path_key(&left.file).cmp(projection_path_key(&right.file))
+    });
     Ok(exports)
 }
 
@@ -902,6 +918,9 @@ fn outbound_calls_query(
             stale_caller_nodes
         );
     }
+    calls.sort_by(|left, right| {
+        projection_path_key(&left.caller_file).cmp(projection_path_key(&right.caller_file))
+    });
     Ok(calls)
 }
 
@@ -1053,6 +1072,26 @@ mod tests {
     use std::fs;
 
     fn assert_send<T: Send>() {}
+
+    #[test]
+    fn splice_matches_stored_path_order_for_dotted_and_nested_files() {
+        let dotted = PathBuf::from("/workspace/src/foo.ts");
+        let nested = PathBuf::from("/workspace/src/foo/bar.ts");
+        let previous = vec![(dotted.clone(), 1), (nested.clone(), 2)];
+        let replacements = BTreeMap::from([(nested.clone(), vec![(nested.clone(), 3)])]);
+        assert_eq!(
+            splice_files(&previous, replacements, |row| &row.0),
+            vec![(dotted.clone(), 1), (nested.clone(), 3)]
+        );
+        let replacements = BTreeMap::from([
+            (dotted.clone(), vec![(dotted.clone(), 4)]),
+            (nested.clone(), Vec::new()),
+        ]);
+        assert_eq!(
+            splice_files(&previous, replacements, |row| &row.0),
+            vec![(dotted, 4)]
+        );
+    }
 
     #[test]
     fn projection_result_is_send() {
