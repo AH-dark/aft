@@ -20712,26 +20712,39 @@ mod refresh_worker_tests {
     #[test]
     fn store_callers_reexpand_a_shallower_revisit_without_duplicate_sites() {
         let (_temp, root, callgraph_dir, source) = ready_store_fixture();
-        fs::write(&source, "fn target() {}\nfn deep() { target(); }\nfn middle() { deep(); }\nfn shared() { middle(); target(); }\nfn upstream() { shared(); }\nfn entry() { upstream(); }\n").unwrap();
         let store = CallGraphStore::open_ready(callgraph_dir, root)
             .unwrap()
             .unwrap();
-        store.refresh_files(&[source]).unwrap();
-        let result = store.callers_of(Path::new("main.rs"), "target", 4).unwrap();
-        assert_eq!(
-            result
+        // Callers are walked in node-id order, and node ids hash positions.
+        // Shifting the layout varies that order, so some layout reaches
+        // `shared` through the deep route before the direct one.
+        for blank_lines in 0..8 {
+            fs::write(
+                &source,
+                format!(
+                    "{}fn target() {{}}\nfn deep() {{ target(); }}\nfn middle() {{ deep(); }}\nfn shared() {{ middle(); target(); }}\nfn upstream() {{ shared(); }}\nfn entry() {{ upstream(); }}\n",
+                    "\n".repeat(blank_lines)
+                ),
+            )
+            .unwrap();
+            store.refresh_files(std::slice::from_ref(&source)).unwrap();
+            let result = store.callers_of(Path::new("main.rs"), "target", 4).unwrap();
+            assert_eq!(
+                result
+                    .callers
+                    .iter()
+                    .filter(|site| site.caller.symbol == "entry")
+                    .count(),
+                1,
+                "layout with {blank_lines} leading blank lines"
+            );
+            let sites = result
                 .callers
                 .iter()
-                .filter(|site| site.caller.symbol == "entry")
-                .count(),
-            1
-        );
-        let sites = result
-            .callers
-            .iter()
-            .map(|site| (&site.caller.file, site.line, site.byte_start))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(sites.len(), result.callers.len());
+                .map(|site| (&site.caller.file, site.line, site.byte_start))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(sites.len(), result.callers.len());
+        }
     }
 
     fn ready_store_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
