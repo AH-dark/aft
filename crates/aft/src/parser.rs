@@ -3895,6 +3895,35 @@ fn extract_go_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
     }
 
+    // Only declarations directly in the source file initialize a package.
+    // Local bindings must not become callgraph owners or outline entries.
+    for declaration in root.named_children(&mut root.walk()) {
+        if !matches!(declaration.kind(), "var_declaration" | "const_declaration") {
+            continue;
+        }
+        let mut stack = vec![declaration];
+        while let Some(spec) = stack.pop() {
+            if matches!(spec.kind(), "var_spec" | "const_spec") {
+                for name_node in spec.children_by_field_name("name", &mut spec.walk()) {
+                    let name = node_text(source, &name_node).to_string();
+                    if name == "_" {
+                        continue;
+                    }
+                    symbols.push(Symbol {
+                        exported: is_go_exported(&name),
+                        name,
+                        kind: SymbolKind::Variable,
+                        range: node_range_with_decorators(&spec, source, lang),
+                        signature: Some(extract_signature(source, &spec)),
+                        scope_chain: vec![],
+                        parent: None,
+                    });
+                }
+            } else {
+                stack.extend(spec.named_children(&mut spec.walk()));
+            }
+        }
+    }
     dedup_symbols(&mut symbols);
     Ok(symbols)
 }
@@ -11167,6 +11196,21 @@ fn body_macros_are_not_items() {
     }
 
     // --- Go extraction ---
+
+    #[test]
+    fn go_package_variables_and_constants_are_symbols() {
+        let source = "package main\nvar Boot = Register()\nvar (\n A, b = 1, 2\n)\nconst Answer = 42\nfunc Register() int { var local = 1; return local }\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vars.go");
+        std::fs::write(&path, source).unwrap();
+        let symbols = TreeSitterProvider::new().list_symbols(&path).unwrap();
+        for name in ["Boot", "A", "b", "Answer"] {
+            let symbol = symbols.iter().find(|s| s.name == name).expect(name);
+            assert_eq!(symbol.kind, SymbolKind::Variable);
+            assert_eq!(symbol.exported, name != "b");
+        }
+        assert!(!symbols.iter().any(|s| s.name == "local"));
+    }
 
     #[test]
     fn go_extracts_all_symbols() {

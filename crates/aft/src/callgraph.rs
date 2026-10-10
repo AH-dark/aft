@@ -1611,6 +1611,12 @@ pub(crate) fn build_file_data_from_tree(
     };
     let value_refs_by_symbol = if lang == LangId::Rust {
         collect_rust_value_refs_by_symbol(&source, root, &symbols, line_index)
+    } else if lang == LangId::Go {
+        attribute_sites_to_symbols(
+            line_index,
+            &symbols,
+            crate::calls::extract_go_value_references(source, root),
+        )
     } else {
         HashMap::new()
     };
@@ -1678,7 +1684,18 @@ pub(crate) fn build_file_data_from_tree(
                     signature: s.signature.clone(),
                     line: s.range.start_line + 1,
                     range: s.range.clone(),
-                    entry_point_attribute: rust_attribute_entry_points.get(&identity).cloned(),
+                    entry_point_attribute: rust_attribute_entry_points
+                        .get(&identity)
+                        .cloned()
+                        .or_else(|| {
+                            (lang == LangId::Go
+                                && s.kind == SymbolKind::Variable
+                                && root.named_children(&mut root.walk()).any(|n| {
+                                    n.kind() == "package_clause"
+                                        && source[n.byte_range()].trim() == "package main"
+                                }))
+                            .then(|| "go_package_initializer".to_string())
+                        }),
                 },
             )
         })
@@ -1694,6 +1711,29 @@ pub(crate) fn build_file_data_from_tree(
                 range: crate::parser::node_range(&default_export.node),
                 entry_point_attribute: None,
             });
+    }
+    // Template calls have a real macro owner. The owner is not a root: only
+    // an invocation from reachable code can make its outgoing edges live.
+    if lang == LangId::Rust {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "macro_definition" {
+                if let Some(name) = node.child_by_field_name("name") {
+                    symbol_metadata.insert(
+                        format!("{}!", &source[name.byte_range()]),
+                        SymbolMeta {
+                            kind: SymbolKind::Function,
+                            exported: false,
+                            signature: None,
+                            line: node.start_position().row as u32 + 1,
+                            range: crate::parser::node_range(&node),
+                            entry_point_attribute: None,
+                        },
+                    );
+                }
+            }
+            stack.extend(node.named_children(&mut node.walk()));
+        }
     }
     if calls_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
         || value_refs_by_symbol.contains_key(TOP_LEVEL_SYMBOL)
@@ -1713,6 +1753,24 @@ pub(crate) fn build_file_data_from_tree(
                 },
                 entry_point_attribute: None,
             });
+    }
+    if lang == LangId::Go {
+        symbol_metadata.insert(
+            "<go-package-init>".to_string(),
+            SymbolMeta {
+                kind: SymbolKind::Function,
+                exported: false,
+                signature: None,
+                line: 1,
+                range: Range {
+                    start_line: 0,
+                    start_col: 0,
+                    end_line: 0,
+                    end_col: 0,
+                },
+                entry_point_attribute: None,
+            },
+        );
     }
 
     Ok(FileCallData {
