@@ -10,13 +10,9 @@
  *   node scripts/version-sync.mjs --from-tag       # read from GITHUB_REF_NAME (e.g. v0.2.0)
  *   node scripts/version-sync.mjs 0.2.0 --dry-run  # preview changes without writing
  *
- * Updates 10 locations:
- *   1-5. npm/{platform}/package.json  → version field
- *   6.   aft-bridge/package.json → version field
- *   7.   aft-opencode/package.json → version field + all optionalDependencies versions + aft-bridge dep
- *   8.   aft-pi/package.json → version field + all optionalDependencies versions + aft-bridge dep
- *   9.   aft-cli/package.json → version field + aft-bridge dep (workspace:* → semver)
- *   10.  Cargo.toml → version field
+ * Updates the platform package manifests, bridge, OpenCode plugin, Pi plugin,
+ * CLI, and both Cargo manifests. Plugin optional dependencies and bridge
+ * dependency versions are synchronized along with each package's version.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
