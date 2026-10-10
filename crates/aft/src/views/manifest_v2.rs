@@ -709,7 +709,21 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let view = ViewStore::open(storage.path(), "serialization").unwrap();
         let manifest = manifest();
-        let canonical = manifest.to_json_bytes().unwrap();
+        let canonical = serde_json::to_vec(&JsonManifestV2 {
+            format_version: MANIFEST_FORMAT_VERSION,
+            path_identity_version: PATH_IDENTITY_VERSION,
+            header: manifest.header.clone(),
+            entries: manifest
+                .entries
+                .iter()
+                .map(|(rel_path, entry)| JsonEntry {
+                    rel_path: rel_path.clone(),
+                    entry: entry.clone(),
+                })
+                .collect(),
+        })
+        .unwrap();
+        assert_eq!(manifest.to_json_bytes().unwrap(), canonical);
         let name = GenerationName::for_manifest(&manifest).unwrap();
         SERIALIZATIONS.with(|count| count.set(0));
         view.prepare_v2(&name, None, &manifest, None).unwrap();

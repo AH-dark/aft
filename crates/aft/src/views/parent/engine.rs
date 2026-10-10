@@ -115,162 +115,8 @@ impl ChildEngine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::*;
-    use super::*;
-    use crate::blob_store::v2::{ContentHash, FamilyPlane};
-    use crate::views::contracts::{PlaneAdapter, ViewAccess};
-    use crate::views::manifest_v2::{EntryPlanes, EntryV2, ManifestHeader, ManifestV2, Producers};
-    use crate::views::readiness::PlaneState;
-    use crate::views::semantic::{FillBudget, SemanticPlane, SemanticProducer};
-    use crate::views::snapshot::{LiveDelta, OpenGeneration};
-    use crate::views::RelPath;
-
-    fn session(root: &Path, storage: &Path) -> ParentSession {
-        ParentSession {
-            root: root.to_path_buf(),
-            storage: storage.to_path_buf(),
-            planes: RequestedPlanes {
-                trigram: true,
-                semantic: true,
-                callgraph: false,
-            },
-            semantic_config: Default::default(),
-            discovery: RwLock::new(None),
-            children: RwLock::new(Vec::new()),
-            semantic: RwLock::new(Plane::Loading),
-            holders: Mutex::new(Vec::new()),
-            stop: AtomicBool::new(false),
-            paused: AtomicBool::new(false),
-            rounds: AtomicUsize::new(0),
-            wake: (Mutex::new(false), Condvar::new()),
-            pointer_interval: Duration::from_secs(1),
-            backstop_interval: Duration::from_secs(1),
-        }
-    }
-
-    #[test]
-    fn semantic_fill_refreshes_parent_engine_within_one_generation() {
-        let storage = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let bytes = b"pub fn alpha() -> u32 { 42 }";
-        std::fs::write(root.path().join("a.rs"), bytes).unwrap();
-        let producer =
-            SemanticProducer::current("model", crate::semantic_index::EmbedTextCaps::default());
-        let plane = Arc::new(SemanticPlane::new(
-            storage.path().to_path_buf(),
-            producer.clone(),
-        ));
-        let registry =
-            crate::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
-        let owner = registry.register_view("child", root.path()).unwrap();
-        let access = ViewAccess::Owner(owner.clone());
-        let mut manifest = ManifestV2::new(ManifestHeader {
-            producers: Producers {
-                trigram: "test".into(),
-                semantic: Some(producer.id()),
-                callgraph: "test".into(),
-            },
-            head_tree: None,
-            ignore_fingerprint: None,
-            segment: None,
-        });
-        manifest
-            .insert(
-                RelPath::new(b"a.rs".to_vec()).unwrap(),
-                EntryV2::regular(
-                    ContentHash::of(bytes),
-                    bytes.len() as u64,
-                    EntryPlanes {
-                        semantic: Some(PlaneState::pending("queued")),
-                        trigram: None,
-                        callgraph: None,
-                    },
-                ),
-            )
-            .unwrap();
-        let generation = Arc::new(OpenGeneration::new("same-generation", manifest, None));
-        plane.open_generation(&access, &generation).unwrap();
-        let snapshot = LiveDelta::new(generation.clone()).snapshot();
-        let session = session(root.path(), storage.path());
-        *write(&session.semantic) = Plane::Ready(Arc::new(ParentSemantic {
-            model: Mutex::new(None),
-            plane: plane.clone(),
-            producer_id: producer.id(),
-        }));
-        let child = Child::new(root.path(), root.path().to_path_buf());
-        *write(&child.semantic) = Plane::Ready(Arc::new(SemanticChild {
-            access,
-            generation,
-            snapshot: snapshot.clone(),
-        }));
-        let mut engine = ChildEngine::new(&session, &child);
-        engine.install_semantic(&session, &child);
-        assert_eq!(read(engine.ctx.semantic_index()).as_ref().unwrap().len(), 0);
-        let report = plane
-            .fill(
-                &owner,
-                &snapshot,
-                FillBudget::default(),
-                &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-                &|| snapshot.clone(),
-            )
-            .unwrap();
-        assert_eq!(report.embedded_keys, 1);
-        engine.install_semantic(&session, &child);
-        assert!(read(engine.ctx.semantic_index()).as_ref().unwrap().len() > 0);
-        assert_eq!(
-            child.semantic_generation().as_deref(),
-            Some("same-generation")
-        );
-        assert_eq!(
-            engine
-                .ctx
-                .search_index()
-                .read()
-                .unwrap()
-                .as_ref()
-                .map(|index| index.file_count()),
-            None
-        );
-        assert_eq!(plane.plane(), FamilyPlane::Semantic);
-    }
-
-    #[test]
-    fn trigram_engine_retains_index_identity_across_retirement() {
-        let root = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let session = session(root.path(), storage.path());
-        let child = Child::new(root.path(), root.path().to_path_buf());
-        let mut engine = ChildEngine::new(&session, &child);
-        let old = Arc::new(crate::search_index::SearchIndex::new());
-        let retired = Arc::downgrade(&old);
-        engine.install_trigram_index(&old);
-        drop(old);
-        assert!(
-            retired.upgrade().is_some(),
-            "the installed allocation must remain alive"
-        );
-        let mut replacement = crate::search_index::SearchIndex::new();
-        replacement.index_file(&root.path().join("new.rs"), b"new_unique_term");
-        engine.install_trigram_index(&Arc::new(replacement));
-        assert_eq!(
-            read(engine.ctx.search_index())
-                .as_ref()
-                .unwrap()
-                .file_count(),
-            1
-        );
-        assert!(
-            retired.upgrade().is_none(),
-            "replacement releases the retired identity"
-        );
-    }
-}
-
-/// Install the child's text and semantic index data into its reader engine.
-/// An engine with no published index yet can still scan files. Runs on the worker.
+/// Creates the child's engine once its trigram snapshot is loaded, and
+/// installs the child's current snapshots into it. Runs on the worker.
 pub(super) fn sync(session: &ParentSession, child: &Child) {
     if !session.planes.trigram && !session.planes.semantic {
         return;
@@ -680,4 +526,158 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     }
     attach_gaps(&mut body, gaps.into_values());
     Response::success(&req.id, body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use super::*;
+    use crate::blob_store::v2::{ContentHash, FamilyPlane};
+    use crate::views::contracts::{PlaneAdapter, ViewAccess};
+    use crate::views::manifest_v2::{EntryPlanes, EntryV2, ManifestHeader, ManifestV2, Producers};
+    use crate::views::readiness::PlaneState;
+    use crate::views::semantic::{FillBudget, SemanticPlane, SemanticProducer};
+    use crate::views::snapshot::{LiveDelta, OpenGeneration};
+    use crate::views::RelPath;
+
+    fn session(root: &Path, storage: &Path) -> ParentSession {
+        ParentSession {
+            root: root.to_path_buf(),
+            storage: storage.to_path_buf(),
+            planes: RequestedPlanes {
+                trigram: true,
+                semantic: true,
+                callgraph: false,
+            },
+            semantic_config: Default::default(),
+            discovery: RwLock::new(None),
+            children: RwLock::new(Vec::new()),
+            semantic: RwLock::new(Plane::Loading),
+            holders: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            rounds: AtomicUsize::new(0),
+            wake: (Mutex::new(false), Condvar::new()),
+            pointer_interval: Duration::from_secs(1),
+            backstop_interval: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn semantic_fill_refreshes_parent_engine_within_one_generation() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"pub fn alpha() -> u32 { 42 }";
+        std::fs::write(root.path().join("a.rs"), bytes).unwrap();
+        let producer =
+            SemanticProducer::current("model", crate::semantic_index::EmbedTextCaps::default());
+        let plane = Arc::new(SemanticPlane::new(
+            storage.path().to_path_buf(),
+            producer.clone(),
+        ));
+        let registry =
+            crate::views::registry::FamilyRegistry::open(storage.path(), "family").unwrap();
+        let owner = registry.register_view("child", root.path()).unwrap();
+        let access = ViewAccess::Owner(owner.clone());
+        let mut manifest = ManifestV2::new(ManifestHeader {
+            producers: Producers {
+                trigram: "test".into(),
+                semantic: Some(producer.id()),
+                callgraph: "test".into(),
+            },
+            head_tree: None,
+            ignore_fingerprint: None,
+            segment: None,
+        });
+        manifest
+            .insert(
+                RelPath::new(b"a.rs".to_vec()).unwrap(),
+                EntryV2::regular(
+                    ContentHash::of(bytes),
+                    bytes.len() as u64,
+                    EntryPlanes {
+                        semantic: Some(PlaneState::pending("queued")),
+                        trigram: None,
+                        callgraph: None,
+                    },
+                ),
+            )
+            .unwrap();
+        let generation = Arc::new(OpenGeneration::new("same-generation", manifest, None));
+        plane.open_generation(&access, &generation).unwrap();
+        let snapshot = LiveDelta::new(generation.clone()).snapshot();
+        let session = session(root.path(), storage.path());
+        *write(&session.semantic) = Plane::Ready(Arc::new(ParentSemantic {
+            model: Mutex::new(None),
+            plane: plane.clone(),
+            producer_id: producer.id(),
+        }));
+        let child = Child::new(root.path(), root.path().to_path_buf());
+        *write(&child.semantic) = Plane::Ready(Arc::new(SemanticChild {
+            access,
+            generation,
+            snapshot: snapshot.clone(),
+        }));
+        let mut engine = ChildEngine::new(&session, &child);
+        engine.install_semantic(&session, &child);
+        assert_eq!(read(engine.ctx.semantic_index()).as_ref().unwrap().len(), 0);
+        let report = plane
+            .fill(
+                &owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+                &|| snapshot.clone(),
+            )
+            .unwrap();
+        assert_eq!(report.embedded_keys, 1);
+        engine.install_semantic(&session, &child);
+        assert!(read(engine.ctx.semantic_index()).as_ref().unwrap().len() > 0);
+        assert_eq!(
+            child.semantic_generation().as_deref(),
+            Some("same-generation")
+        );
+        assert_eq!(
+            engine
+                .ctx
+                .search_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|index| index.file_count()),
+            None
+        );
+        assert_eq!(plane.plane(), FamilyPlane::Semantic);
+    }
+
+    #[test]
+    fn trigram_engine_retains_index_identity_across_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = session(root.path(), storage.path());
+        let child = Child::new(root.path(), root.path().to_path_buf());
+        let mut engine = ChildEngine::new(&session, &child);
+        let old = Arc::new(crate::search_index::SearchIndex::new());
+        let retired = Arc::downgrade(&old);
+        engine.install_trigram_index(&old);
+        drop(old);
+        assert!(
+            retired.upgrade().is_some(),
+            "the installed allocation must remain alive"
+        );
+        let mut replacement = crate::search_index::SearchIndex::new();
+        replacement.index_file(&root.path().join("new.rs"), b"new_unique_term");
+        engine.install_trigram_index(&Arc::new(replacement));
+        assert_eq!(
+            read(engine.ctx.search_index())
+                .as_ref()
+                .unwrap()
+                .file_count(),
+            1
+        );
+        assert!(
+            retired.upgrade().is_none(),
+            "replacement releases the retired identity"
+        );
+    }
 }
