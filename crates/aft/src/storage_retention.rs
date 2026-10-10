@@ -1253,7 +1253,11 @@ fn candidate(
             .min(new_bytes);
     }
     report.removed_roots += 1;
-    clear_unknown_observation(storage, key)?;
+    // The observation is shared by every plane for this key. Keep its original
+    // grace until the last cache is gone, rather than restarting it per plane.
+    if !cache_key_present(storage, key, deadline)? {
+        clear_unknown_observation(storage, key)?;
+    }
     drop(files_guard);
     drop(leases);
     Ok(())
@@ -1477,6 +1481,70 @@ fn collect_one_v2_family(
 #[cfg(test)]
 mod storage_retention_tests {
     use super::*;
+
+    #[test]
+    fn retention_observation_clears_only_after_last_cache_plane() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "0123456789abcdef";
+        for domain in ["symbols", "semantic"] {
+            let path = cache(temp.path(), domain, key);
+            filetime::set_file_mtime(
+                path.join("payload.bin"),
+                filetime::FileTime::from_unix_time(0, 0),
+            )
+            .unwrap();
+        }
+        atomic_json(
+            &temp.path().join(format!("retention/unknown/{key}.json")),
+            &0_u64,
+        )
+        .unwrap();
+        assert_eq!(
+            run_pass(temp.path(), &|| false).removed_roots,
+            2,
+            "removing one plane reset the shared grace for the other plane"
+        );
+        assert!(!temp
+            .path()
+            .join(format!("retention/unknown/{key}.json"))
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_private_permissions_survive_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_PATH: &str = "AFT_RETENTION_PRIVATE_UMASK_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = PathBuf::from(path);
+            unsafe {
+                libc::umask(0o777);
+            }
+            atomic_json(&path, &serde_json::json!({"bound": true})).unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                read_json::<serde_json::Value>(&path).unwrap()["bound"],
+                true
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("private.json");
+        let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "storage_retention::storage_retention_tests::retention_private_permissions_survive_restrictive_umask"]).env(CHILD_PATH, &path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "restrictive-umask writer failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn retention_worker_panic_releases_running_state() {
@@ -2425,11 +2493,18 @@ mod storage_retention_tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert_eq!(
-                read_json::<u64>(&observation).unwrap(),
-                first_seen,
-                "a restarted pass replaced the first observation"
-            );
+            if should_remove {
+                assert!(
+                    !observation.exists(),
+                    "removed cache kept its old observation"
+                );
+            } else {
+                assert_eq!(
+                    read_json::<u64>(&observation).unwrap(),
+                    first_seen,
+                    "a restarted pass replaced the first observation"
+                );
+            }
             let result: serde_json::Value =
                 read_json(&temp.path().join(format!("restart-result-{now}.json"))).unwrap();
             assert_eq!(result["removed_roots"], usize::from(should_remove));
@@ -2726,12 +2801,10 @@ pub(crate) fn schedule(
             });
         })
     {
-        if let Ok(mut states) = states().lock() {
-            if let Some(state) = states.get_mut(&key) {
-                state.running = false;
-                state.last_run = None;
-            }
-        }
+        drop(RunningReset {
+            storage: &key,
+            completed: false,
+        });
         crate::slog_warn!("storage retention worker could not start: {error}");
     }
 }
@@ -2776,4 +2849,26 @@ fn clear_unknown_observation(storage: &Path, key: &str) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn cache_key_present(storage: &Path, key: &str, deadline: Instant) -> io::Result<bool> {
+    for (directory, flat) in domain_paths(storage)? {
+        if !flat {
+            if directory.join(key).try_exists()? {
+                return Ok(true);
+            }
+        } else if directory.try_exists()? {
+            let prefix = format!("{key}.");
+            for (path, _) in tree_files(&directory, deadline)? {
+                if path.parent() == Some(directory.as_path())
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }

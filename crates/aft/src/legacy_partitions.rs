@@ -107,9 +107,9 @@ pub fn evaluate_root_keyed_copy_disk_floor(
     }
 }
 
-/// Read free bytes for `path` from the filesystem containing the nearest
-/// existing ancestor. Future root-keyed migration/copy paths use this seam for
-/// the 1.5× disk-floor preflight.
+/// Read free bytes on the volume containing the nearest existing ancestor of
+/// `path`. Callgraph migration checks this value before copying durable index
+/// files into a root-specific store.
 pub fn available_disk_for(path: &Path) -> io::Result<u64> {
     #[cfg(unix)]
     {

@@ -2936,7 +2936,7 @@ impl BackupStore {
             let _ = crate::durability::atomic_write(
                 &marker,
                 s.as_bytes(),
-                crate::durability::AtomicWriteDurability::FileAndDirectory,
+                crate::durability::AtomicWriteDurability::None,
             );
         }
     }
@@ -3135,7 +3135,7 @@ impl BackupStore {
                 let _ = crate::durability::atomic_write(
                     &marker,
                     s.as_bytes(),
-                    crate::durability::AtomicWriteDurability::FileAndDirectory,
+                    crate::durability::AtomicWriteDurability::None,
                 );
             }
         }
@@ -3182,7 +3182,7 @@ impl BackupStore {
             let _ = crate::durability::atomic_write(
                 meta_path,
                 s.as_bytes(),
-                crate::durability::AtomicWriteDurability::FileAndDirectory,
+                crate::durability::AtomicWriteDurability::None,
             );
         }
     }
@@ -5454,10 +5454,15 @@ fn write_temp_atomic_rename(
 }
 
 fn session_gc_lock_path(session_dir: &Path) -> PathBuf {
-    session_dir.parent().unwrap().join(format!(
-        ".{}.session-gc.lock",
-        BackupStore::path_hash(session_dir)
-    ))
+    // Stable gates cannot be unlinked safely while a waiter holds their inode.
+    // Use bounded stripes rather than leaking one gate per expired session.
+    const STRIPES: u8 = 64;
+    let name = session_dir.file_name().unwrap_or_default();
+    let stripe = blake3::hash(name.as_encoded_bytes()).as_bytes()[0] % STRIPES;
+    session_dir
+        .parent()
+        .unwrap()
+        .join(format!(".session-gc-{stripe:02}.lock"))
 }
 
 fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {

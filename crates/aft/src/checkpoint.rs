@@ -1191,7 +1191,7 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
                 return;
             }
         }
-        if let Err(error) = fs::rename(&source, &target) {
+        if let Err(error) = rename_checkpoint_namespace(&source, &target) {
             crate::slog_warn!(
                 "failed to move unbound durable checkpoints into {}: {}",
                 target.display(),
@@ -1226,7 +1226,13 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
         }
         let target_session = target.join(session_entry.file_name());
         if !target_session.exists() {
-            let _ = fs::rename(&source_session, &target_session);
+            if let Err(error) = rename_checkpoint_namespace(&source_session, &target_session) {
+                crate::slog_warn!(
+                    "failed to move unbound durable checkpoints into {}: {}",
+                    target_session.display(),
+                    error
+                );
+            }
             continue;
         }
         let Ok(checkpoint_entries) = fs::read_dir(&source_session) else {
@@ -1236,7 +1242,15 @@ fn migrate_unbound_checkpoint_namespace(storage_dir: &Path, harness: &str) {
             let source_checkpoint = checkpoint_entry.path();
             let target_checkpoint = target_session.join(checkpoint_entry.file_name());
             if !target_checkpoint.exists() {
-                let _ = fs::rename(source_checkpoint, target_checkpoint);
+                if let Err(error) =
+                    rename_checkpoint_namespace(&source_checkpoint, &target_checkpoint)
+                {
+                    crate::slog_warn!(
+                        "failed to move unbound durable checkpoints into {}: {}",
+                        target_checkpoint.display(),
+                        error
+                    );
+                }
                 continue;
             }
             // `<storage>/unbound/checkpoints` (written before configure) and
@@ -1303,7 +1317,20 @@ fn replaced_checkpoint_path(target: &Path) -> PathBuf {
 /// then is the old copy deleted; if the move into place fails, the old copy is
 /// moved back.
 fn replace_checkpoint_dir(source: &Path, target: &Path) -> io::Result<()> {
-    replace_checkpoint_dir_with(source, target, |from, to| fs::rename(from, to))
+    replace_checkpoint_dir_with(source, target, rename_checkpoint_namespace)
+}
+
+fn rename_checkpoint_namespace(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)?;
+    if let Some(parent) = source.parent() {
+        crate::durability::sync_dir(parent)?;
+    }
+    if target.parent() != source.parent() {
+        if let Some(parent) = target.parent() {
+            crate::durability::sync_dir(parent)?;
+        }
+    }
+    Ok(())
 }
 
 fn replace_checkpoint_dir_with(
@@ -1945,6 +1972,45 @@ fn current_timestamp_nanos() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_namespace_moves_sync_both_affected_parents() {
+        for layout in ["namespace", "session", "checkpoint"] {
+            let storage = tempfile::tempdir().unwrap();
+            let source = storage
+                .path()
+                .join(UNBOUND_HARNESS_SEGMENT)
+                .join("checkpoints");
+            let target = storage.path().join("harness/checkpoints");
+            fs::create_dir_all(source.join("session/good")).unwrap();
+            fs::write(source.join("session/good/payload"), b"durable").unwrap();
+            if layout != "namespace" {
+                fs::create_dir_all(&target).unwrap();
+            }
+            if layout == "checkpoint" {
+                fs::create_dir_all(target.join("session")).unwrap();
+            }
+            let (from, to) = match layout {
+                "namespace" => (source.clone(), target.clone()),
+                "session" => (source.join("session"), target.join("session")),
+                _ => (source.join("session/good"), target.join("session/good")),
+            };
+            crate::durability::take();
+            migrate_unbound_checkpoint_namespace(storage.path(), "harness");
+            let events = crate::durability::take();
+            assert!(to.exists());
+            for parent in [from.parent().unwrap(), to.parent().unwrap()] {
+                assert!(
+                    events.contains(&(
+                        crate::durability::EventKind::DirectorySync,
+                        parent.to_path_buf()
+                    )),
+                    "rename did not sync {}: {events:?}",
+                    parent.display()
+                );
+            }
+        }
+    }
     #[test]
     fn failed_checkpoint_atomic_replace_cleans_temporary() {
         let dir = tempfile::tempdir().unwrap();

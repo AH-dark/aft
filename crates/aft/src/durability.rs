@@ -1,6 +1,7 @@
 //! Durable file commits use the platform's full sync, including F_FULLFSYNC on
 //! macOS. Rebuildable and process-lifetime stores deliberately do not call these
-//! helpers. The test ledger observes the real calls, never substitutes for them.
+//! sync helpers. Atomic writes select their durability explicitly. The test
+//! ledger observes the real calls, never substitutes for them.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -28,14 +29,25 @@ pub(crate) fn atomic_write(
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random).map_err(io::Error::other)?;
     let temporary = parent.join(format!(".aft-{:032x}.tmp", u128::from_ne_bytes(random)));
+    #[cfg(test)]
+    before_temp_create(&temporary);
     let file = crate::private_storage::options()
         .write(true)
         .create_new(true)
         .open(&temporary)?;
-    let _cleanup = TempCleanup(temporary.clone());
+    let mut cleanup = TempCleanup(Some(temporary.clone()));
     // Close before replacing so Windows does not retain an open temp handle.
     (move || -> io::Result<()> {
         let mut file = file;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() & 0o777 != crate::private_storage::FILE_MODE {
+                file.set_permissions(fs::Permissions::from_mode(
+                    crate::private_storage::FILE_MODE,
+                ))?;
+            }
+        }
         file.write_all(bytes)?;
         if !matches!(durability, AtomicWriteDurability::None) {
             sync_file(&file, path)?;
@@ -43,6 +55,7 @@ pub(crate) fn atomic_write(
         Ok(())
     })()?;
     crate::fs_lock::rename_over(&temporary, path)?;
+    cleanup.0 = None;
     record(EventKind::AtomicReplace, path);
     if matches!(durability, AtomicWriteDurability::FileAndDirectory) {
         sync_dir(parent)?;
@@ -50,11 +63,28 @@ pub(crate) fn atomic_write(
     Ok(())
 }
 
-struct TempCleanup(PathBuf);
+struct TempCleanup(Option<PathBuf>);
 
 impl Drop for TempCleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[cfg(test)]
+type BeforeTempCreate = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BEFORE_TEMP_CREATE: std::cell::RefCell<Option<BeforeTempCreate>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_temp_create(path: &Path) {
+    let hook = BEFORE_TEMP_CREATE.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
     }
 }
 
