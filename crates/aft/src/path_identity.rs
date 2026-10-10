@@ -71,7 +71,8 @@ fn lexical_normalize(path: &Path) -> PathBuf {
                 Some(Component::Normal(_)) => {
                     result.pop();
                 }
-                Some(Component::RootDir | Component::Prefix(_)) => {}
+                Some(Component::RootDir) => {}
+                Some(Component::Prefix(_)) if path.has_root() => {}
                 _ => result.push(component),
             },
             Component::CurDir => {}
@@ -108,6 +109,19 @@ mod tests {
         }
         #[cfg(unix)]
         assert_eq!(lexical_normalize(Path::new("/../../x")), Path::new("/x"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lexical_normalization_preserves_drive_relative_parents() {
+        assert_eq!(
+            lexical_normalize(Path::new(r"C:..\..\x")),
+            Path::new(r"C:..\..\x")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new(r"C:\..\..\x")),
+            Path::new(r"C:\x")
+        );
     }
 
     #[test]
