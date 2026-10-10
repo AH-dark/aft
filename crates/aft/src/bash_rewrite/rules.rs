@@ -1180,10 +1180,9 @@ fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
             }
             for flag in flags.chars() {
                 match flag {
-                    // -R: recursive listing — `read` of a directory is
-                    // single-level only, but the result is still a useful
-                    // approximation of "what's in this tree".
-                    'R' => {}
+                    // Directory reads are single-level; recursive listing must
+                    // stay with the shell to preserve all descendants.
+                    'R' => return None,
                     // Plain `ls` hides dotfiles, while `read` normally includes
                     // them. Preserve the caller's explicit request to show all
                     // entries without changing direct `read` behavior.
@@ -1249,6 +1248,22 @@ mod tests {
     use crate::context::{default_language_provider_factory, AppContext};
     use crate::hashline::integration::RegistrationRequest;
     use crate::protocol::DEFAULT_SESSION_ID;
+
+    #[test]
+    fn recursive_ls_declines_single_level_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        for command in ["ls -R", "ls -aR", "ls -Ra ."] {
+            assert!(super::ls_request(command, &ctx).is_none(), "{command}");
+        }
+        assert!(super::ls_request("ls -a", &ctx).is_some());
+    }
 
     // The oracle needs a real POSIX bash. On Windows `bash` on PATH is often the
     // WSL launcher, which fails without an installed distribution, so the byte

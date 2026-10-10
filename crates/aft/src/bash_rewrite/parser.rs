@@ -121,6 +121,7 @@ fn tokenize(header: &str, heredoc: Option<String>) -> Option<ParsedCommand> {
     let mut token = String::new();
     let mut quote = Quote::None;
     let mut appends_to = None;
+    let mut bare_word = true;
     let mut chars = header.char_indices().peekable();
 
     while let Some((_, ch)) = chars.next() {
@@ -143,18 +144,38 @@ fn tokenize(header: &str, heredoc: Option<String>) -> Option<ParsedCommand> {
                 _ => token.push(ch),
             },
             Quote::None => match ch {
-                c if c.is_whitespace() => push_token(&mut args, &mut token),
-                '\'' => quote = Quote::Single,
-                '"' => quote = Quote::Double,
+                c if c.is_whitespace() => {
+                    push_token(&mut args, &mut token);
+                    bare_word = true;
+                }
+                '\'' => {
+                    bare_word = false;
+                    quote = Quote::Single;
+                }
+                '"' => {
+                    bare_word = false;
+                    quote = Quote::Double;
+                }
                 '\\' => match chars.next() {
-                    Some((_, escaped)) => token.push(escaped),
+                    Some((_, '\n')) => {}
+                    Some((_, escaped)) => {
+                        bare_word = false;
+                        token.push(escaped);
+                    }
                     None => token.push('\\'),
                 },
                 '`' => return None,
                 ch if !word_character_is_literal(ch, quote) => return None,
                 '|' | ';' => return None,
-                '&' if matches!(chars.peek(), Some((_, '&'))) => return None,
+                '&' => return None,
+                '#' if token.is_empty() && bare_word => return None,
                 '>' if matches!(chars.peek(), Some((_, '>'))) => {
+                    // An unquoted numeric word adjoining a redirect selects a
+                    // descriptor; it is not an echo argument.
+                    if bare_word && !token.is_empty() && token.bytes().all(|ch| ch.is_ascii_digit())
+                    {
+                        return None;
+                    }
                     chars.next();
                     push_token(&mut args, &mut token);
                     if appends_to.is_some() {
@@ -427,6 +448,39 @@ pub(super) mod tests {
         "cat >> notes.txt <<E'OF'\n$HOME\nEOF",
         "cat >> notes.txt <<'EOF'\nEOFsuffix\nmore\nEOF",
     ];
+
+    #[test]
+    fn append_shell_control_syntax_declines() {
+        for command in [
+            "echo hi #note >> notes.txt",
+            "echo hi 2>> notes.txt",
+            "echo hi &>> notes.txt",
+            "echo hi & >> notes.txt",
+        ] {
+            assert!(parse(command).is_none(), "must decline: {command}");
+        }
+        for command in [
+            "echo '#note' >> notes.txt",
+            "echo \\#note >> notes.txt",
+            "echo x#note >> notes.txt",
+            "echo '2'>> notes.txt",
+            "echo \\2>> notes.txt",
+            "echo '&' >> notes.txt",
+            "echo \\& >> notes.txt",
+        ] {
+            assert!(parse(command).is_some(), "must accept literal: {command}");
+        }
+    }
+
+    #[test]
+    fn append_unquoted_continuation_matches_literal_words() {
+        let command = "echo hel\\\nlo >> notes.txt";
+        assert_eq!(parse(command).unwrap().args, ["echo", "hello"]);
+        assert_eq!(
+            super::parse_top_level("echo hel\\\nlo").unwrap(),
+            vec![vec!["echo", "hello"]]
+        );
+    }
 
     #[test]
     fn literal_append_table() {
