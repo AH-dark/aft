@@ -133,7 +133,11 @@ fn outline_mode_for_call(bare_name: &str, arguments: &Value, project_root: &Path
     let Some(obj) = arguments.as_object() else {
         return OutlineMode::Text;
     };
-    if obj.get("files").and_then(Value::as_bool) == Some(true) {
+    if obj
+        .get("files")
+        .and_then(crate::subc_translate::model_boolean)
+        == Some(true)
+    {
         return OutlineMode::Files;
     }
     let Some(target) = obj.get("target").and_then(Value::as_str) else {
@@ -231,49 +235,14 @@ fn safety_string_arg_for_call(bare_name: &str, arguments: &Value, key: &str) -> 
 }
 
 fn coerce_boolean(value: &Value) -> bool {
-    match value {
-        Value::Bool(value) => *value,
-        Value::Number(num) => num.as_i64() == Some(1) || num.as_u64() == Some(1),
-        Value::String(raw) => {
-            let normalized = raw.trim().to_ascii_lowercase();
-            normalized == "true" || normalized == "1"
-        }
-        _ => false,
-    }
+    crate::subc_translate::model_boolean(value).unwrap_or(false)
 }
 
 // Return true for agent tools whose text output is formatted on the server.
 // The capability manifest and this formatter both identify tools by their bare
 // internal routing names, without the agent-facing `aft_` prefix.
 fn is_core_agent_tool(bare_name: &str) -> bool {
-    matches!(
-        bare_name,
-        "status"
-            | "bash"
-            | "powershell"
-            | "read"
-            | "write"
-            | "edit"
-            | "apply_patch"
-            | "grep"
-            | "glob"
-            | "search"
-            | "outline"
-            | "zoom"
-            | "inspect"
-            | "callgraph"
-            | "conflicts"
-            | "ast_search"
-            | "ast_replace"
-            | "delete"
-            | "move"
-            | "import"
-            | "safety"
-            | "bash_status"
-            | "bash_kill"
-            | "bash_write"
-            | "bash_watch"
-    )
+    crate::subc_translate::supports_tool(bare_name)
 }
 
 /// Render the text block for a tool `CallToolResult` from the structured AFT `Response`.
@@ -4857,5 +4826,38 @@ mod import_format_tests {
             ),
             "removed the node:fs import (its only name)\nfile source.ts"
         );
+    }
+}
+
+#[cfg(test)]
+mod model_flag_tests {
+    use super::*;
+
+    #[test]
+    fn outline_files_model_boolean_matches_execution() {
+        for value in [serde_json::json!("true"), serde_json::json!(1.0)] {
+            let context = FormatContext::from_tool_call(
+                "outline",
+                &serde_json::json!({"files": value}),
+                Path::new("."),
+            );
+            assert_eq!(context.outline_mode, OutlineMode::Files);
+        }
+    }
+
+    #[test]
+    fn floating_model_boolean_dry_run_is_not_rendered_as_applied() {
+        let context = FormatContext::from_tool_call(
+            "ast_replace",
+            &serde_json::json!({"dryRun": 1.0}),
+            Path::new("."),
+        );
+        assert!(context.ast_dry_run);
+        let context = FormatContext::from_tool_call(
+            "callgraph",
+            &serde_json::json!({"includeUnresolved": 1.0}),
+            Path::new("."),
+        );
+        assert!(context.callgraph_include_unresolved);
     }
 }

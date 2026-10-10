@@ -511,6 +511,8 @@ pub(super) fn held_request_census(
     bg_subs: &HashMap<RouteChannel, BgSub>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     control_requests: usize,
+    database_waits: &persistence::DatabaseWaits,
+    ledger_edge: &tool_provider::LedgerEdge,
 ) -> HeldRequestCensus {
     let now = Instant::now();
     let age = |since: Instant| Some(now.saturating_duration_since(since));
@@ -518,6 +520,12 @@ pub(super) fn held_request_census(
         control_requests,
         ..HeldRequestCensus::default()
     };
+    for since in database_waits.held_since() {
+        census.add("database_admission", age(since));
+    }
+    for since in ledger_edge.held_since() {
+        census.add("ledger_admission", age(since));
+    }
     let mut deferred_keys = HashSet::new();
     for entry in &pending_responses.entries {
         deferred_keys.insert((entry.route, entry.corr));

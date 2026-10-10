@@ -168,7 +168,7 @@ impl StandingActor {
     /// by this actor have no harness marker and cannot preserve a retired config.
     pub(super) fn observe_config_snapshot(&self) {
         let owned = self.owned_actors.lock().clone();
-        let mut snapshots = self
+        let snapshot = self
             .executor
             .actor_entries()
             .into_iter()
@@ -180,11 +180,9 @@ impl StandingActor {
                     *owned_here && owned_root == root_id && ctx.config().harness.is_none()
                 })
             })
-            .map(|(root_id, ctx)| (root_id, ctx.config().as_ref().clone()))
-            .collect::<Vec<_>>();
-        snapshots.sort_by(|(left, _), (right, _)| left.as_path().cmp(right.as_path()));
-        if let Some((_, snapshot)) = snapshots.into_iter().next() {
-            *self.observed_config.lock() = snapshot;
+            .min_by(|(left, _), (right, _)| left.as_path().cmp(right.as_path()));
+        if let Some((_, ctx)) = snapshot {
+            *self.observed_config.lock() = ctx.config().as_ref().clone();
         }
     }
 

@@ -12,36 +12,7 @@ pub(super) fn is_bash_family_tool(name: &str) -> bool {
 }
 
 pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "status"
-            | "bash"
-            | "powershell"
-            | "read"
-            | "write"
-            | "edit"
-            | "apply_patch"
-            | "grep"
-            | "glob"
-            | "search"
-            | "outline"
-            | "zoom"
-            | "inspect"
-            | "callgraph"
-            | "conflicts"
-            | "ast_search"
-            | "ast_replace"
-            | "delete"
-            | "move"
-            | "import"
-            | "safety"
-            | "bash_status"
-            | "bash_kill"
-            | "bash_write"
-            // Served only by the catalog's `worker` preset; see
-            // `commands::bash_watch`.
-            | "bash_watch"
-    )
+    crate::subc_translate::supports_tool(name)
 }
 
 /// Internal plumbing commands the harness consumer (NOT the agent) invokes over

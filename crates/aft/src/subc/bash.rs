@@ -1765,18 +1765,22 @@ async fn submit_bash_promote(
                 detach_on_user_message,
             );
             log_ctx::with_session(Some(session_for_promote.clone()), || {
+                #[cfg(any(test, feature = "test-timing-hooks"))]
                 if let Ok(path) = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE") {
                     std::fs::write(path, b"started").expect("write promotion start marker");
                 }
+                #[cfg(any(test, feature = "test-timing-hooks"))]
                 if let Some(delay) = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS")
                     .ok()
                     .and_then(|value| value.parse::<u64>().ok())
                 {
                     std::thread::sleep(Duration::from_millis(delay));
                 }
-                let response = if let Some(value) =
-                    std::env::var_os("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR")
-                {
+                #[cfg(any(test, feature = "test-timing-hooks"))]
+                let forced = std::env::var_os("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR");
+                #[cfg(not(any(test, feature = "test-timing-hooks")))]
+                let forced: Option<std::ffi::OsString> = None;
+                let response = if let Some(value) = forced {
                     if value.to_string_lossy() == "panic" {
                         panic!("forced subc bash promote panic");
                     }

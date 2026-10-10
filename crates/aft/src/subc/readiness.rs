@@ -227,6 +227,11 @@ pub(super) trait RootWarmer: Send + Sync {
     /// Short name for the readiness log line.
     fn name(&self) -> &'static str;
 
+    /// A no-op warmer has no use for the daemon's root inventory.
+    fn requires_live_roots(&self) -> bool {
+        true
+    }
+
     fn warm<'a>(
         &'a self,
         set: &'a WarmSet,
@@ -241,6 +246,10 @@ pub(super) trait RootWarmer: Send + Sync {
 pub(super) struct NoWarmer;
 
 impl RootWarmer for NoWarmer {
+    fn requires_live_roots(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "none"
     }
@@ -276,6 +285,7 @@ pub(super) trait ReadinessControl: Send + Sync {
 /// Why and how the module flipped ready. Rendered as the readiness log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum FlipCause {
+    NoWarmerInstalled,
     /// The live-root query failed in any way; nothing was warmed.
     QueryFailed(ControlError),
     /// The daemon reported no bindings at all.
@@ -288,9 +298,14 @@ pub(super) enum FlipCause {
         timed_out: usize,
     },
     /// The warmer returned an error; the module flips without it.
-    WarmFailed { set: WarmSet, error: String },
+    WarmFailed {
+        set: WarmSet,
+        error: String,
+    },
     /// The budget ran out before the warmer finished.
-    BudgetExhausted { set: WarmSet },
+    BudgetExhausted {
+        set: WarmSet,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +335,7 @@ impl fmt::Display for ReadinessReport {
             )
         };
         match &self.cause {
+            FlipCause::NoWarmerInstalled => f.write_str("no load-only warmer installed")?,
             FlipCause::QueryFailed(error) => write!(f, "live_roots refused: {error}")?,
             FlipCause::NoBindings => f.write_str("live_roots: no bindings")?,
             FlipCause::WarmFinished {
@@ -381,6 +397,9 @@ async fn decide_flip_cause(
     warmer: &dyn RootWarmer,
     deadline: Instant,
 ) -> FlipCause {
+    if !warmer.requires_live_roots() {
+        return FlipCause::NoWarmerInstalled;
+    }
     let query_deadline = deadline.min(Instant::now() + LIVE_ROOTS_QUERY_TIMEOUT);
     let reply = match tokio::time::timeout_at(query_deadline, control.live_roots()).await {
         Ok(Ok(reply)) => reply,
@@ -1229,5 +1248,33 @@ mod tests {
         ]));
         assert!(!daemon_supports_ready_flip(&[]));
         assert!(!daemon_supports_ready_flip(&[LIVE_ROOTS_OP.to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod no_warmer_tests {
+    use super::*;
+
+    struct NoInventoryControl;
+    impl ReadinessControl for NoInventoryControl {
+        fn live_roots(&self) -> BoxFuture<'_, Result<LiveRootsReply, ControlError>> {
+            panic!("a no-op warmer must not request the root inventory")
+        }
+        fn flip_ready(&self) -> BoxFuture<'_, Result<(), ControlError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn no_op_warmer_flips_ready_without_a_live_root_query() {
+        let report = run_readiness(
+            &NoInventoryControl,
+            &NoWarmer,
+            SpawnRole::PlainStart,
+            Instant::now(),
+        )
+        .await;
+        assert_eq!(report.cause, FlipCause::NoWarmerInstalled);
+        assert_eq!(report.flip_attempts, 1);
     }
 }

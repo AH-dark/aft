@@ -118,7 +118,7 @@ fn read_tiers_from(
     let mut tiers = Vec::new();
     let mut migration = None;
 
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, feature = "test-timing-hooks"))]
     if let Some(delay_ms) = std::env::var("AFT_TEST_SUBC_CONFIG_READ_DELAY_MS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())

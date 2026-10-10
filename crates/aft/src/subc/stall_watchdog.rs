@@ -374,6 +374,16 @@ fn run_watchdog(
             let stalled_for =
                 StallDetector::stalled_for(&detector.watches[index], progress_age, now);
             if marker.restart_on_stall() && stalled_for >= config.frame_loop_exit_threshold {
+                // A process-wide suspension ages both the promised wake and the
+                // watchdog. Keep the evidence, but let a punctual tick decide
+                // whether the frame loop is still stalled after resume.
+                if wake_late >= config.frame_loop_exit_threshold {
+                    (config.log)(&format!(
+                        "stall watchdog: exit deferred marker={} because watchdog itself woke late watchdog_wake_late_ms={}",
+                        marker.name(), wake_late.as_millis(),
+                    ));
+                    continue;
+                }
                 (config.stderr)(&format!(
                     "stall watchdog: exiting marker={} stalled_for_ms={} {} watchdog_wake_late_ms={} capture={} exit_code={}",
                     marker.name(),
@@ -1520,6 +1530,150 @@ mod tests {
             text.contains("stat: ") && text.contains("wchan: "),
             "{text}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_pause_probe_child() {
+        let Ok(probe_dir) = std::env::var("AFT_TEST_WATCHDOG_PAUSE_PROBE_DIR") else {
+            let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+            fixture.ping(42).await;
+            assert!(fixture.exits.lock().unwrap().is_empty());
+            fixture.finish();
+            return;
+        };
+        let dir = PathBuf::from(probe_dir);
+        let release = dir.join("release");
+        let hook_release = release.clone();
+        let mut fixture = FrameLoopFixture::start(Arc::new(move || {
+            wait_until("promised frame-loop wake release", || hook_release.exists());
+        }))
+        .await;
+        fixture.send_ping(42).await;
+        wait_until("watchdog observed pending frame-loop work", || {
+            fixture
+                .log
+                .lines()
+                .iter()
+                .any(|line| line.contains("stall detected marker=subc_frame_loop"))
+        });
+        std::fs::write(dir.join("ready"), b"ready").unwrap();
+        let wedged = std::env::var("AFT_TEST_WATCHDOG_PAUSE_PROBE_CASE").unwrap() == "wedged";
+        if wedged {
+            wait_until("wedged loop exit", || {
+                !fixture.exits.lock().unwrap().is_empty()
+            });
+            std::fs::write(&release, b"release").unwrap();
+        }
+        let pong = tokio::time::timeout(
+            Duration::from_secs(5),
+            subc_transport::read_frame(&mut fixture.daemon),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(pong.header.ty, subc_protocol::FrameType::Pong);
+        let exits = fixture.exits.lock().unwrap().len();
+        let deferrals = fixture
+            .log
+            .lines()
+            .iter()
+            .filter(|line| {
+                line.contains("exit deferred") && line.contains("watchdog_wake_late_ms=")
+            })
+            .count();
+        let exit_wake_late_ms = fixture.stderr.lines().iter().find_map(|line| {
+            line.split("watchdog_wake_late_ms=")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        });
+        std::fs::write(dir.join("result"), serde_json::to_vec(&serde_json::json!({
+            "exits": exits, "deferrals": deferrals, "captures": fixture.capture.calls().len(), "exit_wake_late_ms": exit_wake_late_ms,
+        })).unwrap()).unwrap();
+        fixture.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_pause_with_promised_frame_wake_does_not_restart_healthy_loop() {
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    unsafe {
+                        libc::kill(child.id() as libc::pid_t, libc::SIGCONT);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        for case in ["healthy", "healthy", "healthy", "healthy", "wedged"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = ChildGuard(Some(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "subc::stall_watchdog::tests::process_pause_probe_child",
+                        "--nocapture",
+                    ])
+                    .env("AFT_TEST_WATCHDOG_PAUSE_PROBE_DIR", dir.path())
+                    .env("AFT_TEST_WATCHDOG_PAUSE_PROBE_CASE", case)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            ));
+            wait_until("child pending-wake observation", || {
+                dir.path().join("ready").exists()
+            });
+            let pid = child.0.as_ref().unwrap().id() as libc::pid_t;
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let mut state = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut state, libc::WUNTRACED) },
+                pid
+            );
+            assert!(libc::WIFSTOPPED(state));
+            // Both watchdog and frame runtime are stopped past the exit bound.
+            // Release the promised wake before resume; only the control stays wedged.
+            std::thread::sleep(TEST_THRESHOLD * 3);
+            if case == "healthy" {
+                std::fs::write(dir.path().join("release"), b"release").unwrap();
+            }
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.path().join("result")).unwrap()).unwrap();
+            let exits = result["exits"].as_u64().unwrap();
+            assert_eq!(
+                exits,
+                u64::from(case == "wedged"),
+                "resume case {case}: {exits} exits"
+            );
+            assert!(result["captures"].as_u64().unwrap() > 0);
+            if case == "wedged" {
+                assert!(
+                    result["deferrals"].as_u64().unwrap() > 0,
+                    "late tick must explain the deferred exit: {result}"
+                );
+                assert!(
+                    result["exit_wake_late_ms"].as_u64().unwrap()
+                        < (TEST_THRESHOLD * 2).as_millis() as u64,
+                    "wedged control must exit on a punctual tick: {result}"
+                );
+            }
+        }
     }
 
     fn secs(value: u64) -> Duration {

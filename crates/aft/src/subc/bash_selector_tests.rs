@@ -59,6 +59,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     handle_tool_call(
         &writer,
         &frame,
+        None,
         PhaseTrace::new(Instant::now()),
         &routes,
         &HashMap::new(),
@@ -66,7 +67,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         &mut HashMap::new(),
         &executor,
         &Arc::default(),
-        &Arc::new(AtomicUsize::new(0)),
+        &Arc::new(PendingDeferredSetups::default()),
         &Arc::new(Notify::new()),
         &PersistentCancelSignal::new(),
         &bash_tx,
@@ -156,6 +157,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
     handle_tool_call(
         &writer,
         &frame,
+        None,
         PhaseTrace::new(started),
         &HashMap::from([(route_key(41, 1), identity)]),
         &HashMap::new(),
@@ -163,7 +165,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         &mut HashMap::new(),
         &executor,
         &Arc::default(),
-        &Arc::new(AtomicUsize::new(0)),
+        &Arc::new(PendingDeferredSetups::default()),
         &Arc::new(Notify::new()),
         &PersistentCancelSignal::new(),
         &bash_tx,

@@ -428,6 +428,20 @@ pub(super) fn catalog_for_session(
     runon: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
+    let (request, preset) = validate_catalog_request(body)?;
+    catalog_for_request(
+        request,
+        preset,
+        disabled,
+        powershell_available,
+        runon,
+        worker_wait_max_ms,
+    )
+}
+
+pub(super) fn validate_catalog_request(
+    body: Value,
+) -> Result<(CatalogRequest, CatalogPreset), ErrorBody> {
     let request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
     let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
@@ -437,6 +451,43 @@ pub(super) fn catalog_for_session(
             "unsupported catalog parameter",
         ));
     }
+    if let Some(item) = &request.system_text {
+        if item.preset != "broca" && item.preset != preset.name() {
+            return Err(errors::invalid_request(
+                "system_text.preset",
+                format!(
+                    "AFT serves the {:?} system text beside the {:?} catalog preset, or the legacy \"broca\" text",
+                    preset.name(), preset.name()
+                ),
+            ));
+        }
+        for (key, value) in &item.params {
+            if key != "worker" || !value.is_boolean() || item.preset != "broca" {
+                return Err(errors::invalid_request(
+                    &format!("system_text.params.{key}"),
+                    "unsupported system-text parameter",
+                ));
+            }
+        }
+    }
+    Ok((request, preset))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static CATALOG_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn catalog_for_request(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+    worker_wait_max_ms: u64,
+) -> Result<Value, ErrorBody> {
+    #[cfg(test)]
+    CATALOG_RENDERS.set(CATALOG_RENDERS.get() + 1);
     let mut answer = CatalogAnswer::new("", "").with_tools(tools_for_session(
         preset,
         disabled,
@@ -464,27 +515,8 @@ pub(super) fn catalog_for_session(
     });
     answer.composition_digest = composition.clone();
     if let Some(item) = request.system_text {
-        // The text item names either the legacy `broca` preset or the
-        // catalog's own preset. Either way the catalog preset decides the
-        // text, so the text always matches the tools served beside it.
-        if item.preset != "broca" && item.preset != preset.name() {
-            return Err(errors::invalid_request(
-                "system_text.preset",
-                format!(
-                    "AFT serves the {:?} system text beside the {:?} catalog preset, or the legacy \"broca\" text",
-                    preset.name(),
-                    preset.name()
-                ),
-            ));
-        }
-        for (key, value) in &item.params {
-            if key != "worker" || !value.is_boolean() || item.preset != "broca" {
-                return Err(errors::invalid_request(
-                    &format!("system_text.params.{key}"),
-                    "unsupported system-text parameter",
-                ));
-            }
-        }
+        // The request was validated before policy persistence; rendering must
+        // not introduce a refusal after the routing settings have been frozen.
         let worker = item
             .params
             .get("worker")
@@ -716,13 +748,15 @@ pub(super) fn ledger_scope(
 }
 
 pub(super) fn keyed_route_frame(
-    frame: &subc_protocol::Frame,
+    decoded: &super::DecodedFrame,
     routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
 ) -> bool {
+    let frame = &decoded.frame;
     routes
         .get(&super::route_key(frame.header.channel, frame.header.epoch))
         .is_some_and(|identity| identity.role == RouteRole::ToolProviderV1)
-        && serde_json::from_slice::<Value>(&frame.body)
+        && decoded
+            .body()
             .is_ok_and(|body| body.get("call_key").and_then(Value::as_str).is_some())
 }
 
@@ -745,11 +779,18 @@ pub(super) fn note_native_outcome(
 /// pass through the same edge and are committed before reaching the socket.
 pub(super) struct LedgerEdge {
     calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
-    waiting: std::sync::Mutex<
-        std::collections::HashMap<(super::RouteChannel, u64), super::PersistentCancelSignal>,
-    >,
+    waiting: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerWait>>,
     ready: tokio::sync::mpsc::UnboundedSender<super::DecodedFrame>,
+    recent_sweeps: std::sync::Mutex<
+        std::collections::HashMap<crate::path_identity::ProjectRootId, std::time::Instant>,
+    >,
 }
+struct LedgerWait {
+    admission: super::AdmissionWait,
+    cancel: super::PersistentCancelSignal,
+    terminal_claim: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct LedgerCall {
     root: crate::path_identity::ProjectRootId,
     key: crate::db::call_ledger::Key,
@@ -767,10 +808,25 @@ impl LedgerEdge {
             std::sync::Arc::new(Self {
                 calls: Default::default(),
                 waiting: Default::default(),
+                recent_sweeps: Default::default(),
                 ready,
             }),
             receiver,
         )
+    }
+
+    fn sweep_due(
+        &self,
+        root: &crate::path_identity::ProjectRootId,
+        now: std::time::Instant,
+    ) -> bool {
+        let mut recent = self.recent_sweeps.lock().unwrap();
+        recent.retain(|_, last| now.saturating_duration_since(*last) < super::DRAIN_TICK_PERIOD);
+        if recent.contains_key(root) {
+            return false;
+        }
+        recent.insert(root.clone(), now);
+        true
     }
 
     pub(super) fn key(
@@ -809,7 +865,7 @@ impl LedgerEdge {
         else {
             return Err(decoded);
         };
-        let Ok(body) = serde_json::from_slice::<Value>(&decoded.frame.body) else {
+        let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
         if body
@@ -823,9 +879,9 @@ impl LedgerEdge {
         {
             return Err(decoded);
         }
-        let Ok(call) =
-            serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(body)
-        else {
+        let Ok(call) = serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(
+            body.clone(),
+        ) else {
             return Err(decoded);
         };
         let Some(call_key) = call.call_key.as_deref() else {
@@ -870,17 +926,7 @@ impl LedgerEdge {
             let writer = writer.clone();
             let metrics = metrics.clone();
             tokio::spawn(async move {
-                let context = crate::subc_format::FormatContext::from_tool_call(
-                    &call.name,
-                    &call.arguments,
-                    &identity.project_root,
-                );
-                let result = ToolCallResult {
-                    text: crate::subc_format::format_response_with_context(
-                        &call.name, &response, &context,
-                    ),
-                    response,
-                };
+                let result = ledger_refusal_result(&call, response, &identity.project_root);
                 if let Ok(frame) = build_tool_response_frame(
                     decoded.frame.header.ver,
                     route,
@@ -910,11 +956,18 @@ impl LedgerEdge {
         let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
         let response_key = key.clone();
         let cancel = PersistentCancelSignal::new();
-        self.waiting
-            .lock()
-            .unwrap()
-            .insert((route, decoded.frame.header.corr), cancel.clone());
+        let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admission = AdmissionWait::from_decoded(&decoded, &call.name);
+        self.waiting.lock().unwrap().insert(
+            (route, decoded.frame.header.corr),
+            LedgerWait {
+                admission,
+                cancel: cancel.clone(),
+                terminal_claim: terminal_claim.clone(),
+            },
+        );
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let sweep_due = self.sweep_due(&root, std::time::Instant::now());
         let rx = executor.submit_async(
             root.clone(),
             crate::executor::Lane::Mutating,
@@ -941,9 +994,19 @@ impl LedgerEdge {
                             "Call ledger database mutex is poisoned",
                         )
                     })?;
-                    ledger::sweep(&conn, ledger::now_ms())
+                    let now = ledger::now_ms();
+                    if sweep_due {
+                        ledger::sweep(&conn, now).map_err(|error| {
+                            Response::error_with_data(
+                                &request_id,
+                                "database_unavailable",
+                                error.to_string(),
+                                json!({"retryable":false}),
+                            )
+                        })?;
+                    }
+                    ledger::reduce_expired(&conn, &key, now)
                         .and_then(|_| {
-                            ledger::reduce_expired(&conn, &key, ledger::now_ms())?;
                             ledger::admit(
                                 &conn,
                                 &key,
@@ -974,6 +1037,24 @@ impl LedgerEdge {
             let result = result_rx.await.unwrap_or(Err(response));
             match result {
                 Ok(Admission::New) => {
+                    let waiting = edge.waiting.lock().unwrap();
+                    if !waiting.contains_key(&(route, decoded.frame.header.corr)) {
+                        drop(waiting);
+                        // Drain answered before admission completed. No tool was
+                        // dispatched, so leave a durable not-started result for repeats.
+                        let _ = repeat_executor.submit_async(root, Lane::Mutating, "ledger-drained-admission".into(), Box::new(move |ctx| {
+                            if let Some(db) = ctx.db() {
+                                if let Ok(conn) = db.lock() {
+                                    let recorded = ledger::not_started(&response_key, "cancelled");
+                                    if let Err(error) = ledger::settle(&conn, &response_key, &recorded, "not_started", Some("cancelled"), ledger::now_ms()) {
+                                        log::warn!("call ledger drained admission settlement failed: {error}");
+                                    }
+                                }
+                            }
+                            Response::success("ledger-drained-admission", json!({}))
+                        }));
+                        return;
+                    }
                     edge.calls.lock().unwrap().insert(
                         (route, decoded.frame.header.corr),
                         LedgerCall {
@@ -988,7 +1069,13 @@ impl LedgerEdge {
                     // Repeats observe the same durable execution, including a
                     // shell recovered after restart. They never dispatch again.
                     loop {
+                        if terminal_claim.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if cancel.is_cancelled() {
+                            if terminal_claim.swap(true, Ordering::SeqCst) {
+                                break;
+                            }
                             let frame = Self::cancelled_frame(&decoded.frame).unwrap();
                             edge.finish_waiting(&decoded.frame);
                             let _ = send_reliable_writer_frame(
@@ -1022,21 +1109,28 @@ impl LedgerEdge {
                         }
                         if let Ok(Some(row)) = row_rx.await {
                             if row.state == State::Settled {
-                                if let Some(recorded) = row.frame {
-                                    if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded)
-                                    {
-                                        let _ = send_reliable_writer_frame(
-                                            &writer,
-                                            &metrics,
-                                            frame,
-                                            "attached ledger result",
-                                        )
-                                        .await;
-                                    }
+                                if terminal_claim.swap(true, Ordering::SeqCst) {
+                                    break;
+                                }
+                                if let Ok(frame) = edge.finish_recorded_result(
+                                    &decoded.frame,
+                                    &response_key,
+                                    row.frame.as_ref(),
+                                ) {
+                                    let _ = send_reliable_writer_frame(
+                                        &writer,
+                                        &metrics,
+                                        frame,
+                                        "attached ledger result",
+                                    )
+                                    .await;
                                 }
                                 break;
                             }
                         } else {
+                            if terminal_claim.swap(true, Ordering::SeqCst) {
+                                break;
+                            }
                             edge.finish_waiting(&decoded.frame);
                             let _ = send_provider_error(
                                 &writer,
@@ -1058,19 +1152,23 @@ impl LedgerEdge {
                     }
                 }
                 Ok(Admission::Repeat(row)) => {
-                    if let Some(recorded) = row.frame {
-                        if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded) {
-                            let _ = send_reliable_writer_frame(
-                                &writer,
-                                &metrics,
-                                frame,
-                                "ledger replay",
-                            )
-                            .await;
-                        }
+                    if terminal_claim.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Ok(frame) = edge.finish_recorded_result(
+                        &decoded.frame,
+                        &response_key,
+                        row.frame.as_ref(),
+                    ) {
+                        let _ =
+                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger replay")
+                                .await;
                     }
                 }
                 Ok(Admission::Conflict) => {
+                    if terminal_claim.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
                     let error = errors::invalid_request(
                         "call_key",
                         "key already names different content or scope",
@@ -1086,17 +1184,10 @@ impl LedgerEdge {
                     }
                 }
                 Err(response) => {
-                    let context = crate::subc_format::FormatContext::from_tool_call(
-                        "read",
-                        &json!({}),
-                        &identity.project_root,
-                    );
-                    let result = ToolCallResult {
-                        text: crate::subc_format::format_response_with_context(
-                            "read", &response, &context,
-                        ),
-                        response,
-                    };
+                    if terminal_claim.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    let result = ledger_refusal_result(&call, response, &identity.project_root);
                     if let Ok(mut frame) = build_tool_response_frame(
                         decoded.frame.header.ver,
                         route,
@@ -1138,7 +1229,7 @@ impl LedgerEdge {
     pub(super) fn cancel(&self, route: super::RouteChannel, corr: u64) -> bool {
         let waiting = self.waiting.lock().unwrap();
         if let Some(signal) = waiting.get(&(route, corr)) {
-            signal.cancel();
+            signal.cancel.cancel();
             true
         } else {
             false
@@ -1147,8 +1238,40 @@ impl LedgerEdge {
 
     pub(super) fn close(&self) {
         for signal in self.waiting.lock().unwrap().values() {
-            signal.cancel();
+            signal.cancel.cancel();
         }
+    }
+
+    pub(super) fn has_waiting(&self, request: &subc_protocol::Frame) -> bool {
+        self.waiting.lock().unwrap().contains_key(&(
+            super::route_key(request.header.channel, request.header.epoch),
+            request.header.corr,
+        ))
+    }
+
+    pub(super) fn held_since(&self) -> Vec<std::time::Instant> {
+        self.waiting
+            .lock()
+            .unwrap()
+            .values()
+            .map(|wait| wait.admission.held_since)
+            .collect()
+    }
+
+    pub(super) fn drain_for_module_drain(
+        &self,
+    ) -> Result<Vec<subc_protocol::Frame>, super::SubcError> {
+        let mut frames = Vec::new();
+        for (_, wait) in self.waiting.lock().unwrap().drain() {
+            if !wait
+                .terminal_claim
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                wait.cancel.cancel();
+                frames.push(wait.admission.draining_frame()?);
+            }
+        }
+        Ok(frames)
     }
 
     pub(super) fn finish_waiting(&self, request: &subc_protocol::Frame) -> bool {
@@ -1159,7 +1282,7 @@ impl LedgerEdge {
                 super::route_key(request.header.channel, request.header.epoch),
                 request.header.corr,
             ))
-            .is_some_and(|signal| signal.is_cancelled())
+            .is_some_and(|waiting| waiting.cancel.is_cancelled())
     }
 
     fn cancelled_frame(
@@ -1186,6 +1309,30 @@ impl LedgerEdge {
         } else {
             Self::replay(request, recorded).map_err(super::SubcError::FrameBuild)
         }
+    }
+
+    fn finish_recorded_result(
+        &self,
+        request: &subc_protocol::Frame,
+        key: &crate::db::call_ledger::Key,
+        recorded: Option<&crate::db::call_ledger::RecordedFrame>,
+    ) -> Result<subc_protocol::Frame, super::SubcError> {
+        if self.finish_waiting(request) {
+            return Self::cancelled_frame(request);
+        }
+        if let Some(recorded) = recorded {
+            match Self::replay(request, recorded) {
+                Ok(frame) => return Ok(frame),
+                Err(error) => log::warn!("call ledger replay could not rebuild terminal: {error}"),
+            }
+        } else {
+            log::warn!("call ledger settled row has no retained terminal");
+        }
+        Self::replay(
+            request,
+            &crate::db::call_ledger::not_retained(key, "unknown"),
+        )
+        .map_err(super::SubcError::FrameBuild)
     }
 
     pub(super) fn authorize(
@@ -1354,6 +1501,22 @@ impl LedgerEdge {
             }
         });
         (sender, task)
+    }
+}
+
+fn ledger_refusal_result(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    response: crate::protocol::Response,
+    project_root: &std::path::Path,
+) -> crate::run_tool_call::ToolCallResult {
+    let context = crate::subc_format::FormatContext::from_tool_call(
+        &call.name,
+        &call.arguments,
+        project_root,
+    );
+    crate::run_tool_call::ToolCallResult {
+        text: crate::subc_format::format_response_with_context(&call.name, &response, &context),
+        response,
     }
 }
 
@@ -3023,6 +3186,7 @@ mod route_tests {
         handle_tool_call(
             &writer,
             &frame,
+            None,
             PhaseTrace::new(Instant::now()),
             &routes,
             &HashMap::new(),
@@ -3030,7 +3194,7 @@ mod route_tests {
             &mut HashMap::new(),
             &executor,
             &Arc::default(),
-            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(PendingDeferredSetups::default()),
             &Arc::new(Notify::new()),
             &PersistentCancelSignal::new(),
             &bash_tx,
@@ -3907,5 +4071,203 @@ mod route_tests {
         .await;
         assert_eq!(reply.header.ty, FrameType::Response);
         assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod ledger_terminal_tests {
+    use super::*;
+    use crate::db::call_ledger::Key;
+    use crate::subc::{control_flags, route_key, Frame, FrameType, PersistentCancelSignal};
+
+    fn request() -> Frame {
+        Frame::build(FrameType::Request, control_flags(), 42, 1, 7, Vec::new()).unwrap()
+    }
+
+    fn key() -> Key {
+        Key {
+            carrier: "first-party".into(),
+            call_key: "repeat".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn drained_ledger_admission_never_dispatches_and_settles_not_started() {
+        use crate::subc::*;
+        let (_dir, root) = test_support::test_root("drained-ledger-admission");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&_dir.path().join("aft.db")).unwrap(),
+        )));
+        assert!(ctx.db().is_some());
+        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = executor.submit_async(
+            root.clone(),
+            crate::executor::Lane::Mutating,
+            "held-admission-lane".into(),
+            Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                crate::protocol::Response::success("held-admission-lane", json!({}))
+            }),
+        );
+        started_rx.await.unwrap();
+        let mut identity = test_support::route_identity(&root, "session");
+        std::sync::Arc::get_mut(&mut identity.0).unwrap().role = RouteRole::ToolProviderV1;
+        let routes = std::collections::HashMap::from([(route_key(42, 1), identity)]);
+        let (edge, mut ready) = LedgerEdge::new();
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 7, serde_json::to_vec(&json!({"name":"read", "arguments":{"filePath":"README.md"}, "call_key":"drain-key"})).unwrap()).unwrap(),
+            phase_trace: PhaseTrace::new(std::time::Instant::now()),
+        };
+        let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
+        assert!(edge
+            .defer(
+                decoded,
+                &routes,
+                &executor,
+                &writer,
+                &std::sync::Arc::new(DispatchPathMetrics::new())
+            )
+            .is_ok());
+        assert_eq!(edge.drain_for_module_drain().unwrap().len(), 1);
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        let key = LedgerEdge::key(routes.get(&route_key(42, 1)).unwrap(), "drain-key");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let row = {
+                    let db = ctx.db().unwrap();
+                    let conn = db.lock().unwrap();
+                    crate::db::call_ledger::get(&conn, &key).unwrap()
+                };
+                if row.is_some_and(|row| {
+                    row.state == crate::db::call_ledger::State::Settled
+                        && row.outcome.as_deref() == Some("not_started")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(ready.try_recv().is_err());
+        assert!(receiver.try_recv().is_err());
+        assert!(edge.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keyed_admission_sweeps_are_coalesced_per_root_and_keep_targeted_expiry() {
+        let (_dir, root) = crate::subc::test_support::test_root("sweep-rate");
+        let (edge, _) = LedgerEdge::new();
+        let now = std::time::Instant::now();
+        assert!(edge.sweep_due(&root, now));
+        assert!(!edge.sweep_due(&root, now));
+        assert!(edge.sweep_due(&root, now + crate::subc::DRAIN_TICK_PERIOD));
+        let source = include_str!("tool_provider.rs");
+        let admission = source
+            .split("let now = ledger::now_ms();")
+            .nth(1)
+            .unwrap()
+            .split("let _ = result_tx.send")
+            .next()
+            .unwrap();
+        assert!(admission.contains("ledger::reduce_expired"));
+    }
+
+    #[test]
+    fn module_drain_counts_and_claims_ledger_admission_terminal_once() {
+        let (edge, _) = LedgerEdge::new();
+        let cancel = PersistentCancelSignal::new();
+        let terminal_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        edge.waiting.lock().unwrap().insert(
+            (route_key(42, 1), 7),
+            LedgerWait {
+                admission: crate::subc::AdmissionWait::from_decoded(
+                    &crate::subc::DecodedFrame {
+                        parsed_body: Default::default(),
+                        frame: request(),
+                        phase_trace: crate::run_tool_call::PhaseTrace::new(
+                            std::time::Instant::now(),
+                        ),
+                    },
+                    "read",
+                ),
+                cancel: cancel.clone(),
+                terminal_claim: terminal_claim.clone(),
+            },
+        );
+        let census = crate::subc::drain::held_request_census(
+            &std::sync::Arc::default(),
+            &crate::subc::PendingSubcResponses::default(),
+            &crate::subc::DispatchPathMetrics::new(),
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            0,
+            &crate::subc::persistence::DatabaseWaits::default(),
+            &edge,
+        );
+        assert_eq!(census.total(), 1);
+        let frames = edge.drain_for_module_drain().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].header.corr, 7);
+        assert!(cancel.is_cancelled());
+        assert!(terminal_claim.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!edge.has_waiting(&request()));
+        assert!(edge.drain_for_module_drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_recorded_terminal_retires_attachment_with_unknown_retention() {
+        let (edge, _) = LedgerEdge::new();
+        edge.waiting.lock().unwrap().insert(
+            (route_key(42, 1), 7),
+            LedgerWait {
+                admission: crate::subc::AdmissionWait::from_decoded(
+                    &crate::subc::DecodedFrame {
+                        parsed_body: Default::default(),
+                        frame: request(),
+                        phase_trace: crate::run_tool_call::PhaseTrace::new(
+                            std::time::Instant::now(),
+                        ),
+                    },
+                    "read",
+                ),
+                cancel: PersistentCancelSignal::new(),
+                terminal_claim: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let frame = edge
+            .finish_recorded_result(&request(), &key(), None)
+            .unwrap();
+        assert!(edge.waiting.lock().unwrap().is_empty());
+        assert_eq!(frame.header.corr, 7);
+        assert_eq!(frame.header.ty, FrameType::Error);
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "result_not_retained");
+        assert_eq!(body["detail"]["outcome"], "unknown");
+    }
+
+    #[test]
+    fn ledger_admission_refusal_uses_the_called_tools_formatter() {
+        let call =
+            serde_json::from_value(serde_json::json!({"name":"search","arguments":{}})).unwrap();
+        let result = ledger_refusal_result(
+            &call,
+            crate::protocol::Response::error("call", "database_unavailable", "ledger offline"),
+            std::path::Path::new("."),
+        );
+        assert_eq!(
+            result.text,
+            "semantic_search: database_unavailable — ledger offline"
+        );
     }
 }

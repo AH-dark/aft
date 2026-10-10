@@ -70,13 +70,7 @@ pub(super) fn catalog(
     }
     let powershell = crate::bash_background::powershell_available();
     let worker_wait_max_ms = ctx.config().bash.worker_wait_max_ms;
-    let answer = tool_provider::catalog_for_session(
-        body.clone(),
-        &identity.disabled_tools,
-        powershell,
-        false,
-        worker_wait_max_ms,
-    )?;
+    let (request, catalog_preset) = tool_provider::validate_catalog_request(body)?;
     if let Some(key) = key(identity, Some(&preset)) {
         if original.contains_key("remote_exec") || original.contains_key("siblings") {
             let policy = match crate::exec_remote::FrozenParams::decode(&original) {
@@ -135,17 +129,14 @@ pub(super) fn catalog(
                 .as_ref()
                 .is_some_and(|policy| policy.enabled)
         });
-    if offered {
-        tool_provider::catalog_for_session(
-            body,
-            &identity.disabled_tools,
-            powershell,
-            true,
-            worker_wait_max_ms,
-        )
-    } else {
-        Ok(answer)
-    }
+    tool_provider::catalog_for_request(
+        request,
+        catalog_preset,
+        &identity.disabled_tools,
+        powershell,
+        offered,
+        worker_wait_max_ms,
+    )
 }
 
 /// Where a bash call's remote-run policy comes from.

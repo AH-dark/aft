@@ -528,9 +528,18 @@ pub(super) fn clear_stale_bg_wakes_for_empty_sessions(
     }
 }
 
+static RELIABLE_PUSH_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
 fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) {
     if queue.len() >= PUSH_BUFFER_MAX_PER_KEY {
         queue.pop_front();
+        let total = RELIABLE_PUSH_EVICTIONS
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        // Keep overload observable without logging once per lost notification.
+        if total.is_power_of_two() {
+            log::warn!("subc reliable Push buffer overflow: evicted_total={total}");
+        }
     }
     queue.push_back(item);
 }
@@ -2332,5 +2341,22 @@ mod tests {
                 root.as_path().display()
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod reliable_eviction_tests {
+    use super::*;
+
+    #[test]
+    fn reliable_buffer_eviction_is_counted_and_preserves_fifo_of_survivors() {
+        let before = RELIABLE_PUSH_EVICTIONS.load(Ordering::Relaxed);
+        let mut queue = VecDeque::new();
+        for number in 0..=PUSH_BUFFER_MAX_PER_KEY {
+            bounded_push_back(&mut queue, number);
+        }
+        assert_eq!(queue.len(), PUSH_BUFFER_MAX_PER_KEY);
+        assert_eq!(queue.front(), Some(&1));
+        assert!(RELIABLE_PUSH_EVICTIONS.load(Ordering::Relaxed) > before);
     }
 }

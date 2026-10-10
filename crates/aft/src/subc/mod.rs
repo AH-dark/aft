@@ -424,6 +424,15 @@ use self::wire::{
 struct DecodedFrame {
     frame: Frame,
     phase_trace: PhaseTrace,
+    parsed_body: OnceLock<Result<Value, serde_json::Error>>,
+}
+
+impl DecodedFrame {
+    fn body(&self) -> Result<&Value, &serde_json::Error> {
+        self.parsed_body
+            .get_or_init(|| serde_json::from_slice(&self.frame.body))
+            .as_ref()
+    }
 }
 
 struct ToolCallCompletion {
@@ -448,6 +457,51 @@ struct RequestFrameMeta {
 }
 
 #[derive(Clone)]
+struct AdmissionWait {
+    route: RouteChannel,
+    corr: u64,
+    meta: RequestFrameMeta,
+    bare_name: String,
+    held_since: Instant,
+}
+
+impl AdmissionWait {
+    fn from_decoded(decoded: &DecodedFrame, bare_name: &str) -> Self {
+        Self {
+            route: route_key(decoded.frame.header.channel, decoded.frame.header.epoch),
+            corr: decoded.frame.header.corr,
+            meta: RequestFrameMeta {
+                ver: decoded.frame.header.ver,
+                flags: decoded.frame.header.flags,
+            },
+            bare_name: bare_name.to_owned(),
+            held_since: decoded.phase_trace.received_at(),
+        }
+    }
+
+    fn draining_frame(&self) -> Result<Frame, SubcError> {
+        let response = drain::module_draining_response("admission", &self.bare_name);
+        let error = ErrorBody::new(
+            drain::MODULE_DRAINING_ERROR_CODE,
+            response.data["message"]
+                .as_str()
+                .expect("drain response has a message"),
+        )
+        .with_detail(json!({"retryable": true}));
+        Frame::build_with_version(
+            self.meta.ver,
+            FrameType::Error,
+            self.meta.flags,
+            self.route.channel,
+            self.route.epoch,
+            self.corr,
+            serde_json::to_vec(&error).map_err(SubcError::Json)?,
+        )
+        .map_err(SubcError::FrameBuild)
+    }
+}
+
+#[derive(Clone)]
 struct ActiveToolCall {
     root_id: ProjectRootId,
     cancellation: JobCancellation,
@@ -465,18 +519,25 @@ struct ActiveToolCall {
 
 type ActiveToolCalls = Arc<StdMutex<HashMap<(RouteChannel, u64), ActiveToolCall>>>;
 
-struct PendingDeferredSetupGuard(Arc<AtomicUsize>);
+#[derive(Default)]
+struct PendingDeferredSetups {
+    count: AtomicUsize,
+    changed: Notify,
+}
+
+struct PendingDeferredSetupGuard(Arc<PendingDeferredSetups>);
 
 impl PendingDeferredSetupGuard {
-    fn new(count: Arc<AtomicUsize>) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
+    fn new(count: Arc<PendingDeferredSetups>) -> Self {
+        count.count.fetch_add(1, Ordering::SeqCst);
         Self(count)
     }
 }
 
 impl Drop for PendingDeferredSetupGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.count.fetch_sub(1, Ordering::SeqCst);
+        self.0.changed.notify_one();
     }
 }
 
@@ -521,6 +582,7 @@ struct PendingSubcResponses {
     dirty: bool,
     wake_generation: u64,
     next_deadline_poll: Option<Instant>,
+    minimum_poll_interval: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -555,6 +617,7 @@ impl PendingSubcResponses {
             keep
         });
         self.entries.push(pending);
+        self.refresh_poll_interval();
     }
 
     fn poll_if_woken(
@@ -590,19 +653,34 @@ impl PendingSubcResponses {
     }
 
     fn timer_poll_interval(&self) -> Option<Duration> {
-        self.entries
+        self.minimum_poll_interval
+    }
+
+    fn refresh_poll_interval(&mut self) {
+        self.minimum_poll_interval = self
+            .entries
             .iter()
             .filter_map(|entry| entry.pending.poll_interval())
-            .min()
+            .min();
     }
 
     fn poll_ready(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
         let mut ready = Vec::new();
         let mut waiting = Vec::with_capacity(self.entries.len());
         for mut entry in self.entries.drain(..) {
-            let response = executor
-                .actor_context(&entry.root)
-                .and_then(|ctx| (entry.pending.poll)(&ctx));
+            let response = match executor.actor_context(&entry.root) {
+                Some(ctx) => (entry.pending.poll)(&ctx),
+                None => {
+                    if let Some(cancellation) = &entry.pending.cancellation {
+                        cancellation.request_cancel();
+                    }
+                    Some(Response::error(
+                        &entry.pending.request_id,
+                        "actor_not_registered",
+                        "executor actor is not registered",
+                    ))
+                }
+            };
             if let Some(response) = response {
                 ready.push(ResolvedSubcResponse { entry, response });
             } else {
@@ -610,6 +688,7 @@ impl PendingSubcResponses {
             }
         }
         self.entries = waiting;
+        self.refresh_poll_interval();
         ready
     }
 
@@ -633,6 +712,7 @@ impl PendingSubcResponses {
             }
             keep
         });
+        self.refresh_poll_interval();
         cancelled
     }
 
@@ -671,6 +751,7 @@ impl PendingSubcResponses {
             }
         }
         self.entries = waiting;
+        self.refresh_poll_interval();
         resolved
     }
 
@@ -698,6 +779,7 @@ impl PendingSubcResponses {
             });
             resolved.push(ResolvedSubcResponse { entry, response });
         }
+        self.refresh_poll_interval();
         resolved
     }
 
@@ -2653,7 +2735,8 @@ fn ingress_route_should_be_processed(
 }
 
 fn bash_elicitation_timeout() -> Duration {
-    if cfg!(debug_assertions) {
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    {
         if let Ok(raw) = std::env::var("AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS") {
             if let Ok(ms) = raw.parse::<u64>() {
                 if ms > 0 {
@@ -3878,9 +3961,9 @@ fn flush_actor_indexes_on_graceful_shutdown(
     drained_at: Instant,
 ) -> String {
     flush_actor_indexes_on_graceful_shutdown_with(actor_contexts, drained_at, || {
-        // Debug-only delay lets the process regression exercise a busy
+        // The opt-in timing hook lets process regressions exercise a busy
         // persistence worker without relying on cache size or disk speed.
-        #[cfg(debug_assertions)]
+        #[cfg(any(test, feature = "test-timing-hooks"))]
         if let Ok(delay) = std::env::var("AFT_TEST_EXIT_INDEX_DELAY_MS") {
             if let Ok(ms) = delay.parse::<u64>() {
                 std::thread::sleep(Duration::from_millis(ms));
@@ -4458,7 +4541,7 @@ where
     // dedicated reader task owns the socket, reads whole frames sequentially, and
     // forwards them over a channel; the loop selects on the cancel-safe `recv()`.
     let (reader_tx, mut reader_rx) = mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
-    let reader_task = spawn_reader_task(read, reader_tx, Arc::clone(&dispatch_path_metrics));
+    let reader_task = spawn_reader_task(read, reader_tx);
     let shutdown = Arc::new(Notify::new());
     // Drain-tick deadline is tracked manually and checked at the TOP of every
     // loop turn rather than as an Interval select arm: the select below is
@@ -4545,7 +4628,7 @@ where
     let mut next_bash_ask_corr: u64 = 1;
     let mut route_bash_cancels: HashMap<RouteChannel, bash::RouteBashCancel> = HashMap::new();
     let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
-    let pending_deferred_setups = Arc::new(AtomicUsize::new(0));
+    let pending_deferred_setups = Arc::new(PendingDeferredSetups::default());
     let mut pending_responses = PendingSubcResponses::default();
     let mut database_waits = persistence::DatabaseWaits::default();
     let health_rollup_cache = Arc::new(HealthRollupCache::new());
@@ -4686,6 +4769,8 @@ where
                         &bg_subs,
                         &pending_binds,
                         control_replies.len(),
+                        &database_waits,
+                        &ledger_edge,
                     );
                     if !progress.quiesced_reported && census.total() == 0 {
                         progress.quiesced_reported = true;
@@ -4804,9 +4889,7 @@ where
                     Some(Err(error)) => break Err(error),
                     Some(Ok(frame)) => frame,
                 };
-                let phase_trace = frame.phase_trace;
-                let frame = frame.frame;
-                dispatch_path_metrics.mark_frame_loop_frame(&frame);
+                dispatch_path_metrics.mark_frame_loop_frame(&frame.frame);
                 #[cfg(test)]
                 if let Some(hooks) = watchdog_test.as_ref() {
                     (hooks.before_frame)();
@@ -4815,16 +4898,21 @@ where
                 if !ingress_route_should_be_processed(
                     &installed_route_epochs,
                     &reclaimed_routes,
-                    &frame,
+                    &frame.frame,
                 ) {
                     log::debug!(
                         "subc attach: silently dropping {:?} for uninstalled route {}@{}",
-                        frame.header.ty,
-                        frame.header.channel,
-                        frame.header.epoch
+                        frame.frame.header.ty,
+                        frame.frame.header.channel,
+                        frame.frame.header.epoch
                     );
                     continue;
                 }
+
+                if !database_waited && !ledger_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
+                    dispatch_path_metrics.tool_received_decoded(&frame);
+                }
+                let DecodedFrame { frame, phase_trace, parsed_body } = frame;
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
@@ -4883,7 +4971,7 @@ where
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
-                        let decoded = DecodedFrame {frame, phase_trace};
+                        let decoded = DecodedFrame {frame, phase_trace, parsed_body};
                         let decoded = if !ledger_waited {
                             match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
                                 Ok(()) => continue,
@@ -4959,8 +5047,8 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
-                        let decoded = DecodedFrame { frame, phase_trace };
-                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded.frame, &routes) {
+                        let decoded = DecodedFrame { frame, phase_trace, parsed_body };
+                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded, &routes) {
                             match database_waits.defer(decoded, &routes, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -4974,14 +5062,23 @@ where
                                 Err(decoded) => decoded,
                             }
                         } else {decoded};
+                        let parsed_body = decoded.parsed_body.into_inner();
                         let frame = decoded.frame;
                         let phase_trace = decoded.phase_trace;
+                        if ledger_waited && !ledger_edge.has_waiting(&frame) {
+                            continue;
+                        }
                         if ledger_waited && ledger_edge.finish_waiting(&frame) {
-                            let cancelled = build_error_frame(frame.header.ver,
+                            let cancelled = match build_error_frame(frame.header.ver,
                                 route.channel, route.epoch, frame.header.corr,
-                                frame.header.flags, "cancelled", "request cancelled")?;
-                            send_reliable_writer_frame(&writer_tx, &dispatch_path_metrics,
-                                cancelled, "cancelled ledger admission").await?;
+                                frame.header.flags, "cancelled", "request cancelled") {
+                                Ok(frame) => frame,
+                                Err(error) => break Err(error),
+                            };
+                            if let Err(error) = send_reliable_writer_frame(&writer_tx, &dispatch_path_metrics,
+                                cancelled, "cancelled ledger admission").await {
+                                break Err(error);
+                            }
                             continue;
                         }
                         let result = if management_routes.contains(&route)
@@ -5012,10 +5109,11 @@ where
                             )
                             .await
                         } else {
-                            handle_tool_call(
-                                &writer_tx,
-                                &frame,
-                                phase_trace,
+                             handle_tool_call(
+                                 &writer_tx,
+                                 &frame,
+                                 parsed_body,
+                                 phase_trace,
                                 &routes,
                                 &pending_binds,
                                 &reclaimed_routes,
@@ -5154,6 +5252,8 @@ where
                                     &bg_subs,
                                     &pending_binds,
                                     control_replies.len(),
+                        &database_waits,
+                        &ledger_edge,
                                 );
                                 drain::report_drain_census(
                                     drain::DRAIN_PHASE_START,
@@ -5173,7 +5273,23 @@ where
                                         until,
                                     ),
                                 });
-                                let ended = match end_bg_subscriptions_for_drain(
+                                 let admission_frames = match database_waits.drain_for_module_drain()
+                                     .and_then(|mut frames| {
+                                         frames.extend(ledger_edge.drain_for_module_drain()?);
+                                         Ok(frames)
+                                     }) {
+                                     Ok(frames) => frames,
+                                     Err(error) => break Err(error),
+                                 };
+                                 let mut admission_error = None;
+                                 for frame in admission_frames {
+                                     if let Err(error) = send_reliable_writer_frame(&writer_tx, &dispatch_path_metrics, frame, "drained admission").await {
+                                         admission_error = Some(error);
+                                         break;
+                                     }
+                                 }
+                                 if let Some(error) = admission_error { break Err(error); }
+                                 let ended = match end_bg_subscriptions_for_drain(
                                     &writer_tx,
                                     &dispatch_path_metrics,
                                     &mut bg_subs,
@@ -5227,6 +5343,8 @@ where
                                     &bg_subs,
                                     &pending_binds,
                                     control_replies.len(),
+                        &database_waits,
+                        &ledger_edge,
                                 );
                                 drain::report_drain_census(
                                     drain::DRAIN_PHASE_RELEASED,
@@ -5572,6 +5690,8 @@ where
             &bg_subs,
             &pending_binds,
             control_replies.len(),
+            &database_waits,
+            &ledger_edge,
         );
         drain::report_connection_end_census(
             &census,
@@ -5590,16 +5710,17 @@ where
     ledger_edge.close();
     cancel_all_active_tool_calls(&active_tool_calls, executor.as_ref(), "connection teardown");
     let setup_drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while pending_deferred_setups.load(Ordering::SeqCst) != 0
+    while pending_deferred_setups.count.load(Ordering::SeqCst) != 0
         && tokio::time::Instant::now() < setup_drain_deadline
     {
         tokio::select! {
             biased;
             Some(pending) = deferred_response_rx.recv() => pending_responses.register(pending),
-            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            _ = pending_deferred_setups.changed.notified() => {}
+            _ = tokio::time::sleep_until(setup_drain_deadline) => break,
         }
     }
-    if pending_deferred_setups.load(Ordering::SeqCst) != 0 {
+    if pending_deferred_setups.count.load(Ordering::SeqCst) != 0 {
         log::warn!(
             "subc attach: timed out waiting for deferred response setup registration during shutdown"
         );
@@ -5834,17 +5955,22 @@ where
         .write_all(buffer)
         .await
         .map_err(subc_transport::FrameIoError::Io)?;
+    let frame_bytes = buffer.len();
+    let write_finished = measure.then(Instant::now);
+    // A single large response must not pin its scratch allocation until disconnect.
+    if buffer.capacity() > 64 * 1024 {
+        *buffer = Vec::new();
+    }
     Ok(write_started.map(|write_started| FrameWriteTiming {
         write_started,
-        write_finished: Instant::now(),
-        frame_bytes: buffer.len(),
+        write_finished: write_finished.expect("measured write has a finish timestamp"),
+        frame_bytes,
     }))
 }
 
 fn spawn_reader_task<R>(
     mut read: R,
     tx: mpsc::Sender<Result<DecodedFrame, SubcError>>,
-    metrics: Arc<DispatchPathMetrics>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -5854,13 +5980,11 @@ where
             match read_frame(&mut read).await {
                 Ok(Some(frame)) => {
                     let received_at = Instant::now();
-                    if frame.header.ty == FrameType::Request && frame.header.channel != 0 {
-                        metrics.tool_received(&frame, received_at);
-                    }
                     #[cfg(any(test, feature = "test-timing-hooks"))]
                     let delay_after_ping =
                         frame.header.ty == FrameType::Ping && frame.header.corr == 124;
                     let decoded = DecodedFrame {
+                        parsed_body: Default::default(),
                         frame,
                         phase_trace: PhaseTrace::new(received_at),
                     };
@@ -5910,13 +6034,19 @@ where
 async fn finish_writer_task(
     mut writer_task: JoinHandle<Result<(), subc_transport::FrameIoError>>,
 ) -> Result<(), SubcError> {
-    match tokio::time::timeout(Duration::from_millis(100), &mut writer_task).await {
+    match tokio::time::timeout(exit_tail_remaining(), &mut writer_task).await {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(error))) => Err(SubcError::FrameIo(error)),
         Ok(Err(error)) => Err(SubcError::WriterJoin(error)),
         Err(_) => {
             writer_task.abort();
-            Ok(())
+            let _ = writer_task.await;
+            Err(SubcError::FrameIo(subc_transport::FrameIoError::Io(
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "subc writer did not finish within the exit tail budget",
+                ),
+            )))
         }
     }
 }
@@ -7597,6 +7727,7 @@ async fn submit_provider_read(
 async fn handle_tool_call(
     tx: &WriterSender,
     frame: &Frame,
+    parsed_body: Option<Result<Value, serde_json::Error>>,
     mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
@@ -7604,7 +7735,7 @@ async fn handle_tool_call(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: &Arc<Executor>,
     active_tool_calls: &ActiveToolCalls,
-    pending_deferred_setups: &Arc<AtomicUsize>,
+    pending_deferred_setups: &Arc<PendingDeferredSetups>,
     shutdown: &Arc<Notify>,
     connection_cancel: &PersistentCancelSignal,
     bash_deferred_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
@@ -7674,7 +7805,8 @@ async fn handle_tool_call(
         }
     }
 
-    let envelope = match serde_json::from_slice::<Value>(&frame.body) {
+    let envelope = match parsed_body.unwrap_or_else(|| serde_json::from_slice::<Value>(&frame.body))
+    {
         Ok(envelope) => envelope,
         Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
     };
@@ -9884,6 +10016,7 @@ pub(crate) mod test_support {
         handle_tool_call(
             &writer,
             &frame,
+            None,
             PhaseTrace::new(Instant::now()),
             &routes,
             &HashMap::new(),
@@ -9891,7 +10024,7 @@ pub(crate) mod test_support {
             &mut HashMap::new(),
             &executor,
             &Arc::default(),
-            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(PendingDeferredSetups::default()),
             &Arc::new(Notify::new()),
             &PersistentCancelSignal::new(),
             &bash_tx,
@@ -10803,6 +10936,8 @@ pub(crate) mod test_support {
             &HashMap::new(),
             &HashMap::new(),
             0,
+            &persistence::DatabaseWaits::default(),
+            &tool_provider::LedgerEdge::new().0,
         );
         assert_eq!(
             census.counts(),
@@ -13118,6 +13253,8 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 0,
+                &persistence::DatabaseWaits::default(),
+                &tool_provider::LedgerEdge::new().0,
             )
             .total()
         };
@@ -16713,7 +16850,7 @@ mod tests {
             )
             .unwrap();
             let mut waits = persistence::DatabaseWaits::default();
-            let decoded = DecodedFrame { frame, phase_trace: PhaseTrace::new(Instant::now()) };
+            let decoded = DecodedFrame { parsed_body: Default::default(), frame, phase_trace: PhaseTrace::new(Instant::now()) };
             let decoded = match waits.defer(decoded, &routes, executor) {
                 Ok(()) => waits.next().await,
                 Err(decoded) => decoded,
@@ -16729,42 +16866,38 @@ mod tests {
             };
             tokio::time::timeout(
                 Duration::from_millis(500),
-                handle_tool_call(
-                    &writer,
-                    &frame,
-                    decoded.phase_trace,
-                    &routes,
-                    &HashMap::new(),
-                    &ReclaimedRoutes::default(),
-                    &mut HashMap::new(),
-                    executor,
-                    &Arc::default(),
-                    &Arc::new(AtomicUsize::new(0)),
-                    &Arc::new(Notify::new()),
-                    &PersistentCancelSignal::new(),
-                    &bash_tx,
-                    &touch_tx,
-                    &Arc::new(DispatchPathMetrics::new()),
-                    &mut HashMap::new(),
-                    &mut HashMap::new(),
-                    &mut 1,
-                    &mut HashMap::new(),
-                    &mut HashMap::new(),
-                    &mut HashMap::new(),
-                    &mut HashMap::new(),
-                    |req, ctx| {
-                        assert!(ctx.database_runtime_refusal(&req.id, &req.command).is_none(), "unready mutation dispatched");
-                        match req.command.as_str() {
-                            "read" => crate::commands::read::handle_read(&req, ctx),
-                            "bash" => crate::commands::bash::handle(&req, ctx),
-                            other => panic!("unexpected dispatch {other}"),
-                        }
-                    },
-                    &deferred_tx,
-                    false,
-                    1024 * 1024,
-                    &drain::ModuleDrainWindow::default(),
-                ),
+                handle_tool_call(&writer, &frame, None, decoded.phase_trace,
+                &routes,
+                &HashMap::new(),
+                &ReclaimedRoutes::default(),
+                &mut HashMap::new(),
+                executor,
+                &Arc::default(),
+                &Arc::new(PendingDeferredSetups::default()),
+                &Arc::new(Notify::new()),
+                &PersistentCancelSignal::new(),
+                &bash_tx,
+                &touch_tx,
+                &Arc::new(DispatchPathMetrics::new()),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut 1,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                |req, ctx| {
+                    assert!(ctx.database_runtime_refusal(&req.id, &req.command).is_none(), "unready mutation dispatched");
+                    match req.command.as_str() {
+                        "read" => crate::commands::read::handle_read(&req, ctx),
+                        "bash" => crate::commands::bash::handle(&req, ctx),
+                        other => panic!("unexpected dispatch {other}"),
+                    }
+                },
+                &deferred_tx,
+                false,
+                1024 * 1024,
+                &drain::ModuleDrainWindow::default(),),
             )
             .await
             .expect("persistence refusal must not wait for the executor")
@@ -17320,11 +17453,9 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut waits = persistence::DatabaseWaits::default();
-            let frame = DecodedFrame {
-                frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
-                    serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
-                phase_trace: PhaseTrace::new(Instant::now()),
-            };
+            let frame = DecodedFrame { parsed_body: Default::default(), frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
+                serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()), };
             assert!(waits.defer(frame, &routes, &executor).is_ok());
             tokio::time::timeout(Duration::from_secs(12), waits.next()).await.unwrap();
         });
@@ -17703,5 +17834,244 @@ mod tests {
                 admissions_per_tick: per_tick.trim().parse().unwrap(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn missing_deferred_actor_resolves_and_cancels_pending_work() {
+        let (_dir, root) = test_support::test_root("missing-deferred-actor");
+        let cancellation = JobCancellation::new();
+        let pending = PendingResponse::polling(
+            "missing-actor".into(),
+            "session".into(),
+            "inspect".into(),
+            Box::new(|_| panic!("a removed actor cannot be polled")),
+        )
+        .with_cancellation(cancellation.clone());
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
+            ledger_key: None,
+            route: route_key(42, 1),
+            corr: 3,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "session".into(),
+            bare_name: "inspect".into(),
+            format_context: crate::subc_format::FormatContext::default(),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        let resolved = registry.poll_ready(&Executor::new());
+        assert_eq!(resolved.len(), 1);
+        assert!(registry.is_empty());
+        assert!(cancellation.cancel_already_requested());
+        assert_eq!(resolved[0].response.data["code"], "actor_not_registered");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_timeout_is_not_reported_as_success() {
+        let task = tokio::spawn(std::future::pending::<
+            Result<(), subc_transport::FrameIoError>,
+        >());
+        assert!(finish_writer_task(task).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_gets_the_exit_tail_to_flush_terminals() {
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Err(subc_transport::FrameIoError::Io(io::Error::from(
+                io::ErrorKind::BrokenPipe,
+            )))
+        });
+        assert!(matches!(
+            finish_writer_task(task).await,
+            Err(SubcError::FrameIo(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod compile_fence_tests {
+    fn compact(source: &str) -> String {
+        source.chars().filter(|ch| !ch.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn cancelled_admission_errors_cannot_bypass_connection_teardown() {
+        let source = include_str!("mod.rs");
+        let branch = source
+            .split("if ledger_waited && ledger_edge.finish_waiting(&frame)")
+            .nth(1)
+            .unwrap()
+            .split("let result = if management_routes")
+            .next()
+            .unwrap();
+        assert!(
+            !branch.contains('?'),
+            "cancelled admissions must leave through loop_result, not return early"
+        );
+        assert_eq!(branch.matches("break Err(error)").count(), 2);
+    }
+
+    #[test]
+    fn forced_promotion_failure_requires_explicit_test_hooks() {
+        let source = compact(include_str!("bash.rs"));
+        assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]letforced=std::env::var_os(\"AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR\")"));
+    }
+
+    #[test]
+    fn subc_delay_and_ttl_hooks_require_explicit_test_hooks() {
+        let source = compact(include_str!("mod.rs"));
+        assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]{ifletOk(raw)=std::env::var(\"AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS\")"));
+        assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]ifletOk(delay)=std::env::var(\"AFT_TEST_EXIT_INDEX_DELAY_MS\")"));
+        let source = compact(include_str!("../subc_config.rs"));
+        assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]ifletSome(delay_ms)=std::env::var(\"AFT_TEST_SUBC_CONFIG_READ_DELAY_MS\")"));
+    }
+}
+
+#[cfg(test)]
+mod writer_setup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn large_frame_does_not_pin_writer_scratch_capacity() {
+        let body = vec![b'x'; 128 * 1024];
+        let frame =
+            Frame::build(FrameType::Response, control_flags(), 42, 1, 7, body.clone()).unwrap();
+        let mut buffer = Vec::new();
+        let timing =
+            write_frame_contiguous(&mut tokio::io::sink(), &frame, &body, &mut buffer, true)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(timing.frame_bytes, frame.header.encode().len() + body.len());
+        assert!(buffer.capacity() <= 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn deferred_setup_completion_notifies_shutdown_even_before_await() {
+        let setups = Arc::new(PendingDeferredSetups::default());
+        let guard = PendingDeferredSetupGuard::new(setups.clone());
+        assert_eq!(setups.count.load(Ordering::SeqCst), 1);
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(10), setups.changed.notified())
+            .await
+            .unwrap();
+        assert_eq!(setups.count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unanswered_metrics_only_track_ingress_admitted_requests() {
+        let source = include_str!("mod.rs");
+        let reader = source
+            .split("fn spawn_reader_task<R>(")
+            .nth(1)
+            .unwrap()
+            .split("async fn finish_writer_task")
+            .next()
+            .unwrap();
+        assert!(!reader.contains("tool_received"));
+        let loop_source = source
+            .split("async fn run_module_loop<R, W>(")
+            .nth(1)
+            .unwrap()
+            .split("fn classify_connection_end")
+            .next()
+            .unwrap();
+        assert!(
+            loop_source
+                .find("ingress_route_should_be_processed")
+                .unwrap()
+                < loop_source.find("tool_received").unwrap()
+        );
+        assert!(loop_source.contains("!database_waited && !ledger_waited"));
+    }
+}
+
+#[cfg(test)]
+mod admission_mechanism_tests {
+    use super::*;
+
+    #[test]
+    fn decoded_request_metadata_is_reused_after_deferral() {
+        let mut decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                42,
+                1,
+                7,
+                br#"{"name":"read","arguments":{"filePath":"README.md"}}"#.to_vec(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        assert_eq!(decoded.body().unwrap()["name"], "read");
+        decoded.frame.body.clear();
+        assert_eq!(decoded.body().unwrap()["name"], "read");
+        assert_eq!(
+            decoded.parsed_body.into_inner().unwrap().unwrap()["arguments"]["filePath"],
+            "README.md"
+        );
+    }
+
+    #[test]
+    fn deferred_poll_interval_cache_tracks_registration_and_removal() {
+        let (_dir, root) = test_support::test_root("poll-interval-cache");
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
+            ledger_key: None,
+            route: route_key(42, 1),
+            corr: 3,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "session".into(),
+            bare_name: "inspect".into(),
+            format_context: crate::subc_format::FormatContext::default(),
+            bind_trust: BindTrust::FirstParty,
+            pending: PendingResponse::polling(
+                "poll-cache".into(),
+                "session".into(),
+                "inspect".into(),
+                Box::new(|_| None),
+            ),
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        assert_eq!(
+            registry.minimum_poll_interval,
+            Some(Duration::from_millis(100))
+        );
+        registry.cancel_request(route_key(42, 1), 3);
+        assert_eq!(registry.minimum_poll_interval, None);
+        assert_eq!(registry.timer_poll_interval(), None);
+    }
+
+    #[test]
+    fn standing_selects_one_actor_before_cloning_its_configuration() {
+        let source = include_str!("standing.rs");
+        let body = source
+            .split("pub(super) fn observe_config_snapshot(&self)")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) fn begin_session_bind")
+            .next()
+            .unwrap();
+        assert!(
+            body.find(".min_by(").unwrap() < body.find("ctx.config().as_ref().clone()").unwrap()
+        );
+        assert!(!body.contains(".collect::<Vec<_>>()"));
     }
 }

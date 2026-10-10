@@ -603,9 +603,27 @@ impl DispatchPathMetrics {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn tool_received(&self, frame: &super::Frame, received_at: Instant) {
-        let name = serde_json::from_slice::<Value>(&frame.body)
-            .ok()
+        let body = serde_json::from_slice::<Value>(&frame.body).ok();
+        self.tool_received_value(frame, received_at, body.as_ref());
+    }
+
+    pub(super) fn tool_received_decoded(&self, decoded: &super::DecodedFrame) {
+        self.tool_received_value(
+            &decoded.frame,
+            decoded.phase_trace.received_at(),
+            decoded.body().ok(),
+        );
+    }
+
+    fn tool_received_value(
+        &self,
+        frame: &super::Frame,
+        received_at: Instant,
+        body: Option<&Value>,
+    ) {
+        let name = body
             .and_then(|body| {
                 body.get("name")
                     .or_else(|| body.get("op"))
@@ -929,6 +947,7 @@ impl DispatchPathMetrics {
         }
 
         let now = Instant::now();
+        self.prune_bg_event_records(subscriptions, now);
         let Ok(mut logged) = self.stuck_pending_watch_logs.lock() else {
             return;
         };
@@ -966,6 +985,17 @@ impl DispatchPathMetrics {
         logged.retain(|_, last| {
             now.saturating_duration_since(*last) < STUCK_PENDING_WATCH_LOG_INTERVAL
         });
+    }
+
+    fn prune_bg_event_records(&self, subscriptions: &BgSubsBySession, now: Instant) {
+        if let Ok(mut events) = self.bg_events.lock() {
+            events.retain(|key, record| {
+                now.saturating_duration_since(record.window_start) < BG_OBSERVABILITY_INTERVAL
+                    || subscriptions
+                        .get(&(key.root.clone(), key.session.clone()))
+                        .is_some_and(|channels| !channels.is_empty())
+            });
+        }
     }
 
     fn record_bg_event_at(
@@ -5461,5 +5491,29 @@ mod plane_timing_tests {
         cache.annotate_plane_timings("/tmp/root", &mut building);
         assert!(building["tier2"]["since_ms"].is_u64());
         assert!(building["tier2"]["last_progress_at_ms"].is_u64());
+    }
+}
+
+#[cfg(test)]
+mod observability_retention_tests {
+    use super::*;
+
+    #[test]
+    fn inactive_background_event_windows_are_pruned_but_live_windows_remain() {
+        let (_dir, root) = crate::subc::test_support::test_root("bg-observability-prune");
+        let metrics = DispatchPathMetrics::new();
+        let start = Instant::now();
+        metrics.record_bg_event_at(&root, "inactive", BgEventKind::ArmHit, start);
+        metrics.record_bg_event_at(&root, "active", BgEventKind::ArmHit, start);
+        let now = start + BG_OBSERVABILITY_INTERVAL;
+        metrics.record_bg_event_at(&root, "recent", BgEventKind::ArmHit, now);
+        let subscriptions = HashMap::from([(
+            (root, "active".to_string()),
+            std::collections::HashSet::from([super::super::route_key(42, 1)]),
+        )]);
+        metrics.prune_bg_event_records(&subscriptions, now);
+        let events = metrics.bg_events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.keys().all(|key| key.session != "inactive"));
     }
 }

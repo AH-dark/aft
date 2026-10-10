@@ -964,7 +964,9 @@ fn normalize_lexically(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
                     out.push(component.as_os_str());
                 }
             }
@@ -1155,11 +1157,9 @@ pub fn subc_translate_owned_with_context(
     if bare_name == "edit" && ctx.effective_hashline {
         return crate::hashline::integration::translate_gate_on_edit(&agent_args)
             .map(|translation| {
-                let mut args = translation
-                    .to_native_args()
-                    .as_object()
-                    .cloned()
-                    .expect("hashline native arguments are always an object");
+                let Value::Object(mut args) = translation.to_native_args() else {
+                    unreachable!("hashline native arguments are always an object");
+                };
                 if ctx.preview {
                     args.insert("preview".to_string(), Value::Bool(true));
                 }
@@ -4567,5 +4567,27 @@ mod audit_regressions {
             assert_eq!(super::percent_decode(text), text);
         }
         assert_eq!(super::percent_decode("%C3%A9%20"), "é ");
+    }
+}
+
+#[cfg(test)]
+mod lexical_parent_tests {
+    use super::*;
+
+    #[test]
+    fn lexical_normalization_preserves_leading_parents() {
+        assert_eq!(
+            normalize_lexically(Path::new("../../x")),
+            PathBuf::from("../../x")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("a/../../../x")),
+            PathBuf::from("../../x")
+        );
+        assert_eq!(normalize_lexically(Path::new("a/../x")), PathBuf::from("x"));
+        assert_eq!(
+            normalize_lexically(Path::new("/../../x")),
+            PathBuf::from("/x")
+        );
     }
 }

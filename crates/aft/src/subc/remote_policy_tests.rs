@@ -588,6 +588,7 @@ async fn exercise_catalog_remote_bash(
     handle_tool_call(
         &writer,
         &call,
+        None,
         PhaseTrace::new(Instant::now()),
         &routes,
         &HashMap::new(),
@@ -595,7 +596,7 @@ async fn exercise_catalog_remote_bash(
         &mut HashMap::new(),
         &executor,
         &Arc::default(),
-        &Arc::new(AtomicUsize::new(0)),
+        &Arc::new(PendingDeferredSetups::default()),
         &Arc::new(Notify::new()),
         &PersistentCancelSignal::new(),
         &bash_tx,
@@ -951,4 +952,27 @@ fn head_sessions_take_remote_runs_from_the_user_config_only() {
     // A worker never inherits the head's user config.
     assert!(lookup(&enabled, &RemoteSource::Worker(None)).is_none());
     assert!(lookup(&enabled, &RemoteSource::None).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_enabled_catalog_is_rendered_once_after_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let worker = identity(root.path(), "single-render-worker", 7, true);
+    let ctx = context(root.path(), storage.path(), None);
+    let before = tool_provider::CATALOG_RENDERS.get();
+    let reply = catalog(fetch(&plan("broca-worker")), &worker, &ctx).unwrap();
+    assert_eq!(tool_provider::CATALOG_RENDERS.get() - before, 1);
+    assert!(bash_catalog_entry(&reply)["input_schema"]["properties"]
+        .get("runon")
+        .is_some());
+    let bad = json!({"preset":"worker", "params": {"remote_exec": plan("broca-worker")["remote_exec"]}, "system_text":{"preset":"reader"}});
+    assert!(catalog(
+        bad,
+        &identity(root.path(), "invalid-catalog", 7, true),
+        &ctx
+    )
+    .is_err());
+    assert_eq!(tool_provider::CATALOG_RENDERS.get() - before, 1);
 }
