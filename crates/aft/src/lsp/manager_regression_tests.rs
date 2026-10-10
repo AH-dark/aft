@@ -261,3 +261,44 @@ fn rejected_close_preserves_open_document_and_diagnostics() {
     );
     assert!(manager.diagnostics.has_report_for_server_file(&key, &file));
 }
+
+#[test]
+fn owned_pull_ingestion_reuses_diagnostic_and_result_id_allocations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = key(tmp.path());
+    let file = tmp.path().join("lib.rs");
+    let report: lsp_types::FullDocumentDiagnosticReport = serde_json::from_value(json!({
+        "resultId": "owned-result-id",
+        "items": [{
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "message": "an owned diagnostic message", "source": "owned-source", "code": "owned-code"
+        }]
+    }))
+    .unwrap();
+    let allocations = [
+        report.result_id.as_ref().unwrap().as_ptr(),
+        report.items[0].message.as_ptr(),
+        report.items[0].source.as_ref().unwrap().as_ptr(),
+    ];
+    let mut manager = LspManager::new();
+    manager.ingest_document_report_kind(
+        &key,
+        &file,
+        Some(1),
+        lsp_types::DocumentDiagnosticReportKind::Full(report),
+    );
+    let entries = manager.diagnostics.entries_for_file(&file);
+    let stored = &entries[0].1;
+    // Each nonempty string must retain its allocation across the ownership
+    // transfer. Cloning the report would allocate replacement strings while
+    // the originals are still live, so this also measures the copies avoided.
+    let retained = [
+        stored.result_id.as_ref().unwrap().as_ptr(),
+        stored.diagnostics[0].message.as_ptr(),
+        stored.diagnostics[0].source.as_ref().unwrap().as_ptr(),
+    ];
+    assert_eq!(
+        allocations, retained,
+        "owned pull strings were unnecessarily cloned"
+    );
+}
