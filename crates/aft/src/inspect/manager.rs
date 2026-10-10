@@ -3585,9 +3585,7 @@ impl InspectManager {
             }
             aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
             #[cfg(debug_assertions)]
-            if debug_cold_cache {
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            cold_cache_test_delay(debug_cold_cache, std::thread::sleep);
             let scan_started = Instant::now();
             self.record_build_progress(
                 &job.key,
@@ -4328,6 +4326,15 @@ struct Tier2PhaseTimings {
 }
 
 const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
+
+#[cfg(debug_assertions)]
+// Timing fixtures are built with Cargo's test-timing-hooks feature to request
+// this artificial delay. Ordinary debug builds do not enable that feature.
+fn cold_cache_test_delay(cold: bool, sleep: impl FnOnce(Duration)) {
+    if cold && cfg!(feature = "test-timing-hooks") {
+        sleep(Duration::from_millis(10));
+    }
+}
 
 fn projection_estimator_duration(phases: &Tier2PhaseTimings) -> Duration {
     // Projection journal files are the denominator used by the cost model.
@@ -7014,6 +7021,20 @@ thread_local! {
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod guard_tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn audit05_debug_cold_scans_use_only_opt_in_delay() {
+        let requested = std::cell::Cell::new(None);
+        cold_cache_test_delay(true, |duration| requested.set(Some(duration)));
+        assert_eq!(
+            requested.get(),
+            cfg!(feature = "test-timing-hooks").then_some(Duration::from_millis(10))
+        );
+        cold_cache_test_delay(false, |_| {
+            panic!("warm scans never request a fixture delay")
+        });
+    }
 
     fn write_ts_project(file_count: usize) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
