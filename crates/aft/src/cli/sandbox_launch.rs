@@ -107,10 +107,16 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             read_profile_json(args.profile_json.as_deref().expect("source count checked"))?
         }
         .canonicalize_for_launch()
-        .map_err(|error| SandboxLaunchError::unavailable(error.to_string()))?;
-        if let Err(error) = apply_sandbox(&profile) {
-            if let Some(path) = args.failure_marker.as_deref() {
-                let _ = write_failure_marker(path);
+        .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
+        let applied = profile.and_then(|profile| apply_sandbox(&profile));
+        if let Err(error) = applied {
+            if error.exit_code == SANDBOX_UNAVAILABLE_EXIT_CODE {
+                if let Some(path) = args.failure_marker.as_deref() {
+                    let _ = write_failure_marker(path);
+                }
+                if let Some(fd) = args.failure_fd {
+                    let _ = write_failure_fd(fd);
+                }
             }
             return Err(error);
         }
@@ -125,6 +131,11 @@ struct LaunchArgs {
     profile_file: Option<PathBuf>,
     profile_json: Option<String>,
     failure_marker: Option<PathBuf>,
+    /// Inherited descriptor that receives the failure marker when
+    /// confinement cannot be applied. A caller supervising the launch uses
+    /// it to tell a launcher failure from a target that exits with the same
+    /// status after a successful launch.
+    failure_fd: Option<i32>,
     command: Vec<OsString>,
     help: bool,
     support: bool,
@@ -185,6 +196,13 @@ impl LaunchArgs {
                         .into_string()
                         .map_err(|_| SandboxLaunchError::usage("--profile-json must be UTF-8"))?,
                 );
+                continue;
+            }
+            if arg == "--failure-fd" {
+                let value = args.next().ok_or_else(|| {
+                    SandboxLaunchError::usage("--failure-fd requires an integer value")
+                })?;
+                parsed.failure_fd = Some(parse_fd(&value)?);
                 continue;
             }
             if arg == "--failure-marker" {
@@ -288,6 +306,19 @@ fn write_failure_marker(path: &Path) -> std::io::Result<()> {
         .open(path)?;
     file.write_all(b"sandbox_unavailable")?;
     file.sync_all()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_failure_fd(fd: RawFd) -> std::io::Result<()> {
+    // Validate first: building a `File` from a closed descriptor aborts
+    // under Rust's IO-safety checks instead of returning an error.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor is open and belongs to the supervising caller;
+    // ManuallyDrop leaves it open so this write does not close it.
+    let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    file.write_all(b"sandbox_unavailable")
 }
 
 #[cfg(target_os = "macos")]
@@ -452,6 +483,29 @@ mod tests {
             Some(PathBuf::from("/tmp/task.sandbox-unavailable"))
         );
         assert_eq!(args.command, os_args(&["/bin/sh", "-c", "true"]));
+    }
+
+    #[test]
+    fn failure_fd_receives_the_marker_and_stays_open() {
+        use std::os::fd::AsRawFd;
+        let args = LaunchArgs::parse(os_args(&[
+            "--profile-json",
+            "{}",
+            "--failure-fd",
+            "4",
+            "--",
+            "/bin/true",
+        ]))
+        .expect("valid launcher arguments");
+        assert_eq!(args.failure_fd, Some(4));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("failure");
+        let file = File::create(&path).unwrap();
+        write_failure_fd(file.as_raw_fd()).unwrap();
+        assert!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } >= 0);
+        drop(file);
+        assert_eq!(std::fs::read(path).unwrap(), b"sandbox_unavailable");
     }
 
     #[test]

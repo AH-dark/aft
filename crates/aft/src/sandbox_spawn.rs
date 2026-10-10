@@ -113,6 +113,13 @@ struct EscalationGrant {
     digest: blake3::Hash,
     expires_at: Instant,
     consumed: bool,
+    /// The grant was used up by a refused consume attempt, so its payload
+    /// bundle was never handed to a task.
+    refused: bool,
+    /// Set once the grant can no longer hand its payload bundle to a task
+    /// (it expired or was refused) and the bundle has been scheduled for
+    /// deletion. The metadata stays so a replay still gets its exact refusal.
+    payload_reclaimed: bool,
     session_dir: PathBuf,
     task_id: String,
 }
@@ -128,6 +135,36 @@ impl EscalationGrantStore {
     #[cfg(test)]
     pub(crate) fn len_for_test(&self) -> usize {
         self.grants.len()
+    }
+
+    /// Mark every grant whose payload can no longer be claimed (expired, or
+    /// refused on a consume attempt) and return those bundles' locations so
+    /// the caller can delete them after releasing the store lock. A grant
+    /// consumed successfully keeps its bundle: the running task owns it.
+    fn take_unclaimable_payloads(&mut self, now: Instant) -> Vec<(PathBuf, String)> {
+        let mut payloads = Vec::new();
+        for grant in self.grants.values_mut() {
+            let expired_unused = !grant.consumed && now >= grant.expires_at;
+            if grant.payload_reclaimed || !(grant.refused || expired_unused) {
+                continue;
+            }
+            grant.payload_reclaimed = true;
+            payloads.push((grant.session_dir.clone(), grant.task_id.clone()));
+        }
+        payloads
+    }
+}
+
+/// Delete escalation payload bundles that no task can claim any more.
+#[cfg(unix)]
+fn delete_unclaimable_payloads(payloads: Vec<(PathBuf, String)>) {
+    for (session_dir, task_id) in payloads {
+        if let Ok(task) = crate::bash_background::persistence::resolve_uninitialized_task_layout(
+            &session_dir,
+            &task_id,
+        ) {
+            let _ = crate::bash_background::persistence::delete_resolved_task(&task);
+        }
     }
 }
 
@@ -683,6 +720,7 @@ fn mint_host_escalation_grant_at(
         }
     };
     let mut store = ctx.escalation_grants().lock();
+    let unclaimable = store.take_unclaimable_payloads(now);
     let grant_id = loop {
         let mut random = [0_u8; 16];
         getrandom::fill(&mut random)
@@ -698,11 +736,51 @@ fn mint_host_escalation_grant_at(
         digest: prepared.0.digest,
         expires_at: now + ESCALATION_GRANT_TTL,
         consumed: false,
+        refused: false,
+        payload_reclaimed: false,
         session_dir: prepared.0.paths.session_dir.clone(),
         task_id: prepared.0.paths.task_id.clone(),
     };
     store.grants.insert(grant_id.clone(), grant);
+    drop(store);
+    delete_unclaimable_payloads(unclaimable);
     Ok(grant_id)
+}
+
+/// Validate one consume attempt and mark the grant used. A refusal that uses
+/// up the grant also marks it refused, so its payload bundle is reclaimed.
+#[cfg(unix)]
+fn check_escalation_grant(
+    store: &mut EscalationGrantStore,
+    principal: &AuthenticatedPrincipal,
+    attempt: &HostEscalationAttempt,
+    now: Instant,
+) -> Result<(blake3::Hash, PathBuf, String), EscalationRefusal> {
+    let Some(grant) = store.grants.get_mut(&attempt.grant_id) else {
+        return Err(EscalationRefusal::DigestMismatch);
+    };
+    if grant.consumed {
+        return Err(EscalationRefusal::Consumed);
+    }
+    let refusal = if now >= grant.expires_at {
+        Some(EscalationRefusal::Expired)
+    } else if grant.principal != *principal {
+        Some(EscalationRefusal::WrongPrincipal)
+    } else if grant.root != attempt.root {
+        Some(EscalationRefusal::DigestMismatch)
+    } else {
+        None
+    };
+    grant.consumed = true;
+    if let Some(refusal) = refusal {
+        grant.refused = true;
+        return Err(refusal);
+    }
+    Ok((
+        grant.digest,
+        grant.session_dir.clone(),
+        grant.task_id.clone(),
+    ))
 }
 
 #[cfg(unix)]
@@ -714,30 +792,11 @@ fn consume_host_escalation_grant_at(
 ) -> Result<PreparedTask, EscalationRefusal> {
     let (digest, session_dir, task_id) = {
         let mut store = ctx.escalation_grants().lock();
-        let Some(grant) = store.grants.get_mut(&attempt.grant_id) else {
-            return Err(EscalationRefusal::DigestMismatch);
-        };
-        if grant.consumed {
-            return Err(EscalationRefusal::Consumed);
-        }
-        if now >= grant.expires_at {
-            grant.consumed = true;
-            return Err(EscalationRefusal::Expired);
-        }
-        if grant.principal != *principal {
-            grant.consumed = true;
-            return Err(EscalationRefusal::WrongPrincipal);
-        }
-        if grant.root != attempt.root {
-            grant.consumed = true;
-            return Err(EscalationRefusal::DigestMismatch);
-        }
-        grant.consumed = true;
-        (
-            grant.digest,
-            grant.session_dir.clone(),
-            grant.task_id.clone(),
-        )
+        let checked = check_escalation_grant(&mut store, principal, attempt, now);
+        let unclaimable = store.take_unclaimable_payloads(now);
+        drop(store);
+        delete_unclaimable_payloads(unclaimable);
+        checked?
     };
 
     let task = crate::bash_background::persistence::resolve_uninitialized_task_layout(
@@ -2831,7 +2890,7 @@ fn sandbox_base_environment_key(key: &OsStr) -> bool {
 fn is_preexec_hijack_env_key(key: &str) -> bool {
     // Dynamic-loader families (glibc/musl `LD_*`, macdyld `DYLD_*`): the whole
     // prefix executes/loads at exec time, so block the family, not a fixed set.
-    if key.starts_with("LD_") || key.starts_with("DYLD_") {
+    if key.starts_with("LD_") || key.starts_with("DYLD_") || key.starts_with("BASH_FUNC_") {
         return true;
     }
     matches!(
@@ -3032,6 +3091,13 @@ fn launcher_argv(
 ) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
     let profile_json = serde_json::to_string(profile)
         .map_err(|error| format!("failed to serialize sandbox profile: {error}"))?;
+    // With marker descriptors, a `/bin/sh` supervisor records an exit status
+    // when the launcher fails before the target runs. Exit status 78 alone
+    // cannot say who failed, because the target may legitimately exit 78
+    // after the launcher has exec'd it. The launcher therefore writes the
+    // `sandbox_unavailable` failure marker itself, through `--failure-fd`,
+    // only when confinement could not be applied; the supervisor reads that
+    // marker instead of guessing from the status.
     let Some((exit_fd, failure_fd)) = marker_fds else {
         let mut wrapped = vec![
             OsString::from("sandbox-launch"),
@@ -3052,10 +3118,9 @@ profile_json=$2
 exit_fd=$3
 failure_fd=$4
 shift 4
-"$launcher" sandbox-launch --profile-json "$profile_json" -- "$@"
+"$launcher" sandbox-launch --profile-json "$profile_json" --failure-fd "$failure_fd" -- "$@"
 code=$?
-if [ "$code" -eq 78 ]; then
-  printf "%s" sandbox_unavailable >&"$failure_fd"
+if [ "$code" -eq 78 ] && [ -s "/dev/fd/$failure_fd" ]; then
   if [ ! -s "/dev/fd/$exit_fd" ]; then
     printf "%s" "$code" >&"$exit_fd"
   fi
@@ -3091,6 +3156,137 @@ fn launcher_argv(
 mod tests {
 
     use super::*;
+
+    struct SupervisorRun {
+        code: Option<i32>,
+        exit_marker: String,
+        failure_marker: String,
+    }
+
+    /// Run the marker-fd supervisor with a fake launcher script, the given
+    /// request environment and shell, and return what it recorded.
+    fn run_supervisor(
+        launcher_body: &str,
+        target: &[&str],
+        request: &HashMap<String, String>,
+        shell: &[&str],
+    ) -> SupervisorRun {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let temp = project.join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+        let launcher = root.path().join("launcher");
+        std::fs::write(&launcher, launcher_body).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = SandboxProfile::build(
+            vec![project],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            temp,
+        )
+        .unwrap();
+        let plan = SpawnPlan::launcher_for_test(profile.clone(), launcher.clone());
+        let exit_path = root.path().join("exit");
+        let failure_path = root.path().join("failure");
+        let exit_file = File::create(&exit_path).unwrap();
+        let failure_file = File::create(&failure_path).unwrap();
+        let target = target.iter().map(OsString::from).collect::<Vec<_>>();
+        let mut command = Command::new(shell[0]);
+        command.args(&shell[1..]);
+        let fds = apply_marker_fd_allowlist(
+            &mut command,
+            exit_file.as_raw_fd(),
+            failure_file.as_raw_fd(),
+        )
+        .unwrap();
+        let (_, args, _) = launcher_argv(
+            &profile,
+            &launcher,
+            target[0].as_os_str(),
+            &target[1..],
+            Path::new("unused"),
+            Some(fds),
+            None,
+        )
+        .unwrap();
+        command.args(args);
+        apply_sandbox_environment(&plan, &mut command, request);
+        let status = command.status().unwrap();
+        SupervisorRun {
+            code: status.code(),
+            exit_marker: std::fs::read_to_string(exit_path).unwrap(),
+            failure_marker: std::fs::read_to_string(failure_path).unwrap(),
+        }
+    }
+
+    /// The fake launcher's argv is `sandbox-launch --profile-json <json>
+    /// --failure-fd <fd> -- <target...>`.
+    const FAILING_LAUNCHER: &str = "#!/bin/sh\nprintf %s sandbox_unavailable >&\"$5\"\nexit 78\n";
+    const EXEC_LAUNCHER: &str = "#!/bin/sh\nshift 6\nexec \"$@\"\n";
+
+    #[test]
+    fn supervisor_reports_unavailable_only_when_the_launcher_says_so() {
+        let failed = run_supervisor(
+            FAILING_LAUNCHER,
+            &["/bin/true"],
+            &HashMap::new(),
+            &["/bin/sh"],
+        );
+        assert_eq!(failed.code, Some(78));
+        assert_eq!(failed.failure_marker, "sandbox_unavailable");
+        assert_eq!(failed.exit_marker, "78");
+
+        // A target that exits 78 after a successful launch is an ordinary
+        // command status, not a confinement failure.
+        let target = run_supervisor(
+            EXEC_LAUNCHER,
+            &["/bin/sh", "-c", "exit 78"],
+            &HashMap::new(),
+            &["/bin/sh"],
+        );
+        assert_eq!(target.code, Some(78));
+        assert_eq!(target.failure_marker, "");
+        assert_eq!(target.exit_marker, "");
+    }
+
+    #[test]
+    fn exported_function_cannot_run_in_outer_supervisor() {
+        let sentinel = tempfile::tempdir().unwrap();
+        let sentinel = sentinel.path().join("unconfined-function");
+        let request = HashMap::from([
+            (
+                "BASH_FUNC_printf%%".to_string(),
+                "() { echo escaped > \"$SENTINEL\"; }".to_string(),
+            ),
+            (
+                "SENTINEL".to_string(),
+                sentinel.to_string_lossy().into_owned(),
+            ),
+        ]);
+        // Bash in POSIX mode stands in for a Bash-backed /bin/sh (as on
+        // macOS) even on Linux hosts where /bin/sh is dash, which does not
+        // import exported functions. The supervisor's own `printf` runs
+        // outside confinement after the launcher fails.
+        let run = run_supervisor(
+            FAILING_LAUNCHER,
+            &["/bin/true"],
+            &request,
+            &["bash", "--posix"],
+        );
+        assert_eq!(run.code, Some(78));
+        assert!(
+            !sentinel.exists(),
+            "request function ran outside the launcher"
+        );
+        assert_eq!(run.failure_marker, "sandbox_unavailable");
+        assert_eq!(run.exit_marker, "78");
+    }
 
     #[test]
     fn host_plan_clears_inherited_environment_and_applies_snapshot() {
@@ -3727,6 +3923,68 @@ mod policy_tests {
             Some(&expired_attempt),
         );
         assert_eq!(refusal_class(&expired), Some("expired"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unclaimable_escalation_payloads_are_reclaimed_and_refusals_stay_exact() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::FirstParty;
+        let environment =
+            ChildEnvironment::from([(OsString::from("ONLY"), OsString::from("snapshot"))]);
+        let bundle_exists = |grant_id: &str| {
+            let store = ctx.escalation_grants().lock();
+            let grant = &store.grants[grant_id];
+            grant.session_dir.join(&grant.task_id).exists()
+                || grant
+                    .session_dir
+                    .join(format!("{}.json", grant.task_id))
+                    .exists()
+        };
+        let start = Instant::now();
+        let stale = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            start,
+        );
+        assert!(bundle_exists(&stale));
+
+        // The next mint after expiry deletes the unused bundle.
+        let later = start + ESCALATION_GRANT_TTL;
+        let fresh = mint_test_grant(
+            &ctx,
+            &principal,
+            project.path(),
+            b"true",
+            &environment,
+            later,
+        );
+        assert!(!bundle_exists(&stale), "expired payload bundle was kept");
+        assert!(bundle_exists(&fresh));
+        let replay = grant_attempt(stale, project.path(), b"true", environment.clone());
+        assert_eq!(
+            consume_host_escalation_grant_at(&ctx, &principal, &replay, later)
+                .err()
+                .map(EscalationRefusal::class),
+            Some("expired")
+        );
+
+        // A refused attempt uses the grant up, so its bundle goes too.
+        let mut wrong_root = grant_attempt(fresh.clone(), project.path(), b"true", environment);
+        wrong_root.root = elsewhere.path().to_path_buf();
+        assert_eq!(
+            consume_host_escalation_grant_at(&ctx, &principal, &wrong_root, later)
+                .err()
+                .map(EscalationRefusal::class),
+            Some("digest_mismatch")
+        );
+        assert!(!bundle_exists(&fresh), "refused payload bundle was kept");
+        assert_eq!(ctx.escalation_grants().lock().len_for_test(), 2);
     }
 
     #[cfg(unix)]

@@ -1888,8 +1888,9 @@ mod tests {
 mv -f "$AFT_TEST_LAUNCH_ARGS.tmp" "$AFT_TEST_LAUNCH_ARGS"
 [ "$1" = "--profile-json" ] || exit 92
 [ -n "$2" ] || exit 93
-[ "$3" = "--" ] || exit 94
-shift 3
+[ "$3" = "--failure-fd" ] || exit 95
+[ "$5" = "--" ] || exit 94
+shift 5
 exec "$@"
 "#,
         )
@@ -1946,8 +1947,10 @@ exec "$@"
         assert_eq!(lines[0], "sandbox-launch");
         assert_eq!(lines[1], "--profile-json");
         assert!(serde_json::from_str::<serde_json::Value>(lines[2]).is_ok());
-        assert_eq!(lines[3], "--");
-        assert!(lines.len() >= 6, "wrapped argv missing target: {lines:?}");
+        assert_eq!(lines[3], "--failure-fd");
+        assert_eq!(lines[4], crate::sandbox_spawn::CHILD_FAILURE_FD.to_string());
+        assert_eq!(lines[5], "--");
+        assert!(lines.len() >= 8, "wrapped argv missing target: {lines:?}");
 
         stop_spawned_test_task(&ctx, &response);
     }
@@ -1972,7 +1975,7 @@ exec "$@"
         fs::write(
             &launcher_script,
             format!(
-                "printf 'spawn\\n' >> '{}'\necho 'sandbox_unavailable: test backend failed' >&2\nexit 78\n",
+                "printf 'spawn\\n' >> '{}'\necho 'sandbox_unavailable: test backend failed' >&2\nprintf %s sandbox_unavailable >&\"$4\"\nexit 78\n",
                 launcher_spawns.display()
             ),
         )
