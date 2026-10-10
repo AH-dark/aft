@@ -360,6 +360,11 @@ async function handleConfigureWarningsForSession(context: {
       storageDir: context.storageDir,
       pluginVersion: context.pluginVersion,
       projectRoot: context.projectRoot,
+      onDeferred: (warning) => {
+        const pending = pendingEagerWarnings.get(context.projectRoot) ?? [];
+        pending.push(warning);
+        pendingEagerWarnings.set(context.projectRoot, pending);
+      },
     },
     combinedWarnings,
   );

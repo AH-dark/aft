@@ -30,6 +30,7 @@ export interface ConfigureWarningOptions {
   storageDir: string;
   pluginVersion: string;
   projectRoot?: string;
+  onDeferred?: (warning: ConfigureWarning) => void;
 }
 
 type PiNotificationClient = {
@@ -186,7 +187,9 @@ export async function deliverConfigureWarnings(
     // "warned" → already shown once; "unknown" → dedup state unreadable
     // (bridge not configured yet), so do NOT deliver — delivering on unknown
     // is what re-fired the warning every session. Only "fresh" delivers.
-    if ((await warnedStatus(opts.bridge, key)) !== "fresh") continue;
+    const status = await warnedStatus(opts.bridge, key);
+    if (status === "unknown") opts.onDeferred?.(warning);
+    if (status !== "fresh") continue;
 
     if (!sendIgnoredMessage(opts.client, opts.sessionId, formatConfigureWarning(warning))) continue;
 
