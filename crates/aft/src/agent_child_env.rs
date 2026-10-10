@@ -511,8 +511,11 @@ fn managed_git_hooks_root_from(
 /// True when a `core.hooksPath` value was selected by AFT: either a
 /// content-keyed hook directory, or the per-storage-root directory that older
 /// daemons injected (an inherited environment may still carry that value).
-fn is_managed_git_hooks_path(value: &Path) -> bool {
-    if value.ends_with(GIT_HOOKS_DIR_NAME) {
+fn is_managed_git_hooks_path(value: &Path, storage_root: &Path) -> bool {
+    let cache_root =
+        managed_git_hooks_root_from(|name| std::env::var_os(name), cfg!(windows), storage_root);
+    let legacy_root = storage_root.join(GIT_HOOKS_DIR_NAME);
+    if value == cache_root || value == legacy_root {
         return true;
     }
     let keyed = value
@@ -524,7 +527,85 @@ fn is_managed_git_hooks_path(value: &Path) -> bool {
     keyed
         && value
             .parent()
-            .is_some_and(|parent| parent.ends_with(GIT_HOOKS_DIR_NAME))
+            .is_some_and(|parent| parent == cache_root || parent == legacy_root)
+}
+
+fn git_config_count<V: AsRef<std::ffi::OsStr>>(environment: &HashMap<String, V>) -> Option<usize> {
+    let Some(value) = environment.get("GIT_CONFIG_COUNT") else {
+        return Some(0);
+    };
+    let value = value.as_ref().to_str()?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let count = value.parse::<usize>().ok()?;
+    // Each counted entry needs both a key and value. This also bounds work on
+    // malformed counts without imposing a new limit on valid Git configuration.
+    if count > environment.len() / 2 || count >= i32::MAX as usize {
+        return None;
+    }
+    (0..count)
+        .all(|index| {
+            environment.contains_key(&format!("GIT_CONFIG_KEY_{index}"))
+                && environment.contains_key(&format!("GIT_CONFIG_VALUE_{index}"))
+        })
+        .then_some(count)
+}
+
+/// Add the managed `core.hooksPath` after the caller's own numbered Git
+/// configuration so those entries keep their indices and values. A malformed
+/// count already makes Git reject the whole set, so that case falls back to a
+/// single managed entry rather than refusing the child launch.
+fn append_managed_git_config(environment: &mut HashMap<String, String>, storage_root: &Path) {
+    // Re-injection into the same map must not stack a second managed entry.
+    remove_managed_git_config(environment, storage_root);
+    let count = git_config_count(environment).unwrap_or(0);
+    environment.insert("GIT_CONFIG_COUNT".into(), (count + 1).to_string());
+    environment.insert(format!("GIT_CONFIG_KEY_{count}"), "core.hooksPath".into());
+    environment.insert(
+        format!("GIT_CONFIG_VALUE_{count}"),
+        managed_git_hooks_dir(storage_root)
+            .to_string_lossy()
+            .into_owned(),
+    );
+}
+
+fn remove_managed_git_config<V: AsRef<std::ffi::OsStr> + From<String> + Clone>(
+    environment: &mut HashMap<String, V>,
+    storage_root: &Path,
+) {
+    let Some(count) = git_config_count(environment) else {
+        return;
+    };
+    let mut entries = Vec::new();
+    for index in 0..count {
+        let key = environment[&format!("GIT_CONFIG_KEY_{index}")].clone();
+        let value = environment[&format!("GIT_CONFIG_VALUE_{index}")].clone();
+        if key.as_ref() != std::ffi::OsStr::new("core.hooksPath")
+            || !is_managed_git_hooks_path(Path::new(value.as_ref()), storage_root)
+        {
+            entries.push((key, value));
+        }
+    }
+    if entries.len() == count {
+        return;
+    }
+    for index in 0..count {
+        environment.remove(&format!("GIT_CONFIG_KEY_{index}"));
+        environment.remove(&format!("GIT_CONFIG_VALUE_{index}"));
+    }
+    if entries.is_empty() {
+        environment.remove("GIT_CONFIG_COUNT");
+    } else {
+        environment.insert(
+            "GIT_CONFIG_COUNT".into(),
+            V::from(entries.len().to_string()),
+        );
+        for (index, (key, value)) in entries.into_iter().enumerate() {
+            environment.insert(format!("GIT_CONFIG_KEY_{index}"), key);
+            environment.insert(format!("GIT_CONFIG_VALUE_{index}"), value);
+        }
+    }
 }
 
 fn managed_git_hook_contents(hook_name: &str) -> String {
@@ -603,15 +684,25 @@ pub fn scrub_inherited_process_markers() {
     }
     std::env::remove_var(GIT_CO_AUTHOR_ENV);
     std::env::remove_var(GH_SHIM_BINARY_ENV);
-    let aft_hooks_value = std::env::var_os("GIT_CONFIG_VALUE_0")
-        .is_some_and(|value| is_managed_git_hooks_path(Path::new(&value)));
-    if aft_hooks_value
-        && std::env::var_os("GIT_CONFIG_KEY_0").as_deref()
-            == Some(std::ffi::OsStr::new("core.hooksPath"))
-    {
-        std::env::remove_var("GIT_CONFIG_COUNT");
-        std::env::remove_var("GIT_CONFIG_KEY_0");
-        std::env::remove_var("GIT_CONFIG_VALUE_0");
+    let original: HashMap<String, OsString> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            key.into_string()
+                .ok()
+                .filter(|key| key.starts_with("GIT_CONFIG_"))
+                .map(|key| (key, value))
+        })
+        .collect();
+    let mut cleaned = original.clone();
+    remove_managed_git_config(&mut cleaned, &crate::bash_background::storage_dir(None));
+    for key in original.keys() {
+        if !cleaned.contains_key(key) {
+            std::env::remove_var(key);
+        }
+    }
+    for (key, value) in cleaned {
+        if original.get(&key) != Some(&value) {
+            std::env::set_var(key, value);
+        }
     }
 }
 
@@ -738,16 +829,7 @@ pub fn inject(
     if !co_author_enabled {
         environment.remove(GIT_CO_AUTHOR_ENV);
         environment.remove(GH_SHIM_BINARY_ENV);
-        let aft_hooks_value = environment
-            .get("GIT_CONFIG_VALUE_0")
-            .is_some_and(|value| is_managed_git_hooks_path(Path::new(value)));
-        if aft_hooks_value
-            && environment.get("GIT_CONFIG_KEY_0").map(String::as_str) == Some("core.hooksPath")
-        {
-            environment.remove("GIT_CONFIG_COUNT");
-            environment.remove("GIT_CONFIG_KEY_0");
-            environment.remove("GIT_CONFIG_VALUE_0");
-        }
+        remove_managed_git_config(environment, storage_root);
     }
     if !gh_enabled && !co_author_enabled {
         return Ok(());
@@ -796,14 +878,7 @@ pub fn inject(
     }
 
     if co_author_enabled {
-        environment.insert("GIT_CONFIG_COUNT".to_string(), "1".to_string());
-        environment.insert("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string());
-        environment.insert(
-            "GIT_CONFIG_VALUE_0".to_string(),
-            managed_git_hooks_dir(storage_root)
-                .to_string_lossy()
-                .into_owned(),
-        );
+        append_managed_git_config(environment, storage_root);
         environment.insert(GIT_CO_AUTHOR_ENV.to_string(), config.git.co_author.clone());
         if config.git.co_author == "auto" {
             environment.insert(
@@ -898,27 +973,96 @@ fn probe_gh_shim_binary(binary: &Path) -> Result<(), String> {
     }
 
     let result = probe_gh_shim_binary_uncached(binary);
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, result.clone());
+    if result.is_ok() {
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, result.clone());
+    }
     result
 }
 
 fn probe_gh_shim_binary_uncached(binary: &Path) -> Result<(), String> {
     // Invoke the image directly, including on Windows where the managed entry is
     // a gh.cmd wrapper. This keeps validation independent of the wrapper's shell.
-    let output = Command::new(binary)
-        .args(["gh-shim", "--shim-version"])
-        .output()
-        .map_err(|error| format!("could not execute --shim-version probe: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "--shim-version probe exited with {status}",
-            status = output.status
-        ));
+    probe_gh_shim_binary_with_budget(binary, Duration::from_secs(2))
+}
+
+fn probe_gh_shim_binary_with_budget(binary: &Path, budget: Duration) -> Result<(), String> {
+    use std::io::{Read, Seek};
+    use std::process::Stdio;
+    struct ProbeOutput(PathBuf);
+    impl Drop for ProbeOutput {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
     }
-    let report: ShimSelfReport = serde_json::from_slice(&output.stdout)
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|error| error.to_string())?;
+    let output_path = std::env::temp_dir().join(format!(
+        "aft-shim-probe-{:032x}",
+        u128::from_le_bytes(random)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut stdout = options
+        .open(&output_path)
+        .map_err(|error| format!("could not create shim probe output: {error}"))?;
+    let _output_cleanup = ProbeOutput(output_path);
+    let mut command = Command::new(binary);
+    command
+        .env_clear()
+        .args(["gh-shim", "--shim-version"])
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone().map_err(|error| error.to_string())?)
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not execute --shim-version probe: {error}"))?;
+    let deadline = Instant::now() + budget;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            result => {
+                #[cfg(unix)]
+                // SAFETY: the child was spawned into a new process group whose
+                // id is its pid; no unrelated process shares that group.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(error) => format!("could not wait for --shim-version probe: {error}"),
+                    _ => "--shim-version probe exceeded its deadline".to_string(),
+                });
+            }
+        }
+    };
+    if !status.success() {
+        return Err(format!("--shim-version probe exited with {status}"));
+    }
+    stdout.rewind().map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    stdout
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let report: ShimSelfReport = serde_json::from_slice(&bytes)
         .map_err(|error| format!("--shim-version probe emitted invalid JSON: {error}"))?;
     if report.shim_version.is_empty() || report.gh_routing_schema_floor == 0 {
         return Err("--shim-version probe omitted required shim identity fields".to_string());
@@ -958,7 +1102,30 @@ fn existing_gh_entry_is_valid(_shims_dir: &Path) -> bool {
     false
 }
 
+fn lock_hook_maintenance(hooks_dir: &Path) -> Result<fs::File, String> {
+    let root = hooks_dir
+        .parent()
+        .ok_or_else(|| "Git hooks directory has no parent".to_string())?;
+    crate::private_storage::open_root(root).map_err(|error| error.to_string())?;
+    let mut options = crate::private_storage::options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    // Keep the lock inode in place: unlinking it would let a later process
+    // acquire a different lock while an earlier maintenance transaction runs.
+    let lock = options
+        .open(root.join(".maintenance.lock"))
+        .map_err(|error| error.to_string())?;
+    lock.lock()
+        .map_err(|error| format!("failed to lock Git hook maintenance: {error}"))?;
+    Ok(lock)
+}
+
 fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {
+    let _maintenance = lock_hook_maintenance(hooks_dir)?;
     let expected = &managed_git_hook_set().hooks;
     if fs::symlink_metadata(hooks_dir).is_err() {
         install_managed_git_hook_set(hooks_dir, expected)?;
@@ -1011,8 +1178,13 @@ fn refresh_legacy_git_hooks(root: &Path, budget: Duration) -> Result<LegacyHookR
         )
     })?;
     let mut report = LegacyHookRefresh::default();
-    // Bound enumeration itself, not a vector collected from an unbounded walk.
-    for entry in entries.take(LEGACY_HOOK_DIRECTORY_SCAN_LIMIT) {
+    let mut keyed_directories = 0usize;
+    // Enumeration is bounded by the deadline, and the refresh work by the
+    // number of hook-set directories. Unrelated cache entries (lock files,
+    // staging leftovers) never count toward the directory limit, and only a
+    // hook-set directory that was actually left unvisited marks the refresh
+    // as bounded: a complete scan is never a reason to refuse a launch.
+    for entry in entries {
         if Instant::now() >= deadline {
             report.bounded = true;
             break;
@@ -1027,6 +1199,11 @@ fn refresh_legacy_git_hooks(root: &Path, budget: Duration) -> Result<LegacyHookR
         if !keyed || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
+        if keyed_directories == LEGACY_HOOK_DIRECTORY_SCAN_LIMIT {
+            report.bounded = true;
+            break;
+        }
+        keyed_directories += 1;
         for (hook_name, contents) in &managed_git_hook_set().hooks {
             if Instant::now() >= deadline {
                 report.bounded = true;
@@ -1070,11 +1247,19 @@ fn refresh_legacy_git_hooks(root: &Path, budget: Duration) -> Result<LegacyHookR
             break;
         }
     }
-    report.bounded |= report.entries_examined == LEGACY_HOOK_DIRECTORY_SCAN_LIMIT;
-    crate::slog_info!(
-        "[agent_child_env] Git hooks refresh {}: entries_examined={} hooks_examined={} rewritten={} bounded={}",
-        root.display(), report.entries_examined, report.hooks_examined, report.rewritten, report.bounded
-    );
+    // This refresh runs before every child launch with co-authorship on, so
+    // a refresh that changed nothing is routine and logged at debug level.
+    if report.rewritten > 0 || report.bounded {
+        crate::slog_info!(
+            "[agent_child_env] Git hooks refresh {}: entries_examined={} hooks_examined={} rewritten={} bounded={}",
+            root.display(), report.entries_examined, report.hooks_examined, report.rewritten, report.bounded
+        );
+    } else {
+        crate::slog_debug!(
+            "[agent_child_env] Git hooks refresh {}: entries_examined={} hooks_examined={} rewritten={} bounded={}",
+            root.display(), report.entries_examined, report.hooks_examined, report.rewritten, report.bounded
+        );
+    }
     Ok(report)
 }
 
@@ -1373,6 +1558,16 @@ fn quarantine_test_logs() -> &'static Mutex<Vec<String>> {
 }
 
 #[cfg(unix)]
+fn gh_entry_staging_path(shims_dir: &Path) -> PathBuf {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    shims_dir.join(format!(
+        ".gh.tmp.{}.{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+#[cfg(unix)]
 fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
     use std::os::unix::fs::symlink;
 
@@ -1394,7 +1589,7 @@ fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
             entry.display()
         ));
     }
-    let temporary = shims_dir.join(format!(".gh.tmp.{}", std::process::id()));
+    let temporary = gh_entry_staging_path(shims_dir);
     let _ = fs::remove_file(&temporary);
     symlink(binary, &temporary).map_err(|error| {
         format!(
@@ -1492,6 +1687,15 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Replace one managed file through a temporary sibling and a rename, so a
 /// reader sees either the old or the new bytes.
 fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(), String> {
+    install_managed_file_before_publish(path, bytes, executable, || {})
+}
+
+fn install_managed_file_before_publish(
+    path: &Path,
+    bytes: &[u8],
+    executable: bool,
+    before_publish: impl FnOnce(),
+) -> Result<(), String> {
     if path.is_dir() {
         return Err(format!(
             "cannot replace managed child file because it is a directory: {}",
@@ -1536,17 +1740,12 @@ fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(
     }
     #[cfg(not(unix))]
     let _ = executable;
-    // Windows rename does not replace an existing destination. Managed files
-    // contain no user data, so remove only the exact stale file before install.
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| {
-            format!(
-                "failed to replace stale managed child file {}: {error}",
-                path.display()
-            )
-        })?;
-    }
+    // `fs::rename` replaces an existing destination file on every platform
+    // (on Windows it asks for replace-existing semantics), so readers never
+    // observe a missing file. A destination held open without delete sharing
+    // makes the rename fail; that error is reported below instead of first
+    // deleting the old file and leaving nothing in its place.
+    before_publish();
     fs::rename(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         format!(
@@ -2395,21 +2594,148 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn managed_file_destination_exists_until_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("managed.cmd");
+        fs::write(&path, b"old bytes").unwrap();
+        install_managed_file_before_publish(&path, b"new bytes", false, || {
+            assert_eq!(fs::read(&path).unwrap(), b"old bytes");
+        })
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn hook_maintenance_holds_a_cross_process_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let hooks = temp
+            .path()
+            .join("git-hooks")
+            .join(&managed_git_hook_set().key);
+        let guard = lock_hook_maintenance(&hooks).unwrap();
+        let other = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(hooks.parent().unwrap().join(".maintenance.lock"))
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(guard);
+        other.try_lock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_deadline_and_minimal_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("aft-probe");
+        write_executable(&binary, "#!/bin/sh\nexec /bin/sleep 60\n");
+        let error = probe_gh_shim_binary_with_budget(&binary, Duration::ZERO).unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        write_executable(&binary, "#!/bin/sh\n[ -z \"${HOME:-}\" ] || exit 1\nprintf '%s' '{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}'\n");
+        probe_gh_shim_binary_uncached(&binary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_failure_can_be_retried_without_changing_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("aft-probe");
+        let marker = temp.path().join("first-call");
+        write_executable(&binary, &format!("#!/bin/sh\nif [ ! -f '{}' ]; then : > '{}'; exit 1; fi\nprintf '%s' '{{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}}'\n", marker.display(), marker.display()));
+        assert!(probe_gh_shim_binary(&binary).is_err());
+        probe_gh_shim_binary(&binary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_staging_names_are_unique_per_call() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_ne!(
+            gh_entry_staging_path(temp.path()),
+            gh_entry_staging_path(temp.path())
+        );
+    }
+
+    #[test]
+    fn git_config_injection_preserves_user_entries() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.github.shim = false;
+        config.git.co_author = "Agent <agent@example.com>".to_string();
+        let mut environment = HashMap::from([
+            ("GIT_CONFIG_COUNT".into(), "2".into()),
+            ("GIT_CONFIG_KEY_0".into(), "user.name".into()),
+            ("GIT_CONFIG_VALUE_0".into(), "Original".into()),
+            ("GIT_CONFIG_KEY_1".into(), "core.hooksPath".into()),
+            ("GIT_CONFIG_VALUE_1".into(), "/user/hooks".into()),
+        ]);
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(environment["GIT_CONFIG_COUNT"], "3");
+        assert_eq!(environment["GIT_CONFIG_VALUE_0"], "Original");
+        assert_eq!(environment["GIT_CONFIG_VALUE_1"], "/user/hooks");
+        assert_eq!(environment["GIT_CONFIG_KEY_2"], "core.hooksPath");
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(environment["GIT_CONFIG_COUNT"], "3", "re-injection stacked");
+        config.git.co_author = "off".into();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(environment["GIT_CONFIG_COUNT"], "2");
+        assert_eq!(environment["GIT_CONFIG_VALUE_0"], "Original");
+        assert_eq!(environment["GIT_CONFIG_VALUE_1"], "/user/hooks");
+        assert!(!environment.contains_key("GIT_CONFIG_KEY_2"));
+    }
+
+    #[test]
+    fn unrelated_git_hooks_suffix_survives_cleanup() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.github.shim = false;
+        config.git.co_author = "off".into();
+        for path in [
+            storage.path().join("user/git-hooks"),
+            storage
+                .path()
+                .join("user/git-hooks")
+                .join(&managed_git_hook_set().key),
+        ] {
+            let mut environment = HashMap::from([
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
+                (
+                    "GIT_CONFIG_VALUE_0".into(),
+                    path.to_string_lossy().into_owned(),
+                ),
+            ]);
+            let original = environment.clone();
+            inject(&config, storage.path(), &mut environment, None).unwrap();
+            assert_eq!(environment, original);
+        }
+    }
+
     #[test]
     fn managed_hooks_path_recognition_covers_keyed_and_legacy_directories() {
+        let storage = tempfile::tempdir().unwrap();
         let key = &managed_git_hook_set().key;
         assert_eq!(key.len(), GIT_HOOK_SET_KEY_LEN);
         assert!(is_managed_git_hooks_path(
-            &Path::new("/c/aft").join(GIT_HOOKS_DIR_NAME).join(key)
+            &managed_git_hooks_dir(storage.path()),
+            storage.path()
         ));
         assert!(is_managed_git_hooks_path(
-            &Path::new("/s").join(GIT_HOOKS_DIR_NAME)
+            &storage.path().join(GIT_HOOKS_DIR_NAME),
+            storage.path()
         ));
         assert!(!is_managed_git_hooks_path(
-            &Path::new("/repo").join(GIT_HOOKS_DIR_NAME).join("custom")
+            &Path::new("/repo").join(GIT_HOOKS_DIR_NAME).join("custom"),
+            storage.path()
         ));
         assert!(!is_managed_git_hooks_path(
-            &Path::new("/repo/.githooks").join(key)
+            &Path::new("/repo/.githooks").join(key),
+            storage.path()
         ));
     }
 
@@ -2418,9 +2744,8 @@ mod tests {
         let mut config = Config::default();
         config.github.shim = false;
         config.git = GitConfig::default();
-        let keyed = Path::new("/c/aft")
-            .join(GIT_HOOKS_DIR_NAME)
-            .join(&managed_git_hook_set().key);
+        let storage = tempfile::tempdir().unwrap();
+        let keyed = managed_git_hooks_dir(storage.path());
         let mut environment = HashMap::from([
             ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
             ("GIT_CONFIG_KEY_0".to_string(), "core.hooksPath".to_string()),
@@ -2429,7 +2754,7 @@ mod tests {
                 keyed.to_string_lossy().into_owned(),
             ),
         ]);
-        inject(&config, Path::new("/unused"), &mut environment, None).unwrap();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
         assert!(environment.is_empty(), "{environment:?}");
     }
 
@@ -2480,7 +2805,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             siblings.len(),
-            1,
+            2,
             "staging directories were left behind: {siblings:?}"
         );
     }
@@ -2861,14 +3186,37 @@ mod tests {
         );
     }
 
+    fn create_hook_set_directories(root: &Path, count: usize) {
+        for index in 0..count {
+            fs::create_dir(root.join(format!("{index:0width$x}", width = GIT_HOOK_SET_KEY_LEN)))
+                .unwrap();
+        }
+    }
+
     #[test]
-    fn legacy_refresh_bounds_enumeration() {
+    fn legacy_refresh_does_not_count_unrelated_entries() {
         let temp = tempfile::tempdir().unwrap();
         for index in 0..270 {
             fs::write(temp.path().join(format!("foreign-{index}")), "not a hook").unwrap();
         }
         let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
-        assert_eq!(report.entries_examined, 256);
+        assert_eq!(report.entries_examined, 270);
+        assert!(!report.bounded);
+    }
+
+    #[test]
+    fn legacy_refresh_bounds_only_unvisited_hook_set_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        create_hook_set_directories(temp.path(), LEGACY_HOOK_DIRECTORY_SCAN_LIMIT);
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        assert!(
+            !report.bounded,
+            "a complete scan at the limit is not bounded"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        create_hook_set_directories(temp.path(), LEGACY_HOOK_DIRECTORY_SCAN_LIMIT + 1);
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
         assert!(report.bounded);
     }
 
@@ -2884,9 +3232,7 @@ mod tests {
     #[test]
     fn incomplete_legacy_refresh_refuses_to_launch_with_unvisited_dispatchers() {
         let temp = tempfile::tempdir().unwrap();
-        for index in 0..270 {
-            fs::write(temp.path().join(format!("foreign-{index}")), "not a hook").unwrap();
-        }
+        create_hook_set_directories(temp.path(), LEGACY_HOOK_DIRECTORY_SCAN_LIMIT + 1);
         let error =
             ensure_managed_git_hooks(&temp.path().join(&managed_git_hook_set().key)).unwrap_err();
         assert!(error.contains("refresh was bounded"), "{error}");
