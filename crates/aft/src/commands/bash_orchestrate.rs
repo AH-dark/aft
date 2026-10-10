@@ -450,12 +450,13 @@ pub fn build_bash_outcome(
     let session_id = req.session().to_string();
     let attach_command = "bash".to_string();
     let detach_on_user_message = params.wait;
-    ctx.bash_background()
-        .register_foreground_task(&session_id, &task_id);
-    if detach_on_user_message {
-        ctx.bash_background()
-            .begin_wait_mode_session(&session_id, &task_id);
-    }
+    // The polling closure owns registration, including cancellation paths
+    // that drop it without ever polling a terminal response.
+    let mut wait_registration = Some(ctx.bash_background().foreground_wait_guard(
+        &session_id,
+        &task_id,
+        detach_on_user_message,
+    ));
     let worker_cap_ms = blocking_wait_cap_ms(
         params.block_to_completion || params.wait,
         worker_wait_max_ms(ctx),
@@ -483,7 +484,6 @@ pub fn build_bash_outcome(
     let task_id_for_poll = task_id.clone();
     let request_id_for_poll = request_id.clone();
     let session_id_for_poll = session_id.clone();
-    let session_id_for_cleanup = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
         // A caller blocked on its command is waiting on it: keep its default
@@ -511,7 +511,7 @@ pub fn build_bash_outcome(
             } else if detach_on_user_message
                 && ctx
                     .bash_background()
-                    .take_wait_mode_detach(&session_id_for_poll)
+                    .take_task_wait_mode_detach(&session_id_for_poll, &task_id_for_poll)
             {
                 Some(detach_wait_mode_bash(
                     ctx,
@@ -574,13 +574,7 @@ pub fn build_bash_outcome(
         };
 
         if response.is_some() {
-            if detach_on_user_message {
-                ctx.bash_background()
-                    .end_wait_mode_session(&session_id_for_cleanup, &task_id_for_poll);
-            } else {
-                ctx.bash_background()
-                    .unregister_foreground_task(&session_id_for_cleanup, &task_id_for_poll);
-            }
+            wait_registration.take();
         }
         response
     });

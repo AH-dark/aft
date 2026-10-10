@@ -17,6 +17,31 @@ use crate::sandbox_spawn::SpawnPlan;
 use super::persistence::{ExitMarker, TaskArtifact, TaskIoHandles, TaskPaths};
 use super::pty_runtime::{CompletionCoordinator, PtyRuntime};
 
+struct SpawnedPtyChild(Option<Box<dyn portable_pty::Child + Send + Sync>>);
+
+impl Drop for SpawnedPtyChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        // Dropping a PTY handle is not a termination guarantee: a child can
+        // ignore HUP. Setup still owns this child, so kill and reap it here.
+        #[cfg(unix)]
+        if let Some(pid) = child.process_id() {
+            unsafe {
+                libc::killpg(pid as i32, libc::SIGKILL);
+            }
+        }
+        let _ = child.kill();
+        loop {
+            match child.wait() {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_pty_for_command(
     spawn_plan: &SpawnPlan,
@@ -202,8 +227,11 @@ fn try_spawn_pty(
         crate::privacy_spawn::note_session(session_id);
     }
     drop(profile_handle);
-    let child_pid = child.process_id();
-    let killer = child.clone_killer();
+    let mut child = SpawnedPtyChild(Some(child));
+    let child_pid = child.0.as_ref().unwrap().process_id();
+    let killer = child.0.as_ref().unwrap().clone_killer();
+    #[cfg(test)]
+    fail_pty_setup_for_test(child_pid)?;
     let reader = pair
         .master
         .try_clone_reader()
@@ -239,7 +267,7 @@ fn try_spawn_pty(
         Some(Arc::clone(&writer)),
     );
     spawn_waiter(
-        child,
+        child.0.take().unwrap(),
         exit,
         Arc::clone(&was_killed),
         Arc::clone(&exit_observed),
@@ -258,6 +286,28 @@ fn try_spawn_pty(
         coordinator,
         #[cfg(any(windows, test))]
         output_drain: cfg!(windows).then(super::pty_runtime::PtyOutputDrain::default),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SETUP_FAILURE: std::cell::RefCell<Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicU32>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_pty_setup_for_test(pid: Option<u32>) -> Result<(), String> {
+    SETUP_FAILURE.with(|failure| {
+        if let Some((ready, observed)) = failure.borrow_mut().take() {
+            observed.store(pid.unwrap(), Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(ready.exists(), "PTY child never armed its HUP handler");
+            Err("clone PTY reader failed: injected setup failure".into())
+        } else {
+            Ok(())
+        }
     })
 }
 
@@ -382,13 +432,15 @@ impl DsrScanner {
 }
 
 pub(crate) fn spawn_waiter(
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
     mut exit_file: std::fs::File,
     was_killed: Arc<AtomicBool>,
     exit_observed: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
 ) {
+    let mut owned_child = SpawnedPtyChild(Some(child));
     thread::spawn(move || {
+        let mut child = owned_child.0.take().unwrap();
         let marker = loop {
             match child.wait() {
                 Ok(status) => {
@@ -579,4 +631,37 @@ mod tests {
         // Partial-but-never-completed sequence must not fire.
         assert_eq!(scan_chunks(&[b"\x1b[6", b"x"]), 0);
     }
+}
+#[cfg(unix)]
+#[test]
+fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
+    use super::persistence::{create_task_layout, BgMode};
+    let dir = tempfile::tempdir().unwrap();
+    let layout = create_task_layout(dir.path(), "session", "bash-0000000000000901").unwrap();
+    let mut handles = TaskIoHandles::create(&layout, BgMode::Pty, false).unwrap();
+    let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    SETUP_FAILURE
+        .with(|failure| *failure.borrow_mut() = Some((dir.path().join("ready"), pid.clone())));
+    let result = try_spawn_pty(
+        &SpawnPlan::Unsandboxed,
+        "bash-0000000000000901",
+        "session",
+        std::ffi::OsStr::new("/bin/sh"),
+        &["-c".into(), "trap '' HUP; : > ready; sleep 30".into()],
+        &layout.paths,
+        dir.path(),
+        &HashMap::new(),
+        24,
+        80,
+        crossbeam_channel::unbounded().0,
+        &mut handles,
+    );
+    let pid = pid.load(Ordering::SeqCst);
+    assert_ne!(pid, 0);
+    let alive = super::process::is_process_alive(pid);
+    if alive {
+        super::process::terminate_pgid(pid as i32, None);
+    }
+    assert!(result.is_err());
+    assert!(!alive, "fallible PTY setup abandoned a live child");
 }

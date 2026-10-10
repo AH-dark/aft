@@ -86,20 +86,55 @@ fn select_systemd_scope_launcher_with(
 pub(crate) fn select_systemd_scope_launcher() -> Option<PathBuf> {
     select_systemd_scope_launcher_with(
         || which::which("systemd-run").ok(),
-        |launcher| {
-            std::process::Command::new(launcher)
-                .args(["--user", "--scope", "--collect", "--quiet", "/bin/true"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-        },
+        |launcher| probe_systemd_scope(launcher, Duration::from_secs(1)),
     )
 }
 
 #[cfg(target_os = "linux")]
+fn probe_systemd_scope(launcher: &Path, limit: Duration) -> bool {
+    let mut command = std::process::Command::new(launcher);
+    command
+        .args(["--user", "--scope", "--collect", "--quiet", "/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    start_new_session(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if Instant::now() < deadline => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            _ => {
+                // The availability probe must not retain a launch indefinitely.
+                // Kill its session as well as the client, then reap the client.
+                unsafe {
+                    libc::killpg(child.id() as i32, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn linux_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
+    // An empty group needs no /proc walk. EPERM still means the group exists
+    // and must be enumerated, including reparented descendants.
+    if pgid > 0 && unsafe { libc::kill(-pgid, 0) } == -1 && io_group_missing() {
+        return Vec::new();
+    }
+    #[cfg(test)]
+    PROC_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -109,6 +144,14 @@ fn linux_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
         .filter_map(|pid| linux_process_member(pid, pgid))
         .collect()
 }
+
+#[cfg(target_os = "linux")]
+fn io_group_missing() -> bool {
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! { static PROC_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 #[cfg(target_os = "linux")]
 fn linux_process_member(pid: u32, expected_pgid: i32) -> Option<LiveDescendant> {
@@ -742,4 +785,34 @@ pub fn is_recorded_process_alive(pid: u32, task_started_at_ms: u64) -> bool {
     crate::root_cache::process_start_time_ms(pid).is_none_or(|started_at_ms| {
         started_at_ms <= task_started_at_ms.saturating_add(PROCESS_START_GRACE_MS)
     })
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn lifecycle_empty_group_avoids_proc_scan() {
+    let mut command = std::process::Command::new("/bin/true");
+    start_new_session(&mut command);
+    let mut child = command.spawn().unwrap();
+    let pgid = child.id() as i32;
+    child.wait().unwrap();
+    PROC_SCAN_COUNT.with(|count| count.set(0));
+    assert!(linux_process_group_members(pgid).is_empty());
+    assert_eq!(
+        PROC_SCAN_COUNT.with(std::cell::Cell::get),
+        0,
+        "empty group required a host-wide scan"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn lifecycle_scope_probe_deadline_falls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = dir.path().join("systemd-run");
+    std::fs::write(&launcher, "#!/bin/sh\nsleep 0.1\nexit 0\n").unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !probe_systemd_scope(&launcher, Duration::ZERO),
+        "expired probe still reported availability"
+    );
 }

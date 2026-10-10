@@ -32,15 +32,95 @@ pub(crate) fn current_pass() -> Option<WatchdogPassCause> {
 /// Registries subscribe to one process timer and wake multiplexer. Weak entries
 /// cannot keep an unloaded project (and all its finished history) alive forever.
 pub(crate) fn start(registry: BgTaskRegistry) {
-    scheduler()
+    if scheduler()
         .send(std::sync::Arc::downgrade(&registry.inner))
-        .expect("bash watchdog scheduler stopped");
+        .is_err()
+    {
+        crate::slog_warn!("bash watchdog scheduler stopped");
+    }
+}
+
+fn start_cleanup_with(
+    cleaning: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    work: impl FnOnce() + Send + 'static,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) {
+    struct Reset(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let reset = Reset(cleaning.clone());
+    if let Err(error) = spawn(Box::new(move || {
+        let _reset = reset;
+        work();
+    })) {
+        crate::slog_warn!("failed to start bash cleanup: {error}");
+    }
 }
 
 struct Subscription {
     registry: std::sync::Weak<super::registry::RegistryInner>,
     wake_rx: Receiver<()>,
     awaiting_reader: HashMap<String, Instant>,
+}
+
+type TimeoutKill = (BgTaskRegistry, std::sync::Arc<BgTask>);
+
+fn timeout_kills() -> Option<crossbeam_channel::Sender<TimeoutKill>> {
+    static KILLS: std::sync::OnceLock<
+        std::sync::Mutex<Option<crossbeam_channel::Sender<TimeoutKill>>>,
+    > = std::sync::OnceLock::new();
+    let mut queue = KILLS
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(queue) = queue.as_ref() {
+        return Some(queue.clone());
+    }
+    let started = {
+        let (tx, rx) = crossbeam_channel::bounded::<TimeoutKill>(64);
+        let mut workers = 0;
+        for index in 0..4 {
+            let rx = rx.clone();
+            match thread::Builder::new()
+                .name(format!("aft-bash-timeout-{index}"))
+                .spawn(move || {
+                    for (registry, task) in rx {
+                        struct Reset(std::sync::Arc<BgTask>);
+                        impl Drop for Reset {
+                            fn drop(&mut self) {
+                                self.0.timeout_kill_queued.store(false, Ordering::SeqCst);
+                            }
+                        }
+                        let _reset = Reset(task.clone());
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if !task.is_terminal() {
+                                let _ = registry.kill_for_timeout(&task.task_id, &task.session_id);
+                            }
+                        }));
+                    }
+                }) {
+                Ok(_) => workers += 1,
+                Err(error) => crate::slog_warn!("failed to start bash timeout worker: {error}"),
+            }
+        }
+        (workers > 0).then_some(tx)
+    };
+    *queue = started.clone();
+    started
+}
+
+fn schedule_timeout_kill(registry: &BgTaskRegistry, task: &std::sync::Arc<BgTask>) {
+    if task.timeout_kill_queued.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if !timeout_kills()
+        .is_some_and(|queue| queue.try_send((registry.clone(), task.clone())).is_ok())
+    {
+        task.timeout_kill_queued.store(false, Ordering::SeqCst);
+    }
 }
 
 fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::registry::RegistryInner>>
@@ -112,17 +192,9 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                                 .iter()
                                 .map(|entry| entry.registry.clone())
                                 .collect();
-                            let cleaning = std::sync::Arc::clone(&cleaning);
-                            thread::Builder::new()
-                                .name("aft-bash-cleanup".into())
-                                .spawn(move || {
-                                    struct Reset(std::sync::Arc<std::sync::atomic::AtomicBool>);
-                                    impl Drop for Reset {
-                                        fn drop(&mut self) {
-                                            self.0.store(false, Ordering::SeqCst);
-                                        }
-                                    }
-                                    let _reset = Reset(cleaning);
+                            start_cleanup_with(
+                                &cleaning,
+                                move || {
                                     for inner in registries
                                         .into_iter()
                                         .filter_map(|registry| registry.upgrade())
@@ -131,8 +203,14 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
                                         registry.cleanup_finished(FINISHED_RETENTION);
                                         registry.request_recurring_persisted_gc();
                                     }
-                                })
-                                .expect("failed to start bash cleanup");
+                                },
+                                |work| {
+                                    thread::Builder::new()
+                                        .name("aft-bash-cleanup".into())
+                                        .spawn(work)
+                                        .map(|_| ())
+                                },
+                            );
                         }
                         continue;
                     }
@@ -172,7 +250,7 @@ fn scheduler() -> &'static crossbeam_channel::Sender<std::sync::Weak<super::regi
     })
 }
 
-fn run_pass(
+pub(super) fn run_pass(
     registry: &BgTaskRegistry,
     pass_cause: WatchdogPassCause,
     awaiting_reader: &mut HashMap<String, Instant>,
@@ -196,8 +274,7 @@ fn run_pass(
             continue;
         }
         let timeout_expired = task
-            .state
-            .lock()
+            .lock_state()
             .ok()
             .map(|state| {
                 state.metadata.remote.is_none()
@@ -208,7 +285,7 @@ fn run_pass(
             })
             .unwrap_or(false);
         if timeout_expired {
-            let _ = registry.kill_for_timeout(&task.task_id, &task.session_id);
+            schedule_timeout_kill(registry, &task);
             continue;
         }
         registry.maybe_emit_long_running_reminder(&task);
@@ -231,6 +308,9 @@ fn retire_terminal_task(
     pass_cause: WatchdogPassCause,
     awaiting_reader: &mut HashMap<String, Instant>,
 ) {
+    if registry.retry_terminal_persist(task).is_err() {
+        return;
+    }
     registry.record_completion_pass_cause(&task.task_id, pass_cause);
     awaiting_reader.remove(&task.task_id);
     registry.retire_watchdog_task(&task.task_id);
@@ -289,4 +369,17 @@ mod tests {
             "without a pending wake a tick pass stays a tick pass"
         );
     }
+}
+#[test]
+fn lifecycle_cleanup_spawn_failure_does_not_panic_or_disable_retry() {
+    let cleaning = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let result = std::panic::catch_unwind(|| {
+        start_cleanup_with(
+            &cleaning,
+            || panic!("worker must not execute"),
+            |_| Err(std::io::Error::other("injected thread admission failure")),
+        )
+    });
+    assert!(result.is_ok(), "cleanup admission killed the scheduler");
+    assert!(!cleaning.load(Ordering::SeqCst));
 }

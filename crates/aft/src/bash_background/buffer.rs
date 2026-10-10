@@ -59,6 +59,24 @@ impl ArtifactSource {
         }
     }
 
+    fn sampled(&self) -> io::Result<(ValidatedArtifact, u64)> {
+        let file = self.open()?;
+        let len = file.len()?;
+        #[cfg(test)]
+        GROW_AFTER_STAT.with(|hook| {
+            if let Some(bytes) = hook.borrow_mut().take() {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.path())
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+            }
+        });
+        Ok((file, len))
+    }
+
     fn path(&self) -> &Path {
         match self {
             Self::Registered { paths, artifact } => paths.artifact_path(*artifact),
@@ -78,6 +96,11 @@ impl ArtifactSource {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static GROW_AFTER_STAT: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone)]
@@ -319,7 +342,7 @@ pub(crate) fn read_file_tail(path: &Path, max_bytes: usize) -> io::Result<(Vec<u
 }
 
 fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<BoundedRead> {
-    let total_bytes = source.open()?.len()?;
+    let (mut file, total_bytes) = source.sampled()?;
     if total_bytes > max_bytes as u64 {
         if max_bytes == 0 {
             return Ok(BoundedRead {
@@ -335,7 +358,7 @@ fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<
             max_bytes - max_bytes / 2,
         );
     }
-    let bytes = source.open()?.read_all()?;
+    let bytes = file.read_range(0, total_bytes)?;
     Ok(BoundedRead {
         text: String::from_utf8_lossy(&bytes).into_owned(),
         truncated: false,
@@ -354,9 +377,9 @@ fn read_single_file_head_tail(
     head_bytes: usize,
     tail_bytes: usize,
 ) -> io::Result<BoundedRead> {
-    let total_bytes = source.open()?.len()?;
+    let (mut file, total_bytes) = source.sampled()?;
     if total_bytes <= max_bytes as u64 {
-        let bytes = source.open()?.read_all()?;
+        let bytes = file.read_range(0, total_bytes)?;
         return Ok(BoundedRead {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             truncated: false,
@@ -382,17 +405,27 @@ fn read_two_file_head_tail(
     head_bytes: usize,
     tail_bytes: usize,
 ) -> (BoundedRead, usize) {
-    let first_len = first.open().and_then(|file| file.len()).unwrap_or(0);
-    let second_len = second.open().and_then(|file| file.len()).unwrap_or(0);
+    let (mut first_file, first_len) = first
+        .sampled()
+        .map(|(file, len)| (Some(file), len))
+        .unwrap_or((None, 0));
+    let (mut second_file, second_len) = second
+        .sampled()
+        .map(|(file, len)| (Some(file), len))
+        .unwrap_or((None, 0));
     let total_bytes = first_len.saturating_add(second_len);
     if total_bytes <= max_bytes as u64 {
-        let first_bytes = first
-            .open()
-            .and_then(|mut file| file.read_all())
+        let first_bytes = first_file
+            .as_mut()
+            .map(|file| file.read_range(0, first_len))
+            .transpose()
+            .map(Option::unwrap_or_default)
             .unwrap_or_default();
-        let second_bytes = second
-            .open()
-            .and_then(|mut file| file.read_all())
+        let second_bytes = second_file
+            .as_mut()
+            .map(|file| file.read_range(0, second_len))
+            .transpose()
+            .map(Option::unwrap_or_default)
             .unwrap_or_default();
         let first_text = String::from_utf8_lossy(&first_bytes);
         let boundary = first_text.len();
@@ -434,17 +467,27 @@ fn read_two_file_tails(
     second: &ArtifactSource,
     max_bytes: usize,
 ) -> (String, bool) {
-    let first_len = first.open().and_then(|file| file.len()).unwrap_or(0);
-    let second_len = second.open().and_then(|file| file.len()).unwrap_or(0);
+    let (mut first_file, first_len) = first
+        .sampled()
+        .map(|(file, len)| (Some(file), len))
+        .unwrap_or((None, 0));
+    let (mut second_file, second_len) = second
+        .sampled()
+        .map(|(file, len)| (Some(file), len))
+        .unwrap_or((None, 0));
     let total_bytes = first_len.saturating_add(second_len);
     if total_bytes <= max_bytes as u64 {
-        let first_bytes = first
-            .open()
-            .and_then(|mut file| file.read_all())
+        let first_bytes = first_file
+            .as_mut()
+            .map(|file| file.read_range(0, first_len))
+            .transpose()
+            .map(Option::unwrap_or_default)
             .unwrap_or_default();
-        let second_bytes = second
-            .open()
-            .and_then(|mut file| file.read_all())
+        let second_bytes = second_file
+            .as_mut()
+            .map(|file| file.read_range(0, second_len))
+            .transpose()
+            .map(Option::unwrap_or_default)
             .unwrap_or_default();
         return (
             combine_streams(
@@ -539,8 +582,13 @@ fn align_start_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-fn align_end_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
+fn align_end_to_utf8(bytes: Vec<u8>) -> Vec<u8> {
+    align_end_to_utf8_with(bytes, || {})
+}
+
+fn align_end_to_utf8_with(mut bytes: Vec<u8>, mut visit: impl FnMut()) -> Vec<u8> {
     while !bytes.is_empty() {
+        visit();
         let last = bytes.len() - 1;
         if bytes[last] < 0x80 {
             break;
@@ -548,12 +596,15 @@ fn align_end_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
         let lead_pos = if (bytes[last] & 0xC0) == 0x80 {
             let mut pos = last;
             while pos > 0 && (bytes[pos] & 0xC0) == 0x80 {
+                visit();
                 pos -= 1;
             }
             if (bytes[pos] & 0xC0) == 0xC0 {
                 pos
             } else {
-                bytes.pop();
+                // No lead byte exists for this continuation run. Discard the
+                // whole run rather than rescanning it after each popped byte.
+                bytes.truncate(if bytes[pos] < 0x80 { pos + 1 } else { pos });
                 continue;
             }
         } else {
@@ -578,6 +629,53 @@ fn align_end_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_bounded_reads_ignore_growth_after_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("stdout");
+        let second = dir.path().join("stderr");
+        std::fs::write(&first, "abcd").unwrap();
+        std::fs::write(&second, "efgh").unwrap();
+        let source = ArtifactSource::Exact(first.clone());
+        let other = ArtifactSource::Exact(second);
+        for operation in 0..4 {
+            std::fs::write(&first, "abcd").unwrap();
+            GROW_AFTER_STAT.with(|hook| *hook.borrow_mut() = Some(vec![b'x'; 1024]));
+            let text = match operation {
+                0 => read_source_bounded(&source, 8).unwrap().text,
+                1 => read_single_file_head_tail(&source, 8, 4, 4).unwrap().text,
+                2 => read_two_file_head_tail(&source, &other, 8, 4, 4).0.text,
+                _ => read_two_file_tails(&source, &other, 8).0,
+            };
+            assert!(
+                !text.contains('x'),
+                "operation {operation} read past its sampled length"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_utf8_alignment_visits_invalid_suffix_once() {
+        for prefix in [vec![], b"ascii".to_vec(), vec![0xff, 0xfe]] {
+            let mut input = prefix.clone();
+            input.extend(std::iter::repeat_n(0x80, 1024));
+            let mut visits = 0;
+            let output = align_end_to_utf8_with(input.clone(), || visits += 1);
+            assert!(
+                visits <= input.len() * 2,
+                "invalid suffix was rescanned {visits} times"
+            );
+            let expected = if prefix.is_empty() {
+                vec![]
+            } else if prefix[0] == b'a' {
+                prefix
+            } else {
+                input
+            };
+            assert_eq!(output, expected);
+        }
+    }
 
     // --- Regression tests for UTF-8 splitting at byte boundaries ---
     // CORRECT behavior: read_file_tail should not split UTF-8 characters.

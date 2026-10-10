@@ -700,6 +700,7 @@ impl BgTaskRegistry {
         compressed: bool,
         root: Option<PathBuf>,
     ) -> Result<String, String> {
+        let _admission = self.background_admission_guard(slot);
         self.check_background_slot(slot, &session_id)?;
         let layout = match plan.prepared_task() {
             Some(p) => p.resolved_task(),

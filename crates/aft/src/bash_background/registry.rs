@@ -597,6 +597,7 @@ pub(crate) struct RegistryInner {
         Mutex<HashMap<String, (std::sync::Weak<BgTask>, Arc<crate::bash_db_hints::HintJob>)>>,
     #[cfg(unix)]
     db_schema_hints: AtomicBool,
+    background_admission: Mutex<()>,
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     /// Failed finished-task bundle deletions and their bounded retry count.
     finished_delete_attempts: Mutex<HashMap<String, usize>>,
@@ -671,8 +672,8 @@ pub(crate) struct RegistryInner {
     /// exception instead.
     live_delivery_sessions: Mutex<HashSet<String>>,
     live_delivery_lock_diagnostics: Arc<crate::lock_diagnostics::LockDiagnostics>,
-    wait_detach_sessions: Mutex<HashSet<String>>,
-    active_wait_sessions: Mutex<HashMap<String, usize>>,
+    wait_detach_sessions: Mutex<HashMap<String, HashSet<String>>>,
+    active_wait_sessions: Mutex<HashMap<String, HashSet<String>>>,
     wait_registered_tasks: Mutex<HashMap<String, HashSet<String>>>,
 }
 
@@ -711,6 +712,8 @@ pub(crate) struct BgTask {
     /// Notified, with `state` locked, when a kill clears
     /// `BgTaskState::kill_in_flight`. Readers that must answer with a settled
     /// status wait on it instead of holding `state` across the kill.
+    terminal_persist_dirty: AtomicBool,
+    pub(crate) timeout_kill_queued: AtomicBool,
     kill_settled: std::sync::Condvar,
     #[cfg(unix)]
     remote_cancel_notify: tokio::sync::Notify,
@@ -723,6 +726,25 @@ pub(crate) struct BgTask {
     /// released; see [`DbWriteOrder`]. Shared by every `BgTask` for the same
     /// session and task id in the process.
     db_write_order: Arc<DbWriteOrder>,
+}
+
+pub(crate) struct ForegroundWaitGuard {
+    registry: BgTaskRegistry,
+    session_id: String,
+    task_id: String,
+    wait_mode: bool,
+}
+
+impl Drop for ForegroundWaitGuard {
+    fn drop(&mut self) {
+        if self.wait_mode {
+            self.registry
+                .end_wait_mode_session(&self.session_id, &self.task_id);
+        } else {
+            self.registry
+                .unregister_foreground_task(&self.session_id, &self.task_id);
+        }
+    }
 }
 
 /// Sequencing for a task's aft.db mirror.
@@ -962,6 +984,7 @@ impl BgTaskRegistry {
                 db_hint_jobs: Mutex::new(HashMap::new()),
                 #[cfg(unix)]
                 db_schema_hints: AtomicBool::new(true),
+                background_admission: Mutex::new(()),
                 tasks: Mutex::new(HashMap::new()),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
                 cleanup_queue: Mutex::new(VecDeque::new()),
@@ -1001,7 +1024,7 @@ impl BgTaskRegistry {
                 live_delivery_lock_diagnostics: crate::lock_diagnostics::LockDiagnostics::new(
                     file!(),
                 ),
-                wait_detach_sessions: Mutex::new(HashSet::new()),
+                wait_detach_sessions: Mutex::new(HashMap::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),
                 wait_registered_tasks: Mutex::new(HashMap::new()),
             }),
@@ -1234,11 +1257,30 @@ impl BgTaskRegistry {
 
     pub fn begin_wait_mode_session(&self, session_id: &str, task_id: &str) {
         if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
-            *active.entry(session_id.to_string()).or_insert(0) += 1;
+            active
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(task_id.to_string());
         }
         self.register_foreground_task(session_id, task_id);
-        if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
-            detach.remove(session_id);
+    }
+
+    pub(crate) fn foreground_wait_guard(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        wait_mode: bool,
+    ) -> ForegroundWaitGuard {
+        if wait_mode {
+            self.begin_wait_mode_session(session_id, task_id);
+        } else {
+            self.register_foreground_task(session_id, task_id);
+        }
+        ForegroundWaitGuard {
+            registry: self.clone(),
+            session_id: session_id.into(),
+            task_id: task_id.into(),
+            wait_mode,
         }
     }
 
@@ -1256,9 +1298,11 @@ impl BgTaskRegistry {
     pub fn end_wait_mode_session(&self, session_id: &str, task_id: &str) {
         let no_active_wait = if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
             match active.get_mut(session_id) {
-                Some(count) if *count > 1 => *count -= 1,
-                Some(_) => {
-                    active.remove(session_id);
+                Some(tasks) => {
+                    tasks.remove(task_id);
+                    if tasks.is_empty() {
+                        active.remove(session_id);
+                    }
                 }
                 None => {}
             }
@@ -1267,8 +1311,11 @@ impl BgTaskRegistry {
             false
         };
         self.unregister_foreground_task(session_id, task_id);
-        if no_active_wait {
-            if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
+        if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
+            if let Some(tasks) = detach.get_mut(session_id) {
+                tasks.remove(task_id);
+            }
+            if no_active_wait || detach.get(session_id).is_some_and(HashSet::is_empty) {
                 detach.remove(session_id);
             }
         }
@@ -1292,47 +1339,63 @@ impl BgTaskRegistry {
         }
 
         let mut killed = 0;
+        let mut first_error = None;
         for task_id in task_ids {
             let Some(task) = self.task_for_session(&task_id, session_id) else {
                 continue;
             };
             let is_terminal = task
-                .state
-                .lock()
-                .map(|state| state.metadata.status.is_terminal())
-                .map_err(|_| "background task lock poisoned".to_string())?;
+                .lock_state()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .metadata
+                .is_terminal();
             if is_terminal {
                 continue;
             }
-            let snapshot = self.kill_with_status_reason(
+            let snapshot = match self.kill_with_status_reason(
                 &task_id,
                 session_id,
                 BgTaskStatus::Killed,
                 Some("call_aborted".to_string()),
-            )?;
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.register_foreground_task(session_id, &task_id);
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
             if snapshot.info.status == BgTaskStatus::Killed
                 && snapshot.info.status_reason.as_deref() == Some("call_aborted")
             {
                 killed += 1;
             }
         }
-        Ok(killed)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(killed),
+        }
     }
 
     pub fn signal_wait_mode_detach(&self, session_id: &str) -> bool {
-        let is_waiting = self
+        let active = self
             .inner
             .active_wait_sessions
             .lock()
-            .map(|active| active.get(session_id).copied().unwrap_or(0) > 0)
-            .unwrap_or(false);
-        if !is_waiting {
+            .map(|active| active.get(session_id).cloned().unwrap_or_default())
+            .unwrap_or_default();
+        if active.is_empty() {
             return false;
         }
         self.inner
             .wait_detach_sessions
             .lock()
-            .map(|mut detach| detach.insert(session_id.to_string()))
+            .map(|mut detach| {
+                let pending = detach.entry(session_id.to_string()).or_default();
+                let before = pending.len();
+                pending.extend(active);
+                pending.len() > before
+            })
             .unwrap_or(false)
     }
 
@@ -1347,10 +1410,28 @@ impl BgTaskRegistry {
     }
 
     pub fn take_wait_mode_detach(&self, session_id: &str) -> bool {
+        let task_id = self
+            .inner
+            .wait_detach_sessions
+            .lock()
+            .ok()
+            .and_then(|detach| detach.get(session_id)?.iter().next().cloned());
+        task_id.is_some_and(|task_id| self.take_task_wait_mode_detach(session_id, &task_id))
+    }
+
+    pub fn take_task_wait_mode_detach(&self, session_id: &str, task_id: &str) -> bool {
         self.inner
             .wait_detach_sessions
             .lock()
-            .map(|mut detach| detach.remove(session_id))
+            .map(|mut detach| {
+                let removed = detach
+                    .get_mut(session_id)
+                    .is_some_and(|tasks| tasks.remove(task_id));
+                if detach.get(session_id).is_some_and(HashSet::is_empty) {
+                    detach.remove(session_id);
+                }
+                removed
+            })
             .unwrap_or(false)
     }
 
@@ -1358,7 +1439,7 @@ impl BgTaskRegistry {
         self.inner
             .wait_detach_sessions
             .lock()
-            .map(|detach| detach.contains(session_id))
+            .map(|detach| detach.contains_key(session_id))
             .unwrap_or(false)
     }
 
@@ -1407,7 +1488,7 @@ impl BgTaskRegistry {
 
     fn ensure_terminal_output_cache(&self, task: &Arc<BgTask>) -> Option<TerminalOutputCache> {
         let (metadata, buffer) = {
-            let state = task.state.lock().ok()?;
+            let state = task.lock_state().ok()?;
             if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
                 return None;
             }
@@ -1421,7 +1502,7 @@ impl BgTaskRegistry {
         let disk_truncation = cap_buffer.enforce_terminal_cap();
         let cache =
             self.render_terminal_output(&metadata, &cap_buffer, disk_truncation, Some(&task.paths));
-        let mut state = task.state.lock().ok()?;
+        let mut state = task.lock_state().ok()?;
         if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
             return None;
         }
@@ -1524,7 +1605,7 @@ impl BgTaskRegistry {
     ) -> BgTaskSnapshot {
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(task, &mut snapshot);
-        if let Ok(state) = task.state.lock() {
+        if let Ok(state) = task.lock_state() {
             if let Some(note) = &state.metadata.execution_note {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
@@ -1535,8 +1616,7 @@ impl BgTaskRegistry {
 
     pub(crate) fn execution_note(&self, task_id: &str, session: &str) -> Option<String> {
         self.task_for_session(task_id, session)?
-            .state
-            .lock()
+            .lock_state()
             .ok()?
             .metadata
             .execution_note
@@ -1545,7 +1625,7 @@ impl BgTaskRegistry {
 
     pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
         self.task_for_session(task_id, session)
-            .is_some_and(|t| t.state.lock().is_ok_and(|s| s.metadata.remote.is_some()))
+            .is_some_and(|t| t.lock_state().is_ok_and(|s| s.metadata.remote.is_some()))
     }
 
     /// A remote task's job ID and phase; `None` for a local task.
@@ -1555,8 +1635,7 @@ impl BgTaskRegistry {
         session: &str,
     ) -> Option<remote::RemoteProgress> {
         self.task_for_session(task_id, session)?
-            .state
-            .lock()
+            .lock_state()
             .ok()?
             .metadata
             .remote
@@ -1583,8 +1662,7 @@ impl BgTaskRegistry {
         }
         let should_sample = {
             let mut state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if !state.metadata.status.is_terminal() {
                 return Ok(());
@@ -1653,13 +1731,12 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
     ) -> Option<(Vec<LiveDescendant>, usize)> {
         let pgid = task
-            .state
-            .lock()
+            .lock_state()
             .ok()
             .and_then(|state| state.metadata.pgid)?;
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);
-        if let Ok(mut state) = task.state.lock() {
+        if let Ok(mut state) = task.lock_state() {
             state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
             state.metadata.live_descendants_omitted =
                 sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
@@ -1680,8 +1757,7 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         let (metadata, buffer) = {
             let state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if !state.metadata.status.is_terminal() {
                 return Ok(());
@@ -2115,7 +2191,7 @@ impl BgTaskRegistry {
         // Fenced so a snapshot queued before this check is written first and
         // none captured later can be overtaken by the one written here.
         with_task_db_fence(&task.session_id, &task.task_id, || {
-            let metadata = match task.state.lock() {
+            let metadata = match task.lock_state() {
                 Ok(state) => state.metadata.clone(),
                 Err(_) => return false,
             };
@@ -2497,12 +2573,6 @@ impl BgTaskRegistry {
         stderr_offset: u64,
         pty_offset: u64,
     ) {
-        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
-            return;
-        };
-        let Ok(conn) = pool.lock() else {
-            return;
-        };
         let offsets = (stdout_offset, stderr_offset, pty_offset);
         if self
             .inner
@@ -2512,17 +2582,43 @@ impl BgTaskRegistry {
         {
             return;
         }
+        let Some((harness, pool)) = self.db_harness_and_pool_for_session(session_id) else {
+            return;
+        };
+        let Ok(conn) = pool.lock() else {
+            return;
+        };
+        // Recheck after database admission: a newer scan may have committed
+        // while this one waited. Resume offsets must never move backwards.
+        let mut last = self
+            .inner
+            .persisted_watch_cursors
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let offsets = last
+            .get(task_id)
+            .map(|previous| {
+                (
+                    previous.0.max(stdout_offset),
+                    previous.1.max(stderr_offset),
+                    previous.2.max(pty_offset),
+                )
+            })
+            .unwrap_or(offsets);
+        if last.get(task_id) == Some(&offsets) {
+            return;
+        }
         if let Err(error) = crate::db::bash_watches::update_watch_offsets_for_task(
             &conn,
             &harness,
             session_id,
             task_id,
-            stdout_offset as i64,
-            stderr_offset as i64,
-            pty_offset as i64,
+            offsets.0 as i64,
+            offsets.1 as i64,
+            offsets.2 as i64,
         ) {
             crate::slog_warn!("persist bash_pattern_watch cursors failed for {task_id}: {error}");
-        } else if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
+        } else {
             last.insert(task_id.to_string(), offsets);
         }
     }
@@ -2596,8 +2692,7 @@ impl BgTaskRegistry {
         })?;
         let mut db = DeferredDbWrites::new(self, &task);
         let mut state = task
-            .state
-            .lock()
+            .lock_state()
             .map_err(|_| "background task lock poisoned".to_string())?;
         state.metadata.scanner_report = scanner_report;
         // Written under the lock so a later terminal write cannot be
@@ -2712,6 +2807,7 @@ impl BgTaskRegistry {
         #[cfg(not(target_os = "linux"))]
         let linux_scope = false;
 
+        let _admission = self.background_admission_guard(slot);
         if let Err(refusal) = self.check_background_slot(slot, &session_id) {
             if let Some(prepared) = spawn_plan.prepared_task() {
                 let _ = delete_resolved_task(&prepared.resolved_task());
@@ -2882,6 +2978,8 @@ impl BgTaskRegistry {
             terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
+            terminal_persist_dirty: AtomicBool::new(false),
+            timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
@@ -2991,6 +3089,8 @@ impl BgTaskRegistry {
     ) -> Result<String, String> {
         self.start_watchdog();
 
+        let _admission =
+            self.background_admission_guard(super::TaskSlot::Background { max: max_running });
         if let Err(refusal) = self.check_background_slot(
             super::TaskSlot::Background { max: max_running },
             &session_id,
@@ -3132,6 +3232,8 @@ impl BgTaskRegistry {
             terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
+            terminal_persist_dirty: AtomicBool::new(false),
+            timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
@@ -3276,6 +3378,7 @@ impl BgTaskRegistry {
     ) -> Result<String, String> {
         self.start_watchdog();
 
+        let _admission = self.background_admission_guard(slot);
         self.check_background_slot(slot, &session_id)?;
 
         let timeout_ms = Some(hard_kill.limit().as_millis() as u64);
@@ -3370,6 +3473,8 @@ impl BgTaskRegistry {
             terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
+            terminal_persist_dirty: AtomicBool::new(false),
+            timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
@@ -3420,8 +3525,7 @@ impl BgTaskRegistry {
 
         let writer = {
             let state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.mode != BgMode::Pty {
                 return Err("task_not_pty".to_string());
@@ -3739,8 +3843,7 @@ impl BgTaskRegistry {
         binding_session_id: &str,
     ) -> Result<(), String> {
         let should_retire = task
-            .state
-            .lock()
+            .lock_state()
             .map_err(|_| "background task lock poisoned".to_string())
             .map(|state| {
                 state.metadata.status.is_terminal()
@@ -3763,7 +3866,7 @@ impl BgTaskRegistry {
                 );
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Ok(mut state) = task.state.lock() {
+                if let Ok(mut state) = task.lock_state() {
                     state.metadata.completion_delivered = true;
                 }
                 self.retire_already_reaped_orphaned_completion(&task.session_id, &task.task_id);
@@ -4192,6 +4295,11 @@ impl BgTaskRegistry {
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
                     self.insert_rehydrated_task(metadata, paths, true)?;
                 } else if metadata.status == BgTaskStatus::Killing {
+                    // Killing records intent, not proof that the daemon sent a
+                    // signal. Finish that work before publishing its outcome.
+                    if Self::persisted_task_process_is_alive(&metadata) {
+                        terminate_piped_task(metadata.pgid, metadata.child_pid, None);
+                    }
                     let recovered = "recovered from inconsistent killing state on replay";
                     let reason = match write_kill_marker_if_absent(&paths) {
                         Ok(()) => recovered.to_string(),
@@ -4382,8 +4490,7 @@ impl BgTaskRegistry {
         self.record_live_delivery_session(&task.session_id);
         validate_task_id(&task_id).map_err(|_| "invalid_task_id")?;
         let (mode, terminal_at_registration) = task
-            .state
-            .lock()
+            .lock_state()
             .map(|state| {
                 (
                     state.metadata.mode.clone(),
@@ -4666,7 +4773,7 @@ impl BgTaskRegistry {
         if self.active_watch_count(&task.task_id) == 0 {
             return;
         }
-        let mode = match task.state.lock() {
+        let mode = match task.lock_state() {
             Ok(state) => state.metadata.mode.clone(),
             Err(_) => return,
         };
@@ -4893,8 +5000,7 @@ impl BgTaskRegistry {
                 let metadata = PersistedTask::from(row);
                 if let Some(task) = self.task(task_id) {
                     let matches_project = task
-                        .state
-                        .lock()
+                        .lock_state()
                         .map(|state| {
                             state
                                 .metadata
@@ -4996,8 +5102,7 @@ impl BgTaskRegistry {
             }
             if let Some(task) = self.task(task_id) {
                 let matches_project = task
-                    .state
-                    .lock()
+                    .lock_state()
                     .map(|state| {
                         state
                             .metadata
@@ -5398,7 +5503,7 @@ impl BgTaskRegistry {
         }
         if snapshot.info.mode == BgMode::Pty {
             #[cfg(unix)]
-            if let Ok(state) = task.state.lock() {
+            if let Ok(state) = task.lock_state() {
                 let (metadata, buffer) = (state.metadata.clone(), state.buffer.clone());
                 drop(state);
                 self.finish_db_hint(&metadata, &buffer);
@@ -5430,33 +5535,25 @@ impl BgTaskRegistry {
     /// guidance is to rename a project only after its live tasks have ended.
     pub fn kill_running_tasks_for_root(&self, project_root: &Path) -> usize {
         let canonical_root = canonicalized_path(project_root);
-        let targets = self
-            .inner
-            .tasks
-            .lock()
-            .map(|tasks| {
-                tasks
-                    .values()
-                    .filter_map(|task| {
-                        let state = task.state.lock().ok()?;
-                        let status = &state.metadata.status;
-                        let running = matches!(status, BgTaskStatus::Running)
-                            || (state.metadata.mode == BgMode::Pty
-                                && matches!(status, BgTaskStatus::Killing));
-                        if !running {
-                            return None;
-                        }
-                        let task_root = state
-                            .metadata
-                            .project_root
-                            .as_deref()
-                            .unwrap_or(&state.metadata.workdir);
-                        (canonicalized_path(task_root) == canonical_root)
-                            .then(|| (task.task_id.clone(), task.session_id.clone()))
-                    })
-                    .collect::<Vec<_>>()
+        let tasks = self.task_arcs();
+        let targets: Vec<_> = tasks
+            .into_iter()
+            .filter_map(|task| {
+                let task_root = {
+                    let state = task.lock_state().ok()?;
+                    if !BgTask::state_is_running(&state) {
+                        return None;
+                    }
+                    state
+                        .metadata
+                        .project_root
+                        .clone()
+                        .unwrap_or_else(|| state.metadata.workdir.clone())
+                };
+                (canonicalized_path(&task_root) == canonical_root)
+                    .then(|| (task.task_id.clone(), task.session_id.clone()))
             })
-            .unwrap_or_default();
+            .collect();
 
         let mut killed = 0;
         for (task_id, session_id) in targets {
@@ -5484,20 +5581,18 @@ impl BgTaskRegistry {
         // holds a slot from here on, even when every slot was already taken:
         // it is already running, and refusing or killing it would lose its
         // work (see `TaskSlot::Foreground`).
-        task.holds_background_slot.store(true, Ordering::SeqCst);
         let terminal_after_promote = {
             let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
-            let updated = self
-                .update_task_metadata_locked(&task, &mut db, |metadata| {
-                    metadata.notify_on_completion = true;
-                    metadata.completion_delivered = false;
-                })
+            let mut updated = state.metadata.clone();
+            updated.notify_on_completion = true;
+            updated.completion_delivered = false;
+            self.persist_task_locked(&task, &updated, &mut db)
                 .map_err(|e| format!("failed to promote background task: {e}"))?;
             state.metadata = updated;
+            task.holds_background_slot.store(true, Ordering::SeqCst);
             state.metadata.status.is_terminal()
         };
         if terminal_after_promote {
@@ -5546,7 +5641,7 @@ impl BgTaskRegistry {
         }
         // Declared before the lock so the aft.db write runs after it is released.
         let mut db = DeferredDbWrites::new(self, &task);
-        let mut state = task.state.lock().ok()?;
+        let mut state = task.lock_state().ok()?;
         if state.metadata.status.is_terminal() || state.metadata.remote.is_some() {
             return None;
         }
@@ -5577,7 +5672,7 @@ impl BgTaskRegistry {
     /// kill as a failed gate and re-ran the command twice more.
     pub(crate) fn kill_for_timeout(&self, task_id: &str, session_id: &str) -> Result<(), String> {
         let reason = self.task_for_session(task_id, session_id).and_then(|task| {
-            let state = task.state.lock().ok()?;
+            let state = task.lock_state().ok()?;
             HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
         });
         self.kill_with_status_reason(
@@ -5596,7 +5691,7 @@ impl BgTaskRegistry {
         session_id: &str,
     ) -> Option<HardKillDeadline> {
         let task = self.task_for_session(task_id, session_id)?;
-        let state = task.state.lock().ok()?;
+        let state = task.lock_state().ok()?;
         if state.metadata.remote.is_some() {
             return None;
         }
@@ -5607,7 +5702,7 @@ impl BgTaskRegistry {
     /// start time so wait handoffs can avoid racing a timeout terminal.
     pub(crate) fn hard_kill_remaining(&self, task_id: &str, session_id: &str) -> Option<Duration> {
         let task = self.task_for_session(task_id, session_id)?;
-        let state = task.state.lock().ok()?;
+        let state = task.lock_state().ok()?;
         if state.metadata.status.is_terminal() {
             return None;
         }
@@ -5623,7 +5718,7 @@ impl BgTaskRegistry {
         session_id: &str,
     ) -> Option<(HardKillDeadline, u64)> {
         let task = self.task_for_session(task_id, session_id)?;
-        let state = task.state.lock().ok()?;
+        let state = task.lock_state().ok()?;
         Some((
             HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)?,
             state.metadata.started_at,
@@ -5638,7 +5733,7 @@ impl BgTaskRegistry {
         session_id: &str,
     ) -> Option<u64> {
         let task = self.task_for_session(task_id, session_id)?;
-        let state = task.state.lock().ok()?;
+        let state = task.lock_state().ok()?;
         state.metadata.timeout_ms
     }
 
@@ -5654,7 +5749,7 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .expect("task for hard-kill limit");
-        task.state.lock().unwrap().metadata.timeout_ms = Some(limit_ms);
+        task.lock_state().unwrap().metadata.timeout_ms = Some(limit_ms);
     }
 
     /// Inspect at most one queue slice per pass. Rotate retained tasks so a
@@ -5694,9 +5789,10 @@ impl BgTaskRegistry {
             let Some(task) = self.task(&task_id) else {
                 continue;
             };
-            let delivered_terminal = task.state.lock().is_ok_and(|state| {
-                state.metadata.status.is_terminal() && state.metadata.completion_delivered
-            });
+            let delivered_terminal = !task.terminal_persist_dirty.load(Ordering::SeqCst)
+                && task.lock_state().is_ok_and(|state| {
+                    state.metadata.status.is_terminal() && state.metadata.completion_delivered
+                });
             let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at);
             let expired = match (terminal_at, cutoff) {
                 (Some(terminal_at), Some(cutoff)) => terminal_at <= cutoff,
@@ -5790,6 +5886,16 @@ impl BgTaskRegistry {
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             tasks.remove(&task.task_id);
         }
+        self.inner
+            .completion_pass_cause
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&task.task_id);
+        self.inner
+            .persisted_watch_cursors
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&task.task_id);
         if let Ok(mut sessions) = self.inner.session_task_ids.lock() {
             if let Some(ids) = sessions.get_mut(&task.session_id) {
                 ids.remove(&task.task_id);
@@ -5995,7 +6101,7 @@ impl BgTaskRegistry {
         let Some(task) = self.task_for_session(task_id, session_id) else {
             return;
         };
-        let unacknowledged_terminal = task.state.lock().is_ok_and(|state| {
+        let unacknowledged_terminal = task.lock_state().is_ok_and(|state| {
             state.metadata.status.is_terminal() && !state.metadata.completion_delivered
         });
         if unacknowledged_terminal {
@@ -6082,8 +6188,7 @@ impl BgTaskRegistry {
             };
             if let Some(task) = task {
                 let terminal = task
-                    .state
-                    .lock()
+                    .lock_state()
                     .map(|state| state.metadata.status.is_terminal())
                     .unwrap_or(false);
                 // Pattern-watch delivery shares the completion ack lane: once the
@@ -6251,7 +6356,7 @@ impl BgTaskRegistry {
         self.inner.shutdown.store(true, Ordering::SeqCst);
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             for task in tasks.values() {
-                if let Ok(mut state) = task.state.lock() {
+                if let Ok(mut state) = task.lock_state() {
                     match &mut state.runtime {
                         TaskRuntime::Piped(child) => *child = None,
                         TaskRuntime::Pty(runtime) => *runtime = None,
@@ -6282,10 +6387,10 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
-        if task.state.lock().is_ok_and(|s| s.metadata.remote.is_some()) {
+        if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
             return Ok(());
         }
-        if let Ok(state) = task.state.lock() {
+        if let Ok(state) = task.lock_state() {
             if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
                 // The Windows wrapper can write the marker before the child
                 // actually exits. Only the waiter makes it safe to close the
@@ -6300,15 +6405,13 @@ impl BgTaskRegistry {
             // A live child handle is authoritative. Reap it before considering
             // the marker so long-running commands do not resolve artifacts.
             let live_child = task
-                .state
-                .lock()
+                .lock_state()
                 .is_ok_and(|state| matches!(state.runtime, TaskRuntime::Piped(Some(_))));
             if live_child {
                 self.reap_child(task);
             }
             let state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned")?;
             match &state.runtime {
                 TaskRuntime::Piped(Some(_)) => return Ok(()),
@@ -6346,13 +6449,13 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn reap_child(&self, task: &Arc<BgTask>) {
-        if task.state.lock().is_ok_and(|s| s.metadata.remote.is_some()) {
+        if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
             return;
         }
         let mut needs_completion = false;
         {
             let mut db = DeferredDbWrites::new(self, task);
-            let Ok(mut state) = task.state.lock() else {
+            let Ok(mut state) = task.lock_state() else {
                 return;
             };
             match &mut state.runtime {
@@ -6410,7 +6513,7 @@ impl BgTaskRegistry {
     #[cfg(unix)]
     fn reap_adopted_child(&self, task: &Arc<BgTask>) {
         let mut db = DeferredDbWrites::new(self, task);
-        let Ok(mut state) = task.state.lock() else {
+        let Ok(mut state) = task.lock_state() else {
             return;
         };
         if state.detached
@@ -6486,7 +6589,7 @@ impl BgTaskRegistry {
         if cfg!(windows) {
             return false;
         }
-        task.state.lock().is_ok_and(|state| match &state.runtime {
+        task.lock_state().is_ok_and(|state| match &state.runtime {
             TaskRuntime::Pty(Some(pty)) => {
                 state.metadata.status != BgTaskStatus::Killing
                     && !pty.was_killed.load(Ordering::SeqCst)
@@ -6514,6 +6617,21 @@ impl BgTaskRegistry {
         if let Ok(mut causes) = self.inner.completion_pass_cause.lock() {
             causes.entry(task_id.to_string()).or_insert(cause);
         }
+    }
+
+    pub(crate) fn retry_terminal_persist(&self, task: &BgTask) -> std::io::Result<()> {
+        if !task.terminal_persist_dirty.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut db = DeferredDbWrites::new(self, task);
+        let state = task
+            .lock_state()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.metadata.is_terminal() {
+            self.persist_task_locked(task, &state.metadata, &mut db)?;
+            task.terminal_persist_dirty.store(false, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     pub(crate) fn running_tasks(&self) -> Vec<Arc<BgTask>> {
@@ -6596,6 +6714,8 @@ impl BgTaskRegistry {
             terminal_notification_routed: Mutex::new(false),
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
+            terminal_persist_dirty: AtomicBool::new(false),
+            timeout_kill_queued: AtomicBool::new(false),
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
@@ -6687,18 +6807,16 @@ impl BgTaskRegistry {
             }
         };
 
-        let mode = match task.state.lock() {
+        let mode = match task.lock_state() {
             Ok(state) => state.metadata.mode.clone(),
             Err(_) => return,
         };
         let terminal = task
-            .state
-            .lock()
+            .lock_state()
             .map(|state| state.metadata.status.is_terminal())
             .unwrap_or(false);
         let completion_delivered = task
-            .state
-            .lock()
+            .lock_state()
             .map(|state| state.metadata.completion_delivered)
             .unwrap_or(true);
 
@@ -6922,7 +7040,7 @@ impl BgTaskRegistry {
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         #[cfg(unix)]
-        if task.state.lock().is_ok_and(|s| s.metadata.remote.is_some()) {
+        if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
             return self.kill_remote_task(&task);
         }
         let mut terminalized = false;
@@ -6940,8 +7058,7 @@ impl BgTaskRegistry {
         let mut killing_db = DeferredDbWrites::new(self, &task);
         let plan = {
             let mut state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 state.pending_terminal_override = None;
@@ -7017,16 +7134,18 @@ impl BgTaskRegistry {
                 KillSignalPlan::AwaitOtherKill
             } else {
                 let was_already_killing = state.metadata.status == BgTaskStatus::Killing;
+                let mut killing = state.metadata.clone();
                 if !was_already_killing {
-                    state.metadata.status = BgTaskStatus::Killing;
+                    killing.status = BgTaskStatus::Killing;
                 }
                 if reason.is_some() {
-                    state.metadata.status_reason = reason.clone();
+                    killing.status_reason = reason.clone();
                 }
                 if !was_already_killing || reason.is_some() {
-                    self.persist_task_locked(&task, &state.metadata, &mut killing_db)
+                    self.persist_task_locked(&task, &killing, &mut killing_db)
                         .map_err(|e| format!("failed to persist killing state: {e}"))?;
                 }
+                state.metadata = killing;
                 if !was_already_killing
                     && state.metadata.mode == BgMode::Pty
                     && terminal_status == BgTaskStatus::TimedOut
@@ -7101,8 +7220,7 @@ impl BgTaskRegistry {
 
                 let mut db = DeferredDbWrites::new(self, &task);
                 let mut state = task
-                    .state
-                    .lock()
+                    .lock_state()
                     .map_err(|_| "background task lock poisoned".to_string())?;
                 state.kill_in_flight = false;
                 state.child_exit_observed |= child_exit_observed;
@@ -7203,8 +7321,7 @@ impl BgTaskRegistry {
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task
-            .state
-            .lock()
+            .lock_state()
             .map_err(|_| "background task lock poisoned".to_string())?;
         state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
         state.metadata.live_descendants_omitted =
@@ -7231,8 +7348,7 @@ impl BgTaskRegistry {
         #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task
-            .state
-            .lock()
+            .lock_state()
             .map_err(|_| "background task lock poisoned".to_string())?;
         state.kill_in_flight = false;
         task.kill_settled.notify_all();
@@ -7294,8 +7410,7 @@ impl BgTaskRegistry {
     ) -> Result<PtyOutputDrainPoll, String> {
         let (master, outcome) = {
             let mut state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 return Ok(PtyOutputDrainPoll::Ready);
@@ -7363,8 +7478,7 @@ impl BgTaskRegistry {
             // blocked behind unrelated database work.
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task
-                .state
-                .lock()
+                .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 state.pending_terminal_override = None;
@@ -7389,24 +7503,36 @@ impl BgTaskRegistry {
                 (None, Some(incomplete)) => Some(incomplete.to_owned()),
                 (reason, None) => reason,
             };
-            let updated = self
-                .update_task_metadata_locked(task, &mut db, |metadata| {
-                    let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
-                        let mut metadata = metadata.clone();
-                        let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
-                        let exit_code = terminal_exit_code_for_status(&target_status);
-                        metadata.mark_terminal(target_status, exit_code, reason.clone());
-                        metadata
-                    } else {
-                        terminal_metadata_from_marker(metadata.clone(), marker, reason.clone())
-                    };
-                    // Capture uncertainty must not turn a successful command
-                    // into a failure: retrying it could repeat side effects.
-                    new_metadata.output_incomplete |= output_incomplete.is_some();
-                    *metadata = new_metadata;
-                })
-                .map_err(|e| format!("failed to persist terminal state: {e}"))?;
-            state.metadata = updated;
+            let transition = |metadata: &mut PersistedTask| {
+                let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
+                    let mut metadata = metadata.clone();
+                    let target_status = pending_override.clone().unwrap_or(BgTaskStatus::Killed);
+                    let exit_code = terminal_exit_code_for_status(&target_status);
+                    metadata.mark_terminal(target_status, exit_code, reason.clone());
+                    metadata
+                } else {
+                    terminal_metadata_from_marker(metadata.clone(), marker.clone(), reason.clone())
+                };
+                // Capture uncertainty must not turn a successful command
+                // into a failure: retrying it could repeat side effects.
+                new_metadata.output_incomplete |= output_incomplete.is_some();
+                *metadata = new_metadata;
+            };
+            let mut observed = state.metadata.clone();
+            transition(&mut observed);
+            state.metadata = match self.update_task_metadata_locked(task, &mut db, transition) {
+                Ok(updated) => updated,
+                Err(error) => {
+                    // The exit marker is authoritative even when storage is
+                    // unavailable. Keep a retryable write, not a running slot.
+                    task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+                    crate::slog_warn!(
+                        "failed to persist terminal state for {}: {error}",
+                        task.task_id
+                    );
+                    observed
+                }
+            };
             task.mark_terminal_now();
             // A reader waiting out an in-flight kill can answer now.
             task.kill_settled.notify_all();
@@ -7627,7 +7753,7 @@ impl BgTaskRegistry {
         // Rendering uses a snapshot taken before the reply may have acked
         // this task. Hold the current state through queue insertion so the ack
         // can fence any late snapshot instead of restoring a notification.
-        let ack_state = owner.as_ref().and_then(|task| task.state.lock().ok());
+        let ack_state = owner.as_ref().and_then(|task| task.lock_state().ok());
         if metadata.completion_delivered
             || ack_state
                 .as_ref()
@@ -8031,8 +8157,7 @@ impl BgTaskRegistry {
             return;
         }
         let command = task
-            .state
-            .lock()
+            .lock_state()
             .map(|state| state.metadata.command.clone())
             .unwrap_or_default();
         *last_reminder_at = Some(now);
@@ -8082,7 +8207,7 @@ impl BgTaskRegistry {
     pub fn task_id_for_call_key(&self, requester: &str, call_key: &str) -> Option<String> {
         let tasks: Vec<Arc<BgTask>> = self.inner.tasks.lock().ok()?.values().cloned().collect();
         tasks.into_iter().find_map(|task| {
-            let state = task.state.lock().ok()?;
+            let state = task.lock_state().ok()?;
             let recorded = state.metadata.call_key.as_ref()?;
             (recorded.requester == requester && recorded.key == call_key)
                 .then(|| task.task_id.clone())
@@ -8092,7 +8217,7 @@ impl BgTaskRegistry {
     /// The requester and call key recorded on a task.
     pub fn task_call_key(&self, task_id: &str) -> Option<super::TaskCallKey> {
         let task = self.task(task_id)?;
-        let state = task.state.lock().ok()?;
+        let state = task.lock_state().ok()?;
         state.metadata.call_key.clone()
     }
 
@@ -8195,6 +8320,21 @@ impl BgTaskRegistry {
             .count_u64("output_ring_bytes", 0)
     }
 
+    /// Serialize background admission until the new task is registered.
+    pub(crate) fn background_admission_guard(
+        &self,
+        slot: super::TaskSlot,
+    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+        // Hold admission through insertion, so concurrent launches cannot
+        // both observe the same free slot. Foreground launches do not queue.
+        matches!(slot, super::TaskSlot::Background { .. }).then(|| {
+            self.inner
+                .background_admission
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        })
+    }
+
     /// Checks whether a launch may start: a foreground command always may; a
     /// background launch may while fewer than `max` tasks hold background
     /// slots in this registry (one project root, all sessions). The refusal
@@ -8235,14 +8375,11 @@ impl BgTaskRegistry {
             own: Vec::new(),
             other_sessions: 0,
         };
-        let Ok(tasks) = self.inner.tasks.lock() else {
-            return holders;
-        };
-        for task in tasks.values() {
+        for task in self.task_arcs() {
             if !task.holds_background_slot.load(Ordering::SeqCst) {
                 continue;
             }
-            let Ok(state) = task.state.lock() else {
+            let Ok(state) = task.lock_state() else {
                 continue;
             };
             if !BgTask::state_is_running(&state) {
@@ -8259,6 +8396,14 @@ impl BgTaskRegistry {
             }
         }
         holders
+    }
+
+    fn task_arcs(&self) -> Vec<Arc<BgTask>> {
+        self.inner
+            .tasks
+            .lock()
+            .map(|tasks| tasks.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn start_watchdog(&self) {
@@ -9212,8 +9357,17 @@ fn modified_within(path: &Path, grace: Duration) -> bool {
 }
 
 fn canonicalized_path(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    ROOT_LOCK_PROBE.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook();
+        }
+    });
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
+
+#[cfg(test)]
+thread_local! { static ROOT_LOCK_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) }; }
 
 fn started_instant_from_unix_millis(started_at: u64) -> Instant {
     let now_ms = SystemTime::now()
@@ -9499,6 +9653,24 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
 }
 
 impl BgTask {
+    /// Unwinding does not make a process terminal. Recover the same state used
+    /// by snapshots so timeout, marker and reap paths can settle the task.
+    pub(crate) fn lock_state(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, BgTaskState>> {
+        match self.state.lock() {
+            Ok(state) => Ok(state),
+            Err(poison) => {
+                let state = poison.into_inner();
+                self.state.clear_poison();
+                crate::slog_warn!(
+                    "recovering poisoned background task state for {}",
+                    self.task_id
+                );
+                Ok(state)
+            }
+        }
+    }
     pub(crate) fn elapsed_for_metadata(&self, metadata: &PersistedTask) -> Duration {
         if metadata.local_fallback_started {
             // The refused job's queue wait is not part of the local command's
@@ -9510,8 +9682,7 @@ impl BgTask {
     }
     fn snapshot(&self, preview_bytes: usize) -> BgTaskSnapshot {
         let state = self
-            .state
-            .lock()
+            .lock_state()
             .unwrap_or_else(|poison| poison.into_inner());
         self.snapshot_locked(&state, preview_bytes)
     }
@@ -9594,21 +9765,21 @@ impl BgTask {
     }
 
     pub(crate) fn is_running(&self) -> bool {
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| Self::state_is_running(&state))
             .unwrap_or(false)
     }
 
     /// [`Self::is_running`] without waiting for the state lock. A contended
-    /// task counts as running: its holder is mid-transition (a kill holds the
-    /// lock while it signals and reaps the process group), and the task has
-    /// not been observed terminal yet.
+    /// task counts as running: its holder may be publishing a transition, and
+    /// no terminal state has been observed yet.
     fn try_is_running(&self) -> bool {
         match self.state.try_lock() {
             Ok(state) => Self::state_is_running(&state),
             Err(std::sync::TryLockError::WouldBlock) => true,
-            Err(std::sync::TryLockError::Poisoned(_)) => false,
+            Err(std::sync::TryLockError::Poisoned(poison)) => {
+                Self::state_is_running(&poison.into_inner())
+            }
         }
     }
 
@@ -9618,9 +9789,8 @@ impl BgTask {
                 && state.metadata.status == BgTaskStatus::Killing)
     }
 
-    fn is_terminal(&self) -> bool {
-        self.state
-            .lock()
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.lock_state()
             .map(|state| state.metadata.status.is_terminal())
             .unwrap_or(false)
     }
@@ -9628,8 +9798,7 @@ impl BgTask {
     /// Whether a kill has released the state lock to signal and reap this
     /// task and has not published its outcome yet.
     pub(crate) fn kill_in_flight(&self) -> bool {
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| state.kill_in_flight)
             .unwrap_or(false)
     }
@@ -9642,7 +9811,7 @@ impl BgTask {
     /// stays `killing` until then and is waited out the same way.
     /// Returns whether it waited.
     fn wait_for_kill_settled(&self, bound: Duration) -> bool {
-        let Ok(state) = self.state.lock() else {
+        let Ok(state) = self.lock_state() else {
             return false;
         };
         let unsettled = |state: &mut BgTaskState| {
@@ -9674,10 +9843,10 @@ impl BgTask {
         delivered: bool,
         registry: &BgTaskRegistry,
     ) -> std::io::Result<()> {
+        registry.retry_terminal_persist(self)?;
         let mut db = DeferredDbWrites::new(registry, self);
         let mut state = self
-            .state
-            .lock()
+            .lock_state()
             .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
         let updated = registry.update_task_metadata_locked(self, &mut db, |metadata| {
             metadata.completion_delivered = delivered;
@@ -9704,7 +9873,7 @@ impl BgTask {
 ///
 /// The handles are taken under the state lock and closed after it is released.
 fn release_terminal_io_handles(task: &BgTask) -> bool {
-    let (handles, runtime_released) = match task.state.lock() {
+    let (handles, runtime_released) = match task.lock_state() {
         Ok(mut state) if state.metadata.status.is_terminal() => {
             let runtime_released = matches!(
                 state.runtime,
@@ -10410,6 +10579,486 @@ mod tests {
         (task_id, task)
     }
 
+    fn lifecycle_running_fixture(
+        registry: &BgTaskRegistry,
+        dir: &tempfile::TempDir,
+    ) -> Arc<BgTask> {
+        let (_, task) = insert_terminal_piped_task(registry, dir, "true", "", "", false);
+        let mut state = task.lock_state().unwrap();
+        state.metadata.status = BgTaskStatus::Running;
+        state.metadata.notify_on_completion = false;
+        state.metadata.completion_delivered = false;
+        write_task(&task.paths.json, &state.metadata).unwrap();
+        drop(state);
+        task.holds_background_slot.store(false, Ordering::SeqCst);
+        task
+    }
+
+    #[test]
+    fn lifecycle_cleanup_prunes_completion_causes() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (id, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        registry
+            .inner
+            .completion_pass_cause
+            .lock()
+            .unwrap()
+            .insert(id.clone(), WatchdogPassCause::Wake);
+        registry.remove_cleanup_task(&task);
+        assert_eq!(registry.completion_pass_cause(&id), None);
+    }
+
+    #[test]
+    fn lifecycle_cleanup_prunes_watch_cursors() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (id, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        registry
+            .inner
+            .persisted_watch_cursors
+            .lock()
+            .unwrap()
+            .insert(id.clone(), (1, 2, 3));
+        registry.remove_cleanup_task(&task);
+        assert!(!registry
+            .inner
+            .persisted_watch_cursors
+            .lock()
+            .unwrap()
+            .contains_key(&id));
+    }
+
+    #[test]
+    fn lifecycle_failed_killing_persist_preserves_running_state() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        fs::remove_file(&task.paths.json).unwrap();
+        fs::create_dir(&task.paths.json).unwrap();
+        assert!(registry.kill(&task.task_id, "session").is_err());
+        let state = task.lock_state().unwrap();
+        assert_eq!(state.metadata.status, BgTaskStatus::Running);
+        assert_eq!(state.metadata.status_reason, None);
+        assert!(!state.kill_in_flight);
+    }
+
+    #[test]
+    fn lifecycle_failed_promotion_does_not_claim_slot() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        fs::remove_file(&task.paths.json).unwrap();
+        fs::create_dir(&task.paths.json).unwrap();
+        assert!(registry.promote(&task.task_id, "session").is_err());
+        assert!(!task.holds_background_slot.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lifecycle_terminal_promotion_enables_completion_delivery() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (id, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.notify_on_completion = false;
+            state.metadata.completion_delivered = true;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        registry.promote(&id, "session").unwrap();
+        let metadata = read_task(&task.paths.json).unwrap();
+        assert!(metadata.notify_on_completion);
+        assert!(!metadata.completion_delivered);
+    }
+
+    #[test]
+    fn lifecycle_poisoned_running_task_is_not_retired() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = task.lock_state().unwrap();
+            state.kill_in_flight = true;
+            panic!("poison task state");
+        }));
+        assert!(task.is_running());
+        assert!(task.kill_in_flight());
+    }
+
+    #[test]
+    fn lifecycle_poisoned_task_still_polls_exit_marker() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        {
+            task.lock_state().unwrap().child_exit_observed = true;
+        }
+        fs::write(&task.paths.exit, "0").unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = task.lock_state().unwrap();
+            panic!("poison task state");
+        }));
+        registry.poll_task(&task).unwrap();
+        assert!(task.snapshot(0).info.status.is_terminal());
+    }
+
+    #[test]
+    fn lifecycle_unchanged_cursor_does_not_wait_for_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, db, _) = registry_with_db_and_frames(dir.path());
+        registry
+            .inner
+            .persisted_watch_cursors
+            .lock()
+            .unwrap()
+            .insert("cursor-task".into(), (1, 2, 3));
+        let held = db.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            registry.persist_task_watch_cursors("session", "cursor-task", 1, 2, 3);
+            tx.send(()).unwrap();
+        });
+        let completed_while_locked = rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            completed_while_locked,
+            "unchanged cursors attempted database admission"
+        );
+    }
+
+    #[test]
+    fn lifecycle_dropping_deferred_response_releases_wait_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::from_app(
+            crate::context::App::default_shared(),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                storage_dir: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let task = lifecycle_running_fixture(ctx.bash_background(), &dir);
+        let request = serde_json::from_value(serde_json::json!({"id": "wait-drop", "command": "bash", "session_id": "session", "params": {"wait": true}})).unwrap();
+        let outcome = crate::commands::bash_orchestrate::build_bash_outcome(
+            &request,
+            &ctx,
+            crate::protocol::Response::success(
+                "wait-drop",
+                serde_json::json!({"task_id": task.task_id, "status": "running"}),
+            ),
+        );
+        assert!(matches!(
+            outcome,
+            crate::response_finalize::DispatchOutcome::Deferred(_)
+        ));
+        assert_eq!(ctx.bash_background().active_wait_session_count(), 1);
+        drop(outcome);
+        assert_eq!(ctx.bash_background().active_wait_session_count(), 0);
+        assert_eq!(ctx.bash_background().abort_inflight("session").unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_concurrent_spawns_respect_single_background_slot() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let registry = registry.clone();
+                let storage = storage.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::super::persistence::with_task_io_fault(
+                        super::super::persistence::TaskIoFault::RunningDelay(
+                            Duration::from_millis(300),
+                        ),
+                        || {
+                            registry.spawn(
+                                SpawnPlan::Unsandboxed,
+                                "sleep 30",
+                                "session".into(),
+                                storage.clone(),
+                                HashMap::new(),
+                                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                                storage.clone(),
+                                1,
+                                true,
+                                false,
+                                Some(storage),
+                            )
+                        },
+                    )
+                })
+            })
+            .collect();
+        let admitted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        registry.shutdown();
+        assert_eq!(
+            admitted, 1,
+            "concurrent launches shared one unreserved slot"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_watchdog_pass_does_not_wait_for_timeout_signaling() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30");
+        super::super::process::start_new_session(&mut command);
+        let child = command.spawn().unwrap();
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.mark_running(child.id(), child.id() as i32);
+            state.metadata.timeout_ms = Some(0);
+            state.runtime = TaskRuntime::Piped(Some(child));
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        registry
+            .inner
+            .watchdog_tasks
+            .lock()
+            .unwrap()
+            .insert(task.task_id.clone(), task.clone());
+        let (reached, release) = install_kill_signal_gate_for_test(&task.task_id);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_registry = registry.clone();
+        let pass = std::thread::spawn(move || {
+            super::super::watchdog::run_pass(
+                &worker_registry,
+                WatchdogPassCause::Tick,
+                &mut HashMap::new(),
+            );
+            tx.send(()).unwrap();
+        });
+        reached.recv_timeout(Duration::from_secs(30)).unwrap();
+        let progressed = rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        release.send(()).unwrap();
+        pass.join().unwrap();
+        registry.shutdown();
+        assert!(
+            progressed,
+            "shared scheduler waited for a task's gated kill"
+        );
+    }
+
+    #[test]
+    fn lifecycle_terminal_observation_survives_persist_failure_and_retries() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        let original = task.lock_state().unwrap().metadata.clone();
+        task.holds_background_slot.store(true, Ordering::SeqCst);
+        fs::remove_file(&task.paths.json).unwrap();
+        fs::create_dir(&task.paths.json).unwrap();
+        registry
+            .inner
+            .watchdog_tasks
+            .lock()
+            .unwrap()
+            .insert(task.task_id.clone(), task.clone());
+        let observed = registry.finalize_from_marker(&task, ExitMarker::Code(0), None);
+        let terminal = task.snapshot(0).info.status;
+        fs::remove_dir(&task.paths.json).unwrap();
+        write_task(&task.paths.json, &original).unwrap();
+        assert!(
+            observed.is_ok(),
+            "storage error prevented terminal publication: {observed:?}"
+        );
+        assert_eq!(terminal, BgTaskStatus::Completed);
+        assert!(registry.background_slot_holders("session").own.is_empty());
+        super::super::watchdog::run_pass(&registry, WatchdogPassCause::Tick, &mut HashMap::new());
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().status,
+            BgTaskStatus::Completed
+        );
+    }
+
+    #[test]
+    fn lifecycle_root_identity_io_runs_without_registry_or_task_locks() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        let probe_registry = registry.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        ROOT_LOCK_PROBE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                probe_calls.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    probe_registry.inner.tasks.try_lock().is_ok(),
+                    "filesystem operation held registry lock"
+                );
+                assert!(
+                    task.state.try_lock().is_ok(),
+                    "filesystem operation held task state lock"
+                );
+            }))
+        });
+        registry.kill_running_tasks_for_root(dir.path());
+        ROOT_LOCK_PROBE.with(|hook| hook.borrow_mut().take());
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "probe never inspected a task's root lookup"
+        );
+    }
+
+    #[test]
+    fn lifecycle_detach_reaches_all_active_waits() {
+        let registry = BgTaskRegistry::default();
+        registry.begin_wait_mode_session("session", "first");
+        registry.begin_wait_mode_session("session", "second");
+        assert!(registry.signal_wait_mode_detach("session"));
+        assert!(registry.take_wait_mode_detach("session"));
+        assert!(registry.take_wait_mode_detach("session"));
+        registry.end_wait_mode_session("session", "first");
+        registry.end_wait_mode_session("session", "second");
+        assert!(!registry.take_wait_mode_detach("session"));
+    }
+
+    #[test]
+    fn lifecycle_new_wait_does_not_clear_pending_detach() {
+        let registry = BgTaskRegistry::default();
+        registry.begin_wait_mode_session("session", "first");
+        assert!(registry.signal_wait_mode_detach("session"));
+        registry.begin_wait_mode_session("session", "second");
+        assert!(registry.take_wait_mode_detach("session"));
+    }
+
+    #[test]
+    fn lifecycle_abort_attempts_every_task_and_retains_failures() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let first = lifecycle_running_fixture(&registry, &dir);
+        let second = lifecycle_running_fixture(&registry, &dir);
+        registry.register_foreground_task("session", &first.task_id);
+        registry.register_foreground_task("session", &second.task_id);
+        let failing_id = registry.inner.wait_registered_tasks.lock().unwrap()["session"]
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let failing = registry.task_for_session(&failing_id, "session").unwrap();
+        let other = if failing_id == first.task_id {
+            second
+        } else {
+            first
+        };
+        fs::remove_file(&failing.paths.json).unwrap();
+        fs::create_dir(&failing.paths.json).unwrap();
+        assert!(registry.abort_inflight("session").is_err());
+        assert!(other.state.lock().unwrap().metadata.is_terminal());
+        assert!(
+            registry.inner.wait_registered_tasks.lock().unwrap()["session"].contains(&failing_id)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_replay_crash_helper() {
+        let Some(storage) = std::env::var_os("AFT_LIFECYCLE_CRASH_STORAGE") else {
+            return;
+        };
+        let storage = PathBuf::from(storage);
+        let registry = BgTaskRegistry::default();
+        let id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "trap '' HUP; sleep 300",
+                "session".into(),
+                storage.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(300)),
+                storage.clone(),
+                10,
+                true,
+                false,
+                Some(storage.clone()),
+            )
+            .unwrap();
+        fs::write(storage.join("task-id"), &id).unwrap();
+        let (reached, _release) = install_kill_signal_gate_for_test(&id);
+        let killer = registry.clone();
+        std::thread::spawn(move || {
+            let _ = killer.kill(&id, "session");
+        });
+        reached.recv_timeout(Duration::from_secs(30)).unwrap();
+        fs::write(storage.join("paused"), b"Killing persisted before signal").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_replay_killing_terminates_live_group_after_daemon_crash() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut daemon = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bash_background::registry::tests::lifecycle_replay_crash_helper",
+                "--nocapture",
+            ])
+            .env("AFT_LIFECYCLE_CRASH_STORAGE", storage.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !storage.path().join("paused").exists() && Instant::now() < deadline {
+            assert!(
+                daemon.try_wait().unwrap().is_none(),
+                "crash fixture exited before its kill gate"
+            );
+            std::thread::yield_now();
+        }
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+        assert!(
+            storage.path().join("paused").exists(),
+            "crash fixture never reached pre-signal gate"
+        );
+        let id = fs::read_to_string(storage.path().join("task-id")).unwrap();
+        let session_dir = super::super::persistence::session_tasks_dir(storage.path(), "session");
+        let paths = resolve_task_layout(&session_dir, &id).unwrap().paths;
+        let metadata = read_task(&paths.json).unwrap();
+        let pgid = metadata.pgid.unwrap();
+        struct ReapGroup(i32);
+        impl Drop for ReapGroup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::killpg(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapGroup(pgid);
+        assert_eq!(metadata.status, BgTaskStatus::Killing);
+        assert!(
+            !super::super::process::live_process_group_members(pgid)
+                .unwrap()
+                .0
+                .is_empty(),
+            "target did not survive daemon loss"
+        );
+        let restarted = BgTaskRegistry::default();
+        restarted.replay_session(storage.path(), "session").unwrap();
+        assert_eq!(read_task(&paths.json).unwrap().status, BgTaskStatus::Killed);
+        assert!(
+            super::super::process::live_process_group_members(pgid)
+                .unwrap()
+                .0
+                .is_empty(),
+            "replay published Killed without terminating the surviving group"
+        );
+    }
+
     #[test]
     fn concurrent_watch_recovery_keeps_the_first_registered_task() {
         let registry = BgTaskRegistry::default();
@@ -10418,7 +11067,7 @@ mod tests {
         let stale_metadata = read_task(&first.paths.json).unwrap();
         // Model replay reading a stale record, then inserting that snapshot
         // after a watch registered the task and updated its live state.
-        first.state.lock().unwrap().metadata.status_reason = Some("live observation".into());
+        first.lock_state().unwrap().metadata.status_reason = Some("live observation".into());
         registry
             .insert_rehydrated_task(stale_metadata, first.paths.clone(), true)
             .unwrap();
@@ -11312,7 +11961,7 @@ mod tests {
         let (task_id, task) =
             insert_terminal_piped_task(&registry, &dir, command, stdout, stderr, true);
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.exit_code = Some(exit);
             state.metadata.status = if exit == 0 {
                 BgTaskStatus::Completed
@@ -12319,7 +12968,7 @@ mod tests {
         let delete_error = Mutex::new(None);
         registry.cleanup_finished_at_with(Duration::ZERO, Instant::now(), |candidate| {
             delete_attempted.store(true, Ordering::SeqCst);
-            let state = task.state.lock().unwrap();
+            let state = task.lock_state().unwrap();
             assert!(
                 state.io_handles.is_none(),
                 "cleanup must close task IO handles before deleting its bundle"
@@ -12391,7 +13040,7 @@ mod tests {
             .insert_rehydrated_task(metadata, paths.clone(), true)
             .unwrap();
         let task = registry.task_for_session(&task_id, "session").unwrap();
-        task.state.lock().unwrap().io_handles = Some(io_handles);
+        task.lock_state().unwrap().io_handles = Some(io_handles);
         drop(layout);
         *task.terminal_at.lock().unwrap() = Some(Instant::now());
         let cleanup_now = Instant::now() + Duration::from_secs(1);
@@ -12427,7 +13076,7 @@ mod tests {
                 "",
                 false,
             );
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.completion_delivered = true;
             write_task(&task.paths.json, &state.metadata).unwrap();
             task_jsons.push(task.paths.json.clone());
@@ -12572,7 +13221,7 @@ mod tests {
             false,
         );
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.completion_delivered = true;
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
@@ -12631,7 +13280,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let (task_id, task) = insert_terminal_pty_task(&registry, &storage, "pty output\n");
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.completion_delivered = true;
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
@@ -12673,7 +13322,7 @@ mod tests {
             false,
         );
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.completion_delivered = true;
             write_task(&task.paths.json, &state.metadata).unwrap();
         }
@@ -12990,7 +13639,7 @@ mod tests {
         let started = Instant::now();
         loop {
             let exited = {
-                let mut state = task.state.lock().unwrap();
+                let mut state = task.lock_state().unwrap();
                 match &mut state.runtime {
                     TaskRuntime::Piped(Some(child)) => matches!(child.try_wait(), Ok(Some(_))),
                     _ => true,
@@ -13041,7 +13690,7 @@ mod tests {
         // in-memory metadata AND the JSON on disk to a Running state to
         // give reap_child the fresh shape it expects to operate on.
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             state.metadata.exit_code = None;
@@ -13080,7 +13729,7 @@ mod tests {
         registry.reap_child(&task);
 
         {
-            let state = task.state.lock().unwrap();
+            let state = task.lock_state().unwrap();
             assert_eq!(
                 state.metadata.status,
                 BgTaskStatus::Running,
@@ -13105,7 +13754,7 @@ mod tests {
         // wrapper exited without persisting an exit code.
         registry.reap_child(&task);
 
-        let state = task.state.lock().unwrap();
+        let state = task.lock_state().unwrap();
         assert!(
             state.metadata.status.is_terminal(),
             "second reap must transition to terminal when PID dead and no marker. Got status={:?}",
@@ -13164,7 +13813,7 @@ mod tests {
         let started = Instant::now();
         loop {
             let exited = {
-                let mut state = task.state.lock().unwrap();
+                let mut state = task.lock_state().unwrap();
                 match &mut state.runtime {
                     TaskRuntime::Piped(Some(child)) => matches!(child.try_wait(), Ok(Some(_))),
                     _ => true,
@@ -13197,7 +13846,7 @@ mod tests {
         // behavior when called manually with both child-exited AND
         // marker-present, regardless of whether the watchdog beat us.
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             if matches!(state.runtime, TaskRuntime::Piped(None)) {
@@ -13216,7 +13865,7 @@ mod tests {
         //  - NOT change status (poll_task will finalize via marker next tick)
         registry.reap_child(&task);
 
-        let state = task.state.lock().unwrap();
+        let state = task.lock_state().unwrap();
         assert!(
             matches!(state.runtime, TaskRuntime::Piped(None)),
             "child handle still released even when marker exists"
@@ -13347,7 +13996,7 @@ mod tests {
         // sees a non-terminal starting point.
         let zombie_pid;
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             state.metadata.exit_code = None;
@@ -13372,7 +14021,7 @@ mod tests {
         registry.poll_task(&task).unwrap();
 
         {
-            let state = task.state.lock().unwrap();
+            let state = task.lock_state().unwrap();
             assert!(
                 matches!(state.runtime, TaskRuntime::Piped(None)),
                 "child handle must be released after marker finalize"
@@ -13432,7 +14081,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             state.metadata.exit_code = None;
@@ -13511,7 +14160,7 @@ mod tests {
             )
             .unwrap();
         let task = registry.task_for_session(&task_id, "session").unwrap();
-        let running = task.state.lock().unwrap().metadata.clone();
+        let running = task.lock_state().unwrap().metadata.clone();
         let mut completed = running.clone();
         completed.mark_terminal(BgTaskStatus::Completed, Some(0), None);
 
@@ -13577,7 +14226,7 @@ mod tests {
 
         let zombie_pid;
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.status = BgTaskStatus::Running;
             state.metadata.status_reason = None;
             state.metadata.exit_code = None;
@@ -13602,7 +14251,7 @@ mod tests {
             .expect("kill should succeed");
 
         {
-            let state = task.state.lock().unwrap();
+            let state = task.lock_state().unwrap();
             assert!(
                 matches!(state.runtime, TaskRuntime::Piped(None)),
                 "child handle must be released after marker-aware kill"
@@ -13644,7 +14293,7 @@ mod tests {
             .unwrap();
         let task = original.task_for_session(&task_id, session).unwrap();
         let paths = task.paths.clone();
-        let metadata = task.state.lock().unwrap().metadata.clone();
+        let metadata = task.lock_state().unwrap().metadata.clone();
         original.detach();
         assert_eq!(metadata.status, BgTaskStatus::Running);
         assert_eq!(
@@ -13695,7 +14344,7 @@ mod tests {
         restarted.replay_session(storage.path(), session).unwrap();
         let task = restarted.task_for_session(&task_id, session).unwrap();
         {
-            let state = task.state.lock().unwrap();
+            let state = task.lock_state().unwrap();
             assert_eq!(state.metadata.status, BgTaskStatus::Running);
             assert!(
                 state.io_handles.is_none(),
@@ -13735,7 +14384,7 @@ mod tests {
             libc::killpg(pgid, libc::SIGKILL);
         }
         {
-            let mut state = task.state.lock().unwrap();
+            let mut state = task.lock_state().unwrap();
             state.metadata.status = BgTaskStatus::Killing;
             write_task(&paths.json, &state.metadata).unwrap();
         }
@@ -13872,7 +14521,7 @@ mod tests {
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
-            let _state = task.state.lock().expect("task state");
+            let _state = task.lock_state().expect("task state");
             held_tx.send(()).expect("held signal");
             let _ = release_rx.recv();
         });
@@ -14145,7 +14794,7 @@ mod tests {
         }
         // Set the flag a kill sets on a PTY before it signals the process
         // group, as if this exited task had been killed.
-        if let TaskRuntime::Pty(Some(pty)) = &task.state.lock().unwrap().runtime {
+        if let TaskRuntime::Pty(Some(pty)) = &task.lock_state().unwrap().runtime {
             pty.was_killed.store(true, Ordering::SeqCst);
         }
         assert!(
@@ -14353,7 +15002,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         // Keep the marker unobserved so this kill, not the watchdog, publishes it.
-        task.state.lock().unwrap().metadata.status = BgTaskStatus::Running;
+        task.lock_state().unwrap().metadata.status = BgTaskStatus::Running;
         registry.kill_for_timeout(&task_id, "session").unwrap();
         let snapshot = registry.status(&task_id, "session", None, None, 0).unwrap();
         assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
@@ -14386,7 +15035,7 @@ mod tests {
         let mut terminated_before_db_release = false;
         if reached_before_db_release {
             while Instant::now() < deadline {
-                if task.state.lock().unwrap().metadata.status.is_terminal() {
+                if task.lock_state().unwrap().metadata.status.is_terminal() {
                     terminated_before_db_release = true;
                     break;
                 }
@@ -14843,8 +15492,7 @@ mod tests {
             let child_pid = registry
                 .task_for_session(&task_id, session)
                 .unwrap()
-                .state
-                .lock()
+                .lock_state()
                 .unwrap()
                 .metadata
                 .child_pid
@@ -15733,7 +16381,7 @@ mod tests {
         let comp_handle = registry.task_for_session(&task_comp, "session-a").unwrap();
         fs::write(&comp_handle.paths.exit, "0\n").unwrap();
         comp_handle.mark_terminal_now();
-        comp_handle.state.lock().unwrap().metadata.mark_terminal(
+        comp_handle.lock_state().unwrap().metadata.mark_terminal(
             BgTaskStatus::Completed,
             Some(0),
             None,
@@ -15904,7 +16552,7 @@ mod tests {
         // come (the guard is alive), as when it waits on the aft.db mutex.
         let mut queued = DeferredDbWrites::new(&owner, &task);
         {
-            let state = task.state.lock().unwrap();
+            let state = task.lock_state().unwrap();
             assert!(!state.metadata.completion_delivered);
             queued.capture(&state.metadata);
         }

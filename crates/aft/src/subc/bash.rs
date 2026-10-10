@@ -1481,7 +1481,7 @@ async fn run_deferred_bash_wait(
                                 && !snapshot.info.status.is_terminal()
                                 && ctx
                                     .bash_background()
-                                    .take_wait_mode_detach(&session_for_poll)
+                                    .take_task_wait_mode_detach(&session_for_poll, &task_id_for_poll)
                             {
                                 if claim_for_poll.answered_elsewhere() {
                                     return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
