@@ -11,6 +11,82 @@ mod inotify;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(any(windows, test))]
+mod notification_buffer {
+    pub(super) struct NotificationBuffer {
+        // ReadDirectoryChangesW requires DWORD alignment regardless of the
+        // allocator's incidental alignment for byte allocations.
+        storage: Vec<u32>,
+        byte_len: usize,
+    }
+
+    impl NotificationBuffer {
+        pub(super) fn new(byte_len: usize) -> Self {
+            Self {
+                storage: vec![0; byte_len.div_ceil(4)],
+                byte_len,
+            }
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.byte_len
+        }
+
+        pub(super) fn resize(&mut self, byte_len: usize) {
+            self.storage.resize(byte_len.div_ceil(4), 0);
+            self.byte_len = byte_len;
+        }
+
+        pub(super) fn as_bytes(&self) -> &[u8] {
+            // SAFETY: u32 has no padding or invalid bit patterns, all words
+            // are initialized, and byte_len never exceeds the allocation.
+            unsafe { std::slice::from_raw_parts(self.storage.as_ptr().cast(), self.byte_len) }
+        }
+
+        pub(super) fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.storage.as_mut_ptr().cast()
+        }
+
+        pub(super) fn complete_into(&mut self, completed: &mut Self) {
+            // The next read uses the spare allocation while translation owns
+            // the completed one. Neither copying nor reallocation is needed.
+            std::mem::swap(self, completed);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn element_alignment<T>(_: &[T]) -> usize {
+            std::mem::align_of::<T>()
+        }
+
+        #[test]
+        fn kernel_notification_buffer_has_dword_alignment_contract() {
+            let mut buffer = NotificationBuffer::new(257);
+            assert!(element_alignment(&buffer.storage) >= 4);
+            assert_eq!(buffer.as_mut_ptr() as usize % 4, 0);
+            assert_eq!(buffer.as_bytes().len(), 257);
+            buffer.resize(64);
+            assert_eq!(buffer.len(), 64);
+        }
+
+        #[test]
+        fn notification_completion_swaps_allocations_without_copying() {
+            let mut active = NotificationBuffer::new(256);
+            let mut completed = NotificationBuffer::new(256);
+            let active_pointer = active.as_mut_ptr();
+            let completed_pointer = completed.as_mut_ptr();
+            active.complete_into(&mut completed);
+            assert_eq!(completed.as_bytes().as_ptr(), active_pointer);
+            assert_eq!(active.as_mut_ptr(), completed_pointer);
+            active.complete_into(&mut completed);
+            assert_eq!(active.as_mut_ptr(), active_pointer);
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) use fsevents::DirectoryWatcher;
 #[cfg(target_os = "macos")]

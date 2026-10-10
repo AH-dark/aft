@@ -203,7 +203,8 @@ struct DirectoryWatch {
     exact_file: Option<PathBuf>,
     recursive: bool,
     handle: HANDLE,
-    buffer: Vec<u8>,
+    buffer: super::notification_buffer::NotificationBuffer,
+    completed_buffer: super::notification_buffer::NotificationBuffer,
     overlapped: Box<OVERLAPPED>,
     pending: bool,
 }
@@ -254,7 +255,10 @@ impl DirectoryWatch {
             exact_file,
             recursive,
             handle,
-            buffer: vec![0; WINDOWS_BUFFER_SIZE],
+            buffer: super::notification_buffer::NotificationBuffer::new(WINDOWS_BUFFER_SIZE),
+            completed_buffer: super::notification_buffer::NotificationBuffer::new(
+                WINDOWS_BUFFER_SIZE,
+            ),
             overlapped: Box::new(OVERLAPPED::default()),
             pending: false,
         })
@@ -273,7 +277,7 @@ impl DirectoryWatch {
             {
                 // Windows rejects buffers larger than 64 KiB for network
                 // handles. parcel-watcher uses the same 64 KiB retry floor.
-                self.buffer.resize(WINDOWS_NETWORK_BUFFER_SIZE, 0);
+                self.buffer.resize(WINDOWS_NETWORK_BUFFER_SIZE);
                 *self.overlapped = OVERLAPPED::default();
                 self.submit_current_buffer().map_err(notify::Error::io)?;
                 self.pending = true;
@@ -400,8 +404,8 @@ fn run_completion_loop(
             }
         }
 
-        let completed_bytes = if buffer_overflow {
-            Vec::new()
+        let byte_count = if buffer_overflow {
+            0
         } else {
             let byte_count = completion.bytes_transferred as usize;
             if byte_count > watch.buffer.len() {
@@ -410,7 +414,8 @@ fn run_completion_loop(
                 ));
                 break;
             }
-            watch.buffer[..byte_count].to_vec()
+            watch.buffer.complete_into(&mut watch.completed_buffer);
+            byte_count
         };
 
         // Rearm before translating or filtering the completed batch. Windows
@@ -425,7 +430,7 @@ fn run_completion_loop(
             vec![buffer_overflow_event(&root)]
         } else {
             match translate_buffer(
-                &completed_bytes,
+                &watch.completed_buffer.as_bytes()[..byte_count],
                 &watch.directory,
                 watch.exact_file.as_deref(),
             ) {
@@ -584,15 +589,12 @@ fn translate_buffer(
                 "ReadDirectoryChangesW returned a truncated notification header",
             ));
         }
-        let entry = unsafe {
-            ptr::read_unaligned(
-                buffer
-                    .as_ptr()
-                    .add(offset)
-                    .cast::<FILE_NOTIFY_INFORMATION>(),
-            )
-        };
-        let filename_bytes = entry.FileNameLength as usize;
+        // Decode the wire fields, not a struct or u16 slice: a completion
+        // slice and later record offsets need not have Rust type alignment.
+        let next_entry_offset = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
+        let action = u32::from_le_bytes(buffer[offset + 4..offset + 8].try_into().unwrap());
+        let filename_bytes =
+            u32::from_le_bytes(buffer[offset + 8..offset + 12].try_into().unwrap()) as usize;
         let filename_start = offset + filename_offset;
         let filename_end = filename_start.saturating_add(filename_bytes);
         if filename_bytes % 2 != 0 || filename_end > buffer.len() {
@@ -600,23 +602,21 @@ fn translate_buffer(
                 "ReadDirectoryChangesW returned a truncated filename",
             ));
         }
-        let filename = unsafe {
-            std::slice::from_raw_parts(
-                buffer.as_ptr().add(filename_start).cast::<u16>(),
-                filename_bytes / 2,
-            )
-        };
-        let path = directory.join(PathBuf::from(OsString::from_wide(filename)));
+        let filename = buffer[filename_start..filename_end]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let path = directory.join(PathBuf::from(OsString::from_wide(&filename)));
         if exact_file.is_none_or(|expected| expected == path) {
-            if let Some(kind) = event_kind(entry.Action) {
+            if let Some(kind) = event_kind(action) {
                 events.push(Event::new(kind).add_path(path));
             }
         }
 
-        if entry.NextEntryOffset == 0 {
+        if next_entry_offset == 0 {
             break;
         }
-        let next = entry.NextEntryOffset as usize;
+        let next = next_entry_offset as usize;
         if next < filename_offset || offset.saturating_add(next) >= buffer.len() {
             return Err(notify::Error::generic(
                 "ReadDirectoryChangesW returned an invalid entry offset",
@@ -775,6 +775,27 @@ mod tests {
             flag.load(Ordering::Acquire),
             "timed out waiting for {label}"
         );
+    }
+
+    #[test]
+    fn notification_parser_accepts_unaligned_utf16_and_rejects_short_headers() {
+        let filename = "界😀.rs";
+        let encoded = filename.encode_utf16().collect::<Vec<_>>();
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&FILE_ACTION_ADDED.to_le_bytes());
+        bytes.extend_from_slice(&(encoded.len() as u32 * 2).to_le_bytes());
+        for word in encoded {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let root = Path::new(r"C:\project");
+        let events = translate_buffer(&bytes[1..], root, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].paths, [root.join(filename)]);
+        assert!(translate_buffer(&bytes[1..12], root, None).is_err());
+        let mut empty = vec![0; 12];
+        empty[4..8].copy_from_slice(&FILE_ACTION_ADDED.to_le_bytes());
+        assert_eq!(translate_buffer(&empty, root, None).unwrap().len(), 1);
     }
 
     #[test]

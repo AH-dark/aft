@@ -375,10 +375,7 @@ pub(crate) fn watcher_path_is_ignored_by_matcher(
         return true;
     }
 
-    let guard = matcher
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    watcher_path_is_ignored(guard.as_deref(), path)
+    with_matcher_snapshot(matcher, |snapshot| watcher_path_is_ignored(snapshot, path))
 }
 
 pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
@@ -387,10 +384,19 @@ pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path:
     if path.components().any(|part| part.as_os_str() == ".git") {
         return false;
     }
-    let guard = matcher
+    with_matcher_snapshot(matcher, |snapshot| watcher_path_is_ignored(snapshot, path))
+}
+
+fn with_matcher_snapshot<T>(
+    matcher: &SharedGitignore,
+    apply: impl FnOnce(Option<&Gitignore>) -> T,
+) -> T {
+    // Filesystem work uses an immutable snapshot, not the rebuild writer's lock.
+    let snapshot = matcher
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    watcher_path_is_ignored(guard.as_deref(), path)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    apply(snapshot.as_deref())
 }
 
 fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
@@ -1983,6 +1989,24 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(filter.raw_paths.contains(&source));
         assert!(filter.flush_deadline.is_some());
+    }
+
+    #[test]
+    fn matcher_snapshot_releases_read_lock_before_path_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let matcher = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(
+            ignore::gitignore::GitignoreBuilder::new(directory.path())
+                .build()
+                .unwrap(),
+        ))));
+        super::with_matcher_snapshot(&matcher, |snapshot| {
+            assert_eq!(snapshot.unwrap().path(), directory.path());
+            let mut writer = matcher
+                .try_write()
+                .expect("path work must not hold the matcher lock");
+            *writer = None;
+            assert_eq!(snapshot.unwrap().path(), directory.path());
+        });
     }
 
     use super::*;
