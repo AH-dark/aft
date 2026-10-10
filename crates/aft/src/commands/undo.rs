@@ -66,7 +66,12 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     let session = req.session();
     let mut save = |paths: &[PathBuf]| save_external_change(ctx, session, paths);
 
-    let Some(file) = req.params.get("file").and_then(|v| v.as_str()) else {
+    let Some(file) = req
+        .params
+        .get("file")
+        .or_else(|| req.params.get("filePath"))
+        .and_then(|v| v.as_str())
+    else {
         let intent_paths = backup
             .preview_last_operation_paths(req.session())
             .unwrap_or_default();
@@ -219,5 +224,42 @@ pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
             }),
         ),
         Err(response) => response,
+    }
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn undo_filepath_alias_restores_only_requested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request: RawRequest = serde_json::from_value(
+            serde_json::json!({"id": "alias-undo", "command": "undo", "filePath": first}),
+        )
+        .unwrap();
+        for path in [&first, &second] {
+            std::fs::write(path, "before").unwrap();
+            ctx.backup()
+                .lock()
+                .snapshot_with_op(
+                    request.session(),
+                    path,
+                    "original",
+                    Some("shared-operation"),
+                )
+                .unwrap();
+            std::fs::write(path, "after").unwrap();
+        }
+        let response = handle_undo(&request, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "before");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "after");
     }
 }

@@ -235,24 +235,33 @@ pub(crate) struct EditObservation {
 }
 
 pub(crate) fn read_edit_source(path: &Path) -> std::io::Result<(String, EditObservation)> {
+    let (bytes, observation) = read_edit_bytes(path)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })?
+        .to_owned();
+    Ok((text, observation))
+}
+
+pub(crate) fn read_edit_bytes(
+    path: &Path,
+) -> std::io::Result<(std::sync::Arc<[u8]>, EditObservation)> {
     let before = crate::backup::DiskFileVersion::of_path(path);
-    let (text, capture) = match crate::backup::CapturedRegularFile::read(path)? {
-        Some(capture) => {
-            let text = std::str::from_utf8(capture.bytes())
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "stream did not contain valid UTF-8",
-                    )
-                })?
-                .to_owned();
-            (text, Some(capture))
+    let (bytes, capture) = match crate::backup::CapturedRegularFile::read(path)? {
+        Some(capture) => (capture.shared_bytes(), Some(capture)),
+        None => {
+            #[cfg(test)]
+            A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
+            (std::fs::read(path)?.into(), None)
         }
-        None => (read_edit_text(path)?, None),
     };
     let version =
         before.filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path));
-    Ok((text, EditObservation { capture, version }))
+    Ok((bytes, EditObservation { capture, version }))
 }
 
 pub(crate) fn auto_backup_observed(
