@@ -646,7 +646,7 @@ fn main() {
                 // queries. Length and a short hash are enough to correlate it
                 // with a copy the client kept. The parser error itself is
                 // bounded because serde can quote a mistyped value in it.
-                let error_text = e.to_string();
+                let error_text = aft::log_redact::aft_redactor(&e.to_string()).into_owned();
                 aft::slog_error!(
                     "parse error: {} ({})",
                     aft::log_redact::truncate_for_log(&error_text, PARSE_ERROR_LOG_BYTES),

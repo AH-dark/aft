@@ -3653,7 +3653,8 @@ const LSP_PARAMS_LOG_BYTES: usize = 512;
 
 fn lsp_params_for_log(params: Option<serde_json::Value>) -> String {
     let rendered = params.unwrap_or(serde_json::Value::Null).to_string();
-    crate::log_redact::truncate_for_log(&rendered, LSP_PARAMS_LOG_BYTES).into_owned()
+    let redacted = crate::log_redact::aft_redactor(&rendered);
+    crate::log_redact::truncate_for_log(&redacted, LSP_PARAMS_LOG_BYTES).into_owned()
 }
 
 pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
@@ -3810,6 +3811,19 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext};
+
+    #[test]
+    fn lsp_secret_is_masked_before_truncation() {
+        let prefix = "x".repeat(LSP_PARAMS_LOG_BYTES - 20);
+        let rendered = lsp_params_for_log(Some(
+            serde_json::json!({ "text": format!("{prefix} ghp_1234567890abcdefghijklmnop") }),
+        ));
+        let logged = crate::log_redact::aft_redactor(&rendered);
+        assert!(
+            !logged.contains("ghp_"),
+            "truncated credential prefix survived: {logged}"
+        );
+    }
 
     #[test]
     fn lsp_params_debug_rendering_is_bounded() {

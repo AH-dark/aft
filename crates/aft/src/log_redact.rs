@@ -5,10 +5,10 @@
 //! bound for the log file passes through [`aft_redactor`] once before it is
 //! written (see `logging::TeeWriter`).
 //!
-//! The patterns mirror `packages/aft-cli/src/lib/sanitize.ts`, which cleans
-//! logs before they go into a public GitHub issue, so a secret that one side
-//! masks the other masks the same way. Both test suites read the shared cases
-//! in `tests/fixtures/log_redaction_cases.json`.
+//! Shared token and URL patterns are also exercised by the CLI sanitizer in
+//! `packages/aft-cli/src/lib/sanitize.ts` through
+//! `tests/fixtures/log_redaction_cases.json`. The durable sink additionally masks
+//! contextual secret fields and private-key records before shortening them.
 //!
 //! What is masked:
 //! - GitHub tokens (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`),
@@ -41,9 +41,28 @@ fn compile(pattern: &str) -> Regex {
 
 static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     compile(
-        r"(?i)\b((?:proxy-)?authorization[^\S\r\n]*:[^\S\r\n]*(?:bearer|basic)[^\S\r\n]+)[A-Za-z0-9._~+/-]+=*",
+        r"(?i)\b((?:proxy-)?authorization[^\S\r\n]*:[^\S\r\n]*(?:bearer|basic|token)[^\S\r\n]+)[A-Za-z0-9._~+/-]+=*",
     )
 });
+static API_KEY_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| compile(r"(?i)\b(x-api-key[^\S\r\n]*:[^\S\r\n]*)[^\s<>]+"));
+static SECRET_JSON_FIELD: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(?i)("(?:password|passwd|pwd|api[_-]?key|apikey|x-api-key|aws_secret_access_key|awsSecretAccessKey|secret_access_key)"\s*:\s*")((?:\\.|[^"\\])+)(")"#,
+    )
+});
+static AWS_SECRET_FIELD: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r#"(?i)\b((?:aws_secret_access_key|secret_access_key)[^\S\r\n]*[=:][^\S\r\n]*)[^\s"'<>]+"#,
+    )
+});
+static SLACK_TOKEN: LazyLock<Regex> = LazyLock::new(|| compile(r"\bxox[baprs]-[A-Za-z0-9-]+\b"));
+static PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    compile(
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
+    )
+});
+
 static GITHUB_PAT: LazyLock<Regex> = LazyLock::new(|| compile(r"\bgithub_pat_[A-Za-z0-9_]+\b"));
 static GITHUB_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"));
@@ -70,6 +89,29 @@ static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     let mut out = Cow::Borrowed(text);
+    if text.contains("PRIVATE KEY-----") {
+        out = replace_in(out, &PRIVATE_KEY, SECRET_PLACEHOLDER);
+    }
+    if text.contains("xox") {
+        out = replace_in(out, &SLACK_TOKEN, SECRET_PLACEHOLDER);
+    }
+    if contains_ignore_ascii_case(text, "x-api-key") {
+        out = replace_in(out, &API_KEY_HEADER, format!("${{1}}{SECRET_PLACEHOLDER}"));
+    }
+    if text.contains('"') {
+        out = replace_in(
+            out,
+            &SECRET_JSON_FIELD,
+            format!("${{1}}{SECRET_PLACEHOLDER}${{3}}"),
+        );
+    }
+    if contains_ignore_ascii_case(text, "secret_access_key") {
+        out = replace_in(
+            out,
+            &AWS_SECRET_FIELD,
+            format!("${{1}}{SECRET_PLACEHOLDER}"),
+        );
+    }
     if contains_ignore_ascii_case(text, "authorization") {
         out = replace_in(
             out,
@@ -119,12 +161,15 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     out
 }
 
-/// Byte-level entry point for the log sink, which receives formatted lines as
-/// bytes. Lines that are not valid UTF-8 are passed through unchanged; every
-/// line AFT's own formatter produces is UTF-8.
+/// Byte-level entry point for the log sink. Invalid UTF-8 is decoded with
+/// replacement characters before masking so malformed bytes cannot bypass it.
 pub fn aft_redact_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
     let Ok(text) = std::str::from_utf8(bytes) else {
-        return Cow::Borrowed(bytes);
+        return Cow::Owned(
+            aft_redactor(&String::from_utf8_lossy(bytes))
+                .into_owned()
+                .into_bytes(),
+        );
     };
     match aft_redactor(text) {
         Cow::Borrowed(_) => Cow::Borrowed(bytes),
@@ -344,8 +389,53 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_bytes_pass_through() {
+    fn contextual_secret_formats_are_masked() {
+        for (input, secret) in [
+            ("x-api-key: private-key-value", "private-key-value"),
+            (
+                "Authorization: Token private-token-value",
+                "private-token-value",
+            ),
+            (
+                r#"{"password":"private-password-value"}"#,
+                "private-password-value",
+            ),
+            (
+                "token xoxb-12345-private-slack-value",
+                "xoxb-12345-private-slack-value",
+            ),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\nprivate-pem-value\n-----END RSA PRIVATE KEY-----",
+                "private-pem-value",
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY=private-aws-secret-value",
+                "private-aws-secret-value",
+            ),
+        ] {
+            let masked = aft_redactor(input);
+            assert!(!masked.contains(secret), "secret survived: {input}");
+            assert!(masked.contains(SECRET_PLACEHOLDER));
+            assert_eq!(aft_redactor(&masked), masked);
+        }
+        assert_eq!(
+            aft_redactor("plain private-aws-secret-value"),
+            "plain private-aws-secret-value"
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_does_not_bypass_masking() {
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(b" ghp_1234567890abcdefghij");
+        let masked = aft_redact_bytes(&bytes);
+        assert!(!String::from_utf8_lossy(&masked).contains("ghp_"));
+        assert!(std::str::from_utf8(&masked).is_ok());
+    }
+
+    #[test]
+    fn non_utf8_bytes_are_safely_decoded() {
         let bytes = [0xff, 0xfe, b'g', b'h'];
-        assert!(matches!(aft_redact_bytes(&bytes), Cow::Borrowed(_)));
+        assert_eq!(aft_redact_bytes(&bytes).as_ref(), "��gh".as_bytes());
     }
 }
