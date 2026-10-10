@@ -447,7 +447,7 @@ pub(crate) fn run_governed_gh(
     body: &str,
 ) -> Result<std::process::Output, String> {
     let config = ctx.config();
-    let mut environment: HashMap<String, String> = std::env::vars().collect();
+    let mut environment = unicode_environment(std::env::vars_os());
     // This `gh` run speaks for the requesting session. Its ticket is revoked
     // when this function returns, whether or not the shim used it.
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
@@ -472,23 +472,57 @@ pub(crate) fn run_governed_gh(
         .stderr(Stdio::piped());
     crate::agent_child_env::apply_to_command(&mut command, &environment);
     crate::privacy_spawn::install(&mut command, config.bash.disclaim_privacy, false)?;
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("could not start the governed gh shim: {error}"))?;
     if config.bash.disclaim_privacy {
         crate::privacy_spawn::note_session(req.session());
     }
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "could not open stdin for the governed gh shim".to_string())?
-        .write_all(body.as_bytes())
-        .map_err(|error| {
-            format!("could not send the comment body to the governed gh shim: {error}")
-        })?;
-    child
-        .wait_with_output()
-        .map_err(|error| format!("could not wait for the governed gh shim: {error}"))
+    wait_for_governed_gh(child, body)
+}
+
+fn wait_for_governed_gh(
+    mut child: std::process::Child,
+    body: &str,
+) -> Result<std::process::Output, String> {
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("could not open stdin for the governed gh shim".to_string());
+    };
+    std::thread::scope(|scope| {
+        // Drain output while sending the body: either pipe can fill before the
+        // child reads stdin. Always reap the child before considering write errors.
+        let writer = scope.spawn(move || stdin.write_all(body.as_bytes()));
+        let output = child.wait_with_output();
+        let written = writer.join();
+        let output =
+            output.map_err(|error| format!("could not wait for the governed gh shim: {error}"))?;
+        // A shim refusal is the primary failure even when it closed stdin early.
+        // If the child claimed success, an incomplete body must still be an error.
+        if output.status.success() {
+            written
+                .map_err(|_| {
+                    "could not send the comment body to the governed gh shim: writer stopped"
+                        .to_string()
+                })?
+                .map_err(|error| {
+                    format!("could not send the comment body to the governed gh shim: {error}")
+                })?;
+        }
+        Ok(output)
+    })
+}
+
+fn unicode_environment(
+    entries: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> HashMap<String, String> {
+    // The environment passed to the child command uses Unicode strings. Ignore
+    // entries that cannot be converted rather than panicking before spawning it.
+    entries
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 pub(crate) fn gh_failure_response(
@@ -579,6 +613,54 @@ mod tests {
     use crate::context::default_language_provider_factory;
     use crate::harness::Harness;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_early_shim_refusal_is_not_hidden_by_a_stdin_pipe_error() {
+        let child = Command::new("/bin/sh")
+            .env_clear()
+            .args(["-c", "exec 0<&-; printf 'fixture refusal' >&2; exit 86"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = wait_for_governed_gh(child, &"x".repeat(1024 * 1024)).unwrap();
+        assert_eq!(output.status.code(), Some(86));
+        assert_eq!(output.stderr, b"fixture refusal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_child_still_reports_an_incomplete_stdin_write() {
+        let child = Command::new("/bin/sh")
+            .env_clear()
+            .args(["-c", "exec 0<&-; exit 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let error = wait_for_governed_gh(child, &"x".repeat(1024 * 1024)).unwrap_err();
+        assert!(error.contains("could not send the comment body"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_environment_entries_do_not_panic_comment_setup() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = OsString::from_vec(vec![0xff]);
+        let environment = unicode_environment([
+            (OsString::from("SAFE"), OsString::from("value")),
+            (OsString::from("BAD_VALUE"), invalid.clone()),
+            (invalid, OsString::from("bad key")),
+        ]);
+        assert_eq!(
+            environment,
+            HashMap::from([("SAFE".into(), "value".into())])
+        );
+    }
 
     #[test]
     fn pull_request_comment_args_use_the_same_body_file_contract() {

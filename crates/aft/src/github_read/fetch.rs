@@ -146,35 +146,52 @@ impl GhCommandRunner for SystemGhCommandRunner {
         args: &[String],
         byte_cap: usize,
     ) -> Result<(GhCommandOutput, bool), GhCommandError> {
-        let mut child = Command::new("gh")
-            .args(args)
-            .current_dir(working_directory)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(command_error)?;
-        let stderr = child.stderr.take().expect("piped gh stderr");
-        // Drain stderr concurrently so a diagnostic cannot block stdout. Its
-        // own iterator is bounded; credentials are redacted by the fetcher.
-        let errors = std::thread::spawn(move || read_capped(stderr, 64 * 1024));
-        let stdout = read_capped(child.stdout.take().expect("piped gh stdout"), byte_cap);
-        let cap_hit = stdout.as_ref().is_ok_and(|bytes| bytes.len() == byte_cap);
-        if cap_hit || stdout.is_err() {
-            let _ = child.kill();
-        }
-        let status = child.wait().map_err(command_error)?;
-        let stderr = errors
-            .join()
-            .map_err(|_| GhCommandError::Other("GitHub CLI stderr reader stopped".to_string()))??;
-        Ok((
-            GhCommandOutput {
-                success: status.success(),
-                stdout: stdout?,
-                stderr,
-            },
-            cap_hit,
-        ))
+        let mut command = Command::new("gh");
+        command.args(args).current_dir(working_directory);
+        run_bounded_command(command, byte_cap)
     }
+}
+
+fn run_bounded_command(
+    mut command: Command,
+    byte_cap: usize,
+) -> Result<(GhCommandOutput, bool), GhCommandError> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(command_error)?;
+    let stderr = child.stderr.take().expect("piped gh stderr");
+    // Drain stderr concurrently so a diagnostic cannot block stdout. Its
+    // own iterator is bounded; credentials are redacted by the fetcher.
+    let errors = std::thread::spawn(move || read_capped(stderr, 64 * 1024));
+    // A lookahead byte distinguishes exact-cap EOF from real overflow.
+    let mut stdout = read_capped(
+        child.stdout.take().expect("piped gh stdout"),
+        byte_cap.saturating_add(1),
+    );
+    let cap_hit = stdout.as_ref().is_ok_and(|bytes| bytes.len() > byte_cap);
+    if cap_hit {
+        stdout
+            .as_mut()
+            .expect("overflow requires captured bytes")
+            .pop();
+    }
+    if cap_hit || stdout.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().map_err(command_error)?;
+    let stderr = errors
+        .join()
+        .map_err(|_| GhCommandError::Other("GitHub CLI stderr reader stopped".to_string()))??;
+    Ok((
+        GhCommandOutput {
+            success: status.success(),
+            stdout: stdout?,
+            stderr,
+        },
+        cap_hit,
+    ))
 }
 
 fn command_error(error: std::io::Error) -> GhCommandError {
@@ -404,14 +421,22 @@ static GITHUB_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
         .expect("GitHub token redaction expression is valid")
 });
 static AUTHORIZATION_VALUE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)((?:authorization|token)\s*[:=]\s*)[^\s,;]+")
-        .expect("authorization redaction expression is valid")
+    regex::Regex::new(
+        r"(?i)((?:authorization|token)\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?[^\s,;]+",
+    )
+    .expect("authorization redaction expression is valid")
+});
+static URL_USERINFO: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(//)[^/@\s]+@").expect("URL userinfo redaction expression is valid")
 });
 
 /// Redact ambient credentials while keeping GitHub's actionable authorization,
 /// private-resource, and not-found diagnostics visible to the caller.
 pub fn redact_gh_error(message: &str) -> String {
-    let with_tokens = GITHUB_TOKEN.replace_all(message, "[redacted]");
+    // Remove URL credentials before matching token assignments; a userinfo
+    // name such as x-access-token must not make that matcher eat the URL host.
+    let with_userinfo = URL_USERINFO.replace_all(message, "${1}[redacted]@");
+    let with_tokens = GITHUB_TOKEN.replace_all(&with_userinfo, "[redacted]");
     AUTHORIZATION_VALUE
         .replace_all(&with_tokens, "${1}[redacted]")
         .into_owned()
@@ -424,6 +449,48 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_cap_stdout_is_not_truncated_but_overflow_is() {
+        for (script, expected_cut) in [("printf abcd", false), ("printf abcde", true)] {
+            let mut command = Command::new("/bin/sh");
+            command.env_clear().args(["-c", script]);
+            let (output, cut) = run_bounded_command(command, 4).unwrap();
+            assert_eq!(output.stdout, b"abcd");
+            assert_eq!(cut, expected_cut, "{script}");
+            if !cut {
+                assert!(output.success);
+            }
+        }
+    }
+
+    #[test]
+    fn authorization_schemes_do_not_leak_credentials() {
+        for message in [
+            "Authorization: Bearer secret-bearer; permission denied",
+            "authorization=Basic secret-basic, permission denied",
+            "Authorization: token secret-token\npermission denied",
+        ] {
+            let redacted = redact_gh_error(message);
+            assert!(!redacted.contains("secret-"), "{redacted}");
+            assert!(redacted.contains("permission denied"), "{redacted}");
+        }
+    }
+
+    #[test]
+    fn url_userinfo_does_not_leak_credentials() {
+        for username in ["username", "x-access-token"] {
+            let redacted = redact_gh_error(&format!(
+                "https://{username}:secret-userinfo@github.com/owner/repo: permission denied",
+            ));
+            assert!(!redacted.contains("secret-userinfo"), "{redacted}");
+            assert!(
+                redacted.contains("github.com/owner/repo: permission denied"),
+                "{redacted}"
+            );
+        }
+    }
 
     #[test]
     fn bounded_reader_stops_at_the_iterator_ceiling() {

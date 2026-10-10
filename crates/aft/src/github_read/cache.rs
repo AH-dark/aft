@@ -496,13 +496,22 @@ impl GithubReadEngine {
             let clock = Arc::clone(&self.clock);
             let state = Arc::clone(&self.state);
             std::thread::spawn(move || {
-                let fetched = fetch_store(
-                    &fetch_request,
-                    cache.as_ref(),
-                    fetcher.as_ref(),
-                    clock.as_ref(),
-                    &state,
-                );
+                // A failed producer must finish its waiters and release the slot
+                // so a later read can fetch again instead of joining a dead flight.
+                let fetched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetch_store(
+                        &fetch_request,
+                        cache.as_ref(),
+                        fetcher.as_ref(),
+                        clock.as_ref(),
+                        &state,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(GithubReadError::FetchFailed(
+                        "GitHub read worker stopped before completing".to_string(),
+                    ))
+                });
                 let waiters = state.lock().flights.remove(&slot).unwrap_or_default();
                 for waiter in waiters {
                     let result = match &fetched {
@@ -1293,6 +1302,72 @@ mod tests {
             assert!(completion.content.contains("fixture"));
         }
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn panicking_fetch_completes_all_waiters_and_allows_a_new_flight() {
+        struct PanicOnceFetcher {
+            calls: AtomicUsize,
+            started: std::sync::mpsc::SyncSender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl GithubFetcher for PanicOnceFetcher {
+            fn fetch(
+                &self,
+                request: &GithubFetchRequest,
+            ) -> Result<GithubDocument, GithubReadError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.started.send(()).unwrap();
+                    self.release.lock().recv().unwrap();
+                    panic!("fixture fetch panic");
+                }
+                FixtureFetcher::default().fetch(request)
+            }
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let fetcher = Arc::new(PanicOnceFetcher {
+            calls: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        let start = || match engine
+            .start(
+                &enabled_gh_read(),
+                request(None),
+                GithubReadSelector::default(),
+            )
+            .unwrap()
+        {
+            GithubReadStart::Deferred(pending) => pending,
+            GithubReadStart::Immediate(_) => panic!("live fetch must defer"),
+        };
+        let first = start();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let follower = start();
+        release_tx.send(()).unwrap();
+        for pending in [first, follower] {
+            assert_eq!(
+                wait_for(pending),
+                Err(GithubReadError::FetchFailed(
+                    "GitHub read worker stopped before completing".to_string()
+                ))
+            );
+        }
+        assert!(engine.state.lock().flights.is_empty());
+        assert_eq!(
+            wait_for(start()).unwrap().freshness,
+            GithubReadFreshness::Fetched
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
