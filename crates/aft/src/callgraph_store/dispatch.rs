@@ -1133,6 +1133,11 @@ pub struct Resolver<'a> {
     pub files: BTreeMap<String, &'a ParseBlob>,
     pub import_targets: BTreeMap<(String, String), String>,
     pub type_targets: BTreeMap<(String, String), (String, String)>,
+    /// Every method of every file, grouped by method name and in file order,
+    /// built on first use. An open or interface receiver then checks only the
+    /// same-named methods instead of rescanning the whole manifest per site.
+    methods_by_name:
+        std::cell::OnceCell<HashMap<&'a str, Vec<(String, &'a ParseBlob, &'a MethodHint)>>>,
     #[cfg(test)]
     file_visits: std::cell::Cell<usize>,
 }
@@ -1142,9 +1147,29 @@ impl<'a> Resolver<'a> {
             files,
             import_targets: BTreeMap::new(),
             type_targets: BTreeMap::new(),
+            methods_by_name: std::cell::OnceCell::new(),
             #[cfg(test)]
             file_visits: std::cell::Cell::new(0),
         }
+    }
+    fn methods_named(&self, member: &str) -> &[(String, &'a ParseBlob, &'a MethodHint)] {
+        let index = self.methods_by_name.get_or_init(|| {
+            let mut index: HashMap<&'a str, Vec<(String, &'a ParseBlob, &'a MethodHint)>> =
+                HashMap::new();
+            for (file, parse) in &self.files {
+                self.note_file_visit();
+                let parse: &'a ParseBlob = parse;
+                for method in &parse.dispatch.methods {
+                    index.entry(method.name.as_str()).or_default().push((
+                        file.clone(),
+                        parse,
+                        method,
+                    ));
+                }
+            }
+            index
+        });
+        index.get(member).map(Vec::as_slice).unwrap_or_default()
     }
     fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
         self.project_type_at_depth(file, name, 0)
@@ -1274,24 +1299,31 @@ impl<'a> Resolver<'a> {
                 }
             }
             let base = parts.join("/");
-            for (path, candidate) in &self.files {
+            // Probe the few names the import can denote, in manifest order,
+            // instead of scanning every file of the project for them.
+            let mut candidates = std::iter::once(base.clone())
+                .chain(
+                    ["ts", "tsx", "js", "py", "rs", "go"]
+                        .iter()
+                        .map(|ext| format!("{base}.{ext}")),
+                )
+                .collect::<Vec<_>>();
+            candidates.sort();
+            for path in candidates {
+                let Some((path, candidate)) = self.files.get_key_value(&path) else {
+                    continue;
+                };
                 self.note_file_visit();
                 if candidate.language != parse.language {
                     continue;
                 }
-                if path == &base
-                    || ["ts", "tsx", "js", "py", "rs", "go"]
-                        .iter()
-                        .any(|ext| path == &format!("{base}.{ext}"))
+                if let Some(t) = candidate
+                    .dispatch
+                    .types
+                    .iter()
+                    .find(|t| t.name == imported_name)
                 {
-                    if let Some(t) = candidate
-                        .dispatch
-                        .types
-                        .iter()
-                        .find(|t| t.name == imported_name)
-                    {
-                        return Some((path.clone(), t));
-                    }
+                    return Some((path.clone(), t));
                 }
             }
             return None;
@@ -1299,25 +1331,19 @@ impl<'a> Resolver<'a> {
         None
     }
     fn methods(&self, file: &str, owner: &str, name: &str) -> Vec<Target> {
-        self.files
+        let language = &self.files[file].language;
+        self.methods_named(name)
             .iter()
-            .filter(|(_, p)| p.language == self.files[file].language)
-            .inspect(|_| self.note_file_visit())
-            .flat_map(|(method_file, p)| {
-                p.dispatch
-                    .methods
-                    .iter()
-                    .filter(move |m| {
-                        m.name == name
-                            && self
-                                .project_type(method_file, &m.owner)
-                                .is_some_and(|(f, t)| f == file && t.name == owner)
-                    })
-                    .map(move |m| Target {
-                        file: method_file.clone(),
-                        symbol: m.symbol.clone(),
-                        provenance: "exact",
-                    })
+            .filter(|(method_file, p, m)| {
+                &p.language == language
+                    && self
+                        .project_type(method_file, &m.owner)
+                        .is_some_and(|(f, t)| f == file && t.name == owner)
+            })
+            .map(|(method_file, _, m)| Target {
+                file: method_file.clone(),
+                symbol: m.symbol.clone(),
+                provenance: "exact",
             })
             .collect()
     }
@@ -1489,15 +1515,12 @@ impl<'a> Resolver<'a> {
         }
         let mut targets = exact.into_iter().collect::<BTreeSet<_>>();
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
-            for (candidate_file, candidate) in &self.files {
-                self.note_file_visit();
+            for (candidate_file, candidate, method) in self.methods_named(member) {
+                let (candidate_file, candidate, method) = (candidate_file, *candidate, *method);
                 if candidate.language != parse.language {
                     continue;
                 }
-                for method in &candidate.dispatch.methods {
-                    if method.name != *member {
-                        continue;
-                    }
+                {
                     let implements = method.trait_name.as_deref().is_some_and(|name| {
                         self.project_type(candidate_file, name)
                             .is_some_and(|(f, t)| f == type_file && t.name == ty.name)

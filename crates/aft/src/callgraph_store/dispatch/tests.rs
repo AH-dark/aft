@@ -533,3 +533,51 @@ fn every_receiver_form_crosses_target_and_unknown_columns() {
         }
     }
 }
+
+#[test]
+fn relative_import_and_open_receiver_dispatch_do_not_rescan_every_file() {
+    let target = parse("export class Target { run() {} }", "typescript");
+    let caller = parse(
+        "import { Target } from './target';\nfunction caller(x: Target) { x.run(); }",
+        "typescript",
+    );
+    let fillers = (0..128)
+        .map(|index| {
+            parse(
+                &format!("export class F{index} {{ other() {{}} }}"),
+                "typescript",
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut files = BTreeMap::new();
+    files.insert("src/caller.ts".to_string(), &caller);
+    files.insert("src/target.ts".to_string(), &target);
+    for (index, filler) in fillers.iter().enumerate() {
+        files.insert(format!("lib/f{index:03}.ts"), filler);
+    }
+    let resolver = Resolver::new(files);
+    let sites = caller.dispatch.sites.clone();
+    assert!(!sites.is_empty(), "{:#?}", caller.dispatch);
+    resolver.file_visits.set(0);
+    for _ in 0..16 {
+        for site in &sites {
+            let resolution = resolver.resolve("src/caller.ts", site);
+            assert!(
+                resolution
+                    .targets
+                    .iter()
+                    .any(|target| target.file == "src/target.ts"),
+                "{resolution:#?}"
+            );
+        }
+    }
+    // The relative import is found by probing its few candidate names, and
+    // same-named methods come from an index built once: neither scales with
+    // sites times files any more.
+    let visits = resolver.file_visits.get();
+    assert!(
+        visits <= 130 + 16 * sites.len() * 7,
+        "{visits} file visits for {} sites in 130 files",
+        16 * sites.len()
+    );
+}
