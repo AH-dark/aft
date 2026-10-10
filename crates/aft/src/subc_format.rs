@@ -4868,6 +4868,7 @@ mod import_format_tests {
 #[cfg(test)]
 mod run_scope_status_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn bash_status_names_scope_revocation() {

@@ -20,6 +20,24 @@ fn observing_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     response
 }
 
+fn assert_run_not_killing() {
+    let (registry, task) = OBSERVED_TASK
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    let snapshot = registry
+        .status(&task, "run-session", None, None, 0)
+        .unwrap();
+    assert_eq!(
+        snapshot.info.status,
+        BgTaskStatus::Running,
+        "unconfirmed scope close must not start a kill"
+    );
+}
+
 async fn assert_scope_kill_settled() {
     let (registry, task) = OBSERVED_TASK
         .get()
@@ -318,6 +336,7 @@ fn close_case(name: &'static str, case: CloseCase) {
                         .await;
                         let retry = describe(&mut daemon.stream).await;
                         assert!(alive(pid), "not-synced must hold work");
+                        assert_run_not_killing();
                         answer(
                             &mut daemon.stream,
                             &retry,
@@ -347,6 +366,7 @@ fn close_case(name: &'static str, case: CloseCase) {
                         .await;
                         let retry = describe(&mut daemon.stream).await;
                         assert!(alive(pid), "describe error must hold work");
+                        assert_run_not_killing();
                         answer(
                             &mut daemon.stream,
                             &retry,
@@ -359,6 +379,7 @@ fn close_case(name: &'static str, case: CloseCase) {
                     CloseCase::Timeout => {
                         let retry = describe(&mut daemon.stream).await;
                         assert!(alive(pid), "describe timeout must hold work");
+                        assert_run_not_killing();
                         answer(
                             &mut daemon.stream,
                             &retry,
@@ -401,6 +422,18 @@ fn close_case(name: &'static str, case: CloseCase) {
                 }
                 wait_dead(pid).await;
                 assert_scope_kill_settled().await;
+                if matches!(case, CloseCase::Duplicate) {
+                    assert!(
+                        read_frame_within(
+                            &mut daemon.stream,
+                            Duration::from_millis(300),
+                            "queued duplicate describe"
+                        )
+                        .await
+                        .is_none(),
+                        "duplicate closes must not queue another describe after the first finishes"
+                    );
+                }
             }
             send_connection_goodbye(&mut daemon.stream).await;
         },
@@ -563,6 +596,48 @@ fn scope_revocation_non_run_background_is_unchanged() {
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            send_connection_goodbye(&mut daemon.stream).await;
+        },
+        |_, _, _| {},
+        bridge_dispatch,
+    );
+}
+
+#[test]
+fn scope_revocation_record_timeout_refuses_without_blocking_frames() {
+    run_subc_bridge_test_with_dispatch(
+        "run-record-timeout",
+        Duration::from_secs(15),
+        |input| async move {
+            let mut daemon = open_fake_daemon_session(input).await;
+            bind(&mut daemon.stream, &daemon.root1, 1, true).await;
+            let marker = daemon.root1.join("must-not-exist");
+            call(
+                &mut daemon.stream,
+                1,
+                100,
+                json!({"command":format!("touch '{}'", marker.display())}),
+            )
+            .await;
+            let _request = describe(&mut daemon.stream).await;
+            send_frame(
+                &mut daemon.stream,
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, 500, Vec::new()).unwrap(),
+            )
+            .await;
+            let pong = read_frame_within(
+                &mut daemon.stream,
+                Duration::from_secs(1),
+                "pong while scope read waits",
+            )
+            .await
+            .expect("scope read blocked the frame loop");
+            assert_eq!(pong.header.ty, FrameType::Pong);
+            let response = read_frame_timeout(&mut daemon.stream, "record timeout refusal").await;
+            assert_eq!(response.header.ty, FrameType::Error);
+            let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(error.code, "run_scope_unavailable");
+            assert!(!marker.exists());
             send_connection_goodbye(&mut daemon.stream).await;
         },
         |_, _, _| {},

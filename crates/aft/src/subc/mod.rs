@@ -4967,6 +4967,7 @@ where
                             dispatch,
                             user_config_path.as_deref(),
                             tool_response_body_limit,
+                            Some(&run_scopes),
                         )
                         .await
                         {
@@ -6435,6 +6436,7 @@ async fn handle_control_request(
     dispatch: DispatchFn,
     user_config_path: Option<&Path>,
     tool_response_body_limit: usize,
+    run_scopes: Option<&run_scope::RunScopes>,
 ) -> Result<(), SubcError> {
     let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
         Ok(request) => request,
@@ -6756,6 +6758,9 @@ async fn handle_control_request(
                 scope,
                 made_tool_call: AtomicBool::new(false),
             }));
+            if let Some(scopes) = run_scopes {
+                scopes.bind(&route_identity);
+            }
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
             metrics.mark_frame_loop_wait(
@@ -11827,6 +11832,7 @@ mod tests {
                 |request, _| Response::success(request.id, json!({})),
                 Some(&dir.path().join("absent-user-config.json")),
                 usize::MAX,
+                None,
             )
             .await
             .expect("admit route bind");
