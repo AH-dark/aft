@@ -178,13 +178,27 @@ pub fn extract_callee_name(node: &tree_sitter::Node, source: &str) -> Option<Str
             // Fallback: use the full text
             let text = &source[func_node.byte_range()];
             // If it contains a dot, take the last segment
-            if text.contains('.') {
+            let name = if text.contains('.') {
                 text.rsplit('.').next().map(|s| s.trim().to_string())
             } else {
                 Some(text.trim().to_string())
-            }
+            };
+            // Other callee kinds (a parenthesized function expression, an
+            // arrow function, a call result) have no name; their source text
+            // must not be recorded as one.
+            name.filter(|name| is_name_like_callee(name))
         }
     }
+}
+
+/// Whether fallback callee text reads as a (possibly qualified) name: word
+/// characters plus the separators and sigils names use across the supported
+/// languages (`::`, `\`, `$`, `@`, and Ruby's trailing `?`/`!`).
+fn is_name_like_callee(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|ch| {
+            ch.is_alphanumeric() || matches!(ch, '_' | '$' | ':' | '\\' | '@' | '?' | '!')
+        })
 }
 
 /// Extract the full callee expression from a call expression node.
@@ -1487,6 +1501,32 @@ mod tests {
             after <= 10000,
             "{after} block binding operations for 1000 declarations"
         );
+    }
+
+    #[test]
+    fn non_name_callee_expressions_are_not_recorded_as_call_names() {
+        let source = "(function () { inner(); })();\n(() => 1)();\nnamed();\n";
+        let tree = parse_source(LangId::TypeScript, source);
+        let names = extract_calls_full(
+            source,
+            tree.root_node(),
+            0,
+            source.len(),
+            LangId::TypeScript,
+        )
+        .into_iter()
+        .map(|call| call.1)
+        .collect::<Vec<_>>();
+        assert_eq!(names, vec!["inner".to_string(), "named".to_string()]);
+
+        // Name-shaped callees that reach the text fallback are still kept.
+        let source = "package main\nfunc main() { fmt.Println(1); helper(); }\n";
+        let tree = parse_source(LangId::Go, source);
+        let names = extract_calls_full(source, tree.root_node(), 0, source.len(), LangId::Go)
+            .into_iter()
+            .map(|call| call.1)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Println".to_string(), "helper".to_string()]);
     }
 
     #[test]
