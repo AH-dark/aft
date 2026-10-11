@@ -91,6 +91,7 @@ export function startOpenCodeLiveConfigReload(
   const { userConfigPath, projectConfigPath } = resolveCortexKitConfigPaths(options.directory);
   return startLiveConfigReload<AftConfig>({
     paths: [userConfigPath, projectConfigPath],
+    projectPath: projectConfigPath,
     load: () => loadOpenCodeConfigForLiveReload(options.directory),
     initialSources: options.initialSources,
     initialProjectText: options.initialSourceTexts?.[projectConfigPath] ?? null,

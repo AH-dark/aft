@@ -89,6 +89,7 @@ export function startPiLiveConfigReload(options: PiLiveConfigReloadOptions): Liv
   const { userConfigPath, projectConfigPath } = resolveCortexKitConfigPaths(options.directory);
   return startLiveConfigReload<AftConfig>({
     paths: [userConfigPath, projectConfigPath],
+    projectPath: projectConfigPath,
     load: () => loadPiConfigForLiveReload(options.directory),
     initialSources: options.initialSources,
     initialProjectText: options.initialSourceTexts?.[projectConfigPath] ?? null,

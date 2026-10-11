@@ -280,6 +280,31 @@ fn deleted_config_file_keeps_the_last_good_config() {
 }
 
 #[test]
+fn deleting_project_config_removes_its_settings_on_live_reload() {
+    let fixture = Fixture::new(
+        r#"{ "format_on_edit": false, "sandbox": { "enabled": false } }"#,
+        Some(r#"{ "format_on_edit": true, "sandbox": { "enabled": true } }"#),
+    );
+    assert!(fixture.ctx.config().format_on_edit);
+    assert!(fixture.ctx.config().sandbox.enabled);
+
+    std::fs::remove_file(&fixture.project_path).expect("delete project config");
+    let outcome = fixture.reload();
+
+    assert!(
+        applied(&outcome).contains(&"format_on_edit"),
+        "deleting the project file must apply the remaining tier: {outcome:?}"
+    );
+    assert!(
+        applied(&outcome).contains(&"sandbox.enabled"),
+        "deleting the project file must remove project-only sandbox settings: {outcome:?}"
+    );
+    let config = fixture.ctx.config();
+    assert!(!config.format_on_edit);
+    assert!(!config.sandbox.enabled);
+}
+
+#[test]
 fn absent_file_that_was_absent_at_connect_is_not_an_error() {
     let fixture = Fixture::new("{}", None);
     write(&fixture.user_path, r#"{ "format_on_edit": true }"#);
@@ -719,7 +744,7 @@ fn a_user_edit_can_still_loosen_what_the_user_set() {
 }
 
 #[test]
-fn a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed() {
+fn a_deleted_project_file_clears_a_previously_relayed_tier() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
@@ -747,12 +772,11 @@ fn a_tier_file_that_appears_with_the_relayed_text_is_then_file_backed() {
     let project_path = project_config_path(&root);
     write(&project_path, relayed);
     assert_eq!(reload_config_now(&ctx), ReloadOutcome::Unchanged);
+    assert!(ctx.config().sandbox.enabled);
 
     std::fs::remove_file(&project_path).unwrap();
-    match Some(reload_config_now(&ctx)) {
-        Some(ReloadOutcome::Kept { reason }) => assert!(reason.contains("was deleted"), "{reason}"),
-        other => panic!("expected the deletion to be refused, got {other:?}"),
-    }
+    assert_eq!(applied(&reload_config_now(&ctx)), vec!["sandbox.enabled"]);
+    assert!(!ctx.config().sandbox.enabled);
 }
 
 #[test]

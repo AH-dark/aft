@@ -7,7 +7,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
@@ -33,14 +33,17 @@ afterEach(() => {
   for (const fn of cleanup.splice(0).reverse()) fn();
 });
 
-async function fixture(user: string) {
+async function fixture(user: string, project?: string) {
   const root = mkdtempSync(join(tmpdir(), "aft-pi-live-config-"));
   const xdg = join(root, "xdg");
   const projectDir = join(root, "project");
   mkdirSync(join(xdg, "cortexkit"), { recursive: true });
   mkdirSync(projectDir, { recursive: true });
+  mkdirSync(join(projectDir, ".cortexkit"), { recursive: true });
   const userPath = join(xdg, "cortexkit", "aft.jsonc");
+  const projectPath = join(projectDir, ".cortexkit", "aft.jsonc");
   writeFileSync(userPath, user);
+  if (project !== undefined) writeFileSync(projectPath, project);
   const releaseEnv = await acquireEnv({ HOME: join(root, "home"), XDG_CONFIG_HOME: xdg });
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   cleanup.push(releaseEnv);
@@ -59,7 +62,7 @@ async function fixture(user: string) {
     watch: false,
   });
   cleanup.push(() => reload.stop());
-  return { root, projectDir, userPath, ctx, reload, notices, calls };
+  return { root, projectDir, projectPath, userPath, ctx, reload, notices, calls };
 }
 
 describe.serial("Pi live config reload", () => {
@@ -94,6 +97,20 @@ describe.serial("Pi live config reload", () => {
     const bash = resolveBashConfig(f.ctx.config);
     expect(bash.foreground_wait_window_ms).toBe(30_000);
     expect(bash.compress).toBe(true);
+  });
+
+  test("deleting the project file removes its live settings", async () => {
+    const f = await fixture(
+      '{ "bash": { "watch_sync_max_ms": 120000 } }',
+      '{ "bash": { "watch_sync_max_ms": 1000 } }',
+    );
+    expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(1000);
+    unlinkSync(f.projectPath);
+
+    f.reload.reload();
+
+    expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(120000);
+    expect(f.notices).toEqual([]);
   });
 
   test("an invalid edit keeps the last valid config", async () => {

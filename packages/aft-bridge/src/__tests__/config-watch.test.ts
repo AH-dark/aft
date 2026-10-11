@@ -104,7 +104,12 @@ describe("applyLiveConfigKeys", () => {
 });
 
 describe("startLiveConfigReload", () => {
-  function harness(initial: TestConfig, initialSources: string[] = []) {
+  function harness(
+    initial: TestConfig,
+    initialSources: string[] = [],
+    projectPath = "/cfg/project/aft.jsonc",
+    initialProjectText?: string,
+  ) {
     let config = initial;
     let nextLoad: LiveConfigLoad<TestConfig> = {
       ok: true,
@@ -115,8 +120,10 @@ describe("startLiveConfigReload", () => {
     const logs: string[] = [];
     const reload = startLiveConfigReload<TestConfig>({
       paths: [],
+      projectPath,
       load: () => nextLoad,
       initialSources,
+      initialProjectText,
       keys: KEYS,
       getConfig: () => config,
       setConfig: (next) => {
@@ -158,6 +165,22 @@ describe("startLiveConfigReload", () => {
 
     expect(h.config().restrict_to_project_root).toBe(true);
     expect(h.errors[0]).toContain("/cfg/user/aft.jsonc was deleted");
+  });
+
+  test("a missing project file removes its live settings", () => {
+    const projectPath = "/cfg/project/aft.jsonc";
+    const h = harness({ restrict_to_project_root: true }, [projectPath], projectPath, "{}");
+    h.loads({
+      ok: true,
+      config: { restrict_to_project_root: false },
+      sources: [],
+      projectText: null,
+    });
+
+    h.reload.reload();
+
+    expect(h.config().restrict_to_project_root).toBe(false);
+    expect(h.errors).toEqual([]);
   });
 
   test("a file absent at startup may appear later", () => {

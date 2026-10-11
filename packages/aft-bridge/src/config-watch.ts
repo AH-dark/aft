@@ -426,8 +426,8 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
 
 /**
  * Result of loading the config files for a live reload. `sources` lists the
- * config files the load actually read; a file it relied on last time that is
- * missing from it counts as deleted.
+ * config files the load actually read; a missing project source can represent
+ * a valid config with no project tier.
  */
 export type LiveConfigLoad<C> =
   | {
@@ -499,6 +499,8 @@ export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveS
 export interface LiveConfigReloadOptions<C> {
   /** The user and project `aft.jsonc` files. */
   paths: readonly string[];
+  /** The project config file path, whose confirmed absence removes that tier. */
+  projectPath: string;
   /** Load and resolve both files. Anything but a clean load is `ok: false`. */
   load(): LiveConfigLoad<C>;
   /** The config files the startup load that produced `getConfig()` read. */
@@ -540,32 +542,32 @@ export function liveConfigReloadLogLine(applied: string[], deferred: string[]): 
 
 /**
  * Watch the config files and keep `ctx.config` current for the live keys.
- * An invalid, unreadable or deleted file keeps the last valid config: the
- * error is reported and nothing else changes. Right after the watch starts
- * the files are read once, so an edit made while the host was starting (after
- * its config was loaded, before the watch existed) is not missed.
+ * An invalid or unreadable config keeps the last valid config. Removing the
+ * project file is a valid change to the project tier, so the remaining config
+ * is applied on the next reload. Right after the watch starts, the files are
+ * checked so any change made since startup (before the watch existed) is not missed.
  */
 export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): LiveConfigReload {
   const baseline = options.getConfig();
   let lastError: string | null = null;
-  // The files the last accepted load read. A load that no longer reads one of
-  // them keeps the last valid config rather than resolving the file as empty:
-  // a security setting must not loosen because a file vanished mid-save or
-  // was deleted by mistake. The next host restart applies a real deletion.
+  // The files the last accepted load read. A missing user config remains an
+  // error, but a missing project config is a valid no-project-tier result.
   let acceptedSources = new Set(options.initialSources);
-  // The project text the published security values rest on. A project edit
-  // that would loosen one of them is held until the next restart, and this
-  // stays at the older text so later reloads keep holding it.
+  // The accepted project text is the reference for the security keys listed
+  // in `aftLiveSecurityKeys`. Edits that weaken them wait for restart; deleting
+  // the file removes its tier instead.
   let acceptedProjectText = options.initialProjectText ?? null;
   // The texts the last accepted load read, handed to the watch so it records
   // what was applied rather than what it happened to read.
   let acceptedTexts: Readonly<Record<string, string>> | undefined;
   const reload = (): LiveConfigApply<C> | null => {
     let loaded = options.load();
+    let deletedProjectConfig = false;
     if (loaded.ok) {
       const read = new Set(loaded.sources);
       const deleted = [...acceptedSources].find((path) => !read.has(path));
-      if (deleted !== undefined) {
+      deletedProjectConfig = deleted === options.projectPath && loaded.projectText === null;
+      if (deleted !== undefined && !deletedProjectConfig) {
         loaded = { ok: false, message: `AFT config at ${deleted} was deleted` };
       } else {
         acceptedSources = read;
@@ -586,11 +588,13 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
     const held: string[] = [];
     const projectText = loaded.projectText ?? null;
     if (loaded.projectText !== undefined && projectText !== acceptedProjectText) {
-      for (const security of options.securityKeys ?? []) {
-        const now = security.key.read(current);
-        if (security.loosens(now, security.key.read(next))) {
-          next = security.key.write(next, now);
-          held.push(security.key.name);
+      if (!deletedProjectConfig) {
+        for (const security of options.securityKeys ?? []) {
+          const now = security.key.read(current);
+          if (security.loosens(now, security.key.read(next))) {
+            next = security.key.write(next, now);
+            held.push(security.key.name);
+          }
         }
       }
       if (held.length === 0) acceptedProjectText = projectText;

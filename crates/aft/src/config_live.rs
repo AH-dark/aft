@@ -410,11 +410,15 @@ fn read_tier(recorded: &TierSource) -> TierRead {
             Err(_) => TierRead::Error(format!("{} is not valid UTF-8", path.display())),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if recorded.from_file && recorded.text.is_some() {
-                // A deleted file is treated as unreadable, not as `{}`: a
-                // security key must not loosen because a file vanished
-                // mid-save or was deleted by mistake. The next connect still
-                // resolves a missing file as `{}`.
+            if recorded.tier == "project" && recorded.from_file && recorded.text.is_some() {
+                // A successfully absent project file removes that tier. The
+                // user tier stays intact and is resolved as the new base.
+                TierRead::Use(TierSource {
+                    text: None,
+                    from_file: true,
+                    ..recorded.clone()
+                })
+            } else if recorded.from_file && recorded.text.is_some() {
                 TierRead::Error(format!("{} was deleted", path.display()))
             } else {
                 TierRead::Use(recorded.clone())
@@ -464,11 +468,12 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             return keep_last_good(ctx, &root_label, reason);
         }
     };
+    let project_deleted =
+        sources.project.from_file && sources.project.text.is_some() && project.text.is_none();
     // A held loosening is released once the project file is back to the text
-    // the published values were resolved from: the edits that were held no
-    // longer exist, so the published config is resolved from the files again.
+    // the published values were resolved from, or when the tier is removed.
     let was_holding = state.project_hold_active.load(Ordering::Acquire);
-    let holding = was_holding && project.text != sources.project.text;
+    let holding = !project_deleted && was_holding && project.text != sources.project.text;
     if was_holding && !holding {
         state.project_hold_active.store(false, Ordering::Release);
     }
@@ -522,7 +527,7 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             .iter()
             .map(|drop| format!("{} ({})", drop.key, drop.reason))
             .collect();
-        let held = if project_changed || holding {
+        let held = if !project_deleted && (project_changed || holding) {
             let mut floor = published.as_ref().clone();
             let user_only_diagnostics =
                 crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
