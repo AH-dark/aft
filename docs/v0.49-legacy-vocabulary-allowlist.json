@@ -173,22 +173,22 @@
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "line": 158,
+      "line": 165,
       "column": 21,
       "token": "filePath",
       "text": "/// Params: `file`/`filePath` (string, optional) — when provided, previews that per-file stack;",
-      "location": "line 158, column 21",
+      "location": "line 165, column 21",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "line": 167,
+      "line": 174,
       "column": 37,
       "token": "filePath",
       "text": ".or_else(|| req.params.get(\"filePath\"))",
-      "location": "line 167, column 37",
+      "location": "line 174, column 37",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
