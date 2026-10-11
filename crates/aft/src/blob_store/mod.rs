@@ -100,8 +100,7 @@ pub(crate) fn publication_durability_barrier() -> MutexGuard<'static, ()> {
 pub const SEMANTIC_PAYLOAD_SCHEMA: u32 = 1;
 pub const SEMANTIC_PRODUCER_VERSION: &str = "semantic-v1";
 pub const CALLGRAPH_PAYLOAD_SCHEMA: u32 = 1;
-pub const CALLGRAPH_PRODUCER_VERSION: &str =
-    "callgraph-v4-nested-use-macro-imports-go-init-callbacks";
+pub const CALLGRAPH_PRODUCER_VERSION: &str = "callgraph-v5-manifest-root-reexport-resolution";
 
 const BLOB_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS blob_payloads (
@@ -985,7 +984,7 @@ mod tests {
             ],
             [
                 (1, "semantic-v1"),
-                (1, "callgraph-v4-nested-use-macro-imports-go-init-callbacks")
+                (1, "callgraph-v5-manifest-root-reexport-resolution")
             ],
             "a payload encoding change must bump its producer key version in the same edit"
         );
