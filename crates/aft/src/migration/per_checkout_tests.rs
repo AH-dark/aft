@@ -3,6 +3,71 @@ use std::path::{Path, PathBuf};
 use super::*;
 use crate::semantic_index::{EmbedTextCaps, SemanticIndex, SemanticIndexFingerprint};
 
+// These draft tests explore refusing status obtained by copying DB/WAL files
+// separately, which is not a consistent read of import completion. Requiring an
+// already-open connection alone breaks standalone pruning. Keep the drafts
+// disabled until a reader can identify the same database, prove writers stopped,
+// and read it without recovery writes while still supporting completed ledgers.
+fn completed_status_fixture(storage: &Path, key: &str) -> ImportLedger {
+    let ledger = ImportLedger::open(storage, key).unwrap();
+    {
+        let connection = lock(&ledger.inner.connection);
+        for artifact in Artifact::ALL {
+            connection.execute(
+                "INSERT INTO imports(artifact,state,attempt,updated_ms,completed_ms) VALUES (?1,'done',1,1,1)",
+                params![artifact.as_str()],
+            ).unwrap();
+        }
+    }
+    ledger
+}
+
+#[test]
+#[ignore = "open question: a cold owning reader must preserve supported standalone pruning"]
+fn open_question_closed_ledger_status_needs_a_safe_owning_reader() {
+    let storage = tempfile::tempdir().unwrap();
+    let key = "0123456789abcdef";
+    let ledger = completed_status_fixture(storage.path(), key);
+    assert!(
+        ImportLedger::read_status(storage.path(), key)
+            .unwrap()
+            .unwrap()
+            .complete
+    );
+    drop(ledger);
+    assert!(
+        matches!(ImportLedger::read_status(storage.path(), key), Err(ImportError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock),
+        "a closed ledger must not be copied or reopened for status"
+    );
+}
+
+#[test]
+#[ignore = "open question: distinguish an unproven snapshot from a verified cold owning reader"]
+fn open_question_unproven_ledger_status_must_not_authorize_pruning() {
+    let storage = tempfile::tempdir().unwrap();
+    let key = "0123456789abcdef";
+    let legacy = storage.path().join("index").join(key);
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("cache.bin"), b"retain this legacy payload").unwrap();
+    drop(completed_status_fixture(storage.path(), key));
+    let after_retention = UNIX_EPOCH + LEGACY_RETENTION + Duration::from_secs(1);
+    let inventory =
+        crate::migration::prune_legacy::inventory(storage.path(), after_retention).unwrap();
+    let set = inventory.sets.iter().find(|set| set.key == key).unwrap();
+    assert!(
+        matches!(
+            set.eligibility,
+            crate::migration::prune_legacy::Eligibility::LedgerUnreadable(_)
+        ),
+        "unowned status must be uncertainty, not pruning authority: {:?}",
+        set.eligibility
+    );
+    assert_eq!(
+        fs::read(legacy.join("cache.bin")).unwrap(),
+        b"retain this legacy payload"
+    );
+}
+
 const POLICY: TrigramPolicy = TrigramPolicy {
     max_file_size: 1 << 20,
 };
