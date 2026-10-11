@@ -75,6 +75,7 @@ async function startFakeDaemon(
   reply: () => unknown,
   reloadWindowMs: number = RELOAD_WINDOW_MS,
   lateReload?: LateReload,
+  endBgStreams = false,
 ): Promise<FakeDaemon> {
   let key = new Uint8Array(32).fill(7);
   const daemonId = new Uint8Array(16).fill(9);
@@ -218,6 +219,10 @@ async function startFakeDaemon(
           continue;
         }
 
+        if (endBgStreams && JSON.parse(body.toString("utf8")).op === "bg_events") {
+          send(FrameType.StreamEnd, header.channel, header.epoch, header.corr, null);
+          continue;
+        }
         state.requests += 1;
         send(FrameType.Response, header.channel, header.epoch, header.corr, reply());
       }
@@ -666,4 +671,95 @@ describe("route.open across a 5s module reload window (real SubcClient, fake dae
     expect(daemon.requests).toBe(2);
     expect(daemon.accepted).toBe(1);
   });
+});
+
+for (const source of ["status", "drain"] as const) {
+  test(`fake daemon fate_unknown ${source} then ACK releases the carrier`, async () => {
+    let request = 0;
+    const daemon = await startFakeDaemon(
+      () => 0,
+      () => ({
+        structuredContent:
+          ++request === 1
+            ? source === "status"
+              ? { success: true, task_id: "lost", status: "fate_unknown", text: "terminal" }
+              : {
+                  success: true,
+                  bg_completions: [{ task_id: "lost", status: "fate_unknown" }],
+                  pending_matches: [],
+                  text: "terminal",
+                }
+            : { success: true, acked_task_ids: ["lost"], text: "ACKed" },
+      }),
+      0,
+    );
+    const pool = new SubcTransportPool({
+      connectionFile: daemon.connectionFile,
+      harness: "pi",
+      consumerIdentity: null,
+    });
+    try {
+      pool.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+      const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+      await bridge.send(source === "status" ? "bash_status" : "bash_drain_completions", {
+        session_id: "fresh",
+        task_id: "lost",
+      });
+      await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+      expect(pool.__retainedSessionCountsForTests().sessions).toBe(1);
+      await bridge.send("bash_ack_completions", { session_id: "fresh", task_ids: ["lost"] });
+      await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+      expect(pool.__retainedSessionCountsForTests().sessions).toBe(0);
+      expect(daemon.requests).toBe(2);
+    } finally {
+      await pool.shutdown();
+      await daemon.close();
+    }
+  });
+}
+
+test("fake daemon reconnect backoff is cancelled by shutdown", async () => {
+  const daemon = await startFakeDaemon(
+    () => 0,
+    () => ({ structuredContent: { success: true, text: "live" } }),
+    0,
+    undefined,
+    true,
+  );
+  let entered!: () => void;
+  let releaseSleep!: () => void;
+  const sleeping = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const pool = new SubcTransportPool({
+    connectionFile: daemon.connectionFile,
+    harness: "pi",
+    consumerIdentity: null,
+    onBgEventsNudge: () => {},
+    bgBackoffSleep: () => {
+      entered();
+      return new Promise<void>((resolve) => {
+        releaseSleep = resolve;
+      });
+    },
+  });
+  let shutdown: Promise<void> | undefined;
+  try {
+    await pool.getBridge(TEST_PROJECT_ROOT).send("ping", { session_id: "s" });
+    await sleeping;
+    let stopped = false;
+    shutdown = pool.shutdown().then(() => {
+      stopped = true;
+    });
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    expect(stopped).toBe(true);
+    const accepted = daemon.accepted;
+    releaseSleep();
+    await shutdown;
+    expect(daemon.accepted).toBe(accepted);
+  } finally {
+    releaseSleep?.();
+    await (shutdown ?? pool.shutdown());
+    await daemon.close();
+  }
 });

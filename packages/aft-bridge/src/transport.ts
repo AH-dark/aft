@@ -118,6 +118,8 @@ export interface AftTransportPool {
     rawArgs?: ToolCallArguments,
     options?: ToolCallOptions,
   ): Promise<ToolCallResult>;
+  /** Observe concrete eviction without creating a replacement bridge. */
+  subscribeBridgeEvictions?(listener: (canonicalRoot: string) => void): () => void;
   getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null;
   /**
    * All currently-live project transports, for session-scoped signals (e.g.

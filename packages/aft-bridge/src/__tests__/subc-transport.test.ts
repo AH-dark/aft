@@ -13,6 +13,7 @@ import { getActiveLogger, setActiveLogger } from "../active-logger.js";
 import type { Logger, LogMeta } from "../logger.js";
 import {
   __dispatchProbeCountForTests,
+  __withDeadlineSuffixForTests,
   type SubcClientLike,
   SubcTransportPool,
 } from "../subc-transport.js";
@@ -2655,4 +2656,80 @@ describe("SubcTransportPool shared connection vs per-route failures", () => {
     expect(logs.some((line) => line.includes("dropping shared client"))).toBe(false);
     await pool.shutdown();
   });
+});
+
+test("throwing provenance nudge callback does not suppress the legacy callback", async () => {
+  let delivered = 0;
+  const client = new FakeClient(async () => envelope({ success: true, text: "live" }));
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake",
+    harness: "pi",
+    connect: async () => client,
+    demandCheck: () => true,
+    reapingEnabled: true,
+    onBgEventsNudgeRef: () => {
+      throw new Error("host callback failed");
+    },
+    onBgEventsNudge: () => {
+      delivered++;
+    },
+  });
+  try {
+    await pool.getBridge(TEST_PROJECT_ROOT).send("ping", { session_id: "s" });
+    await settleMicrotasks();
+    const before = delivered;
+    client.subscriptions[0].emit();
+    expect(delivered).toBe(before + 1);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
+test("deadline suffix wraps shared SDK errors without changing their metadata", () => {
+  const detail = { reason: "reload" };
+  const original = new SubcError("refused", "module_reloading", detail);
+  const wrapped = __withDeadlineSuffixForTests(original, "; deadline") as SubcError & {
+    cause?: unknown;
+  };
+  expect(original.message).toBe("refused");
+  expect(wrapped).not.toBe(original);
+  expect(wrapped.message).toBe("refused; deadline");
+  expect(wrapped.code).toBe("module_reloading");
+  expect(wrapped.detail).toBe(detail);
+  expect(wrapped.cause).toBe(original);
+  const managed = new SubcCallError("refused", "managed", "module_reloading", original);
+  const next = __withDeadlineSuffixForTests(managed, "; deadline") as SubcCallError;
+  expect(next.kind).toBe(managed.kind);
+  expect(next.detail).toBe(detail);
+  expect(managed.message).toBe("managed");
+});
+
+test("session detach deletes its nudge log state without scanning other sessions", async () => {
+  const client = new FakeClient(async () => envelope({ success: true, text: "live" }));
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake",
+    harness: "pi",
+    connect: async () => client,
+  });
+  try {
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    for (const session of ["s1", "s2"]) await bridge.send("ping", { session_id: session });
+    const internals = pool as any;
+    for (const record of internals.sessions.values())
+      internals.logNudgeDelivery("drop", record, "test nudge");
+    let scans = 0;
+    const logs = internals.nudgeDeliveryLogState;
+    const keys = logs.keys.bind(logs);
+    logs.keys = () => {
+      scans++;
+      return keys();
+    };
+    await pool.closeSession(TEST_PROJECT_ROOT, "s1");
+    expect(scans).toBe(0);
+    expect(logs.size).toBe(1);
+    await pool.closeSession(TEST_PROJECT_ROOT, "s2");
+    expect(logs.size).toBe(0);
+  } finally {
+    await pool.shutdown();
+  }
 });
