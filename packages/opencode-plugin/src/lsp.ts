@@ -1,9 +1,12 @@
+import { isAbsolute, resolve, win32 } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { PluginInput } from "@opencode-ai/plugin";
 import { sessionWarn } from "./logger.js";
 
 /** Wire format for a single LSP symbol hint sent to the binary. */
 interface LspSymbolHint {
   name: string;
+  /** Absolute file URI; percent escapes never masquerade as a bare filename. */
   file: string;
   line: number;
   kind?: string;
@@ -27,6 +30,29 @@ export const LSP_SYMBOL_KIND_MAP: Record<number, string> = {
   12: "function",
   23: "struct",
 };
+
+function symbolFileUri(file: string, directory?: string): string | undefined {
+  if (/^file:/i.test(file)) {
+    try {
+      return new URL(file).href;
+    } catch {
+      return undefined;
+    }
+  }
+  const windowsPath = (path: string) => /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
+  const windows = windowsPath(file) || (directory !== undefined && windowsPath(directory));
+  if (windows) {
+    if (!win32.isAbsolute(file) && !directory) return undefined;
+    return pathToFileURL(directory ? win32.resolve(directory, file) : file, { windows: true }).href;
+  }
+  if (!isAbsolute(file)) {
+    // An SDK-relative filename belongs to its explicit query root, not to the
+    // plugin process's current directory. Without that root, omit the hint.
+    if (!directory || !isAbsolute(directory)) return undefined;
+    file = resolve(directory, file);
+  }
+  return pathToFileURL(file, { windows: false }).href;
+}
 
 /**
  * Query the OpenCode LSP for workspace symbols matching `symbolName`.
@@ -67,19 +93,8 @@ export async function queryLspHints(
     // Map to wire format
     const hints: LspSymbolHint[] = [];
     for (const sym of symbols) {
-      // Convert file URI to path (handles Windows file:///C:/path correctly)
-      let file = sym.location.uri;
-      if (file.startsWith("file://")) {
-        try {
-          file = new URL(file).pathname;
-          // On Windows, URL.pathname gives /C:/path — strip leading slash
-          if (process.platform === "win32" && /^\/[A-Za-z]:/.test(file)) {
-            file = file.slice(1);
-          }
-        } catch {
-          file = file.slice(7);
-        }
-      }
+      const file = symbolFileUri(sym.location.uri, directory);
+      if (!file) continue;
 
       const hint: LspSymbolHint = {
         name: sym.name,
@@ -95,7 +110,7 @@ export async function queryLspHints(
       hints.push(hint);
     }
 
-    return { symbols: hints };
+    return hints.length > 0 ? { symbols: hints } : undefined;
   } catch (err) {
     sessionWarn(sessionId, `LSP query failed for "${symbolName}": ${(err as Error).message}`);
     return undefined;

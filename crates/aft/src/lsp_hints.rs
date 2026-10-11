@@ -8,7 +8,7 @@
 use crate::protocol::RawRequest;
 use crate::symbols::SymbolMatch;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A single LSP-sourced symbol hint: name, file path, line number, and optional kind.
 #[derive(Debug, Clone, Deserialize)]
@@ -26,9 +26,20 @@ pub struct LspHints {
     pub symbols: Vec<LspSymbolHint>,
 }
 
-/// Strip `file://` URI prefix from a path, returning the bare filesystem path.
-fn strip_file_uri(path: &str) -> &str {
-    path.strip_prefix("file://").unwrap_or(path)
+fn hint_path(file: &str, project_root: Option<&Path>) -> Option<PathBuf> {
+    if file
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        return crate::lsp::position::url_to_path(&url::Url::parse(file).ok()?).ok();
+    }
+    // Bare paths are filesystem names, never percent-encoded URI pathnames.
+    // The URI helper also recognizes absolute Windows paths on Unix hosts.
+    let path = Path::new(file);
+    if let Ok(uri) = crate::lsp::position::path_to_uri(path) {
+        return crate::lsp::position::url_to_path(&uri).ok();
+    }
+    project_root.map(|root| root.join(path))
 }
 
 /// Parse `lsp_hints` from a raw request.
@@ -56,7 +67,27 @@ pub fn parse_lsp_hints(req: &RawRequest) -> Option<LspHints> {
 /// (the hint line falls within the symbol's start_line..=end_line range). If
 /// exactly one candidate aligns with a hint, returns just that match. Otherwise,
 /// returns all matches unchanged (graceful fallback).
+/// Without an explicit root, only absolute hint and candidate paths may narrow results.
+/// Use [`apply_lsp_disambiguation_at_root`] for request-relative paths.
 pub fn apply_lsp_disambiguation(matches: Vec<SymbolMatch>, hints: &LspHints) -> Vec<SymbolMatch> {
+    apply_lsp_disambiguation_inner(matches, hints, None)
+}
+
+/// Apply hints using the project root that owns the request's candidate paths.
+/// Absolute hints are file URIs or plain paths; relative paths are unescaped names.
+pub fn apply_lsp_disambiguation_at_root(
+    matches: Vec<SymbolMatch>,
+    hints: &LspHints,
+    project_root: &Path,
+) -> Vec<SymbolMatch> {
+    apply_lsp_disambiguation_inner(matches, hints, Some(project_root))
+}
+
+fn apply_lsp_disambiguation_inner(
+    matches: Vec<SymbolMatch>,
+    hints: &LspHints,
+    project_root: Option<&Path>,
+) -> Vec<SymbolMatch> {
     if matches.len() <= 1 || hints.symbols.is_empty() {
         return matches;
     }
@@ -66,13 +97,22 @@ pub fn apply_lsp_disambiguation(matches: Vec<SymbolMatch>, hints: &LspHints) -> 
         .enumerate()
         .filter_map(|(i, m)| {
             let is_aligned = hints.symbols.iter().any(|hint| {
-                let hint_file = strip_file_uri(&hint.file);
-                // The integer range test runs before `paths_match`, which
-                // canonicalizes both paths: most hints fail it for free.
-                hint.name == m.symbol.name
-                    && hint.line >= m.symbol.range.start_line
-                    && hint.line <= m.symbol.range.end_line
-                    && paths_match(hint_file, &m.file)
+                if hint.name != m.symbol.name
+                    || hint.line < m.symbol.range.start_line
+                    || hint.line > m.symbol.range.end_line
+                {
+                    return false;
+                }
+                let (Some(hint_file), Some(candidate_file)) = (
+                    hint_path(&hint.file, project_root),
+                    hint_path(&m.file, project_root),
+                ) else {
+                    return false;
+                };
+                paths_match(
+                    &hint_file.to_string_lossy(),
+                    &candidate_file.to_string_lossy(),
+                )
             });
             if is_aligned {
                 Some(i)
@@ -131,6 +171,152 @@ fn suffix_at_separator_boundary(longer: &str, shorter: &str) -> bool {
 mod tests {
     use super::*;
     use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
+
+    #[test]
+    fn absolute_file_uri_decodes_spaces_unicode_and_literal_percent_names() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("data %20 café.ts");
+        let other = root.path().join("other.ts");
+        for path in [&file, &other] {
+            std::fs::write(path, "function f() {}\n").unwrap();
+        }
+        let hints = LspHints {
+            symbols: vec![LspSymbolHint {
+                name: "f".into(),
+                file: crate::lsp::position::path_to_uri(&file)
+                    .unwrap()
+                    .to_string(),
+                line: 0,
+                kind: None,
+            }],
+        };
+        let matches = vec![
+            make_match("f", file.to_str().unwrap(), 0, 1, SymbolKind::Function),
+            make_match("f", other.to_str().unwrap(), 0, 1, SymbolKind::Function),
+        ];
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, root.path());
+        assert_eq!(
+            result.len(),
+            1,
+            "encoded URI did not select its real filename"
+        );
+        assert_eq!(result[0].file, file.to_str().unwrap());
+    }
+
+    #[test]
+    fn relative_hint_resolves_against_explicit_root_not_suffix_or_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        let file = root.path().join("same.ts");
+        let other = decoy.path().join("same.ts");
+        for path in [&file, &other] {
+            std::fs::write(path, "function f() {}\n").unwrap();
+        }
+        let hints = LspHints {
+            symbols: vec![LspSymbolHint {
+                name: "f".into(),
+                file: "same.ts".into(),
+                line: 0,
+                kind: None,
+            }],
+        };
+        let matches = vec![
+            make_match("f", file.to_str().unwrap(), 0, 1, SymbolKind::Function),
+            make_match("f", other.to_str().unwrap(), 0, 1, SymbolKind::Function),
+        ];
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, root.path());
+        assert_eq!(
+            result.len(),
+            1,
+            "relative hint ambiguously suffix-matched another root"
+        );
+        assert_eq!(result[0].file, file.to_str().unwrap());
+    }
+
+    #[test]
+    fn bare_percent_filename_is_not_decoded_into_another_file() {
+        let root = tempfile::tempdir().unwrap();
+        let literal = root.path().join("a%20b.ts");
+        let spaced = root.path().join("a b.ts");
+        for path in [&literal, &spaced] {
+            std::fs::write(path, "function f() {}\n").unwrap();
+        }
+        let hints = LspHints {
+            symbols: vec![LspSymbolHint {
+                name: "f".into(),
+                file: "a%20b.ts".into(),
+                line: 0,
+                kind: None,
+            }],
+        };
+        let matches = vec![
+            make_match("f", literal.to_str().unwrap(), 0, 1, SymbolKind::Function),
+            make_match("f", spaced.to_str().unwrap(), 0, 1, SymbolKind::Function),
+        ];
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, root.path());
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].file,
+            literal.to_str().unwrap(),
+            "literal percent path was decoded into a different filename"
+        );
+    }
+
+    #[test]
+    fn unrooted_relative_hint_cannot_choose_by_filename_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("same.ts");
+        let other = root.path().join("other.ts");
+        let hints = LspHints {
+            symbols: vec![LspSymbolHint {
+                name: "f".into(),
+                file: "same.ts".into(),
+                line: 0,
+                kind: None,
+            }],
+        };
+        let matches = vec![
+            make_match("f", file.to_str().unwrap(), 0, 1, SymbolKind::Function),
+            make_match("f", other.to_str().unwrap(), 0, 1, SymbolKind::Function),
+        ];
+        assert_eq!(
+            apply_lsp_disambiguation(matches, &hints).len(),
+            2,
+            "without a root, a relative hint is not an absolute file identity"
+        );
+    }
+
+    #[test]
+    fn file_uris_preserve_windows_drive_and_unc_identity() {
+        for (file, uri) in [
+            (r"C:\work\a b%20.ts", "file:///C:/work/a%20b%2520.ts"),
+            (
+                r"\\server\share\a b%20.ts",
+                "file://server/share/a%20b%2520.ts",
+            ),
+        ] {
+            let hints = LspHints {
+                symbols: vec![LspSymbolHint {
+                    name: "f".into(),
+                    file: uri.into(),
+                    line: 0,
+                    kind: None,
+                }],
+            };
+            let matches = vec![
+                make_match("f", file, 0, 1, SymbolKind::Function),
+                make_match("f", r"C:\other\a.ts", 0, 1, SymbolKind::Function),
+            ];
+            let result =
+                apply_lsp_disambiguation_at_root(matches, &hints, Path::new("/unrelated-root"));
+            assert_eq!(
+                result.len(),
+                1,
+                "Windows URI did not retain its file identity"
+            );
+            assert_eq!(result[0].file, file);
+        }
+    }
 
     fn make_request(lsp_hints: Option<serde_json::Value>) -> RawRequest {
         RawRequest {
@@ -230,7 +416,7 @@ mod tests {
                 kind: None,
             }],
         };
-        let result = apply_lsp_disambiguation(matches, &hints);
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, &std::env::temp_dir());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].symbol.range.start_line, 2);
     }
@@ -249,7 +435,7 @@ mod tests {
                 kind: None,
             }],
         };
-        let result = apply_lsp_disambiguation(matches, &hints);
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, &std::env::temp_dir());
         assert_eq!(
             result.len(),
             2,
@@ -272,7 +458,7 @@ mod tests {
                 kind: None,
             }],
         };
-        let result = apply_lsp_disambiguation(matches, &hints);
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, &std::env::temp_dir());
         assert_eq!(
             result.len(),
             2,
@@ -281,20 +467,36 @@ mod tests {
     }
 
     #[test]
-    fn disambiguate_file_uri_stripped() {
+    fn disambiguate_absolute_file_uri() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("api.ts");
         let matches = vec![
-            make_match("handler", "src/api.ts", 10, 20, SymbolKind::Function),
-            make_match("handler", "src/api.ts", 30, 40, SymbolKind::Function),
+            make_match(
+                "handler",
+                file.to_str().unwrap(),
+                10,
+                20,
+                SymbolKind::Function,
+            ),
+            make_match(
+                "handler",
+                file.to_str().unwrap(),
+                30,
+                40,
+                SymbolKind::Function,
+            ),
         ];
         let hints = LspHints {
             symbols: vec![LspSymbolHint {
                 name: "handler".into(),
-                file: "file://src/api.ts".into(),
+                file: crate::lsp::position::path_to_uri(&file)
+                    .unwrap()
+                    .to_string(),
                 line: 15,
                 kind: None,
             }],
         };
-        let result = apply_lsp_disambiguation(matches, &hints);
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, root.path());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].symbol.range.start_line, 10);
     }
@@ -310,7 +512,7 @@ mod tests {
                 kind: None,
             }],
         };
-        let result = apply_lsp_disambiguation(matches, &hints);
+        let result = apply_lsp_disambiguation_at_root(matches, &hints, &std::env::temp_dir());
         assert_eq!(result.len(), 1);
     }
 

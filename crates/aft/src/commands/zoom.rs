@@ -1217,7 +1217,11 @@ fn zoom_one_symbol_inner(
 
     // LSP-enhanced disambiguation (S03)
     let matches = if let Some(hints) = lsp_hints::parse_lsp_hints(req) {
-        lsp_hints::apply_lsp_disambiguation(matches, &hints)
+        lsp_hints::apply_lsp_disambiguation_at_root(
+            matches,
+            &hints,
+            &ctx.resolve_relative_path(std::path::Path::new(".")),
+        )
     } else {
         matches
     };
