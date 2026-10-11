@@ -692,9 +692,9 @@ pub struct ServerDiagnosticCapabilities {
     /// `identifier` field from server's diagnosticProvider, if any.
     /// Used to scope previousResultId tracking when multiple servers share a file.
     pub identifier: Option<String>,
-    /// Whether the server requested workspace diagnostic refresh notifications.
-    /// We declare `refreshSupport: false` in our client capabilities so this
-    /// should always be false in practice — kept for completeness.
+    /// Retained for source compatibility, but not populated from server metadata.
+    /// Workspace diagnostic refresh support belongs to the client's capabilities.
+    #[deprecated(note = "refreshSupport is a client capability, not a server capability")]
     pub refresh_support: bool,
 }
 
@@ -2511,17 +2511,6 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
         }
     }
 
-    // Workspace diagnostic refresh (rare — most servers don't request this,
-    // and we declared refreshSupport=false in our client capabilities anyway).
-    if let Some(refresh) = value
-        .get("workspace")
-        .and_then(|w| w.get("diagnostic"))
-        .and_then(|d| d.get("refreshSupport"))
-        .and_then(|r| r.as_bool())
-    {
-        caps.refresh_support = refresh;
-    }
-
     caps
 }
 
@@ -2678,7 +2667,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_caps_workspace_refresh_support() {
+    #[allow(deprecated)]
+    fn server_metadata_does_not_enable_client_refresh() {
         let value = json!({
             "workspace": {
                 "diagnostic": {
@@ -2687,7 +2677,10 @@ mod tests {
             }
         });
         let caps = parse_diagnostic_capabilities(&value);
-        assert!(caps.refresh_support);
+        assert!(
+            !caps.refresh_support,
+            "an echoed client capability is not server support"
+        );
         // No diagnosticProvider → pull still false
         assert!(!caps.pull_diagnostics);
     }
