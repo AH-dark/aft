@@ -97,6 +97,13 @@ fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
+    // Every store read of this answer comes from one read transaction on a
+    // dedicated connection, so a refresh committing meanwhile cannot mix
+    // states. The original store stays alive (shadowed) for its pins.
+    let store = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "call_tree", error),
+    };
     match call_tree_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(tree) => {
             note_callgraph_served(ctx, "call_tree", 0, "ok");

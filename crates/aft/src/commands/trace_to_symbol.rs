@@ -110,6 +110,13 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    // Every store read of this answer comes from one read transaction on a
+    // dedicated connection, so a refresh committing meanwhile cannot mix
+    // states. The original store stays alive (shadowed) for its pins.
+    let store = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "trace_to_symbol", error),
+    };
     if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {
         return store_error_response(&req.id, "trace_to_symbol", error);
     }

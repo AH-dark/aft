@@ -128,6 +128,13 @@ fn answer_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
+    // Every store read of this answer comes from one read transaction on a
+    // dedicated connection, so a refresh committing meanwhile cannot mix
+    // states. The original store stays alive (shadowed) for its pins.
+    let store = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "trace_data", error),
+    };
     match trace_data_result(
         &store,
         &file_path,

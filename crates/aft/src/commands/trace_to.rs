@@ -96,6 +96,13 @@ fn answer_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         return response;
     }
 
+    // Every store read of this answer comes from one read transaction on a
+    // dedicated connection, so a refresh committing meanwhile cannot mix
+    // states. The original store stays alive (shadowed) for its pins.
+    let store = match store.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => return store_error_response(&req.id, "trace_to", error),
+    };
     match trace_to_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to", 0, "ok");
