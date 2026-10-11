@@ -10222,7 +10222,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v15-nested-use-macro-imports-go-init-callbacks";
+const BUILD_OUTPUT_VERSION: &str = "v16-manifest-root-reexport-resolution";
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
@@ -12921,6 +12921,7 @@ fn collect_rust_pub_use_reexport_refs(
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
     let mut ordinal = 0usize;
+    let module_memo = callgraph::ModuleResolutionMemo::default();
 
     for import in imports {
         let Some(visibility) = &import.default_import else {
@@ -12959,7 +12960,13 @@ fn collect_rust_pub_use_reexport_refs(
             line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
-            dependencies: rust_module_dependencies(project_root, abs_path, &module_path, facts),
+            dependencies: rust_module_dependencies(
+                project_root,
+                abs_path,
+                &module_path,
+                &module_memo,
+                facts,
+            ),
         });
     }
 
@@ -19945,7 +19952,7 @@ fn module_ref_target(
         {
             return Some(target);
         }
-        return rust_module_candidates(project_root, &caller_path, module_path, facts)
+        return rust_module_candidates(project_root, &caller_path, module_path, memo, facts)
             .into_iter()
             .find(|candidate| is_indexed(candidate));
     }
@@ -20147,7 +20154,7 @@ fn module_dependencies_with_memo(
     memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
-    let mut deps = rust_module_dependencies(project_root, abs_path, module_path, facts);
+    let mut deps = rust_module_dependencies(project_root, abs_path, module_path, memo, facts);
     let caller_dir = abs_path.parent().unwrap_or(project_root);
     if let Some(resolved) =
         callgraph::resolve_module_path_with_memo(caller_dir, module_path, memo, facts)
@@ -20167,9 +20174,10 @@ fn rust_module_dependencies(
     project_root: &Path,
     abs_path: &Path,
     module_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
-    rust_module_candidates(project_root, abs_path, module_path, facts)
+    rust_module_candidates(project_root, abs_path, module_path, memo, facts)
         .into_iter()
         .collect()
 }
@@ -20181,6 +20189,7 @@ fn rust_module_candidates(
     project_root: &Path,
     abs_path: &Path,
     module_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> Vec<String> {
     let mut candidates = Vec::new();
@@ -20190,10 +20199,40 @@ fn rust_module_candidates(
             .canonical(abs_path)
             .unwrap_or_else(|| abs_path.to_path_buf()),
     );
-    let Some(path_segments) = rust_module_dependency_segments(&rel_path, module_path) else {
+    // A manifest can put a crate root outside src/, as ripgrep's binary does.
+    // Resolve use paths from that target's directory, not from a guessed src/.
+    let root_dir = memo
+        .rust_crate_root_file(project_root, abs_path, facts)
+        .and_then(|root| root.parent().map(Path::to_path_buf));
+    let (src_prefix, path_segments) = if let Some(root_dir) = root_dir {
+        let caller_rel = relative_path(
+            &root_dir,
+            &facts
+                .canonical(abs_path)
+                .unwrap_or_else(|| abs_path.to_path_buf()),
+        );
+        let path = rust_module_path_without_alias_or_use_list(module_path);
+        let segments = path
+            .split("::")
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if segments.is_empty() || matches!(segments[0], "std" | "core" | "alloc") {
+            return candidates;
+        }
+        (
+            relative_path(project_root, &root_dir),
+            rust_resolve_segments_from(rust_module_segments_for_rel(&caller_rel), &segments),
+        )
+    } else {
+        (
+            rust_src_prefix(&rel_path),
+            rust_module_dependency_segments(&rel_path, module_path),
+        )
+    };
+    let Some(path_segments) = path_segments else {
         return candidates;
     };
-    let src_prefix = rust_src_prefix(&rel_path);
     rust_push_module_dependency_candidate(
         project_root,
         &mut candidates,
@@ -20243,15 +20282,17 @@ fn rust_push_module_dependency_candidate(
     segments: &[String],
     facts: &FactPaths<'_>,
 ) {
+    let prefix = if src_prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{src_prefix}/")
+    };
     let candidates = if segments.is_empty() {
-        vec![
-            format!("{src_prefix}/lib.rs"),
-            format!("{src_prefix}/main.rs"),
-        ]
+        vec![format!("{prefix}lib.rs"), format!("{prefix}main.rs")]
     } else {
         vec![
-            format!("{}/{}.rs", src_prefix, segments.join("/")),
-            format!("{}/{}/mod.rs", src_prefix, segments.join("/")),
+            format!("{}{}.rs", prefix, segments.join("/")),
+            format!("{}{}/mod.rs", prefix, segments.join("/")),
         ]
     };
     for candidate in candidates {
@@ -25427,11 +25468,11 @@ edition = "2021"
         let source = b"package main\nvar Boot = Register()\n";
         for (old_version, current_version) in [
             (
-                "callgraph-v3-package-initializers-macro-owners",
+                "callgraph-v4-nested-use-macro-imports-go-init-callbacks",
                 crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
             ),
             (
-                "ruled-callgraph-v4-package-initializers-macro-owners",
+                "ruled-callgraph-v5-nested-use-macro-imports-go-init-callbacks",
                 crate::views::callgraph::PRODUCER,
             ),
         ] {
@@ -25751,6 +25792,154 @@ edition = "2021"
             ),
             "previous reference-ID scheme must be rebuilt before any current view read"
         );
+    }
+
+    #[test]
+    fn callgraph_rust_nested_aliases_custom_bin_root_match_legacy_and_view() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let manifest = write_file(root, "Cargo.toml", "[package]\nname='custom-layout'\nversion='0.1.0'\nedition='2021'\n[[bin]]\nname='rg'\npath='crates/core/main.rs'\n");
+        let main = write_file(root, "crates/core/main.rs", "mod flags;\nfn main() { generate(); special(); }\nfn generate() { flags::generate_complete_bash(); flags::generate_complete_fish(); flags::generate_complete_powershell(); flags::generate_complete_zsh(); flags::generate_man_page(); }\nfn special() { flags::generate_help_short(); flags::generate_help_long(); flags::generate_version_short(); flags::generate_version_long(); flags::generate_version_pcre2(); }\n");
+        let flags = write_file(root, "crates/core/flags/mod.rs", "pub(crate) use crate::flags::{\n complete::{bash::generate as generate_complete_bash, fish::generate as generate_complete_fish, powershell::generate as generate_complete_powershell, zsh::generate as generate_complete_zsh},\n doc::{help::{generate_long as generate_help_long, generate_short as generate_help_short}, man::generate as generate_man_page, version::{generate_long as generate_version_long, generate_pcre2 as generate_version_pcre2, generate_short as generate_version_short}},\n};\nmod complete;\nmod doc;\nmod parse;\n");
+        let complete = write_file(root, "crates/core/flags/complete/mod.rs", "pub(crate) mod bash;\npub(crate) mod fish;\npub(crate) mod powershell;\npub(crate) mod zsh;\n");
+        let bash = write_file(
+            root,
+            "crates/core/flags/complete/bash.rs",
+            "pub(crate) fn generate() {}\npub(crate) fn spare() {}\n",
+        );
+        let fish = write_file(
+            root,
+            "crates/core/flags/complete/fish.rs",
+            "pub(crate) fn generate() {}\n",
+        );
+        let powershell = write_file(
+            root,
+            "crates/core/flags/complete/powershell.rs",
+            "pub(crate) fn generate() {}\n",
+        );
+        let zsh = write_file(
+            root,
+            "crates/core/flags/complete/zsh.rs",
+            "pub(crate) fn generate() {}\n",
+        );
+        let doc = write_file(
+            root,
+            "crates/core/flags/doc/mod.rs",
+            "pub(crate) mod help;\npub(crate) mod man;\npub(crate) mod version;\n",
+        );
+        let help = write_file(root, "crates/core/flags/doc/help.rs", "pub(crate) fn generate_short() { crate::flags::parse::lookup(); }\npub(crate) fn generate_long() { crate::flags::parse::lookup(); }\n");
+        let man = write_file(
+            root,
+            "crates/core/flags/doc/man.rs",
+            "pub(crate) fn generate() { crate::flags::parse::lookup(); }\n",
+        );
+        let version = write_file(root, "crates/core/flags/doc/version.rs", "pub(crate) fn generate_short() { generate_digits(); }\npub(crate) fn generate_long() { generate_short(); generate_pcre2(); }\npub(crate) fn generate_digits() {}\npub(crate) fn generate_pcre2() {}\n");
+        let parse = write_file(
+            root,
+            "crates/core/flags/parse.rs",
+            "pub(crate) fn lookup() {}\n",
+        );
+        let files = vec![
+            main, flags, complete, bash, fish, powershell, zsh, doc, help, man, version, parse,
+        ];
+        let (store, legacy) = go_fixture_store(root, &files);
+        let targets = [
+            (
+                "generate_complete_bash",
+                "crates/core/flags/complete/bash.rs",
+                "generate",
+                "generate",
+            ),
+            (
+                "generate_complete_fish",
+                "crates/core/flags/complete/fish.rs",
+                "generate",
+                "generate",
+            ),
+            (
+                "generate_complete_powershell",
+                "crates/core/flags/complete/powershell.rs",
+                "generate",
+                "generate",
+            ),
+            (
+                "generate_complete_zsh",
+                "crates/core/flags/complete/zsh.rs",
+                "generate",
+                "generate",
+            ),
+            (
+                "generate_man_page",
+                "crates/core/flags/doc/man.rs",
+                "generate",
+                "generate",
+            ),
+            (
+                "generate_help_short",
+                "crates/core/flags/doc/help.rs",
+                "generate_short",
+                "special",
+            ),
+            (
+                "generate_help_long",
+                "crates/core/flags/doc/help.rs",
+                "generate_long",
+                "special",
+            ),
+            (
+                "generate_version_short",
+                "crates/core/flags/doc/version.rs",
+                "generate_short",
+                "special",
+            ),
+            (
+                "generate_version_long",
+                "crates/core/flags/doc/version.rs",
+                "generate_long",
+                "special",
+            ),
+            (
+                "generate_version_pcre2",
+                "crates/core/flags/doc/version.rs",
+                "generate_pcre2",
+                "special",
+            ),
+        ];
+        for (alias, file, symbol, caller) in targets {
+            let target: (String, Option<String>, Option<String>) = store.conn.lock().unwrap().query_row(
+                "SELECT status,target_file,target_symbol FROM refs WHERE kind='call' AND full_ref=?1", [format!("flags::{alias}")],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+            assert_eq!(target, ("resolved".to_string(), Some(file.to_string()), Some(symbol.to_string())),
+                "custom [[bin]] alias {alias} must land on the real leaf, not a resolved facade name");
+            assert_direct_caller(&store, file, symbol, "crates/core/main.rs", caller);
+        }
+        let mut inputs = files;
+        inputs.push(manifest);
+        let view = callgraph_fixture_view(root, &inputs);
+        for (alias, file, symbol, caller) in targets {
+            assert!(
+                view.outbound_calls
+                    .iter()
+                    .any(|call| call.caller_symbol == caller
+                        && call.target.ends_with(&format!("{file}::{symbol}"))),
+                "view custom-root alias {alias} must land on the real leaf"
+            );
+        }
+        let cold = callgraph_fixture_scan(root, legacy);
+        let viewed = callgraph_fixture_scan(root, view);
+        for symbol in [
+            "generate",
+            "generate_short",
+            "generate_long",
+            "generate_digits",
+            "generate_pcre2",
+            "lookup",
+        ] {
+            assert!(!callgraph_fixture_has(&cold, "items", symbol), "{cold}");
+            assert!(!callgraph_fixture_has(&viewed, "items", symbol), "{viewed}");
+        }
+        assert!(callgraph_fixture_has(&cold, "items", "spare"), "{cold}");
+        assert_eq!(cold["items"], viewed["items"]);
     }
 
     #[test]
