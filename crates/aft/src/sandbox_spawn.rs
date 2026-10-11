@@ -1448,6 +1448,25 @@ fn build_native_profile(
     principal: &AuthenticatedPrincipal,
     task_bundle_dir: &Path,
 ) -> Result<SandboxProfile, String> {
+    let policy = ctx.access_policy("").map_err(|response| {
+        response.data["message"]
+            .as_str()
+            .unwrap_or("access policy could not be resolved")
+            .to_string()
+    })?;
+    build_native_profile_for_config(&ctx.config(), principal, task_bundle_dir, Some(policy))
+}
+
+/// Build the native profile from a configuration snapshot. Bash launches
+/// reach this through [`build_native_profile`]; formatter and checker
+/// launches, which hold only the request's configuration, call it directly.
+#[cfg(unix)]
+fn build_native_profile_for_config(
+    config: &crate::config::Config,
+    principal: &AuthenticatedPrincipal,
+    task_bundle_dir: &Path,
+    policy: Option<crate::access_policy::AccessPolicy>,
+) -> Result<SandboxProfile, String> {
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -1465,7 +1484,7 @@ fn build_native_profile(
     }
 
     let mut project_roots = Vec::new();
-    if let Some(root) = &ctx.config().project_root {
+    if let Some(root) = &config.project_root {
         project_roots.push(root.clone());
     }
     if let AuthenticatedPrincipal::RouteBind { project_root, .. } = principal {
@@ -1514,12 +1533,17 @@ fn build_native_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
-        let mut policy = ctx.access_policy("").map_err(|response| {
-            response.data["message"]
-                .as_str()
-                .unwrap_or("access policy could not be resolved")
-                .to_string()
-        })?;
+        let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        // Context-backed launches retain request-level policy. Config-only
+        // formatter/checker launches derive the same credential and store floors.
+        let mut policy = policy.unwrap_or_else(|| {
+            crate::access_policy::AccessPolicy::from_config(
+                config,
+                &storage,
+                project_roots.clone(),
+                &home,
+            )
+        });
         policy.roots = project_roots.clone();
         policy
             .private_stores
@@ -1605,16 +1629,15 @@ fn build_native_profile(
                 shell_read_deny.extend(git_policy.hooks.iter().cloned());
             }
         }
-        let storage = ctx.storage_dir();
         let mut managed_paths = Vec::new();
-        if ctx.config().github.shim {
+        if config.github.shim {
             managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
-            managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
+            managed_paths.push(crate::agent_child_env::shim_binary(config)?);
         }
-        if ctx.config().git.co_author != "off" {
+        if config.git.co_author != "off" {
             managed_paths.push(crate::agent_child_env::managed_git_hooks_dir(&storage));
-            if ctx.config().git.co_author == "auto" {
-                managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
+            if config.git.co_author == "auto" {
+                managed_paths.push(crate::agent_child_env::shim_binary(config)?);
             }
         }
         // Governance injection materializes these before resolving a spawn.
@@ -4080,6 +4103,120 @@ fn command_argv_for_plan(
             }
         }
         #[cfg(unix)]
+        SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
+    }
+}
+
+/// Session under which formatter and checker launches allocate their private
+/// task directory when the request carries no session.
+#[cfg(unix)]
+const TOOL_LAUNCH_SESSION: &str = "aft-tools";
+
+/// Resources of one formatter or checker launched under the native sandbox.
+/// Keep it alive until the tool has exited: dropping it deletes the private
+/// task directory that holds the launch's temporary directory.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct ToolSandboxLaunch {
+    #[cfg(unix)]
+    task: Option<crate::bash_background::persistence::ResolvedTask>,
+}
+
+#[cfg(unix)]
+impl Drop for ToolSandboxLaunch {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            let _ = crate::bash_background::persistence::delete_resolved_task(task);
+        }
+    }
+}
+
+/// Wrap a formatter, formatter version probe or full checker in the
+/// project's sandbox when the configuration enables it. These tools run
+/// project-controlled code (project-local binaries, build scripts,
+/// proc-macros), so with sandboxing enabled they get the same native launch
+/// and environment allowlist as an agent bash command.
+///
+/// `Ok(None)`: no sandbox applies (sandboxing is disabled, or the caller is
+/// one the native sandbox does not cover, exactly as for bash); run the tool
+/// as before. `Err`: sandboxing is enabled but cannot be applied, so the
+/// caller must not run the tool at all.
+pub(crate) fn sandboxed_tool_command(
+    config: &crate::config::Config,
+    program: &OsStr,
+    args: &[OsString],
+) -> Result<Option<(std::process::Command, ToolSandboxLaunch)>, String> {
+    if !config.sandbox.enabled {
+        return Ok(None);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (program, args);
+        Err("sandbox_unavailable: sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux".to_string())
+    }
+
+    #[cfg(unix)]
+    {
+        #[cfg(test)]
+        if let Some(plan) = TEST_PLAN_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return tool_command_for_plan(&plan, ToolSandboxLaunch { task: None }, program, args);
+        }
+
+        let principal = current_authenticated_principal();
+        if !principal_is_first_party(&principal) {
+            return Ok(None);
+        }
+        let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+        let session =
+            crate::log_ctx::current_session().unwrap_or_else(|| TOOL_LAUNCH_SESSION.to_string());
+        let task = crate::bash_background::persistence::allocate_task_layout(&storage, &session)
+            .map_err(|error| {
+                format!(
+                    "sandbox_unavailable: failed to allocate a private launch directory: {error}"
+                )
+            })?;
+        let io_dir = task.paths.io_dir.clone();
+        let launch = ToolSandboxLaunch { task: Some(task) };
+        let profile = build_native_profile_for_config(config, &principal, &io_dir, None)
+            .map_err(|error| format!("sandbox_unavailable: {error}"))?;
+        let launcher_path = std::env::current_exe().map_err(|error| {
+            format!("sandbox_unavailable: failed to locate the aft executable: {error}")
+        })?;
+        let plan = SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        };
+        tool_command_for_plan(&plan, launch, program, args)
+    }
+}
+
+#[cfg(unix)]
+fn tool_command_for_plan(
+    plan: &SpawnPlan,
+    launch: ToolSandboxLaunch,
+    program: &OsStr,
+    args: &[OsString],
+) -> Result<Option<(Command, ToolSandboxLaunch)>, String> {
+    match plan.policy() {
+        SpawnPlan::Unsandboxed => Ok(None),
+        SpawnPlan::Refused { code, message, .. } => Err(format!("{code}: {message}")),
+        // Host plans exist only for an approved, digest-bound bash command.
+        SpawnPlan::Host { .. } => Err(
+            "sandbox_unavailable: a host escalation plan cannot run a formatter or checker"
+                .to_string(),
+        ),
+        SpawnPlan::Launcher { .. } => {
+            let no_request_environment = HashMap::new();
+            let (launcher, wrapped, _profile_handle) =
+                command_argv_for_plan(plan, program, args, Path::new(""), None)?;
+            let mut command = crate::effective_path::new_command(launcher);
+            command.args(wrapped);
+            // Replaces the inherited daemon environment with the sandbox
+            // allowlist (HOME, USER, locale, PATH, private TMPDIR).
+            apply_sandbox_environment(plan, &mut command, &no_request_environment);
+            disclaim_command_for_plan(plan, &mut command, &no_request_environment)?;
+            Ok(Some((command, launch)))
+        }
         SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
     }
 }

@@ -153,13 +153,42 @@ fn kill_process_tree(child: &mut Child) {
 }
 
 /// Build the command used by formatter and checker subprocesses.
-fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, FormatError> {
+///
+/// With sandboxing enabled the tool runs through the project's native
+/// sandbox launcher (see `sandbox_spawn::sandboxed_tool_command`); the
+/// returned launch handle must outlive the child. When the sandbox is enabled
+/// but cannot be applied, the tool is not run and the error says why.
+fn external_tool_command(
+    config: &Config,
+    command: &str,
+    args: &[&str],
+) -> Result<(Command, Option<crate::sandbox_spawn::ToolSandboxLaunch>), FormatError> {
+    let sandbox_args = args
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    match crate::sandbox_spawn::sandboxed_tool_command(
+        config,
+        std::ffi::OsStr::new(command),
+        &sandbox_args,
+    ) {
+        Ok(Some((cmd, launch))) => return Ok((cmd, Some(launch))),
+        Ok(None) => {}
+        Err(stderr) => {
+            return Err(FormatError::Failed {
+                tool: command.to_string(),
+                stderr,
+            })
+        }
+    }
+
     #[cfg(windows)]
     if crate::windows_command::is_batch_file(Path::new(command)) {
         return crate::windows_command::batch_command(
             Path::new(command),
             args.iter().map(|arg| std::ffi::OsStr::new(*arg)),
         )
+        .map(|cmd| (cmd, None))
         .map_err(|error| FormatError::Failed {
             tool: command.to_string(),
             stderr: error.to_string(),
@@ -168,7 +197,7 @@ fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, Format
 
     let mut cmd = crate::effective_path::new_command(command);
     cmd.args(args);
-    Ok(cmd)
+    Ok((cmd, None))
 }
 
 /// Spawn a subprocess and wait for completion with timeout protection.
@@ -178,12 +207,13 @@ fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, Format
 /// and waits for it to exit. Returns `FormatError::NotFound` when the binary
 /// isn't on PATH.
 pub fn run_external_tool(
+    config: &Config,
     command: &str,
     args: &[&str],
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = external_tool_command(command, args)?;
+    let (mut cmd, _sandbox_launch) = external_tool_command(config, command, args)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {
@@ -643,7 +673,8 @@ pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Optio
     resolve_tool_uncached(tool, project_root).is_some()
 }
 
-fn ruff_format_available(project_root: Option<&Path>) -> bool {
+fn ruff_format_available(config: &Config) -> bool {
+    let project_root = config.project_root.as_deref();
     let key = availability_cache_key("ruff-format", project_root);
     if let Ok(cache) = TOOL_AVAILABILITY_CACHE.lock() {
         if let Some((available, checked_at)) = cache.get(&key) {
@@ -653,22 +684,23 @@ fn ruff_format_available(project_root: Option<&Path>) -> bool {
         }
     }
 
-    let result = ruff_format_available_uncached(project_root);
+    let result = ruff_format_available_uncached(config);
     if let Ok(mut cache) = TOOL_AVAILABILITY_CACHE.lock() {
         cache.insert(key, (result, Instant::now()));
     }
     result
 }
 
-fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
-    let command = match resolve_tool("ruff", project_root) {
+fn ruff_format_available_uncached(config: &Config) -> bool {
+    let command = match resolve_tool("ruff", config.project_root.as_deref()) {
         Some(command) => command,
         None => return false,
     };
-    let mut version_command = match external_tool_command(&command, &["--version"]) {
-        Ok(command) => command,
-        Err(_) => return false,
-    };
+    let (mut version_command, _sandbox_launch) =
+        match external_tool_command(config, &command, &["--version"]) {
+            Ok(command) => command,
+            Err(_) => return false,
+        };
     let output = match version_command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1635,7 +1667,7 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
     // immediately before the user/agent-initiated format operation—not during
     // configure or warm-time availability detection. The availability cache
     // makes a burst of formats probe once for this project generation.
-    if formatter_tool == "ruff" && !ruff_format_available(config.project_root.as_deref()) {
+    if formatter_tool == "ruff" && !ruff_format_available(config) {
         crate::slog_warn!(
             "format: {} (skipped: formatter_not_installed: ruff; version gate requires >= 0.1.2)",
             path.display()
@@ -1653,7 +1685,13 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
     // process CWD differs from the project root.
     let working_dir = config.project_root.as_deref();
 
-    match run_external_tool(&cmd, &arg_refs, working_dir, config.formatter_timeout_secs) {
+    match run_external_tool(
+        config,
+        &cmd,
+        &arg_refs,
+        working_dir,
+        config.formatter_timeout_secs,
+    ) {
         Ok(_) => {
             crate::slog_info!("format: {} ({})", path.display(), cmd);
             (true, None)
@@ -1710,12 +1748,13 @@ pub fn auto_format(path: &Path, config: &Config) -> (bool, Option<String>) {
 /// Returns `FormatError::NotFound` when the binary isn't on PATH, and
 /// `FormatError::Timeout` if the deadline is exceeded.
 pub fn run_external_tool_capture(
+    config: &Config,
     command: &str,
     args: &[&str],
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = external_tool_command(command, args)?;
+    let (mut cmd, _sandbox_launch) = external_tool_command(config, command, args)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {
@@ -1961,6 +2000,7 @@ pub(crate) fn validate_full_batch(paths: &[PathBuf], config: &Config) -> BatchVa
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = run_external_tool_capture(
+            config,
             &batch.command,
             &arg_refs,
             batch.root.as_deref(),
@@ -2691,6 +2731,7 @@ pub fn validate_full(path: &Path, config: &Config) -> (Vec<ValidationError>, Opt
     let working_dir = config.project_root.as_deref();
 
     match run_external_tool_capture(
+        config,
         &cmd,
         &arg_refs,
         working_dir,
@@ -2751,6 +2792,133 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn sandbox_enabled_config() -> Config {
+        let mut config = Config::default();
+        config.sandbox.enabled = true;
+        config
+    }
+
+    /// With sandboxing enabled a formatter or checker must start through the
+    /// sandbox launcher, with the sandbox environment allowlist instead of
+    /// the daemon's environment.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_enabled_tool_runs_through_the_launcher_with_the_allowlisted_environment() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "cargo sets CARGO_MANIFEST_DIR in test processes; it stands in for daemon-only state"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let temp = project.join("temp");
+        fs::create_dir_all(&temp).unwrap();
+        let launch_log = root.path().join("launcher-argv");
+        let launcher = root.path().join("launcher");
+        // Fake launcher: argv is `sandbox-launch --profile-json <json> --
+        // <tool> <args...>`; record it and exec the tool.
+        fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nshift 4\nexec \"$@\"\n",
+                launch_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = crate::sandbox_profile::SandboxProfile::build(
+            vec![project],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            temp,
+        )
+        .unwrap();
+        let plan = crate::sandbox_spawn::SpawnPlan::launcher_for_test(profile, launcher);
+        let env_dump = root.path().join("tool-env");
+        let script = format!("env > '{}'", env_dump.display());
+        let config = sandbox_enabled_config();
+        let result = crate::sandbox_spawn::with_spawn_plan_for_test(plan, || {
+            run_external_tool(&config, "/bin/sh", &["-c", &script], None, 10)
+        });
+        result.unwrap();
+
+        let argv = fs::read_to_string(&launch_log)
+            .expect("the tool must be started through the sandbox launcher");
+        let argv = argv.lines().collect::<Vec<_>>();
+        assert_eq!(argv[0], "sandbox-launch", "{argv:?}");
+        assert_eq!(argv[1], "--profile-json", "{argv:?}");
+        assert_eq!(argv[3], "--", "{argv:?}");
+        assert_eq!(argv[4], "/bin/sh", "{argv:?}");
+        let environment = fs::read_to_string(&env_dump).unwrap();
+        assert!(
+            !environment
+                .lines()
+                .any(|line| line.starts_with("CARGO_MANIFEST_DIR=")),
+            "the daemon environment reached the sandboxed tool: {environment}"
+        );
+        assert!(
+            environment.lines().any(|line| line.starts_with("TMPDIR=")),
+            "{environment}"
+        );
+    }
+
+    /// When sandboxing is enabled but the sandbox cannot be applied, the tool
+    /// must not run at all, rather than fall back to an unconfined launch.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_refusal_prevents_the_tool_from_running() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("ran");
+        let script = format!(": > '{}'", marker.display());
+        let config = sandbox_enabled_config();
+        for capture in [false, true] {
+            let plan = crate::sandbox_spawn::SpawnPlan::refused_for_test("sandbox_unavailable");
+            let result = crate::sandbox_spawn::with_spawn_plan_for_test(plan, || {
+                if capture {
+                    run_external_tool_capture(&config, "/bin/sh", &["-c", &script], None, 10)
+                } else {
+                    run_external_tool(&config, "/bin/sh", &["-c", &script], None, 10)
+                }
+            });
+            match &result {
+                Err(FormatError::Failed { stderr, .. }) => {
+                    assert!(stderr.starts_with("sandbox_unavailable"), "{stderr}")
+                }
+                other => panic!("refused sandbox must fail the tool: {other:?}"),
+            }
+            assert!(
+                !marker.exists(),
+                "a refused sandbox must not run the tool unconfined"
+            );
+        }
+    }
+
+    /// Windows has no native sandbox: with sandboxing enabled, formatters and
+    /// checkers are refused there, as bash commands are.
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_enabled_tool_is_refused_on_windows() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("ran");
+        let script = format!("type nul > \"{}\"", marker.display());
+        let result = run_external_tool(
+            &sandbox_enabled_config(),
+            "cmd.exe",
+            &["/D", "/C", &script],
+            None,
+            10,
+        );
+        assert!(
+            matches!(&result, Err(FormatError::Failed { stderr, .. }) if stderr.starts_with("sandbox_unavailable")),
+            "{result:?}"
+        );
+        assert!(!marker.exists());
+    }
 
     #[cfg(unix)]
     fn counting_checker(root: &Path, tool: &str, output: &str, code: i32) {
@@ -2959,7 +3127,9 @@ mod tests {
     fn run_external_tool_wakes_when_the_tool_exits() {
         let before = FULL_POLL_SLEEPS.with(|count| count.get());
         for _ in 0..5 {
-            let result = run_external_tool("sh", &["-c", "echo done"], None, 30).unwrap();
+            let result =
+                run_external_tool(&Config::default(), "sh", &["-c", "echo done"], None, 30)
+                    .unwrap();
             assert_eq!(result.stdout.trim(), "done");
         }
         assert_eq!(FULL_POLL_SLEEPS.with(|count| count.get()) - before, 0);
@@ -2970,15 +3140,22 @@ mod tests {
     #[test]
     fn run_external_tool_waits_for_exit_after_pipes_close() {
         let started = Instant::now();
-        let result =
-            run_external_tool("sh", &["-c", "exec >&- 2>&-; sleep 0.3; exit 0"], None, 30).unwrap();
+        let result = run_external_tool(
+            &Config::default(),
+            "sh",
+            &["-c", "exec >&- 2>&-; sleep 0.3; exit 0"],
+            None,
+            30,
+        )
+        .unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(started.elapsed() >= Duration::from_millis(300));
     }
 
     #[test]
     fn run_external_tool_not_found() {
-        let result = run_external_tool("__nonexistent_tool_xyz__", &[], None, 5);
+        let result =
+            run_external_tool(&Config::default(), "__nonexistent_tool_xyz__", &[], None, 5);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::NotFound { tool } => {
@@ -3018,7 +3195,7 @@ mod tests {
         } else {
             ("sleep", &["60"])
         };
-        let result = run_external_tool(tool, args, None, 1);
+        let result = run_external_tool(&Config::default(), tool, args, None, 1);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Timeout { tool, timeout_secs } => {
@@ -3037,7 +3214,7 @@ mod tests {
         } else {
             ("echo", &["hello"])
         };
-        let result = run_external_tool(tool, args, None, 5);
+        let result = run_external_tool(&Config::default(), tool, args, None, 5);
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -3051,8 +3228,14 @@ mod tests {
         let shim = temp.path().join("formatter shim.cmd");
         std::fs::write(&shim, "@echo off\r\necho %~1\r\n").unwrap();
 
-        let result =
-            run_external_tool(shim.to_str().unwrap(), &["--stdin-filepath"], None, 5).unwrap();
+        let result = run_external_tool(
+            &Config::default(),
+            shim.to_str().unwrap(),
+            &["--stdin-filepath"],
+            None,
+            5,
+        )
+        .unwrap();
 
         assert_eq!(result.stdout.trim(), "--stdin-filepath");
     }
@@ -3062,6 +3245,7 @@ mod tests {
     fn format_helper_handles_large_stderr_without_deadlock() {
         let start = Instant::now();
         let result = run_external_tool_capture(
+            &Config::default(),
             "sh",
             &[
                 "-c",
@@ -3089,7 +3273,7 @@ mod tests {
         } else {
             ("false", &[])
         };
-        let result = run_external_tool(tool, args, None, 5);
+        let result = run_external_tool(&Config::default(), tool, args, None, 5);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Failed { tool, .. } => {
@@ -3693,14 +3877,15 @@ mod tests {
         } else {
             ("false", &[])
         };
-        let result = run_external_tool_capture(tool, args, None, 5);
+        let result = run_external_tool_capture(&Config::default(), tool, args, None, 5);
         assert!(result.is_ok(), "capture should not error on non-zero exit");
         assert_eq!(result.unwrap().exit_code, 1);
     }
 
     #[test]
     fn run_external_tool_capture_not_found() {
-        let result = run_external_tool_capture("__nonexistent_xyz__", &[], None, 5);
+        let result =
+            run_external_tool_capture(&Config::default(), "__nonexistent_xyz__", &[], None, 5);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::NotFound { tool } => assert_eq!(tool, "__nonexistent_xyz__"),
@@ -3983,7 +4168,7 @@ C:\repo\other.go:1:1: other file
             ..Config::default()
         };
 
-        assert!(!ruff_format_available(config.project_root.as_deref()));
+        assert!(!ruff_format_available(&config));
         let (cmd, args) = detect_type_checker(&path, LangId::Python, &config).unwrap();
         assert!(cmd.ends_with("ruff"), "expected ruff checker, got: {cmd}");
         assert_eq!(args[0], "check");
