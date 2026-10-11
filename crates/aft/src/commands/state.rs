@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -334,31 +334,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         crate::private_storage::open_dir(parent, parent)?;
     }
-    let tmp_path = path.with_file_name(format!(
-        "{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        std::process::id(),
-        unix_millis()
-    ));
-
-    let mut file = crate::private_storage::create(&tmp_path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-
-    if let Err(error) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-
+    crate::durability::atomic_write(path, bytes, crate::durability::AtomicWriteDurability::File)?;
+    // File durability is required; directory durability remains a best-effort mirror policy.
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        let _ = crate::durability::sync_dir(parent);
     }
-
     Ok(())
 }
 
@@ -371,6 +351,91 @@ fn unix_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn state_writer_private_mode_survives_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AFT_TEST_STATE_PRIVATE_UMASK";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            // Only file creation sees the restrictive mask; keep fixture access intact.
+            unsafe { libc::umask(0o777) };
+            super::atomic_write(&path, b"state").unwrap();
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::state::tests::state_writer_private_mode_survives_restrictive_umask",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "umask child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn state_writer_preserves_a_colliding_temporary_and_existing_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, b"old value").unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = collision.clone();
+        crate::durability::BEFORE_TEMP_CREATE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |temporary| {
+                std::fs::write(temporary, b"another writer").unwrap();
+                *observed.borrow_mut() = Some(temporary.to_path_buf());
+            }));
+        });
+        assert!(super::atomic_write(&path, b"new value").is_err());
+        let temporary = collision
+            .borrow()
+            .clone()
+            .expect("actual writer creation hook");
+        assert_eq!(std::fs::read(temporary).unwrap(), b"another writer");
+        assert_eq!(std::fs::read(path).unwrap(), b"old value");
+    }
+
+    #[test]
+    fn state_writer_keeps_required_file_sync_and_private_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        crate::durability::take();
+        super::atomic_write(&path, b"state payload").unwrap();
+        let events = crate::durability::take();
+        assert!(events.iter().any(|(kind, event_path)| *kind
+            == crate::durability::EventKind::FileSync
+            && event_path == &path));
+        assert_eq!(std::fs::read(&path).unwrap(), b"state payload");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn state_writer_cleans_owned_temporary_on_failed_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("destination");
+        std::fs::create_dir(&path).unwrap();
+        assert!(super::atomic_write(&path, b"state").is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(path.is_dir());
+    }
     use serde_json::json;
 
     use super::*;
