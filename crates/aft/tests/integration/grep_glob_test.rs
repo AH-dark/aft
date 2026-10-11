@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use filetime::{set_file_mtime, FileTime};
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, warm_executable, AftProcess};
+use super::helpers::{link_cached_path, user_config, warm_executable, AftProcess};
 
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -1243,7 +1243,7 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
         .to_string_lossy()
         .to_string();
     let installed_fake_server = fake_bin_dir.join(&fake_binary_name);
-    fs::copy(&fake_server, &installed_fake_server).expect("copy fake server");
+    link_cached_path(&fake_server, &installed_fake_server).expect("link cached fake server");
     // The fake LSP has no CLI probe; closed stdin makes its protocol loop exit.
     warm_executable(&installed_fake_server, &[]);
 

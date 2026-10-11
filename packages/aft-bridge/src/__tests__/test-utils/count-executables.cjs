@@ -1,5 +1,5 @@
 // Run with EXEC_COUNT_LOG=/tmp/aft-exec.jsonl bun test --preload /absolute/path/to/this/file.
-// Count newly created executable files, including copies that preserve executable mode.
+// Count published executable paths; temporary pending/signing files are never launched.
 const fs = require("node:fs");
 const path = require("node:path");
 const { appendFileSync, lstatSync, statSync } = fs;
@@ -20,6 +20,12 @@ const isExecutable = (file) => {
 };
 function record(file, operation) {
   file = key(file);
+  if (
+    path.basename(file).startsWith(".pending-") ||
+    file.split(path.sep).some((part) => part.startsWith("aft-pi-signed-"))
+  ) {
+    return;
+  }
   if (!reported.has(file) && isExecutable(file)) {
     reported.add(file);
     appendFileSync(output, JSON.stringify({ operation, path: file }) + "\n");
@@ -50,7 +56,16 @@ fs.chmodSync = function (file, mode, ...rest) {
   if (created.has(key(file))) record(file, "chmodSync");
   return result;
 };
-for (const name of ["copyFile", "cp"]) {
+for (const name of ["renameSync", "linkSync"]) {
+  const original = fs[name];
+  fs[name] = function (source, destination, ...args) {
+    const fresh = !exists(destination);
+    const result = original.call(this, source, destination, ...args);
+    if (fresh) recordTree(destination, name);
+    return result;
+  };
+}
+for (const name of ["copyFile", "cp", "rename", "link"]) {
   const original = fs[name];
   fs[name] = function (src, dest, ...rest) {
     const fresh = !exists(dest);
@@ -61,7 +76,7 @@ for (const name of ["copyFile", "cp"]) {
     });
   };
 }
-for (const name of ["writeFile", "copyFile", "cp"]) {
+for (const name of ["writeFile", "copyFile", "cp", "rename", "link"]) {
   const original = fs.promises[name];
   fs.promises[name] = async function (...args) {
     const dest = name === "writeFile" ? args[0] : args[1];

@@ -27,7 +27,7 @@ use tempfile::tempdir;
 
 #[cfg(unix)]
 use super::helpers::warm_executable;
-use super::helpers::AftProcess;
+use super::helpers::{link_cached_executable, link_cached_path, AftProcess};
 
 fn fake_server_path() -> PathBuf {
     crate::test_helpers::fake_lsp::fake_server_binary()
@@ -296,8 +296,6 @@ fn app_context_with_fake_typescript_lsp() -> AppContext {
     ctx
 }
 
-/// Returns the script with the directory that holds it; the caller keeps the
-/// directory alive for as long as the language server may be launched.
 fn executable_crashing_lsp_script(stderr: &str) -> (tempfile::TempDir, PathBuf) {
     let temp_dir = tempdir().expect("tempdir for crashing lsp");
     #[cfg(windows)]
@@ -312,33 +310,20 @@ fn executable_crashing_lsp_script(stderr: &str) -> (tempfile::TempDir, PathBuf) 
             }
         }
         source.push_str("exit /b 1\r\n");
-        fs::write(&script, source).expect("write crashing lsp cmd script");
+        link_cached_executable(&script, source.as_bytes()).expect("cache crashing lsp cmd script");
         (temp_dir, script)
     }
 
     #[cfg(not(windows))]
-    let script = temp_dir.path().join("crashing_lsp.py");
-    #[cfg(not(windows))]
-    let source = format!(
-        "#!/usr/bin/env python3
-import sys
-sys.stderr.write({stderr:?})
-sys.stderr.flush()
-"
-    );
-    #[cfg(not(windows))]
-    fs::write(&script, source).expect("write crashing lsp script");
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).expect("chmod crashing lsp script");
+        let script = temp_dir.path().join("crashing_lsp.py");
+        let source = format!(
+            "#!/usr/bin/env python3\nimport sys\nsys.stderr.write({stderr:?})\nsys.stderr.flush()\n"
+        );
+        link_cached_executable(&script, source.as_bytes()).expect("cache crashing lsp script");
+        warm_executable(&script, &["--version"]);
+        (temp_dir, script)
     }
-    #[cfg(not(windows))]
-    warm_executable(&script, &["--version"]);
-    #[cfg(not(windows))]
-    (temp_dir, script)
 }
 
 #[test]
@@ -452,7 +437,8 @@ fn custom_pull_only_server_reports_diagnostics_on_edit_and_inspect() {
         .expect("fake server filename")
         .to_string_lossy()
         .to_string();
-    fs::copy(&fake_server, bin_dir.join(&binary_name)).expect("install fake custom server");
+    link_cached_path(&fake_server, &bin_dir.join(&binary_name))
+        .expect("link cached fake custom server");
 
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1")),

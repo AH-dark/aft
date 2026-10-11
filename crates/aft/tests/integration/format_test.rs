@@ -11,7 +11,7 @@ use serde_json::json;
 
 #[cfg(unix)]
 use super::helpers::warm_executable;
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{link_cached_executable, user_config, AftProcess};
 
 // ============================================================================
 // Helpers
@@ -27,47 +27,33 @@ fn is_on_path(binary: &str) -> bool {
         .is_ok()
 }
 
-/// Install a stub `tsc` checker that prints a fixed TS2322 error and exits 2.
-/// On Unix the stub is a `tsc` shell script with the executable bit set.
-/// On Windows it's a `tsc.cmd` batch file (Windows resolves both `tsc` and
-/// `tsc.cmd` against PATH via PATHEXT). Either way the resolver finds it
-/// when `<dir>/node_modules/.bin` is prepended to PATH.
 fn install_tsc_stub(dir: &std::path::Path, file_name: &str) {
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         let stub = bin_dir.join("tsc");
-        fs::write(
-            &stub,
-            format!(
-                "#!/bin/sh\nprintf '%s(1,7): error TS2322: Type \\\"string\\\" is not assignable to type \\\"number\\\".\\n' '{}/{file_name}'\nexit 2\n",
-                dir.display()
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&stub).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&stub, perms).unwrap();
+        let source = format!(
+            "#!/bin/sh\nprintf '%s(1,7): error TS2322: Type \\\"string\\\" is not assignable to type \\\"number\\\".\\n' '{}/{file_name}'\nexit 2\n",
+            dir.display()
+        );
+        link_cached_executable(&stub, source.as_bytes()).unwrap();
         warm_executable(&stub, &["--version"]);
     }
 
     #[cfg(windows)]
     {
-        // Batch file: @echo off + a single echo with the canonical error
-        // format. Path uses backslashes per Windows convention so the
-        // resolver-printed location matches the file we wrote.
         let stub = bin_dir.join("tsc.cmd");
-        fs::write(
-            &stub,
-            format!(
-                "@echo off\r\necho {}\\{file_name}(1,7): error TS2322: Type \"string\" is not assignable to type \"number\".\r\nexit /b 2\r\n",
-                dir.display()
-            ),
+        let source = format!(
+            r#"@echo off
+echo {}\{file_name}(1,7): error TS2322: Type "string" is not assignable to type "number".
+exit /b 2
+"#,
+            dir.display()
         )
-        .unwrap();
+        .replace('\n', "\r\n");
+        link_cached_executable(&stub, source.as_bytes()).unwrap();
     }
 }
 
@@ -94,7 +80,7 @@ fn rustfmt_edition_test_lock() -> MutexGuard<'static, ()> {
 
 /// Configure the guard-mediated rustfmt tests with a scheduling-tolerant budget.
 ///
-/// Each test launches a newly-written command wrapper and the real formatter.
+/// Each test launches a command wrapper and the real formatter.
 /// Under Windows shard load, those process hops can exceed the product's normal
 /// 10-second formatter deadline even though this test only verifies the selected
 /// edition arguments. Keep the wider budget local to this fixture so it does not
@@ -119,15 +105,12 @@ fn configure_rustfmt_edition_test(aft: &mut AftProcess, project_root: &std::path
     );
 }
 
-/// Install a rustfmt wrapper that rejects a missing or unexpected edition flag.
 fn install_rustfmt_edition_guard(dir: &std::path::Path, expected_edition: Option<&str>) {
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
         let guard = match expected_edition {
             Some(edition) => format!(
                 "if [ \"$1\" != \"--edition\" ] || [ \"$2\" != \"{edition}\" ]; then\n  printf '%s\\n' 'rustfmt expected --edition {edition}' >&2\n  exit 1\nfi\n"
@@ -135,26 +118,22 @@ fn install_rustfmt_edition_guard(dir: &std::path::Path, expected_edition: Option
             None => "if [ \"$1\" = \"--edition\" ]; then\n  printf '%s\\n' 'rustfmt expected no edition flag' >&2\n  exit 1\nfi\n".to_string(),
         };
         let stub = bin_dir.join("rustfmt");
-        fs::write(
-            &stub,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  exec \"$AFT_TEST_REAL_RUSTFMT\" \"$@\"\nfi\n{guard}exec \"$AFT_TEST_REAL_RUSTFMT\" \"$@\"\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let source = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  exec \"$AFT_TEST_REAL_RUSTFMT\" \"$@\"\nfi\n{guard}exec \"$AFT_TEST_REAL_RUSTFMT\" \"$@\"\n"
+        );
+        link_cached_executable(&stub, source.as_bytes()).unwrap();
         warm_executable(&stub, &["--version"]);
     }
 
     #[cfg(windows)]
     {
-        let script = match expected_edition {
+        let source = match expected_edition {
             Some(edition) => format!(
                 "@echo off\r\nif \"%~1\"==\"--version\" goto version\r\nif not \"%~1\"==\"--edition\" goto missing\r\nif not \"%~2\"==\"{edition}\" goto missing\r\n\"%AFT_TEST_REAL_RUSTFMT%\" %*\r\nexit /b %errorlevel%\r\n:version\r\n\"%AFT_TEST_REAL_RUSTFMT%\" --version\r\nexit /b %errorlevel%\r\n:missing\r\necho rustfmt expected --edition {edition} 1>&2\r\nexit /b 1\r\n"
             ),
             None => "@echo off\r\nif \"%~1\"==\"--version\" goto version\r\nif \"%~1\"==\"--edition\" goto unexpected_edition\r\n\"%AFT_TEST_REAL_RUSTFMT%\" %*\r\nexit /b %errorlevel%\r\n:version\r\n\"%AFT_TEST_REAL_RUSTFMT%\" --version\r\nexit /b %errorlevel%\r\n:unexpected_edition\r\necho rustfmt expected no edition flag 1>&2\r\nexit /b 1\r\n".to_string(),
         };
-        fs::write(bin_dir.join("rustfmt.cmd"), script).unwrap();
+        link_cached_executable(&bin_dir.join("rustfmt.cmd"), source.as_bytes()).unwrap();
     }
 }
 
@@ -660,8 +639,6 @@ fn format_integration_formatter_not_installed() {
 #[cfg(unix)]
 #[test]
 fn format_integration_ruff_old_version_is_gated_at_format_time() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = format_test_dir("ruff_old_version");
     fs::write(dir.join("ruff.toml"), "line-length = 88\n").unwrap();
     let bin_dir = dir.join("node_modules").join(".bin");
@@ -669,12 +646,14 @@ fn format_integration_ruff_old_version_is_gated_at_format_time() {
     let canary = dir.join("ruff-version-canary");
     let _ = fs::remove_file(&canary);
     let ruff = bin_dir.join("ruff");
-    fs::write(
+    link_cached_executable(
         &ruff,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf executed > \"$RUFF_CANARY\"; printf 'ruff 0.1.1\\n'; exit 0; fi\nexit 0\n",
+        br#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf executed > "$RUFF_CANARY"; printf 'ruff 0.1.1\n'; exit 0; fi
+exit 0
+"#,
     )
     .unwrap();
-    fs::set_permissions(&ruff, fs::Permissions::from_mode(0o755)).unwrap();
     // The `--version` branch writes the canary checked below, so warm through
     // the fixture's inert branch before AFT performs the real version probe.
     warm_executable(&ruff, &["--warmup"]);
@@ -716,13 +695,13 @@ fn format_integration_oxfmt_config_runs_oxfmt() {
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let stub = bin_dir.join("oxfmt");
-    fs::write(
+    link_cached_executable(
         &stub,
-        "#!/bin/sh\nif [ \"$1\" = \"--write\" ]; then printf 'const x = 1;\n' > \"$2\"; fi\n",
+        br#"#!/bin/sh
+if [ "$1" = "--write" ]; then printf 'const x = 1;\n' > "$2"; fi
+"#,
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     warm_executable(&stub, &["--version"]);
 
     let target = dir.join("format_oxfmt.ts");
@@ -757,13 +736,14 @@ fn format_integration_oxfmt_ignored_path_reports_formatter_excluded_path() {
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let stub = bin_dir.join("oxfmt");
-    fs::write(
+    link_cached_executable(
         &stub,
-        "#!/bin/sh\nprintf 'Expected at least one target file after applying ignore rules.\n' >&2\nexit 1\n",
+        br#"#!/bin/sh
+printf 'Expected at least one target file after applying ignore rules.\n' >&2
+exit 1
+"#,
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     warm_executable(&stub, &["--version"]);
 
     let target = dir.join("format_oxfmt_ignored.ts");
@@ -1112,7 +1092,6 @@ fn read_response_within(
 #[cfg(unix)]
 #[test]
 fn validate_on_edit_full_keeps_status_responsive_while_checker_runs() {
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     let dir = format_test_dir("validate_full_status_responsive");
@@ -1130,18 +1109,22 @@ fn validate_on_edit_full_keeps_status_responsive_while_checker_runs() {
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let stub = bin_dir.join("tsc");
-    fs::write(
-        &stub,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\n: > '{started}'\ni=0\nwhile [ ! -f '{release}' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\ncat '{target}' >> '{seen}'\nprintf '%s(1,7): error TS2322: Type string is not assignable to type number.\\n' '{target}'\nexit 2\n",
-            started = started.display(),
-            release = release.display(),
-            target = target.display(),
-            seen = seen.display(),
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = format!(
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'Version 5.0.0'; exit 0; fi
+: > '{started}'
+i=0
+while [ ! -f '{release}' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
+cat '{target}' >> '{seen}'
+printf '%s(1,7): error TS2322: Type string is not assignable to type number.\\n' '{target}'
+exit 2
+"#,
+        started = started.display(),
+        release = release.display(),
+        target = target.display(),
+        seen = seen.display(),
+    );
+    link_cached_executable(&stub, source.as_bytes()).unwrap();
     warm_executable(&stub, &["--version"]);
     let _release_guard = ReleaseOnDrop(release.clone());
 
@@ -1340,13 +1323,14 @@ fn validate_full_nonzero_without_diagnostics_reports_error() {
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let stub = bin_dir.join("tsc");
-    fs::write(
+    link_cached_executable(
         &stub,
-        "#!/bin/sh\necho 'failed before diagnostics' >&2\nexit 2\n",
+        br#"#!/bin/sh
+echo 'failed before diagnostics' >&2
+exit 2
+"#,
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
     warm_executable(&stub, &["--version"]);
 
     let path = prepend_path(&std::ffi::OsString::new(), &dir);

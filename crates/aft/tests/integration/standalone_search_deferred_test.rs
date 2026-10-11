@@ -9,7 +9,9 @@ use std::time::{Duration, Instant, SystemTime};
 use filetime::{set_file_mtime, FileTime};
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+#[cfg(unix)]
+use super::helpers::link_cached_executable;
+use super::helpers::{link_cached_path, user_config, AftProcess};
 
 const SEARCH_QUERY: &str = "where does standalone deferred cancellation stop remote embedding";
 
@@ -696,7 +698,7 @@ fn standalone_read_answers_while_inspect_initializes_a_language_server() {
         .to_string_lossy()
         .to_string();
     let installed = bin_dir.join(&binary_name);
-    fs::copy(&fake_server, &installed).expect("install fake server");
+    link_cached_path(&fake_server, &installed).expect("link cached fake server");
     // The fake LSP has no CLI probe; closed stdin makes its protocol loop exit.
     super::helpers::warm_executable(&installed, &[]);
 
@@ -938,14 +940,11 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
     let formatter_dir = project.path().join("bin");
     fs::create_dir_all(&formatter_dir).expect("create formatter directory");
     let formatter = formatter_dir.join("biome");
-    fs::write(
+    link_cached_executable(
         &formatter,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'biome 2.0.0'; exit 0; fi\nsleep 0.4\n",
+        b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'biome 2.0.0'; exit 0; fi\nsleep 0.4\n",
     )
-    .expect("write formatter shim");
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&formatter, fs::Permissions::from_mode(0o755))
-        .expect("make formatter executable");
+    .expect("cache formatter shim");
     let formatter_path = std::env::join_paths(
         std::iter::once(formatter_dir.as_os_str().to_os_string()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).map(Into::into),

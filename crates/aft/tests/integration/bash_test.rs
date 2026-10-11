@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use super::helpers::warm_executable;
+use super::helpers::{link_cached_executable, warm_executable};
 use super::helpers::{user_config, AftProcess};
 
 #[cfg(unix)]
@@ -9,12 +9,7 @@ fn shell_quote_path(path: &std::path::Path) -> String {
 
 #[cfg(unix)]
 fn write_executable_shim(path: &std::path::Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::write(path, body).unwrap();
-    let mut permissions = std::fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(path, permissions).unwrap();
+    link_cached_executable(path, body.as_bytes()).unwrap();
     warm_executable(path, &["--version"]);
 }
 

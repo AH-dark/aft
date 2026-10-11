@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[allow(dead_code)]
+pub mod executable_cache;
 pub mod fake_lsp;
 
 #[path = "../../src/test_env.rs"]

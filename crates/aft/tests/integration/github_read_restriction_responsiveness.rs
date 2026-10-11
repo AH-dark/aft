@@ -3,7 +3,6 @@
 use std::env;
 use std::fs;
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -26,7 +25,7 @@ use aft::protocol::RawRequest;
 use serde_json::json;
 use url::Url;
 
-use super::helpers::{AftProcess, ReleaseOnDrop};
+use super::helpers::{link_cached_executable, AftProcess, ReleaseOnDrop};
 
 const RESOURCE: &str = "issue://owner/repo/7";
 const AMBIENT_OPERATOR_CREDENTIAL: &str = "ghp_operator_ambient_credential";
@@ -44,12 +43,7 @@ fn enabled_gh_read() -> GithubConfig {
 }
 
 fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("write fixture executable");
-    let mut permissions = fs::metadata(path)
-        .expect("stat fixture executable")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make fixture executable");
+    link_cached_executable(path, body.as_bytes()).expect("cache fixture executable");
 }
 
 fn write_success_gh(bin_dir: &Path) {

@@ -1,21 +1,12 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { appendFileSync, constants } from "node:fs";
-import {
-  access,
-  chmod,
-  copyFile,
-  mkdir,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 
 import { type CatalogEntry, SubcClient } from "@cortexkit/subc-client";
 import { isolatedAftEnvironment } from "../../test-child-environment.js";
+import { cachedExecutable, cachedExecutableBytes } from "../test-utils/cached-executable.js";
 
 const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
 const SUBC_BINARY_NAME = process.platform === "win32" ? "subc-core.exe" : "subc-core";
@@ -161,14 +152,11 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   const stderrPath = join(logDir, "subc-core.stderr.log");
   console.info(`[subc e2e] diagnostics: ${logDir}`);
   const moduleStderrPath = join(logDir, "aft.stderr.log");
-  const moduleWrapper = join(tempDir, "aft-with-stderr.sh");
-  // exec preserves the module PID and protocol descriptors; only stderr is redirected.
-  // Capture panics too, which do not necessarily reach AFT's structured file logger.
-  if (process.platform !== "win32") {
-    await writeFile(moduleWrapper, '#!/bin/sh\nlog=$1\nshift\nexec "$@" 2>>"$log"\n', {
-      mode: 0o700,
-    });
-  }
+  // The shared wrapper preserves the module PID while sending its stderr to the rig log.
+  const moduleWrapper =
+    process.platform === "win32"
+      ? ""
+      : cachedExecutable('#!/bin/sh\nlog=$1\nshift\nexec "$@" 2>>"$log"\n');
 
   await mkdir(join(configHome, "cortexkit"), { recursive: true });
   await Promise.all([mkdir(homeDir, { recursive: true }), mkdir(runtimeDir, { recursive: true })]);
@@ -231,23 +219,18 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
     connectionFile,
   };
 
-  let daemon: ChildProcessWithoutNullStreams | null = null;
-  let testExecutableDir: string | null = null;
   let testDaemonPath: string;
+  let daemon: ChildProcessWithoutNullStreams | null = null;
   try {
-    // Keep the executable in the cache tree so the orphan sweep can still
-    // identify and reap it if the test runner exits before cleanup.
-    await mkdir(FETCHED_SUBC_CORE_CACHE_ROOT, { recursive: true });
-    testExecutableDir = await mkdtemp(join(FETCHED_SUBC_CORE_CACHE_ROOT, ".rig-"));
-    testDaemonPath = join(
-      testExecutableDir,
-      `ckdev-subc${process.platform === "win32" ? ".exe" : ""}`,
+    testDaemonPath = cachedExecutableBytes(
+      await readFile(prepared.subcCorePath),
+      FETCHED_SUBC_CORE_CACHE_ROOT,
+      process.platform === "win32" ? "ckdev-subc.exe" : "ckdev-subc",
     );
-    await copyFile(prepared.subcCorePath, testDaemonPath);
-    if (process.platform !== "win32") await chmod(testDaemonPath, 0o755);
+    // The content-addressed path stays under the sweep root so orphaned daemons
+    // remain identifiable without making a fresh executable copy for each rig.
     daemon = await spawnReadyDaemon(testDaemonPath, daemonDirs);
   } catch (err) {
-    if (testExecutableDir) await safeRemoveDir(testExecutableDir);
     await safeRemoveDir(tempDir);
     throw err;
   }
@@ -295,7 +278,6 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
       cleaned = true;
       await stopDaemon(daemon);
       await safeRemoveDir(tempDir);
-      if (testExecutableDir) await safeRemoveDir(testExecutableDir);
     },
   };
 }

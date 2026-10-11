@@ -2,6 +2,8 @@
 // which share this module via `#[path]`. Each binary uses a different subset,
 // so some re-exports are unused in one or the other.
 #[allow(unused_imports)]
+pub use crate::test_helpers::executable_cache::{link_cached_executable, link_cached_path};
+#[allow(unused_imports)]
 pub use crate::test_helpers::{
     canonicalize_like_product, cargo_manifest_dir, disable_in_process_file_watcher, fixture_path,
     real_rust_analyzer_available, thread_scratch_dir, user_config, user_config_tier,

@@ -4,7 +4,7 @@
 //! to test the full move pipeline: symbol extraction, destination insertion,
 //! consumer import rewiring, checkpoint creation/restore, and error paths.
 
-use crate::helpers::{fixture_path, user_config, AftProcess};
+use crate::helpers::{fixture_path, link_cached_executable, user_config, AftProcess};
 use serde_json::json;
 
 /// Copy the `tests/fixtures/move_symbol/` directory into a temp dir,
@@ -85,7 +85,6 @@ fn full_validation_case(
     fail: bool,
     checker: ValidationChecker,
 ) -> (tempfile::TempDir, serde_json::Value) {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(
@@ -149,7 +148,6 @@ exit "$status"
 "#,
         ),
     }
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&json!({"id":"cfg-count", "command":"configure", "harness":"opencode", "project_root":root,
             "config":user_config(json!({"format_on_edit":false, "validate_on_edit":"full", "checker":{"typescript":"tsc"}, "lsp":{"enabled":false}}))}).to_string());
@@ -369,7 +367,11 @@ fn assert_full_validation_does_not_run_on_failure_or_rollback(checker: Validatio
 
 fn write_file(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
-    std::fs::write(path, content).expect("write file");
+    if content.starts_with("#!") {
+        link_cached_executable(path, content.as_bytes()).expect("cache executable fixture");
+    } else {
+        std::fs::write(path, content).expect("write file");
+    }
 }
 
 fn setup_namespace_move_case(

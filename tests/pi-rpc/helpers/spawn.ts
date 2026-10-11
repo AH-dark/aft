@@ -1,17 +1,20 @@
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import {
-  chmodSync,
-  copyFileSync,
   existsSync,
+  linkSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { cachedExecutableBytes } from "../../../packages/aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { hermeticGitChildEnv } from "../../helpers/git-env.js";
 import { createRpcClient, type RpcClient } from "./rpc-client";
 
@@ -160,21 +163,31 @@ function seedBinaryCache(configDir: string): void {
   const reported = execFileSync(builtBinary, ["--version"], { encoding: "utf8" })
     .trim()
     .replace(/^aft\s+/, "");
+  let binaryBytes = readFileSync(builtBinary);
+  // A linker signature alone is not enough for local Sequoia execution. Sign a
+  // disposable staging copy, then publish the signed bytes into the shared
+  // content-addressed cache so each Pi fixture points at one immutable image.
+  if (process.platform === "darwin") {
+    const stagingDir = mkdtempSync(join(tmpdir(), "aft-pi-signed-"));
+    const stagingBinary = join(stagingDir, `aft${ext}`);
+    try {
+      writeFileSync(stagingBinary, binaryBytes, { mode: 0o755 });
+      try {
+        execFileSync("codesign", ["--force", "--sign", "-", stagingBinary], { stdio: "ignore" });
+        binaryBytes = readFileSync(stagingBinary);
+      } catch {
+        // codesign unavailable / failed — leave the linker-signed bytes as-is.
+      }
+    } finally {
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
+  }
+  const cachedBinary = cachedExecutableBytes(binaryBytes);
   const cacheBinDir = join(configDir, "cache", "aft", "bin", `v${reported}`);
   mkdirSync(cacheBinDir, { recursive: true });
   const dest = join(cacheBinDir, `aft${ext}`);
-  copyFileSync(builtBinary, dest);
-  chmodSync(dest, 0o755);
-  // The copy is only linker-signed; macOS Sequoia SIGKILLs such binaries on
-  // exec. Ad-hoc re-sign (best-effort) so local macOS runs don't die — the
-  // Linux CI job doesn't need it. Mirrors scripts/dev-rebuild.sh.
-  if (process.platform === "darwin") {
-    try {
-      execFileSync("codesign", ["--force", "--sign", "-", dest], { stdio: "ignore" });
-    } catch {
-      // codesign unavailable / failed — leave the copy as-is.
-    }
-  }
+  if (process.platform === "win32") linkSync(cachedBinary, dest);
+  else symlinkSync(cachedBinary, dest);
 }
 
 function writeConfigs(opts: PiSpawnOptions): string {

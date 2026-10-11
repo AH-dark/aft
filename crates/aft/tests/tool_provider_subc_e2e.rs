@@ -1,11 +1,12 @@
 //! Tool-provider v1 route selection through a real subc daemon.
 //!
 //! The consumer declares its role versions on `route.open`; the daemon
-//! forwards them, unverified, to AFT's bind. This test copies the configured
-//! `ck-subc` source into a test-only `ckdev-subc` executable (subc-daemon 0.29
-//! or later, which advertises `route-role-versions/v1`) in a temporary,
-//! isolated home, runs it with the `aft` binary this package builds as its
-//! module, and checks from the consumer's side that:
+//! forwards them, unverified, to AFT's bind. This test runs the configured
+//! `ck-subc` bytes from a stable content-addressed test cache under the
+//! `ckdev-subc` name (subc-daemon 0.29 or later, which advertises
+//! `route-role-versions/v1`) in a temporary, isolated home, runs it with the
+//! `aft` binary this package builds as its module, and checks from the
+//! consumer's side that:
 //!
 //! - a route opened with `role_versions: {"tool-provider": "v1"}` is served
 //!   the catalog and admits calls under the v1 grammar;
@@ -33,7 +34,6 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -57,7 +57,7 @@ impl HermeticDaemon {
     fn start(subc_bin: &Path, home: &Path) -> Self {
         let runtime = home.join("runtime");
         let connection_file = runtime.join("subc-connection.json");
-        let test_bin = copy_test_daemon(subc_bin, home);
+        let test_bin = cache_test_daemon(subc_bin);
         let child = Command::new(&test_bin)
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -91,30 +91,31 @@ impl HermeticDaemon {
     }
 }
 
-fn copy_test_daemon(subc_bin: &Path, home: &Path) -> PathBuf {
-    let test_bin = home.join("ckdev-subc");
-    std::fs::copy(subc_bin, &test_bin).expect("copy daemon into the isolated test home");
-    test_bin
+fn cache_test_daemon(subc_bin: &Path) -> PathBuf {
+    let bytes = std::fs::read(subc_bin).expect("read daemon for the executable cache");
+    crate::test_helpers::executable_cache::cached_executable_named(&bytes, "ckdev-subc")
+        .expect("cache immutable test daemon")
 }
 
 #[test]
-fn copied_test_daemon_executes_under_the_ckdev_name() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("ck-subc");
-    std::fs::write(&source, "#!/bin/sh\nprintf '%s\\n' \"$0\"\n").unwrap();
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-
-    let test_bin = copy_test_daemon(&source, &home);
-    assert_eq!(test_bin.file_name(), Some(OsStr::new("ckdev-subc")));
-    let output = Command::new(&test_bin).output().expect("run copied daemon");
+fn cached_test_daemon_keeps_ckdev_name() {
+    let script = b"#!/bin/sh\nprintf '%s\\n' \"$0\"\n";
+    let first =
+        crate::test_helpers::executable_cache::cached_executable_named(script, "ckdev-subc")
+            .unwrap();
+    let second =
+        crate::test_helpers::executable_cache::cached_executable_named(script, "ckdev-subc")
+            .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.file_name(), Some(std::ffi::OsStr::new("ckdev-subc")));
+    assert_eq!(first.parent().unwrap().file_name().unwrap().len(), 64);
+    let output = Command::new(&first)
+        .output()
+        .expect("run cached daemon fixture");
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        test_bin.to_string_lossy()
+        first.to_string_lossy()
     );
 }
 

@@ -8,11 +8,10 @@
 //! is invisible to the census.
 //!
 //! `parked_semantic_loads_are_unattributed` is the reproduction of the cause
-//! found. It copies the configured `ck-subc` source to a test-only
-//! `ckdev-subc` executable in a temporary, isolated home, runs it with the
-//! `aft` binary this package builds as its module, and opens one short session
-//! per root: bind, run a 15 s command, close the route, the way agent
-//! sessions come and go. Each bind runs configure, which reloads that root's
+//! found. It runs the configured `ck-subc` bytes from the shared immutable test
+//! executable cache in a temporary, isolated home, with the `aft` binary this
+//! package builds as its module, and opens one short session per root: bind, run
+//! a 15 s command, close the route, the way agent sessions come and go. Each bind runs configure, which reloads that root's
 //! semantic index from disk on a background thread, and the next completion
 //! drain installs it. The name reflects the first hypothesis (a finished load
 //! parked in its channel); that turned out not to hold, because unbinding a
@@ -44,14 +43,18 @@
 //! The daemon test never touches the operator's daemon: it starts its own
 //! `ckdev-subc` copy with every XDG directory, `HOME` and `TMPDIR` pointed into a
 //! temporary directory, on a kernel-assigned port, in its own process group,
-//! and kills that group when it finishes. It runs the module with
+//! and kills that group when it finishes. The daemon process uses the shared
+//! content-addressed executable cache rather than creating a fresh copy in each
+//! test home. It runs the module with
 //! `MallocStackLogging=1` and reads that process with `malloc_history`, which
 //! briefly suspends it; that is safe only because the process is the test's own.
 
 #![cfg(target_os = "macos")]
 
+#[path = "helpers/executable_cache.rs"]
+mod executable_cache;
+
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -287,7 +290,7 @@ impl HermeticDaemon {
         let runtime = home.join("runtime");
         let connection_file = runtime.join("subc-connection.json");
         let _ = std::fs::remove_file(&connection_file);
-        let test_bin = copy_test_daemon(subc_bin, home);
+        let test_bin = cache_test_daemon(subc_bin);
         let child = Command::new(&test_bin)
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
@@ -322,30 +325,27 @@ impl HermeticDaemon {
     }
 }
 
-fn copy_test_daemon(subc_bin: &Path, home: &Path) -> PathBuf {
-    let test_bin = home.join("ckdev-subc");
-    std::fs::copy(subc_bin, &test_bin).expect("copy daemon into the isolated test home");
-    test_bin
+fn cache_test_daemon(subc_bin: &Path) -> PathBuf {
+    let bytes = std::fs::read(subc_bin).expect("read daemon for the executable cache");
+    executable_cache::cached_executable_named(&bytes, "ckdev-subc")
+        .expect("cache immutable test daemon")
 }
 
 #[test]
-fn copied_test_daemon_executes_under_the_ckdev_name() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("ck-subc");
-    std::fs::write(&source, "#!/bin/sh\nprintf '%s\\n' \"$0\"\n").unwrap();
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&home).unwrap();
-
-    let test_bin = copy_test_daemon(&source, &home);
-    assert_eq!(test_bin.file_name(), Some(OsStr::new("ckdev-subc")));
-    let output = Command::new(&test_bin).output().expect("run copied daemon");
+fn cached_test_daemon_keeps_ckdev_name() {
+    let script = b"#!/bin/sh\nprintf '%s\\n' \"$0\"\n";
+    let first = executable_cache::cached_executable_named(script, "ckdev-subc").unwrap();
+    let second = executable_cache::cached_executable_named(script, "ckdev-subc").unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.file_name(), Some(std::ffi::OsStr::new("ckdev-subc")));
+    assert_eq!(first.parent().unwrap().file_name().unwrap().len(), 64);
+    let output = Command::new(&first)
+        .output()
+        .expect("run cached daemon fixture");
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        test_bin.to_string_lossy()
+        first.to_string_lossy()
     );
 }
 

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use super::helpers::AftProcess;
+use super::helpers::{link_cached_executable, AftProcess};
 
 const TS7_ENV: &str = "AFT_TEST_TS7_NODE_MODULES";
 const TS5_ENV: &str = "AFT_TEST_TS5_NODE_MODULES";
@@ -392,12 +392,8 @@ fn mixed_typescript_5_and_7_packages_get_separate_servers() {
 /// A marker script that records that it ran; nothing in these tests may run
 /// it.
 fn sentinel(path: &Path, marker: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    write(
-        path,
-        &format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display()),
-    );
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display());
+    link_cached_executable(path, source.as_bytes()).unwrap();
 }
 
 /// A TypeScript 7 installation without its platform package (optional
@@ -467,7 +463,6 @@ fn typescript_7_without_its_platform_package_is_a_named_gap_and_spawns_nothing()
 /// identify itself as typescript-go after initialize is stopped and named.
 #[test]
 fn native_binary_that_is_not_typescript_go_is_rejected() {
-    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("app");
     write(&root.join("package.json"), r#"{"private":true}"#);
@@ -494,11 +489,8 @@ fn native_binary_that_is_not_typescript_go_is_rejected() {
     // Any other language server in the platform binary's place: the fake
     // server reports serverInfo.name "fake-lsp-server".
     let binary = platform_dir.join("lib").join("tsc");
-    write(
-        &binary,
-        &format!("#!/bin/sh\nexec '{}'\n", fake_server_path().display()),
-    );
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = format!("#!/bin/sh\nexec '{}'\n", fake_server_path().display());
+    link_cached_executable(&binary, source.as_bytes()).unwrap();
     let file = root.join("src").join("index.ts");
     write(&file, "export const count = 1;\n");
 

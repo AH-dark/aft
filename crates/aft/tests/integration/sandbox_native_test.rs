@@ -114,12 +114,11 @@ impl CortexkitFloorFixture {
         }
         std::fs::write(&connection, "daemon-token").unwrap();
         let shim_image = if copy_shim {
-            let image = data.join("bin/ck-aft");
-            std::fs::create_dir_all(image.parent().unwrap()).unwrap();
-            // The write-denial probe must not risk corrupting the real test
-            // executable if the sandbox regresses or is deliberately mutated.
-            std::fs::copy(env!("CARGO_BIN_EXE_aft"), &image).unwrap();
-            Some(image)
+            let bytes = std::fs::read(env!("CARGO_BIN_EXE_aft")).unwrap();
+            Some(
+                crate::test_helpers::executable_cache::cached_executable(&bytes)
+                    .expect("cache isolated shim image"),
+            )
         } else {
             None
         };
@@ -640,7 +639,6 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
 #[test]
 fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
     skip_if_landlock_absent!();
-    use std::os::unix::fs::PermissionsExt;
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
     let storage = fixture.path().join("storage");
@@ -657,7 +655,25 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
         .output()
         .unwrap();
     assert!(created.status.success());
-    let mut aft = AftProcess::spawn();
+    let real_binary = which::which("sqlite3").unwrap();
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = -readonly ]; then exec {} \"$@\"; fi\nprintf 'Error: in prepare, no such column: substrate\\n' >&2\nexit 1\n",
+        quote(&real_binary)
+    );
+    // Keep the hashed executable under the project so the native sandbox permits it.
+    let cached = crate::test_helpers::executable_cache::cached_executable_named_in(
+        &project.join(".aft-test-bin"),
+        script.as_bytes(),
+        "sqlite3",
+    )
+    .unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(cached.parent().unwrap().to_path_buf()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )),
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
     assert_eq!(
         configure_native(&mut aft, &project, &storage, true)["success"],
         true
@@ -676,12 +692,8 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
         "{allowed}"
     );
 
-    // The command can report an error without reading the protected database.
-    // Its probe must not gain access just because it runs after that command.
-    let binary = project.join("sqlite3");
-    let real_binary = which::which("sqlite3").unwrap();
-    std::fs::write(&binary, format!("#!/bin/sh\nif [ \"$1\" = -readonly ]; then exec {} \"$@\"; fi\nprintf 'Error: in prepare, no such column: substrate\\n' >&2\nexit 1\n", quote(&real_binary))).unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The cached stand-in returns the missing-column error; only its read-only
+    // schema probe invokes SQLite, so the denied case cannot read the database.
     assert_eq!(
         configure_native_policy(
             &mut aft,
@@ -696,7 +708,7 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
     let denied = foreground(
         &mut aft,
         "schema-denied",
-        "./sqlite3 private/store.db 'SELECT substrate FROM tasks'",
+        "sqlite3 private/store.db 'SELECT substrate FROM tasks'",
     );
     assert_eq!(denied["status"], "failed", "{denied}");
     let output = denied["output"].as_str().unwrap();

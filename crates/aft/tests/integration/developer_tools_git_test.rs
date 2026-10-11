@@ -10,16 +10,22 @@ use std::process::Command;
 
 use serde_json::json;
 
-use super::helpers::AftProcess;
+use super::helpers::{link_cached_executable, AftProcess};
 
 /// Write an executable script that appends its arguments to `log`.
-fn recording_script(path: &Path, log: &Path, tail: &str) {
+fn recording_script(path: &Path, log: &Path, tail: &str, share: bool) {
     let body = format!(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{tail}\n",
         log.display()
     );
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    if share {
+        link_cached_executable(path, body.as_bytes()).unwrap();
+    } else {
+        // This launcher stand-in must resolve inside the injected launcher directory.
+        // The passing path never executes it, so its private path has no first-run scan.
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
 
 fn invocations(log: &Path) -> Vec<String> {
@@ -37,6 +43,7 @@ fn launcher_stub(dir: &Path) -> PathBuf {
         &dir.join("git"),
         &log,
         "echo 'xcode-select: note: No developer tools were found, requesting install.' >&2\nexit 1",
+        false,
     );
     log
 }
@@ -117,6 +124,7 @@ fn a_real_git_earlier_on_path_is_still_used() {
         &homebrew.join("git"),
         &homebrew_log,
         &format!("exec '{}' \"$@\"", real_git.display()),
+        true,
     );
 
     let project = temp.path().join("project");

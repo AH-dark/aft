@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import {
-  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -55,6 +54,7 @@ import {
   toolResultForCall,
 } from "./mock-server.js";
 import { taskKillDeadlineText } from "../../../../packages/aft-bridge/src/bash-hints.js";
+import { cachedExecutable as cacheSharedExecutable } from "../../../../packages/aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import {
   assertComparison,
   assertDualHostParity,
@@ -127,38 +127,30 @@ async function root(): Promise<string> {
   return path;
 }
 
-// Fake executables live in one fixed cache shared by every run instead of in
-// the per-test temp directories. On macOS, Gatekeeper (syspolicyd) scans every
-// newly created executable the first time it runs, so writing fresh copies on
-// each run cost dozens of scans and a busy CPU core per `bun test`. A file's
-// directory is named by a hash of its bytes and mode, so a run reuses the copy
-// an earlier run left behind and an edited script gets a new path. Nothing
-// here deletes the cache: it holds a few tiny scripts.
-const CACHED_FILES = join(tmpdir(), "opencode2-harness-test-executables");
+// Executable fixtures use the bridge's immutable content-addressed cache so
+// identical bytes share one launch path across test runs. Keep non-executable
+// fixture data in its own small cache instead of the per-test temp directories.
+const CACHED_DATA_FILES = join(tmpdir(), "opencode2-harness-test-data");
 
 async function cachedFile(content: string, executable: boolean): Promise<string> {
+  if (executable) return cacheSharedExecutable(content);
+
   const digest = createHash("sha256")
-    .update(executable ? "executable\0" : "data\0")
+    .update("data\0")
     .update(content)
     .digest("hex")
     // Short enough that a path to it still fits in a `#!` line on Linux.
     .slice(0, 24);
-  const directory = join(CACHED_FILES, digest);
-  const path = join(directory, executable ? "executable" : "data");
+  const directory = join(CACHED_DATA_FILES, digest);
+  const path = join(directory, "data");
   const existing = await stat(path).catch(() => undefined);
-  if (
-    existing?.isFile() &&
-    (!executable || (existing.mode & 0o111) === 0o111) &&
-    (await readFile(path, "utf8")) === content
-  ) {
-    return path;
-  }
+  if (existing?.isFile() && (await readFile(path, "utf8")) === content) return path;
+
   // Written under a unique name and renamed into place, so a concurrent run
   // either sees no file or the whole file, never a half-written one.
   await mkdir(directory, { recursive: true });
   const pending = join(directory, `.pending-${process.pid}-${randomUUID()}`);
   await writeFile(pending, content);
-  if (executable) await chmod(pending, 0o755);
   await rename(pending, path);
   return path;
 }

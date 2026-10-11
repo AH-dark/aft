@@ -937,8 +937,6 @@ fn real_live_status_stays_raw_without_an_envelope() {
 #[cfg(unix)]
 #[test]
 fn real_gate_script_output_ends_with_verdict_then_trailer() {
-    use std::os::unix::fs::PermissionsExt;
-
     let mut aft = AftProcess::spawn();
     let project = tempfile::tempdir().expect("project tempdir");
     configure_real_bash(&mut aft, project.path());
@@ -949,12 +947,8 @@ fn real_gate_script_output_ends_with_verdict_then_trailer() {
     )
     .unwrap();
     let script = project.path().join("rust-test-gate.sh");
-    fs::write(
-        &script,
-        format!("#!/bin/sh\ncat {}\n", shell_quote(&fixture)),
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = format!("#!/bin/sh\ncat {}\n", shell_quote(&fixture));
+    test_helpers::executable_cache::link_cached_executable(&script, source.as_bytes()).unwrap();
 
     let reply = aft.send(
         &serde_json::json!({

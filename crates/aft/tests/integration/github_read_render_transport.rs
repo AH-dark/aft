@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -19,7 +18,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use url::Url;
 
-use super::helpers::AftProcess;
+use super::helpers::{link_cached_executable, AftProcess};
 
 fn enabled_gh_read() -> aft::config::GithubConfig {
     aft::config::GithubConfig {
@@ -197,9 +196,9 @@ fn fixture_pinned_issue_and_pull_request_renders_follow_omp_shape() {
 fn write_fake_gh(bin_dir: &Path) {
     fs::create_dir_all(bin_dir).expect("create fixture gh directory");
     let script = bin_dir.join("gh");
-    fs::write(
+    link_cached_executable(
         &script,
-        r#"#!/bin/sh
+        br#"#!/bin/sh
 printf '%s %s\n' "$1" "$2" >> "$AFT_GH_READ_CALL_LOG"
 case "$1:$2" in
   issue:view)
@@ -211,22 +210,17 @@ case "$1:$2" in
    api:graphql)
      cat "$AFT_GH_READ_FIXTURE_DIR/pr-review-comments.json"
      ;;
-   api:repos/*)
-     printf '[]\n'
+    api:repos/*)
+      printf '[]\n'
+      ;;
+    *)
+     printf 'unexpected fixture gh command: %s %s\n' "$1" "$2" >&2
+     exit 1
      ;;
-   *)
-    printf 'unexpected fixture gh command: %s %s\n' "$1" "$2" >&2
-    exit 1
-    ;;
-esac
+ esac
 "#,
     )
-    .expect("write fixture gh script");
-    let mut permissions = fs::metadata(&script)
-        .expect("stat fixture gh script")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("make fixture gh script executable");
+    .expect("cache fixture gh script");
 }
 
 fn spawn_fixture_aft(bin_dir: &Path, call_log: &Path) -> AftProcess {

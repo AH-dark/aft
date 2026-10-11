@@ -4,7 +4,6 @@ import {
   linkSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   statSync,
   symlinkSync,
   unlinkSync,
@@ -16,23 +15,41 @@ import { dirname, join } from "node:path";
 const cacheRoot = join(tmpdir(), "aft-test-executables");
 
 export function cachedExecutable(source: string): string {
-  const digest = createHash("sha256").update("mode:755\0").update(source).digest("hex");
-  const path = join(cacheRoot, digest, "executable");
+  return cachedExecutableBytes(Buffer.from(source));
+}
+
+export function cachedExecutableBytes(
+  bytes: Uint8Array,
+  root = cacheRoot,
+  name = process.platform === "win32" ? "executable.exe" : "executable",
+): string {
+  const digest = createHash("sha256").update("mode:755\0").update(bytes).digest("hex");
+  const path = join(root, digest, name);
   try {
     const stat = statSync(path);
-    if (stat.isFile() && (stat.mode & 0o777) === 0o755 && readFileSync(path, "utf8") === source)
-      return path;
+    if (!stat.isFile() || (stat.mode & 0o777) !== 0o755 || !readFileSync(path).equals(bytes)) {
+      throw new Error(`content-addressed test executable is invalid: ${path}`);
+    }
+    return path;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 
   mkdirSync(dirname(path), { recursive: true });
-  // Publish only complete executable bytes; another test process may use the same digest.
+  // Link publication is atomic and never replaces a path another process won.
   const pending = join(dirname(path), `.pending-${process.pid}-${randomUUID()}`);
   try {
-    writeFileSync(pending, source);
+    writeFileSync(pending, bytes, { flag: "wx" });
     chmodSync(pending, 0o755);
-    renameSync(pending, path);
+    try {
+      linkSync(pending, path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const stat = statSync(path);
+      if (!stat.isFile() || (stat.mode & 0o777) !== 0o755 || !readFileSync(path).equals(bytes)) {
+        throw new Error(`content-addressed test executable is invalid: ${path}`);
+      }
+    }
   } finally {
     try {
       unlinkSync(pending);
@@ -40,15 +57,6 @@ export function cachedExecutable(source: string): string {
       // A failed best-effort cleanup must not hide the original publication error.
     }
   }
-  return path;
-}
-
-// A hard link reuses the cached inode instead of copying it. Do not use it for
-// fixtures whose code under test calls realpath: on macOS, realpath of a file
-// with several hard links may return any one of the links' paths.
-export function hardlinkCachedExecutable(path: string, source: string): string {
-  mkdirSync(dirname(path), { recursive: true });
-  linkSync(cachedExecutable(source), path);
   return path;
 }
 

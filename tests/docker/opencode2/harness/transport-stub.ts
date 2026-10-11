@@ -1,5 +1,8 @@
-import { chmod, mkdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { link, mkdir, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { cachedExecutable } from "../../../../packages/aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 export interface TransportDeadStub {
   /** The path handed to the plugin as `AFT_BINARY_PATH` for the whole run. */
@@ -126,9 +129,9 @@ export async function makeTransportDeadStub(
 /**
  * Writes one of the stand-in's files and returns the absolute path it now
  * lives at. The swapped `aft` symlink always stays inside the isolation root;
- * only the files it points at can live elsewhere. Unit tests pass a writer
- * that reuses one fixed copy per content, because on macOS every newly
- * created executable is scanned by Gatekeeper the first time it runs.
+ * only the files it points at can live elsewhere. Supplied writers and the
+ * default writer keep executable bytes in a shared content-addressed cache, so
+ * repeated test processes do not create a fresh executable path for each rig.
  */
 export type StandInFileWriter = (file: {
   name: string;
@@ -136,15 +139,41 @@ export type StandInFileWriter = (file: {
   executable: boolean;
 }) => Promise<string>;
 
-function isolationRootWriter(stateRoot: string): StandInFileWriter {
-  return async ({ name, content, executable }) => {
-    const path = join(stateRoot, name);
-    await rm(path, { force: true });
-    await writeFile(path, content);
-    if (executable) await chmod(path, 0o755);
-    return path;
-  };
+/**
+ * Return one stable path for data read by the shell stand-in. It uses the same
+ * create-only publication rule as executable fixtures but is not marked runnable.
+ */
+async function cachedTextFile(content: string): Promise<string> {
+  const digest = createHash("sha256").update("data\\0").update(content).digest("hex");
+  const directory = join(tmpdir(), "aft-test-files", digest);
+  const path = join(directory, "data");
+  try {
+    if ((await stat(path)).isFile() && (await readFile(path, "utf8")) === content) return path;
+    throw new Error(`content-addressed test data is invalid: ${path}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  await mkdir(directory, { recursive: true });
+  const pending = join(directory, `.pending-${process.pid}-${randomUUID()}`);
+  await writeFile(pending, content, { flag: "wx" });
+  try {
+    await link(pending, path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if ((await readFile(path, "utf8")) !== content) {
+      throw new Error(`content-addressed test data is invalid: ${path}`);
+    }
+  } finally {
+    await rm(pending, { force: true });
+  }
+  return path;
 }
+
+function isolationRootWriter(_stateRoot: string): StandInFileWriter {
+  return async ({ content, executable }) =>
+    executable ? cachedExecutable(content) : cachedTextFile(content);
+}
+
 
 /**
  * Point the scenario's `aft` at the real binary or at the stand-in.

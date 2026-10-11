@@ -23,7 +23,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -777,14 +776,11 @@ fn write_project_repo(root: &Path) -> PathBuf {
 fn write_upstream_gh(bin: &Path) {
     fs::create_dir_all(bin).expect("create upstream bin");
     let gh = bin.join("gh");
-    fs::write(
+    crate::test_helpers::executable_cache::link_cached_executable(
         &gh,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\nexit 73\n",
+        b"#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_SHIM_TEST_RECORD\"\nexit 73\n",
     )
-    .expect("write upstream gh stand-in");
-    let mut permissions = fs::metadata(&gh).expect("gh metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&gh, permissions).expect("make gh stand-in executable");
+    .expect("cache upstream gh stand-in");
 }
 
 fn write_user_config(config_home: &Path, connection_file: &Path) {

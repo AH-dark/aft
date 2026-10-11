@@ -12,6 +12,49 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
+fn executable_cache_reuses_one_immutable_content_addressed_path() {
+    let bytes = b"#!/bin/sh\nprintf '%s\n' cached\n";
+    let first = crate::test_helpers::executable_cache::cached_executable(bytes).unwrap();
+    let before = fs::metadata(&first).unwrap();
+    let second = crate::test_helpers::executable_cache::cached_executable(bytes).unwrap();
+    let after = fs::metadata(&second).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.parent().unwrap().file_name().unwrap().len(), 64);
+    assert_eq!(fs::read(&second).unwrap(), bytes);
+    assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(before.ino(), after.ino());
+    }
+}
+
+#[test]
+fn concurrent_executable_cache_users_share_one_published_path() {
+    use crate::test_helpers::executable_cache::cached_executable;
+
+    let bytes = b"#!/bin/sh\nexit 0\n";
+    let barrier = Arc::new(Barrier::new(4));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                cached_executable(bytes).unwrap()
+            })
+        })
+        .collect();
+    let paths: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+
+    assert!(paths.iter().all(|path| path == &paths[0]));
+    assert_eq!(fs::read(&paths[0]).unwrap(), bytes);
+}
+
+#[test]
 fn concurrent_builders_compile_once() {
     let dir = tempfile::tempdir().unwrap();
     let barrier = Arc::new(Barrier::new(2));
@@ -60,10 +103,13 @@ fn installation_never_write_opens_a_running_executable() {
     use std::process::Stdio;
 
     let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("shell");
-    fs::copy("/bin/sh", &source).unwrap();
+    let script = br#"#!/bin/sh
+printf 'ready\n'
+read release
+"#;
+    let source_key = cache::key(&[script], "rustc", "unix");
+    let source = cache::install_bytes(dir.path(), &source_key, "unix", script).unwrap();
     let mut child = Command::new(&source)
-        .args(["-c", "echo ready; read release"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

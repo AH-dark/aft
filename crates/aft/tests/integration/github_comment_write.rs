@@ -2,17 +2,16 @@
 
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use super::helpers::AftProcess;
+use super::helpers::{link_cached_executable, AftProcess};
 
 fn write_fake_gh(path: &Path) {
-    fs::write(
+    link_cached_executable(
         path,
-        r#"#!/bin/sh
+        br#"#!/bin/sh
 if [ "$1 $2" = "gh-shim --shim-version" ]; then
   printf '%s\n' '{"shim_version":"fixture","gh_routing_schema_floor":1}'
   exit 0
@@ -49,10 +48,7 @@ printf '%s\n' "unexpected fake gh invocation: $*" >&2
 exit 2
 "#,
     )
-    .expect("write fake gh");
-    let mut permissions = fs::metadata(path).expect("stat fake gh").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("make fake gh executable");
+    .expect("cache fake gh");
 }
 
 fn path_with(bin: &Path) -> std::ffi::OsString {

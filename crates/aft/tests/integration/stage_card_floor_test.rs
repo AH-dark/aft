@@ -141,11 +141,11 @@ fn a_card_that_cannot_report_its_formats_is_refused() {
     write_floor(root.path(), card_formats()["stores"].clone());
     // A build from before the floor scheme has no --formats flag.
     let old_card = root.path().join("old-card");
-    fs::write(&old_card, "#!/bin/sh\necho 'aft 0.57.2'\nexit 0\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&old_card, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::test_helpers::executable_cache::link_cached_executable(
+        &old_card,
+        b"#!/bin/sh\necho 'aft 0.57.2'\nexit 0\n",
+    )
+    .unwrap();
     let output = check(&old_card, root.path());
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(stderr(&output).contains("--formats"), "{}", stderr(&output));

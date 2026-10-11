@@ -4239,7 +4239,6 @@ fn scoped_diagnostics_inspect(ctx: &AppContext, id: &str, scope: &str) -> Value 
 #[cfg(unix)]
 #[test]
 fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
-    use std::os::unix::fs::PermissionsExt;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     if !std::process::Command::new(&cargo)
         .arg("--version")
@@ -4264,11 +4263,13 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
     let storage = tempfile::tempdir().unwrap();
     let trace = storage.path().join("cargo-runs");
     let wrapper = storage.path().join("cargo-wrapper");
-    std::fs::write(&wrapper, format!(
+    let source = format!(
         "#!/bin/sh\n[ \"$GIT_OPTIONAL_LOCKS\" = 0 ] || exit 7\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
-        trace.display(), Path::new(&cargo).display()
-    )).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        trace.display(),
+        Path::new(&cargo).display()
+    );
+    crate::test_helpers::executable_cache::link_cached_executable(&wrapper, source.as_bytes())
+        .unwrap();
     let make_context = || {
         let ctx = configured_context(&root);
         ctx.update_config(|config| config.storage_dir = Some(storage.path().to_path_buf()));
@@ -4372,7 +4373,6 @@ fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
 #[cfg(unix)]
 #[test]
 fn rust_inspect_explicit_cargo_deadline_is_partial_and_kills_the_check() {
-    use std::os::unix::fs::PermissionsExt;
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     if !std::process::Command::new(&cargo)
         .arg("--version")
@@ -4391,11 +4391,13 @@ fn rust_inspect_explicit_cargo_deadline_is_partial_and_kills_the_check() {
     let storage = tempfile::tempdir().unwrap();
     let wrapper = storage.path().join("cargo-wrapper");
     let pid_file = storage.path().join("check-pid");
-    std::fs::write(&wrapper, format!(
+    let source = format!(
         "#!/bin/sh\nif [ \"$1\" = check ]; then echo $$ > '{}'; exec sleep 30; fi\nexec '{}' \"$@\"\n",
-        pid_file.display(), Path::new(&cargo).display()
-    )).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pid_file.display(),
+        Path::new(&cargo).display()
+    );
+    crate::test_helpers::executable_cache::link_cached_executable(&wrapper, source.as_bytes())
+        .unwrap();
     let ctx = configured_context_with_diagnostics_timeout(&root, 3000);
     ctx.update_config(|config| config.storage_dir = Some(storage.path().to_path_buf()));
     ctx.lsp()

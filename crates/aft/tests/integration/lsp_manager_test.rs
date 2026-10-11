@@ -15,6 +15,7 @@ use lsp_types::FileChangeType;
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+use super::helpers::link_cached_executable;
 #[cfg(unix)]
 use super::helpers::warm_executable;
 
@@ -318,32 +319,21 @@ fn collect_optional_notification(
     })
 }
 
-/// Returns the server script with the directory that holds it; the caller keeps
-/// the directory alive until the manager that launches the server is dropped.
 fn executable_protocol_server_script() -> (tempfile::TempDir, PathBuf) {
     let temp_dir = tempdir().expect("tempdir for protocol server");
     let dir = temp_dir.path().to_path_buf();
     let script = dir.join("protocol_lsp_server.py");
-    fs::write(&script, PROTOCOL_SERVER).expect("write protocol server");
+    link_cached_executable(&script, PROTOCOL_SERVER.as_bytes()).expect("cache protocol server");
     #[cfg(windows)]
     {
         let wrapper = dir.join("protocol_lsp_server.cmd");
-        fs::write(
-            &wrapper,
-            "@echo off\r\npython --version >nul 2>nul\r\nif %ERRORLEVEL% NEQ 0 goto py_launcher\r\npython \"%~dp0protocol_lsp_server.py\"\r\nexit /b %ERRORLEVEL%\r\n:py_launcher\r\npy -3 \"%~dp0protocol_lsp_server.py\"\r\n",
-        )
-        .expect("write protocol server cmd wrapper");
+        let source = "@echo off\r\npython --version >nul 2>nul\r\nif %ERRORLEVEL% NEQ 0 goto py_launcher\r\npython \"%~dp0protocol_lsp_server.py\"\r\nexit /b %ERRORLEVEL%\r\n:py_launcher\r\npy -3 \"%~dp0protocol_lsp_server.py\"\r\n";
+        link_cached_executable(&wrapper, source.as_bytes())
+            .expect("cache protocol server cmd wrapper");
         (temp_dir, wrapper)
     }
     #[cfg(not(windows))]
     {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&script).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script, permissions).expect("chmod protocol server");
-        }
         warm_executable(&script, &["--version"]);
         (temp_dir, script)
     }

@@ -633,17 +633,16 @@ fn drain_with_live_lsp_servers_and_writer(
         let fake = crate::test_helpers::fake_lsp::fake_server_binary();
         let bin_dir = tempfile::tempdir().unwrap();
         let wrapper = bin_dir.path().join("rust-analyzer");
-        std::fs::write(
+        let source = format!(
+            "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 {server_env} AFT_FAKE_LSP_PID_DIR='{}' exec '{}' \"$@\"\n",
+            pids.path().display(),
+            fake.display()
+        );
+        crate::test_helpers::executable_cache::link_cached_executable(
             &wrapper,
-            format!(
-                "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 {server_env} AFT_FAKE_LSP_PID_DIR='{}' exec '{}' \"$@\"\n",
-                pids.path().display(),
-                fake.display()
-            ),
+            source.as_bytes(),
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(
             config_dir.join("aft.jsonc"),
             serde_json::to_vec(&json!({

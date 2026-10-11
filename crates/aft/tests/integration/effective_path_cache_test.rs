@@ -3,7 +3,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -23,10 +23,7 @@ fn aft_binary() -> PathBuf {
 }
 
 fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
+    crate::test_helpers::executable_cache::link_cached_executable(path, body.as_bytes()).unwrap();
 }
 
 fn input_stamp(path: PathBuf) -> Value {

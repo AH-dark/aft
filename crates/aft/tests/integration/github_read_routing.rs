@@ -2,7 +2,6 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,14 +14,14 @@ use aft::response_finalize::DispatchOutcome;
 use aft::subc_translate::{subc_translate_with_context, TranslateContext};
 use serde_json::{json, Value};
 
-use super::helpers::AftProcess;
+use super::helpers::{link_cached_executable, AftProcess};
 
 fn write_fake_gh(bin_dir: &Path) {
     fs::create_dir_all(bin_dir).expect("create fake gh directory");
     let script = bin_dir.join("gh");
-    fs::write(
+    link_cached_executable(
         &script,
-        r#"#!/bin/sh
+        br#"#!/bin/sh
 if [ -n "${AFT_TEST_GH_STARTED:-}" ]; then
   : > "$AFT_TEST_GH_STARTED"
 fi
@@ -45,10 +44,7 @@ case "$1" in
 esac
 "#,
     )
-    .expect("write fake gh");
-    let mut permissions = fs::metadata(&script).expect("stat fake gh").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("make fake gh executable");
+    .expect("cache fake gh");
 }
 
 fn spawned_with_fake_gh(bin_dir: &Path) -> AftProcess {
@@ -103,9 +99,9 @@ fn read_response(aft: &mut AftProcess, id: &str, file: &str, params: Value) -> V
 fn write_timeline_fake_gh(bin_dir: &Path) {
     fs::create_dir_all(bin_dir).expect("create timeline fixture gh directory");
     let script = bin_dir.join("gh");
-    fs::write(
+    link_cached_executable(
         &script,
-        r#"#!/bin/sh
+        br#"#!/bin/sh
 case "$1:$2" in
   pr:view)
     cat <<'JSON'
@@ -129,12 +125,7 @@ JSON
 esac
 "#,
     )
-    .expect("write timeline fixture gh script");
-    let mut permissions = fs::metadata(&script)
-        .expect("stat timeline fixture gh script")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("make timeline fixture gh script executable");
+    .expect("cache timeline fixture gh script");
 }
 
 fn ordinals_with_prefix(text: &str, prefix: &str) -> std::collections::BTreeSet<usize> {
@@ -337,8 +328,7 @@ PATCH
 esac
 "#
     );
-    fs::write(bin.join("gh"), script).unwrap();
-    fs::set_permissions(bin.join("gh"), fs::Permissions::from_mode(0o755)).unwrap();
+    link_cached_executable(&bin.join("gh"), script.as_bytes()).unwrap();
     let mut aft = spawned_with_fake_gh(&bin);
     configure_gh_read_enabled(&mut aft, project.path());
     let whole = read_response(&mut aft, "whole-diff", "pr://42/diff", json!({}));

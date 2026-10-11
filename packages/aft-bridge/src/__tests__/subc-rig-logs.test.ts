@@ -1,23 +1,18 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { cachedExecutable } from "./test-utils/cached-executable.js";
 
 test.skipIf(process.platform === "win32")(
   "subc rig retains module and daemon stderr across failed startup retries",
   async () => {
     const dir = await mkdtemp(join(tmpdir(), "subc-log-test-"));
     try {
-      const daemon = join(dir, "ck-subc");
-      const module = join(dir, "module");
+      const module = cachedExecutable('#!/bin/sh\nprintf "module panic diagnostic\\n" >&2\n');
       const logs = join(dir, "logs");
-      await writeFile(module, '#!/bin/sh\nprintf "module panic diagnostic\\n" >&2\n', {
-        mode: 0o700,
-      });
-      await writeFile(
-        daemon,
-        `#!${process.execPath}
+      const daemonSource = `#!${process.execPath}
 import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const config = JSON.parse(readFileSync(process.env.XDG_CONFIG_HOME + "/cortexkit/subc.jsonc", "utf8"));
@@ -26,9 +21,8 @@ spawnSync(mod.program, mod.args, { env: { ...process.env, ...mod.env }, stdio: "
 console.error("daemon startup diagnostic");
 console.error("daemon executable name: " + process.argv[1].split("/").pop());
 process.exit(1);
-`,
-        { mode: 0o700 },
-      );
+`;
+      const daemon = cachedExecutable(daemonSource);
       const rig = resolve(import.meta.dir, "e2e/subc-rig.ts");
       const result = spawnSync(
         process.execPath,

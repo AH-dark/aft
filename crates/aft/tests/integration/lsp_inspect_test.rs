@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use serde_json::json;
 use tempfile::tempdir;
 
-use super::helpers::{canonicalize_like_product, user_config, warm_executable, AftProcess};
+use super::helpers::{
+    canonicalize_like_product, link_cached_path, user_config, warm_executable, AftProcess,
+};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -108,7 +110,7 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
         .to_string_lossy()
         .to_string();
     let installed_fake_server = fake_bin_dir.join(&fake_binary_name);
-    std::fs::copy(&fake_server, &installed_fake_server).unwrap();
+    link_cached_path(&fake_server, &installed_fake_server).unwrap();
     // The fake LSP has no CLI probe; closed stdin makes its protocol loop exit.
     warm_executable(&installed_fake_server, &[]);
 
@@ -183,7 +185,7 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
     } else {
         virtualenv_bin.join("pyright-langserver")
     };
-    std::fs::copy(&fake_server, &installed_server).unwrap();
+    link_cached_path(&fake_server, &installed_server).unwrap();
     warm_executable(&installed_server, &["--stdio"]);
 
     let mut aft = AftProcess::spawn_with_env(&[("PATH", empty_path().as_os_str())]);
@@ -219,11 +221,12 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
         servers[0]["workspace_root"],
         canonicalize_like_product(&backend).display().to_string()
     );
+    // Preserve the package-visible link while normalizing its containing directory.
+    let expected_server_path = canonicalize_like_product(installed_server.parent().unwrap())
+        .join(installed_server.file_name().unwrap());
     assert_eq!(
         servers[0]["binary_path"],
-        canonicalize_like_product(&installed_server)
-            .display()
-            .to_string()
+        expected_server_path.display().to_string()
     );
     assert_eq!(servers[0]["spawn_status"], "ok");
     assert_eq!(response["diagnostics_complete"], false);
@@ -254,7 +257,7 @@ fn lsp_inspect_classifies_nested_python_node_modules_binary() {
     } else {
         nested_bin.join("pyright-langserver")
     };
-    std::fs::copy(fake_server_path(), &installed_server).unwrap();
+    link_cached_path(&fake_server_path(), &installed_server).unwrap();
     warm_executable(&installed_server, &["--stdio"]);
 
     let mut aft = AftProcess::spawn_with_env(&[
@@ -291,11 +294,12 @@ fn lsp_inspect_classifies_nested_python_node_modules_binary() {
         server["workspace_root"],
         canonicalize_like_product(&backend).display().to_string()
     );
+    // The resolved target is shared; the resolver should report the package path.
+    let expected_server_path = canonicalize_like_product(installed_server.parent().unwrap())
+        .join(installed_server.file_name().unwrap());
     assert_eq!(
         server["binary_path"],
-        canonicalize_like_product(&installed_server)
-            .display()
-            .to_string()
+        expected_server_path.display().to_string()
     );
     assert_eq!(server["spawn_status"], "ok");
 
@@ -321,7 +325,7 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
     } else {
         project_bin.join("typescript-language-server")
     };
-    std::fs::copy(&fake_server, &installed_server).unwrap();
+    link_cached_path(&fake_server, &installed_server).unwrap();
     warm_executable(&installed_server, &["--stdio"]);
 
     let mut aft = AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1"))]);

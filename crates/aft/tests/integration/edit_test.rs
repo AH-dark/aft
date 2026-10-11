@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use aft::edit::replace_byte_range;
 
-#[cfg(unix)]
-use super::helpers::warm_executable;
 use super::helpers::{fixture_path, user_config, AftProcess};
+#[cfg(unix)]
+use super::helpers::{link_cached_executable, warm_executable};
 
 fn fake_server_path() -> PathBuf {
     crate::test_helpers::fake_lsp::fake_server_binary()
@@ -15,15 +15,10 @@ fn fake_server_path() -> PathBuf {
 
 #[cfg(unix)]
 fn install_executable(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
     let bin_dir = dir.join("node_modules").join(".bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let tool = bin_dir.join(name);
-    fs::write(&tool, script).unwrap();
-    let mut perms = fs::metadata(&tool).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&tool, perms).unwrap();
+    link_cached_executable(&tool, script.as_bytes()).unwrap();
     warm_executable(&tool, &["--version"]);
     tool
 }

@@ -18,7 +18,7 @@ use aft::protocol::RawRequest;
 use aft::response_finalize::DispatchOutcome;
 use tempfile::tempdir;
 
-use super::helpers::{warm_executable, AftProcess};
+use super::helpers::{link_cached_path, warm_executable, AftProcess};
 
 fn fake_server_path() -> PathBuf {
     crate::test_helpers::fake_lsp::fake_server_binary()
@@ -269,7 +269,7 @@ fn standalone_ndjson_polls_cold_navigation_off_the_input_loop() {
     } else {
         "rust-analyzer"
     });
-    fs::copy(fake_server_path(), &installed).expect("install fake rust analyzer");
+    link_cached_path(&fake_server_path(), &installed).expect("link cached fake rust analyzer");
     warm_executable(&installed, &[]);
 
     let mut paths = vec![bin_dir];

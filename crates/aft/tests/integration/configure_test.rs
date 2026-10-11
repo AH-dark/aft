@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 #[cfg(unix)]
+use super::helpers::link_cached_executable;
+#[cfg(unix)]
 use super::helpers::warm_executable;
 use super::helpers::{user_config, AftProcess};
 
@@ -235,8 +237,6 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
 #[cfg(unix)]
 #[test]
 fn configure_ruff_warning_checks_existence_without_executing_project_binary() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("app.py"), "x = 1\n").unwrap();
     std::fs::write(dir.path().join("ruff.toml"), "line-length = 88\n").unwrap();
@@ -244,12 +244,11 @@ fn configure_ruff_warning_checks_existence_without_executing_project_binary() {
     std::fs::create_dir_all(&bin_dir).unwrap();
     let canary = dir.path().join("ruff-configure-canary");
     let ruff = bin_dir.join("ruff");
-    std::fs::write(
+    link_cached_executable(
         &ruff,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf executed > \"$RUFF_CANARY\"; printf 'ruff 0.1.1\\n'; fi\n",
+        b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf executed > \"$RUFF_CANARY\"; printf 'ruff 0.1.1\\n'; fi\n",
     )
     .unwrap();
-    std::fs::set_permissions(&ruff, std::fs::Permissions::from_mode(0o755)).unwrap();
     // The `--version` branch writes the canary, so use the inert probe mode
     // and leave the test's later assertion about AFT's version check intact.
     warm_executable(&ruff, &["--warmup"]);

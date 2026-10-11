@@ -1179,16 +1179,22 @@ impl Drop for KillOnDrop {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_census_sees_an_aft_executable_under_a_path_with_spaces() {
+    use std::os::unix::process::CommandExt;
+
     let base = tempdir().unwrap();
     let storage = prune_fixture(base.path());
     let before = tree(&storage);
     let dir = base.path().join("with space").join("Application Support");
     fs::create_dir_all(&dir).unwrap();
     let executable = dir.join("aft");
-    fs::copy(aft_binary(), &executable).unwrap();
-    // With stdin held open the standalone server keeps running.
+    let cached =
+        crate::test_helpers::executable_cache::cached_executable(&fs::read(aft_binary()).unwrap())
+            .unwrap();
+    // Keep the image shared while presenting the application's installed path
+    // as argv[0], which is the identity the process census is meant to read.
     let child = KillOnDrop(
-        Command::new(&executable)
+        Command::new(&cached)
+            .arg0(&executable)
             .env("AFT_STORAGE_DIR", base.path().join("child-storage"))
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
