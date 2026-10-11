@@ -159,7 +159,7 @@ describe("install lock", () => {
     second?.release();
   });
 
-  test("an older same-process lease cannot release a reclaimed generation", () => {
+  test("aged live leases stay held and old releases cannot erase later generations", () => {
     const first = acquireInstallLock("pkg-generation");
     expect(first).not.toBeNull();
     const lockFile = join(lspPackageDir("pkg-generation"), ".aft-installing");
@@ -167,10 +167,13 @@ describe("install lock", () => {
     utimesSync(lockFile, stale, stale);
 
     const second = acquireInstallLock("pkg-generation");
-    expect(second).not.toBeNull();
+    expect(second).toBeNull();
+    first?.release();
+    const third = acquireInstallLock("pkg-generation");
+    expect(third).not.toBeNull();
     first?.release();
     expect(existsSync(lockFile)).toBe(true);
-    second?.release();
+    third?.release();
     expect(existsSync(lockFile)).toBe(false);
   });
 

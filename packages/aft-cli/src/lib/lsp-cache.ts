@@ -14,6 +14,7 @@
 
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { acquireLspCacheClearLease } from "@cortexkit/aft-bridge";
 import { dirSize } from "./fs-util.js";
 import { getAftLspBinariesDir, getAftLspPackagesDir } from "./paths.js";
 
@@ -114,10 +115,12 @@ export interface ClearResult {
   cleared: { name: string; path: string; size: number }[];
   errors: { path: string; error: string }[];
   totalBytes: number;
+  skipped?: { path: string; reason: string }[];
 }
 
 /**
- * Remove every entry under both LSP cache subtrees.
+ * Remove entries under both LSP cache subtrees only while clearing is exclusive.
+ * If a writer may still be active, retain and report the entire snapshot.
  *
  * Returns metadata for the doctor output (number of entries cleared, bytes
  * reclaimed, individual failures). Errors don't abort — we want to clean
@@ -126,19 +129,32 @@ export interface ClearResult {
  */
 export function clearLspCaches(): ClearResult {
   const result: ClearResult = { cleared: [], errors: [], totalBytes: 0 };
-  const report = getLspCacheReport();
-
-  for (const entry of [...report.npm.entries, ...report.github.entries]) {
-    try {
-      rmSync(entry.path, { recursive: true, force: true });
-      result.cleared.push({ name: entry.name, path: entry.path, size: entry.size });
-      result.totalBytes += entry.size;
-    } catch (err) {
-      result.errors.push({
+  const lease = acquireLspCacheClearLease();
+  try {
+    const report = getLspCacheReport();
+    if (!lease) {
+      const entries = [...report.npm.entries, ...report.github.entries];
+      result.skipped = (entries.length ? entries : [report.npm, report.github]).map((entry) => ({
         path: entry.path,
-        error: err instanceof Error ? err.message : String(err),
-      });
+        reason: "an LSP cache lease is active or cannot be verified",
+      }));
+      return result;
     }
+
+    for (const entry of [...report.npm.entries, ...report.github.entries]) {
+      try {
+        rmSync(entry.path, { recursive: true, force: true });
+        result.cleared.push({ name: entry.name, path: entry.path, size: entry.size });
+        result.totalBytes += entry.size;
+      } catch (err) {
+        result.errors.push({
+          path: entry.path,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  } finally {
+    lease?.release();
   }
 
   return result;

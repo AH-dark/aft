@@ -33,7 +33,8 @@ import {
   type AftTransportPool,
   cachedFileSha256,
   cachedFileSha256Sync,
-  npmInvocation,
+  lspNpmInstallInvocation,
+  lspPublicationCutoff,
   npmSpawnEnv,
   resolveNpm,
   spawn,
@@ -41,6 +42,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
+  acquireInstallLock,
   type InstallLockLease,
   isInstalled,
   lspBinaryPath,
@@ -281,6 +283,7 @@ function runInstall(
   signal?: AbortSignal,
   deadlineMs = 120_000,
   runtime = { spawn, terminate: terminateNpmProcessTree },
+  before?: string,
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const target = `${spec.npm}@${version}`;
@@ -307,13 +310,12 @@ function runInstall(
 
     ensureInstallAnchor(cwd);
 
-    const invocation = npmInvocation(npm, [
-      "install",
-      "--no-save",
-      "--ignore-scripts",
-      "--silent",
-      target,
-    ]);
+    const invocation = lspNpmInstallInvocation(npm, target, before);
+    if (!invocation) {
+      warn(`[lsp] npm cannot honor the publication cutoff for ${target}; refusing install`);
+      resolve(false);
+      return;
+    }
     const child = runtime.spawn(invocation.command, invocation.args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
@@ -501,6 +503,9 @@ async function ensureServerInstalled(
       cachedPackageDir(spec.npm),
       installLock,
       signal,
+      undefined,
+      undefined,
+      lspPublicationCutoff(config.graceDays, Boolean(config.versions[spec.npm])),
     ).catch((err: unknown) => {
       error(`[lsp] background install ${spec.npm} crashed: ${err}`);
       return false;
@@ -616,11 +621,14 @@ export function installedVersionAllowed(spec: NpmServerSpec, config: AutoInstall
 
 /** A cached install that is present, untampered, and of an allowed version. */
 function cachedInstallUsable(spec: NpmServerSpec, config: AutoInstallConfig): boolean {
-  return (
-    isInstalled(spec.npm, spec.binary) &&
-    validateCachedNpmInstall(spec) &&
-    installedVersionAllowed(spec, config)
-  );
+  if (!isInstalled(spec.npm, spec.binary)) return false;
+  const lease = acquireInstallLock(spec.npm);
+  if (!lease) return false;
+  try {
+    return validateCachedNpmInstall(spec) && installedVersionAllowed(spec, config);
+  } finally {
+    lease.release();
+  }
 }
 
 /**

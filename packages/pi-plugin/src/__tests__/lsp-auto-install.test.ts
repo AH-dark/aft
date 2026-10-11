@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { lspNpmInstallInvocation } from "@cortexkit/aft-bridge";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   type AutoInstallConfig,
@@ -299,7 +300,7 @@ describe("runAutoInstall", () => {
     // npm must be resolved beyond a GUI-stripped PATH, then converted to a
     // platform-safe invocation (npm.cmd requires cmd.exe on Windows).
     expect(source).toMatch(/resolveNpm\(\)/);
-    expect(source).toMatch(/npmInvocation\(npm,/);
+    expect(source).toMatch(/lspNpmInstallInvocation\(npm, target, before\)/);
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
     expect(source).toContain("terminate: terminateNpmProcessTree");
@@ -315,9 +316,9 @@ describe("runAutoInstall", () => {
     expect(source).toContain("if (terminationPromise && child.pid !== undefined) return;");
     expect(source).not.toContain('child.kill("SIGTERM")');
     expect(source).toContain("finish(false)");
-    expect(source).toMatch(
-      /\[\s*["']install["']\s*,\s*["']--no-save["']\s*,\s*["']--ignore-scripts["']\s*,\s*["']--silent["']\s*,\s*target\s*,?\s*\]/,
-    );
+    expect(
+      lspNpmInstallInvocation({ command: "npm", binDir: "/fixture" }, "fixture@1.0.0")?.args,
+    ).toEqual(["install", "--no-save", "--ignore-scripts", "--silent", "fixture@1.0.0"]);
     expect(source).not.toContain('spawn("bun"');
     expect(source).toContain("child.unref()");
   });

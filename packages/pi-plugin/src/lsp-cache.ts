@@ -24,11 +24,14 @@ import {
   renameSync,
   rmSync,
   statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { getAftCacheRoot, getAftLspPackagesDir } from "@cortexkit/aft-bridge";
+import {
+  acquireLspInstallLease,
+  getAftCacheRoot,
+  getAftLspPackagesDir,
+} from "@cortexkit/aft-bridge";
 import { writeAtomicFile } from "./atomic-file.js";
 import { log, warn } from "./logger.js";
 
@@ -137,125 +140,11 @@ export function readInstalledMeta(packageKey: string): InstalledMeta | null {
   return readInstalledMetaIn(lspPackageDir(packageKey));
 }
 
-/**
- * Path to the install-in-progress lockfile.
- *
- * Convention: presence of this file means an install is currently running
- * (or crashed). The auto-installer treats it as "do not start another".
- * Stale lockfiles older than 30 minutes are auto-cleared.
- */
-function lockPath(npmPackage: string): string {
-  return join(lspPackageDir(npmPackage), ".aft-installing");
-}
+export type InstallLockLease = import("@cortexkit/aft-bridge").LspInstallLease;
 
-const STALE_LOCK_MS = 30 * 60 * 1000;
-
-export interface InstallLockLease {
-  retain(): void;
-  release(): void;
-}
-
-/**
- * Acquire an install lock for `lockKey` using an atomic `O_EXCL` open.
- *
- * The previous implementation used `existsSync` + `writeFileSync({flag:"w"})`
- * which is a textbook TOCTOU: two concurrent processes both pass the check,
- * both call write (which truncates with flag "w"), and both think they own
- * the lock. With `wx` the second process's open() fails atomically.
- *
- * Stale-lock recovery: if the lock file exists, we read it. If the recorded
- * PID is no longer alive OR the file is older than `STALE_LOCK_MS`, we claim
- * the lock by atomically replacing it (unlink + create with `wx`). If that
- * race fails (someone else just claimed it), we return null honestly.
- *
- * The lock file content is `<pid>\n<iso-timestamp>\n<acquisition-token>\n` so
- * other processes can detect dead owners while releases remain generation-safe.
- */
+/** Pi and OpenCode coordinate installs through shared claims outside removable cache directories. */
 export function acquireInstallLock(lockKey: string): InstallLockLease | null {
-  mkdirSync(lspPackageDir(lockKey), { recursive: true });
-  const lock = lockPath(lockKey);
-  const token = randomUUID();
-  const tryClaim = (): InstallLockLease | null => {
-    try {
-      // Atomic exclusive create. If the file exists, throws EEXIST.
-      const fd = openSync(lock, "wx");
-      try {
-        writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n${token}\n`);
-      } finally {
-        closeSync(fd);
-      }
-      let retained = false;
-      let released = false;
-      return {
-        retain() {
-          retained = true;
-        },
-        release() {
-          if (released) return;
-          released = true;
-          if (retained) {
-            warn(
-              `[lsp] retaining install lock for ${lockKey} after unconfirmed npm termination; ` +
-                `cross-process retries remain blocked until stale-lock recovery`,
-            );
-            return;
-          }
-          releaseInstallLock(lockKey, token);
-        },
-      };
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") return null;
-      warn(`[lsp] unexpected error acquiring install lock for ${lockKey}: ${err}`);
-      return null;
-    }
-  };
-
-  const claimed = tryClaim();
-  if (claimed) return claimed;
-
-  // Failed — inspect the existing lock to decide whether to steal it.
-  let owningPid: number | null = null;
-  let lockMtimeMs = 0;
-  try {
-    const raw = readFileSync(lock, "utf8");
-    const firstLine = raw.split(/\r?\n/, 1)[0]?.trim() ?? "";
-    const parsed = Number.parseInt(firstLine, 10);
-    if (Number.isFinite(parsed) && parsed > 0) owningPid = parsed;
-    lockMtimeMs = statSync(lock).mtimeMs;
-  } catch {
-    // Lock vanished between failure and inspection — try once more.
-    return tryClaim();
-  }
-
-  // Owning process still alive AND lock is fresh? Don't steal.
-  //
-  // Two clock-related hazards:
-  //   (a) Use Math.abs(age) so locks with mtime further than STALE_LOCK_MS
-  //       in either direction get reclaimed (clock skew defense). Small
-  //       negative ages from FS mtime rounding still count as fresh.
-  //   (b) On Windows, `process.kill(pid, 0)` is unreliable: skip the PID
-  //       liveness check and rely on the age timeout. Worst case: 30min
-  //       to reclaim a dead lock — already documented STALE_LOCK_MS.
-  const age = Date.now() - lockMtimeMs;
-  const ageWithinFresh = Math.abs(age) < STALE_LOCK_MS;
-  const skipLiveness = process.platform === "win32";
-  const ownerAlive = !skipLiveness && owningPid !== null && isProcessAlive(owningPid);
-  if (skipLiveness ? ageWithinFresh : ownerAlive && ageWithinFresh) {
-    return null;
-  }
-
-  // Steal: log why, then atomically replace. unlink+wx avoids a brief window
-  // where another process could observe "no lock". If unlink races, retry once.
-  log(
-    `[lsp] reclaiming install lock for ${lockKey} (owner_pid=${owningPid ?? "unknown"}, alive=${ownerAlive}, age_ms=${age})`,
-  );
-  try {
-    unlinkSync(lock);
-  } catch {
-    // Already gone — fine.
-  }
-  return tryClaim();
+  return acquireLspInstallLease(lockKey, lspPackageDir(lockKey));
 }
 
 /**
@@ -272,45 +161,6 @@ function isProcessAlive(pid: number): boolean {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ESRCH") return false;
     return true;
-  }
-}
-
-function releaseInstallLock(lockKey: string, acquisitionToken: string): void {
-  const lock = lockPath(lockKey);
-  // TOCTOU defense — only unlink if this acquisition token still owns the lock.
-  // The previous `existsSync && unlinkSync` would delete another process's
-  // lock if A's lock had been reclaimed by B due to STALE_LOCK_MS.
-  try {
-    let owningPid: number | null = null;
-    let owningToken = "";
-    try {
-      const raw = readFileSync(lock, "utf8");
-      const lines = raw.split(/\r?\n/);
-      const parsed = Number.parseInt(lines[0]?.trim() ?? "", 10);
-      if (Number.isFinite(parsed) && parsed > 0) owningPid = parsed;
-      owningToken = lines[2]?.trim() ?? "";
-    } catch (readErr) {
-      const code = (readErr as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") return;
-      warn(`[lsp] could not read install lock for ${lockKey} during release: ${readErr}`);
-      return;
-    }
-
-    if (owningPid !== process.pid || owningToken !== acquisitionToken) {
-      log(`[lsp] not releasing install lock for ${lockKey}: acquisition ownership changed`);
-      return;
-    }
-
-    try {
-      unlinkSync(lock);
-    } catch (unlinkErr) {
-      const code = (unlinkErr as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") {
-        warn(`[lsp] failed to release install lock for ${lockKey}: ${unlinkErr}`);
-      }
-    }
-  } catch (err) {
-    warn(`[lsp] unexpected error releasing install lock for ${lockKey}: ${err}`);
   }
 }
 
