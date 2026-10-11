@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::url_resolution::resolve_file_or_url;
 use crate::commands::read::{handle_github_zoom, is_github_read_target};
 use crate::commands::symbol_render::{
     build_container_outline, might_have_container_members, qualified_symbol_name,
@@ -15,7 +16,7 @@ use crate::lsp_hints;
 use crate::parser::{detect_language, json_document_value, node_text, FileParser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
-use crate::url_fetch::{fetch_url_to_cache, is_http_url, UrlFetchOptions};
+use crate::url_fetch::is_http_url;
 
 /// A reference to a called/calling function.
 #[derive(Debug, Clone, Serialize)]
@@ -235,33 +236,6 @@ fn is_followable_call(call: &RawCall, enrichment: &ZoomEnrichment) -> bool {
         && enrichment
             .imported_bindings
             .contains(&call.full_callee[..binding_end])
-}
-
-fn resolve_file_or_url(
-    req: &RawRequest,
-    ctx: &AppContext,
-    file: &str,
-) -> Result<PathBuf, Response> {
-    if is_http_url(file) {
-        let storage_dir = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
-        let allow_private = ctx.config().url_fetch_allow_private
-            || req
-                .params
-                .get("allow_private")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-        return fetch_url_to_cache(
-            file,
-            &storage_dir,
-            UrlFetchOptions {
-                allow_private,
-                ..UrlFetchOptions::default()
-            },
-        )
-        .map_err(|error| Response::error(&req.id, "url_fetch_failed", error.to_string()));
-    }
-
-    ctx.validate_read_path(&req.id, req.session(), Path::new(file))
 }
 
 fn resolve_zoom_file(

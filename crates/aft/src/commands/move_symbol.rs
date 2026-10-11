@@ -578,17 +578,15 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         // the destination too, leaving it defined in BOTH files. Treat it like a
         // write failure: restore and bail.
         Ok(wr) if wr.rolled_back => {
-            if restore_checkpoint(ctx, req.session(), &checkpoint_name) {
-                ctx.backup()
-                    .lock()
-                    .discard_operation_entries(req.session(), &op_id);
-            }
+            let outcome = rollback_move(ctx, req.session(), &checkpoint_name, &op_id, &new_files);
             return move_error(
                 &req.id,
                 file,
                 &written_files,
                 &new_files,
                 "removing the symbol from the source produced invalid syntax; the move was rolled back and nothing changed",
+                &checkpoint_name,
+                &outcome,
             );
         }
         Ok(wr) => {
@@ -604,17 +602,15 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             }));
         }
         Err(e) => {
-            if restore_checkpoint(ctx, req.session(), &checkpoint_name) {
-                ctx.backup()
-                    .lock()
-                    .discard_operation_entries(req.session(), &op_id);
-            }
+            let outcome = rollback_move(ctx, req.session(), &checkpoint_name, &op_id, &new_files);
             return move_error(
                 &req.id,
                 file,
                 &written_files,
                 &new_files,
                 &format!("failed to write source: {}", e),
+                &checkpoint_name,
+                &outcome,
             );
         }
     }
@@ -631,19 +627,21 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             if !dest_existed {
                 files_to_delete.push(dest_path.to_path_buf());
             }
-            let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
-            cleanup_new_files(&files_to_delete);
-            if restored {
-                ctx.backup()
-                    .lock()
-                    .discard_operation_entries(req.session(), &op_id);
-            }
+            let outcome = rollback_move(
+                ctx,
+                req.session(),
+                &checkpoint_name,
+                &op_id,
+                &files_to_delete,
+            );
             return move_error(
                 &req.id,
                 destination,
                 &written_files,
-                &new_files,
+                &files_to_delete,
                 "adding the symbol to the destination produced invalid syntax; the move was rolled back and nothing changed",
+                &checkpoint_name,
+                &outcome,
             );
         }
         Ok(wr) => {
@@ -667,19 +665,21 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             if !dest_existed {
                 files_to_delete.push(dest_path.to_path_buf());
             }
-            let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
-            cleanup_new_files(&files_to_delete);
-            if restored {
-                ctx.backup()
-                    .lock()
-                    .discard_operation_entries(req.session(), &op_id);
-            }
+            let outcome = rollback_move(
+                ctx,
+                req.session(),
+                &checkpoint_name,
+                &op_id,
+                &files_to_delete,
+            );
             return move_error(
                 &req.id,
                 destination,
                 &written_files,
                 &files_to_delete,
                 &format!("failed to write destination: {}", e),
+                &checkpoint_name,
+                &outcome,
             );
         }
     }
@@ -692,19 +692,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             // consumer still imports from the old location while others were
             // updated). Restore everything and fail, same as the Err branch.
             Ok(wr) if wr.rolled_back => {
-                let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
-                cleanup_new_files(&new_files);
-                if restored {
-                    ctx.backup()
-                        .lock()
-                        .discard_operation_entries(req.session(), &op_id);
-                }
+                let outcome =
+                    rollback_move(ctx, req.session(), &checkpoint_name, &op_id, &new_files);
                 return move_error(
                     &req.id,
                     &path.display().to_string(),
                     &written_files,
                     &new_files,
                     "rewriting a consumer's import produced invalid syntax; the move was rolled back and nothing changed",
+                    &checkpoint_name,
+                    &outcome,
                 );
             }
             Ok(wr) => {
@@ -721,19 +718,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 }));
             }
             Err(e) => {
-                let restored = restore_checkpoint(ctx, req.session(), &checkpoint_name);
-                cleanup_new_files(&new_files);
-                if restored {
-                    ctx.backup()
-                        .lock()
-                        .discard_operation_entries(req.session(), &op_id);
-                }
+                let outcome =
+                    rollback_move(ctx, req.session(), &checkpoint_name, &op_id, &new_files);
                 return move_error(
                     &req.id,
                     &path.display().to_string(),
                     &written_files,
                     &new_files,
                     &format!("failed to write consumer: {}", e),
+                    &checkpoint_name,
+                    &outcome,
                 );
             }
         }
@@ -2582,75 +2576,101 @@ fn extract_alias(raw_text: &str, symbol_name: &str) -> Option<String> {
 }
 
 /// Restore a checkpoint by name, scoped to the caller's session.
-fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) -> bool {
-    let mut cp_store = ctx.checkpoint().lock();
-    if let Err(e) = cp_store.restore(session, name) {
-        log::debug!(
-            "move_symbol rollback: failed to restore checkpoint '{}': {}",
-            name,
-            e
-        );
-        false
-    } else {
-        true
-    }
+fn restore_checkpoint(ctx: &AppContext, session: &str, name: &str) -> Result<(), String> {
+    ctx.checkpoint()
+        .lock()
+        .restore(session, name)
+        .map(|_| ())
+        .map_err(|error| {
+            log::debug!(
+                "move_symbol rollback: failed to restore checkpoint '{}': {}",
+                name,
+                error
+            );
+            error.to_string()
+        })
 }
 
-/// Delete new files that were created during the operation.
-fn cleanup_new_files(new_files: &[PathBuf]) {
+fn rollback_move(
+    ctx: &AppContext,
+    session: &str,
+    checkpoint: &str,
+    op_id: &str,
+    new_files: &[PathBuf],
+) -> super::rollback_outcome::RollbackOutcome {
+    let mut outcome = super::rollback_outcome::RollbackOutcome::from_restore(restore_checkpoint(
+        ctx, session, checkpoint,
+    ));
+    cleanup_new_files(new_files, &mut outcome);
+    // Files may remain changed after an incomplete restore or deletion.
+    // Retain the checkpoint and operation backups so recovery can be retried.
+    if outcome.complete() {
+        ctx.backup()
+            .lock()
+            .discard_operation_entries(session, op_id);
+    }
+    outcome
+}
+
+/// Delete new files and record only deletions that actually completed.
+fn cleanup_new_files(
+    new_files: &[PathBuf],
+    outcome: &mut super::rollback_outcome::RollbackOutcome,
+) {
     for path in new_files {
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(path) {
-                log::debug!(
-                    "move_symbol rollback: failed to delete new file {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
+        let result = match std::fs::remove_file(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        };
+        outcome.record_deletion(path, result);
     }
 }
 
-/// Build a structured error response for a failed move operation.
+/// Report confirmed recovery actions; a failed checkpoint restore leaves
+/// written file states uncertain.
 fn move_error(
     req_id: &str,
     failed_file: &str,
     written_files: &[PathBuf],
     new_files: &[PathBuf],
     message: &str,
+    checkpoint: &str,
+    outcome: &super::rollback_outcome::RollbackOutcome,
 ) -> Response {
     let mut rolled_back: Vec<serde_json::Value> = written_files
         .iter()
-        .map(|p| {
+        .map(|path| {
             serde_json::json!({
-                "file": p.display().to_string(),
-                "action": "restored",
+                "file": path.display().to_string(),
+                "action": if outcome.restored() { "restored" } else { "uncertain" },
             })
         })
         .collect();
-
-    for p in new_files {
+    for path in new_files {
         rolled_back.push(serde_json::json!({
-            "file": p.display().to_string(),
-            "action": "deleted",
+            "file": path.display().to_string(),
+            "action": if outcome.deleted(path) { "deleted" } else { "uncertain" },
         }));
     }
-
     log::debug!(
-        "move_symbol failed at {}: {} — rolled back {} files",
+        "move_symbol failed at {}: {} — rollback_complete: {}, {} file states",
         failed_file,
         message,
+        outcome.complete(),
         rolled_back.len()
     );
-
+    let mut data = serde_json::json!({"failed_file": failed_file, "rolled_back": rolled_back});
+    outcome.append_to(&mut data, checkpoint);
+    let message = if outcome.complete() {
+        message.to_string()
+    } else {
+        message.replace("; the move was rolled back and nothing changed", "")
+    };
     Response::error_with_data(
         req_id,
         "move_symbol_failed",
-        message,
-        serde_json::json!({
-            "failed_file": failed_file,
-            "rolled_back": rolled_back,
-        }),
+        outcome.failure_message(&message, checkpoint),
+        data,
     )
 }
 
@@ -3261,6 +3281,189 @@ mod tests {
 #[cfg(test)]
 mod audit_regressions {
     use super::*;
+
+    #[test]
+    fn move_restore_failure_reports_uncertain_files_and_retains_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.ts");
+        std::fs::write(&file, "before").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let session = "move-recovery";
+        {
+            let mut backup = ctx.backup().lock();
+            backup
+                .snapshot_with_op(session, &file, "before", Some("move-operation"))
+                .unwrap();
+            ctx.checkpoint()
+                .lock()
+                .create(
+                    session,
+                    "move-recovery-checkpoint",
+                    vec![file.clone()],
+                    &backup,
+                )
+                .unwrap();
+        }
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let outcome = rollback_move(
+            &ctx,
+            session,
+            "move-recovery-checkpoint",
+            "move-operation",
+            &[],
+        );
+        let response = move_error(
+            "move",
+            file.to_str().unwrap(),
+            std::slice::from_ref(&file),
+            &[],
+            "write failed; the move was rolled back and nothing changed",
+            "move-recovery-checkpoint",
+            &outcome,
+        );
+        assert_eq!(response.data["rollback_complete"], false);
+        assert_eq!(response.data["rolled_back"][0]["action"], "uncertain");
+        assert!(response.data["rollback_error"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()));
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("rollback incomplete"));
+        assert!(!response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing changed"));
+        let retained = ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths(session)
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&retained[0]).unwrap(),
+            std::fs::canonicalize(&file).unwrap()
+        );
+        std::fs::remove_dir(&file).unwrap();
+        ctx.checkpoint()
+            .lock()
+            .restore(session, "move-recovery-checkpoint")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+    }
+
+    #[test]
+    fn failed_new_file_cleanup_is_not_reported_as_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.ts");
+        let created = dir.path().join("created.ts");
+        std::fs::write(&file, "before").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let session = "cleanup-recovery";
+        {
+            let mut backup = ctx.backup().lock();
+            backup
+                .snapshot_with_op(session, &file, "before", Some("cleanup-operation"))
+                .unwrap();
+            ctx.checkpoint()
+                .lock()
+                .create(session, "cleanup-checkpoint", vec![file.clone()], &backup)
+                .unwrap();
+            backup
+                .snapshot_op_tombstone(session, "cleanup-operation", &created, "created file")
+                .unwrap();
+        }
+        std::fs::write(&file, "after").unwrap();
+        std::fs::create_dir(&created).unwrap();
+        let outcome = rollback_move(
+            &ctx,
+            session,
+            "cleanup-checkpoint",
+            "cleanup-operation",
+            std::slice::from_ref(&created),
+        );
+        let response = move_error(
+            "move",
+            "source.ts",
+            std::slice::from_ref(&file),
+            std::slice::from_ref(&created),
+            "write failed",
+            "cleanup-checkpoint",
+            &outcome,
+        );
+        assert_eq!(response.data["rollback_complete"], false);
+        assert_eq!(response.data["rolled_back"][0]["action"], "restored");
+        assert_eq!(response.data["rolled_back"][1]["action"], "uncertain");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "before");
+        assert!(created.is_dir());
+        let retained = ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths(session)
+            .unwrap();
+        assert!(retained
+            .iter()
+            .any(|path| std::fs::canonicalize(path).unwrap()
+                == std::fs::canonicalize(&file).unwrap()));
+        assert!(retained
+            .iter()
+            .any(|path| std::fs::canonicalize(path).unwrap()
+                == std::fs::canonicalize(&created).unwrap()));
+        ctx.checkpoint()
+            .lock()
+            .restore(session, "cleanup-checkpoint")
+            .unwrap();
+    }
+
+    #[test]
+    fn complete_move_rollback_reports_completion_and_discards_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.ts");
+        std::fs::write(&file, "before").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let session = "complete-recovery";
+        {
+            let mut backup = ctx.backup().lock();
+            backup
+                .snapshot_with_op(session, &file, "before", Some("move-operation"))
+                .unwrap();
+            ctx.checkpoint()
+                .lock()
+                .create(session, "complete-checkpoint", vec![file.clone()], &backup)
+                .unwrap();
+        }
+        std::fs::write(&file, "after").unwrap();
+        let outcome = rollback_move(&ctx, session, "complete-checkpoint", "move-operation", &[]);
+        let response = move_error(
+            "move",
+            file.to_str().unwrap(),
+            std::slice::from_ref(&file),
+            &[],
+            "write failed",
+            "complete-checkpoint",
+            &outcome,
+        );
+        assert_eq!(response.data["rollback_complete"], true);
+        assert_eq!(response.data["rolled_back"][0]["action"], "restored");
+        assert!(response.data.get("rollback_error").is_none());
+        assert_eq!(response.data["message"], "write failed");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "before");
+        assert!(ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths(session)
+            .is_err());
+    }
 
     #[test]
     fn repeated_symbol_moves_keep_distinct_recovery_checkpoints() {
