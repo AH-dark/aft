@@ -1,84 +1,160 @@
-# Callgraph slice
+# callgraph: inspect-truth cell gate
 
-## Delivery and corpus gate
+Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
-The code and behavioral fixtures are delivered. The corpus gate is **not measured, owed to the chair**. Here, “chair” means the coordinating review agent that owns the campaign's final acceptance. That agent took ownership of Linux baseline/candidate collection and scoring because the worker's remote runner uploads tracked source but not ignored baseline/corpus inputs. No accuracy score, no-lowered-cell verdict, or corpus `NewServer` classification is claimed here. Historical slice tables are not substituted for raw captures.
+## Before
 
-`judgments/callgraph.json` records this unmeasured status. It intentionally has no row judgments or after-output directories: none have been collected by this slice.
+| repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ripgrep | rust | dead_code | scored | 52 | 0 | 0 (+0) | 0.00 | n/a | 0 | 31 | 21 |
+| ripgrep | rust | todos | scored | 11 | 11 | 11 (+0) | 1.00 | 1.00 | 0 | 0 | 11 |
+| axum | rust | dead_code | scored | 55 | 0 | 0 (+0) | 0.00 | n/a | 0 | 6 | 49 |
+| axum | rust | todos | scored | 5 | 5 | 5 (+0) | 1.00 | 1.00 | 0 | 0 | 5 |
+| soft-serve | go | dead_code | scored | 101 | 0 | 0 (+0) | 0.00 | n/a | 0 | 29 | 72 |
+| soft-serve | go | dead_code (functions) | scored | 98 | 20 | 5 (+0) | 0.05 | 0.25 | 0 | 26 | 72 |
+| soft-serve | go | todos | scored | 33 | 33 | 33 (+0) | 1.00 | 1.00 | 0 | 0 | 33 |
 
-| Repository | Language | Before | After | Cell verdict |
-|---|---|---|---|---|
-| ripgrep | Rust | not re-scored | not measured | pending collection/scoring |
-| axum | Rust | not re-scored | not measured | pending collection/scoring |
-| soft-serve | Go | not re-scored | not measured | pending collection/scoring |
-| aft | Rust | new, no baseline | not measured | pending collection/scoring if the language re-run includes the local corpus entry |
+- ripgrep raw output: `local-ignore/callgraph/corpus/_results/ripgrep/13dd9cb71` (corpus `3fce3b5bb0236da2df6d99672afb8a719642eca7`).
+- ripgrep baseline_aft_truncated_scopes (excluded from comparison): []
+- ripgrep judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 0, "inspect-tool.json": 0}
 
-### Pinned inputs retained in this worktree
+- axum raw output: `local-ignore/callgraph/corpus/_results/axum/13dd9cb71` (corpus `f8b02f22cf10bee707bda19b58265b9e33677535`).
+- axum baseline_aft_truncated_scopes (excluded from comparison): []
+- axum judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 4, "inspect-tool.json": 0}
 
-Paths below are relative to this worktree, not to the operator's checkout. They are ignored artifacts outside regenerable build directories; the worker did not modify the corpora.
+- soft-serve raw output: `local-ignore/callgraph/corpus/_results/soft-serve/13dd9cb71` (corpus `37685d36f5b7bf0e32217ddd7c8e045c57772619`).
+- soft-serve baseline_aft_truncated_scopes (excluded from comparison): []
+- soft-serve judgments_unapplied: {"harness.json": 0, "callgraph.json": 5, "ts-liveness.json": 0, "dead-code-scanner.json": 0, "inspect-tool.json": 0}
 
-| Input | Revision | Retained source path |
-|---|---|---|
-| baseline AFT | `13dd9cb71a7bbf9076377ac1ba1717dabf15e586` (0.58.2) | `local-ignore/callgraph/baseline-source/` — exact `git archive`, without `.git` |
-| ripgrep | `3fce3b5bb0236da2df6d99672afb8a719642eca7` | `local-ignore/callgraph/corpus/ripgrep/` |
-| axum | `f8b02f22cf10bee707bda19b58265b9e33677535` | `local-ignore/callgraph/corpus/axum/` |
-| soft-serve | `37685d36f5b7bf0e32217ddd7c8e045c57772619` | `local-ignore/callgraph/corpus/soft-serve/` |
+## After
 
-These local ignored paths are **not** automatically uploaded to remote Linux jobs. Transfer them manually into the Linux repository copy that will run the evaluation.
+| repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ripgrep | rust | dead_code | scored | 21 | 0 | 0 (+0) | 0.00 | n/a | 0 | 21 | 0 |
+| ripgrep | rust | todos | scored | 11 | 11 | 11 (+0) | 1.00 | 1.00 | 0 | 0 | 11 |
+| axum | rust | dead_code | scored | 10 | 0 | 0 (+0) | 0.00 | n/a | 0 | 10 | 0 |
+| axum | rust | todos | scored | 5 | 5 | 5 (+0) | 1.00 | 1.00 | 0 | 0 | 5 |
+| soft-serve | go | dead_code | scored | 32 | 0 | 0 (+0) | 0.00 | n/a | 0 | 32 | 0 |
+| soft-serve | go | dead_code (functions) | scored | 29 | 20 | 9 (+0) | 0.31 | 0.45 | 0 | 29 | 0 |
+| soft-serve | go | todos | scored | 33 | 33 | 33 (+0) | 1.00 | 1.00 | 0 | 0 | 33 |
 
-### Linux collection/scoring recipe
+- ripgrep raw output: `local-ignore/callgraph/corpus/_results/ripgrep/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` (corpus `3fce3b5bb0236da2df6d99672afb8a719642eca7`).
+- ripgrep baseline_aft_truncated_scopes (excluded from comparison): []
+- ripgrep judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 10, "inspect-tool.json": 0}
+- ripgrep/rust/dead_code languages_unsupported: [{"language": "ruby", "files": 1}]
 
-Run from the repository root containing the delivered candidate changes. Preserve captures/oracles outside `target/`; each collection already gets independent AFT storage. Build the baseline archive and candidate serially, with Rust wrappers disabled:
+- axum raw output: `local-ignore/callgraph/corpus/_results/axum/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` (corpus `f8b02f22cf10bee707bda19b58265b9e33677535`).
+- axum baseline_aft_truncated_scopes (excluded from comparison): []
+- axum judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 0, "inspect-tool.json": 0}
+
+- soft-serve raw output: `local-ignore/callgraph/corpus/_results/soft-serve/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` (corpus `37685d36f5b7bf0e32217ddd7c8e045c57772619`).
+- soft-serve baseline_aft_truncated_scopes (excluded from comparison): []
+- soft-serve judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 2, "inspect-tool.json": 0}
+
+## Cell rule
+
+- PASS: no cell lowered.
+
+
+## Measured delivery and target verdicts
+
+Baseline `13dd9cb71` and engine candidate `a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` were collected on Linux and retained in this worktree alongside their oracles. The tables above are a **local re-score of those captures**, not a new collection. Subsequent commits change only the collection harness, tests, provenance descriptors, judgments and this report; no engine source changed during row review.
+
+| Acceptance | Before | After | Verdict |
+|---|---:|---:|---|
+| No lowered precision/recall cell | baseline | 0 lowered cells | **PASS** |
+| ripgrep dead-code count <= 10 | 52 | 21; all 21 judged, 0 unjudged | **Numeric target missed; all remaining rows explained below** |
+| axum dead-code count <= 10 | 55 | 10; all 10 judged, 0 unjudged | **PASS** |
+| soft-serve ordinary dead-code count | 101 | 32; all 32 judged, 0 unjudged | Improvement; no separate count threshold |
+| soft-serve function precision >= 0.6 | 0.05 (5/98) | 0.31 (9/29); all 29 judged, 0 unjudged | **Numeric target missed; every row judged and mechanisms explained** |
+| soft-serve function recall | 0.25 | 0.45 | Improved |
+| soft-serve NewServer not test-only | previously stranded initializer caller | absent from ordinary and test-only findings | **PASS** |
+
+The soft-serve capture has exactly 32 ordinary rows and three test-only rows. A direct check of the normalized ordinary rows and the complete three-row `test_only_top` confirms that `NewServer` occurs in neither. Judgment annotations do **not** remove AFT rows or raise the scorer's precision: the missed 0.6 target remains missed, even after all rows are explained. Ripgrep likewise remains above ten. Explanation is the reviewed spec's fallback, not a claim that either numeric target passed.
+
+`judgments/callgraph.json` now has the actual candidate output directories and **32 source-reviewed Go entries: 19 aft_correct and 13 aft_false_positive**. They cover all 29 function/method rows plus three non-function rows. The scorer's `judgment_category()` maps `dead_code (functions)` to the canonical `dead_code` category, so one entry per `(path, symbol)` covers both Go buckets; no duplicate function-bucket entries are needed. Ripgrep's 21 existing judgments remain unchanged in `judgments/dead-code-scanner.json`.
+
+### Retained inputs and reproducible scoring
+
+| Repository | Corpus pin |
+|---|---|
+| ripgrep | `3fce3b5bb0236da2df6d99672afb8a719642eca7` |
+| axum | `f8b02f22cf10bee707bda19b58265b9e33677535` |
+| soft-serve | `37685d36f5b7bf0e32217ddd7c8e045c57772619` |
+
+Sources are under `local-ignore/callgraph/corpus/<repo>/`. Raw baseline, candidate and oracle records are retained under `local-ignore/callgraph/corpus/_results/<repo>/<revision>/`; local score JSON/Markdown are under `local-ignore/callgraph/score/`. These are outside regenerable build directories. The prior scanner origins, deleted with their old `target/` worktree artifacts, were recollected at the **same** revisions (`7306b6953ace4ad20e8b3108486e6b0d831d8af5` for Rust, `715f01b05062908be3f9cd147f0e4399c40274ec` for Go). `dead-code-scanner.json` now points directly to these three retained origins without changing any existing judgment or revision, rather than relying on a temporary `target/inspect-truth-corpus` symlink.
 
 ```sh
-cargo --version
-CARGO_TARGET_DIR="$PWD/target/callgraph-baseline" CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= \
-  cargo build --release -p agent-file-tools \
-  --manifest-path local-ignore/callgraph/baseline-source/Cargo.toml
-CARGO_BUILD_RUSTC_WRAPPER= RUSTC_WRAPPER= cargo build --release -p agent-file-tools
-./target/callgraph-baseline/release/aft --version
-./target/release/aft --version
-```
-
-Record the exact candidate revision (the source version of this delivered branch, or its reviewed merge) and use it consistently for collection and scoring:
-
-```sh
-CANDIDATE_COMMIT="$(git rev-parse HEAD)"
-python3 --version
-python3 benchmarks/inspect-truth/run.py collect \
-  --repo ripgrep --repo axum --repo soft-serve \
-  --corpus-root local-ignore/callgraph/corpus \
-  --baseline-bin target/callgraph-baseline/release/aft \
-  --aft-bin target/release/aft --aft-commit "$CANDIDATE_COMMIT" \
-  --diagnostics-sample 0
 python3 benchmarks/inspect-truth/run.py score \
   --repo ripgrep --repo axum --repo soft-serve \
   --corpus-root local-ignore/callgraph/corpus \
-  --aft-commit "$CANDIDATE_COMMIT" \
+  --aft-commit a37cdbe83ec281fd7a13fe76b83d5b1eae96deae \
   --output-dir local-ignore/callgraph/score --slice callgraph
 ```
 
-`collect` gathers baseline and candidate, and runs each oracle once per corpus pin. Rust uses the `corpus.json` Cargo-check commands; Go uses staticcheck U1000, deadcode (production and test runs), and go vet. Stage required oracle executables and dependencies on the benchmark host. `--diagnostics-sample 0` omits diagnostics sampling; diagnostics/status-bar acceptance is not claimed by this slice.
+This command validates every applicable judgments file against its own baseline/after origin, scored three before and three after repositories, and reported **0 lowered cells**. It regenerates the automatic tables above; the explanatory sections below are authored additions. No collection was rerun during this follow-up. Diagnostics sampling was disabled in collection; no error/warning diagnostic or release-timing claim follows from these results. Local AFT and the other corpus languages are not included in this three-repository run. Ripgrep carries a scoreable `language_unsupported` gap for Ruby (one file).
 
-For the local AFT Rust entry, add `--repo aft` to the `run.py collect` and `run.py score` commands if required by the campaign language re-run. That entry has no baseline and also invokes its configured TypeScript oracle/install steps. Record `git status --porcelain` before/after; these must match.
+## Soft-serve row decisions
 
-The scorer reads **every** existing judgments file, validating entries against each file's own baseline/after origins. Earlier slices recorded some origins under deleted `target/` trees; those captures must be restored or recollected before a score can validate them. Do not delete old judgments or reconstruct their raw rows from Markdown. After collecting, set this slice's `after_outputs` to the real retained directories and add actual row judgments before the final score.
+All paths in this section refer to the pinned soft-serve source root above. The JSON contains an individual one-line source note for every finding, including the three non-functions: `pkg/db/models/settings.go::Settings`, `pkg/git/service.go::ServiceHandler`, and `pkg/ui/pages/repo/repo.go::CopyURLMsg`. All three are declared but neither constructed nor referenced elsewhere.
 
-### Acceptance to settle on the corpus
+The **16 correct function/method findings** are `IsBranch`, `HashPassword`, `ListPublicKeys`, `SetPassword`, `Transaction`, the three standalone service wrappers (`UploadPack`, `UploadArchive`, `ReceivePack`), `jobs.Register`, `ReadPointer`, `GeneratePointer`, `Common.Repo`, and `Swap`/`Less` on each unused slice type `FileItems` and `StashItems`. Those slice types have no construction/sort uses; satisfying `sort.Interface` does not make an unused receiver live. The pointer scanner/tests use `ReadPointerFromBuffer`, not the unused reader wrapper. `HashPassword` does have unit-test callers (`pkg/backend/auth_test.go:6,16`) and a production caller inside unused `SetPassword` (`pkg/backend/user.go:384`); it is production-transitively dead, not a claim that nobody calls it. The reviewed rule says a production caller prevents test-only classification.
 
-- No defined precision/recall cell may fall below its baseline. Defined precision may become `n/a` only with AFT count zero and every before-side AFT row judged; other defined-to-`n/a` moves fail.
-- soft-serve `dead_code (functions)` precision must reach at least **0.6**, or be explained using the reviewed spec's row judgments. `NewServer` must no longer appear in the test-only list; its production caller is inside a package-level var closure.
-- ripgrep and axum dead-code counts must each be **<= 10**, with **`aft_rows_unjudged: 0`**, or the missed target must be explained row by row. An explanation is not a claim that the numeric target passed.
-- If AFT's own Rust entry is included, its cells are new: Rust count <= rustc count + 10, all dead-code/unused-export rows judged, Python unsupported gap retained, and clean checkout status unchanged.
-- Preserve raw baseline, oracle, candidate and judgment-origin outputs outside regenerable directories. Unknown/pending/analysis-incomplete responses are not empty findings and cannot establish accuracy.
+The **13 false-positive function/method findings** are grouped below. These classifications rely on actual registration or live receiver contracts, not merely capitalized/exported names.
+
+| Mechanism | Rows | Source evidence | Fixable within this slice's original engine fence? |
+|---|---|---|---|
+| External LFS interface dispatch | `pkg/git/lfs.go::{LockBackend, FromID, FromPath, AsArguments, AsLockSpec}` (5) | Processor construction/execution at `:85-95`; live lock backend returned at `:234-241`; compile-time `transfer.LockBackend` assertion at `:231` and `transfer.Lock` assertion at `:417`; method declarations at `:234,275,305,420,430` | **Not as a simple missing call/value edge.** Recognizing these external contracts belongs to Go interface liveness in `inspect/scanners/dead_code.rs` (or shared typed dispatch), outside the original file fence. |
+| External Bubble Tea delegate dispatch | `Spacing` in `pkg/ui/pages/repo/{filesitem,logitem,refsitem,stashitem}.go` and `pkg/ui/pages/selection/item.go` (5) | Actual delegate instances passed to `selector.New` at `files.go:89`, `log.go:69`, `refs.go:45`, `stash.go:49`, `selection.go:70` | **Outside the original fence's interface-liveness owner.** These live `list.ItemDelegate` implementations need their imported interface contract recognized; blanket preservation of every method would incorrectly keep the unused sorting receivers above. |
+| Standard HTTP unwrapper contract | `pkg/web/logging.go::Unwrap` (1) | `:43` supplies the `http.ResponseController` unwrapper contract; the middleware constructs the receiver at `:74` and passes it to the handler at `:79` | **Interface-liveness follow-up outside the original fence.** This is an implicit standard HTTP adapter contract, not a direct repository call to `Unwrap`. |
+| HTTP callback reachability | `pkg/web/goget.go::GoGetHandler` (1) | `pkg/web/git.go:116` registers `http.HandlerFunc(GoGetHandler)` under wrappers; `pkg/web/server.go:22` calls its `GitController` | **Yes, a candidate for fenced Go value-reference/caller resolution work.** The simple HandlerFunc fixture passes, but this real nested registration is still stranded. The exact missing graph edge was not runtime-traced in this report-only pass, so the registration is evidence of a gap, not a diagnosis of a particular line to patch. |
+| Go package init-function reachability | `pkg/webhook/event.go::Events` (1) | The imported SSH command package calls it from `pkg/ssh/cmd/webhooks.go:37-42` to initialize CLI event names | **Yes.** `go_initializer_edges` currently selects variables and `<go-package-init>` intermediates, not `init` functions (`dead_code_projection.rs:942`). A paired imported/unimported init-function fixture is the appropriate follow-up; rooting all packages unconditionally would be wrong. |
+
+The two latter rows are residual callgraph-layer gaps related to this slice's callback/initialization work and should be investigated inside the fence. The eleven interface-contract rows need the scanner/dispatch owner rather than more name-based call guesses. **No engine change was authorized or made in this row-review pass.**
+
+## Ripgrep: all 21 remaining rows
+
+All paths below refer to pinned ripgrep. Every row is already `aft_false_positive` in `judgments/dead-code-scanner.json`; none is newly reclassified or deleted. Declaration line numbers can differ from AFT's comment-inclusive symbol-range line.
+
+| # | Finding | Row-by-row production-use explanation | Mechanism / slice relationship |
+|---:|---|---|---|
+| 1 | `crates/core/flags/complete/bash.rs::generate` | Re-exported as `generate_complete_bash` at `flags/mod.rs:20`; invoked by `core/main.rs:366`. | Nested use-tree alias; fenced alias gap that this slice should close. |
+| 2 | `crates/core/flags/complete/fish.rs::generate` | Re-exported as `generate_complete_fish` at `flags/mod.rs:21`; invoked by `core/main.rs:368`. | Same nested alias gap. |
+| 3 | `crates/core/flags/complete/powershell.rs::generate` | Re-exported as `generate_complete_powershell` at `flags/mod.rs:22`; invoked by `core/main.rs:370`. | Same nested alias gap. |
+| 4 | `crates/core/flags/complete/zsh.rs::generate` | Re-exported as `generate_complete_zsh` at `flags/mod.rs:23`; invoked by `core/main.rs:367`. | Same nested alias gap. |
+| 5 | `crates/core/flags/doc/help.rs::generate_short` | Re-exported as `generate_help_short` at `flags/mod.rs:28`; invoked by `core/main.rs:394`. | Same nested alias gap. |
+| 6 | `crates/core/flags/doc/help.rs::generate_long` | Re-exported as `generate_help_long` at `flags/mod.rs:27`; invoked by `core/main.rs:395`. | Same nested alias gap. |
+| 7 | `crates/core/flags/doc/man.rs::generate` | Re-exported as `generate_man_page` at `flags/mod.rs:30`; invoked by `core/main.rs:365`. | Same nested alias gap. |
+| 8 | `crates/core/flags/doc/version.rs::generate_digits` | Called by `generate_short` at `version.rs:23`; that caller is reached through `generate_version_short`. | Transitive consequence of the nested alias gap. |
+| 9 | `crates/core/flags/doc/version.rs::generate_short` | Re-exported as `generate_version_short` at `flags/mod.rs:34`; invoked by `core/main.rs:396`. | Nested alias gap. |
+| 10 | `crates/core/flags/doc/version.rs::generate_long` | Re-exported as `generate_version_long` at `flags/mod.rs:32`; invoked by `core/main.rs:397`. | Nested alias gap. |
+| 11 | `crates/core/flags/doc/version.rs::generate_pcre2` | Re-exported as `generate_version_pcre2` at `flags/mod.rs:33`; invoked at `core/main.rs:401` and `version.rs:44`. | Nested alias gap. |
+| 12 | `crates/core/flags/lowargs.rs::new` | `ContextSeparator::new` is invoked through local alias `Separator` in `Flag::update` implementations at `flags/defs.rs:1257,1892,2000`. | Trait/caller and local-type alias reachability; candidate callgraph follow-up, not a missing generator root. |
+| 13 | `crates/core/flags/lowargs.rs::disabled` | `ContextSeparator::disabled` is invoked through `Separator` in flag update code at `flags/defs.rs:1256`. | Same trait/caller and local-type alias issue. |
+| 14 | `crates/core/flags/parse.rs::lookup` | Called by help rendering at `doc/help.rs:170,179` and man rendering at `doc/man.rs:73,85`. | Transitive consequence of stranded nested generator aliases. |
+| 15 | `crates/core/messages.rs::messages` | Invoked in the exported `message!` and `ignore_message!` templates at `messages.rs:73,94`; `core/main.rs:11-12` imports macros from this module. | Cross-file macro invocation/owner linkage; fenced macro-liveness gap that the same-file fixture does not eliminate. |
+| 16 | `crates/core/messages.rs::ignore_messages` | Invoked by the exported `ignore_message!` template at `messages.rs:94`, available through the same macro-use module. | Same cross-file macro linkage gap. |
+| 17 | `crates/core/messages.rs::set_errored` | Invoked by exported `err_message!` at `messages.rs:84`, which also invokes `message!` at `:85`. | Same cross-file/nested macro linkage gap. |
+| 18 | `crates/printer/src/util.rs::from_sink_match` | `Sunk::from_sink_match` is called by the standard printer's sink implementation at `standard.rs:905`. | Generic `Sink for StandardSink` caller reachability; not unused library API. |
+| 19 | `crates/printer/src/util.rs::from_sink_context` | `Sunk::from_sink_context` is called by the standard printer's sink implementation at `standard.rs:920`. | Same generic sink caller reachability gap. |
+| 20 | `crates/searcher/src/lines.rs::without_terminator` | Called in production search processing at `searcher/core.rs:120,351`. | Generic search execution/helper caller reachability gap. |
+| 21 | `crates/searcher/src/lines.rs::preceding` | Called in production context extraction at `searcher/core.rs:198,253`. | Same generic search execution/helper caller reachability gap. |
+
+### Remaining mechanisms and scope
+
+- **Nested Rust re-export aliases: 12 rows**, counting ten directly aliased generators and the two stranded helpers (`generate_digits`, `lookup`). `flags/mod.rs:18-39` is an actual nested use tree (`complete::{...}`, `doc::{help::{...}, version::{...}}`), not the flat re-export covered by the new fixture. Preserved raw use text is available to `callgraph_store/mod.rs`, so recursively flattening/retaining that tree and resolving each alias is **inside the fence**. This is part of the intended Rust use-as behavior and is the clearest residual gap this slice should close; the report-only follow-up does not claim it fixed.
+- **Cross-file exported macro reachability: 3 rows.** The helpers are visibly called in templates and the root imports the module with `#[macro_use]`. The delivered owner/body-edge fixture proves the same-file case, not cross-file exported-macro scoping or nested macro invocations. Extraction/resolution of macro owners and their invocation associations is **fenced work** in parser/calls/callgraph/callgraph_store. The exact absent incoming/outgoing edge was not inspected from the runtime graph here; do not reinterpret these rows as proof that no body edges were extracted.
+- **Trait/generic caller reachability: 6 rows.** Two local `Separator` references are candidates for fenced Rust type-alias/qualified-call resolution; four printer/searcher helpers sit under generic sink/search caller chains. Some fixes may fit the resolver, but full receiver/trait liveness may require `callgraph_store/dispatch.rs` or `inspect/scanners/dead_code.rs`, which are **outside the original file fence**. Source uses prove false positives; they do not, without a graph trace, identify a single safe fenced patch.
+
+Thus at least the **12 alias-related and 3 macro-related rows are clear follow-up obligations within this slice's mechanisms**. The six generic/trait rows warrant a separate traced diagnosis rather than optimistic blanket rooting. No new engine changes were made in this report-only follow-up; ripgrep's 21 rows still exceed the <=10 target, with every row explained rather than silently waived.
 
 ## Implemented behavior
 
 - Go file-level `var`/`const` bindings are `SymbolKind::Variable` on the parser-backed surfaces. Local bindings and blank identifiers are excluded. Initializer/closure calls belong to the binding range, not `<top-level>`.
 - Go callback values and package-variable references enter the value-ref lane. Bare names resolve within the package; dotted paths resolve through an import alias (including a raw-text alias fallback) or a same-package name. Dotted unresolved values survive projection. Value-ref kind determines projected provenance on both legacy and view stores, so callbacks do not masquerade as method dispatch.
-- `resolve_ref` is the single Go resolver. It uses go.mod module prefixes to find package files for calls, values and imports. Import resolutions are stored; snapshot initialization edges consume those stored targets, not current checkout bytes. A reached file initializes its package and imported packages, including blank imports; a package imported only by dead code remains unreachable. A separate `<go-package-init>` intermediate avoids accidentally rooting unattributed calls.
+- `resolve_ref` is the single Go resolver. It uses go.mod module prefixes to find package files for calls, values and imports. Import resolutions are stored; snapshot initialization edges consume those stored targets, not current checkout bytes. A reached file activates variables in its package and imported packages, including blank imports; the paired unimported-package fixture stays unreachable. Package init functions still need the explicit reachability follow-up identified above. A separate `<go-package-init>` intermediate avoids accidentally rooting unattributed calls.
 - go.mod events drop the shared module map and re-resolve stored Go refs. The aggregate manifest list and rollup predicate already included go.mod at this slice's base; the new warmed-cache fixture proves the real aggregate hash rejects a go.mod-only edit and its findings equal a clean build.
-- Rust inline-module use aliases now reach the original scoped item; qualified re-export aliases land on the definition. Macro-template calls have `name!` owner nodes and edges, never unconditional roots. View blobs retain those calls and explicit initializer/attribute roots.
+- Rust inline-module use aliases now reach the original scoped item; flat qualified re-export aliases land on the definition; nested use-tree aliases remain a corpus gap described above. Macro-template calls have `name!` owner nodes and edges, never unconditional roots. View blobs retain those calls and explicit initializer/attribute roots.
 - Actual view materialization previously marked every exported variable as an entry point. For Go variables only, it now uses the serialized explicit roots instead. The Cobra imported/unimported pair checks real view/legacy equality; a separate TypeScript exported-variable fixture retains the old root flag and its language-fence mutant is red.
 
 All new fixtures are crate-internal tests in fenced files. The Go provider test exercises package variables/constants through the same symbol-list path used by outline and symbol lookup. Existing Go parser/outline contracts passed in the repository library gate; no existing expected-value contract needed reversing.
@@ -93,6 +169,10 @@ To reach the active view surface, narrowly scoped changes also cover join serial
 
 ## Verification
 
+### Exact-total collection regression
+
+The collection harness now reads `total.value` for `{"kind":"exact","value":N}` envelopes while retaining numeric-total compatibility. The new `CollectionFixtures.test_offset_paging_reads_exact_total_object_not_summary_count` fixture collects two pages using the envelope's total even when summary count is one; reverting the fix fails that fixture with `collected 2 of {'kind': 'exact', 'value': 2} rows`. The companion `test_offset_paging_rejects_missing_rows_with_exact_total_object` fixture rejects a one-row terminal page advertising two rows. Disabling the completeness guard makes only that second fixture fail (`RuntimeError not raised`), while the valid-paging fixture remains green. Both mutations restored an empty unstaged diff. Python 3.14.4 on Linux ran all **30 offline harness fixtures**, passing. Local Python 3.9.6 scoring then validated three before/after repositories and all applicable judgments, with no lowered cells.
+
 - Initial red: `parser::tests::go_package_variables_and_constants_are_symbols` failed on missing `Boot` before extraction was implemented; restored fixture passed.
 - Final focused resolver module: Cargo 1.99.0, `cargo test -p agent-file-tools --lib -- rust_resolution_tests`: **21 passed**. Includes imported/unimported Cobra vars, Boot/Register, callbacks, warmed module map, warmed aggregate, aliases, macro invocation/no-invocation, old-version lookup misses, and legacy/view parity.
 - `cargo test -p agent-file-tools --test integration -- callgraph_test`: **58 passed**.
@@ -102,7 +182,7 @@ To reach the active view surface, narrowly scoped changes also cover join serial
 - Rustfmt 1.10.0-stable: local `cargo fmt --all` and `cargo fmt --all -- --check`, plus `git diff --check`, passed. Comment reviews flagged no unclear new comments. AFT diagnostics were partial; direct Rust compilation/tests were authoritative.
 - The initial code revision `528861ee3e434a9d6caab2d92ec438189d430e7e` built in release on Linux (13m35s). Subsequent refinements store Go import resolutions before projecting initializer edges and correct the Go-only materialization root flag; the chair must rebuild the delivered final source rather than reuse that earlier release binary.
 - Several default-2-vCPU jobs ended SIGTERM before tests. MOTOR identified OOM: test rustc needs about 7.2 GB but the default allocation provides 7 GiB. Subsequent AFT Cargo jobs used `linux,4c` (14 GiB) and completed. No local build or test fallback was used.
-- Retained gate outputs: `local-ignore/callgraph/evidence/rust-gate-initial.stdout` and `rust-gate-final.stdout`. Corpus captures/scores remain unrun by agreement; no synthetic load, package-manifest edits, or search-ranking/routing changes were made.
+- Retained gate outputs: `local-ignore/callgraph/evidence/rust-gate-initial.stdout` and `rust-gate-final.stdout`. The reviewer subsequently supplied the corpus captures, which were scored locally above; no synthetic load, package-manifest edits, or search-ranking/routing changes were made.
 
 ## Mutation controls
 
