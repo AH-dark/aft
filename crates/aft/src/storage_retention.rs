@@ -504,13 +504,33 @@ fn mount_matches(binding: &Binding) -> bool {
     let boot_volume = mount_point(Path::new("/")).as_deref() == Some(Path::new("/"));
     #[cfg(not(target_os = "macos"))]
     let boot_volume = false;
+    #[cfg(test)]
+    let uuid_at = |path: &Path| {
+        let probe_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(uuid) = test_volume_uuids()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&probe_path)
+        {
+            return Some(uuid.clone());
+        }
+        volume_uuid(path)
+    };
+    #[cfg(not(test))]
+    let uuid_at = volume_uuid;
     mount_matches_with(
         binding,
-        &volume_uuid,
+        &uuid_at,
         &device,
         boot_id().as_deref(),
         boot_volume,
     )
+}
+
+#[cfg(test)]
+fn test_volume_uuids() -> &'static Mutex<HashMap<PathBuf, String>> {
+    static UUIDS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    UUIDS.get_or_init(Default::default)
 }
 
 fn mount_matches_with(
@@ -1478,6 +1498,54 @@ mod storage_retention_tests {
         path
     }
 
+    struct TestVolumeUuidGuard(PathBuf);
+
+    impl Drop for TestVolumeUuidGuard {
+        fn drop(&mut self) {
+            test_volume_uuids()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.0);
+        }
+    }
+
+    // Give the surviving parent a UUID even on runners without filesystem UUID
+    // discovery. Disconnection fixtures must invalidate this identity as well
+    // as their device number, or they still describe the mounted parent volume.
+    fn uuid_backed_binding(storage: &Path, scope: &str) -> TestVolumeUuidGuard {
+        let record = storage.join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        let parent = binding.root.parent().unwrap().to_path_buf();
+        assert!(parent.is_dir());
+        let uuid = format!("fixture-volume-{scope}");
+        test_volume_uuids()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.clone(), uuid.clone());
+        let guard = TestVolumeUuidGuard(parent);
+        binding.stable_volume = Some(VolumeIdentity {
+            uuid: Some(uuid),
+            boot_id: boot_id(),
+        });
+        atomic_json(&record, &binding).unwrap();
+        assert!(
+            mount_matches(&binding),
+            "fixture parent must expose its recorded UUID"
+        );
+        guard
+    }
+
+    fn disconnect_uuid_backed_binding(storage: &Path, scope: &str, anchor: &Path) -> Binding {
+        let record = storage.join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        binding.volume = Some((anchor.to_path_buf(), 42));
+        // The removed volume's UUID is absent at both the unreachable anchor
+        // and the surviving parent, which belongs to the fixture's mounted volume.
+        binding.stable_volume.as_mut().unwrap().uuid = Some(format!("disconnected-volume-{scope}"));
+        atomic_json(&record, &binding).unwrap();
+        binding
+    }
+
     #[test]
     fn traversal_resumes_after_restart() {
         let temp = tempfile::tempdir().unwrap();
@@ -2160,28 +2228,35 @@ mod storage_retention_tests {
     #[test]
     fn storage_retention_linked_worktree_25h_keeps_live_reader_and_mount_checks() {
         let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, false, true);
+        let _uuid = uuid_backed_binding(temp.path(), &scope);
         let marker = crate::root_cache::ReadMarker::create(&path, "query").unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
         drop(marker);
-        let record = temp.path().join(format!("retention/roots/{scope}.json"));
-        let mut binding: serde_json::Value = read_json(&record).unwrap();
-        binding["volume"] = serde_json::json!([temp.path().join("unmounted"), 42]);
-        atomic_json(&record, &binding).unwrap();
-        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        let binding =
+            disconnect_uuid_backed_binding(temp.path(), &scope, &temp.path().join("unmounted"));
+        assert!(!mount_matches(&binding));
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_mount_mismatch, 1, "{report:?}");
         assert!(path.exists());
     }
 
     #[test]
     fn storage_retention_keeps_a_disconnected_volume() {
         let (temp, root, scope) = fixture();
-        let record = temp.path().join(format!("retention/roots/{scope}.json"));
-        let mut binding: Binding = read_json(&record).unwrap();
-        binding.volume = Some((temp.path().join("unmounted-volume"), 42));
-        atomic_json(&record, &binding).unwrap();
+        let _uuid = uuid_backed_binding(temp.path(), &scope);
+        let binding = disconnect_uuid_backed_binding(
+            temp.path(),
+            &scope,
+            &temp.path().join("unmounted-volume"),
+        );
         fs::remove_dir(root).unwrap();
+        assert!(!mount_matches(&binding));
         let path = cache(temp.path(), "index", &scope);
-        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_mount_mismatch, 1, "{report:?}");
         assert!(path.exists());
     }
 
