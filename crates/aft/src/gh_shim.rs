@@ -3091,23 +3091,32 @@ fn resolve_and_cache_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> 
     let image = executing_image();
     let real_gh = resolve_real_gh(&image)?;
     let encoded_login = url::form_urlencoded::byte_serialize(login.as_bytes()).collect::<String>();
-    let output = Command::new(real_gh)
-        .args(["api", &format!("users/{encoded_login}"), "--jq", ".id"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let numeric_id = String::from_utf8(output.stdout)
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|id| *id > 0)?;
+    let mut command = Command::new(real_gh);
+    command.args(["api", &format!("users/{encoded_login}"), "--jq", ".id"]);
+    let numeric_id = numeric_id_from_command(
+        command,
+        std::time::Instant::now() + crate::format::AVAILABILITY_PROBE_BUDGET,
+    )?;
     let mut ids = cached_numeric_ids(paths);
     ids.insert(login.to_string(), numeric_id);
     write_numeric_ids_silently(paths, &ids);
     Some(numeric_id)
+}
+
+fn numeric_id_from_command(command: Command, deadline: std::time::Instant) -> Option<u64> {
+    let output = crate::format::capture_probe_command(command, "gh", deadline, || {
+        crate::executor::current_job_cancelled()
+    })
+    .ok()?;
+    if !output.status.success() || output.truncated {
+        return None;
+    }
+    output
+        .stdout
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
 }
 
 fn write_numeric_ids_silently(paths: &StatePaths, ids: &BTreeMap<String, u64>) {
@@ -7289,6 +7298,33 @@ fn unix_seconds() -> u64 {
 // use read as dead there; the module compiles in both profiles.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn supplemental_numeric_id_probe_does_not_accept_an_expired_deadline() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '123\\n'"]);
+        assert_eq!(
+            numeric_id_from_command(command, std::time::Instant::now()),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplemental_numeric_id_probe_refuses_overflow_instead_of_parsing_a_prefix() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '123\\n'; head -c 5000 /dev/zero | tr '\\000' ' '",
+        ]);
+        assert_eq!(
+            numeric_id_from_command(
+                command,
+                std::time::Instant::now() + crate::format::AVAILABILITY_PROBE_BUDGET
+            ),
+            None
+        );
+    }
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
