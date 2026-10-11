@@ -6869,6 +6869,8 @@ impl CallGraphStore {
         Ok(snapshot)
     }
 
+    /// The content hash (hex) recorded for the stored file `file`, or None
+    /// when the store has no row for it. See
     /// [`CallGraphRead::stored_content_hash`].
     pub fn stored_content_hash(&self, file: &str) -> Result<Option<String>> {
         self.refresh_read_marker()?;

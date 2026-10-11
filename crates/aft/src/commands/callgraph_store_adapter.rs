@@ -3751,7 +3751,8 @@ mod trace_to_tests {
         assert!(impact.depth_limited);
         assert_eq!(impact.truncated, 2);
 
-        // With room for them, nothing is omitted.
+        // With a depth limit that reaches upstreamA and upstreamB, no
+        // callers are omitted.
         let deeper =
             callers_result(&store, Path::new(&target.file), &target.symbol, 2, true).unwrap();
         assert!(!deeper.depth_limited);
@@ -3782,9 +3783,8 @@ mod trace_to_tests {
     }
 
     #[test]
-    // `truncated` was pinned at 0 here because the boundary callers' own
-    // callers (upstreamA and upstreamB) were never counted. They are omitted
-    // by the depth limit, so the serialized answers now report 2.
+    // At depth 1 the answers list hubCaller but not its callers upstreamA
+    // and upstreamB, so both serialized answers report `"truncated":2`.
     fn batched_boundary_counts_preserve_serialized_callers_and_impact_contract() {
         let mut store = CountingStore::new();
         let target = node("target", false);
