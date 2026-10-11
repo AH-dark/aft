@@ -66,6 +66,20 @@ async function fixture(user: string, project?: string) {
 }
 
 describe.serial("Pi live config reload", () => {
+  test("malformed hardening reload preserves the whole last-good candidate", async () => {
+    const f = await fixture(
+      '{"sandbox":{"enabled":true,"read_deny":["private"]},"bash":{"watch_sync_max_ms":120000}}',
+    );
+    writeFileSync(
+      f.userPath,
+      '{"sandbox":{"enabled":true,"write_allow":5},"bash":{"watch_sync_max_ms":1000}}',
+    );
+    f.reload.reload();
+    expect(f.ctx.config.sandbox?.enabled).toBe(true);
+    expect(f.ctx.config.sandbox?.read_deny).toEqual(["private"]);
+    expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(120000);
+    expect(f.notices[0]).toContain("invalid_security_config:sandbox");
+  });
   test("a restrict_to_project_root edit reaches the registered hoisted tools", async () => {
     const f = await fixture('{ "restrict_to_project_root": false }');
     const { api, tools } = makeMockApi();

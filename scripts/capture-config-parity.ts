@@ -169,6 +169,16 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
 }
 
 const CASES: ParityCase[] = [
+  { name: "malformed_security_sandbox", user: { sandbox: { enabled: true, write_allow: 5 } } },
+  { name: "malformed_security_indexes", project: { indexes: { semantic: "off" } } },
+  { name: "malformed_security_remote_exec", project: { remote_exec: { enabled: "off" } } },
+  { name: "malformed_security_disables", user: { disabled_tools: "aft_write" } },
+  { name: "malformed_security_active_harness", user: { harnesses: { opencode: { sandbox: { enabled: true, write_allow: 5 } }, pi: { sandbox: "opaque" } } } },
+  { name: "pi_malformed_security_sandbox", harness: "pi", user: { sandbox: { enabled: true, write_allow: 5 } } },
+  { name: "pi_malformed_security_active_harness", harness: "pi", user: { harnesses: { pi: { sandbox: { enabled: true, write_allow: 5 } }, opencode: { sandbox: "opaque" } } } },
+  { name: "malformed_nonsecurity_inspect_partial", user: { inspect: { categories: { diagnostics: "off" } }, format_on_edit: true } },
+  { name: "malformed_config_document", user: "{" },
+  { name: "pi_malformed_config_document", harness: "pi", user: "{" },
   { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
   { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
   { name: "privacy_project_off_dropped", project: { bash: { disclaim_privacy: false } } },

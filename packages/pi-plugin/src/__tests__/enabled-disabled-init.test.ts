@@ -143,7 +143,7 @@ describe.serial("Pi config error state", () => {
 
     const { tools } = await bootInErrorState();
 
-    await expectFailingCall(tools, "failed to parse");
+    await expectFailingCall(tools, "invalid_config_document");
     await expectFailingCall(tools, "Fix the JSONC syntax in that file");
   });
 });

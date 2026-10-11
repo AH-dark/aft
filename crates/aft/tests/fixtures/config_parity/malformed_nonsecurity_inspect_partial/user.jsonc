@@ -1,0 +1,8 @@
+{
+  "inspect": {
+    "categories": {
+      "diagnostics": "off"
+    }
+  },
+  "format_on_edit": true
+}

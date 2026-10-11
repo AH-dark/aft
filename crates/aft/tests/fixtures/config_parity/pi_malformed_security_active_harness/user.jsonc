@@ -1,0 +1,13 @@
+{
+  "harnesses": {
+    "pi": {
+      "sandbox": {
+        "enabled": true,
+        "write_allow": 5
+      }
+    },
+    "opencode": {
+      "sandbox": "opaque"
+    }
+  }
+}

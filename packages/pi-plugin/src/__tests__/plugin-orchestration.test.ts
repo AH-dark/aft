@@ -79,7 +79,7 @@ describe("Pi Lane G plugin orchestration regressions", () => {
         pluginVersion: "1.0.0",
       });
       expect(messages).toHaveLength(1);
-      expect(messages[0]).toContain("failed to parse and was ignored");
+      expect(messages[0]).toContain("failed to parse and was rejected");
       expect(messages[0]).toContain("npx @cortexkit/aft doctor");
     } finally {
       rmSync(root, { recursive: true, force: true });

@@ -11,6 +11,7 @@ import {
   legacyConfigNoticeMessage,
   legacyProjectConfigLocationNotice,
   MIN_WORKER_WAIT_MAX_MS,
+  malformedSecurityConfigErrors,
   mergeIndexes,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
   noticeDigest,
@@ -1349,7 +1350,7 @@ export function getConfigLoadErrors(): readonly ConfigLoadError[] {
 
 export function formatConfigParseFailureMessage(configPath: string, errorMessage: string): string {
   return (
-    `AFT config at ${configPath} failed to parse and was ignored (running on defaults): ${errorMessage}. ` +
+    `AFT config at ${configPath} failed to parse and was rejected; no configuration was applied: ${errorMessage}. ` +
     "Fix the syntax or run `npx @cortexkit/aft doctor`."
   );
 }
@@ -1405,7 +1406,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
     if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
       recordConfigParseFailure(configPath, "root must be an object");
-      return null;
+      throw new ConfigRejectedError(["invalid_config_document"], configPath);
     }
     // comment-json attaches Symbol(before/after:<key>) props to track comments.
     // Zod stringifies keys when building error paths, which throws on those
@@ -1413,10 +1414,11 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     // Validate against a symbol-free deep copy.
     cleanConfig = stripJsoncSymbols(rawConfig);
   } catch (err) {
+    if (err instanceof ConfigRejectedError) throw err;
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
     recordConfigParseFailure(configPath, errorMsg);
-    return null;
+    throw new ConfigRejectedError(["invalid_config_document"], configPath);
   }
 
   // Retired keys are translated on the raw document, before schema
@@ -1462,6 +1464,12 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     log(`Config loaded from ${configPath}`);
     parsed = result.data;
   } else {
+    const rejected = malformedSecurityConfigErrors(
+      normalizeConfigForActiveHarness(cleanConfig),
+      ACTIVE_HARNESS,
+      result.error.issues,
+    );
+    if (rejected.length > 0) throw new ConfigRejectedError(rejected, configPath);
     const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
     warn(`Config validation error in ${configPath}: ${errorMsg}`);
     configValidationErrors.push({ path: configPath, message: errorMsg });
@@ -1499,6 +1507,7 @@ function parseConfigPartially(rawConfig: Record<string, unknown>): AftConfig {
         partialConfig[key] = parsed[key];
       }
     } else {
+      warn(`Discarded invalid configuration section: ${key}`);
       const sectionErrors = sectionResult.error.issues
         .filter((i) => i.path[0] === key)
         .map((i) => `${i.path.join(".")}: ${i.message}`)

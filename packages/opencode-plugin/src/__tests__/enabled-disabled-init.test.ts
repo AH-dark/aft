@@ -131,7 +131,7 @@ describe.serial("OpenCode config error state", () => {
     const { tools } = await bootInErrorState(layout);
 
     expect(Object.keys(tools)).toContain("read");
-    await expectFailingCall(tools, "failed to parse");
+    await expectFailingCall(tools, "invalid_config_document");
     await expect(tools.read.execute({ filePath: "a.ts" }, {})).rejects.toThrow(
       "Fix the JSONC syntax in that file",
     );
