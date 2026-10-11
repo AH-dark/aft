@@ -1237,3 +1237,71 @@ pub fn handle_apply_patch(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     apply_patch(req, ctx, &resolved)
 }
+
+#[cfg(test)]
+mod approved_audit11 {
+    use super::*;
+
+    #[test]
+    fn ambiguous_update_reports_refusal_and_preserves_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let original = "\u{feff}head\r\n  target\r\nother\r\n\ttarget\r\n";
+        std::fs::write(&path, original.as_bytes()).unwrap();
+        let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n-\u{feff}head\n+\u{feff}changed\n@@\n-target\n+replacement\n*** End Patch", path.display());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req = RawRequest {
+            id: "match-guard".into(),
+            command: "apply_patch".into(),
+            params: serde_json::json!({"patch_text": patch, "validate": "off"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+        assert_eq!(response["code"], "apply_patch_failed", "{response}");
+        assert!(response["failures"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Ambiguous non-exact match"));
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn malformed_later_update_is_rejected_before_any_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        let original = b"\xef\xbb\xbfhead\r\nlast";
+        let binary = b"\xffuntouched\r\n";
+        std::fs::write(&first, original).unwrap();
+        std::fs::write(&second, binary).unwrap();
+        let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n-\u{feff}head\n+\u{feff}changed\n*** Update File: {}\n@@\ngarbage\n*** End Patch", first.display(), second.display());
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req = RawRequest {
+            id: "parse-guard".into(),
+            command: "apply_patch".into(),
+            params: serde_json::json!({"patch_text": patch, "validate": "off"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+        assert_eq!(response["code"], "invalid_request", "{response}");
+        assert!(response["message"].as_str().unwrap().contains("line 8"));
+        assert_eq!(std::fs::read(first).unwrap(), original);
+        assert_eq!(std::fs::read(second).unwrap(), binary);
+    }
+}
