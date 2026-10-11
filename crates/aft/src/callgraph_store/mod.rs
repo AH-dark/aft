@@ -25960,6 +25960,13 @@ edition = "2021"
             );
             let cmd = write_file(root, "cmd/command.go", "package cmd\nimport \"github.com/spf13/cobra\"\nvar Command = &cobra.Command{RunE: func() error { InitBackendContext(); return nil }}\nfunc InitBackendContext() {}\n");
             let (_, snapshot) = go_fixture_store(root, &[main.clone(), cmd.clone()]);
+            assert!(
+                snapshot
+                    .outbound_calls
+                    .windows(2)
+                    .all(|pair| pair[0].caller_file <= pair[1].caller_file),
+                "package initialization edges must preserve main's final caller-path grouping"
+            );
             let has_var_owner = snapshot.outbound_calls.iter().any(|call| {
                 call.caller_symbol == "Command" && call.target.ends_with("::InitBackendContext")
             });
@@ -25976,6 +25983,13 @@ edition = "2021"
                 "InitBackendContext"
             ));
             let viewed_snapshot = callgraph_fixture_view(root, &[main, cmd, root.join("go.mod")]);
+            assert!(
+                viewed_snapshot
+                    .outbound_calls
+                    .windows(2)
+                    .all(|pair| pair[0].caller_file <= pair[1].caller_file),
+                "view package initialization edges must preserve main's caller-path grouping"
+            );
             let view_roots = format!("{:?}", viewed_snapshot.entry_point_symbols);
             let viewed = callgraph_fixture_scan(root, viewed_snapshot);
             assert_eq!(
