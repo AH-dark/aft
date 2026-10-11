@@ -344,23 +344,46 @@ fn collect_redirection_targets(
 ) {
     // In tree-sitter-bash, redirects on `echo hi > /tmp/out` are siblings of
     // the `command` node, wrapped inside `redirected_statement`. Walking
-    // `command.children` would miss them. Walk from the parent
-    // (`redirected_statement`) when present, otherwise fall back to walking
-    // `command` itself in case a future grammar version inlines redirections
-    // under `command`.
-    let walk_root = match command.parent() {
-        Some(parent) if parent.kind() == "redirected_statement" => parent,
-        _ => command,
-    };
-    let mut cursor = walk_root.walk();
-    for child in walk_root.children(&mut cursor) {
-        // Skip the inner `command` node itself — its children are arguments,
-        // not redirections, and re-walking them is just wasted work.
-        if child.id() == command.id() {
-            continue;
+    // `command.children` would miss them.
+    //
+    // A trailing redirect after a list or pipeline (`cd dir && echo hi > f`,
+    // `a | b > f`) is attached to a `redirected_statement` around the whole
+    // list or pipeline. The shell applies it to the last command only, so
+    // only that command climbs through `list`/`pipeline` parents to claim it,
+    // and it is resolved against the directory in effect for that command.
+    let mut body = command;
+    while let Some(parent) = body.parent() {
+        match parent.kind() {
+            "redirected_statement" => {
+                let mut cursor = parent.walk();
+                for child in parent.children(&mut cursor) {
+                    // The body holds the command (or the list containing it);
+                    // its commands are scanned on their own.
+                    if child.id() == body.id() {
+                        continue;
+                    }
+                    collect_redirection_targets_from_node(source, child, cwd, &mut on_target);
+                }
+                return;
+            }
+            "list" | "pipeline" if is_last_named_child(parent, body) => body = parent,
+            _ => break,
         }
+    }
+    // No enclosing redirect: walk `command` itself in case a future grammar
+    // version inlines redirections under `command`.
+    let mut cursor = command.walk();
+    for child in command.children(&mut cursor) {
         collect_redirection_targets_from_node(source, child, cwd, &mut on_target);
     }
+}
+
+fn is_last_named_child(parent: Node<'_>, child: Node<'_>) -> bool {
+    parent
+        .named_child_count()
+        .checked_sub(1)
+        .and_then(|last| parent.named_child(last as u32))
+        .is_some_and(|last| last.id() == child.id())
 }
 
 fn collect_redirection_targets_from_node(
@@ -977,6 +1000,29 @@ mod tests {
             project.path()
         )
         .is_empty());
+    }
+
+    /// tree-sitter-bash attaches a trailing redirect to a node around the
+    /// whole list or pipeline; the shell applies it to the last command, in
+    /// the directory that command runs in.
+    #[cfg(unix)]
+    #[test]
+    fn trailing_redirect_after_a_list_belongs_to_the_last_command() {
+        let project = tempfile::tempdir().unwrap();
+        let usr = vec![(vec!["/usr/*".to_string()], vec!["/usr/*".to_string()])];
+        for command in [
+            "cd /usr && echo hi > out.txt",
+            "true && echo hi > /usr/aft-scan-probe",
+            "echo hi | cat > /usr/aft-scan-probe",
+        ] {
+            assert_eq!(
+                external_ask_shapes(command, project.path()),
+                usr,
+                "{command}"
+            );
+        }
+        // A redirect on an earlier command is resolved before the cd.
+        assert!(external_ask_shapes("echo hi > out.txt && cd /usr", project.path()).is_empty());
     }
 
     #[test]
