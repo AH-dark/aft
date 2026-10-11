@@ -359,7 +359,8 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("state.json");
-            // Only file creation sees the restrictive mask; keep fixture access intact.
+            // Create the fixture directory first so umask cannot make it inaccessible.
+            // Only the state file is created with the restrictive mask.
             unsafe { libc::umask(0o777) };
             super::atomic_write(&path, b"state").unwrap();
             assert_eq!(

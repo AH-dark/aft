@@ -269,7 +269,8 @@ fn wait_with_timeout(
     )
 }
 
-// Supplemental identity and availability checks are best effort, not whole operations.
+// The optional gh numeric-ID lookup and Ruff version check are best-effort probes.
+// Their short budget is separate from primary GitHub requests and formatter runs.
 pub(crate) const AVAILABILITY_PROBE_BUDGET: Duration = Duration::from_secs(3);
 const PROBE_CAPTURE_BYTES: usize = 4096;
 
