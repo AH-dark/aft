@@ -16057,8 +16057,16 @@ mod tests {
             json!(["typescript"]),
             "{response:?}"
         );
-        assert_eq!(
-            response.data["lsp_status"], "diagnostics unknown (server not responding)",
+        // The caller's diagnostics budget may expire before the helper reports
+        // the frozen pipe's timeout. Both outcomes must remain explicitly unknown.
+        assert!(
+            matches!(
+                response.data["lsp_status"].as_str(),
+                Some(
+                    "diagnostics unknown (server not responding)"
+                        | "diagnostics unknown (no authoritative response within the diagnostics budget)"
+                )
+            ),
             "{response:?}"
         );
         assert!(

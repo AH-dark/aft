@@ -333,6 +333,7 @@ fn set_test_foreground_wait_ms(ms: u64) -> EnvVarGuard {
     set_test_env("AFT_TEST_FOREGROUND_WAIT_MS", &ms.to_string())
 }
 
+#[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_error() -> EnvVarGuard {
     let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
     let previous = std::env::var_os(key);
@@ -340,6 +341,7 @@ fn set_test_force_bash_promote_error() -> EnvVarGuard {
     EnvVarGuard { key, previous }
 }
 
+#[cfg(feature = "test-timing-hooks")]
 fn set_test_force_bash_promote_panic() -> EnvVarGuard {
     let key = "AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR";
     let previous = std::env::var_os(key);
@@ -347,6 +349,7 @@ fn set_test_force_bash_promote_panic() -> EnvVarGuard {
     EnvVarGuard { key, previous }
 }
 
+#[cfg(feature = "test-timing-hooks")]
 fn set_test_bash_elicitation_ttl_ms(ms: u64) -> EnvVarGuard {
     let key = "AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS";
     let previous = std::env::var_os(key);
@@ -2744,6 +2747,7 @@ fn subc_bridge_untrusted_bash_elicitation_deny_and_malformed_fail_closed() {
     );
 }
 
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_untrusted_bash_elicitation_ttl_denies_and_settles() {
     run_subc_bridge_test_with_env(
@@ -3372,6 +3376,9 @@ fn subc_bridge_bash_route_close_cancels_deferred_wait() {
     );
 }
 
+// Integration tests link the library without cfg(test); these injected failures
+// therefore require the explicit test-only feature, not production hook reads.
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
     run_subc_bridge_test_with_env(
@@ -3391,6 +3398,7 @@ fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
     );
 }
 
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
@@ -3408,6 +3416,7 @@ fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
     );
 }
 
+#[cfg(feature = "test-timing-hooks")]
 fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
     vec![
         set_test_foreground_wait_ms(200),
@@ -3422,6 +3431,7 @@ fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
     ]
 }
 
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
@@ -3435,6 +3445,7 @@ fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
     );
 }
 
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
@@ -5303,6 +5314,7 @@ async fn drive_bash_route_close_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+#[cfg(feature = "test-timing-hooks")]
 async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -5354,10 +5366,12 @@ async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+#[cfg(feature = "test-timing-hooks")]
 async fn drive_bash_promote_panic_daemon(input: FakeDaemonInput) {
     drive_started_promotion_daemon(input, true).await;
 }
 
+#[cfg(feature = "test-timing-hooks")]
 async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bool) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -10562,6 +10576,7 @@ async fn drive_bash_elicitation_deny_and_malformed_daemon(input: FakeDaemonInput
     send_connection_goodbye(&mut stream).await;
 }
 
+#[cfg(feature = "test-timing-hooks")]
 async fn drive_bash_elicitation_ttl_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..

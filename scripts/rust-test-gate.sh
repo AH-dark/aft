@@ -439,6 +439,10 @@ fi
 if phase_enabled conformance; then
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
     cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
+  # Keep promotion failure, deadline handoff, and elicitation TTL coverage in
+  # the hook-enabled phase; ordinary production builds cannot inject them.
+  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl" \
+    cargo test -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl
 fi
 
 # The main subc storm test asserts production-calibrated absolute latencies
