@@ -2,8 +2,6 @@
 
 Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
-**Measurement boundary:** the tables and judgments below still describe engine candidate `a37cdbe83`. Scoped engine repairs are now implemented at `8035691a2b288875959cfd7c102d31bab678df8f`, with before-fix reds, mutation controls and legacy/view parity. Their corpus effect is **not yet measured**; the next Linux review collection must build `8035691a2b288875959cfd7c102d31bab678df8f` or the later report-only branch HEAD, which has identical engine source. Existing judgments and raw origins are retained, and no collection was rerun here.
-
 ## Before
 
 | repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |
@@ -32,33 +30,96 @@ Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
 | repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ripgrep | rust | dead_code | scored | 21 | 0 | 0 (+0) | 0.00 | n/a | 0 | 21 | 0 |
+| ripgrep | rust | dead_code | scored | 16 | 0 | 0 (+0) | 0.00 | n/a | 0 | 16 | 0 |
 | ripgrep | rust | todos | scored | 11 | 11 | 11 (+0) | 1.00 | 1.00 | 0 | 0 | 11 |
-| axum | rust | dead_code | scored | 10 | 0 | 0 (+0) | 0.00 | n/a | 0 | 10 | 0 |
+| axum | rust | dead_code | scored | 9 | 0 | 0 (+0) | 0.00 | n/a | 0 | 9 | 0 |
 | axum | rust | todos | scored | 5 | 5 | 5 (+0) | 1.00 | 1.00 | 0 | 0 | 5 |
-| soft-serve | go | dead_code | scored | 32 | 0 | 0 (+0) | 0.00 | n/a | 0 | 32 | 0 |
-| soft-serve | go | dead_code (functions) | scored | 29 | 20 | 9 (+0) | 0.31 | 0.45 | 0 | 29 | 0 |
+| soft-serve | go | dead_code | scored | 29 | 0 | 0 (+0) | 0.00 | n/a | 0 | 29 | 0 |
+| soft-serve | go | dead_code (functions) | scored | 26 | 20 | 9 (+0) | 0.35 | 0.45 | 0 | 26 | 0 |
 | soft-serve | go | todos | scored | 33 | 33 | 33 (+0) | 1.00 | 1.00 | 0 | 0 | 33 |
 
-- ripgrep raw output: `local-ignore/callgraph/corpus/_results/ripgrep/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` (corpus `3fce3b5bb0236da2df6d99672afb8a719642eca7`).
+- ripgrep raw output: `local-ignore/callgraph/corpus/_results/ripgrep/213581cc831fcfdd33360168d1e31d47ca034b55` (corpus `3fce3b5bb0236da2df6d99672afb8a719642eca7`).
 - ripgrep baseline_aft_truncated_scopes (excluded from comparison): []
-- ripgrep judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 10, "inspect-tool.json": 0}
+- ripgrep judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 15, "inspect-tool.json": 0}
 - ripgrep/rust/dead_code languages_unsupported: [{"language": "ruby", "files": 1}]
 
-- axum raw output: `local-ignore/callgraph/corpus/_results/axum/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` (corpus `f8b02f22cf10bee707bda19b58265b9e33677535`).
+- axum raw output: `local-ignore/callgraph/corpus/_results/axum/213581cc831fcfdd33360168d1e31d47ca034b55` (corpus `f8b02f22cf10bee707bda19b58265b9e33677535`).
 - axum baseline_aft_truncated_scopes (excluded from comparison): []
-- axum judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 0, "inspect-tool.json": 0}
+- axum judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 1, "inspect-tool.json": 0}
 
-- soft-serve raw output: `local-ignore/callgraph/corpus/_results/soft-serve/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` (corpus `37685d36f5b7bf0e32217ddd7c8e045c57772619`).
+- soft-serve raw output: `local-ignore/callgraph/corpus/_results/soft-serve/213581cc831fcfdd33360168d1e31d47ca034b55` (corpus `37685d36f5b7bf0e32217ddd7c8e045c57772619`).
 - soft-serve baseline_aft_truncated_scopes (excluded from comparison): []
-- soft-serve judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 2, "inspect-tool.json": 0}
+- soft-serve judgments_unapplied: {"harness.json": 0, "callgraph.json": 3, "ts-liveness.json": 0, "dead-code-scanner.json": 2, "inspect-tool.json": 0}
 
 ## Cell rule
 
 - PASS: no cell lowered.
 
+## Latest measured revision: 213581cc8
 
-## Measured delivery and target verdicts
+The automatic tables above are **measured at `213581cc831fcfdd33360168d1e31d47ca034b55`**, using the retained Linux release captures and the same baseline/judgments. They do not measure the newer custom-crate-root repair at engine commit `ba586aa46f9698684b079ef30a03c3cc8f4a8b96`. Its fixtures and mutation control pass, but its corpus effect awaits the next Linux collection. Existing judgment entries and their original capture directories remain unchanged.
+
+| Bucket | Baseline 13dd9cb71 | Previous a37cdbe83 | Measured 213581cc8 | Target verdict at 213581cc8 |
+|---|---:|---:|---:|---|
+| ripgrep dead_code | 52 | 21 | 16; 16 judged, 0 unjudged | <=10 **still missed** |
+| axum dead_code | 55 | 10 | 9; 9 judged, 0 unjudged | <=10 **PASS** |
+| soft-serve dead_code | 101 | 32 | 29; 29 judged, 0 unjudged | Improved; no separate count threshold |
+| soft-serve dead_code (functions) | 98 | 29 | 26; 26 judged, 0 unjudged | Precision 0.35 <0.6 **still missed** |
+| soft-serve function precision / recall | 0.05 / 0.25 | 0.31 / 0.45 | 0.35 / 0.45 | Precision improves; recall unchanged |
+| Todos: ripgrep / axum / soft-serve | 11 / 5 / 33 | 11 / 5 / 33 | 11 / 5 / 33 | Unchanged |
+| Cell rule | baseline | PASS | **PASS, 0 lowered cells** | No metric cell lowered |
+
+A direct set comparison of the raw normalized ripgrep findings confirms **21 previous rows, 16 current rows, and no new rows**. The five removals are `messages::{messages,ignore_messages,set_errored}` and `lines::{without_terminator,preceding}`. The cross-file macro repair therefore had the expected corpus effect. My earlier expectation that nested-use flattening would also clear the twelve generator/transitive rows was **wrong for ripgrep's actual layout**: all twelve remained. The previous alias fixture used `src/main.rs`; the corpus declares `[[bin]] path = "crates/core/main.rs"` (`Cargo.toml:30-33`). That missing fixture dimension left an ordinary Rust alias resolver gap; it does not depend on interface or trait-contract dispatch.
+
+### Every remaining ripgrep row, classified at 213581cc8
+
+Classes: **(a)** expected to clear through nested use-tree alias resolution (including its transitive callees) and still present, **(b)** interface/trait-contract reachability outside the authorized alias/macro repair scope, **(c)** a finding absent from the previous capture. All 16 below retain their existing false-positive judgments. There are **12 (a), 4 (b), 0 (c)**. The two other previously deferred searcher helper rows disappeared in this measurement and are not silently counted among the remaining sixteen.
+
+All source paths below are relative to pinned ripgrep `3fce3b5bb0236da2df6d99672afb8a719642eca7` at `local-ignore/callgraph/corpus/ripgrep/`.
+
+| # | Remaining row | Class | Exact construct and evidence |
+|---:|---|---|---|
+| 1 | `crates/core/flags/complete/bash.rs::generate` | (a) | `crate::flags::{complete::{bash::generate as generate_complete_bash}}` in `flags/mod.rs:18-20`; `flags::generate_complete_bash()` at `core/main.rs:366`, under the custom bin root. |
+| 2 | `crates/core/flags/complete/fish.rs::generate` | (a) | Same nested complete group, `fish::generate as generate_complete_fish` at `flags/mod.rs:21`; call at `core/main.rs:368`. |
+| 3 | `crates/core/flags/complete/powershell.rs::generate` | (a) | Same group, `powershell::generate as generate_complete_powershell` at `flags/mod.rs:22`; call at `core/main.rs:370`. |
+| 4 | `crates/core/flags/complete/zsh.rs::generate` | (a) | Same group, `zsh::generate as generate_complete_zsh` at `flags/mod.rs:23`; call at `core/main.rs:367`. |
+| 5 | `crates/core/flags/doc/help.rs::generate_short` | (a) | `doc::{help::{generate_short as generate_help_short}}` at `flags/mod.rs:25-28`; call at `core/main.rs:394`. |
+| 6 | `crates/core/flags/doc/help.rs::generate_long` | (a) | Same doubly nested help group, `generate_long as generate_help_long` at `flags/mod.rs:27`; call at `core/main.rs:395`. |
+| 7 | `crates/core/flags/doc/man.rs::generate` | (a) | `doc::{man::generate as generate_man_page}` at `flags/mod.rs:30`; call at `core/main.rs:365`. |
+| 8 | `crates/core/flags/doc/version.rs::generate_digits` | (a), transitive | Called by `generate_short` at `version.rs:23`; that generator is stranded behind the same custom-root nested alias. This is not a new row or a trait contract. |
+| 9 | `crates/core/flags/doc/version.rs::generate_short` | (a) | `doc::{version::{generate_short as generate_version_short}}` at `flags/mod.rs:31-34`; call at `core/main.rs:396`. |
+| 10 | `crates/core/flags/doc/version.rs::generate_long` | (a) | Same version group, `generate_long as generate_version_long` at `flags/mod.rs:32`; call at `core/main.rs:397`. |
+| 11 | `crates/core/flags/doc/version.rs::generate_pcre2` | (a) | Same group, `generate_pcre2 as generate_version_pcre2` at `flags/mod.rs:33`; calls at `core/main.rs:401` and `version.rs:44`. |
+| 12 | `crates/core/flags/lowargs.rs::new` | (b) | `ContextSeparator::new` called through local type alias `Separator` in live `Flag::update` implementations at `flags/defs.rs:1257,1892,2000`; deferred trait/caller reachability, unchanged. |
+| 13 | `crates/core/flags/lowargs.rs::disabled` | (b) | `ContextSeparator::disabled` called through `Separator` in `Flag::update` at `flags/defs.rs:1256`; deferred trait/caller reachability, unchanged. |
+| 14 | `crates/core/flags/parse.rs::lookup` | (a), transitive | Direct ordinary calls from the stranded help/man generators at `doc/help.rs:170,179` and `doc/man.rs:73,85`; not an interface/trait row. |
+| 15 | `crates/printer/src/util.rs::from_sink_match` | (b) | Called by the generic standard printer sink at `standard.rs:905`; the `Sink for StandardSink` contract/caller chain remains the interface-liveness follow-up. |
+| 16 | `crates/printer/src/util.rs::from_sink_context` | (b) | Called by the same generic sink at `standard.rs:920`; same deferred contract/caller chain. |
+
+### Residual diagnosis, exact reduced fixture and repair
+
+The defect is in **Rust module candidate construction after leaf flattening**. Qualified calls find the `flags/mod.rs` facade through declared modules, but its flattened `crate::flags::...` re-export refs still constructed candidates from guessed `src/` paths. A reduced pre-fix trace reported `status = resolved` yet `target_file = crates/core/flags/mod.rs` and `target_symbol = generate_complete_bash`: a facade alias with no defining leaf node. Merely asserting “resolved” would have passed for the wrong reason.
+
+`callgraph_rust_nested_aliases_custom_bin_root_match_legacy_and_view` now uses the exact manifest target `crates/core/main.rs`, the `flags/mod.rs`, `complete/mod.rs` and `doc/mod.rs` hierarchy, and the nested groups/aliases from the corpus. It includes **all ten direct aliases plus `generate_digits` and `lookup`**. For every direct alias it asserts the real stored target file/symbol and direct caller, then repeats the target-edge and liveness checks against an actual view; both transitive helpers become live and a spare remains dead. The fixture was red before repair, including the resolved-but-facade target assertion.
+
+The resolver now derives the caller's logical module path and source prefix from the memoized manifest-declared crate target root, including custom bin/lib layouts. It falls back to conventional `src/` only when no target is known. The same resolver helper feeds stored refs, dependencies and view indexes. It does not root generators, guess interface calls, or alter trait liveness. Replacing the manifest-root lookup with the old fallback makes only the named fixture fail, with the wrong facade target reproduced; restoration leaves an empty unstaged diff and the full resolver fixture module passes.
+
+**Yes, <=10 is reachable without interface liveness for this observed set.** Twelve of the sixteen rows are the demonstrated custom-root alias/transitive defect, leaving four deferred contract rows if those twelve disappear. This is a structural feasibility conclusion, **not a measured new count of four**. The current <=10 claim remains unproven until the new engine tip is collected. No out-of-scope trait/interface repair was made.
+
+### Version and verification handoff
+
+Engine repair commit: `ba586aa46f9698684b079ef30a03c3cc8f4a8b96`. Build-output is `v16-manifest-root-reexport-resolution`; blob producers are `callgraph-v5-manifest-root-reexport-resolution` and active-view `ruled-callgraph-v6-manifest-root-reexport-resolution`. These invalidate stale resolver interpretation and derived graphs. The rebuild is still once per file content/language/current producer, followed by reuse; the older version descriptions retained below are historical.
+
+Cargo 1.99.0, serialized `linux,4c` gates: resolver module **27 passed**, manifest module **7 passed**, callgraph integration **58 passed**, binary **122 passed**. Mandatory full gate: TLS **1 passed**, tokenizer **3 passed**, Biome **711 files**, library **5711 passed, 4 failed, 50 ignored**. Failures were the semantic-backend status/wording fixture, storage archive ENOENT, deferred producer SendError, and `warm_verify_uses_bounded_workers_and_one_stat_per_indexed_file` (“must use multiple workers”); the latter passed its focused one-test rerun. No unrelated fix was included, and later full-gate phases were not reached. Log: `local-ignore/callgraph/evidence/rust-gate-custom-root-repair.stdout`.
+
+Rustfmt 1.10.0-stable format/check and diff checks passed. AFT's completed Rust diagnostic snapshot covered `callgraph_store/mod.rs`, `blob_store/mod.rs` and `views/callgraph.rs` with zero errors/warnings. New source comments were reviewed without flags. Local scoring of the retained 213581cc8 captures validated three before/after repositories with **no decrease in any scored precision/recall cell** relative to baseline. That score does not measure the current custom-root repair, whose corpus collection awaits the next review run. All old judgments remain attached to their original captures; no collection was rerun here.
+
+
+## Preserved historical implementation and verification record
+
+The sections below describe earlier measured/implemented revisions. The latest 213581cc8 table and custom-root diagnosis above supersede their pending-rerun statements. They remain here to preserve original judgments, fixture provenance and earlier controls.
+
+## Historical measured revision a37cdbe83 and its row review
 
 Baseline `13dd9cb71` and engine candidate `a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` were collected on Linux and retained in this worktree alongside their oracles. The tables above are a **local re-score of those captures**, not a new collection. Subsequent row-review commits changed only the collection harness, tests, provenance descriptors, judgments and this report. A later scoped engine repair is documented below; its results must not be inferred from these older tables.
 
