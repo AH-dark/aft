@@ -6,6 +6,8 @@ pub struct ParsedCommand {
 }
 
 pub fn parse(command: &str) -> Option<ParsedCommand> {
+    #[cfg(test)]
+    PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let command = command.trim();
     if command.is_empty() {
         return None;
@@ -19,6 +21,16 @@ pub fn parse(command: &str) -> Option<ParsedCommand> {
     }
 
     Some(parsed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn take_parse_calls() -> usize {
+    PARSE_CALLS.with(|calls| calls.replace(0))
 }
 
 fn split_heredoc(command: &str) -> Option<(&str, Option<String>)> {

@@ -7,7 +7,7 @@ const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const GREP_FOOTER_FRESHNESS_WINDOW: Duration = Duration::from_secs(60);
 
 use crate::bash_rewrite::footer::{add_footer, add_grep_footer};
-use crate::bash_rewrite::parser::parse;
+use crate::bash_rewrite::parser::{parse, ParsedCommand};
 use crate::bash_rewrite::{RewriteRequest, RewriteRule};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -22,6 +22,19 @@ pub struct CatAppendRule;
 pub struct SedRule;
 pub struct LsRule;
 
+// Dispatch shares one immutable parse across built-in rules. The public
+// RewriteRule interface still parses standalone decisions for library callers.
+pub(super) trait ParsedRewriteRule: RewriteRule {
+    fn decide_parsed(
+        &self,
+        parsed: Option<&ParsedCommand>,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision;
+}
+
 impl RewriteRule for GrepRule {
     fn name(&self) -> &'static str {
         "grep"
@@ -34,27 +47,8 @@ impl RewriteRule for GrepRule {
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = grep_request(command, "grep") else {
-            return decline("grep", "grep.decline", "unsupported grep shape");
-        };
-        if let Some(path) = params.get("path").and_then(Value::as_str) {
-            if !path_is_safe(ctx, path, true) {
-                return decline(
-                    "grep",
-                    "grep.decline",
-                    "grep path is outside the project root or missing",
-                );
-            }
-        }
-        accept(
-            "grep",
-            "grep.accept",
-            "dc.grep.accept.v1",
-            command,
-            request_id,
-            session_id,
-            params,
-        )
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
@@ -76,27 +70,8 @@ impl RewriteRule for RgRule {
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = grep_request(command, "rg") else {
-            return decline("rg", "rg.decline", "unsupported rg shape");
-        };
-        if let Some(path) = params.get("path").and_then(Value::as_str) {
-            if !path_is_safe(ctx, path, true) {
-                return decline(
-                    "rg",
-                    "rg.decline",
-                    "rg path is outside the project root or missing",
-                );
-            }
-        }
-        accept(
-            "rg",
-            "rg.accept",
-            "dc.rg.accept.v1",
-            command,
-            request_id,
-            session_id,
-            params,
-        )
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
@@ -118,7 +93,248 @@ impl RewriteRule for FindRule {
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = find_request(command) else {
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::glob::handle_glob(&tool_request("glob", request, ctx), ctx),
+            "glob",
+            request,
+        )
+    }
+}
+
+impl RewriteRule for CatRule {
+    fn name(&self) -> &'static str {
+        "cat"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            "read",
+            request,
+        )
+    }
+}
+
+impl RewriteRule for HeadRule {
+    fn name(&self) -> &'static str {
+        "head"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            "read",
+            request,
+        )
+    }
+}
+
+impl RewriteRule for TailRule {
+    fn name(&self) -> &'static str {
+        "tail"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            "read",
+            request,
+        )
+    }
+}
+
+impl RewriteRule for CatAppendRule {
+    fn name(&self) -> &'static str {
+        "cat_append"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::edit_match::handle_edit_match(
+                &tool_request("edit_match", request, ctx),
+                ctx,
+            ),
+            "edit",
+            request,
+        )
+    }
+}
+
+impl RewriteRule for SedRule {
+    fn name(&self) -> &'static str {
+        "sed"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            "read",
+            request,
+        )
+    }
+}
+
+impl RewriteRule for LsRule {
+    fn name(&self) -> &'static str {
+        "ls"
+    }
+
+    fn decide(
+        &self,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let parsed = parse(command);
+        self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
+    }
+
+    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+        call_and_footer(
+            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
+            "read",
+            request,
+        )
+    }
+}
+
+impl ParsedRewriteRule for GrepRule {
+    fn decide_parsed(
+        &self,
+        parsed: Option<&ParsedCommand>,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = grep_request_from_parsed(parsed, "grep") else {
+            return decline("grep", "grep.decline", "unsupported grep shape");
+        };
+        if let Some(path) = params.get("path").and_then(Value::as_str) {
+            if !path_is_safe(ctx, path, true) {
+                return decline(
+                    "grep",
+                    "grep.decline",
+                    "grep path is outside the project root or missing",
+                );
+            }
+        }
+        accept(
+            "grep",
+            "grep.accept",
+            "dc.grep.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+}
+
+impl ParsedRewriteRule for RgRule {
+    fn decide_parsed(
+        &self,
+        parsed: Option<&ParsedCommand>,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = grep_request_from_parsed(parsed, "rg") else {
+            return decline("rg", "rg.decline", "unsupported rg shape");
+        };
+        if let Some(path) = params.get("path").and_then(Value::as_str) {
+            if !path_is_safe(ctx, path, true) {
+                return decline(
+                    "rg",
+                    "rg.decline",
+                    "rg path is outside the project root or missing",
+                );
+            }
+        }
+        accept(
+            "rg",
+            "rg.accept",
+            "dc.rg.accept.v1",
+            command,
+            request_id,
+            session_id,
+            params,
+        )
+    }
+}
+
+impl ParsedRewriteRule for FindRule {
+    fn decide_parsed(
+        &self,
+        parsed: Option<&ParsedCommand>,
+        command: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        ctx: &AppContext,
+    ) -> crate::bash_rewrite::RewriteDecision {
+        let Some(params) = find_request_from_parsed(parsed) else {
             return decline("find", "find.decline", "unsupported find shape");
         };
         if let Some(path) = params.get("path").and_then(Value::as_str) {
@@ -147,29 +363,18 @@ impl RewriteRule for FindRule {
             params,
         )
     }
-
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
-        call_and_footer(
-            crate::commands::glob::handle_glob(&tool_request("glob", request, ctx), ctx),
-            "glob",
-            request,
-        )
-    }
 }
 
-impl RewriteRule for CatRule {
-    fn name(&self) -> &'static str {
-        "cat"
-    }
-
-    fn decide(
+impl ParsedRewriteRule for CatRule {
+    fn decide_parsed(
         &self,
+        parsed: Option<&ParsedCommand>,
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = cat_read_request(command) else {
+        let Some(params) = cat_read_request_from_parsed(parsed) else {
             return decline("cat", "cat.decline", "unsupported cat shape");
         };
         let path = params
@@ -192,29 +397,18 @@ impl RewriteRule for CatRule {
             params,
         )
     }
-
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
-        call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
-            "read",
-            request,
-        )
-    }
 }
 
-impl RewriteRule for HeadRule {
-    fn name(&self) -> &'static str {
-        "head"
-    }
-
-    fn decide(
+impl ParsedRewriteRule for HeadRule {
+    fn decide_parsed(
         &self,
+        parsed: Option<&ParsedCommand>,
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = head_tail_read_request(command, "head") else {
+        let Some(params) = head_tail_read_request_from_parsed(parsed, "head") else {
             return decline("head", "head.decline", "unsupported head shape");
         };
         let path = params
@@ -242,29 +436,18 @@ impl RewriteRule for HeadRule {
             params,
         )
     }
-
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
-        call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
-            "read",
-            request,
-        )
-    }
 }
 
-impl RewriteRule for TailRule {
-    fn name(&self) -> &'static str {
-        "tail"
-    }
-
-    fn decide(
+impl ParsedRewriteRule for TailRule {
+    fn decide_parsed(
         &self,
+        parsed: Option<&ParsedCommand>,
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(mut params) = head_tail_read_request(command, "tail") else {
+        let Some(mut params) = head_tail_read_request_from_parsed(parsed, "tail") else {
             return decline("tail", "tail.decline", "unsupported tail shape");
         };
         let path = params
@@ -301,29 +484,18 @@ impl RewriteRule for TailRule {
             params,
         )
     }
-
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
-        call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
-            "read",
-            request,
-        )
-    }
 }
 
-impl RewriteRule for CatAppendRule {
-    fn name(&self) -> &'static str {
-        "cat_append"
-    }
-
-    fn decide(
+impl ParsedRewriteRule for CatAppendRule {
+    fn decide_parsed(
         &self,
+        parsed: Option<&ParsedCommand>,
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = append_request(command) else {
+        let Some(params) = append_request_from_parsed(parsed) else {
             return decline(
                 "cat_append",
                 "cat_append.decline",
@@ -351,32 +523,18 @@ impl RewriteRule for CatAppendRule {
             params,
         )
     }
-
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
-        call_and_footer(
-            crate::commands::edit_match::handle_edit_match(
-                &tool_request("edit_match", request, ctx),
-                ctx,
-            ),
-            "edit",
-            request,
-        )
-    }
 }
 
-impl RewriteRule for SedRule {
-    fn name(&self) -> &'static str {
-        "sed"
-    }
-
-    fn decide(
+impl ParsedRewriteRule for SedRule {
+    fn decide_parsed(
         &self,
+        parsed: Option<&ParsedCommand>,
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = sed_request(command) else {
+        let Some(params) = sed_request_from_parsed(parsed) else {
             return decline("sed", "sed.decline", "unsupported sed shape");
         };
         let path = params
@@ -400,29 +558,18 @@ impl RewriteRule for SedRule {
             params,
         )
     }
-
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
-        call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
-            "read",
-            request,
-        )
-    }
 }
 
-impl RewriteRule for LsRule {
-    fn name(&self) -> &'static str {
-        "ls"
-    }
-
-    fn decide(
+impl ParsedRewriteRule for LsRule {
+    fn decide_parsed(
         &self,
+        parsed: Option<&ParsedCommand>,
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = ls_request(command, ctx) else {
+        let Some(params) = ls_request_from_parsed(parsed, ctx) else {
             return decline("ls", "ls.decline", "unsupported ls shape or target");
         };
         accept(
@@ -433,14 +580,6 @@ impl RewriteRule for LsRule {
             request_id,
             session_id,
             params,
-        )
-    }
-
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
-        call_and_footer(
-            crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
-            "read",
-            request,
         )
     }
 }
@@ -845,8 +984,8 @@ fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
     })
 }
 
-fn grep_request(command: &str, binary: &str) -> Option<Value> {
-    let parsed = parse(command)?;
+fn grep_request_from_parsed(parsed: Option<&ParsedCommand>, binary: &str) -> Option<Value> {
+    let parsed = parsed?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != binary {
         return None;
     }
@@ -1042,8 +1181,8 @@ fn find_matching_files(root: &Path, pattern: &glob::Pattern) -> Option<BTreeSet<
     Some(matches)
 }
 
-fn find_request(command: &str) -> Option<Value> {
-    let parsed = parse(command)?;
+fn find_request_from_parsed(parsed: Option<&ParsedCommand>) -> Option<Value> {
+    let parsed = parsed?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != "find" {
         return None;
     }
@@ -1095,8 +1234,8 @@ fn find_request(command: &str) -> Option<Value> {
     }
 }
 
-fn cat_read_request(command: &str) -> Option<Value> {
-    let parsed = parse(command)?;
+fn cat_read_request_from_parsed(parsed: Option<&ParsedCommand>) -> Option<Value> {
+    let parsed = parsed?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() {
         return None;
     }
@@ -1106,8 +1245,11 @@ fn cat_read_request(command: &str) -> Option<Value> {
     Some(json!({ "file": parsed.args[1] }))
 }
 
-fn head_tail_read_request(command: &str, command_name: &str) -> Option<Value> {
-    let parsed = parse(command)?;
+fn head_tail_read_request_from_parsed(
+    parsed: Option<&ParsedCommand>,
+    command_name: &str,
+) -> Option<Value> {
+    let parsed = parsed?;
     if parsed.appends_to.is_some()
         || parsed.heredoc.is_some()
         || parsed.args.first()? != command_name
@@ -1138,12 +1280,12 @@ fn head_tail_read_request(command: &str, command_name: &str) -> Option<Value> {
     Some(json!({ "file": file, "limit": lines }))
 }
 
-fn append_request(command: &str) -> Option<Value> {
-    let parsed = parse(command)?;
+fn append_request_from_parsed(parsed: Option<&ParsedCommand>) -> Option<Value> {
+    let parsed = parsed?;
     let file = parsed.appends_to.clone()?;
 
     let append_content = if parsed.args == ["cat"] {
-        parsed.heredoc?
+        parsed.heredoc.clone()?
     } else if parsed.heredoc.is_none()
         && parsed.args.first().is_some_and(|arg| arg == "echo")
         && parsed.args.len() >= 2
@@ -1162,8 +1304,8 @@ fn append_request(command: &str) -> Option<Value> {
     }))
 }
 
-fn sed_request(command: &str) -> Option<Value> {
-    let parsed = parse(command)?;
+fn sed_request_from_parsed(parsed: Option<&ParsedCommand>) -> Option<Value> {
+    let parsed = parsed?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() {
         return None;
     }
@@ -1186,8 +1328,8 @@ fn sed_request(command: &str) -> Option<Value> {
     }))
 }
 
-fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
-    let parsed = parse(command)?;
+fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &AppContext) -> Option<Value> {
+    let parsed = parsed?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != "ls" {
         return None;
     }
@@ -1251,6 +1393,16 @@ fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
     }
 
     Some(json!({ "file": target, "include_hidden": include_hidden }))
+}
+
+#[cfg(test)]
+fn grep_request(command: &str, binary: &str) -> Option<Value> {
+    grep_request_from_parsed(parse(command).as_ref(), binary)
+}
+
+#[cfg(test)]
+fn find_request(command: &str) -> Option<Value> {
+    find_request_from_parsed(parse(command).as_ref())
 }
 
 #[cfg(test)]
