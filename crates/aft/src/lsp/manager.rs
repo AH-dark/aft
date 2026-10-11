@@ -432,6 +432,33 @@ where
     pull_file_diagnostics_unlocked_inner(lock, file_path, config, timeout, false)
 }
 
+/// Wait for every expected producer's versioned report without retaining the
+/// manager lock while parked on channel activity. Pre-edit snapshots and exact
+/// notified versions are supplied by the caller, not inferred from cached rows.
+pub fn wait_for_post_edit_diagnostics_unlocked<G>(
+    lock: impl Fn() -> G,
+    file_path: &Path,
+    expected_versions: &[(ServerKey, i32)],
+    pre_snapshot: &HashMap<ServerKey, PreEditSnapshot>,
+    timeout: Duration,
+) -> PostEditWaitOutcome
+where
+    G: std::ops::DerefMut<Target = LspManager>,
+{
+    let mut wait = lock().start_post_edit_diagnostics_wait(
+        file_path,
+        expected_versions,
+        pre_snapshot,
+        timeout,
+    );
+    let mut complete = lock().poll_post_edit_diagnostics_wait(&mut wait, None);
+    while !complete && !wait.deadline_reached() {
+        let event = wait.next_event();
+        complete = lock().poll_post_edit_diagnostics_wait(&mut wait, event);
+    }
+    lock().finish_post_edit_diagnostics_wait(wait)
+}
+
 /// [`pull_file_diagnostics_unlocked`], storing each rust-analyzer report
 /// together with the file's latest `cargo check` results. rust-analyzer
 /// answers a pull with its own analysis only and pushes the compiler's errors
@@ -703,6 +730,10 @@ impl PostEditDiagnosticsWait {
     }
 
     pub(crate) fn next_event(&self) -> Option<ReceivedLspEvent> {
+        #[cfg(all(test, unix))]
+        if let Some(probe) = POST_EDIT_PARK_PROBE.with(|probe| probe.borrow_mut().take()) {
+            probe();
+        }
         let remaining = self
             .deadline
             .saturating_duration_since(std::time::Instant::now());
@@ -716,6 +747,13 @@ impl PostEditDiagnosticsWait {
             default(remaining) => None,
         }
     }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    // Probe actual mutex ownership at the parking boundary and inject reports;
+    // unit tests need no scheduling delay or elapsed-time assertion.
+    static POST_EDIT_PARK_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A subscription for a caller that waits for language-server events with
@@ -3209,7 +3247,10 @@ impl LspManager {
         }
     }
 
-    /// Wait for diagnostics to arrive for a specific file until a timeout expires.
+    /// Cached-data convenience: wait for any matching publication or timeout,
+    /// then return stored rows without proving version or per-producer freshness.
+    /// This retains mutable manager access while waiting. Freshness callers use
+    /// [`wait_for_post_edit_diagnostics_unlocked`] with captured target versions.
     pub fn wait_for_diagnostics(
         &mut self,
         file_path: &Path,
@@ -3718,7 +3759,8 @@ impl LspManager {
         }
     }
 
-    /// Wait for diagnostics to arrive for a specific file until a deadline.
+    /// Wait for any matching publication, then read cached diagnostic rows.
+    /// An empty return or timeout does not prove the file was checked clean.
     ///
     /// Drains already-queued events first, then blocks on the shared event
     /// channel only until either `publishDiagnostics` arrives for this file or
@@ -7377,6 +7419,10 @@ mod startup_regression_tests;
 #[cfg(all(test, unix))]
 #[path = "instance_regression_tests.rs"]
 mod instance_regression_tests;
+
+#[cfg(all(test, unix))]
+#[path = "fresh_wait_regression_tests.rs"]
+mod fresh_wait_regression_tests;
 
 #[cfg(test)]
 mod env_binary_override_tests {

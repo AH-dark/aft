@@ -74,24 +74,42 @@ fn fresh_git_worktree_produces_typescript_diagnostics_without_installing() {
         lsp_paths_extra: vec![bin],
         ..Config::default()
     };
-    let mut manager = LspManager::new();
-    manager.ensure_file_open(&file, &config).unwrap();
-    manager.wait_for_diagnostics(&file, &config, Duration::from_secs(15));
-    let diagnostics = manager.get_diagnostics_for_file(&file);
+    let manager = parking_lot::Mutex::new(LspManager::new());
+    let (pre, expected) = {
+        let mut lsp = manager.lock();
+        let pre = lsp.snapshot_pre_edit_state(&file);
+        let content = std::fs::read_to_string(&file).unwrap();
+        let expected = lsp
+            .notify_file_changed_versioned(&file, &content, &config)
+            .unwrap();
+        (pre, expected)
+    };
+    let result = aft::lsp::manager::wait_for_post_edit_diagnostics_unlocked(
+        || manager.lock(),
+        &file,
+        &expected,
+        &pre,
+        Duration::from_secs(15),
+    );
+    assert!(
+        result.complete(),
+        "fresh worktree producers did not prove their versions: {result:?}"
+    );
+    let diagnostics = result.diagnostics;
     assert!(
         diagnostics
             .iter()
             .any(|d| d.message.contains("not assignable to type 'number'")),
         "expected TS2322, got {diagnostics:?}"
     );
-    let notes = manager.runtime_notes();
+    let notes = manager.lock().runtime_notes();
     assert!(
         notes
             .iter()
             .any(|n| n.contains("not the project's pinned TypeScript")),
         "{notes:?}"
     );
-    manager.shutdown_all();
+    manager.lock().shutdown_all();
     let mut after: Vec<_> = std::fs::read_dir(&fresh)
         .unwrap()
         .map(|e| e.unwrap().file_name())
