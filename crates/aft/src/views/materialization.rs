@@ -529,7 +529,9 @@ fn materialize_reading(
                     signature: symbol.signature.clone(),
                     exported: symbol.exported,
                     default_export: symbol.is_default_export,
-                    entry_point: if parse.language == "go" && symbol.kind == "variable" {
+                    entry_point: if parse.language == "go"
+                        && matches!(symbol.kind.as_str(), "variable" | "method")
+                    {
                         parse.entry_point_symbols.contains(&symbol.scoped_name)
                     } else {
                         symbol.exported
