@@ -468,12 +468,10 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             return keep_last_good(ctx, &root_label, reason);
         }
     };
-    let project_deleted =
-        sources.project.from_file && sources.project.text.is_some() && project.text.is_none();
-    // A held loosening is released once the project file is back to the text
-    // the published values were resolved from, or when the tier is removed.
+    // A held loosening is released once the project file is restored to the
+    // text whose security settings were previously published.
     let was_holding = state.project_hold_active.load(Ordering::Acquire);
-    let holding = !project_deleted && was_holding && project.text != sources.project.text;
+    let holding = was_holding && project.text != sources.project.text;
     if was_holding && !holding {
         state.project_hold_active.store(false, Ordering::Release);
     }
@@ -488,8 +486,9 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
         return ReloadOutcome::Unchanged;
     }
     let project_changed = project.text != sources.project.text;
-    // What the edit would resolve to if only the user file had changed. A
-    // project edit may tighten security keys relative to it, never loosen.
+    // What the config would resolve to if the user tier changed but the project
+    // tier stayed at its last accepted text. A project edit or deletion may
+    // tighten this security floor, but cannot loosen it live.
     let user_only_tiers: Vec<ConfigTier> = [&user, &sources.project]
         .into_iter()
         .filter_map(tier_for)
@@ -527,7 +526,7 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
             .iter()
             .map(|drop| format!("{} ({})", drop.key, drop.reason))
             .collect();
-        let held = if !project_deleted && (project_changed || holding) {
+        let held = if project_changed || holding {
             let mut floor = published.as_ref().clone();
             let user_only_diagnostics =
                 crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
@@ -592,9 +591,9 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
 /// Keep every security key of `candidate` at least as strict as in `floor`,
 /// and name the keys that were held back.
 ///
-/// `floor` is what the files would resolve to with the project file as it was
-/// before this edit, so a project edit can add hardening but not remove it.
-/// The next connect resolves the files afresh and applies a held loosening.
+/// `floor` is what the files resolve to with the previously accepted project
+/// text, so a project edit or deletion can add hardening but cannot remove it
+/// live. The next connect resolves the files afresh and applies a held loosening.
 fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'static str> {
     let mut held = Vec::new();
     if !candidate.lsp_idle_minutes.tightens(floor.lsp_idle_minutes) {

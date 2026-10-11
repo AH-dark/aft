@@ -99,18 +99,28 @@ describe.serial("Pi live config reload", () => {
     expect(bash.compress).toBe(true);
   });
 
-  test("deleting the project file removes its live settings", async () => {
+  test("deleting a project file applies ordinary settings and holds security loosening", async () => {
+    const project = '{ "bash": { "host_fallback": false, "watch_sync_max_ms": 1000 } }';
     const f = await fixture(
-      '{ "bash": { "watch_sync_max_ms": 120000 } }',
-      '{ "bash": { "watch_sync_max_ms": 1000 } }',
+      '{ "bash": { "host_fallback": true, "watch_sync_max_ms": 120000 } }',
+      project,
     );
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
     expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(1000);
     unlinkSync(f.projectPath);
 
-    f.reload.reload();
+    const deleted = f.reload.reload();
 
+    expect(deleted?.held).toEqual(["bash.host_fallback"]);
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
     expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(120000);
     expect(f.notices).toEqual([]);
+
+    writeFileSync(f.projectPath, project);
+    const restored = f.reload.reload();
+    expect(restored?.held).toEqual([]);
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
+    expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(1000);
   });
 
   test("an invalid edit keeps the last valid config", async () => {

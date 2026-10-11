@@ -543,9 +543,9 @@ export function liveConfigReloadLogLine(applied: string[], deferred: string[]): 
 /**
  * Watch the config files and keep `ctx.config` current for the live keys.
  * An invalid or unreadable config keeps the last valid config. Removing the
- * project file is a valid change to the project tier, so the remaining config
- * is applied on the next reload. Right after the watch starts, the files are
- * checked so any change made since startup (before the watch existed) is not missed.
+ * project file reapplies ordinary settings from the remaining tiers, while
+ * security settings that would loosen stay at their published values until
+ * restart. The watch checks files on attachment so startup changes are not missed.
  */
 export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): LiveConfigReload {
   const baseline = options.getConfig();
@@ -554,8 +554,7 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
   // error, but a missing project config is a valid no-project-tier result.
   let acceptedSources = new Set(options.initialSources);
   // The accepted project text is the reference for the security keys listed
-  // in `aftLiveSecurityKeys`. Edits that weaken them wait for restart; deleting
-  // the file removes its tier instead.
+  // in `aftLiveSecurityKeys`. Edits or deletion that weaken them wait for restart.
   let acceptedProjectText = options.initialProjectText ?? null;
   // The texts the last accepted load read, handed to the watch so it records
   // what was applied rather than what it happened to read.
@@ -588,13 +587,11 @@ export function startLiveConfigReload<C>(options: LiveConfigReloadOptions<C>): L
     const held: string[] = [];
     const projectText = loaded.projectText ?? null;
     if (loaded.projectText !== undefined && projectText !== acceptedProjectText) {
-      if (!deletedProjectConfig) {
-        for (const security of options.securityKeys ?? []) {
-          const now = security.key.read(current);
-          if (security.loosens(now, security.key.read(next))) {
-            next = security.key.write(next, now);
-            held.push(security.key.name);
-          }
+      for (const security of options.securityKeys ?? []) {
+        const now = security.key.read(current);
+        if (security.loosens(now, security.key.read(next))) {
+          next = security.key.write(next, now);
+          held.push(security.key.name);
         }
       }
       if (held.length === 0) acceptedProjectText = projectText;

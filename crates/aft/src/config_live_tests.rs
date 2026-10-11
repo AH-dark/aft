@@ -280,10 +280,11 @@ fn deleted_config_file_keeps_the_last_good_config() {
 }
 
 #[test]
-fn deleting_project_config_removes_its_settings_on_live_reload() {
+fn deleting_project_config_applies_ordinary_settings_and_holds_security() {
+    let project = r#"{ "format_on_edit": true, "sandbox": { "enabled": true } }"#;
     let fixture = Fixture::new(
         r#"{ "format_on_edit": false, "sandbox": { "enabled": false } }"#,
-        Some(r#"{ "format_on_edit": true, "sandbox": { "enabled": true } }"#),
+        Some(project),
     );
     assert!(fixture.ctx.config().format_on_edit);
     assert!(fixture.ctx.config().sandbox.enabled);
@@ -293,15 +294,19 @@ fn deleting_project_config_removes_its_settings_on_live_reload() {
 
     assert!(
         applied(&outcome).contains(&"format_on_edit"),
-        "deleting the project file must apply the remaining tier: {outcome:?}"
+        "deleting the project file must apply ordinary settings: {outcome:?}"
     );
-    assert!(
-        applied(&outcome).contains(&"sandbox.enabled"),
-        "deleting the project file must remove project-only sandbox settings: {outcome:?}"
-    );
+    assert_eq!(held(&outcome), vec!["sandbox.enabled"]);
     let config = fixture.ctx.config();
     assert!(!config.format_on_edit);
-    assert!(!config.sandbox.enabled);
+    assert!(config.sandbox.enabled);
+
+    write(&fixture.project_path, project);
+    let restored = fixture.reload();
+    assert!(held(&restored).is_empty());
+    assert!(applied(&restored).contains(&"format_on_edit"));
+    assert!(fixture.ctx.config().format_on_edit);
+    assert!(fixture.ctx.config().sandbox.enabled);
 }
 
 #[test]
@@ -744,7 +749,7 @@ fn a_user_edit_can_still_loosen_what_the_user_set() {
 }
 
 #[test]
-fn a_deleted_project_file_clears_a_previously_relayed_tier() {
+fn deleting_a_file_backed_relayed_tier_holds_security_until_recreated() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().join("project");
     std::fs::create_dir_all(&root).unwrap();
@@ -775,8 +780,14 @@ fn a_deleted_project_file_clears_a_previously_relayed_tier() {
     assert!(ctx.config().sandbox.enabled);
 
     std::fs::remove_file(&project_path).unwrap();
-    assert_eq!(applied(&reload_config_now(&ctx)), vec!["sandbox.enabled"]);
-    assert!(!ctx.config().sandbox.enabled);
+    let deleted = reload_config_now(&ctx);
+    assert_eq!(held(&deleted), vec!["sandbox.enabled"]);
+    assert!(ctx.config().sandbox.enabled);
+
+    write(&project_path, relayed);
+    let restored = reload_config_now(&ctx);
+    assert!(held(&restored).is_empty());
+    assert!(ctx.config().sandbox.enabled);
 }
 
 #[test]

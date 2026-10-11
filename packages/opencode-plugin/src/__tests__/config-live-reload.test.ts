@@ -161,20 +161,28 @@ describe.serial("OpenCode live config reload", () => {
     expect(f.notices[0]).toContain("was deleted");
   });
 
-  test("a deleted project file removes its live settings", async () => {
+  test("deleting a project file applies ordinary settings and holds security loosening", async () => {
+    const project = '{ "bash": { "host_fallback": false, "watch_sync_max_ms": 1000 } }';
     const f = await fixture(
       '{ "bash": { "host_fallback": true, "watch_sync_max_ms": 120000 } }',
-      '{ "bash": { "host_fallback": false, "watch_sync_max_ms": 1000 } }',
+      project,
     );
     expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
     expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(1000);
     unlinkSync(f.projectPath);
 
-    f.reload.reload();
+    const deleted = f.reload.reload();
 
-    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(true);
+    expect(deleted?.held).toEqual(["bash.host_fallback"]);
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
     expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(120000);
     expect(f.notices).toEqual([]);
+
+    writeFileSync(f.projectPath, project);
+    const restored = f.reload.reload();
+    expect(restored?.held).toEqual([]);
+    expect(resolveBashConfig(f.ctx.config).host_fallback).toBe(false);
+    expect(resolveBashConfig(f.ctx.config).watch_sync_max_ms).toBe(1000);
   });
 
   test("a project edit cannot turn host fallback on until the next restart", async () => {
