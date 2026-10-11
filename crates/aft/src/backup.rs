@@ -969,23 +969,23 @@ impl BackupStore {
         self.clear_db_mirror_sync();
     }
 
-    /// Run namespace repair, stale-session GC, and legacy migration at most once
-    /// per process for the selected storage namespace.
+    /// Retry incomplete namespace repair on backup operations. Stale-session GC
+    /// and legacy-format maintenance run once per process/storage namespace.
     ///
-    /// Configure deliberately does not invoke this. The first backup mutation or
-    /// restore pays this one-time maintenance cost, while ordinary binds remain
-    /// independent of harness-wide history.
+    /// Configure deliberately does not invoke this. Backup mutations or restores
+    /// perform the maintenance; ordinary project binding does not enumerate the
+    /// undo histories belonging to other sessions of the selected host.
     pub fn run_process_maintenance_once(&mut self) {
         let Some(storage_dir) = self.storage_dir.clone() else {
             return;
         };
+        self.repair_root_backups_if_needed();
         let key = (storage_dir, self.effective_storage_harness());
         if !BACKUP_MAINTENANCE_KEYS.lock().unwrap().insert(key) {
             return;
         }
 
         self.record_disk_io_for_tests();
-        self.repair_root_backups_if_needed();
         self.gc_stale_sessions(self.maintenance_ttl_hours);
         self.migrate_legacy_layout_if_needed();
         self.tighten_permissions_if_needed();
@@ -2953,61 +2953,150 @@ impl BackupStore {
         }
     }
 
-    fn repair_root_backups_if_needed(&self) {
+    fn repair_root_backups_if_needed(&self) -> LegacyBackupRepairReport {
+        let mut report = LegacyBackupRepairReport::default();
         let (Some(storage_dir), Some(harness)) =
             (&self.storage_dir, self.effective_storage_harness())
         else {
-            return;
+            return report;
         };
-        let root_backups = storage_dir.join("backups");
-        if !dir_has_entries(&root_backups) {
-            return;
+        let source_root = storage_dir.join("backups");
+        if !dir_has_entries(&source_root) {
+            return report;
         }
-        let harness_backups = storage_dir.join(harness).join("backups");
-        if dir_has_entries(&harness_backups) {
-            return;
+        let target_root = storage_dir.join(harness).join("backups");
+        let Ok(Some(_namespace)) = backup_namespace_gate(storage_dir, false) else {
+            report.protected += 1;
+            report.leftovers += 1;
+            crate::slog_warn!("legacy backup repair deferred: namespace is busy; retry on the next backup operation");
+            return report;
+        };
+        if let Err(error) = create_private_durable_dir(&target_root) {
+            report.failed += 1;
+            report.leftovers += 1;
+            crate::slog_warn!(
+                "failed to create harness backup dir {}: {}",
+                target_root.display(),
+                error
+            );
+            return report;
         }
-        if let Some(parent) = harness_backups.parent() {
-            if let Err(error) = create_private_durable_dir(parent) {
-                crate::slog_warn!(
-                    "failed to create harness backup dir {}: {}",
-                    parent.display(),
-                    error
-                );
-                return;
-            }
-        }
-        if harness_backups.exists() {
-            let _ = std::fs::remove_dir(&harness_backups);
-        }
-        match std::fs::rename(&root_backups, &harness_backups) {
-            Ok(()) => {
-                crate::slog_info!(
-                    "moved legacy root backups into harness namespace: {}",
-                    harness_backups.display()
-                );
-            }
+        let entries = match std::fs::read_dir(&source_root) {
+            Ok(entries) => entries,
             Err(error) => {
+                report.failed += 1;
+                report.leftovers += 1;
                 crate::slog_warn!(
-                    "failed to move legacy root backups into {}: {}; trying child merge",
-                    harness_backups.display(),
+                    "failed to enumerate legacy backups {}: {}",
+                    source_root.display(),
                     error
                 );
-                if create_private_durable_dir(&harness_backups).is_err() {
-                    return;
+                return report;
+            }
+        };
+        let mut retained_coordination = false;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    report.failed += 1;
+                    report.leftovers += 1;
+                    continue;
                 }
-                if let Ok(entries) = std::fs::read_dir(&root_backups) {
-                    for entry in entries.flatten() {
-                        let source = entry.path();
-                        let target = harness_backups.join(entry.file_name());
-                        if !target.exists() {
-                            let _ = std::fs::rename(source, target);
-                        }
+            };
+            let name = entry.file_name();
+            // Session gates must keep their inode identity for waiting writers.
+            // They are coordination files, not backup histories to migrate.
+            if name.to_string_lossy().starts_with(".session-gc-")
+                && name.to_string_lossy().ends_with(".lock")
+            {
+                retained_coordination = true;
+                continue;
+            }
+            let source = entry.path();
+            let target = target_root.join(&name);
+            match target.try_exists() {
+                Ok(true) => {
+                    report.conflicts += 1;
+                    report.leftovers += 1;
+                    continue;
+                }
+                Err(_) => {
+                    report.failed += 1;
+                    report.leftovers += 1;
+                    continue;
+                }
+                Ok(false) => {}
+            }
+            let is_directory = match entry.file_type() {
+                Ok(kind) => kind.is_dir(),
+                Err(_) => {
+                    report.failed += 1;
+                    report.leftovers += 1;
+                    continue;
+                }
+            };
+            if is_directory {
+                match acquire_inactive_session_leases(&source) {
+                    Ok(Some(leases)) => drop(leases),
+                    Ok(None) => {
+                        report.protected += 1;
+                        report.leftovers += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        report.failed += 1;
+                        report.leftovers += 1;
+                        continue;
                     }
                 }
-                let _ = std::fs::remove_dir(&root_backups);
+            }
+            // Namespace exclusion prevents new stack leases until this move
+            // finishes. The no-replace rename also preserves a racing target.
+            match legacy_backup_move(&source, &target) {
+                Ok(()) => {
+                    report.moved += 1;
+                    if crate::durability::sync_dir(&source_root)
+                        .and_then(|()| crate::durability::sync_dir(&target_root))
+                        .is_err()
+                    {
+                        report.failed += 1;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    report.conflicts += 1;
+                    report.leftovers += 1;
+                }
+                Err(_) => {
+                    report.failed += 1;
+                    report.leftovers += 1;
+                }
             }
         }
+        if report.leftovers == 0 && !retained_coordination {
+            if let Err(error) = std::fs::remove_dir(&source_root) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    report.failed += 1;
+                    report.leftovers += 1;
+                    crate::slog_warn!(
+                        "failed to remove repaired legacy backup directory {}: {}",
+                        source_root.display(),
+                        error
+                    );
+                }
+            } else if crate::durability::sync_dir(storage_dir).is_err() {
+                report.failed += 1;
+            }
+        }
+        if report.leftovers > 0 || report.failed > 0 {
+            crate::slog_warn!("legacy backup repair into {}: moved={} conflicts={} protected={} failed={} leftovers={}; retry on the next backup operation", target_root.display(), report.moved, report.conflicts, report.protected, report.failed, report.leftovers);
+        } else if report.moved > 0 {
+            crate::slog_info!(
+                "moved legacy root backups into harness namespace: {}",
+                target_root.display()
+            );
+        }
+        report
     }
 
     fn gc_stale_sessions(&mut self, ttl_hours: u32) {
@@ -3473,6 +3562,23 @@ impl BackupStore {
             return Ok(None);
         };
         self.record_disk_io_for_tests();
+        let namespace_root = self.storage_dir.as_deref().unwrap();
+        create_private_durable_dir(namespace_root).map_err(|error| AftError::IoError {
+            path: namespace_root.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let _namespace =
+            backup_namespace_gate(namespace_root, true).map_err(|error| AftError::IoError {
+                path: namespace_root.display().to_string(),
+                message: error.to_string(),
+            })?;
+        #[cfg(test)]
+        AFTER_BACKUP_NAMESPACE_ADMISSION.with(|slot| {
+            let hook = slot.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook(namespace_root);
+            }
+        });
         let parent = session_dir.parent().unwrap();
         create_private_durable_dir(parent).map_err(|error| AftError::IoError {
             path: parent.display().to_string(),
@@ -5477,6 +5583,111 @@ fn session_gc_lock_path(session_dir: &Path) -> PathBuf {
         .join(format!(".session-gc-{stripe:02}.lock"))
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LegacyBackupRepairReport {
+    moved: usize,
+    conflicts: usize,
+    protected: usize,
+    failed: usize,
+    leftovers: usize,
+}
+
+#[cfg(test)]
+type NamespaceAdmissionHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    static AFTER_BACKUP_NAMESPACE_ADMISSION: std::cell::RefCell<Option<NamespaceAdmissionHook>> = const { std::cell::RefCell::new(None) };
+}
+
+fn backup_namespace_gate(storage: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
+    let path = storage.join(".backup-repair.lock");
+    crate::production_storage::refuse_write(&path)?;
+    let mut options = crate::private_storage::options();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if wait {
+        file.lock()?;
+    } else {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Ok(Some(file))
+}
+
+/// Publish a legacy entry only if its destination is still unclaimed. An
+/// existence check followed by ordinary rename can replace a racing empty dir.
+fn legacy_backup_move(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source =
+            std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+        let target =
+            std::ffi::CString::new(target.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (source, target);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "exclusive legacy backup rename is unavailable",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if result == 0 {
+                return Ok(());
+            }
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result = unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (source, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exclusive legacy backup rename is unavailable",
+        ))
+    }
+}
+
 fn session_gc_gate(session_dir: &Path, wait: bool) -> std::io::Result<Option<std::fs::File>> {
     let path = session_gc_lock_path(session_dir);
     crate::production_storage::refuse_write(&path)?;
@@ -5606,6 +5817,191 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_backup_repair_reports_unwritable_namespace_without_losing_source() {
+        let storage = tempfile::tempdir().unwrap();
+        let source = storage.path().join("backups/legacy/payload");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"retain legacy").unwrap();
+        let target = storage.path().join("opencode/backups");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"occupied namespace").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        let report = store.repair_root_backups_if_needed();
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.leftovers, 1);
+        assert_eq!(report.moved, 0);
+        assert_eq!(fs::read(source).unwrap(), b"retain legacy");
+        assert_eq!(fs::read(target).unwrap(), b"occupied namespace");
+    }
+    #[test]
+    fn legacy_backup_repair_reports_progress_and_unresolved_conflicts() {
+        let storage = tempfile::tempdir().unwrap();
+        let source = storage.path().join("backups");
+        let target = storage.path().join("opencode/backups");
+        for path in [
+            source.join("conflict"),
+            source.join("available"),
+            target.join("conflict"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(source.join("available/payload"), b"move").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        let report = store.repair_root_backups_if_needed();
+        assert_eq!(
+            report,
+            LegacyBackupRepairReport {
+                moved: 1,
+                conflicts: 1,
+                leftovers: 1,
+                ..Default::default()
+            }
+        );
+        assert!(source.join("conflict").is_dir());
+        assert!(target.join("conflict").is_dir());
+    }
+
+    #[test]
+    fn backup_stack_admission_holds_namespace_repair_exclusion() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.path().to_path_buf(), 72);
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hook_observed = observed.clone();
+        AFTER_BACKUP_NAMESPACE_ADMISSION.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |root| {
+                hook_observed.set(true);
+                assert!(
+                    backup_namespace_gate(root, false).unwrap().is_none(),
+                    "stack admission did not exclude namespace repair"
+                );
+            }))
+        });
+        let lease = store
+            .acquire_stack_disk_lock("admission", &storage.path().join("user.txt"))
+            .unwrap();
+        assert!(observed.get(), "actual stack-admission hook did not run");
+        assert!(lease.is_some());
+    }
+    #[test]
+    fn legacy_backup_merge_moves_nonconflicts_and_preserves_both_conflicts() {
+        let storage = tempfile::tempdir().unwrap();
+        let source = storage.path().join("backups");
+        let target = storage.path().join("opencode/backups");
+        for path in [
+            source.join("conflict"),
+            source.join("available"),
+            target.join("conflict"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(source.join("conflict/payload"), b"legacy conflict").unwrap();
+        fs::write(target.join("conflict/payload"), b"current conflict").unwrap();
+        fs::write(source.join("available/payload"), b"move this").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        store.run_process_maintenance_once();
+        assert_eq!(
+            fs::read(source.join("conflict/payload")).unwrap(),
+            b"legacy conflict"
+        );
+        assert_eq!(
+            fs::read(target.join("conflict/payload")).unwrap(),
+            b"current conflict"
+        );
+        assert_eq!(
+            fs::read(target.join("available/payload")).unwrap(),
+            b"move this",
+            "a populated destination must not suppress nonconflicting repair"
+        );
+        assert!(!source.join("available").exists());
+    }
+
+    #[test]
+    fn legacy_backup_repair_retries_after_a_conflict_is_resolved() {
+        let storage = tempfile::tempdir().unwrap();
+        let source = storage.path().join("backups/conflict");
+        let target = storage.path().join("opencode/backups/conflict");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(source.join("payload"), b"legacy").unwrap();
+        fs::write(target.join("payload"), b"current").unwrap();
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        store.run_process_maintenance_once();
+        assert!(source.join("payload").exists());
+        fs::remove_dir_all(&target).unwrap();
+        store.run_process_maintenance_once();
+        assert_eq!(
+            fs::read(target.join("payload")).unwrap(),
+            b"legacy",
+            "a partial repair was permanently marked complete"
+        );
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn legacy_backup_move_never_replaces_a_reserved_empty_destination() {
+        let storage = tempfile::tempdir().unwrap();
+        let source = storage.path().join("legacy");
+        let target = storage.path().join("reserved");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(source.join("payload"), b"legacy").unwrap();
+        assert!(
+            legacy_backup_move(&source, &target).is_err(),
+            "a competing empty destination must not be replaced"
+        );
+        assert_eq!(fs::read(source.join("payload")).unwrap(), b"legacy");
+        assert!(target.is_dir());
+        assert!(!target.join("payload").exists());
+    }
+
+    #[test]
+    fn legacy_backup_repair_preserves_an_active_source_stack() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut source_store = BackupStore::new();
+        source_store.set_storage_dir(storage.path().to_path_buf(), 72);
+        let key = storage.path().join("user.txt");
+        let lease = source_store
+            .acquire_stack_disk_lock("active", &key)
+            .unwrap()
+            .unwrap();
+        let session = source_store.session_dir("active").unwrap();
+        fs::write(session.join("payload"), b"active writer").unwrap();
+        let mut destination = BackupStore::new();
+        destination.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        destination.run_process_maintenance_once();
+        assert!(
+            session.exists(),
+            "repair moved a stack still owned by a writer"
+        );
+        assert!(lease.verify_writer_epoch().unwrap());
+        assert_eq!(fs::read(session.join("payload")).unwrap(), b"active writer");
+    }
     #[test]
     fn stale_session_gc_preserves_active_stack_lease() {
         let storage = tempfile::tempdir().unwrap();
