@@ -31,7 +31,7 @@ use super::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 /// Bump when extracted evidence or its interpretation changes. Version 3 adds
 /// receiver facts and precise typed dispatch to the deterministic, single-parse
 /// extraction. Earlier blobs must be rebuilt instead of seeding old call edges.
-pub const PRODUCER: &str = "ruled-callgraph-v4-package-initializers-macro-owners";
+pub const PRODUCER: &str = "ruled-callgraph-v5-nested-use-macro-imports-go-init-callbacks";
 
 #[derive(Clone, Debug)]
 pub struct CallgraphAttachment {

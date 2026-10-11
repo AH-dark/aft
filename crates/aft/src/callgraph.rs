@@ -1401,6 +1401,7 @@ fn collect_calls_by_symbol(
         line_index,
         symbols,
         extract_calls_full(source, root, 0, source.len(), lang),
+        lang,
     )
 }
 
@@ -1486,6 +1487,7 @@ fn collect_rust_value_refs_by_symbol(
         line_index,
         symbols,
         extract_rust_value_references(source, root),
+        LangId::Rust,
     )
 }
 
@@ -1493,6 +1495,7 @@ fn attribute_sites_to_symbols(
     line_index: &SourceLineIndex,
     symbols: &[Symbol],
     raw_sites: Vec<(String, String, u32, usize, usize)>,
+    lang: LangId,
 ) -> HashMap<String, Vec<CallSite>> {
     let mut ranges = symbols
         .iter()
@@ -1548,7 +1551,16 @@ fn attribute_sites_to_symbols(
     let mut calls_by_symbol = HashMap::new();
     for (symbol, sites) in symbols.iter().zip(sites_by_symbol) {
         if !sites.is_empty() {
-            calls_by_symbol.insert(symbol_identity(symbol), sites);
+            if lang == LangId::Go && symbol.kind == SymbolKind::Function && symbol.name == "init" {
+                // Go runs every init declaration in a file. They share a
+                // file-local owner, so retain all bodies rather than the last.
+                calls_by_symbol
+                    .entry(symbol_identity(symbol))
+                    .or_insert_with(Vec::new)
+                    .extend(sites);
+            } else {
+                calls_by_symbol.insert(symbol_identity(symbol), sites);
+            }
         }
     }
     if !top_level_sites.is_empty() {
@@ -1604,8 +1616,8 @@ pub(crate) fn build_file_data_from_tree(
             split_macro_body_calls(line_index, &symbols, raw_calls, &macro_facts.bodies);
         macro_body_calls_by_macro = body_calls;
         macro_mentions_by_symbol =
-            attribute_sites_to_symbols(line_index, &symbols, macro_facts.unparsed_mentions);
-        attribute_sites_to_symbols(line_index, &symbols, raw_calls)
+            attribute_sites_to_symbols(line_index, &symbols, macro_facts.unparsed_mentions, lang);
+        attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang)
     } else {
         collect_calls_by_symbol(&source, root, lang, &symbols, line_index)
     };
@@ -1616,6 +1628,7 @@ pub(crate) fn build_file_data_from_tree(
             line_index,
             &symbols,
             crate::calls::extract_go_value_references(source, root),
+            lang,
         )
     } else {
         HashMap::new()

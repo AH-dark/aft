@@ -1536,20 +1536,28 @@ impl EmissionParse {
         let refs_by_ordinal = blob
             .parse()
             .into_iter()
-            .flat_map(|parse| parse.refs.iter().enumerate())
-            .fold(HashMap::new(), |mut by_ordinal, (position, reference)| {
-                // Keep the cold writer's first-reference metadata when several
-                // references share an AST ordinal (including macro arguments).
-                match by_ordinal.entry(reference.ordinal) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(position);
-                    }
-                    std::collections::hash_map::Entry::Occupied(_) => {
-                        colliding_ordinals.insert(reference.ordinal);
+            .flat_map(|parse| {
+                let keys = parse.reference_keys();
+                let mut counts = HashMap::new();
+                for reference in &parse.refs {
+                    *counts.entry(reference.ordinal).or_insert(0usize) += 1;
+                }
+                // Preserve main's cold-order replay protection for every bound
+                // key belonging to a group that shared an original AST ordinal.
+                for (reference, key) in parse.refs.iter().zip(&keys) {
+                    if counts[&reference.ordinal] > 1 {
+                        colliding_ordinals.insert(*key);
                     }
                 }
-                by_ordinal
-            });
+                keys.into_iter().enumerate()
+            })
+            .fold(
+                HashMap::new(),
+                |mut by_ordinal, (position, reference_key)| {
+                    by_ordinal.insert(reference_key, position);
+                    by_ordinal
+                },
+            );
         Self {
             blob,
             refs_by_ordinal,

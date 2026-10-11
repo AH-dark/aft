@@ -754,7 +754,11 @@ fn rust_module_refs(source: &str, lang: LangId, root: tree_sitter::Node<'_>) -> 
                     kind: BlobRefKind::Module,
                     caller_symbol: None,
                     short_name: Some(module_name.clone()),
-                    full_ref: Some(module_name.clone()),
+                    full_ref: Some(if super::rust_module_has_macro_use(source, node) {
+                        format!("#[macro_use] mod {module_name};")
+                    } else {
+                        module_name.clone()
+                    }),
                     module_path: Some(module_name),
                     line: node.start_position().row as u32 + 1,
                     byte_start: node.start_byte(),
@@ -981,6 +985,61 @@ fn bound_name(name: &str, path: &str) -> String {
 }
 
 impl ParseBlob {
+    /// AST ordinals stay intact in the blob. When several facts occupy one
+    /// ordinal, their bound keys must also distinguish source span and caller.
+    /// Singleton references retain their historical key; collision suffixes
+    /// hash only stable, path-free source facts, never map order or rowids.
+    pub(crate) fn reference_keys(&self) -> Vec<u32> {
+        let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (position, reference) in self.refs.iter().enumerate() {
+            groups.entry(reference.ordinal).or_default().push(position);
+        }
+        let mut used = groups.keys().copied().collect::<BTreeSet<_>>();
+        let mut keys = self.refs.iter().map(|r| r.ordinal).collect::<Vec<_>>();
+        for (ordinal, positions) in groups {
+            if positions.len() < 2 {
+                continue;
+            }
+            let calls = positions
+                .iter()
+                .copied()
+                .filter(|p| self.refs[*p].kind == BlobRefKind::Call)
+                .collect::<Vec<_>>();
+            let primary = if calls.len() == 1 {
+                calls[0]
+            } else {
+                positions[0]
+            };
+            for position in positions {
+                if position == primary {
+                    continue;
+                }
+                let reference = &self.refs[position];
+                let bytes = serde_json::to_vec(&(
+                    "bound-reference-v2",
+                    ordinal,
+                    reference.kind,
+                    reference.byte_start,
+                    reference.byte_end,
+                    &reference.caller_symbol,
+                    &reference.full_ref,
+                    &reference.module_path,
+                    &reference.local_name,
+                    &reference.requested_name,
+                ))
+                .expect("source facts serialize");
+                let hash = blake3::hash(&bytes);
+                let mut key =
+                    u32::from_le_bytes(hash.as_bytes()[..4].try_into().expect("four hash bytes"));
+                while !used.insert(key) {
+                    key = key.wrapping_add(1);
+                }
+                keys[position] = key;
+            }
+        }
+        keys
+    }
+
     fn file_data(&self, path: &str) -> Result<FileCallData, ManifestJoinError> {
         let lang = language_id(&self.language)
             .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(self.language.clone()))?;
@@ -1164,7 +1223,9 @@ impl ParseBlob {
         }
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
-        for (position, raw) in self.refs.iter().enumerate() {
+        for (position, (raw, reference_key)) in
+            self.refs.iter().zip(self.reference_keys()).enumerate()
+        {
             let position = u32::try_from(position).expect("reference vector fits u32");
             let dependencies =
                 if let Some(dependencies) = cached.and_then(|cache| cache.get(&position)) {
@@ -1205,7 +1266,7 @@ impl ParseBlob {
                 caller_nodes.get(name).map(|id| (*id).clone())
             });
             raw_refs.push(super::RawRef {
-                ref_id: format!("{path}:{}:{:?}", raw.ordinal, raw.kind),
+                ref_id: format!("{path}:{reference_key}:{:?}", raw.kind),
                 caller_node,
                 caller_symbol,
                 caller_file: path.to_string(),
@@ -1313,10 +1374,15 @@ impl JoinResult {
                     .map(|site| (path.as_bytes().to_vec(), site.ordinal)),
             );
             let extract = blob.bind(rel, &paths)?;
-            for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
+            for ((raw, bound), reference_key) in blob
+                .refs
+                .iter()
+                .zip(&extract.raw_refs)
+                .zip(blob.reference_keys())
+            {
                 let ref_key = CallerRefKey {
                     caller_blob_key: key.clone(),
-                    ref_ordinal: raw.ordinal,
+                    ref_ordinal: reference_key,
                     caller_path: path.as_bytes().to_vec(),
                 };
                 if selected.is_none_or(|set| set.contains(&ref_key)) {
@@ -1410,10 +1476,12 @@ impl JoinResult {
                 continue;
             };
             if let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(&loaded[key])? {
-                current_keys.extend(blob.refs.iter().map(|raw| CallerRefKey {
-                    caller_blob_key: key.clone(),
-                    ref_ordinal: raw.ordinal,
-                    caller_path: path.as_bytes().to_vec(),
+                current_keys.extend(blob.reference_keys().into_iter().map(|reference_key| {
+                    CallerRefKey {
+                        caller_blob_key: key.clone(),
+                        ref_ordinal: reference_key,
+                        caller_path: path.as_bytes().to_vec(),
+                    }
                 }));
             }
         }
@@ -1722,6 +1790,7 @@ struct ViewFileSurface {
     node_kind_by_id: BTreeMap<String, String>,
     module_targets: BTreeMap<String, Option<String>>,
     declared_module_targets: BTreeMap<String, Option<String>>,
+    macro_use_module_targets: BTreeSet<String>,
     reexports: Vec<(Option<String>, BTreeMap<String, String>, bool)>,
 }
 
@@ -1737,6 +1806,7 @@ impl ViewFileSurface {
             node_kind_by_id: index.node_kind_by_id.clone().into_iter().collect(),
             module_targets: index.module_targets.clone().into_iter().collect(),
             declared_module_targets: index.declared_module_targets.clone().into_iter().collect(),
+            macro_use_module_targets: index.macro_use_module_targets.clone(),
             reexports: index
                 .reexports
                 .iter()
@@ -1762,6 +1832,7 @@ impl ViewFileSurface {
             node_kind_by_id: self.node_kind_by_id.clone().into_iter().collect(),
             module_targets: self.module_targets.clone().into_iter().collect(),
             declared_module_targets: self.declared_module_targets.clone().into_iter().collect(),
+            macro_use_module_targets: self.macro_use_module_targets.clone(),
             reexports: self
                 .reexports
                 .iter()
@@ -2224,11 +2295,16 @@ fn join_manifest_with_surfaces(
         bindings.insert(rel.to_string(), binding);
         if resolve {
             let caller_work = work.entry(rel.to_string()).or_default();
-            for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
+            for ((raw, bound), reference_key) in blob
+                .refs
+                .iter()
+                .zip(&extract.raw_refs)
+                .zip(blob.reference_keys())
+            {
                 caller_work.push((
                     CallerRefKey {
                         caller_blob_key: key.clone(),
-                        ref_ordinal: raw.ordinal,
+                        ref_ordinal: reference_key,
                         caller_path: path.as_bytes().to_vec(),
                     },
                     (raw.kind, bound.clone()),
@@ -2319,11 +2395,16 @@ fn join_manifest_with_surfaces(
         let extract =
             blob.bind_with_dependencies(caller, &paths, Some(&bindings[caller].references))?;
         let caller_work = work.entry(caller.clone()).or_default();
-        for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
+        for ((raw, bound), reference_key) in blob
+            .refs
+            .iter()
+            .zip(&extract.raw_refs)
+            .zip(blob.reference_keys())
+        {
             caller_work.push((
                 CallerRefKey {
                     caller_blob_key: key.clone(),
-                    ref_ordinal: raw.ordinal,
+                    ref_ordinal: reference_key,
                     caller_path: caller.as_bytes().to_vec(),
                 },
                 (raw.kind, bound.clone()),
@@ -2498,6 +2579,7 @@ fn join_manifest_with_surfaces(
 enum ViewSurfaceQuery {
     Language(String),
     Module(String, String),
+    MacroUse(String),
     Parent(String),
     Reexports(String),
     Node(String, String),
@@ -2546,6 +2628,7 @@ impl ViewSurfaceQuery {
                 vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()]
             }
             Self::Language(file)
+            | Self::MacroUse(file)
             | Self::Module(file, _)
             | Self::Reexports(file)
             | Self::Node(file, _)
@@ -2563,6 +2646,7 @@ impl ViewSurfaceQuery {
                 surface_value(&index.lang_for(file).map(|lang| format!("{lang:?}")))
             }
             Self::Module(file, module) => surface_value(&index.module_target(file, module)),
+            Self::MacroUse(file) => surface_value(&index.macro_use_modules(file)),
             Self::Parent(file) => surface_value(&index.module_parent(file)),
             Self::Reexports(file) => reexport_surface(&index.reexports_for(file)),
             Self::Node(file, symbol) => surface_value(&index.node_for_symbol(file, symbol)),
@@ -2597,6 +2681,11 @@ impl<I> ViewSurfaceIndex<'_, I> {
 }
 
 impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
+    fn macro_use_modules(&self, file: &str) -> Vec<String> {
+        let value = self.inner.macro_use_modules(file);
+        self.record(ViewSurfaceQuery::MacroUse(file.into()), &value);
+        value
+    }
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
         self.inner.go_package_files(caller_file, module)
     }
