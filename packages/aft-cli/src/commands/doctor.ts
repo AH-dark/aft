@@ -1822,11 +1822,7 @@ async function clearPluginCache(
 }
 
 function reportLspCacheClear(cleanup: ClearResult): void {
-  if (cleanup.skipped?.length) {
-    log.warn(
-      `LSP install cache: clear skipped; an installer, another clear, or an unverifiable lease is present (${cleanup.skipped.length} entries retained)`,
-    );
-  } else if (cleanup.cleared.length === 0) {
+  if (cleanup.cleared.length === 0) {
     log.info("LSP install cache: nothing to clear, reclaimed 0 B");
   } else {
     log.success(

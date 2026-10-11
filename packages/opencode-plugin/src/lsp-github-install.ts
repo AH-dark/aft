@@ -63,7 +63,6 @@ import {
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
-  acquireInstallLock,
   readInstalledMetaIn,
   readVersionCheck,
   shouldRecheckVersion,
@@ -1255,16 +1254,6 @@ async function downloadAndInstall(
 
 /* ─────────────────────────── per-server flow ─────────────────────────── */
 
-function validateCachedGithubInstallWithLock(spec: GithubServerSpec, platform: Platform): boolean {
-  const lease = acquireInstallLock(spec.githubRepo);
-  if (!lease) return false;
-  try {
-    return validateCachedGithubInstall(spec, platform);
-  } finally {
-    lease.release();
-  }
-}
-
 async function ensureGithubInstalled(
   spec: GithubServerSpec,
   config: GithubInstallConfig,
@@ -1451,7 +1440,7 @@ export function runGithubAutoInstall(
   for (const spec of GITHUB_LSP_TABLE) {
     if (
       isGithubInstalled(spec, host.platform) &&
-      validateCachedGithubInstallWithLock(spec, host.platform)
+      validateCachedGithubInstall(spec, host.platform)
     ) {
       cachedBinDirs.push(ghBinDir(spec));
     }
@@ -1512,7 +1501,7 @@ export function runGithubAutoInstall(
       return GITHUB_LSP_TABLE.filter(
         (spec) =>
           isGithubInstalled(spec, currentHost.platform) &&
-          validateCachedGithubInstallWithLock(spec, currentHost.platform),
+          validateCachedGithubInstall(spec, currentHost.platform),
       ).map((spec) => ghBinDir(spec));
     },
   };

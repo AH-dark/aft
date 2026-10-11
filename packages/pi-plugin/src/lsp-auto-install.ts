@@ -42,7 +42,6 @@ import {
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
-  acquireInstallLock,
   type InstallLockLease,
   isInstalled,
   lspBinaryPath,
@@ -621,14 +620,11 @@ export function installedVersionAllowed(spec: NpmServerSpec, config: AutoInstall
 
 /** A cached install that is present, untampered, and of an allowed version. */
 function cachedInstallUsable(spec: NpmServerSpec, config: AutoInstallConfig): boolean {
-  if (!isInstalled(spec.npm, spec.binary)) return false;
-  const lease = acquireInstallLock(spec.npm);
-  if (!lease) return false;
-  try {
-    return validateCachedNpmInstall(spec) && installedVersionAllowed(spec, config);
-  } finally {
-    lease.release();
-  }
+  return (
+    isInstalled(spec.npm, spec.binary) &&
+    validateCachedNpmInstall(spec) &&
+    installedVersionAllowed(spec, config)
+  );
 }
 
 /**

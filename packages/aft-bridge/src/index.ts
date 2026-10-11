@@ -230,13 +230,7 @@ export {
   sampleBridgeLifecycleCensus,
 } from "./location-lifecycle.js";
 export type { Logger, LogMeta } from "./logger.js";
-export {
-  acquireLspCacheClearLease,
-  acquireLspInstallLease,
-  type LspInstallLease,
-  lspNpmInstallInvocation,
-  lspPublicationCutoff,
-} from "./lsp-install-lease.js";
+export { lspNpmInstallInvocation, lspPublicationCutoff } from "./lsp-npm-policy.js";
 // --- which incoming messages interrupt a blocking bash wait ---
 export {
   BASH_WAIT_DETACH_MAGIC_KEYWORD,
