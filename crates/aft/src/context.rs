@@ -8080,8 +8080,10 @@ impl AppContext {
         self.callgraph_cold_build_spawn_count
             .fetch_add(1, Ordering::SeqCst);
         let lifecycle = self.subc_lifecycle.clone();
+        let test_hooks = crate::callgraph_store::CallgraphBackgroundTestHooks::capture();
 
         std::thread::spawn(move || {
+            let _test_hooks = test_hooks.install();
             let _permit = permit;
             let mut settlement = CallGraphStoreBuildSettlement::new(tx, force_token, persist_epoch);
             crate::log_ctx::with_session(session_id, || {

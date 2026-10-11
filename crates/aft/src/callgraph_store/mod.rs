@@ -1408,9 +1408,10 @@ mod write_amplification_tests {
 
 #[cfg(test)]
 type ColdBuildBeforePublishObserver = dyn Fn() + Send + Sync + 'static;
-// THREAD-LOCAL, not a process-global: the observer fires synchronously on the
-// thread running the cold build, and the only caller (a test) installs and
-// clears it on its own thread. A process-global `Mutex<Option<...>>` raced
+// THREAD-LOCAL, not a process-global: tests install and clear the observer on
+// their own thread. Context workers explicitly inherit the initiating thread's
+// hooks so simulated disk availability and build observations cover background
+// work too. A process-global `Mutex<Option<...>>` raced
 // across parallel tests — one test's installed observer fired during ANOTHER
 // test's `cold_build_with_lease`, asserting against the wrong build's edges
 // (flaked on Windows CI under parallel scheduling). Production never sets it.
@@ -1510,6 +1511,39 @@ fn notify_cold_build_extract_observer(_paths: &[PathBuf]) {}
 #[doc(hidden)]
 pub fn set_legacy_migration_available_disk_for_test(bytes: Option<u64>) {
     MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow_mut() = bytes);
+}
+
+/// Carry only the initiating test's hooks across the context's worker boundary.
+/// Keeping them thread-local prevents unrelated parallel roots from inheriting
+/// another test's simulated disk floor or cold-build observer.
+pub(crate) struct CallgraphBackgroundTestHooks {
+    available_disk: Option<u64>,
+    swap_observer: Option<Arc<ColdBuildSwapObserver>>,
+}
+
+impl CallgraphBackgroundTestHooks {
+    pub(crate) fn capture() -> Self {
+        Self {
+            available_disk: MIGRATION_AVAILABLE_DISK_OVERRIDE.with(|slot| *slot.borrow()),
+            swap_observer: COLD_BUILD_SWAP_OBSERVER.with(|slot| slot.borrow().clone()),
+        }
+    }
+
+    pub(crate) fn install(self) -> CallgraphBackgroundTestHooksGuard {
+        let previous = Self::capture();
+        set_legacy_migration_available_disk_for_test(self.available_disk);
+        set_cold_build_swap_observer(self.swap_observer);
+        CallgraphBackgroundTestHooksGuard(previous)
+    }
+}
+
+pub(crate) struct CallgraphBackgroundTestHooksGuard(CallgraphBackgroundTestHooks);
+
+impl Drop for CallgraphBackgroundTestHooksGuard {
+    fn drop(&mut self) {
+        set_legacy_migration_available_disk_for_test(self.0.available_disk);
+        set_cold_build_swap_observer(self.0.swap_observer.take());
+    }
 }
 
 #[doc(hidden)]
