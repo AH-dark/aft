@@ -14,6 +14,8 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { interruptBashWaitsForChatMessage } from "./bash-wait-detach.js";
 import {
   appendInTurnBgCompletions,
+  appendPendingWakeRecovery,
+  cancelPendingWakesForContext,
   extractSessionID,
   getActiveSessionId,
   handleIdleBgCompletions,
@@ -550,6 +552,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   let clearInspectTier2Idle = () => {};
   let clearAnnouncementTimer = () => {};
   const shutdownCleanup = registerShutdownCleanup(async (reason) => {
+    cancelPendingWakesForContext(ctx);
     autoUpdateAbort.abort();
     liveConfigReload.stop();
     clearInspectTier2Idle();
@@ -852,9 +855,22 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   return {
     tool: allTools,
     "experimental.chat.system.transform": async (
-      _input: { sessionID?: string; model: unknown },
+      systemInput: { sessionID?: string; model: unknown },
       output: { system: string[] },
     ) => {
+      if (systemInput.sessionID) {
+        const recovered = { output: "" };
+        await appendPendingWakeRecovery(
+          {
+            ctx,
+            directory: getSessionDirectoryCached(systemInput.sessionID) ?? input.directory,
+            sessionID: systemInput.sessionID,
+            client: input.client,
+          },
+          recovered,
+        );
+        if (recovered.output) appendHintsToSystem(output.system, recovered.output);
+      }
       if (!hintsBlock) return;
       // Extend the existing entry instead of pushing a second system
       // message; strict Qwen-family templates reject non-leading system
