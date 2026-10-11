@@ -547,8 +547,22 @@ pub fn extract_go_value_references(source: &str, root: tree_sitter::Node) -> Vec
                 node.end_byte(),
             ));
         }
-        // A selector is one reference, not a second bare reference to its base.
-        if node.kind() != "selector_expression" {
+        // A dotted name is one reference, but a fluent selector's receiver can
+        // contain calls with callback arguments. Walk that computed receiver
+        // without inventing extra references to the names in a pure dotted path.
+        if node.kind() == "selector_expression" {
+            let mut operand = node.child_by_field_name("operand");
+            while let Some(base) = operand {
+                if base.kind() == "selector_expression" {
+                    operand = base.child_by_field_name("operand");
+                } else {
+                    if !matches!(base.kind(), "identifier" | "package_identifier") {
+                        visit(base, source, results);
+                    }
+                    break;
+                }
+            }
+        } else {
             for child in node.named_children(&mut node.walk()) {
                 visit(child, source, results);
             }

@@ -958,7 +958,7 @@ fn go_initializer_edges(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut vars = conn.prepare("SELECT scoped_name FROM nodes WHERE file_path=?1 AND (kind='variable' OR scoped_name='<go-package-init>')")?;
+    let mut vars = conn.prepare("SELECT scoped_name FROM nodes WHERE file_path=?1 AND (kind='variable' OR scoped_name='<go-package-init>' OR (kind='function' AND scoped_name='init'))")?;
     let mut imports = conn.prepare("SELECT DISTINCT target_file FROM refs WHERE caller_file=?1 AND kind='import' AND target_file IS NOT NULL AND status='resolved'")?;
     let mut targets_by_file = BTreeMap::new();
     let mut calls = Vec::new();
