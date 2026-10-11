@@ -443,6 +443,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "background disk-cache maintenance, not an agent-visible list; the scan counts directory entries inside the iterator loop and logs examined, removed and completion counts; a bounded scan refuses a new record until it can certify the 64-record cap",
     },
     ExclusionEntry {
+        file: "subc/tool_provider.rs",
+        enclosing_item: "uncertain_settlement_frame",
+        location_or_primitive: "SETTLEMENT_RESULT_EXCERPT_BYTES",
+        reason: "bounded diagnostic byte excerpt of an already formatted terminal, not a result-list cutoff; original_result_truncated explicitly discloses omitted bytes and no replay guarantee is claimed",
+    },
+    ExclusionEntry {
         file: "logging.rs",
         enclosing_item: "write_str",
         location_or_primitive: "PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES",

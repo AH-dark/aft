@@ -2295,6 +2295,34 @@ pub(super) fn bash_denied_untrusted_completion(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn bash_authorization_failed_completion(
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+    format_context: crate::subc_format::FormatContext,
+) -> BashDeferredCompletion {
+    let response = Response::error(
+        &request_id,
+        "database_unavailable",
+        super::tool_provider::AUTHORIZATION_FAILURE_MESSAGE,
+    );
+    BashDeferredCompletion {
+        route,
+        corr,
+        flags,
+        ver,
+        root,
+        request_id,
+        result: Some(bash_result_from_response(response, &format_context)),
+        fatal: false,
+        settles_hold: true,
+    }
+}
+
 /// Terminal for a bash call answered early because the module is draining. The
 /// command never ran, so the retryable error is safe to retry.
 #[allow(clippy::too_many_arguments)]

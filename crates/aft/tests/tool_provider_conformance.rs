@@ -3175,3 +3175,105 @@ async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
         "{refused}"
     );
 }
+
+#[tokio::test]
+async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let warm = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"read","arguments":{"path":"input.txt"}}),
+        false,
+    )
+    .await;
+    let route = Subject::HEAD
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    for (index, state) in ["Authorized", "DispatchStarted"].into_iter().enumerate() {
+        let marker = root.join(format!("project/authorization-{index}-marker"));
+        let call_key = format!("authorization-{index}");
+        let mut call = json!({"name":"bash", "arguments":{"command":marker_command(&marker)}, "call_key":call_key});
+        route.adapt_preset(&mut call);
+        let mut wire = route.wire.lock().await;
+        let corr = wire.next_corr;
+        wire.next_corr += 1;
+        write_frame(
+            &mut wire.stream,
+            &Frame::build(
+                FrameType::Request,
+                flags(),
+                route.channel,
+                1,
+                corr,
+                serde_json::to_vec(&call).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ask = next_frame(&mut wire.stream).await.unwrap();
+        assert_eq!(ask.header.ty, FrameType::Request);
+        assert!(!marker.exists());
+        let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+        conn.execute_batch(&format!("CREATE TRIGGER refuse_authorization_{index} BEFORE UPDATE ON call_ledger WHEN NEW.call_key='{call_key}' AND NEW.state='{state}' BEGIN SELECT RAISE(ABORT, 'authorization storage fixture failure'); END;")).unwrap();
+        for _ in 0..2 {
+            write_frame(
+                &mut wire.stream,
+                &Frame::build(
+                    FrameType::Response,
+                    flags(),
+                    route.channel,
+                    1,
+                    ask.header.corr,
+                    br#"{"decision":"allow"}"#.to_vec(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let reply = tokio::time::timeout(Duration::from_secs(1), next_frame(&mut wire.stream))
+            .await
+            .expect("durable authorization failure must answer before prompt expiry")
+            .unwrap();
+        assert_eq!(reply.header.corr, corr);
+        assert_eq!(response_json(&reply)["isError"], true);
+        assert!(response_json(&reply)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("could not be durably recorded"));
+        assert!(
+            !marker.exists(),
+            "authorization storage failure must never spawn"
+        );
+        let executions: usize = conn
+            .query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(executions, 0);
+        write_frame(
+            &mut wire.stream,
+            &Frame::build(
+                FrameType::Response,
+                flags(),
+                route.channel,
+                1,
+                ask.header.corr,
+                br#"{"decision":"allow"}"#.to_vec(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), next_frame(&mut wire.stream))
+                .await
+                .is_err(),
+            "late/duplicate allows must not emit another original terminal"
+        );
+    }
+}
