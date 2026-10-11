@@ -1,23 +1,53 @@
 {
-  "after_outputs": {},
-  "entries": [],
-  "status": "not_measured",
-  "owner": "chair",
-  "reason": "The chair took ownership of Linux corpus collection and scoring because the worker runner does not transfer ignored baseline/corpus inputs or return release binaries. No rows, scores, NewServer classification or cell verdicts are invented.",
+  "after_outputs": {
+    "ripgrep": "local-ignore/callgraph/corpus/_results/ripgrep/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae",
+    "axum": "local-ignore/callgraph/corpus/_results/axum/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae",
+    "soft-serve": "local-ignore/callgraph/corpus/_results/soft-serve/a37cdbe83ec281fd7a13fe76b83d5b1eae96deae"
+  },
+  "entries": [
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"git/reference.go","symbol":"IsBranch","verdict":"aft_correct","note":"Unused Reference predicate: git/reference.go:43 defines IsBranch, but repository UI callers use IsTag rather than IsBranch."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/backend/auth.go","symbol":"HashPassword","verdict":"aft_correct","note":"Production-transitively dead: auth.go:15 is called only by unused SetPassword at user.go:384 and unit tests at auth_test.go:6,16; the production caller prevents test-only classification under the reviewed rule."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/backend/user.go","symbol":"ListPublicKeys","verdict":"aft_correct","note":"Unused Backend wrapper at user.go:327; callers use the store's ListPublicKeysByUserID/ListPublicKeysByUsername APIs instead."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/backend/user.go","symbol":"SetPassword","verdict":"aft_correct","note":"Backend.SetPassword at user.go:378 has no repository callers or interface contract; its HashPassword/store calls are stranded with it."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/db/db.go","symbol":"Transaction","verdict":"aft_correct","note":"Unused background-context convenience wrapper at db.go:53; production callers select TransactionContext instead."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/db/models/settings.go","symbol":"Settings","verdict":"aft_correct","note":"The model struct at settings.go:4 is never constructed or referenced elsewhere in the repository."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/lfs.go","symbol":"LockBackend","verdict":"aft_false_positive","note":"External interface dispatch: lfs.go:234 implements transfer.Backend and returns the live lock backend used by the processor created at lfs.go:85-95."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/lfs.go","symbol":"FromID","verdict":"aft_false_positive","note":"External transfer.LockBackend dispatch: method at lfs.go:275, compile-time contract at :231, and processor execution at :85-95 establish the live receiver."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/lfs.go","symbol":"FromPath","verdict":"aft_false_positive","note":"External transfer.LockBackend dispatch: method at lfs.go:305 belongs to the backend asserted at :231 and supplied by LockBackend at :234-241 to the live processor."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/lfs.go","symbol":"AsArguments","verdict":"aft_false_positive","note":"External transfer.Lock dispatch: method at lfs.go:420 belongs to the live LFSLock with the compile-time transfer.Lock assertion at :417."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/lfs.go","symbol":"AsLockSpec","verdict":"aft_false_positive","note":"External transfer.Lock dispatch: method at lfs.go:430 belongs to the live lock asserted at :417 and returned through the processor's LockBackend contract."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/service.go","symbol":"ServiceHandler","verdict":"aft_correct","note":"The function type alias at service.go:57 has no repository references; service dispatch uses its concrete Handler methods without this alias."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/service.go","symbol":"UploadPack","verdict":"aft_correct","note":"Unreferenced standalone wrapper at service.go:190; production service routing uses Service.Handler/gitServiceHandler rather than this wrapper."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/service.go","symbol":"UploadArchive","verdict":"aft_correct","note":"Unreferenced standalone wrapper at service.go:195; production service routing uses Service.Handler/gitServiceHandler rather than this wrapper."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/git/service.go","symbol":"ReceivePack","verdict":"aft_correct","note":"Unreferenced standalone wrapper at service.go:200; production service routing uses Service.Handler/gitServiceHandler rather than this wrapper."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/jobs/jobs.go","symbol":"Register","verdict":"aft_correct","note":"The registry writer at jobs.go:26 is never called; serve/server.go:64 reads jobs.List but no repository code registers a job."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/lfs/pointer.go","symbol":"ReadPointer","verdict":"aft_correct","note":"Unused reader convenience helper at pointer.go:41; the scanner and tests call ReadPointerFromBuffer instead."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/lfs/pointer.go","symbol":"GeneratePointer","verdict":"aft_correct","note":"The LFS pointer generation helper at pointer.go:115 has no repository callers or function-value references."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/common/common.go","symbol":"Repo","verdict":"aft_correct","note":"Unused context getter at common.go:82; RepoKey is populated by ssh/ui.go:219 but no code invokes this Common.Repo method."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/filesitem.go","symbol":"Swap","verdict":"aft_correct","note":"sort.Interface method at filesitem.go:53 on FileItems (:47), a slice type never instantiated or sorted; the UI uses other item/message representations."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/filesitem.go","symbol":"Less","verdict":"aft_correct","note":"sort.Interface method at filesitem.go:56 on unused FileItems (:47); merely satisfying an interface does not make an unused receiver live."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/filesitem.go","symbol":"Spacing","verdict":"aft_false_positive","note":"External list.ItemDelegate dispatch: FileItemDelegate.Spacing at filesitem.go:76 is used through the delegate passed to selector.New at files.go:89."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/logitem.go","symbol":"Spacing","verdict":"aft_false_positive","note":"External list.ItemDelegate dispatch: LogItemDelegate.Spacing at logitem.go:56 belongs to the live delegate passed to selector.New at log.go:69."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/refsitem.go","symbol":"Spacing","verdict":"aft_false_positive","note":"External list.ItemDelegate dispatch: RefItemDelegate.Spacing at refsitem.go:77 belongs to the live delegate passed to selector.New at refs.go:45."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/repo.go","symbol":"CopyURLMsg","verdict":"aft_correct","note":"The message struct at repo.go:32 is never constructed, dispatched or matched by the repository UI."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/stashitem.go","symbol":"Swap","verdict":"aft_correct","note":"sort.Interface method at stashitem.go:42 on StashItems (:36), a slice type never instantiated or passed to sorting code."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/stashitem.go","symbol":"Less","verdict":"aft_correct","note":"sort.Interface method at stashitem.go:45 on unused StashItems (:36); an unused receiver does not acquire interface liveness."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/repo/stashitem.go","symbol":"Spacing","verdict":"aft_false_positive","note":"External list.ItemDelegate dispatch: StashItemDelegate.Spacing at stashitem.go:58 belongs to the live delegate passed to selector.New at stash.go:49."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/ui/pages/selection/item.go","symbol":"Spacing","verdict":"aft_false_positive","note":"External list.ItemDelegate dispatch: ItemDelegate.Spacing at item.go:127 belongs to the live delegate passed to selector.New at selection.go:70."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/web/goget.go","symbol":"GoGetHandler","verdict":"aft_false_positive","note":"HTTP callback reachability gap: GitController registers http.HandlerFunc(GoGetHandler) at web/git.go:116 and NewRouter calls GitController at web/server.go:22."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/web/logging.go","symbol":"Unwrap","verdict":"aft_false_positive","note":"Implicit standard HTTP interface dispatch: logWriter.Unwrap at logging.go:43 supplies the ResponseController unwrapper contract on the writer passed to the live handler at :74,79."},
+    {"repo":"soft-serve","category":"dead_code","side":"aft","path":"pkg/webhook/event.go","symbol":"Events","verdict":"aft_false_positive","note":"Go init-function reachability gap: Events at webhook/event.go:32 is called by the imported SSH command package's init at ssh/cmd/webhooks.go:37-42."}
+  ],
+  "status": "measured",
+  "candidate_revision": "a37cdbe83ec281fd7a13fe76b83d5b1eae96deae",
   "baseline_revision": "13dd9cb71a7bbf9076377ac1ba1717dabf15e586",
-  "baseline_archive": "local-ignore/callgraph/baseline-source",
-  "corpus": [
-    {"repo": "ripgrep", "language": "rust", "revision": "3fce3b5bb0236da2df6d99672afb8a719642eca7", "source": "local-ignore/callgraph/corpus/ripgrep", "status": "owed_to_chair"},
-    {"repo": "axum", "language": "rust", "revision": "f8b02f22cf10bee707bda19b58265b9e33677535", "source": "local-ignore/callgraph/corpus/axum", "status": "owed_to_chair"},
-    {"repo": "soft-serve", "language": "go", "revision": "37685d36f5b7bf0e32217ddd7c8e045c57772619", "source": "local-ignore/callgraph/corpus/soft-serve", "status": "owed_to_chair"},
-    {"repo": "aft", "language": "rust", "baseline": "new, no baseline", "status": "not_measured"}
-  ],
-  "acceptance_owed": [
-    "No lowered precision or recall cell under the reviewed spec's zero-count exception.",
-    "soft-serve dead_code (functions) precision >= 0.6, or row-by-row explanation; NewServer is not test-only.",
-    "ripgrep and axum dead_code count <= 10 each with aft_rows_unjudged: 0, or row-by-row explanation of missed targets.",
-    "If local AFT is included: Rust count <= rustc + 10, all relevant rows judged, unsupported-language gap retained, unchanged checkout status."
-  ],
-  "recipe": "benchmarks/inspect-truth/slices/callgraph.md",
+  "corpus_revisions": {
+    "ripgrep": "3fce3b5bb0236da2df6d99672afb8a719642eca7",
+    "axum": "f8b02f22cf10bee707bda19b58265b9e33677535",
+    "soft-serve": "37685d36f5b7bf0e32217ddd7c8e045c57772619"
+  },
+  "classification_counts": {"aft_correct": 19, "aft_false_positive": 13, "function_rows": 29, "non_function_rows": 3},
+  "scope_note": "The scorer maps dead_code (functions) to canonical dead_code judgments, so these 32 entries cover both Go buckets without duplicate entries. Existing ripgrep judgments are retained in earlier files.",
+  "report": "benchmarks/inspect-truth/slices/callgraph.md",
   "release_note": "Both legacy and active-view callgraph producer keys changed. Existing stores/views rebuild their callgraph evidence once; identical file content/language/current-producer keys then reuse the rebuilt parse blobs. The one-time cost is per file content, not per inspect."
 }
