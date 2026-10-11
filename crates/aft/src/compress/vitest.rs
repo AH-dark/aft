@@ -21,7 +21,7 @@ impl Compressor for VitestCompressor {
         &self,
         command: &str,
         output: &str,
-        _exit_code: Option<i32>,
+        _exit_code: Option<i64>,
     ) -> CompressionResult {
         compress_test_runner(command, output)
     }
@@ -43,7 +43,7 @@ impl Compressor for VitestCompressor {
     fn compress_output_match_with_exit_code(
         &self,
         output: &str,
-        _exit_code: Option<i32>,
+        _exit_code: Option<i64>,
     ) -> CompressionResult {
         if looks_like_jest_output(output) {
             compress_test_runner("jest", output)

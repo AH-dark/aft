@@ -19,7 +19,7 @@ impl Compressor for NpmCompressor {
         &self,
         command: &str,
         output: &str,
-        _exit_code: Option<i32>,
+        _exit_code: Option<i64>,
     ) -> CompressionResult {
         match npm_subcommand(command).as_deref() {
             Some("install" | "i" | "ci") => compress_install(output).into(),

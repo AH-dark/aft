@@ -136,7 +136,7 @@ impl HintJob {
         }
     }
 
-    pub(crate) fn finish(&self, output: &str, exit_code: Option<i32>) -> Option<&str> {
+    pub(crate) fn finish(&self, output: &str, exit_code: Option<i64>) -> Option<&str> {
         self.result
             .get_or_init(|| {
                 let launch = self.launch.lock().ok()?.take();

@@ -541,7 +541,9 @@ pub struct PersistedTask {
     /// before AFT recorded it; such a task is never extended.
     #[serde(default, skip_serializing_if = "is_false")]
     pub default_hard_kill: bool,
-    pub exit_code: Option<i32>,
+    /// Windows remote exit codes can exceed i32::MAX. Using i64 preserves all
+    /// their bits and also stores signed local process exit codes unchanged.
+    pub exit_code: Option<i64>,
     pub child_pid: Option<u32>,
     pub pgid: Option<i32>,
     /// `Some` records a completed Unix sample, including an empty group. `None`
@@ -676,7 +678,7 @@ impl PersistedTask {
     pub fn mark_terminal(
         &mut self,
         status: BgTaskStatus,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
         reason: Option<String>,
     ) {
         let finished_at = unix_millis();

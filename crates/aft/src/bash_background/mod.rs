@@ -286,6 +286,7 @@ thread_local! {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteLaunch {
+    pub requested_platform: Option<crate::exec_remote::types::Platform>,
     pub params: crate::exec_remote::FrozenParams,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub explicit_runon: bool,
@@ -360,6 +361,7 @@ pub(crate) fn remote_for_runon(
             .and_then(|policy| policy.default_demand.as_deref()),
     )?;
     launch.requested_vcpus = resolved.weight_hint;
+    launch.requested_platform = resolved.platform;
     launch.requested_network = resolved.network;
     launch.explicit_runon = true;
     Ok(launch)

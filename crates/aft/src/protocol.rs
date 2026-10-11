@@ -49,7 +49,7 @@ pub struct BashCompletedFrame {
     pub task_id: String,
     pub session_id: String,
     pub status: BgTaskStatus,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub command: String,
     /// Tail of stdout+stderr (≤300 bytes), already decoded as lossy UTF-8.
     /// Empty string when no output was captured. Used by plugins to inline
@@ -327,7 +327,7 @@ impl BashCompletedFrame {
         task_id: impl Into<String>,
         session_id: impl Into<String>,
         status: BgTaskStatus,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
         command: impl Into<String>,
         output_preview: impl Into<String>,
         output_truncated: bool,

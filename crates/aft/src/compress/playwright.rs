@@ -26,7 +26,7 @@ impl Compressor for PlaywrightCompressor {
         &self,
         _command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let compressed = compress_playwright(output);
         if matches!(exit_code, Some(code) if code != 0) && is_success_summary(&compressed) {

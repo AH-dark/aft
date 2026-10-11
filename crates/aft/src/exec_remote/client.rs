@@ -12,6 +12,7 @@ pub const CAPABILITY: &str = "exec-remote/v1";
 pub struct ExecRemoteClient {
     consumer: Arc<SubcConsumer>,
     route: subc_client_rs::RouteHandle,
+    module_id: String,
 }
 
 impl ExecRemoteClient {
@@ -34,7 +35,9 @@ impl ExecRemoteClient {
             .map_err(Error::Transport)?;
         let route = consumer
             .open_route(
-                RouteTarget::ManagementSurface { module_id },
+                RouteTarget::ManagementSurface {
+                    module_id: module_id.clone(),
+                },
                 identity,
                 CallOptions {
                     consumer_identity: crate::launch_nonce::consumer_identity(),
@@ -43,10 +46,33 @@ impl ExecRemoteClient {
             )
             .await
             .map_err(Error::Transport)?;
-        Ok(Self { consumer, route })
+        Ok(Self {
+            consumer,
+            route,
+            module_id,
+        })
     }
 
     pub async fn run(&self, request: &RunRequest) -> Result<RemoteStream, Error> {
+        if request.platform == Some(Platform::Windows) {
+            let catalog = self.consumer.catalog_list().await.map_err(|error| {
+                Error::Protocol(format!(
+                    "runon \"windows\" capability discovery failed before launch: {error}"
+                ))
+            })?;
+            let advertised = catalog.modules.iter().any(|module| {
+                module.module_id == self.module_id
+                    && module.capabilities.as_ref().is_some_and(|capabilities| {
+                        capabilities
+                            .provides
+                            .iter()
+                            .any(|capability| capability == "exec-remote/platforms:windows")
+                    })
+            });
+            if !advertised {
+                return Err(Error::Protocol("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing exec-remote/platforms:windows)".into()));
+            }
+        }
         self.stream("exec.run", request, StreamConsumer::new())
             .await
     }

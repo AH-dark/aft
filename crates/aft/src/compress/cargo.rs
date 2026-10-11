@@ -17,7 +17,7 @@ impl Compressor for CargoCompressor {
         &self,
         command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         match cargo_subcommand(command).as_deref() {
             Some("build" | "check" | "clippy") => compress_build_like(output),
@@ -33,7 +33,7 @@ impl Compressor for CargoCompressor {
     fn compress_output_match_with_exit_code(
         &self,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         compress_test(output, exit_code)
     }
@@ -165,7 +165,7 @@ fn is_final_cargo_summary(line: &str) -> bool {
         || trimmed.starts_with("test result:")
 }
 
-fn compress_test(output: &str, exit_code: Option<i32>) -> CompressionResult {
+fn compress_test(output: &str, exit_code: Option<i64>) -> CompressionResult {
     let lines: Vec<&str> = output.lines().collect();
     let has_failures = lines.iter().any(|line| line.trim() == "failures:");
     if !has_failures {

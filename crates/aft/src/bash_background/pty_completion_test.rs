@@ -176,7 +176,7 @@ impl Fixture {
         assert_eq!(snapshot.info.status, expected_status);
         assert_eq!(
             snapshot.exit_code,
-            Some(exit_code),
+            Some(i64::from(exit_code)),
             "retain the child's actual exit code"
         );
         let data = serde_json::json!(snapshot);
@@ -189,13 +189,13 @@ impl Fixture {
             .contains("output may be incomplete"));
         let persisted = read_task(&self.task.paths.json).unwrap();
         assert_eq!(persisted.status, snapshot.info.status);
-        assert_eq!(persisted.exit_code, Some(exit_code));
+        assert_eq!(persisted.exit_code, Some(i64::from(exit_code)));
         assert_eq!(serde_json::json!(persisted)["output_incomplete"], true);
         assert_eq!(persisted.status_reason, snapshot.info.status_reason);
         let completions = self.registry.pending_completions_for_session("session");
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].status, expected_status);
-        assert_eq!(completions[0].exit_code, Some(exit_code));
+        assert_eq!(completions[0].exit_code, Some(i64::from(exit_code)));
         assert_eq!(serde_json::json!(completions[0])["output_incomplete"], true);
         assert_eq!(completions[0].status_reason, snapshot.info.status_reason);
         let text = crate::subc_format::format_response(

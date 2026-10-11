@@ -28,7 +28,7 @@ struct DbTaskRow {
     command: String,
     cwd: String,
     status: String,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
     pid: Option<i64>,
     pgid: Option<i64>,
     started_at: i64,

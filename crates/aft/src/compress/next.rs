@@ -15,7 +15,7 @@ impl Compressor for NextCompressor {
         &self,
         _command: &str,
         output: &str,
-        _exit_code: Option<i32>,
+        _exit_code: Option<i64>,
     ) -> CompressionResult {
         compress_next(output).into()
     }

@@ -20,7 +20,7 @@ impl Compressor for BunCompressor {
         &self,
         command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         match bun_subcommand(command).as_deref() {
             Some("install" | "i" | "add" | "remove") => compress_package(output).into(),
@@ -49,7 +49,7 @@ impl Compressor for BunCompressor {
     fn compress_output_match_with_exit_code(
         &self,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         preserve_bun_failure(output, compress_test(output), exit_code)
     }
@@ -58,7 +58,7 @@ impl Compressor for BunCompressor {
 fn preserve_bun_failure(
     output: &str,
     compressed: CompressionResult,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
 ) -> CompressionResult {
     let stripped_failure =
         compressed.text.trim().is_empty() || !super::text_has_failure_signal(&compressed.text);

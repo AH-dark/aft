@@ -63,7 +63,7 @@ pub enum Verdict {
         refusal_detail: Option<String>,
     },
     Exited {
-        code: i32,
+        code: i64,
     },
     Signalled {
         signal: i32,
@@ -95,7 +95,10 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
         }
         Outcome::OutcomeUnknown | Outcome::Unknown { .. } => return Verdict::OutcomeUnknown,
         Outcome::HistoryExpired => return Verdict::HistoryExpired,
-        Outcome::Exit { .. } | Outcome::Signal { .. } | Outcome::Cancelled => {}
+        Outcome::Exit { .. }
+        | Outcome::WindowsExit { .. }
+        | Outcome::Signal { .. }
+        | Outcome::Cancelled => {}
         _ => return Verdict::OutcomeUnknown,
     }
     match &terminal.killed {
@@ -105,7 +108,12 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
         None => {}
     }
     match terminal.outcome {
-        Outcome::Exit { code } => Verdict::Exited { code },
+        Outcome::Exit { code } => Verdict::Exited {
+            code: i64::from(code),
+        },
+        Outcome::WindowsExit { code } => Verdict::Exited {
+            code: i64::from(code),
+        },
         Outcome::Signal { signal } => Verdict::Signalled { signal },
         Outcome::Cancelled => Verdict::Cancelled,
         _ => Verdict::OutcomeUnknown,

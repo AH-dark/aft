@@ -106,6 +106,10 @@ pub(crate) enum Script {
     NetworkLost,
     NetworkUnsupported,
     Started,
+    Windows {
+        code: Option<u32>,
+        acknowledge: bool,
+    },
 }
 
 pub(crate) struct Daemon {
@@ -128,6 +132,14 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
 }
 
 pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: usize) -> Daemon {
+    daemon_with_capabilities(script, &[claim], clients).await
+}
+
+pub(crate) async fn daemon_with_capabilities(
+    script: Script,
+    claims: &[&str],
+    clients: usize,
+) -> Daemon {
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -138,7 +150,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
     let acceptance_gate = Arc::new(tokio::sync::Notify::new());
     let server_acceptance_gate = acceptance_gate.clone();
     let server_key = key.clone();
-    let claim = claim.to_string();
+    let claims: Vec<String> = claims.iter().map(|claim| (*claim).to_string()).collect();
     let server = tokio::spawn(async move {
         let mut runs = 0;
         for _ in 0..clients {
@@ -180,7 +192,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                 }).unwrap())),
                 FrameType::Request if header.channel == 0 => match body["op"].as_str() {
                     Some("catalog.list") => replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
-                        "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":[claim], "requires":[]}}]}))),
+                        "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":claims, "requires":[]}}]}))),
                     Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
                     _ => panic!("unexpected control request {body}"),
                 },
@@ -196,12 +208,18 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                             }
                             if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 });
+                                if matches!(script, Script::Windows { acknowledge: true, .. }) {
+                                    accepted = accepted.with_platform(Platform::Windows);
+                                }
                                 if matches!(script, Script::NetworkGranted | Script::NetworkLost) {
                                     accepted = accepted.with_network(Network::Outbound);
                                 } else if matches!(script, Script::NetworkUnknown) {
                                     accepted = accepted.with_network(Network::Unknown("future_network".into()));
                                 }
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(accepted)).unwrap()));
+                                if matches!(script, Script::Windows { .. }) {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Started(Started::new(0, 123, 1).with_path_mapping(PathMapping::new("/", r"C:\m")))).unwrap()));
+                                }
                                 if matches!(script, Script::Started) {
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Started(Started::new(0, 123, 1))).unwrap()));
                                 }
@@ -219,6 +237,8 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                     Script::RefusedWithDetail => Outcome::RefusedBeforeStart { reason: RefusalReason::RunnerDraining },
                                     Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },
                                     Script::Expired => Outcome::HistoryExpired,
+                                    Script::Windows { code: Some(code), .. } => Outcome::WindowsExit { code },
+                                    Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
                             if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. } | Script::Started | Script::GatedAcceptance) && !attaching { /* held-open run stream */ }

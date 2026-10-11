@@ -916,6 +916,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                     connection_file: Some(daemon.connection.clone()),
                     harness: "runner".into(),
                     session: "session".into(),
+                    requested_platform: None,
                     requested_vcpus: None,
                     requested_network: false,
                 },

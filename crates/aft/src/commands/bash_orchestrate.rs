@@ -939,7 +939,10 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
     }
     if snapshot.sandbox_native
         && snapshot.sandbox_unavailable
-        && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
+        && snapshot.exit_code
+            == Some(i64::from(
+                crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE,
+            ))
     {
         return Response::error_with_data(
             request_id,
@@ -1095,7 +1098,7 @@ mod tests {
         output_truncated: bool,
         output_path: Option<&str>,
         status: BgTaskStatus,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> BgTaskSnapshot {
         BgTaskSnapshot {
             info: BgTaskInfo {
@@ -1166,7 +1169,9 @@ mod tests {
             false,
             None,
             BgTaskStatus::Failed,
-            Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE),
+            Some(i64::from(
+                crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE,
+            )),
         );
         snapshot.sandbox_native = true;
         snapshot.sandbox_unavailable = true;
@@ -1194,7 +1199,9 @@ mod tests {
             false,
             None,
             BgTaskStatus::Failed,
-            Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE),
+            Some(i64::from(
+                crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE,
+            )),
         );
         snapshot.sandbox_native = true;
 

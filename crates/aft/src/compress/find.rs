@@ -16,7 +16,7 @@ impl Compressor for FindCompressor {
         &self,
         command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let stripped = strip_ansi(output);
         if stripped.trim().is_empty() {

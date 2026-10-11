@@ -34,7 +34,7 @@ pub type FilesystemManifest = BTreeMap<String, ManifestEntry>;
 pub struct StructuredObservation {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub entries: Vec<(String, bool)>,
     pub selected_paths: Vec<String>,
     pub matches: Vec<(String, u32, String)>,
@@ -45,20 +45,20 @@ pub struct StructuredObservation {
 pub struct Observation {
     pub raw_stdout: Vec<u8>,
     pub raw_stderr: Vec<u8>,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub structured: StructuredObservation,
     pub filesystem: FilesystemManifest,
 }
 
 pub trait ObservationAdapter {
-    fn adapt(&self, stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> Observation;
+    fn adapt(&self, stdout: &[u8], stderr: &[u8], exit_code: Option<i64>) -> Observation;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ByteObservationAdapter;
 
 impl ObservationAdapter for ByteObservationAdapter {
-    fn adapt(&self, stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> Observation {
+    fn adapt(&self, stdout: &[u8], stderr: &[u8], exit_code: Option<i64>) -> Observation {
         Observation {
             raw_stdout: stdout.to_vec(),
             raw_stderr: stderr.to_vec(),
@@ -77,7 +77,7 @@ impl ObservationAdapter for ByteObservationAdapter {
 pub fn observation_from_process(
     stdout: &[u8],
     stderr: &[u8],
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
     root: &Path,
 ) -> Observation {
     let mut observation = ByteObservationAdapter.adapt(stdout, stderr, exit_code);
@@ -90,7 +90,7 @@ pub fn observation_from_process(
 pub fn observation_from_aft_response(
     response: &Value,
     root: &Path,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
 ) -> Observation {
     let output = response
         .get("output")

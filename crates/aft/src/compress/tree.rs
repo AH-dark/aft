@@ -15,7 +15,7 @@ impl Compressor for TreeCompressor {
         &self,
         _command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let stripped = strip_ansi(output);
         if matches!(exit_code, Some(code) if code != 0) {

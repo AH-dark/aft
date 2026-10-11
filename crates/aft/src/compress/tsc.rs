@@ -33,7 +33,7 @@ impl Compressor for TscCompressor {
         &self,
         _command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let compressed = compress_tsc(output);
         if matches!(exit_code, Some(code) if code != 0) && compressed == "No errors. [cmpaft]" {

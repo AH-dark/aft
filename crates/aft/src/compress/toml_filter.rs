@@ -424,7 +424,7 @@ pub fn apply_filter(filter: &TomlFilter, output: &str) -> CompressionResult {
 pub fn apply_filter_with_exit_code(
     filter: &TomlFilter,
     output: &str,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
 ) -> CompressionResult {
     if filter.strip_ansi {
         let stripped = crate::compress::generic::strip_ansi(output);
@@ -438,7 +438,7 @@ pub(crate) fn apply_filter_with_exit_code_prestripped(
     filter: &TomlFilter,
     raw_output: &str,
     stripped_output: &str,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
 ) -> CompressionResult {
     let output = if filter.strip_ansi {
         stripped_output
@@ -451,7 +451,7 @@ pub(crate) fn apply_filter_with_exit_code_prestripped(
 fn apply_filter_to_text(
     filter: &TomlFilter,
     output: &str,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
 ) -> CompressionResult {
     if filter.shortcircuit_when.is_none()
         && filter.class_cap.is_none()

@@ -68,6 +68,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
         connection_file: Some(connection),
         harness: "broca".into(),
         session: "session".into(),
+        requested_platform: None,
         requested_vcpus: None,
         requested_network: false,
         params: exec::FrozenParams {
@@ -1253,10 +1254,12 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        accepted_platform: None,
         explicit_runon: false,
         connection_file: Some(daemon.connection.clone()),
         harness: "broca".into(),
         session: "session".into(),
+        requested_platform: None,
         requested_vcpus: None,
         requested_network: false,
         granted_network: false,
@@ -1570,10 +1573,12 @@ fn persist_accepted_with_snapshot(
     metadata.status = BgTaskStatus::Running;
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        accepted_platform: None,
         explicit_runon: false,
         connection_file: Some(connection),
         harness: "runner".into(),
         session: "session".into(),
+        requested_platform: None,
         requested_vcpus: None,
         requested_network: false,
         granted_network: false,
@@ -2173,6 +2178,178 @@ fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json:
 }
 
 #[tokio::test]
+async fn runon_windows_not_advertised_refuses_without_remote_or_local_spawn() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let marker = dir.path().join("local-spawn-proof");
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": format!("touch '{}'", marker.display()),
+            "runon": "windows", "wait": true, "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    assert!(!reply.success, "{reply:?}");
+    assert_eq!(reply.data["code"], "remote_unavailable", "{reply:?}");
+    let message = reply.data["message"].as_str().unwrap();
+    assert!(message.contains("windows"), "{message}");
+    assert!(
+        message.contains("doesn't offer Windows jobs yet"),
+        "{message}"
+    );
+    assert!(
+        exec_runs(&daemon).is_empty(),
+        "unadvertised Windows must never be sent"
+    );
+    assert!(
+        !marker.exists(),
+        "explicit Windows must never fall back locally"
+    );
+}
+
+async fn windows_daemon(
+    code: Option<u32>,
+    acknowledge: bool,
+) -> crate::exec_remote::wire_tests::Daemon {
+    crate::exec_remote::wire_tests::daemon_with_capabilities(
+        Script::Windows { code, acknowledge },
+        &["exec-remote/v1", "exec-remote/platforms:windows"],
+        1,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn runon_windows_advertised_preserves_request_mapping_and_full_exit_code() {
+    for code in [256, 0xC000_0005, u32::MAX] {
+        let daemon = windows_daemon(Some(code), true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let storage = dir.path().join("storage");
+        ctx.update_config(|config| config.storage_dir = Some(storage.clone()));
+        let (reply, _) = orchestrated_reply(
+            &ctx,
+            &daemon,
+            serde_json::json!({
+                "command": "cargo test", "runon": "windows", "wait": true,
+                "foreground_orchestrate": true, "compressed": false,
+            }),
+        )
+        .await;
+        assert!(reply.success, "{reply:?}");
+        assert_eq!(reply.data["status"], "failed", "{reply:?}");
+        assert_eq!(reply.data["exit_code"], u64::from(code), "{reply:?}");
+        assert!(
+            reply.data["output"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("[exit code: {code}]")),
+            "{reply:?}"
+        );
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["platform"], "windows");
+        assert!(runs[0].get("weight_hint").is_none());
+        assert!(runs[0].get("network").is_none());
+        let task_id = reply.data["task_id"].as_str().unwrap();
+        let task = ctx.bash_background().task(task_id).unwrap();
+        let saved = read_task(&task.paths.json).unwrap();
+        assert_eq!(saved.exit_code, Some(i64::from(code)));
+        let conn = crate::db::open(&dir.path().join("roundtrip.db")).unwrap();
+        let row = saved.to_bash_task_row("broca", &task.paths).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
+        let restored_row = crate::db::bash_tasks::get_bash_task(&conn, "broca", "session", task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_row.exit_code, Some(i64::from(code)));
+        assert_eq!(
+            saved
+                .remote
+                .as_ref()
+                .unwrap()
+                .started
+                .as_ref()
+                .unwrap()
+                .path_mapping,
+            Some(PathMapping::new("/", r"C:\m"))
+        );
+        let restarted = registry();
+        restarted.replay_session(&storage, "session").unwrap();
+        let snapshot = restarted.observed_status(task_id, "session", 8192).unwrap();
+        assert_eq!(snapshot.exit_code, Some(i64::from(code)));
+        let completions = restarted.drain_completions();
+        assert!(
+            completions
+                .iter()
+                .any(|completion| completion.task_id == task_id
+                    && completion.exit_code == Some(i64::from(code))),
+            "{completions:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn runon_windows_unknown_offline_outcome_keeps_safe_rerun_advice() {
+    let daemon = windows_daemon(None, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "cargo test", "runon": "windows", "wait": true,
+            "foreground_orchestrate": true, "compressed": false,
+        }),
+    )
+    .await;
+    assert_eq!(reply.data["status"], "fate_unknown", "{reply:?}");
+    assert!(
+        reply.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("rerunning is safe"),
+        "{reply:?}"
+    );
+    assert_eq!(exec_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
+async fn runon_windows_unacknowledged_platform_cancels_and_distrusts_exit() {
+    let daemon = windows_daemon(Some(0), false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "cargo test", "runon": "windows", "wait": true,
+            "foreground_orchestrate": true, "compressed": false,
+        }),
+    )
+    .await;
+    assert_eq!(reply.data["status"], "fate_unknown", "{reply:?}");
+    assert!(reply.data["exit_code"].is_null(), "{reply:?}");
+    assert!(
+        reply.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("Windows platform was not acknowledged"),
+        "{reply:?}"
+    );
+    assert!(daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.cancel"));
+    assert_eq!(exec_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
 async fn runon_network_is_present_on_wire_only_when_requested() {
     for (runon, network, cpus) in [
         ("linux", None, None),
@@ -2482,6 +2659,8 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         "linux,net,net",
         "linux,unknown",
         "windows,4c",
+        "windows,net",
+        "windows,wat",
     ] {
         let response = handle_with_policy(
             &restarted_context(dir.path()),
@@ -2491,8 +2670,10 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         assert!(!response.success, "{runon}: {response:?}");
         let message = response.data["message"].as_str().unwrap_or_default();
         assert!(message.contains(runon), "{runon}: {response:?}");
-        let reason = if runon.starts_with("windows") {
-            "only runs Linux"
+        let reason = if runon == "windows,4c" {
+            "fixed at 4 vCPUs"
+        } else if runon == "windows,net" {
+            "no network"
         } else {
             "not valid"
         };
@@ -2664,8 +2845,8 @@ async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
         (
             &ctx,
             enabled(),
-            serde_json::json!({"runon": "windows"}),
-            "unknown runner demand \"windows\"",
+            serde_json::json!({"runon": "plan9"}),
+            "unknown runner demand \"plan9\"",
         ),
     ] {
         let mut params = serde_json::json!({"command": command, "runon": "linux"});
@@ -3217,10 +3398,12 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
 #[test]
 fn remote_phase_comes_from_acceptance_started_or_output() {
     let mut remote = RemoteTask {
+        accepted_platform: None,
         connection_file: None,
         explicit_runon: true,
         harness: "broca".into(),
         session: "session".into(),
+        requested_platform: None,
         requested_vcpus: None,
         requested_network: false,
         granted_network: false,

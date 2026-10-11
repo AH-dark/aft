@@ -1013,7 +1013,7 @@ fn install_bash_compressor(runtime: &AppContext) {
     let filter_registry_handle = runtime.shared_filter_registry();
     let compress_flag = runtime.bash_compress_flag();
     runtime.bash_background().set_compressor_with_exit_code(
-        move |command: &str, output: String, exit_code: Option<i32>| {
+        move |command: &str, output: String, exit_code: Option<i64>| {
             if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 return aft::compress::CompressionResult::new(output);
             }

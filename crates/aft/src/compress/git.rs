@@ -23,7 +23,7 @@ impl Compressor for GitCompressor {
         &self,
         command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let compressed = match git_subcommand(command).as_deref() {
             Some("add") => compress_add(output),

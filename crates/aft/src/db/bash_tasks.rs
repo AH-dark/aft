@@ -77,7 +77,7 @@ pub struct BashTaskRow {
     pub command: String,
     pub cwd: String,
     pub status: String,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub pid: Option<i64>,
     pub pgid: Option<i64>,
     pub started_at: i64,

@@ -287,7 +287,7 @@ pub struct BgCompletion {
     #[serde(skip_serializing)]
     pub session_id: String,
     pub status: BgTaskStatus,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub command: String,
     /// Small head+tail preview of the cached terminal render at completion time,
     /// cached so push-frame consumers and `bash_drain_completions` callers see
@@ -380,7 +380,7 @@ pub struct RemoteRefusal {
 pub struct BgTaskSnapshot {
     #[serde(flatten)]
     pub info: BgTaskInfo,
-    pub exit_code: Option<i32>,
+    pub exit_code: Option<i64>,
     pub child_pid: Option<u32>,
     pub workdir: String,
     pub output_preview: String,
@@ -638,7 +638,7 @@ pub(crate) struct RegistryInner {
     /// `bash_status`/`list` snapshot reads. When `None`, output is returned
     /// uncompressed.
     pub(crate) compressor:
-        Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
+        Mutex<Option<Box<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     /// Harness of the most recent configure of this root. Routes from several
     /// harnesses share the root, so this is only a fallback for a task,
@@ -1462,7 +1462,7 @@ impl BgTaskRegistry {
 
     pub fn set_compressor_with_exit_code<F>(&self, compressor: F)
     where
-        F: Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync + 'static,
+        F: Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync + 'static,
     {
         if let Ok(mut slot) = self.inner.compressor.lock() {
             *slot = Some(Box::new(compressor));
@@ -1475,7 +1475,7 @@ impl BgTaskRegistry {
         &self,
         command: &str,
         output: String,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let Ok(slot) = self.inner.compressor.lock() else {
             return CompressionResult::new(output);
@@ -9124,7 +9124,7 @@ fn append_bash_output_envelope(
 
 fn completion_preview_for_cache(
     cache: &TerminalOutputCache,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
 ) -> (String, bool) {
     // Reminder previews are sized by exit status: success gets a short tail,
     // failure keeps head+tail context (see output.rs completion caps).
@@ -9331,7 +9331,7 @@ fn live_descendants_summary(metadata: &PersistedTask) -> Option<String> {
     ))
 }
 
-fn completion_status_text(status: &BgTaskStatus, exit_code: Option<i32>) -> String {
+fn completion_status_text(status: &BgTaskStatus, exit_code: Option<i64>) -> String {
     match status {
         BgTaskStatus::TimedOut => "timed out".to_string(),
         BgTaskStatus::Killed => "killed".to_string(),
@@ -9981,7 +9981,7 @@ fn terminal_metadata_from_marker(
             } else {
                 BgTaskStatus::Failed
             };
-            metadata.mark_terminal(status, Some(code), reason);
+            metadata.mark_terminal(status, Some(i64::from(code)), reason);
         }
         ExitMarker::Killed => metadata.mark_terminal(
             BgTaskStatus::Killed,
@@ -10005,7 +10005,7 @@ fn kill_marker_failure_reason(reason: Option<&str>, error: &str) -> String {
     }
 }
 
-fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i32> {
+fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i64> {
     match status {
         BgTaskStatus::TimedOut => Some(124),
         BgTaskStatus::Killed => Some(137),
@@ -12025,7 +12025,7 @@ mod tests {
             insert_terminal_piped_task(&registry, &dir, command, stdout, stderr, true);
         {
             let mut state = task.lock_state().unwrap();
-            state.metadata.exit_code = Some(exit);
+            state.metadata.exit_code = Some(i64::from(exit));
             state.metadata.status = if exit == 0 {
                 BgTaskStatus::Completed
             } else {

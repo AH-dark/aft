@@ -310,7 +310,7 @@ pub trait Compressor: Send + Sync {
         &self,
         command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult;
 
     fn specificity(&self) -> Specificity {
@@ -341,7 +341,7 @@ pub trait Compressor: Send + Sync {
     fn compress_output_match_with_exit_code(
         &self,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         self.compress_with_exit_code("", output, exit_code)
     }
@@ -358,7 +358,7 @@ pub fn compress(command: &str, output: String, ctx: &AppContext) -> CompressionR
 pub fn compress_with_exit_code(
     command: &str,
     output: String,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
     ctx: &AppContext,
 ) -> CompressionResult {
     if !ctx.config().experimental_bash_compress {
@@ -389,7 +389,7 @@ pub fn compress_with_registry(
 pub fn compress_with_registry_exit_code(
     command: &str,
     output: &str,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
     registry: &FilterRegistry,
 ) -> CompressionResult {
     let input_line_count = output.lines().count();
@@ -401,7 +401,7 @@ pub fn compress_with_registry_exit_code(
 fn compress_with_registry_exit_code_inner(
     command: &str,
     output: &str,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
     registry: &FilterRegistry,
 ) -> CompressionResult {
     let stripped_for_generic = strip_ansi(output);
@@ -515,7 +515,7 @@ fn failure_preserving_result(
     command: &str,
     stripped_raw_output: &str,
     result: CompressionResult,
-    exit_code: Option<i32>,
+    exit_code: Option<i64>,
 ) -> CompressionResult {
     if !matches!(exit_code, Some(code) if code != 0) {
         return result;

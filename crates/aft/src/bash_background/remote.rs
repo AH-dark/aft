@@ -75,6 +75,12 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
         return None;
     }
     let remote = metadata.remote.as_ref().filter(|r| r.explicit_runon)?;
+    if remote.terminal.is_none() && remote.job_id.is_none() {
+        return Some(super::RemoteRefusal {
+            code: "remote_unavailable",
+            message: metadata.execution_note.clone()?,
+        });
+    }
     let crate::exec_remote::Verdict::RunLocally {
         reason,
         refusal_detail,
@@ -132,6 +138,12 @@ fn draining_budget_ms(_root: &Path) -> u64 {
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
 const RUNNER_ID: &str = "ck-motor";
+
+#[cfg(unix)]
+fn platform_acknowledged(remote: &RemoteTask) -> bool {
+    remote.requested_platform != Some(Platform::Windows)
+        || (remote.accepted && remote.accepted_platform == Some(Platform::Windows))
+}
 
 #[cfg(unix)]
 fn remote_execution_note(remote: &RemoteTask) -> String {
@@ -254,6 +266,10 @@ pub(crate) struct DrainingRetry {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_platform: Option<Platform>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_platform: Option<Platform>,
     pub connection_file: Option<PathBuf>,
     #[serde(default)]
     pub explicit_runon: bool,
@@ -461,6 +477,7 @@ impl OutputSink for TaskSink {
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
             r.accepted = true;
+            r.accepted_platform = accepted.platform.clone();
             r.granted_network = accepted.network == Some(Network::Outbound);
             if accepted.env_not_forwarded.is_some() {
                 r.env_not_forwarded = accepted.env_not_forwarded.clone();
@@ -737,6 +754,8 @@ impl BgTaskRegistry {
         metadata.status = BgTaskStatus::Running;
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
+            requested_platform: launch.requested_platform.clone(),
+            accepted_platform: None,
             connection_file: launch.connection_file,
             explicit_runon: launch.explicit_runon,
             harness: launch.harness,
@@ -860,6 +879,7 @@ impl BgTaskRegistry {
                         .saturating_add(u64::from(hard_kill.limit().subsec_nanos() > 0)),
                 ),
                 &exec::PresetParams {
+                    platform: launch.requested_platform,
                     siblings: launch.params.siblings,
                     weight_hint: requested_vcpus,
                     network: launch.requested_network.then_some(Network::Outbound),
@@ -1033,6 +1053,12 @@ impl BgTaskRegistry {
             }
         };
         let mut fallback = None;
+        if remote.accepted && !platform_acknowledged(&remote) {
+            if let Some(job_id) = remote.job_id {
+                let _ = client.cancel_job(job_id).await;
+            }
+            return Err("remote outcome unknown: Windows platform was not acknowledged; cancel requested; result not trusted".into());
+        }
         let mut stream = if retry_request.is_some() {
             let Some(stream) = self.submit_draining_retry(&client, &task, &root).await? else {
                 return Ok(());
@@ -1113,6 +1139,28 @@ impl BgTaskRegistry {
                     continue;
                 }
             };
+            // Old runners may ignore the platform field even when discovery
+            // advertises it. Require the acceptance to acknowledge Windows.
+            let platform_ok = if remote.requested_platform == Some(Platform::Windows) {
+                let (accepted, acknowledged, job_id) = {
+                    let state = task.state.lock().map_err(|_| "task lock poisoned")?;
+                    let current = state.metadata.remote.as_ref().unwrap();
+                    (
+                        current.accepted,
+                        platform_acknowledged(current),
+                        current.job_id,
+                    )
+                };
+                if accepted && !acknowledged {
+                    if let Some(job_id) = job_id {
+                        let _ = client.cancel_job(job_id).await;
+                    }
+                    return Err("remote outcome unknown: Windows platform was not acknowledged; cancel requested; result not trusted".into());
+                }
+                acknowledged
+            } else {
+                true
+            };
             match result {
                 Ok(StreamProgress::Record) => recovery.reset(),
                 Ok(StreamProgress::Complete(Verdict::RunLocally {
@@ -1159,6 +1207,9 @@ impl BgTaskRegistry {
                     );
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
+                    if !platform_ok {
+                        return Err("remote outcome unknown: Windows platform was not acknowledged; result not trusted".into());
+                    }
                     self.remote_terminal(&task, verdict, None);
                     return Ok(());
                 }
@@ -1590,7 +1641,7 @@ impl BgTaskRegistry {
             ),
             Verdict::Signalled { signal } => (
                 BgTaskStatus::Failed,
-                128_i32.checked_add(signal),
+                128_i32.checked_add(signal).map(i64::from),
                 Some(format!("remote signal {signal}")),
             ),
             // The runner already killed the command at its `timeout`, counted

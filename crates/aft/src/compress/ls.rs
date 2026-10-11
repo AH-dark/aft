@@ -15,7 +15,7 @@ impl Compressor for LsCompressor {
         &self,
         command: &str,
         output: &str,
-        _exit_code: Option<i32>,
+        _exit_code: Option<i64>,
     ) -> CompressionResult {
         let stripped = strip_ansi(output);
         if stripped.trim().is_empty() {

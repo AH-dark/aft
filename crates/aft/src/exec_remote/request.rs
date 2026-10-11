@@ -5,6 +5,8 @@ use std::{collections::BTreeMap, path::Path};
 /// from config files. The caller does not build snapshots or transfer bundles.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PresetParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<super::types::Platform>,
     pub siblings: Vec<String>,
     pub weight_hint: Option<u32>,
     pub queue_wait_limit_s: Option<u64>,
@@ -134,6 +136,9 @@ pub fn build_request(
                 .collect(),
         )
         .with_siblings(preset.siblings.clone());
+    if let Some(platform) = &preset.platform {
+        request = request.with_platform(platform.clone());
+    }
     if let Some(weight) = preset.weight_hint {
         request = request.with_weight_hint(weight);
     }

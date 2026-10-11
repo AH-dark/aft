@@ -17,7 +17,7 @@ impl Compressor for RuffCompressor {
         &self,
         _command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let compressed = compress_ruff(output);
         if matches!(exit_code, Some(code) if code != 0) && compressed.text.trim() == "ruff: clean" {

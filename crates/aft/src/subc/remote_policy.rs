@@ -196,6 +196,7 @@ pub(super) fn lookup(
                     connection_file: connection_file(ctx),
                     harness: harness.clone(),
                     session: session.clone(),
+                    requested_platform: None,
                     requested_vcpus: None,
                     requested_network: false,
                 })
@@ -216,6 +217,7 @@ pub(super) fn lookup(
                 connection_file: connection_file(ctx),
                 harness: key.harness.clone(),
                 session: key.session.clone(),
+                requested_platform: None,
                 requested_vcpus: None,
                 requested_network: false,
             })

@@ -7478,7 +7478,7 @@ fn install_bash_compressor(ctx: &AppContext) {
     let filter_registry_handle = ctx.shared_filter_registry();
     let compress_flag = ctx.bash_compress_flag();
     ctx.bash_background().set_compressor_with_exit_code(
-        move |command: &str, output: String, exit_code: Option<i32>| {
+        move |command: &str, output: String, exit_code: Option<i64>| {
             if !compress_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 return crate::compress::CompressionResult::new(output);
             }

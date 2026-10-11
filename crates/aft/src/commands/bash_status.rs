@@ -108,7 +108,10 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 Response::error_with_data(&req.id, refusal.code, &refusal.message, json!(snapshot))
             } else if snapshot.sandbox_native
                 && snapshot.sandbox_unavailable
-                && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
+                && snapshot.exit_code
+                    == Some(i64::from(
+                        crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE,
+                    ))
             {
                 Response::error_with_data(
                     &req.id,

@@ -18,7 +18,7 @@ impl Compressor for GoCompressor {
         &self,
         command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         match go_subcommand(command).as_deref() {
             Some("test") => preserve_go_failure(output, compress_test(output), exit_code).into(),
@@ -35,7 +35,7 @@ impl Compressor for GoCompressor {
     fn compress_output_match_with_exit_code(
         &self,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         preserve_go_failure(output, compress_test(output), exit_code).into()
     }
@@ -54,7 +54,7 @@ impl Compressor for GolangciLintCompressor {
         &self,
         _command: &str,
         output: &str,
-        exit_code: Option<i32>,
+        exit_code: Option<i64>,
     ) -> CompressionResult {
         let compressed = compress_golangci(output);
         if exited_nonzero(exit_code) && compressed.trim() == "golangci-lint: clean" {
@@ -73,7 +73,7 @@ impl Compressor for GolangciLintCompressor {
     }
 }
 
-fn preserve_go_failure(output: &str, compressed: String, exit_code: Option<i32>) -> String {
+fn preserve_go_failure(output: &str, compressed: String, exit_code: Option<i64>) -> String {
     let compressed_trimmed = compressed.trim();
     let compressed_has_signal = super::text_has_failure_signal(&compressed);
     let raw_has_signal = super::text_has_failure_signal(output);
@@ -91,7 +91,7 @@ fn preserve_go_failure(output: &str, compressed: String, exit_code: Option<i32>)
     }
 }
 
-fn exited_nonzero(exit_code: Option<i32>) -> bool {
+fn exited_nonzero(exit_code: Option<i64>) -> bool {
     matches!(exit_code, Some(code) if code != 0)
 }
 

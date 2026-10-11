@@ -163,10 +163,7 @@ fn run_row(row: &CorpusRow) -> Result<(), String> {
     let aft_exit_code = if row.route.starts_with("rewritten:") {
         Some(0)
     } else {
-        aft_response
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .map(|code| code as i32)
+        aft_response.get("exit_code").and_then(Value::as_i64)
     };
     let mut aft_observation =
         observation_from_aft_response(&aft_response, aft_root.path(), aft_exit_code);
@@ -233,7 +230,7 @@ fn run_oracle(
     Ok(observation_from_process(
         &output.stdout,
         &output.stderr,
-        output.status.code(),
+        output.status.code().map(i64::from),
         root,
     ))
 }

@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.5"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.7"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.5"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.7"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -519,6 +519,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         ("SHELL_SECRET".into(), "must stay on caller".into()),
     ]);
     let preset = PresetParams {
+        platform: None,
         siblings: vec![worktree.to_str().unwrap().into()],
         weight_hint: Some(16),
         queue_wait_limit_s: Some(0),
@@ -575,6 +576,64 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         &preset
     )
     .is_err());
+}
+
+#[test]
+fn linux_request_retains_the_pre_platform_wire_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    for (demand, options) in [
+        ("linux", ""),
+        ("linux,4c", ",\"weight_hint\":4"),
+        ("linux,net", ""),
+        ("linux,4c,net", ",\"weight_hint\":4"),
+    ] {
+        let resolved = policy::parse_demand(demand).unwrap();
+        let request = build_request(
+            &root,
+            &root,
+            &root,
+            "cargo test",
+            Default::default(),
+            Some(23),
+            &PresetParams {
+                platform: resolved.platform,
+                weight_hint: resolved.weight_hint,
+                network: resolved.network.then_some(Network::Outbound),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let encoded_root = serde_json::to_string(root.to_str().unwrap()).unwrap();
+        let wire = serde_json::to_string(&request)
+            .unwrap()
+            .replace(&encoded_root, r#""/Users/u/repo""#);
+        let network = if resolved.network {
+            ",\"network\":\"outbound\""
+        } else {
+            ""
+        };
+        let expected = format!(
+            r#"{{"workspace_key":"/Users/u/repo","repository_root":"/Users/u/repo","cwd":"/Users/u/repo","command":"cargo test","env":{{}}{options},"timeout":23,"siblings":[]{network}}}"#
+        );
+        assert_eq!(wire.as_bytes(), expected.as_bytes(), "{demand}");
+    }
+}
+
+#[test]
+fn windows_exit_outcomes_preserve_all_32_bits() {
+    for code in [256, 0xC000_0005, u32::MAX] {
+        let wire = format!(r#"{{"type":"windows_exit","code":{code}}}"#);
+        let outcome: Outcome = serde_json::from_str(&wire).unwrap();
+        assert_eq!(serde_json::to_string(&outcome).unwrap(), wire);
+        let record = TerminalRecord::new(job_id(), outcome, 1, 0, 0);
+        assert_eq!(
+            grade(&record),
+            Verdict::Exited {
+                code: i64::from(code)
+            }
+        );
+    }
 }
 
 #[test]

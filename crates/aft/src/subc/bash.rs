@@ -2685,6 +2685,7 @@ mod grant_path_tests {
             .or_insert_with(|| json!(ctx.config().project_root));
         let launch = crate::bash_background::RemoteLaunch {
             explicit_runon: false,
+            requested_platform: None,
             requested_vcpus: None,
             requested_network: false,
             connection_file: REMOTE_RUNON_CONNECTION.lock().unwrap().clone(),

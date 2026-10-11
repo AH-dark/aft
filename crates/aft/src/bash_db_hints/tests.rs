@@ -35,7 +35,7 @@ fn failure(dir: &Path, command: &str, enabled: bool) -> Option<String> {
         &SpawnPlan::Unsandboxed,
         enabled,
     );
-    job.finish(&output, result.status.code())
+    job.finish(&output, result.status.code().map(i64::from))
         .map(str::to_string)
 }
 

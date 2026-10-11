@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Runner platforms whose demands `runon` accepts; options are parsed separately.
-pub const KNOWN_DEMANDS: &[&str] = &["linux"];
+pub const KNOWN_DEMANDS: &[&str] = &["linux", "windows"];
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -80,9 +80,10 @@ fn valid_prefix(prefix: &str) -> bool {
         })
 }
 
-/// The sizing and outbound-network options parsed from a runner demand.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The platform, sizing and outbound-network options parsed from a runner demand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedDemand {
+    pub platform: Option<super::types::Platform>,
     pub weight_hint: Option<u32>,
     pub network: bool,
 }
@@ -112,12 +113,19 @@ pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<Resol
 /// before the remote command can be dispatched.
 pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
     let mut tokens = demand.split(',');
-    if !KNOWN_DEMANDS.contains(&tokens.next().unwrap_or_default()) {
+    let platform = tokens.next().unwrap_or_default();
+    if !KNOWN_DEMANDS.contains(&platform) {
         return Err(unknown_demand(demand));
     }
     let mut resolved = ResolvedDemand::default();
+    if platform == "windows" {
+        resolved.platform = Some(super::types::Platform::Windows);
+    }
     for token in tokens {
         if token == "net" {
+            if platform == "windows" {
+                return Err(format!("runon {demand:?} is not valid: Windows jobs have no network; windows,net is not supported"));
+            }
             if resolved.network {
                 return Err(format!(
                     "runon {demand:?} is not valid: duplicate net option"
@@ -135,6 +143,9 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
         if count.is_none() {
             return Err(invalid_vcpu_demand(demand));
         }
+        if platform == "windows" {
+            return Err(format!("runon {demand:?} is not valid: the Windows slot is fixed at 4 vCPUs; use plain windows without a vCPU count"));
+        }
         if resolved.weight_hint.is_some() {
             return Err(format!(
                 "runon {demand:?} is not valid: duplicate vCPU count"
@@ -146,13 +157,16 @@ pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
 }
 
 fn invalid_vcpu_demand(demand: &str) -> String {
+    if demand.starts_with("windows,") {
+        return format!("runon {demand:?} is not valid: Windows jobs accept no options; use plain windows (fixed at 4 vCPUs, no network)");
+    }
     format!("runon {demand:?} is not valid: options are net and a vCPU count as Nc, for example \"linux,4c,net\"")
 }
 
 /// The refusal for a demand no runner serves.
 pub fn unknown_demand(demand: &str) -> String {
     format!(
-        "unknown runner demand {demand:?}; the server only runs Linux; runon accepts {}",
+        "unknown runner demand {demand:?}; runon accepts {}",
         KNOWN_DEMANDS
             .iter()
             .map(|d| format!("{d:?}"))
@@ -164,6 +178,27 @@ pub fn unknown_demand(demand: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_demand_accepts_only_the_fixed_offline_slot() {
+        let resolved = resolve_demand("windows", None).unwrap();
+        assert_eq!(
+            resolved.platform,
+            Some(super::super::types::Platform::Windows)
+        );
+        assert_eq!(resolved.weight_hint, None);
+        assert!(!resolved.network);
+        assert_eq!(resolve_demand("", Some("windows")).unwrap(), resolved);
+        for (demand, reason) in [
+            ("windows,4c", "fixed at 4 vCPUs"),
+            ("windows,net", "no network"),
+            ("windows,wat", "not valid"),
+        ] {
+            let error = resolve_demand(demand, None).unwrap_err();
+            assert!(error.contains(demand), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+    }
 
     #[test]
     fn network_demand_options_parse_in_any_order_and_refuse_duplicates_by_name() {
@@ -184,11 +219,10 @@ mod tests {
             assert!(error.contains(demand), "{error}");
             assert!(error.contains("not valid"), "{error}");
         }
-        for demand in ["windows", "windows,4c", "windows,net,4c"] {
+        for demand in ["plan9", "plan9,4c", "plan9,net,4c"] {
             let error = resolve_demand(demand, None).unwrap_err();
             assert!(error.contains(demand), "{error}");
             assert!(error.contains("unknown runner demand"), "{error}");
-            assert!(error.contains("only runs Linux"), "{error}");
         }
     }
 
@@ -317,11 +351,12 @@ mod tests {
         assert!(resolve_demand("", None)
             .unwrap_err()
             .contains("runon needs a runner demand"));
-        let error = resolve_demand("windows", Some("linux")).unwrap_err();
-        assert!(
-            error.contains("unknown runner demand \"windows\""),
-            "{error}"
+        assert_eq!(
+            resolve_demand("windows", Some("linux")).unwrap().platform,
+            Some(super::super::types::Platform::Windows)
         );
+        let error = resolve_demand("plan9", Some("linux")).unwrap_err();
+        assert!(error.contains("unknown runner demand \"plan9\""), "{error}");
         let error = resolve_demand("", Some("gpu")).unwrap_err();
         assert!(error.contains("unknown runner demand \"gpu\""), "{error}");
     }
