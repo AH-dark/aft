@@ -11,6 +11,37 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Debug)]
+pub(crate) enum PublicationFailure {
+    View(crate::views::ViewError),
+    Other(String),
+}
+
+impl From<crate::views::ViewError> for PublicationFailure {
+    fn from(error: crate::views::ViewError) -> Self {
+        Self::View(error)
+    }
+}
+impl From<String> for PublicationFailure {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+impl std::fmt::Display for PublicationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::View(error) => std::fmt::Display::fmt(error, f),
+            Self::Other(error) => f.write_str(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FailureCategory {
+    StorageOrBuild,
+    Conflict,
+}
+
 /// One retry deadline for both inline and detached publications of a root.
 /// Keeping it on the context preserves the delay when another scheduler wake
 /// supersedes a detached job without changing the checkout.
@@ -21,6 +52,7 @@ pub(crate) struct PublicationRetry {
     due: Option<Instant>,
     initial: Duration,
     maximum: Duration,
+    category: Option<FailureCategory>,
 }
 
 impl Default for PublicationRetry {
@@ -32,6 +64,7 @@ impl Default for PublicationRetry {
             due: None,
             initial: Duration::from_secs(1),
             maximum: Duration::from_secs(300),
+            category: None,
         }
     }
 }
@@ -54,12 +87,25 @@ impl PublicationRetry {
         self.failures = 0;
         self.delay = Duration::ZERO;
         self.due = None;
+        self.category = None;
     }
 
     fn failed(&mut self, root: &std::path::Path, error: &str) {
+        self.failed_as(root, error, FailureCategory::StorageOrBuild);
+    }
+
+    fn failed_as(&mut self, root: &std::path::Path, error: &str, category: FailureCategory) {
+        // A competing successful publisher is not another occurrence of the
+        // previous storage/build fault. Keep independent retry streaks.
+        if self.category != Some(category) {
+            self.failures = 0;
+            self.delay = Duration::ZERO;
+        }
+        self.category = Some(category);
         // Failed generations have fresh artifact names, so comparing complete
         // error strings would turn the same storage fault into a new failure
-        // every attempt. Only progress or a checkout change ends the streak.
+        // every attempt. Within one category, only progress or a checkout
+        // change ends the streak.
         if self.failures > 0 {
             self.failures = self.failures.saturating_add(1);
             self.delay = (self.delay * 2).min(self.maximum);
@@ -82,6 +128,21 @@ impl PublicationRetry {
         } else {
             #[cfg(test)]
             tests::record_failure(root, self.delay, self.failures, false);
+        }
+    }
+
+    fn failed_conflict(&mut self, root: &std::path::Path, error: &str) {
+        self.failed_as(root, error, FailureCategory::Conflict);
+    }
+
+    fn failed_publication(&mut self, root: &std::path::Path, error: &PublicationFailure) {
+        if matches!(
+            error,
+            PublicationFailure::View(crate::views::ViewError::PublicationConflict { .. })
+        ) {
+            self.failed_conflict(root, &error.to_string());
+        } else {
+            self.failed(root, &error.to_string());
         }
     }
 }
@@ -325,9 +386,9 @@ pub(crate) fn schedule(
         let mut retry = ctx.view_publication_retry().lock();
         match &result {
             Ok(()) => retry.reset(&root),
-            Err(error) => retry.failed(&root, error),
+            Err(error) => retry.failed_publication(&root, error),
         }
-        return result;
+        return result.map_err(|error| error.to_string());
     };
     let root = ctx
         .canonical_cache_root_opt()
@@ -397,9 +458,7 @@ pub(crate) fn schedule(
                 ran_deferred = target.ctx.defer_callgraph_build();
                 let result = (|| {
                     let _permit = loop {
-                        lifecycle
-                            .phase("manifest")
-                            .map_err(|error| error.to_string())?;
+                        lifecycle.phase("manifest")?;
                         if let Some(permit) = target.ctx.cold_build_limiter().try_acquire() {
                             break permit;
                         }
@@ -423,12 +482,12 @@ pub(crate) fn schedule(
                     // Content-changing configure is rejected by commit_view_update.
                     let report = {
                         let _epoch = write_epoch_as_detached_writer(&target);
-                        lifecycle.phase("cas").map_err(|error| error.to_string())?;
+                        lifecycle.phase("cas")?;
                         // Sealing and cancellation are atomic with respect to superseding
                         // submissions, which hold JOBS while signaling this token.
                         let _jobs = JOBS.lock();
                         if token.cancel_requested_before_commit() {
-                            return Err("view publication superseded".to_owned());
+                            return Err(PublicationFailure::Other("view publication superseded".to_owned()));
                         }
                         #[cfg(test)]
                         let cas_started = Instant::now();
@@ -445,7 +504,7 @@ pub(crate) fn schedule(
                     report.pending_paths.len(),
                     target.ctx.canonical_cache_root().display()
                 );
-                    Ok::<(), String>(())
+                    Ok::<(), PublicationFailure>(())
                 })();
                 match result {
                     Ok(()) => {
@@ -467,7 +526,7 @@ pub(crate) fn schedule(
                         // Retain the complete path union until a successful install;
                         // scheduling acknowledgement is not publication completion.
                         let root = target.ctx.canonical_cache_root();
-                        target.ctx.view_publication_retry().lock().failed(&root, &error);
+                        target.ctx.view_publication_retry().lock().failed_publication(&root, &error);
                     }
                 }
             }

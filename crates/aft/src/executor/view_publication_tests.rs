@@ -671,7 +671,8 @@ fn publication_io_error_names_operation_and_path() {
     let error = fixture
         .ctx
         .publish_view_paths(BTreeSet::new(), true)
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(error.starts_with("view I/O failed reading "), "{error}");
     assert!(error.contains("tracked.rs"), "{error}");
     assert_ne!(fixture.view.current_generation().unwrap(), None);
@@ -1057,4 +1058,74 @@ fn deleted_root_pending_publication_retires_once_without_rescheduling() {
         "deleted publication must never be re-scheduled"
     );
     assert!(!running_for_context(&fixture.ctx));
+}
+#[test]
+fn publication_conflict_does_not_inherit_storage_failure_backoff() {
+    let root = tempfile::tempdir().unwrap();
+    let mut retry = PublicationRetry::default();
+    retry.failed(root.path(), "invalid view manifest: malformed entry");
+    retry.failed(root.path(), "invalid view manifest: malformed entry");
+    assert_eq!(retry.failures, 2);
+    retry.failed_conflict(root.path(), "publication base changed to winner");
+    assert_eq!(retry.failures, 1);
+    assert_eq!(retry.delay, retry.initial);
+    assert!(retry.due().is_some());
+}
+
+#[test]
+fn context_keeps_a_typed_conflict_and_the_winning_generation_for_retry() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.project.path().join("tracked.rs"),
+        "pub fn contender() {}\n",
+    )
+    .unwrap();
+    let paths = BTreeSet::from([b"tracked.rs".to_vec()]);
+    let mut first = fixture
+        .ctx
+        .prepare_view_paths(paths.clone(), true, &mut |_| Ok(()))
+        .unwrap();
+    let mut second = fixture
+        .ctx
+        .prepare_view_paths(paths, true, &mut |_| Ok(()))
+        .unwrap();
+    let winner = fixture
+        .ctx
+        .commit_view_update(&mut first)
+        .unwrap()
+        .generation
+        .unwrap();
+    let error = fixture.ctx.commit_view_update(&mut second).unwrap_err();
+    assert!(
+        matches!(&error, PublicationFailure::View(crate::views::ViewError::PublicationConflict {
+        attempted_generation, current_generation: Some(current),
+    }) if !attempted_generation.is_empty() && *current == winner)
+    );
+    assert_eq!(
+        fixture
+            .ctx
+            .view_runtime_snapshot()
+            .unwrap()
+            .generation
+            .as_deref(),
+        Some(winner.as_str())
+    );
+    let mut retry = PublicationRetry::default();
+    retry.failed(fixture.project.path(), "storage failure");
+    retry.failed(fixture.project.path(), "storage failure");
+    retry.failed_publication(fixture.project.path(), &error);
+    assert!(matches!(retry.category, Some(FailureCategory::Conflict)));
+    assert_eq!(retry.failures, 1);
+    retry.failed_publication(
+        fixture.project.path(),
+        &PublicationFailure::Other(error.to_string()),
+    );
+    assert!(matches!(
+        retry.category,
+        Some(FailureCategory::StorageOrBuild)
+    ));
+    assert_eq!(
+        retry.failures, 1,
+        "formatted text must not decide the retry category"
+    );
 }

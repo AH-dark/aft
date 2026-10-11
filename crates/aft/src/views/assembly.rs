@@ -108,6 +108,7 @@ impl PreparedAssembly {
     pub fn commit(&mut self) -> Result<AssemblyReport> {
         if let Some(publication) = self.publication.take() {
             let retires_legacy_plane = publication.base_generation.is_none();
+            let attempted_generation = publication.generation.clone();
             let pointer_started = Instant::now();
             let outcome = publication.commit();
             self.profile.pointer_ms = pointer_started.elapsed().as_millis();
@@ -137,9 +138,10 @@ impl PreparedAssembly {
                 }
                 PublishOutcome::Conflict { current_generation } => {
                     self.profile.outcome = "conflict";
-                    return Err(ViewError::InvalidManifest(format!(
-                        "publication base changed to {current_generation:?}"
-                    )));
+                    return Err(ViewError::PublicationConflict {
+                        attempted_generation,
+                        current_generation,
+                    });
                 }
             }
         }

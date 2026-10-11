@@ -244,7 +244,7 @@ struct Driver {
 }
 fn error(e: impl std::fmt::Display) -> PlaneError {
     PlaneError {
-        plane: FamilyPlane::Callgraph,
+        plane: Some(FamilyPlane::Callgraph),
         reason: e.to_string(),
     }
 }

@@ -1159,6 +1159,89 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn legacy_registry(storage: &Path) -> PathBuf {
+        let path = family_dir(storage, "family").unwrap().join(REGISTRY_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE registry_meta (singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, gc_epoch INTEGER NOT NULL);
+             INSERT INTO registry_meta VALUES (1, 1, 37);
+             CREATE TABLE members (scope TEXT PRIMARY KEY, root BLOB, view_dir TEXT NOT NULL,
+               registered_at_ms INTEGER NOT NULL, last_bind_ms INTEGER NOT NULL, last_publish_ms INTEGER,
+               state TEXT NOT NULL, missing_sweeps INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE readers (reader_id TEXT PRIMARY KEY, label TEXT NOT NULL, owner_pid INTEGER NOT NULL,
+               owner_start INTEGER NOT NULL, registered_at_ms INTEGER NOT NULL);
+             CREATE TABLE sweep_lease (singleton INTEGER PRIMARY KEY, owner_pid INTEGER NOT NULL,
+               owner_start INTEGER NOT NULL, epoch INTEGER NOT NULL, acquired_at_ms INTEGER NOT NULL);"
+        ).unwrap();
+        connection
+            .execute(
+                "INSERT INTO members (scope, root, view_dir, registered_at_ms, last_bind_ms, state)
+            VALUES ('old', ?1, ?2, 1, 2, 'active')",
+                params![
+                    encode_root(storage),
+                    path_text(&view_dir(storage, "old").unwrap())
+                ],
+            )
+            .unwrap();
+        path
+    }
+
+    #[test]
+    #[ignore = "Mixed-version read misses need a policy that protects inactive legacy views without indefinitely stopping family GC"]
+    fn legacy_registry_is_a_read_miss_not_a_current_directory() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = legacy_registry(storage.path());
+        let before = fs::read(&path).unwrap();
+        assert!(FamilyRegistry::open_existing(storage.path(), "family")
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    #[ignore = "Re-registration migration must retain legacy protection and work with persisted retention cursors and volume identity"]
+    fn legacy_member_requires_reregistration_before_becoming_current() {
+        let storage = tempfile::tempdir().unwrap();
+        legacy_registry(storage.path());
+        let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
+        assert!(registry.member("old").unwrap().is_none());
+        assert!(
+            registry.members().is_err(),
+            "an incomplete directory census must stop retention"
+        );
+        assert_eq!(
+            registry
+                .connection()
+                .query_row("SELECT gc_epoch FROM registry_meta", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            37
+        );
+        let owner = registry.register_view("old", storage.path()).unwrap();
+        assert_eq!(
+            registry.member("old").unwrap().unwrap().view_dir,
+            owner.view_dir()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "Native path encoding awaits an approved mixed-version and legacy-retention registry migration"]
+    fn non_utf8_view_directory_round_trips_without_lossy_aliases() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp
+            .path()
+            .join(std::ffi::OsString::from_vec(b"storage-\xff".to_vec()));
+        fs::create_dir(&storage).unwrap();
+        let registry = FamilyRegistry::open(&storage, "family").unwrap();
+        let owner = registry.register_view("native", temp.path()).unwrap();
+        let member = registry.member("native").unwrap().unwrap();
+        assert_eq!(member.view_dir, owner.view_dir());
+        assert_ne!(member.view_dir, PathBuf::from(path_text(owner.view_dir())));
+    }
+
     #[test]
     fn registration_is_idempotent_and_readers_leave_on_drop() {
         let storage = tempfile::tempdir().unwrap();
