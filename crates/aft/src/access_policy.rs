@@ -173,7 +173,7 @@ impl AccessPolicy {
         if self
             .absolute_floor
             .iter()
-            .any(|floor| path.starts_with(floor))
+            .any(|floor| floor_contains(path, floor))
         {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
@@ -185,7 +185,7 @@ impl AccessPolicy {
             .private_stores
             .deny
             .iter()
-            .any(|floor| path.starts_with(floor))
+            .any(|floor| floor_contains(path, floor))
             && !exceptions.iter().any(|root| path.starts_with(root))
             && !(operation == AccessOperation::Read && owned_artifact)
         {
@@ -212,7 +212,7 @@ impl AccessPolicy {
     /// Exact location checks still preserve final symlinks instead of following them.
     pub fn decide_tree_write(&self, path: &Path) -> AccessDecision {
         for floor in self.absolute_floor.iter().chain(&self.private_stores.deny) {
-            if floor.starts_with(path)
+            if floor_contains(floor, path)
                 && self.decide(AccessOperation::Write, floor, false)
                     == AccessDecision::Deny(AccessDenial::Floor)
             {
@@ -258,6 +258,106 @@ impl AccessPolicy {
         profile.data_policy.write_allow.push(temp_dir);
         Ok(profile)
     }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn floor_contains(path: &Path, prefix: &Path) -> bool {
+    path.starts_with(prefix)
+}
+
+#[cfg(windows)]
+fn floor_contains(path: &Path, prefix: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "CompareStringOrdinal"]
+        fn compare_string_ordinal(
+            left: *const u16,
+            left_len: i32,
+            right: *const u16,
+            right_len: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+
+    // Windows accepts case aliases even for missing final components. Compare
+    // whole components with the OS's ordinal case rules, without following a
+    // final symlink or losing non-UTF-8 names through string conversion.
+    let path = crate::inspect::job::normalize_path(path);
+    let prefix = crate::inspect::job::normalize_path(prefix);
+    let mut components = path.components();
+    prefix.components().all(|expected| {
+        let Some(actual) = components.next() else {
+            return false;
+        };
+        let left = actual.as_os_str().encode_wide().collect::<Vec<_>>();
+        let right = expected.as_os_str().encode_wide().collect::<Vec<_>>();
+        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+        else {
+            return false;
+        };
+        // Both UTF-16 buffers stay alive for the call, and the lengths are checked.
+        // CompareStringOrdinal returns CSTR_EQUAL (2); errors conservatively
+        // match a protected name. This comparator never grants access.
+        unsafe {
+            matches!(
+                compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1),
+                0 | 2
+            )
+        }
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn floor_contains(path: &Path, prefix: &Path) -> bool {
+    use std::ffi::c_void;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        #[link_name = "CFStringCreateWithCharacters"]
+        fn create_string(allocator: *const c_void, chars: *const u16, len: isize) -> *const c_void;
+        #[link_name = "CFStringCompare"]
+        fn compare_strings(left: *const c_void, right: *const c_void, options: usize) -> isize;
+        #[link_name = "CFRelease"]
+        fn release(value: *const c_void);
+    }
+
+    // Protected names include case and Unicode decomposition aliases on macOS.
+    // Use these comparisons only to deny access, never to widen roots or grants.
+    let mut components = path.components();
+    prefix.components().all(|expected| {
+        let Some(actual) = components.next() else {
+            return false;
+        };
+        let (Some(left), Some(right)) =
+            (actual.as_os_str().to_str(), expected.as_os_str().to_str())
+        else {
+            return actual
+                .as_os_str()
+                .as_bytes()
+                .eq_ignore_ascii_case(expected.as_os_str().as_bytes());
+        };
+        let left = left.encode_utf16().collect::<Vec<_>>();
+        let right = right.encode_utf16().collect::<Vec<_>>();
+        // The buffers live through string creation. Every created CF string is
+        // released, and allocation failure conservatively matches a protected name.
+        unsafe {
+            let left = create_string(std::ptr::null(), left.as_ptr(), left.len() as isize);
+            let right = create_string(std::ptr::null(), right.as_ptr(), right.len() as isize);
+            // Ignore case and treat different Unicode decompositions of a letter as equal.
+            let equal =
+                left.is_null() || right.is_null() || compare_strings(left, right, 1 | 16) == 0;
+            if !left.is_null() {
+                release(left);
+            }
+            if !right.is_null() {
+                release(right);
+            }
+            equal
+        }
+    })
 }
 
 pub(crate) fn expand_home(path: &Path, home: &Path) -> PathBuf {
@@ -446,6 +546,34 @@ mod tests {
             .write_allow_roots()
             .iter()
             .any(|path| file.starts_with(path)));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn floor_matching_uses_native_case_insensitive_components() {
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = policy(root.path(), &root.path().join("store"));
+        policy.outside = AccessDecision::Allow;
+        policy
+            .absolute_floor
+            .push(root.path().join("private-Ω/Secret.txt"));
+        let alias = root.path().join("PRIVATE-ω/secret.TXT");
+        assert_eq!(
+            policy.decide(AccessOperation::Write, &alias, false),
+            AccessDecision::Deny(AccessDenial::Floor)
+        );
+        assert_eq!(
+            policy.decide(AccessOperation::Read, &alias, true),
+            AccessDecision::Deny(AccessDenial::Floor)
+        );
+        assert_eq!(
+            policy.decide(
+                AccessOperation::Write,
+                &root.path().join("PRIVATE-ω/secret.TXT-sibling"),
+                false
+            ),
+            AccessDecision::Allow
+        );
     }
 
     #[test]
