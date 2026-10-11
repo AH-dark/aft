@@ -705,7 +705,7 @@ pub(crate) fn promote_bash(
     bash_watch_available: bool,
     capped_worker_wait: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    match ctx.bash_background().promote_typed(task_id, session_id) {
         Ok(_) if capped_worker_wait => {
             if worker_session {
                 ctx.bash_background().renew_hard_kill(
@@ -757,12 +757,12 @@ pub(crate) fn promote_bash(
             bash_watch_available,
             &kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
         ),
-        Err(message) if message.contains("not found") => Response::error(
+        Err(message) if message.is_missing_task() => Response::error(
             request_id,
             "task_not_found",
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
-        Err(message) => Response::error(request_id, "execution_failed", message),
+        Err(message) => Response::error(request_id, "execution_failed", message.to_string()),
     }
 }
 
@@ -774,7 +774,7 @@ pub(crate) fn detach_wait_mode_bash(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    match ctx.bash_background().promote_typed(task_id, session_id) {
         Ok(_) => wait_detach_response(
             request_id,
             task_id,
@@ -782,12 +782,12 @@ pub(crate) fn detach_wait_mode_bash(
             bash_watch_available,
             &kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
         ),
-        Err(message) if message.contains("not found") => Response::error(
+        Err(message) if message.is_missing_task() => Response::error(
             request_id,
             "task_not_found",
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
-        Err(message) => Response::error(request_id, "execution_failed", message),
+        Err(message) => Response::error(request_id, "execution_failed", message.to_string()),
     }
 }
 
@@ -846,7 +846,7 @@ pub(crate) fn handback_remote_bash(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    match ctx.bash_background().promote_typed(task_id, session_id) {
         Ok(_) => {
             let progress = ctx.bash_background().remote_progress(task_id, session_id);
             let output = format!(
@@ -882,12 +882,12 @@ pub(crate) fn handback_remote_bash(
                 }),
             )
         }
-        Err(message) if message.contains("not found") => Response::error(
+        Err(message) if message.is_missing_task() => Response::error(
             request_id,
             "task_not_found",
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
-        Err(message) => Response::error(request_id, "execution_failed", message),
+        Err(message) => Response::error(request_id, "execution_failed", message.to_string()),
     }
 }
 
@@ -902,7 +902,7 @@ pub(crate) fn detach_bash_for_module_drain(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    match ctx.bash_background().promote_typed(task_id, session_id) {
         Ok(_) => {
             let snapshot = ctx
                 .bash_background()
@@ -934,12 +934,12 @@ pub(crate) fn detach_bash_for_module_drain(
                 }),
             )
         }
-        Err(message) if message.contains("not found") => Response::error(
+        Err(message) if message.is_missing_task() => Response::error(
             request_id,
             "task_not_found",
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
-        Err(message) => Response::error(request_id, "execution_failed", message),
+        Err(message) => Response::error(request_id, "execution_failed", message.to_string()),
     }
 }
 

@@ -1422,6 +1422,8 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
 #[derive(Clone, Copy)]
 pub(crate) enum TaskIoFault {
     LayoutEnospc,
+    OutputHandlesEnospc,
+    OutputHandlesMisleadingText,
     RunningEnospc,
     RunningDelay(std::time::Duration),
     /// Delays the starting-record write, which happens before the spawn
@@ -2431,6 +2433,22 @@ impl TaskIoHandles {
                 ),
             ),
         };
+        #[cfg(test)]
+        if matches!(
+            TASK_IO_FAULT.with(std::cell::Cell::get),
+            Some(TaskIoFault::OutputHandlesEnospc)
+        ) {
+            return Err(task_storage_full_for_test());
+        }
+        #[cfg(test)]
+        if matches!(
+            TASK_IO_FAULT.with(std::cell::Cell::get),
+            Some(TaskIoFault::OutputHandlesMisleadingText)
+        ) {
+            return Err(io::Error::other(
+                "storage limit exceeded; startup deadline expired",
+            ));
+        }
         Ok(Self {
             dirs: task.dirs.clone(),
             stdout,

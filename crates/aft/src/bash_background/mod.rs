@@ -962,7 +962,7 @@ pub(crate) fn spawn(
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
     #[cfg(unix)]
     let remote_result = remote.map(|launch| {
-        ctx.bash_background().spawn_remote(
+        ctx.bash_background().spawn_remote_typed(
             launch,
             spawn_plan.clone(),
             command,
@@ -979,7 +979,7 @@ pub(crate) fn spawn(
         )
     });
     #[cfg(not(unix))]
-    let remote_result: Option<Result<String, String>> = {
+    let remote_result: Option<Result<String, registry::RegistryError>> = {
         let _ = remote;
         None
     };
@@ -987,7 +987,7 @@ pub(crate) fn spawn(
         result
     } else if pty {
         // A PTY always runs in the background, so it always takes a slot.
-        ctx.bash_background().spawn_pty_with_shell(
+        ctx.bash_background().spawn_pty_with_shell_typed(
             spawn_plan,
             command,
             shell,
@@ -1005,7 +1005,7 @@ pub(crate) fn spawn(
             pty_cols,
         )
     } else {
-        ctx.bash_background().spawn_with_shell_in_slot(
+        ctx.bash_background().spawn_with_shell_in_slot_typed(
             spawn_plan,
             command,
             shell,
@@ -1039,7 +1039,7 @@ pub(crate) fn spawn(
             }
             successful_spawn_response(request_id, session_id, &task_id, pty, ctx)
         }
-        Err(message) if message.contains("limit exceeded") => {
+        Err(registry::RegistryError::TaskLimit(message)) => {
             cleanup_plan.cleanup_unspawned();
             #[cfg(unix)]
             if let Some(task) = unregistered_task.as_ref() {
@@ -1047,7 +1047,9 @@ pub(crate) fn spawn(
             }
             Response::error(request_id, "background_task_limit_exceeded", message)
         }
-        Err(message) => {
+        Err(error) => {
+            let startup_deadline = matches!(error, registry::RegistryError::StartupDeadline(_));
+            let message = error.to_string();
             // A deadline may already have handed the starting task id to its
             // caller. Keep its terminal failure record available to status.
             if !spawn_receipt_committed() {
@@ -1060,7 +1062,11 @@ pub(crate) fn spawn(
             {
                 let _ = persistence::delete_resolved_task(task);
             }
-            execution_error_response(request_id, cleanup_plan.is_native_launcher(), message)
+            if startup_deadline {
+                Response::error(request_id, "bash_start_deadline", message)
+            } else {
+                execution_error_response(request_id, cleanup_plan.is_native_launcher(), message)
+            }
         }
     }
 }
