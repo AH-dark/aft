@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type RouteHandle,
+  SocketTimeoutError,
   StaleRouteHandleError,
   SubcCallError,
   SubcError,
@@ -16,16 +17,20 @@ import {
 import {
   AftToolError,
   adaptToolError,
+  BASH_FRAME_READ_TIMEOUT_DISPOSITION,
   BASH_TRANSPORT_DISPOSITION,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   classifyBashHostFallbackError,
   isBashTransportDeadError,
   isRouteOpenReloadWindowError,
+  isSubcFrameReadTimeoutError,
+  SUBC_FRAME_READ_TIMEOUT_DISPOSITION,
   SUBC_MODULE_RESTART_DISPOSITION,
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
 } from "../error-contract.js";
 import {
   isLocalRouteCloseRejection,
+  SubcFrameReadTimeoutError,
   SubcRootGenerationExpiredError,
   SubcRootReapedError,
   SubcRouteClosedMidCallError,
@@ -413,5 +418,98 @@ describe("adaptToolError", () => {
     expect(midCall.message).toContain("UNKNOWN");
     expect(midCall.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
     expect(midCall.message).not.toContain(SUBC_MODULE_RESTART_DISPOSITION);
+  });
+
+  test("a frame-read timeout never enables bash host fallback", () => {
+    const rawSocketTimeout = new SocketTimeoutError("timed out waiting for 359 bytes");
+    const subcLost = new SubcError(
+      "timed out waiting for 359 bytes",
+      undefined,
+      undefined,
+      "connection_lost",
+    );
+    const typed = new SubcFrameReadTimeoutError(subcLost);
+
+    for (const error of [rawSocketTimeout, subcLost, typed]) {
+      expect(isSubcFrameReadTimeoutError(error)).toBe(true);
+      expect(classifyBashHostFallbackError(error)).toBeUndefined();
+      expect(isBashTransportDeadError(error)).toBe(false);
+    }
+  });
+
+  test("a frame-read timeout on bash gets the unknown-outcome bash disposition", () => {
+    const original = new SubcFrameReadTimeoutError(
+      new SubcError("timed out waiting for 359 bytes", undefined, undefined, "connection_lost"),
+    );
+
+    const adapted = adaptToolError("bash", original) as SubcFrameReadTimeoutError;
+
+    expect(adapted).toBe(original);
+    expect(adapted.kind).toBe("outcome_unknown");
+    expect(adapted.code).toBe("frame_read_timeout");
+    expect(adapted.message).toStartWith(
+      "the command may have run; timed out waiting for frame body bytes from the AFT daemon",
+    );
+    expect(adapted.message).toContain(BASH_FRAME_READ_TIMEOUT_DISPOSITION);
+    expect(adapted.message).toContain("UNKNOWN");
+    expect(adapted.message).toContain("bash_status");
+    expect(adapted.message).toContain("do not re-run side-effecting commands blindly");
+    expect(adapted.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
+    expect(adapted.message).not.toContain(SUBC_MODULE_RESTART_DISPOSITION);
+  });
+
+  test("a frame-read timeout on a read tool gets the unknown-outcome tool disposition", () => {
+    const original = new SubcFrameReadTimeoutError(
+      new SocketTimeoutError("timed out waiting for 359 bytes"),
+    );
+
+    const adapted = adaptToolError("read", original) as SubcFrameReadTimeoutError;
+
+    expect(adapted).toBe(original);
+    expect(adapted.kind).toBe("outcome_unknown");
+    expect(adapted.code).toBe("frame_read_timeout");
+    expect(adapted.message).toStartWith(
+      "the command may have run; timed out waiting for frame body bytes from the AFT daemon",
+    );
+    expect(adapted.message).toContain(SUBC_FRAME_READ_TIMEOUT_DISPOSITION);
+    expect(adapted.message).toContain("UNKNOWN");
+    expect(adapted.message).toContain("never blind-retry a mutation");
+    expect(adapted.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
+    expect(adapted.message).not.toContain(BASH_FRAME_READ_TIMEOUT_DISPOSITION);
+  });
+
+  test("raw SocketTimeoutError and SubcError are mapped to SubcFrameReadTimeoutError", () => {
+    const rawSocket = new SocketTimeoutError("timed out waiting for 359 bytes");
+    const adaptedBash = adaptToolError("bash", rawSocket);
+    expect(adaptedBash).toBeInstanceOf(SubcFrameReadTimeoutError);
+    expect((adaptedBash as SubcFrameReadTimeoutError).cause).toBe(rawSocket);
+    expect((adaptedBash as SubcFrameReadTimeoutError).message).toContain(
+      BASH_FRAME_READ_TIMEOUT_DISPOSITION,
+    );
+
+    const rawSubc = new SubcError(
+      "timed out waiting for 100 bytes",
+      undefined,
+      undefined,
+      "connection_lost",
+    );
+    const adaptedRead = adaptToolError("read", rawSubc);
+    expect(adaptedRead).toBeInstanceOf(SubcFrameReadTimeoutError);
+    expect((adaptedRead as SubcFrameReadTimeoutError).cause).toBe(rawSubc);
+    expect((adaptedRead as SubcFrameReadTimeoutError).message).toContain(
+      SUBC_FRAME_READ_TIMEOUT_DISPOSITION,
+    );
+  });
+
+  test("frame-read timeout disposition is appended once when passed through twice", () => {
+    const error = new SubcFrameReadTimeoutError(
+      new SocketTimeoutError("timed out waiting for 359 bytes"),
+    );
+
+    adaptToolError("bash", error);
+    adaptToolError("bash", error);
+
+    const occurrences = error.message.split(BASH_FRAME_READ_TIMEOUT_DISPOSITION).length - 1;
+    expect(occurrences).toBe(1);
   });
 });

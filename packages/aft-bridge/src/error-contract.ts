@@ -21,12 +21,16 @@ import {
 import {
   isLocalRouteCloseRejection,
   isSubcClientClosedError,
+  isSubcFrameReadTimeoutError,
   isSubcRouteTornDownError,
+  SubcFrameReadTimeoutError,
   SubcRootGenerationExpiredError,
   SubcRootReapedError,
   SubcRouteClosedMidCallError,
   SubcTransportShuttingDownError,
 } from "./subc-transport.js";
+
+export { isSubcFrameReadTimeoutError, SubcFrameReadTimeoutError };
 
 export interface AftToolErrorCause {
   code: string;
@@ -93,6 +97,23 @@ export const BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION =
  */
 export const SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION =
   "The plugin closed this call's route while the call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
+
+/**
+ * Agent-facing guidance for a bash call whose response frame timed out
+ * mid-read (the frame header arrived, but the body never followed). The
+ * command was dispatched to the daemon and may have executed or started a
+ * background task.
+ */
+export const BASH_FRAME_READ_TIMEOUT_DISPOSITION =
+  "The command's state is UNKNOWN: the transport timed out while reading the response frame, so it may or may not have executed. Check bash_status if a task ID could have been assigned, and do not re-run side-effecting commands blindly.";
+
+/**
+ * Agent-facing guidance for a tool call whose response frame timed out
+ * mid-read. The request was handed to the socket and dispatched to the
+ * daemon, so it may have executed.
+ */
+export const SUBC_FRAME_READ_TIMEOUT_DISPOSITION =
+  "The transport timed out while reading the response frame for this call, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
 
 /**
  * A request that was in flight when the plugin closed its own route: the
@@ -227,6 +248,7 @@ export function classifyBashHostFallbackError(error: unknown): BashHostFallbackC
   }
   if (error instanceof BridgeTransportUnknownOutcomeError) return undefined;
   if (isRouteClosedMidCallError(error)) return undefined;
+  if (isSubcFrameReadTimeoutError(error)) return undefined;
   if (error instanceof SubcTransportShuttingDownError) return "transport down";
   if (isSubcRouteTornDownError(error)) return "route closed before dispatch";
 
@@ -263,6 +285,18 @@ function isTransportClassError(error: unknown): boolean {
  */
 export function adaptToolError(command: string, error: unknown): unknown {
   if (!(error instanceof Error)) return error;
+
+  if (isSubcFrameReadTimeoutError(error)) {
+    const typedError =
+      error instanceof SubcFrameReadTimeoutError ? error : new SubcFrameReadTimeoutError(error);
+    const disposition =
+      command === "bash"
+        ? BASH_FRAME_READ_TIMEOUT_DISPOSITION
+        : SUBC_FRAME_READ_TIMEOUT_DISPOSITION;
+    if (typedError.message.includes(disposition)) return typedError;
+    typedError.message = typedError.message ? `${typedError.message} ${disposition}` : disposition;
+    return typedError;
+  }
 
   if (error instanceof BridgeTransportUnknownOutcomeError) {
     if (error.message.includes(BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION)) return error;

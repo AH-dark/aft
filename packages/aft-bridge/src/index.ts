@@ -198,11 +198,13 @@ export {
   AftToolError,
   type AftToolErrorCause,
   adaptToolError,
+  BASH_FRAME_READ_TIMEOUT_DISPOSITION,
   BASH_TRANSPORT_DISPOSITION,
   type BashHostFallbackCause,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   classifyBashHostFallbackError,
   isBashTransportDeadError,
+  SUBC_FRAME_READ_TIMEOUT_DISPOSITION,
   SUBC_ROUTE_CLOSED_MID_CALL_DISPOSITION,
   toolErrorFromResponse,
 } from "./error-contract.js";
@@ -346,7 +348,9 @@ export {
 } from "./storage-paths.js";
 export {
   type BgNudgeRef,
+  isSubcFrameReadTimeoutError,
   resolveBridgeForNudge,
+  SubcFrameReadTimeoutError,
   type SubcLocalRouteCloseReason,
   SubcRouteClosedMidCallError,
   SubcTransportPool,

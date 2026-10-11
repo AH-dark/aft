@@ -28,6 +28,7 @@ import {
   isConsumerReconnectTransient,
   type RequestOptions,
   type RouteTarget,
+  SocketTimeoutError,
   StaleRouteHandleError,
   SubcCallError,
   SubcClient,
@@ -105,6 +106,68 @@ export class SubcRouteClosedMidCallError extends SubcCallError {
 }
 
 /**
+ * A data-plane request was queued and sent, but reading the daemon's response
+ * frame timed out waiting for body bytes after the header was received.
+ *
+ * subc-client raises SocketTimeoutError from readExact when the body does not
+ * arrive within BODY_READ_TIMEOUT_MS after the header. Because the request was
+ * already sent to the daemon, it may have executed: the outcome is unknown.
+ * The call must not be blind-retried, and bash must not re-run it on the host.
+ */
+export class SubcFrameReadTimeoutError extends SubcCallError {
+  constructor(cause: unknown) {
+    super(
+      "outcome_unknown",
+      "the command may have run; timed out waiting for frame body bytes from the AFT daemon",
+      "frame_read_timeout",
+      cause,
+    );
+    this.name = "SubcFrameReadTimeoutError";
+  }
+}
+
+function isFrameTimeoutMessage(message: unknown): boolean {
+  return (
+    typeof message === "string" &&
+    (/timed out waiting for \d+ bytes/i.test(message) ||
+      /timed out waiting for frame body bytes/i.test(message))
+  );
+}
+
+export function isSubcFrameReadTimeoutError(error: unknown): boolean {
+  if (error instanceof SubcFrameReadTimeoutError) return true;
+  if (error instanceof SocketTimeoutError) return true;
+  if (error instanceof SubcError && isFrameTimeoutMessage(error.message)) return true;
+  if (error instanceof SubcCallError) {
+    if (error.code === "frame_read_timeout") return true;
+    if (
+      error.cause !== undefined &&
+      error.cause !== error &&
+      isSubcFrameReadTimeoutError(error.cause)
+    ) {
+      return true;
+    }
+    if (isFrameTimeoutMessage(error.message)) return true;
+  }
+  if (error instanceof Error) {
+    if (
+      error.cause !== undefined &&
+      error.cause !== error &&
+      isSubcFrameReadTimeoutError(error.cause)
+    ) {
+      return true;
+    }
+    if (isFrameTimeoutMessage(error.message)) return true;
+  }
+  return false;
+}
+
+export function frameReadTimeoutError(error: unknown): unknown {
+  if (!isSubcFrameReadTimeoutError(error)) return error;
+  return error instanceof SubcFrameReadTimeoutError ? error : new SubcFrameReadTimeoutError(error);
+}
+
+/**
  * subc-client's rejection of a request that was pending when the client itself
  * closed the route: `closeRoute` tearing that route down, or the client closing
  * its connection. The client types both with `closeReason: "closed_by_caller"`;
@@ -164,6 +227,7 @@ export function isSubcClientClosedError(error: unknown): error is SubcError {
  * the connection has already been torn down locally.
  */
 export function isSocketDeathError(error: unknown, depth = 0): boolean {
+  if (isSubcFrameReadTimeoutError(error)) return true;
   // Raw data-plane requests wrap socket death in a SubcError; its typed
   // connection-loss reason survives even when the underlying errno does not.
   if (error instanceof SubcError && error.closeReason === "connection_lost") return true;
@@ -2267,7 +2331,8 @@ export class SubcTransportPool implements AftTransportPool {
         if (
           aborted ||
           isRouteProvenAbsentError(error) ||
-          (error instanceof SubcError && error.closeReason !== undefined)
+          (error instanceof SubcError && error.closeReason !== undefined) ||
+          isSubcFrameReadTimeoutError(error)
         ) {
           clearRouteEntry(entry);
         }
@@ -2360,7 +2425,9 @@ export class SubcTransportPool implements AftTransportPool {
           if (reopened) this.resetRouteReopenBackoff();
           return reply;
         } catch (requestError) {
-          const error = routeClosedMidCallError(requestError, routeAndEntry.entry, record);
+          const error = frameReadTimeoutError(
+            routeClosedMidCallError(requestError, routeAndEntry.entry, record),
+          );
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           const ownsRoute = this.isCurrentSession(key, record) && this.client === client;
           // A route that was bound before a module reload started gets its
