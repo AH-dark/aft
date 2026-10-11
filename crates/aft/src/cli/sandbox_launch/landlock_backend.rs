@@ -3,7 +3,7 @@ use landlock::{
     AccessFs, BitFlags, CompatLevel, Compatible, LandlockStatus, PathBeneath, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, ABI,
 };
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -68,7 +68,10 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
     // Git and other standard tools open /dev/null read-write; granting only
     // file rights on this sink does not make any persistent path writable.
     apply_paths(
-        profile.read_allow.iter().map(PathBuf::as_path),
+        profile
+            .read_allow
+            .iter()
+            .map(|path| (path.as_path(), profile.read_allow_listed.contains(path))),
         profile
             .write_allow_roots()
             .into_iter()
@@ -79,11 +82,11 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
 
 pub(super) fn probe() -> Result<AppliedLandlock, String> {
     close_inherited_fds()?;
-    apply_paths([Path::new("/")], [Path::new("/")], false)
+    apply_paths([(Path::new("/"), false)], [Path::new("/")], false)
 }
 
 fn apply_paths<'a>(
-    read_paths: impl IntoIterator<Item = &'a Path>,
+    read_paths: impl IntoIterator<Item = (&'a Path, bool)>,
     write_paths: impl IntoIterator<Item = &'a Path>,
     yama_same_uid_exposed: bool,
 ) -> Result<AppliedLandlock, String> {
@@ -99,10 +102,10 @@ fn apply_paths<'a>(
         .create()
         .map_err(|error| format!("failed to create Landlock ruleset: {error}"))?;
 
-    let mut read_paths = read_paths.into_iter().collect::<BTreeSet<_>>();
+    let mut read_paths = read_paths.into_iter().collect::<BTreeMap<_, _>>();
     for path in write_paths {
-        let opened = open_rule_path(path)?;
-        let access = if read_paths.remove(path) {
+        let opened = open_rule_path(path).map_err(|error| error.to_string())?;
+        let access = if read_paths.remove(path).is_some() {
             read_access | write_access
         } else {
             write_access
@@ -118,8 +121,10 @@ fn apply_paths<'a>(
             })?;
     }
 
-    for path in read_paths {
-        let opened = open_rule_path(path)?;
+    for (path, from_listing) in read_paths {
+        let Some(opened) = open_read_rule_path(path, from_listing)? else {
+            continue;
+        };
         let access = access_for_opened_path(read_access, opened.is_dir);
         ruleset = ruleset
             .add_rule(PathBeneath::new(opened.fd, access))
@@ -219,12 +224,22 @@ struct OpenedRulePath {
     is_dir: bool,
 }
 
-fn open_rule_path(path: &Path) -> Result<OpenedRulePath, String> {
+fn open_read_rule_path(path: &Path, from_listing: bool) -> Result<Option<OpenedRulePath>, String> {
+    match open_rule_path(path) {
+        Ok(opened) => Ok(Some(opened)),
+        // A child can disappear even after launcher validation. Removing this
+        // read rule cannot widen access; never substitute its parent directory.
+        Err(error) if from_listing && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn open_rule_path(path: &Path) -> std::io::Result<OpenedRulePath> {
     if !path.is_absolute() {
-        return Err(format!(
+        return Err(std::io::Error::other(format!(
             "Landlock rule path is not absolute: {}",
             path.display()
-        ));
+        )));
     }
     if path == Path::new("/") {
         let fd = open_filesystem_root()?;
@@ -232,27 +247,35 @@ fn open_rule_path(path: &Path) -> Result<OpenedRulePath, String> {
     }
 
     let parent = path.parent().ok_or_else(|| {
-        format!(
+        std::io::Error::other(format!(
             "Landlock rule path has no parent directory: {}",
             path.display()
-        )
+        ))
     })?;
     let name = path.file_name().ok_or_else(|| {
-        format!(
+        std::io::Error::other(format!(
             "Landlock rule path has no final component: {}",
             path.display()
-        )
+        ))
     })?;
     let parent_fd = open_directory_no_symlinks(parent)?;
-    let fd = open_relative_no_symlinks(parent_fd.as_raw_fd(), name, false)
-        .map_err(|error| format!("failed to securely open {}: {error}", path.display()))?;
-    let metadata = fstat_fd(&fd)
-        .map_err(|error| format!("failed to inspect opened path {}: {error}", path.display()))?;
+    let fd = open_relative_no_symlinks(parent_fd.as_raw_fd(), name, false).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to securely open {}: {error}", path.display()),
+        )
+    })?;
+    let metadata = fstat_fd(&fd).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to inspect opened path {}: {error}", path.display()),
+        )
+    })?;
     if file_type(&metadata) == libc::S_IFLNK {
-        return Err(format!(
+        return Err(std::io::Error::other(format!(
             "Landlock rule path resolved to a symlink: {}",
             path.display()
-        ));
+        )));
     }
     Ok(OpenedRulePath {
         fd,
@@ -260,7 +283,7 @@ fn open_rule_path(path: &Path) -> Result<OpenedRulePath, String> {
     })
 }
 
-fn open_filesystem_root() -> Result<OwnedFd, String> {
+fn open_filesystem_root() -> std::io::Result<OwnedFd> {
     let fd = unsafe {
         libc::open(
             c"/".as_ptr(),
@@ -268,17 +291,18 @@ fn open_filesystem_root() -> Result<OwnedFd, String> {
         )
     };
     if fd < 0 {
-        Err(format!(
-            "failed to open filesystem root for Landlock: {}",
-            std::io::Error::last_os_error()
+        let error = std::io::Error::last_os_error();
+        Err(std::io::Error::new(
+            error.kind(),
+            format!("failed to open filesystem root for Landlock: {}", error),
         ))
     } else {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
 
-fn open_directory_no_symlinks(path: &Path) -> Result<OwnedFd, String> {
-    let components = normalized_relative_components(path)?;
+fn open_directory_no_symlinks(path: &Path) -> std::io::Result<OwnedFd> {
+    let components = normalized_relative_components(path).map_err(std::io::Error::other)?;
     let root = open_filesystem_root()?;
     if components.is_empty() {
         return Ok(root);
@@ -288,7 +312,7 @@ fn open_directory_no_symlinks(path: &Path) -> Result<OwnedFd, String> {
         .iter()
         .fold(PathBuf::new(), |path, component| path.join(component));
     let relative = CString::new(relative.as_os_str().as_bytes())
-        .map_err(|_| format!("path contains NUL: {}", path.display()))?;
+        .map_err(|_| std::io::Error::other(format!("path contains NUL: {}", path.display())))?;
     let how = OpenHow {
         flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0,
@@ -308,9 +332,9 @@ fn open_directory_no_symlinks(path: &Path) -> Result<OwnedFd, String> {
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() != Some(libc::ENOSYS) {
-        return Err(format!(
-            "openat2 secure walk failed for {}: {error}",
-            path.display()
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("openat2 secure walk failed for {}: {error}", path.display()),
         ));
     }
 
@@ -318,9 +342,12 @@ fn open_directory_no_symlinks(path: &Path) -> Result<OwnedFd, String> {
     for component in components {
         current =
             open_relative_no_symlinks(current.as_raw_fd(), component, true).map_err(|error| {
-                format!(
-                    "component-wise secure walk failed for {}: {error}",
-                    path.display()
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "component-wise secure walk failed for {}: {error}",
+                        path.display()
+                    ),
                 )
             })?;
     }
@@ -423,6 +450,56 @@ pub(super) fn abi_label(abi: ABI) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vanished_listed_read_rule_is_omitted_after_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let sibling = root.join("listed");
+        let readable = sibling.join("readable");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::write(&readable, "listed file").unwrap();
+        let mut profile = SandboxProfile::build(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![readable.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            root,
+        )
+        .unwrap();
+        profile.read_allow_listed = vec![readable.clone()];
+        let profile = profile.canonicalize_for_launch().unwrap();
+        assert!(open_read_rule_path(&profile.read_allow[0], true)
+            .unwrap()
+            .is_some());
+        std::fs::remove_file(&readable).unwrap();
+        assert!(open_read_rule_path(&profile.read_allow[0], true)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir(&sibling).unwrap();
+        assert!(open_read_rule_path(&profile.read_allow[0], true)
+            .unwrap()
+            .is_none());
+        assert!(open_read_rule_path(&profile.read_allow[0], false).is_err());
+        assert!(
+            open_rule_path(&profile.read_allow[0]).is_err(),
+            "writes remain required"
+        );
+    }
+
+    #[test]
+    fn listed_read_rule_non_missing_open_errors_still_refuse() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(open_read_rule_path(&link, true).is_err());
+        assert!(open_read_rule_path(&link.join("file"), true).is_err());
+        assert!(open_read_rule_path(Path::new("relative"), true).is_err());
+    }
 
     #[test]
     fn v1_and_v2_cannot_meet_the_mandatory_floor() {

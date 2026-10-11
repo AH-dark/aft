@@ -448,7 +448,7 @@ fn v1_profile_is_a_structured_sandbox_unavailable_failure() {
     assert_eq!(output.status.code(), Some(78));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("sandbox_unavailable:"));
-    assert!(stderr.contains("unsupported sandbox profile version 1; expected 3"));
+    assert!(stderr.contains("unsupported sandbox profile version 1; expected 4"));
 }
 
 #[test]
@@ -785,6 +785,35 @@ fn p5_secret_read_is_denied_and_other_reads_are_allowed() {
         String::from_utf8_lossy(&ordinary_output.stderr)
     );
     assert_eq!(ordinary_output.stdout, b"ordinary\n");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_vanished_listed_read_grant_launches_without_broadening_access() {
+    skip_if_landlock_absent!();
+    let mut fixture = ProbeFixture::new();
+    let vanished = fixture.outside_home.join("listed-sibling");
+    fs::create_dir(&vanished).unwrap();
+    let mut profile: SandboxProfile =
+        serde_json::from_slice(&fs::read(fixture.profile.path()).unwrap()).unwrap();
+    profile.read_allow.push(vanished.clone());
+    profile.read_allow_listed.push(vanished.clone());
+    fixture.profile = InheritedProfile::new(&profile);
+    fs::remove_dir(&vanished).unwrap();
+    let new_sibling = fixture.outside_home.join("unlisted-sibling");
+    fs::write(&new_sibling, "must remain unreadable").unwrap();
+    let output = fixture.launch_bash(&format!(
+        "cat {} || exit 10; if cat {} >/dev/null 2>&1; then exit 11; fi; if cat {} >/dev/null 2>&1; then exit 12; fi",
+        shell_path(&fixture.arbitrary_file),
+        shell_path(&fixture.secret.join("id_probe")),
+        shell_path(&new_sibling),
+    ));
+    assert!(
+        output.status.success(),
+        "vanished listed read grant refused or widened access: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"ordinary\n");
 }
 
 #[cfg(target_os = "macos")]

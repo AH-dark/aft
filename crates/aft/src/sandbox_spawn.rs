@@ -1982,7 +1982,7 @@ struct ListedReadChild {
 
 #[cfg(any(test, target_os = "linux"))]
 trait ReadDirectoryLister {
-    fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String>;
+    fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>>;
 }
 
 #[cfg(target_os = "linux")]
@@ -2098,7 +2098,8 @@ fn compute_linux_profile(
         .chain(&profile.data_policy.deny)
         .cloned()
         .collect::<Vec<_>>();
-    let mut grants = split_read_grants(&intended, &split_denies, lister)?;
+    let (mut grants, mut listed) =
+        split_read_grants_with_inventory(&intended, &split_denies, lister)?;
     // Reintroduce only explicit private-tree exceptions, still split around
     // ordinary denies (including the connection file and repository hooks).
     // A nested repository-hooks deny means reads are granted per existing
@@ -2114,7 +2115,27 @@ fn compute_linux_profile(
             mandatory: false,
         })
         .collect::<Vec<_>>();
-    grants.extend(split_read_grants(&exceptions, &profile.read_deny, lister)?);
+    let (exception_grants, exception_listed) =
+        split_read_grants_with_inventory(&exceptions, &profile.read_deny, lister)?;
+    // Direct and explicitly supplied grants remain required even if the same
+    // path was also discovered while splitting a different read root.
+    let required = grants
+        .iter()
+        .filter(|path| !listed.contains(path))
+        .chain(
+            exception_grants
+                .iter()
+                .filter(|path| !exception_listed.contains(path)),
+        )
+        .chain(&profile.read_allow)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    grants.extend(exception_grants);
+    grants.extend(profile.read_allow);
+    listed.extend(exception_listed);
+    listed.retain(|path| !required.contains(path));
+    listed.sort_unstable();
+    listed.dedup();
     grants.sort_unstable();
     grants.dedup();
     profile
@@ -2125,6 +2146,7 @@ fn compute_linux_profile(
         )
         .map_err(|error| error.to_string())?;
     profile.read_allow = grants;
+    profile.read_allow_listed = listed;
     Ok(profile)
 }
 
@@ -2158,6 +2180,9 @@ fn add_linux_payload_read_grants(
         .extend(payload_grants.iter().cloned());
 
     let mut final_read_allow = profile.read_allow.clone();
+    profile
+        .read_allow_listed
+        .retain(|path| !payload_grants.contains(path));
     final_read_allow.extend(payload_grants);
     final_read_allow.sort_unstable();
     final_read_allow.dedup();
@@ -2202,13 +2227,26 @@ fn split_read_grants(
     denies: &[PathBuf],
     lister: &mut impl ReadDirectoryLister,
 ) -> Result<Vec<PathBuf>, String> {
-    let mut emitted = BTreeSet::new();
+    split_read_grants_with_inventory(intended, denies, lister).map(|(paths, _)| paths)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn split_read_grants_with_inventory(
+    intended: &[IntendedReadGrant],
+    denies: &[PathBuf],
+    lister: &mut impl ReadDirectoryLister,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut emitted = BTreeMap::new();
     for grant in intended {
-        split_read_grant(grant, denies, lister, &mut emitted)?;
+        split_read_grant(grant, denies, lister, false, &mut emitted)?;
     }
-    let emitted = emitted.into_iter().collect::<Vec<_>>();
-    validate_final_read_rules(&emitted, denies)?;
-    Ok(emitted)
+    let paths = emitted.keys().cloned().collect::<Vec<_>>();
+    let listed = emitted
+        .into_iter()
+        .filter_map(|(path, listed)| listed.then_some(path))
+        .collect();
+    validate_final_read_rules(&paths, denies)?;
+    Ok((paths, listed))
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -2216,7 +2254,8 @@ fn split_read_grant(
     grant: &IntendedReadGrant,
     denies: &[PathBuf],
     lister: &mut impl ReadDirectoryLister,
-    emitted: &mut BTreeSet<PathBuf>,
+    from_listing: bool,
+    emitted: &mut BTreeMap<PathBuf, bool>,
 ) -> Result<(), String> {
     if let Some(deny) = denies
         .iter()
@@ -2234,16 +2273,23 @@ fn split_read_grant(
 
     let contains_deny = denies.iter().any(|deny| deny.starts_with(&grant.path));
     if !grant.force_children && !contains_deny {
-        emitted.insert(grant.path.clone());
+        emitted
+            .entry(grant.path.clone())
+            .and_modify(|listed| *listed &= from_listing)
+            .or_insert(from_listing);
         return Ok(());
     }
 
-    let children = lister.children(&grant.path).map_err(|error| {
-        format!(
-            "sandbox_unavailable: cannot split read root {}: {error}",
-            grant.path.display()
-        )
-    })?;
+    let children = match lister.children(&grant.path) {
+        Ok(children) => children,
+        Err(error) if from_listing && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "sandbox_unavailable: cannot split read root {}: {error}",
+                grant.path.display()
+            ))
+        }
+    };
     for child in children {
         // An exact denied file is simply omitted by the recursive call. Only a
         // strict descendant deny would require traversing this child as a directory.
@@ -2264,6 +2310,7 @@ fn split_read_grant(
             },
             denies,
             lister,
+            true,
             emitted,
         )?;
     }
@@ -2315,30 +2362,40 @@ struct SecureReadDirectoryLister;
 
 #[cfg(target_os = "linux")]
 impl ReadDirectoryLister for SecureReadDirectoryLister {
-    fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String> {
+    fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>> {
         let parent_fd = open_absolute_no_symlinks(parent, true)?;
         let readable_fd =
             open_directory_for_enumeration(parent_fd.as_raw_fd()).map_err(|error| {
-                format!(
-                    "failed to open directory for enumeration {}: {error}",
-                    parent.display()
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to open directory for enumeration {}: {error}",
+                        parent.display()
+                    ),
                 )
             })?;
         let duplicate = unsafe { libc::dup(readable_fd.as_raw_fd()) };
         if duplicate < 0 {
-            return Err(format!(
-                "failed to duplicate directory fd for {}: {}",
-                parent.display(),
-                std::io::Error::last_os_error()
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to duplicate directory fd for {}: {}",
+                    parent.display(),
+                    error
+                ),
             ));
         }
         let directory = unsafe { libc::fdopendir(duplicate) };
         if directory.is_null() {
             let error = std::io::Error::last_os_error();
             unsafe { libc::close(duplicate) };
-            return Err(format!(
-                "failed to enumerate directory {}: {error}",
-                parent.display()
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to enumerate directory {}: {error}",
+                    parent.display()
+                ),
             ));
         }
 
@@ -2352,9 +2409,9 @@ impl ReadDirectoryLister for SecureReadDirectoryLister {
                     if error.raw_os_error() == Some(0) {
                         break;
                     }
-                    return Err(format!(
-                        "failed while enumerating {}: {error}",
-                        parent.display()
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("failed while enumerating {}: {error}", parent.display()),
                     ));
                 }
                 let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
@@ -2363,27 +2420,43 @@ impl ReadDirectoryLister for SecureReadDirectoryLister {
                 }
                 let name = OsStr::from_bytes(name);
                 let diagnostic_path = parent.join(name);
-                let diagnostic = std::fs::symlink_metadata(&diagnostic_path).map_err(|error| {
-                    format!(
-                        "directory entry changed while inspecting {}: {error}",
-                        diagnostic_path.display()
-                    )
-                })?;
+                let diagnostic = match std::fs::symlink_metadata(&diagnostic_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "directory entry changed while inspecting {}: {error}",
+                                diagnostic_path.display()
+                            ),
+                        ))
+                    }
+                };
                 if diagnostic.file_type().is_symlink() {
                     continue;
                 }
 
-                let child_fd =
-                    open_child_no_symlinks(parent_fd.as_raw_fd(), name).map_err(|error| {
-                        format!(
-                            "directory entry changed while opening {}: {error}",
-                            diagnostic_path.display()
-                        )
-                    })?;
+                let child_fd = match open_child_no_symlinks(parent_fd.as_raw_fd(), name) {
+                    Ok(fd) => fd,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "directory entry changed while opening {}: {error}",
+                                diagnostic_path.display()
+                            ),
+                        ))
+                    }
+                };
                 let metadata = fstat_fd(&child_fd).map_err(|error| {
-                    format!(
-                        "failed to inspect opened directory entry {}: {error}",
-                        diagnostic_path.display()
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to inspect opened directory entry {}: {error}",
+                            diagnostic_path.display()
+                        ),
                     )
                 })?;
                 if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
@@ -2416,9 +2489,12 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
 #[cfg(target_os = "linux")]
-fn open_absolute_no_symlinks(path: &Path, directory: bool) -> Result<OwnedFd, String> {
+fn open_absolute_no_symlinks(path: &Path, directory: bool) -> std::io::Result<OwnedFd> {
     if !path.is_absolute() {
-        return Err(format!("path is not absolute: {}", path.display()));
+        return Err(std::io::Error::other(format!(
+            "path is not absolute: {}",
+            path.display()
+        )));
     }
     let root = unsafe {
         libc::open(
@@ -2427,13 +2503,14 @@ fn open_absolute_no_symlinks(path: &Path, directory: bool) -> Result<OwnedFd, St
         )
     };
     if root < 0 {
-        return Err(format!(
-            "failed to open filesystem root: {}",
-            std::io::Error::last_os_error()
+        let error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("failed to open filesystem root: {}", error),
         ));
     }
     let root = unsafe { OwnedFd::from_raw_fd(root) };
-    let components = normalized_relative_components(path)?;
+    let components = normalized_relative_components(path).map_err(std::io::Error::other)?;
     if components.is_empty() {
         return Ok(root);
     }
@@ -2442,7 +2519,7 @@ fn open_absolute_no_symlinks(path: &Path, directory: bool) -> Result<OwnedFd, St
         .iter()
         .fold(PathBuf::new(), |path, component| path.join(component));
     let relative = CString::new(relative.as_os_str().as_bytes())
-        .map_err(|_| format!("path contains NUL: {}", path.display()))?;
+        .map_err(|_| std::io::Error::other(format!("path contains NUL: {}", path.display())))?;
     let flags = libc::O_PATH | libc::O_CLOEXEC | if directory { libc::O_DIRECTORY } else { 0 };
     let how = OpenHow {
         flags: flags as u64,
@@ -2463,16 +2540,16 @@ fn open_absolute_no_symlinks(path: &Path, directory: bool) -> Result<OwnedFd, St
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() != Some(libc::ENOSYS) {
-        return Err(format!(
-            "secure open failed for {}: {error}",
-            path.display()
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("secure open failed for {}: {error}", path.display()),
         ));
     }
 
     let mut current = root;
     for (index, component) in components.iter().enumerate() {
         let component = CString::new(component.as_bytes())
-            .map_err(|_| format!("path contains NUL: {}", path.display()))?;
+            .map_err(|_| std::io::Error::other(format!("path contains NUL: {}", path.display())))?;
         let last = index + 1 == components.len();
         let mut flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         if !last || directory {
@@ -2480,20 +2557,28 @@ fn open_absolute_no_symlinks(path: &Path, directory: bool) -> Result<OwnedFd, St
         }
         let opened = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
         if opened < 0 {
-            return Err(format!(
-                "component-wise secure open failed for {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "component-wise secure open failed for {}: {}",
+                    path.display(),
+                    error
+                ),
             ));
         }
         let opened = unsafe { OwnedFd::from_raw_fd(opened) };
-        let metadata = fstat_fd(&opened)
-            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        let metadata = fstat_fd(&opened).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to inspect {}: {error}", path.display()),
+            )
+        })?;
         if metadata.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            return Err(format!(
+            return Err(std::io::Error::other(format!(
                 "secure open encountered a symlink: {}",
                 path.display()
-            ));
+            )));
         }
         current = opened;
     }
@@ -4475,9 +4560,89 @@ mod policy_tests {
 mod read_allow_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vanished_listed_sibling_is_dropped_without_widening_read_access() {
+        struct RemovingLister {
+            parent: PathBuf,
+            sibling: PathBuf,
+            removed: bool,
+        }
+        impl ReadDirectoryLister for RemovingLister {
+            fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>> {
+                let children = SecureReadDirectoryLister.children(parent)?;
+                if parent == self.parent {
+                    assert!(children.iter().any(|child| child.path == self.sibling));
+                    std::fs::remove_dir_all(&self.sibling).expect("remove listed sibling");
+                    self.removed = true;
+                }
+                Ok(children)
+            }
+        }
+
+        let root = tempfile::tempdir().expect("fixture");
+        let root = root.path().canonicalize().expect("canonical fixture");
+        let shared = root.join("shared");
+        let vanished = shared.join("vanished");
+        let kept = shared.join("kept");
+        let denied = shared.join("denied");
+        let project = root.join("project");
+        let temp = root.join("task-temp");
+        for path in [&vanished, &kept, &denied, &project, &temp] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let profile = SandboxProfile::build(
+            vec![project.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![denied.clone()],
+            Vec::new(),
+            Vec::new(),
+            temp.clone(),
+        )
+        .expect("base profile");
+        let mut lister = RemovingLister {
+            parent: shared.clone(),
+            sibling: vanished.clone(),
+            removed: false,
+        };
+        let profile = compute_linux_profile(profile, &shared, &[], &[], &mut lister)
+            .expect("split shared read root");
+        assert!(lister.removed, "deletion hook must run after enumeration");
+        assert!(profile.read_allow.contains(&vanished));
+        let listed_grants = profile.read_allow.clone();
+        let profile = profile
+            .canonicalize_for_launch()
+            .expect("a vanished listed sibling must not refuse sandbox setup");
+        assert_eq!(profile.read_allow, vec![project, kept, temp]);
+        assert!(profile
+            .read_allow
+            .iter()
+            .all(|path| listed_grants.contains(path)));
+        assert!(!profile
+            .read_allow
+            .iter()
+            .any(|path| denied.starts_with(path)));
+        assert!(!profile.read_allow.contains(&shared));
+
+        std::fs::create_dir(&vanished).expect("recreate removed sibling");
+        let new_sibling = shared.join("new-sibling");
+        std::fs::create_dir(&new_sibling).expect("create later sibling");
+        for path in [&vanished, &new_sibling, &denied] {
+            assert!(!profile
+                .read_allow
+                .iter()
+                .any(|grant| path.starts_with(grant)));
+        }
+        let transferred: SandboxProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        assert_eq!(transferred.canonicalize_for_launch().unwrap(), profile);
+    }
+
     #[derive(Default)]
     struct FakeLister {
-        entries: BTreeMap<PathBuf, Result<Vec<ListedReadChild>, String>>,
+        entries: BTreeMap<PathBuf, Result<Vec<ListedReadChild>, (std::io::ErrorKind, String)>>,
     }
 
     impl FakeLister {
@@ -4497,18 +4662,34 @@ mod read_allow_tests {
         }
 
         fn failure(mut self, parent: &str, message: &str) -> Self {
-            self.entries
-                .insert(PathBuf::from(parent), Err(message.to_string()));
+            self.entries.insert(
+                PathBuf::from(parent),
+                Err((std::io::ErrorKind::Other, message.to_string())),
+            );
+            self
+        }
+
+        fn missing(mut self, parent: &str) -> Self {
+            self.entries.insert(
+                PathBuf::from(parent),
+                Err((std::io::ErrorKind::NotFound, "directory vanished".into())),
+            );
             self
         }
     }
 
     impl ReadDirectoryLister for FakeLister {
-        fn children(&mut self, parent: &Path) -> Result<Vec<ListedReadChild>, String> {
+        fn children(&mut self, parent: &Path) -> std::io::Result<Vec<ListedReadChild>> {
             self.entries
                 .get(parent)
                 .cloned()
-                .unwrap_or_else(|| Err(format!("unexpected enumeration of {}", parent.display())))
+                .unwrap_or_else(|| {
+                    Err((
+                        std::io::ErrorKind::Other,
+                        format!("unexpected enumeration of {}", parent.display()),
+                    ))
+                })
+                .map_err(|(kind, message)| std::io::Error::new(kind, message))
         }
     }
 
@@ -4562,6 +4743,7 @@ mod read_allow_tests {
             ],
             write_deny_nested: Vec::new(),
             read_allow: Vec::new(),
+            read_allow_listed: Vec::new(),
             read_deny: vec![
                 connection,
                 "/home/alice/.ssh".into(),
@@ -4791,6 +4973,54 @@ mod read_allow_tests {
         )
         .expect_err("private-tree exceptions must not override credential denies");
         assert!(error.contains("overlaps mandatory secret floor"), "{error}");
+    }
+
+    #[test]
+    fn vanished_listed_deny_ancestor_is_omitted_during_split() {
+        let mut lister = FakeLister::default()
+            .directory("/shared", &[("vanished", true), ("kept", true)])
+            .missing("/shared/vanished");
+        let denies = vec![PathBuf::from("/shared/vanished/secret")];
+        let (paths, listed) = split_read_grants_with_inventory(
+            &[grant("/shared", true, false)],
+            &denies,
+            &mut lister,
+        )
+        .expect("a listed child disappearing before recursion only removes its grant");
+        assert_eq!(paths, vec![PathBuf::from("/shared/kept")]);
+        assert_eq!(listed, paths);
+        assert!(
+            split_read_grants(
+                &[grant("/shared/vanished", true, false)],
+                &denies,
+                &mut lister,
+            )
+            .is_err(),
+            "an explicitly requested missing directory still refuses"
+        );
+    }
+
+    #[test]
+    fn direct_read_grant_remains_required_when_also_listed() {
+        let mut lister = FakeLister::default().directory("/shared", &[("required", false)]);
+        for grants in [
+            vec![
+                grant("/shared", true, false),
+                grant("/shared/required", false, false),
+            ],
+            vec![
+                grant("/shared/required", false, false),
+                grant("/shared", true, false),
+            ],
+        ] {
+            let (paths, listed) =
+                split_read_grants_with_inventory(&grants, &[], &mut lister).unwrap();
+            assert_eq!(paths, vec![PathBuf::from("/shared/required")]);
+            assert!(
+                listed.is_empty(),
+                "direct provenance wins regardless of grant order"
+            );
+        }
     }
 
     #[test]

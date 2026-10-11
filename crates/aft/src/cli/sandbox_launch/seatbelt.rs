@@ -183,6 +183,7 @@ mod tests {
             write_deny: Vec::new(),
             write_deny_nested: vec![nested_deny],
             read_allow: Vec::new(),
+            read_allow_listed: Vec::new(),
             read_deny: Vec::new(),
             socket_deny: Vec::new(),
             cache_roots: Vec::new(),

@@ -228,6 +228,7 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
         write_deny: vec![],
         write_deny_nested: vec![],
         read_allow: vec![],
+        read_allow_listed: vec![],
         read_deny: vec![],
         socket_deny: vec![],
         cache_roots: vec![],
