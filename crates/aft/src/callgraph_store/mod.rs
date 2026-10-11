@@ -20757,6 +20757,9 @@ mod refresh_worker_tests {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
         fs::create_dir_all(&root).unwrap();
+        // The adapter canonicalizes input files, including Windows verbatim
+        // prefixes, so the store root must use the same path spelling.
+        let root = fs::canonicalize(root).unwrap();
         let artifact_key = crate::search_index::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &artifact_key, false);
         let callgraph_dir = temp
