@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Re-records the real-query reference on the unchanged engine after the semantic-lane ranking train landed (main 62d19f172). Changes only real-query-baseline.json, manifest.sha256 and an investigations note. No engine file changes."
+}
