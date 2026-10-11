@@ -131,10 +131,13 @@ fn scan_with_read_exemption(
 
     let mut asks = Vec::new();
     let mut seen = HashSet::new();
-    let mut scan_cwd = cwd.clone();
+    // `None` once a directory change goes somewhere the scanner cannot know
+    // (`cd "$DIR"`, `cd -`, ...). Relative paths are then not resolved
+    // against a stale directory; each one gets its own ask instead.
+    let mut scan_cwd = Some(cwd.clone());
     // Directories pushed by `pushd` earlier in this command line. The shell's
     // own stack from before the command is unknown, so a `popd` past these
-    // entries leaves the tracked directory unchanged.
+    // entries leaves the directory unknown.
     let mut directory_stack = Vec::new();
     for node in command_nodes {
         let parts = command_parts(command, node);
@@ -146,13 +149,21 @@ fn scan_with_read_exemption(
         let head = tokens[0].as_str();
 
         if CWD_COMMANDS.contains(&head) {
-            collect_redirection_targets(command, node, &scan_cwd, |target| match target {
-                RedirectTarget::Path { path, input_only } => {
-                    let exemption = if input_only { read_exemption } else { None };
-                    push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
-                }
-                RedirectTarget::Dynamic => {}
-            });
+            collect_redirection_targets(
+                command,
+                node,
+                scan_cwd.as_deref(),
+                |target| match target {
+                    RedirectTarget::Path { path, input_only } => {
+                        let exemption = if input_only { read_exemption } else { None };
+                        push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+                    }
+                    RedirectTarget::RelativeToUnknown(text) => {
+                        push_unknown_base_path(&mut asks, &mut seen, text);
+                    }
+                    RedirectTarget::Dynamic => {}
+                },
+            );
             let home = std::env::var_os("HOME").map(PathBuf::from);
             track_cwd_change(
                 head,
@@ -171,9 +182,12 @@ fn scan_with_read_exemption(
                 None
             };
             for arg in path_args(&parts) {
-                match path_arg_target(arg, &scan_cwd) {
+                match path_arg_target(arg, scan_cwd.as_deref()) {
                     PathArgTarget::Path(path) => {
                         push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+                    }
+                    PathArgTarget::RelativeToUnknown(text) => {
+                        push_unknown_base_path(&mut asks, &mut seen, text);
                     }
                     // A dynamic target (e.g. `rm "$DEST/file"`) can't be
                     // resolved to a concrete directory. Matching native
@@ -188,12 +202,15 @@ fn scan_with_read_exemption(
             }
         }
 
-        collect_redirection_targets(command, node, &scan_cwd, |target| match target {
+        collect_redirection_targets(command, node, scan_cwd.as_deref(), |target| match target {
             RedirectTarget::Path { path, input_only } => {
                 // Only a plain `<` input redirect reads its target; `>`, `>>`,
                 // `&>`, `<>` and friends can create or truncate it.
                 let exemption = if input_only { read_exemption } else { None };
                 push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
+            }
+            RedirectTarget::RelativeToUnknown(text) => {
+                push_unknown_base_path(&mut asks, &mut seen, text);
             }
             // Dynamic redirect target (e.g. `echo hi > "$FOO/bar"`): no
             // external_directory ask, same rationale as dynamic path args
@@ -305,11 +322,16 @@ enum RedirectTarget {
         path: PathBuf,
         input_only: bool,
     },
+    /// A relative target while the working directory is unknown.
+    RelativeToUnknown(String),
     Dynamic,
 }
 
 enum PathArgTarget {
     Path(PathBuf),
+    /// A literal relative path while the working directory is unknown; it
+    /// carries the path as written (quotes removed).
+    RelativeToUnknown(String),
     Dynamic,
     None,
 }
@@ -317,7 +339,7 @@ enum PathArgTarget {
 fn collect_redirection_targets(
     source: &str,
     command: Node<'_>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     mut on_target: impl FnMut(RedirectTarget),
 ) {
     // In tree-sitter-bash, redirects on `echo hi > /tmp/out` are siblings of
@@ -344,7 +366,7 @@ fn collect_redirection_targets(
 fn collect_redirection_targets_from_node(
     source: &str,
     node: Node<'_>,
-    cwd: &Path,
+    cwd: Option<&Path>,
     on_target: &mut impl FnMut(RedirectTarget),
 ) {
     // tree-sitter-bash 0.25.x emits `file_redirect` and `heredoc_redirect`
@@ -377,6 +399,9 @@ fn collect_redirection_targets_from_node(
                     PathArgTarget::Path(path) => {
                         on_target(RedirectTarget::Path { path, input_only })
                     }
+                    PathArgTarget::RelativeToUnknown(text) => {
+                        on_target(RedirectTarget::RelativeToUnknown(text))
+                    }
                     PathArgTarget::Dynamic => on_target(RedirectTarget::Dynamic),
                     PathArgTarget::None => {}
                 }
@@ -398,55 +423,50 @@ fn is_dynamic_node(node: Node<'_>) -> bool {
     )
 }
 
-/// Follow the literal forms of `cd`, `pushd` and `popd` so later relative
-/// paths resolve where the shell will actually be. Forms whose target is not
-/// known here (`cd -`, a dynamic directory, stack rotation with `+N`/`-N`)
-/// leave the tracked directory unchanged.
+/// Follow `cd`, `pushd` and `popd` so later relative paths resolve where the
+/// shell will actually be. A change whose target is not known here (`cd -`,
+/// a dynamic or unresolvable directory, stack rotation with `+N`/`-N`, a
+/// `popd` past the directories pushed in this command line) makes the
+/// directory unknown until a later change names a literal absolute path.
 fn track_cwd_change(
     head: &str,
     parts: &[Part],
     home: Option<&Path>,
-    scan_cwd: &mut PathBuf,
-    directory_stack: &mut Vec<PathBuf>,
+    scan_cwd: &mut Option<PathBuf>,
+    directory_stack: &mut Vec<Option<PathBuf>>,
 ) {
     let args = parts.iter().skip(1).map(|part| part.text.as_str());
     let options_only = args.clone().all(|arg| arg.starts_with('-') && arg != "-");
+    let target = |scan_cwd: &Option<PathBuf>| {
+        path_args(parts)
+            .next()
+            .and_then(|arg| arg_path(arg, scan_cwd.as_deref()))
+    };
     match head {
         "cd" => {
-            if options_only {
+            *scan_cwd = if options_only {
                 // A bare `cd` goes to the home directory.
-                if let Some(home) = home {
-                    *scan_cwd = resolve_existing(home);
-                }
-            } else if !args.clone().any(|arg| arg == "-") {
-                if let Some(path) = path_args(parts)
-                    .next()
-                    .and_then(|arg| arg_path(arg, scan_cwd))
-                {
-                    *scan_cwd = path;
-                }
-            }
+                home.map(resolve_existing)
+            } else if args.clone().any(|arg| arg == "-") {
+                None
+            } else {
+                target(scan_cwd)
+            };
         }
         "pushd" => {
-            if args
-                .clone()
-                .any(|arg| arg.starts_with('+') || arg.starts_with('-'))
-            {
-                return;
-            }
-            if let Some(path) = path_args(parts)
-                .next()
-                .and_then(|arg| arg_path(arg, scan_cwd))
-            {
-                directory_stack.push(std::mem::replace(scan_cwd, path));
-            }
+            let rotates = options_only
+                || args
+                    .clone()
+                    .any(|arg| arg.starts_with('+') || arg.starts_with('-'));
+            let next = if rotates { None } else { target(scan_cwd) };
+            directory_stack.push(std::mem::replace(scan_cwd, next));
         }
         "popd" => {
-            if options_only {
-                if let Some(previous) = directory_stack.pop() {
-                    *scan_cwd = previous;
-                }
-            }
+            *scan_cwd = if options_only {
+                directory_stack.pop().flatten()
+            } else {
+                None
+            };
         }
         _ => {}
     }
@@ -463,20 +483,35 @@ fn path_args(parts: &[Part]) -> impl Iterator<Item = &str> {
     })
 }
 
-fn arg_path(arg: &str, cwd: &Path) -> Option<PathBuf> {
+fn arg_path(arg: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     match path_arg_target(arg, cwd) {
         PathArgTarget::Path(path) => Some(path),
-        PathArgTarget::Dynamic | PathArgTarget::None => None,
+        PathArgTarget::RelativeToUnknown(_) | PathArgTarget::Dynamic | PathArgTarget::None => None,
     }
 }
 
-fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
+fn path_arg_target(arg: &str, cwd: Option<&Path>) -> PathArgTarget {
     let text = home(&unquote(arg), cwd);
     if dynamic(&text) {
         return PathArgTarget::Dynamic;
     }
 
-    let Some(text) = glob_prefix(&text) else {
+    let Some(cwd) = cwd else {
+        // With the working directory unknown, a relative path (a leading glob
+        // included) has no directory to resolve against. Report it as
+        // written so the caller asks for this path alone.
+        if text.is_empty() || Path::new(&text).is_absolute() || is_device_file(&text) {
+            return absolute_path_target(&text, None);
+        }
+        return PathArgTarget::RelativeToUnknown(text);
+    };
+    absolute_path_target(&text, Some(cwd))
+}
+
+/// Resolve `text` against `cwd`, which may be `None` only for a path that is
+/// already absolute (or names nothing, such as a device file).
+fn absolute_path_target(text: &str, cwd: Option<&Path>) -> PathArgTarget {
+    let Some(text) = glob_prefix(text) else {
         return PathArgTarget::None;
     };
 
@@ -495,7 +530,10 @@ fn path_arg_target(arg: &str, cwd: &Path) -> PathArgTarget {
     let resolved = if path.is_absolute() {
         path
     } else {
-        cwd.join(path)
+        match cwd {
+            Some(cwd) => cwd.join(path),
+            None => return PathArgTarget::None,
+        }
     };
     PathArgTarget::Path(resolve_existing(&resolved))
 }
@@ -517,7 +555,9 @@ fn unquote(text: &str) -> String {
     out
 }
 
-fn home(text: &str, cwd: &Path) -> String {
+/// Expand `~`, `$HOME` and `$PWD`. With the working directory unknown,
+/// `$PWD` is left in place so the word is treated as dynamic.
+fn home(text: &str, cwd: Option<&Path>) -> String {
     if text == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| text.to_string());
     }
@@ -527,11 +567,15 @@ fn home(text: &str, cwd: &Path) -> String {
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    let pwd = cwd.to_string_lossy();
-    text.replace("$HOME", &home)
-        .replace("${HOME}", &home)
-        .replace("$PWD", pwd.as_ref())
-        .replace("${PWD}", pwd.as_ref())
+    let text = text.replace("$HOME", &home).replace("${HOME}", &home);
+    match cwd {
+        Some(cwd) => {
+            let pwd = cwd.to_string_lossy();
+            text.replace("$PWD", pwd.as_ref())
+                .replace("${PWD}", pwd.as_ref())
+        }
+        None => text,
+    }
 }
 
 fn glob_prefix(text: &str) -> Option<&str> {
@@ -644,6 +688,21 @@ fn push_external_path(
     );
 }
 
+/// Ask for one relative path used while the working directory is unknown.
+/// The pattern is the path as written, and there is no "always" pattern:
+/// approving it permanently would approve that name under any directory.
+fn push_unknown_base_path(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, text: String) {
+    push_ask(
+        asks,
+        seen,
+        PermissionAsk {
+            kind: PermissionKind::ExternalDirectory,
+            patterns: vec![text],
+            always: Vec::new(),
+        },
+    );
+}
+
 fn push_ask(asks: &mut Vec<PermissionAsk>, seen: &mut HashSet<String>, ask: PermissionAsk) {
     let key = format!("{:?}:{:?}:{:?}", ask.kind, ask.patterns, ask.always);
     if seen.insert(key) {
@@ -662,14 +721,14 @@ mod tests {
         let scan_cwd = temp.path().join("project").join("subdir");
         std::fs::create_dir_all(&scan_cwd).unwrap();
 
-        let path = arg_path("$PWD/output.log", &scan_cwd).unwrap();
+        let path = arg_path("$PWD/output.log", Some(&scan_cwd)).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("output.log")));
     }
 
     #[test]
     fn dynamic_file_arg_is_reported_as_dynamic_target() {
-        let target = path_arg_target(r#""$DEST/file""#, Path::new("/tmp"));
+        let target = path_arg_target(r#""$DEST/file""#, Some(Path::new("/tmp")));
 
         assert!(matches!(target, PathArgTarget::Dynamic));
     }
@@ -680,7 +739,7 @@ mod tests {
         let scan_cwd = temp.path().join("outside");
         std::fs::create_dir_all(&scan_cwd).unwrap();
 
-        let path = arg_path("./file.log", &scan_cwd).unwrap();
+        let path = arg_path("./file.log", Some(&scan_cwd)).unwrap();
 
         assert_eq!(path, normalize_path(&scan_cwd.join("file.log")));
     }
@@ -691,14 +750,17 @@ mod tests {
         // to a real block device. The scanner fails closed on the latter.
         for arg in ["/dev/fd/0", "/dev/fd/2", "/dev/fd/255"] {
             assert!(
-                matches!(path_arg_target(arg, Path::new("/tmp")), PathArgTarget::None),
+                matches!(
+                    path_arg_target(arg, Some(Path::new("/tmp"))),
+                    PathArgTarget::None
+                ),
                 "expected {arg} to be skipped as a device path"
             );
         }
         for arg in ["/dev/fd/../sda", "/dev/fd/", "/dev/fd/2x", "/dev/fd/2/x"] {
             assert!(
                 matches!(
-                    path_arg_target(arg, Path::new("/tmp")),
+                    path_arg_target(arg, Some(Path::new("/tmp"))),
                     PathArgTarget::Path(_)
                 ),
                 "expected {arg} to be treated as a regular path (fail closed)"
@@ -712,7 +774,7 @@ mod tests {
         // pipe inode under CI), so the device check must run on the raw
         // path — after canonicalize it no longer matches the allowlist.
         for arg in ["/dev/stderr", "/dev/stdin", "/dev/stdout", "/dev/fd/2"] {
-            let target = path_arg_target(arg, Path::new("/tmp"));
+            let target = path_arg_target(arg, Some(Path::new("/tmp")));
             assert!(
                 matches!(target, PathArgTarget::None),
                 "expected {arg} to be skipped as a device path"
@@ -836,12 +898,93 @@ mod tests {
         assert!(asks.is_empty(), "{asks:?}");
     }
 
+    fn external_ask_shapes(command: &str, project: &Path) -> Vec<(Vec<String>, Vec<String>)> {
+        scan_with_project_root(command, project, project)
+            .into_iter()
+            .filter(|ask| matches!(ask.kind, PermissionKind::ExternalDirectory))
+            .map(|ask| (ask.patterns, ask.always))
+            .collect()
+    }
+
+    /// After a directory change whose target the scanner cannot know, a
+    /// relative path must not be resolved against the old directory (inside
+    /// the project, so no ask). Each such path gets its own ask naming the
+    /// path as written, with no "always" pattern, because its meaning
+    /// depends on a directory nobody approved.
+    #[test]
+    fn relative_paths_after_an_unknown_directory_change_ask() {
+        let project = tempfile::tempdir().unwrap();
+        for (command, path) in [
+            ("cd \"$TARGET\" && rm -rf build", "build"),
+            ("cd - && rm notes.txt", "notes.txt"),
+            ("popd && rm notes.txt", "notes.txt"),
+            ("pushd +1 && rm notes.txt", "notes.txt"),
+            ("cd \"$TARGET\" && cd sub && rm notes.txt", "notes.txt"),
+            ("cd \"$TARGET\" && echo hi > out.txt", "out.txt"),
+            ("cd \"$TARGET\"; cat 'quoted name'/file", "quoted name/file"),
+        ] {
+            assert_eq!(
+                external_ask_shapes(command, project.path()),
+                vec![(vec![path.to_string()], Vec::new())],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_directory_never_produces_a_blanket_ask() {
+        let project = tempfile::tempdir().unwrap();
+        // A dynamic path stays without an external-directory ask (the bash
+        // ask still gates the command); it must not turn into a wildcard.
+        assert!(external_ask_shapes("cd \"$TARGET\" && rm \"$NAME\"", project.path()).is_empty());
+        // Descriptor duplication and device files name no relative path.
+        assert!(
+            external_ask_shapes("cd \"$TARGET\" && make 2>&1 > /dev/null", project.path())
+                .is_empty()
+        );
+        let asks = scan_with_project_root(
+            "cd \"$TARGET\" && rm -rf build",
+            project.path(),
+            project.path(),
+        );
+        assert!(
+            asks.iter()
+                .all(|ask| !ask.patterns.iter().chain(&ask.always).any(|p| p == "*")),
+            "{asks:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_absolute_directory_change_ends_the_unknown_state() {
+        let project = tempfile::tempdir().unwrap();
+        assert_eq!(
+            external_ask_shapes(
+                "cd \"$TARGET\" && cd /usr && rm aft-scan-probe",
+                project.path()
+            ),
+            vec![(vec!["/usr/*".to_string()], vec!["/usr/*".to_string()])]
+        );
+        // Absolute paths keep their ordinary ask while the directory is unknown.
+        assert_eq!(
+            external_ask_shapes("cd \"$TARGET\" && rm /usr/aft-scan-probe", project.path()),
+            vec![(vec!["/usr/*".to_string()], vec!["/usr/*".to_string()])]
+        );
+        // Moving back into the project by absolute path asks for nothing.
+        let inside = project.path().display().to_string();
+        assert!(external_ask_shapes(
+            &format!("cd \"$TARGET\" && cd '{inside}' && rm notes.txt"),
+            project.path()
+        )
+        .is_empty());
+    }
+
     #[test]
     fn bare_cd_moves_the_scan_directory_home() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let mut scan_cwd = temp.path().to_path_buf();
+        let mut scan_cwd = Some(temp.path().to_path_buf());
         let mut stack = Vec::new();
         let parts = |words: &[&str]| {
             words
@@ -858,8 +1001,7 @@ mod tests {
             &mut scan_cwd,
             &mut stack,
         );
-        assert_eq!(scan_cwd, resolve_existing(&home));
-        let before = scan_cwd.clone();
+        assert_eq!(scan_cwd, Some(resolve_existing(&home)));
         track_cwd_change(
             "cd",
             &parts(&["cd", "-"]),
@@ -867,7 +1009,7 @@ mod tests {
             &mut scan_cwd,
             &mut stack,
         );
-        assert_eq!(scan_cwd, before, "cd - goes to an unknown directory");
+        assert_eq!(scan_cwd, None, "cd - goes to an unknown directory");
     }
 
     #[test]
