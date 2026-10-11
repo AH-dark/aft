@@ -1830,14 +1830,36 @@ impl HealthRollupWorker {
         executor: Arc<Executor>,
         shared_app: Arc<App>,
     ) -> Self {
+        Self::start_with_interval(cache, executor, shared_app, HEALTH_ROLLUP_TTL)
+    }
+
+    fn start_with_interval(
+        cache: Arc<HealthRollupCache>,
+        executor: Arc<Executor>,
+        shared_app: Arc<App>,
+        interval: Duration,
+    ) -> Self {
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("aft-health-rollup".to_string())
-            .spawn(move || loop {
+            .spawn(move || 'worker: loop {
                 cache.refresh(&executor, &shared_app);
-                match wake_rx.recv_timeout(HEALTH_ROLLUP_TTL) {
-                    Ok(true) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                // Bind completions can arrive during a rollup. A queued request
+                // must not start another full census immediately; the interval
+                // is a minimum quiet period after each completed refresh.
+                let next_refresh = Instant::now() + interval;
+                loop {
+                    let remaining = next_refresh.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match wake_rx.recv_timeout(remaining) {
+                        Ok(true) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break 'worker
+                        }
+                    }
                 }
             })
             .expect("spawn health rollup worker");
@@ -3565,6 +3587,91 @@ mod tests {
                 .as_u64()
                 .is_some_and(|age| age < 1_000),
             "the background publication must reset snapshot age"
+        );
+        worker.shutdown();
+    }
+
+    #[test]
+    fn health_worker_refresh_requests_respect_minimum_interval() {
+        let cache = Arc::new(HealthRollupCache::new());
+        let worker = HealthRollupWorker::start_with_interval(
+            Arc::clone(&cache),
+            Arc::new(Executor::new()),
+            crate::context::App::default_shared(),
+            Duration::from_millis(100),
+        );
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(350) {
+            worker.request_refresh();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        worker.shutdown();
+        let refreshes = cache.refreshes.load(Ordering::Acquire);
+        assert!(
+            refreshes >= 2,
+            "requests must not prevent periodic refreshes"
+        );
+        assert!(
+            refreshes <= 4,
+            "refresh requests bypassed the interval: {refreshes} builds in 350 ms"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "60-second offline rollup thread CPU measurement with 50 actor roots"]
+    fn bench_health_rollup_cpu_per_minute() {
+        use std::os::unix::thread::JoinHandleExt;
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 64,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        }));
+        let mut dirs = Vec::new();
+        for i in 0..50 {
+            let (dir, root) = test_root(&format!("rollup-cpu-{i}"));
+            assert!(executor.register_actor(root, test_ctx()));
+            dirs.push(dir);
+        }
+        let cache = Arc::new(HealthRollupCache::new());
+        let worker = HealthRollupWorker::start(
+            Arc::clone(&cache),
+            executor,
+            crate::context::App::default_shared(),
+        );
+        let mut clock = 0;
+        assert_eq!(
+            unsafe {
+                libc::pthread_getcpuclockid(
+                    worker.join.as_ref().unwrap().as_pthread_t(),
+                    &mut clock,
+                )
+            },
+            0
+        );
+        let cpu_ns = || {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(unsafe { libc::clock_gettime(clock, &mut time) }, 0);
+            time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+        };
+        let before = cpu_ns();
+        let started = Instant::now();
+        // Model route-bind completions; sleeping generates no synthetic CPU load.
+        while started.elapsed() < Duration::from_secs(60) {
+            worker.request_refresh();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let cpu = cpu_ns() - before;
+        println!(
+            "roots=50 wall_ms={} rollup_cpu_ms_per_minute={} refreshes={}",
+            started.elapsed().as_millis(),
+            cpu / 1_000_000,
+            cache.refreshes.load(Ordering::Acquire)
         );
         worker.shutdown();
     }
