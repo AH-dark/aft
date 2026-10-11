@@ -396,7 +396,10 @@ def collect_category(session: AftSession, category: str, scope: List[str],
                 rows.append(item)
             following = envelope["next_offset"]
             if following is None:
-                if len(rows) != total:
+                # The list envelope reports total as {"kind": "exact", "value": N};
+                # only an exact total can confirm every row was collected.
+                expected = total.get("value") if isinstance(total, dict) and total.get("kind") == "exact" else total
+                if not isinstance(expected, int) or len(rows) != expected:
                     raise RuntimeError(f"{category}: collected {len(rows)} of {total} rows")
                 return rows
             if following != offset + len(items) or following <= offset:

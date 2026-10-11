@@ -177,6 +177,25 @@ class CollectionFixtures(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all("offset" not in call.kwargs for call in session.inspect.call_args_list))
 
+    def test_offset_paging_reads_exact_total_object_not_summary_count(self):
+        first = self.response([{"file": "a.rs", "symbol": "A", "line": 1}], 1,
+            {"total": {"kind": "exact", "value": 2}, "offset": 0, "next_offset": 1})
+        second = self.response([{"file": "a.rs", "symbol": "B", "line": 2}], 1,
+            {"total": {"kind": "exact", "value": 2}, "offset": 1, "next_offset": None})
+        session = Mock()
+        session.inspect.side_effect = [first, second]
+        rows = harness.collect_category(session, "dead_code", [], {}, [])
+        self.assertEqual([item["symbol"] for item in rows], ["A", "B"])
+        self.assertEqual(session.inspect.call_args.kwargs["offset"], 1)
+
+    def test_offset_paging_rejects_missing_rows_with_exact_total_object(self):
+        session = Mock()
+        session.inspect.return_value = self.response(
+            [{"file": "a.rs", "symbol": "A", "line": 1}], 1,
+            {"total": {"kind": "exact", "value": 2}, "offset": 0, "next_offset": None})
+        with self.assertRaisesRegex(RuntimeError, "collected 1 of"):
+            harness.collect_category(session, "dead_code", [], {}, [])
+
     def test_pending_retried_but_terminal_unavailable_not_retried(self):
         session = Mock()
         session.inspect.side_effect = [self.response([], None, summary={"status": "pending"}),
