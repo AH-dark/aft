@@ -72,6 +72,94 @@ const PLANES: RequestedPlanes = RequestedPlanes {
 };
 
 #[test]
+fn cold_parent_search_scans_unpublished_children_and_respects_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    for name in ["alpha", "beta"] {
+        let child = root.join(name);
+        git_init(&child);
+        std::fs::create_dir_all(child.join("src")).unwrap();
+        std::fs::write(
+            child.join("src/lib.rs"),
+            "pub fn explicit_conversion_requires_confirmation() {}\n",
+        )
+        .unwrap();
+    }
+    let storage = tempfile::tempdir().unwrap();
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.clone());
+    config.views.enabled = true;
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    assert!(prepare(&root, PLANES));
+    assert!(activate(
+        &ctx,
+        &root,
+        storage.path(),
+        &ctx.config().semantic
+    ));
+    let session = session_for_root(&root).unwrap();
+    assert!(session.wait_rounds(1, Duration::from_secs(30)));
+    assert!(session
+        .children()
+        .iter()
+        .all(|child| !child.trigram_ready()));
+    for (path, expected) in [(None, 2), (Some(root.join("alpha")), 1)] {
+        let mut value = serde_json::json!({
+            "id": "cold-parent-search", "command": "semantic_search",
+            "query": "explicit_conversion_requires_confirmation",
+        });
+        if let Some(path) = path {
+            value["path"] = serde_json::json!(path);
+        }
+        let req = serde_json::from_value(value).unwrap();
+        let answer = super::engine::search(&req, &ctx, &session);
+        assert!(answer.success, "{answer:?}");
+        let rows = answer.data["results"].as_array().unwrap();
+        assert_eq!(rows.len(), expected, "{answer:?}");
+        assert!(rows.iter().any(|row| row["file"] == "alpha/src/lib.rs"));
+        assert_eq!(answer.data["complete"], false, "{answer:?}");
+        assert_eq!(answer.data["lexical_only_fallback"], true, "{answer:?}");
+        assert!(answer.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("explicit_conversion"));
+        assert!(answer.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("bounded disk scan"));
+    }
+    assert_eq!(std::fs::read_dir(storage.path()).unwrap().count(), 0);
+    deactivate(&root);
+    assert!(prepare(
+        &root,
+        RequestedPlanes {
+            trigram: false,
+            semantic: false,
+            callgraph: false
+        }
+    ));
+    assert!(activate(
+        &ctx,
+        &root,
+        storage.path(),
+        &ctx.config().semantic
+    ));
+    let session = session_for_root(&root).unwrap();
+    assert!(session.wait_rounds(1, Duration::from_secs(30)));
+    let req = serde_json::from_value(serde_json::json!({
+        "id": "parent-search-disabled", "command": "semantic_search", "query": "explicit_conversion_requires_confirmation",
+    })).unwrap();
+    let answer = super::engine::search(&req, &ctx, &session);
+    assert_eq!(answer.data["status"], "unavailable", "{answer:?}");
+    assert!(
+        !answer.data["text"].as_str().unwrap().contains("No results"),
+        "{answer:?}"
+    );
+    deactivate(&root);
+}
+
+#[test]
 fn activate_requires_prepare_and_deactivate_stops_the_session() {
     let temp = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temp.path()).unwrap();

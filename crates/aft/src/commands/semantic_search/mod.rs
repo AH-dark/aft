@@ -727,6 +727,25 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    handle_semantic_search_with_disk_fallback(req, ctx, false)
+}
+
+/// Parent-folder children may have no publication yet. Their reader engines
+/// must still run the bounded exact/lexical scan while the indexes warm.
+pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    let config = ctx.config();
+    handle_semantic_search_with_disk_fallback(
+        req,
+        ctx,
+        config.indexes.trigram || config.indexes.semantic,
+    )
+}
+
+fn handle_semantic_search_with_disk_fallback(
+    req: &RawRequest,
+    ctx: &AppContext,
+    allow_disk_fallback: bool,
+) -> Response {
     use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
@@ -873,6 +892,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         extensions,
         &plan,
         external_source.as_ref(),
+        allow_disk_fallback,
     );
     if response.success {
         let embedding_counts = crate::search_b2::embed_counter::read(&req.id);
@@ -1972,6 +1992,7 @@ fn handle_semantic_search_inner(
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
     external_source: Option<&ExternalReadinessSource<'_>>,
+    allow_disk_fallback: bool,
 ) -> Response {
     if search_cancellation_requested() {
         return cancelled_search_response(req);
@@ -2054,11 +2075,14 @@ fn handle_semantic_search_inner(
             );
         }
     };
-    // With neither index lane ready there is nothing to rank: refuse with
-    // each lane's status instead of presenting a filesystem walk as search.
+    // Ordinary roots retain the index-lane refusal policy. Parent children
+    // may still be warming their first indexes, so their reader engines use
+    // the existing bounded exact/lexical fallback instead.
     let lanes = SearchLaneStatus::observe(ctx, lexical_ready);
-    if let Some(refusal) = lanes.refusal(&req.id, ctx) {
-        return refusal;
+    if !allow_disk_fallback {
+        if let Some(refusal) = lanes.refusal(&req.id, ctx) {
+            return refusal;
+        }
     }
     let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
     if lexical_ready && mode != SearchMode::Regex && !engine_plan.contains(SearchLaneKind::Semantic)

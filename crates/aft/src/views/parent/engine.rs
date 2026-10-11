@@ -1,14 +1,11 @@
 //! Per-child search engines for a parent folder's `aft_search`.
 //!
-//! `aft_search` ranks with lanes and fusion that belong to one root, so a
-//! parent answer is assembled from each child's own engine rather than from a
-//! second ranking of the parent's making. Each child gets an [`AppContext`]
-//! that is never configured or bound: the worker installs the child's loaded
-//! trigram snapshot and, when semantic search is on, the semantic index built
-//! from the child's admitted view vectors. Nothing in that context builds,
-//! loads or writes an index; a query only runs the engine over what is
-//! installed. Every child's ranking is therefore the ranking a direct search
-//! of that child produces over the same content.
+//! Each child gets a reader-only [`AppContext`] with its own search engine.
+//! The worker installs the child's published text and semantic indexes into
+//! that context. Queries search those indexes, or use the bounded disk scan
+//! when no usable index is available. These query contexts never write a
+//! store. The parent merges child results without applying a second set of
+//! ranking rules.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -37,7 +34,7 @@ impl ChildEngine {
         config.project_root = Some(child.root.clone());
         // The engine reads the indexes installed below, never a view of its own.
         config.views.enabled = false;
-        config.indexes.trigram = true;
+        config.indexes.trigram = session.planes.trigram;
         config.indexes.semantic = session.planes.semantic;
         config.indexes.callgraph = false;
         config.semantic = session.semantic_config.clone();
@@ -108,17 +105,14 @@ impl ChildEngine {
     }
 }
 
-/// Creates the child's engine once its trigram snapshot is loaded, and
-/// installs the child's current snapshots into it. Runs on the worker.
+/// Install the child's text and semantic index data into its reader engine.
+/// An engine with no published index yet can still scan files. Runs on the worker.
 pub(super) fn sync(session: &ParentSession, child: &Child) {
     if !session.planes.trigram && !session.planes.semantic {
         return;
     }
     let mut engine = lock(&child.engine);
     if engine.is_none() {
-        if !child.trigram_ready() {
-            return;
-        }
         *engine = Some(ChildEngine::new(session, child));
     }
     if let Some(engine) = engine.as_mut() {
@@ -208,24 +202,32 @@ fn render_text(query: &str, page: &[Value], more_available: bool) -> String {
     if page.is_empty() {
         return format!("No results for \"{query}\" in this parent folder's repositories.");
     }
-    let mut lines =
-        page.iter()
-            .map(|row| {
-                let location = format!(
-                    "{}:{}-{}",
-                    row["file"].as_str().unwrap_or_default(),
-                    row["start_line"].as_u64().unwrap_or(0),
-                    row["end_line"].as_u64().unwrap_or(0)
-                );
-                let mut line = format!("{location} {}", row["name"].as_str().unwrap_or_default());
-                if let Some(first) = row["snippet"].as_str().and_then(|snippet| {
-                    snippet.lines().map(str::trim).find(|line| !line.is_empty())
-                }) {
-                    line.push_str(&format!("\n  {first}"));
-                }
-                line
-            })
-            .collect::<Vec<_>>();
+    let mut lines = page
+        .iter()
+        .map(|row| {
+            let location = format!(
+                "{}:{}-{}",
+                row["file"].as_str().unwrap_or_default(),
+                row["start_line"]
+                    .as_u64()
+                    .or_else(|| row["line"].as_u64())
+                    .unwrap_or(0),
+                row["end_line"]
+                    .as_u64()
+                    .or_else(|| row["line"].as_u64())
+                    .unwrap_or(0)
+            );
+            let mut line = format!("{location} {}", row["name"].as_str().unwrap_or_default());
+            if let Some(first) = row["snippet"]
+                .as_str()
+                .or_else(|| row["line_text"].as_str())
+                .and_then(|snippet| snippet.lines().map(str::trim).find(|line| !line.is_empty()))
+            {
+                line.push_str(&format!("\n  {first}"));
+            }
+            line
+        })
+        .collect::<Vec<_>>();
     if more_available {
         lines.push("(More results are available: raise topK or pass offset.)".into());
     }
@@ -329,12 +331,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
                lent: Option<crate::semantic_index::EmbeddingModel>,
                vector: Option<&Vec<f32>>| {
         let mut engine = lock(&child.engine);
-        let Some(engine) = engine.as_mut() else {
-            let reason = read(&child.trigram)
-                .gap_reason("trigram")
-                .unwrap_or_else(|| "the search engine of this repository is still loading".into());
-            return (Err(reason), lent);
-        };
+        let engine = engine.get_or_insert_with(|| ChildEngine::new(session, child));
         let mut params = json!({
             "id": req.id,
             "command": "semantic_search",
@@ -353,8 +350,9 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         if lending {
             *engine.ctx.semantic_embedding_model().lock() = lent;
         }
-        let search =
-            || crate::commands::semantic_search::handle_semantic_search(&child_req, &engine.ctx);
+        let search = || {
+            crate::commands::semantic_search::handle_parent_child_search(&child_req, &engine.ctx)
+        };
         let response = match vector {
             Some(vector) => crate::commands::semantic_search::with_precomputed_query_vector(
                 query,
@@ -403,8 +401,15 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     let mut more_available = false;
     let mut engine_capped = false;
     let mut fully_degraded = true;
+    let mut lexical_only_fallback = false;
+    let mut bounded_disk_fallback = false;
     let mut semantic_statuses = Vec::new();
     for (child, outcome) in children.iter().zip(outcomes) {
+        if session.planes.trigram {
+            if let Some(reason) = read(&child.trigram).gap_reason("trigram") {
+                gaps.child(child, reason);
+            }
+        }
         if session.planes.semantic && semantic.ready().is_some() {
             if let Some(reason) = read(&child.semantic).gap_reason("semantic") {
                 gaps.child(child, reason);
@@ -431,6 +436,9 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         more_available |= data["more_available"].as_bool().unwrap_or(false);
         engine_capped |= data["engine_capped"].as_bool().unwrap_or(false);
         fully_degraded &= data["fully_degraded"].as_bool().unwrap_or(false);
+        lexical_only_fallback |= data["lexical_only_fallback"].as_bool().unwrap_or(false);
+        bounded_disk_fallback |=
+            data["lexical_only_fallback"] == true && data["fully_degraded"] == true;
         if let Some(status) = data["semantic_status"].as_str() {
             semantic_statuses.push(status.to_owned());
         }
@@ -475,11 +483,22 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         [] => "unavailable".to_string(),
         _ => "partial".to_string(),
     };
+    let searched = first.is_some();
     let first = first.unwrap_or(Value::Null);
+    let mut text = if searched {
+        render_text(query, &page, more_available)
+    } else {
+        format!("Search unavailable for \"{query}\" in this parent folder's repositories.")
+    };
+    if bounded_disk_fallback {
+        text.push_str(
+            "\n\n(Child indexes unavailable: literal matches were read from a bounded disk scan.)",
+        );
+    }
     let mut body = json!({
-        "status": first["status"].as_str().unwrap_or("ready"),
+        "status": first["status"].as_str().unwrap_or("unavailable"),
         "complete": true,
-        "text": render_text(query, &page, more_available),
+        "text": text,
         "query": query,
         "include_tests": include_tests,
         "interpreted_as": first["interpreted_as"],
@@ -489,6 +508,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         "more_available": more_available,
         "engine_capped": engine_capped,
         "fully_degraded": fully_degraded,
+        "lexical_only_fallback": lexical_only_fallback,
         "semantic_status": semantic_status,
     });
     if let Some(object) = body.as_object_mut() {

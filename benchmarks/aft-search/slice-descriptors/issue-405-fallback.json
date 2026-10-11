@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/views/parent/tests.rs"
+  ],
+  "slices": [
+    "issue-405-fallback"
+  ],
+  "note": "Only parent-folder child readers opt into the bounded cold-index fallback; ordinary searches still call handle_semantic_search with allow_disk_fallback=false. All exact_recall sentence/pair rows bind individual Git corpus repositories, whose .git markers rule out parent-folder discovery. All 26 concept_recall fixtures and every included real_query manifest row bind an isolated evidence-tree copy with .git entries removed throughout. This includes query-only, split/joined query-pattern, paired prose-only, paging-invariance and semantic-building requests; building clients use the same copied root. None can discover a child Git repository or activate a ParentSession. Requests may pass the parent route check but cannot enter its child-search branch. All measured engine rows must remain byte-equal; the new cold-parent fixture tests behavior outside that benchmark population. No parity fixture or ranking rule is changed."
+}
