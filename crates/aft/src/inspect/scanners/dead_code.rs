@@ -937,6 +937,16 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
     previous: Option<&DeadCodeRollupState>,
     changed_files: &BTreeSet<String>,
 ) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
+    let parsed = parse_dead_code_contributions(project_root, contributions);
+    // Unchanged-state reuse must not hide a new gap or retain an error after
+    // repair. Rebuild from the current facts while either state has a gap.
+    let has_decode_gaps = parsed.iter().any(|contribution| contribution.decode_failed)
+        || previous.is_some_and(|state| {
+            state
+                .materialized
+                .iter()
+                .any(|contribution| contribution.decode_failed)
+        });
     let contribution_hashes = contribution_hashes(
         previous.map(|state| &state.contribution_hashes),
         contributions,
@@ -969,7 +979,8 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
                 && fragment.production_reachable_exports
                     == reachable_symbols_for_file(&previous.production.reachable, file)
         });
-        if previous.contribution_hashes == contribution_hashes
+        if !has_decode_gaps
+            && previous.contribution_hashes == contribution_hashes
             && previous.public_api_files == *public_api_files
             && previous.roles_fingerprint == roles_fingerprint
             && previous.drill_down_limit == drill_down_limit
@@ -994,12 +1005,12 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         }
     }
 
-    let parsed = parse_dead_code_contributions(contributions);
     let mut affected_files = changed_files
         .union(&changed_graph_files)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if previous.is_none()
+    if has_decode_gaps
+        || previous.is_none()
         || previous.is_some_and(|state| {
             state.public_api_files != *public_api_files
                 || state.roles_fingerprint != roles_fingerprint
@@ -1549,11 +1560,30 @@ fn fold_dead_code_fragments(
     aggregate
 }
 
-fn parse_dead_code_contributions(contributions: &[FileContribution]) -> Vec<DeadCodeContribution> {
+fn parse_dead_code_contributions(
+    project_root: &Path,
+    contributions: &[FileContribution],
+) -> Vec<DeadCodeContribution> {
     contributions
         .iter()
-        .filter_map(|contribution| {
-            serde_json::from_value::<DeadCodeContribution>(contribution.contribution.clone()).ok()
+        .map(|contribution| {
+            serde_json::from_value::<DeadCodeContribution>(contribution.contribution.clone())
+                .unwrap_or_else(|_| {
+                    // An undecodable record is a coverage gap, not a file with
+                    // no findings. Its JSON file field may also be corrupt, so
+                    // retain the authoritative cache-row path instead.
+                    let file = relative_path(project_root, &contribution.file_path);
+                    DeadCodeContribution {
+                        file: file.clone(),
+                        generated: Some(false),
+                        decode_failed: true,
+                        parse_errors: vec![json!({
+                            "file": file,
+                            "message": "cached dead-code contribution could not be decoded",
+                        })],
+                        ..Default::default()
+                    }
+                })
         })
         .collect::<Vec<_>>()
 }
@@ -6089,11 +6119,14 @@ fn normalize_path(path: &Path) -> PathBuf {
     crate::inspect::job::normalize_path(path)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct DeadCodeContribution {
     #[serde(skip)]
     go_initializers: Option<GoInitializerContribution>,
     file: String,
+    // This marker belongs only to the in-memory rollup, never cached JSON.
+    #[serde(skip)]
+    decode_failed: bool,
     #[serde(default)]
     rust_api: Option<RustApiFacts>,
     #[serde(default)]
@@ -6339,6 +6372,136 @@ mod tests {
                 .collect::<Vec<_>>(),
             original
         );
+    }
+
+    #[test]
+    fn cached_dead_code_decode_gap_is_named_incomplete_and_repairable() {
+        let (_temp, root, files) = fixture_project(&[
+            ("src/good.rs", "pub fn good_unused() {}\n"),
+            ("src/bad.rs", "pub fn bad_unused() {}\n"),
+        ]);
+        let snapshot = snapshot(
+            files.clone(),
+            vec![
+                export(&root, "src/good.rs", "good_unused", "function"),
+                export(&root, "src/bad.rs", "bad_unused", "function"),
+            ],
+            vec![],
+        );
+        let contributions = run_dead_code_scan(&job(&root, files.clone(), snapshot.clone()))
+            .outcome
+            .expect("valid scan")
+            .contributions;
+        let public = BTreeSet::new();
+        let roles = crate::inspect::entry_points::ProjectRoles::default();
+        let rollup = |facts: &[FileContribution], previous: Option<&DeadCodeRollupState>| {
+            aggregate_dead_code_contributions_incremental(
+                &root,
+                &snapshot,
+                facts,
+                &public,
+                &roles,
+                None,
+                Some("decode-gap"),
+                previous,
+                &BTreeSet::new(),
+            )
+        };
+        let (valid, valid_state, _) = rollup(&contributions, None);
+        assert_eq!(valid["complete"], true);
+        assert_eq!(valid["count"], 2);
+        let inspect_dir = root.join(".aft-cache/inspect");
+        let writer =
+            crate::inspect::cache::InspectCache::open(inspect_dir.clone(), root.clone()).unwrap();
+        let key = JobKey::for_project_category(InspectCategory::DeadCode);
+
+        for case in [
+            "missing exports",
+            "wrong exports and forged file",
+            "wrong file",
+        ] {
+            let mut malformed = contributions.clone();
+            let bad = malformed
+                .iter_mut()
+                .find(|item| item.contribution["file"] == "src/bad.rs")
+                .unwrap();
+            match case {
+                "missing exports" => {
+                    bad.contribution.as_object_mut().unwrap().remove("exports");
+                }
+                "wrong exports and forged file" => {
+                    bad.contribution["exports"] = json!("invalid cached value");
+                    bad.contribution["file"] = json!("forged.rs");
+                }
+                _ => {
+                    bad.contribution["file"] = json!(42);
+                }
+            }
+            assert_eq!(
+                bad.contribution["facts_format_version"],
+                DEAD_CODE_FACTS_FORMAT_VERSION
+            );
+            writer
+                .store_tier2_result(key.clone(), &files, &malformed, valid.clone())
+                .unwrap();
+            let borrower = crate::inspect::cache::InspectCache::open_readonly(
+                inspect_dir.clone(),
+                root.clone(),
+            )
+            .unwrap()
+            .unwrap();
+            let rows = borrower
+                .load_tier2_contributions(InspectCategory::DeadCode)
+                .unwrap();
+            let raw = rows
+                .iter()
+                .map(|row| row.contribution.clone())
+                .collect::<Vec<_>>();
+            let loaded = rows
+                .into_iter()
+                .map(|row| {
+                    let path = if row.file_path.is_absolute() {
+                        row.file_path
+                    } else {
+                        root.join(row.file_path)
+                    };
+                    FileContribution::new(row.category, path, row.freshness, row.contribution)
+                        .with_type_ref_names(row.type_ref_names)
+                })
+                .collect::<Vec<_>>();
+            let (cold, state, _) = rollup(&loaded, None);
+            assert_eq!(cold["complete"], false, "{case}");
+            assert_eq!(cold["scanned_files"], 2);
+            assert_eq!(cold["count"], 1);
+            assert!(aggregate_has_item(&cold, "src/good.rs", "good_unused"));
+            assert!(!aggregate_has_item(&cold, "src/bad.rs", "bad_unused"));
+            assert_eq!(
+                cold["parse_errors"],
+                json!([{
+                    "file": "src/bad.rs",
+                    "message": "cached dead-code contribution could not be decoded",
+                }])
+            );
+            let (warm, gap_state, _) = rollup(&loaded, Some(&state));
+            assert_eq!(warm, cold, "unchanged gap: {case}");
+            let (corrupted, _, _) = rollup(&loaded, Some(&valid_state));
+            assert_eq!(
+                corrupted, cold,
+                "corruption without changed-file notice: {case}"
+            );
+            let (repaired, _, _) = rollup(&contributions, Some(&gap_state));
+            assert_eq!(repaired, valid, "repaired contribution: {case}");
+            assert_eq!(
+                borrower
+                    .load_tier2_contributions(InspectCategory::DeadCode)
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.contribution.clone())
+                    .collect::<Vec<_>>(),
+                raw,
+                "read-only rollup must not rewrite cached rows"
+            );
+        }
     }
 
     #[test]

@@ -190,6 +190,8 @@ impl From<serde_json::Error> for InspectCacheError {
 /// v41: source-buffer freshness, Rust impl scopes, complexity scoring and cycle
 /// traversal corrections invalidate existing facts as well as derived results.
 /// A metadata epoch now fences raw contribution rows, not just aggregate hashes.
+/// Malformed dead-code facts remain named decode gaps, making aggregates
+/// incomplete instead of silently certifying a reduced file set.
 pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 41;
 // Reserved metadata category: its integer is an epoch, never a scan timestamp.
 const CACHE_VERSION_CATEGORY: &str = "__cache_version__";
@@ -2758,7 +2760,7 @@ mod tests {
 
     #[test]
     fn cache_epoch_writer_invalidates_old_and_missing_markers() {
-        for marker in [Some(34), None] {
+        for marker in [Some(34), Some(35), None] {
             let (_dir, root, inspect, key, hash) = cache_epoch_fixture(marker);
             let cache = InspectCache::open(inspect, root).unwrap();
             assert!(cache
@@ -2819,7 +2821,7 @@ mod tests {
 
     #[test]
     fn cache_epoch_borrower_misses_old_and_missing_markers_without_writes() {
-        for marker in [Some(34), None] {
+        for marker in [Some(34), Some(35), None] {
             let (_dir, root, inspect, key, hash) = cache_epoch_fixture(marker);
             let cache = InspectCache::open_readonly(inspect, root).unwrap().unwrap();
             let cache = &cache.inner;
