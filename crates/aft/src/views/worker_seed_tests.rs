@@ -1,0 +1,455 @@
+use super::*;
+
+fn git(root: &Path, args: &[&str]) {
+    assert!(std::process::Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .status()
+        .unwrap()
+        .success());
+}
+
+fn checkouts(files: usize) -> (Vec<tempfile::TempDir>, AssemblyRequest, AssemblyRequest) {
+    let main = super::cold_fallback_tests::repository(files);
+    fs::write(
+        main.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@target":["file_0"]}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        main.path().join("alias.ts"),
+        "import { target_0 } from '@target'; export function alias() { return target_0(); }",
+    )
+    .unwrap();
+    fs::write(
+        main.path().join("lib.rs"),
+        "mod target; use target::Thing; pub fn caller() { let t = Thing; t.method(); }",
+    )
+    .unwrap();
+    fs::write(
+        main.path().join("target.rs"),
+        "pub struct Thing; impl Thing { pub fn method(&self) {} }",
+    )
+    .unwrap();
+    git(main.path(), &["add", "."]);
+    git(
+        main.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "resolver fixtures",
+        ],
+    );
+    let worker = tempfile::tempdir().unwrap();
+    git(
+        main.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            worker.path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let storage = tempfile::tempdir().unwrap();
+    let request = |root: &Path| AssemblyRequest {
+        storage: storage.path().to_path_buf(),
+        project_root: root.to_path_buf(),
+        family: crate::search_index::artifact_cache_key(root),
+        scope: crate::path_identity::project_scope_key(root),
+        desired_head: head_tree_fingerprint(&head_tree_entries(root).unwrap()),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    let main_request = request(main.path());
+    let worker_request = request(worker.path());
+    (vec![main, worker, storage], main_request, worker_request)
+}
+
+fn assert_cold_parity(request: &AssemblyRequest, report: &AssemblyReport) {
+    let view = ViewStore::open(&request.storage, &request.scope).unwrap();
+    let derived = view
+        .derived_path(report.generation.as_deref().unwrap())
+        .unwrap();
+    let blobs = BlobStore::open(&request.storage, &request.family, BlobPlane::Callgraph).unwrap();
+    let cold_dir = tempfile::tempdir().unwrap();
+    let cold = cold_dir.path().join("derived-cold.sqlite");
+    crate::views::materialization::materialize_manifest_view_database(
+        &cold,
+        blobs.path(),
+        report.manifest.as_ref().unwrap(),
+    )
+    .unwrap();
+    crate::views::materialization::parity::assert_logical_parity(&derived, &cold);
+    let _pin =
+        crate::pins::QueryPin::acquire(view.view_dir(), report.generation.as_deref().unwrap())
+            .unwrap();
+    let open = |dir: &Path, generation: &str| {
+        crate::callgraph_store::ReadonlyCallGraphStore::open_pinned_derived(
+            request.project_root.clone(),
+            request.family.clone(),
+            dir.to_path_buf(),
+            generation,
+        )
+        .unwrap()
+    };
+    let seeded = open(view.view_dir(), report.generation.as_deref().unwrap());
+    let fresh = open(cold_dir.path(), "cold");
+    let primary = if fs::read_to_string(request.project_root.join("file_0.ts"))
+        .unwrap()
+        .contains("function target_0(")
+    {
+        "target_0"
+    } else {
+        "replaced_0"
+    };
+    for (file, symbol) in [("file_0.ts", primary), ("alias.ts", "alias")] {
+        let path = Path::new(file);
+        assert_eq!(
+            format!("{:?}", seeded.callers_of(path, symbol, 5).unwrap()).as_bytes(),
+            format!("{:?}", fresh.callers_of(path, symbol, 5).unwrap()).as_bytes(),
+            "callers bytes for {symbol}"
+        );
+        assert_eq!(
+            format!("{:?}", seeded.impact_of(path, symbol, 5).unwrap()).as_bytes(),
+            format!("{:?}", fresh.impact_of(path, symbol, 5).unwrap()).as_bytes(),
+            "impact bytes for {symbol}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&seeded.trace_to(path, symbol, 5).unwrap()).unwrap(),
+            serde_json::to_vec(&fresh.trace_to(path, symbol, 5).unwrap()).unwrap(),
+            "trace bytes for {symbol}"
+        );
+    }
+    let dead_code = |reader: &crate::callgraph_store::ReadonlyCallGraphStore| {
+        use crate::inspect::{InspectCategory, InspectJob, JobKey};
+        let (_, mut snapshot, _, _) =
+            crate::callgraph_store::project_dead_code_snapshot_from_view(reader).unwrap();
+        // Projection timestamps describe the query invocation, not graph content.
+        snapshot.generated_at = None;
+        let job = InspectJob {
+            job_id: 1,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files: snapshot.files.clone(),
+            project_root: request.project_root.clone(),
+            inspect_dir: cold_dir.path().join("inspect"),
+            config: std::sync::Arc::new(crate::config::Config {
+                project_root: Some(request.project_root.clone()),
+                ..Default::default()
+            }),
+            symbol_cache: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::parser::SymbolCache::new(),
+            )),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: Some(std::sync::Arc::new(snapshot)),
+        };
+        serde_json::to_vec(
+            &crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+                .outcome
+                .unwrap()
+                .aggregate,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        dead_code(&seeded),
+        dead_code(&fresh),
+        "dead-code query bytes"
+    );
+}
+
+#[test]
+fn worker_first_publication_clones_main_with_cold_query_parity() {
+    let (_dirs, main, mut worker) = checkouts(24);
+    let main_report = publish_checkout(&main).unwrap();
+    let mut republish = main.clone();
+    republish.desired_head = "same-graph-new-generation".into();
+    let reused = publish_checkout(&republish).unwrap();
+    let main_view = ViewStore::open(&main.storage, &main.scope).unwrap();
+    let main_path = main_view
+        .derived_path(main_report.generation.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(
+        main_view
+            .derived_path(reused.generation.as_deref().unwrap())
+            .unwrap(),
+        main_path,
+        "the donor pointer may name a reused artifact owned by an older manifest"
+    );
+    let before = crate::views::materialization::parity::logical_snapshot(&main_path);
+    fs::write(
+        worker.project_root.join("file_0.ts"),
+        "export function target_0() { return 999; }",
+    )
+    .unwrap();
+    fs::write(
+        worker.project_root.join("target.rs"),
+        "pub struct Thing; impl Thing { pub fn method(&self) { helper(); } } fn helper() {} ",
+    )
+    .unwrap();
+    worker
+        .changed_paths
+        .extend([b"file_0.ts".to_vec(), b"target.rs".to_vec()]);
+    fs::remove_file(worker.project_root.join("file_1.ts")).unwrap();
+    fs::rename(
+        worker.project_root.join("file_2.ts"),
+        worker.project_root.join("renamed.ts"),
+    )
+    .unwrap();
+    fs::write(
+        worker.project_root.join("added.ts"),
+        "import { target_2 } from './renamed'; export function added() { return target_2(); }",
+    )
+    .unwrap();
+    git(&worker.project_root, &["add", "-A"]);
+    git(
+        &worker.project_root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "worker membership changes",
+        ],
+    );
+    worker.desired_head = head_tree_fingerprint(&head_tree_entries(&worker.project_root).unwrap());
+    worker.changed_paths.extend([
+        b"file_1.ts".to_vec(),
+        b"file_2.ts".to_vec(),
+        b"renamed.ts".to_vec(),
+        b"added.ts".to_vec(),
+    ]);
+    let mut prepared = prepare_checkout(&worker, &mut |_| Ok(())).unwrap();
+    assert!(
+        prepared.profile.derived_cloned,
+        "a new linked checkout must clone its main checkout's compatible derived database"
+    );
+    assert_eq!(prepared.profile.seed_source, "sibling");
+    let report = prepared.commit().unwrap();
+    assert_eq!(report.blob_puts, 3);
+    assert_cold_parity(&worker, &report);
+    assert_eq!(
+        before,
+        crate::views::materialization::parity::logical_snapshot(&main_path),
+        "cloning must not mutate the donor"
+    );
+}
+
+#[test]
+fn worker_seed_uses_freshest_ready_sibling_and_repairs_unusable_own_base() {
+    let (_dirs, main, mut worker) = checkouts(24);
+    let original = publish_checkout(&main).unwrap();
+    fs::write(
+        worker.project_root.join("file_0.ts"),
+        "export function target_0() { return 42; }",
+    )
+    .unwrap();
+    worker.changed_paths.insert(b"file_0.ts".to_vec());
+    let newer = publish_checkout(&worker).unwrap();
+    let worker_view = ViewStore::open(&worker.storage, &worker.scope).unwrap();
+    let newer_path = worker_view
+        .derived_path(newer.generation.as_deref().unwrap())
+        .unwrap();
+    let third = tempfile::tempdir().unwrap();
+    git(
+        &main.project_root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            third.path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let mut third_request = main.clone();
+    third_request.project_root = third.path().to_path_buf();
+    third_request.scope = crate::path_identity::project_scope_key(third.path());
+    let freshest = worker_seed::sibling_checkout_seed(
+        &third_request,
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        freshest.path, newer_path,
+        "a newer ready worker must outrank the main checkout"
+    );
+    drop(freshest);
+    let main_view = ViewStore::open(&main.storage, &main.scope).unwrap();
+    let old_path = main_view
+        .derived_path(original.generation.as_deref().unwrap())
+        .unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while crate::db::file_identity::open_connections(&old_path) != 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Connection::open(&old_path)
+        .unwrap()
+        .execute("UPDATE meta SET v='0' WHERE k='ready'", [])
+        .unwrap();
+    let seed =
+        worker_seed::sibling_checkout_seed(&main, Instant::now() + crate::db::STEADY_BUSY_TIMEOUT)
+            .unwrap()
+            .unwrap();
+    assert_eq!(seed.path, newer_path);
+    drop(seed);
+    let mut repaired = prepare_checkout(&main, &mut |_| Ok(())).unwrap();
+    assert_eq!(repaired.profile.seed_source, "sibling");
+    assert_eq!(repaired.profile.cold_build_reason, "none");
+    let report = repaired.commit().unwrap();
+    assert_cold_parity(&main, &report);
+}
+
+#[test]
+fn worker_seed_rejects_foreign_family_and_oversized_diff() {
+    let (_dirs, main, mut worker) = checkouts(128);
+    publish_checkout(&main).unwrap();
+    worker.family = "unrelated-family".into();
+    assert!(worker_seed::sibling_checkout_seed(
+        &worker,
+        Instant::now() + crate::db::STEADY_BUSY_TIMEOUT
+    )
+    .unwrap()
+    .is_none());
+    worker.family = main.family;
+    for i in 0..128 {
+        fs::write(
+            worker.project_root.join(format!("file_{i}.ts")),
+            format!("export function replaced_{i}() {{}} "),
+        )
+        .unwrap();
+        worker
+            .changed_paths
+            .insert(format!("file_{i}.ts").into_bytes());
+    }
+    let mut prepared = prepare_checkout(&worker, &mut |_| Ok(())).unwrap();
+    assert!(
+        !prepared.profile.derived_cloned,
+        "the diff cutoff must apply before copying a sibling database"
+    );
+    assert_eq!(prepared.profile.seed_source, "cold");
+    assert_eq!(prepared.profile.cold_build_reason, "large_diff");
+    let report = prepared.commit().unwrap();
+    assert_cold_parity(&worker, &report);
+}
+
+#[test]
+#[ignore = "offline publication measurement with 4,891 tracked files and a linked checkout"]
+fn bench_4891_file_worker_publication() {
+    let (_dirs, main, worker) = checkouts(4887);
+    let mut initial = prepare_checkout(&main, &mut |_| Ok(())).unwrap();
+    println!(
+        "main files=4891 materialize_ms={}",
+        initial.profile.materialization_call_ms
+    );
+    initial.commit().unwrap();
+    let started = Instant::now();
+    let mut prepared = prepare_checkout(&worker, &mut |_| Ok(())).unwrap();
+    println!(
+        "worker files=4891 publication_ms={} materialize_ms={} clone_ms={} cloned={}",
+        started.elapsed().as_millis(),
+        prepared.profile.materialization_call_ms,
+        prepared.profile.derived_clone_ms,
+        prepared.profile.derived_cloned
+    );
+    let report = prepared.commit().unwrap();
+    assert_eq!(report.manifest.as_ref().unwrap().entries().count(), 4891);
+    assert_eq!(report.blob_puts, 0);
+    assert_cold_parity(&worker, &report);
+}
+
+#[test]
+#[ignore = "offline cold materialization of this repository's committed source corpus"]
+fn bench_repository_cold_materialization() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let archive = Command::new("git")
+        .args(["archive", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(archive.status.success());
+    let mut unpack = Command::new("tar")
+        .arg("-x")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    unpack
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&archive.stdout)
+        .unwrap();
+    assert!(unpack.wait().unwrap().success());
+    git(project.path(), &["init", "--quiet"]);
+    git(project.path(), &["add", "."]);
+    git(
+        project.path(),
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "repository corpus",
+        ],
+    );
+    let request = AssemblyRequest {
+        storage: storage.path().to_path_buf(),
+        project_root: project.path().to_path_buf(),
+        family: crate::search_index::artifact_cache_key(project.path()),
+        scope: crate::path_identity::project_scope_key(project.path()),
+        desired_head: head_tree_fingerprint(&head_tree_entries(project.path()).unwrap()),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    crate::blob_store::PAYLOAD_READ_COUNTS.with(|counts| counts.set(Default::default()));
+    let prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+    let reads = crate::blob_store::PAYLOAD_READ_COUNTS.with(|counts| counts.get());
+    let (path, connection) = prepared.derived_checkpoint.as_ref().unwrap();
+    let unknown: usize = connection
+        .query_row("SELECT COUNT(*) FROM view_unknown_live", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    println!("repository files={} materialize_ms={} derived_bytes={} unknown_live_rows={} payload_reads={} payload_bytes={}", prepared.report.manifest.as_ref().unwrap().entries().count(), prepared.profile.materialization_call_ms, fs::metadata(path).unwrap().len(), unknown, reads.blake3_calls, reads.bytes);
+    for name in [
+        "refs",
+        "edges",
+        "view_bindings",
+        "view_unknown_live",
+        "sqlite_autoindex_view_unknown_live_1",
+    ] {
+        let bytes: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(pgsize),0) FROM dbstat WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        println!("repository table={name} allocated_bytes={bytes}");
+    }
+}

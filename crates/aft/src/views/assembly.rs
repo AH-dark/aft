@@ -594,6 +594,8 @@ pub fn prepare_checkout(
         && base_ready
     {
         prepared.profile.outcome = "no_op";
+        prepared.profile.seed_source = "own";
+        prepared.profile.cold_build_reason = "none";
         prepared.report.manifest = None;
         prepared.report.blob_puts = blob_puts;
         return Ok(prepared);
@@ -607,6 +609,8 @@ pub fn prepare_checkout(
             .as_deref()
             .is_some_and(|base| view.derived_path(base).is_ok_and(|path| path.is_file()));
     if reused_derived {
+        prepared.profile.seed_source = "own";
+        prepared.profile.cold_build_reason = "none";
         view.reuse_derived(
             &next_generation,
             current_generation.as_deref().expect("reused base"),
@@ -639,6 +643,22 @@ pub fn prepare_checkout(
             }
             _ => None,
         };
+        // A missing or unusable local base can seed from a ready sibling:
+        // derived rows use manifest-relative paths,
+        // and the ordinary cutoff/fingerprint checks still gate the patch.
+        let sibling = if base.is_none() && request.callgraph {
+            worker_seed::sibling_checkout_seed(
+                request,
+                Instant::now() + crate::db::STEADY_BUSY_TIMEOUT,
+            )?
+        } else {
+            None
+        };
+        let base = base.or_else(|| {
+            sibling
+                .as_ref()
+                .map(|seed| (seed.path.clone(), seed.manifest.clone()))
+        });
         let mut incremental_base = None;
         if let Some((base_path, base_manifest)) = base {
             let size = super::materialization::manifest_diff_size(&base_manifest, &manifest);
@@ -653,7 +673,16 @@ pub fn prepare_checkout(
                 ));
             } else {
                 match super::generation::clone_derived(&base_path, &derived) {
-                    Ok(_) => incremental_base = Some(base_manifest),
+                    Ok(_) => {
+                        prepared.profile.seed_source =
+                            if sibling.is_some() { "sibling" } else { "own" };
+                        prepared.profile.cold_build_reason = "none";
+                        #[cfg(test)]
+                        {
+                            prepared.profile.derived_cloned = true;
+                        }
+                        incremental_base = Some(base_manifest);
+                    }
                     Err(error) if view_error_is_unreadable_database(&error) => {
                         cold_build = Some((ColdBuildReason::BaseUnreadable, error.to_string()));
                         super::generation::remove_unpublished_derived(&derived)?;
@@ -713,6 +742,13 @@ pub fn prepare_checkout(
             }
         }
         if !patched {
+            prepared.profile.seed_source = "cold";
+            prepared.profile.cold_build_reason = match cold_build.as_ref().map(|(reason, _)| reason)
+            {
+                Some(ColdBuildReason::LargeDiff) => "large_diff",
+                Some(_) => "base_unreadable",
+                None => "no_base",
+            };
             prepared.derived_checkpoint = Some((derived.clone(), open_derived_keeper(&derived)?));
             if let Some((reason, detail)) = &cold_build {
                 record_cold_build(view.view_dir(), *reason);
@@ -820,6 +856,10 @@ struct PublicationProfile {
     total_ms: u128,
     derived_bytes: u64,
     derived_clone_ms: u128,
+    seed_source: &'static str,
+    cold_build_reason: &'static str,
+    #[cfg(test)]
+    derived_cloned: bool,
     materialization_call_ms: u128,
     closure_ms: u128,
     materialization: super::materialization::profile::PhaseTimings,
@@ -849,6 +889,10 @@ impl PublicationProfile {
             total_ms: 0,
             derived_bytes: 0,
             derived_clone_ms: 0,
+            seed_source: "cold",
+            cold_build_reason: "no_base",
+            #[cfg(test)]
+            derived_cloned: false,
             materialization_call_ms: 0,
             closure_ms: 0,
             materialization: super::materialization::profile::PhaseTimings::default(),
@@ -905,7 +949,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} {}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} seed_source={} cold_build_reason={} {}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -929,7 +973,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.cleanup_memory_ms,
         profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
-        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.io.fields(),
+        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.seed_source, profile.cold_build_reason, profile.io.fields(),
     )
 }
 
@@ -984,6 +1028,7 @@ mod tests {
         assert!(line.contains("closure_logical_bytes_written="));
         assert!(line.contains("total_bytes_read="));
         assert!(line.contains("semantic_fill=false generation=none concurrent_publications=0"));
+        assert!(line.contains("seed_source=cold cold_build_reason=no_base"));
         assert_eq!(line.matches("index_event kind=view_publication").count(), 1);
     }
 }
@@ -1655,3 +1700,10 @@ mod semantic_fill_tests;
 #[cfg(test)]
 #[path = "cold_fallback_tests.rs"]
 mod cold_fallback_tests;
+
+#[path = "assembly_seed.rs"]
+mod worker_seed;
+
+#[cfg(test)]
+#[path = "worker_seed_tests.rs"]
+mod worker_seed_tests;

@@ -401,6 +401,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal family membership census, not an agent-visible list; an incomplete membership snapshot aborts background marking rather than deleting unmarked content",
     },
     ExclusionEntry {
+        file: "views/assembly_seed.rs",
+        enclosing_item: "worktree_roots, read_worktree_child, read_worktree_roots",
+        location_or_primitive: "take(MAX_BYTES + 1), take(65_536), MAX_WORKTREES",
+        reason: "optional sibling donor discovery bounds Git topology bytes, records and worktrees at their iterators; an incomplete or malformed enumeration disables reuse rather than claiming a freshest donor",
+    },
+    ExclusionEntry {
         file: "views/generation.rs",
         enclosing_item: "blob_references_by_generation, sweep_generations_locked, remove_generation_files",
         location_or_primitive: "take(4097), take(65537), take(65536)",
