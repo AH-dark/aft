@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Reporting-only change in semantic_search/mod.rs: a capped identifier fallback keeps more_available true and an exhausted capped page discloses a lower-bound total. Candidate admission, lane plans, weights, comparator, scores and page order are unchanged, so every benchmark row must stay byte-equal to the reference. Also fixes the executor's dispatch-loop liveness marker and replaces an expiring test embedding server."
+}
