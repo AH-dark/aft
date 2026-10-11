@@ -13,29 +13,15 @@ const NO_RANK: u32 = u32::MAX;
 
 static PATTERN_REGEX: OnceLock<Regex> = OnceLock::new();
 static STRING_ENCODER: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
-static BINARY_ENCODER: OnceLock<HashMap<Vec<u8>, u32>> = OnceLock::new();
+static BINARY_ENCODER: OnceLock<HashMap<&'static [u8], u32>> = OnceLock::new();
 
 /// Count Claude tokens in `text`.
 pub fn count_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    // Keep the same direct-token shortcut and pre-tokenizer as encoding, but
-    // accumulate counts instead of allocating a final token-ID vector.
-    if text.encode_utf16().take(10).count() < 10 && string_encoder().contains_key(text) {
-        return 1;
-    }
     let mut count = 0;
-    for piece in pattern_regex().find_iter(text) {
-        let piece = piece
-            .expect("Claude pre-tokenizer regex should not fail")
-            .as_str();
-        if string_encoder().contains_key(piece) {
-            count += 1;
-        } else {
-            visit_byte_pair_tokens(piece.as_bytes(), |_| count += 1);
-        }
-    }
+    emit_tokens(text, &mut |_| count += 1);
     count
 }
 
@@ -48,31 +34,41 @@ pub fn encode(text: &str) -> Vec<u32> {
 }
 
 fn encode_internal(text: &str) -> Vec<u32> {
+    #[cfg(test)]
+    ENCODE_OUTPUTS.with(|calls| calls.set(calls.get() + 1));
+    let mut result = Vec::new();
+    emit_tokens(text, &mut |rank| result.push(rank));
+    #[cfg(test)]
+    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + result.capacity() * 4));
+    result
+}
+
+fn emit_tokens(text: &str, emit: &mut impl FnMut(u32)) {
     // ai-tokenizer checks direct rank before pre-tokenizing for short strings.
     if text.encode_utf16().take(10).count() < 10 {
         if let Some(&rank) = string_encoder().get(text) {
-            #[cfg(test)]
-            TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + 4));
-            return vec![rank];
+            emit(rank);
+            return;
         }
     }
 
-    let mut result = Vec::new();
     for piece in pattern_regex().find_iter(text) {
         let piece = piece
             .expect("Claude pre-tokenizer regex should not fail")
             .as_str();
 
         if let Some(&rank) = string_encoder().get(piece) {
-            result.push(rank);
+            emit(rank);
             continue;
         }
 
-        result.extend(byte_pair_merge(piece.as_bytes()));
+        byte_pair_merge(piece.as_bytes(), emit);
     }
-    #[cfg(test)]
-    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + result.capacity() * 4));
-    result
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENCODE_OUTPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn pattern_regex() -> &'static Regex {
@@ -83,25 +79,19 @@ fn string_encoder() -> &'static HashMap<&'static str, u32> {
     STRING_ENCODER.get_or_init(|| STRING_ENCODER_ENTRIES.iter().copied().collect())
 }
 
-fn binary_encoder() -> &'static HashMap<Vec<u8>, u32> {
-    BINARY_ENCODER.get_or_init(|| {
-        BINARY_ENCODER_ENTRIES
-            .iter()
-            .map(|(bytes, rank)| (bytes.to_vec(), *rank))
-            .collect()
-    })
+fn binary_encoder() -> &'static HashMap<&'static [u8], u32> {
+    BINARY_ENCODER.get_or_init(|| BINARY_ENCODER_ENTRIES.iter().copied().collect())
 }
 
-fn byte_pair_merge(piece: &[u8]) -> Vec<u32> {
+fn byte_pair_merge(piece: &[u8], emit: &mut impl FnMut(u32)) {
     #[cfg(test)]
     if LEGACY_BPE.with(|legacy| legacy.get()) {
-        return byte_pair_merge_legacy(piece);
+        for rank in byte_pair_merge_legacy(piece) {
+            emit(rank);
+        }
+        return;
     }
-    let mut output = Vec::new();
-    visit_byte_pair_tokens(piece, |rank| output.push(rank));
-    #[cfg(test)]
-    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + output.capacity() * 4));
-    output
+    visit_byte_pair_tokens(piece, emit);
 }
 
 fn visit_byte_pair_tokens(piece: &[u8], mut emit: impl FnMut(u32)) {
@@ -132,6 +122,9 @@ fn visit_byte_pair_tokens(piece: &[u8], mut emit: impl FnMut(u32)) {
     while left < len {
         let right = next[left];
         let rank = get_rank_for_slice(&piece[left..right]);
+        // Every byte has a vocabulary rank, and boundaries merge only when the
+        // combined slice has a rank, so a surviving piece must remain ranked.
+        debug_assert_ne!(rank, NO_RANK, "unranked final BPE piece");
         if rank != NO_RANK {
             emit(rank);
         }
@@ -259,6 +252,36 @@ fn get_rank_for_slice(slice: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn count_tokens_does_not_materialize_encoded_output() {
+        super::ENCODE_OUTPUTS.with(|calls| calls.set(0));
+        assert_eq!(super::count_tokens("hello"), 1);
+        super::ENCODE_OUTPUTS.with(|calls| assert_eq!(calls.get(), 0));
+        assert_eq!(super::encode("hello").len(), 1);
+        super::ENCODE_OUTPUTS.with(|calls| assert_eq!(calls.get(), 1));
+    }
+
+    #[test]
+    fn binary_encoder_borrows_static_keys() {
+        let (bytes, rank) = super::BINARY_ENCODER_ENTRIES[0];
+        let stored = super::binary_encoder()
+            .keys()
+            .find(|key| &key[..] == bytes)
+            .unwrap();
+        assert_eq!(stored.as_ptr(), bytes.as_ptr());
+        assert_eq!(super::binary_encoder().get(bytes), Some(&rank));
+    }
+
+    #[test]
+    fn vocabulary_covers_every_single_byte() {
+        for byte in 0..=u8::MAX {
+            assert_ne!(
+                super::get_rank_for_slice(&[byte]),
+                super::NO_RANK,
+                "byte {byte}"
+            );
+        }
+    }
     use super::*;
 
     #[test]

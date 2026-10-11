@@ -29,22 +29,12 @@ fn main() {
         manifest_dir.join("src/claude_data.rs").display()
     );
 
-    // Resolve the optional regen source. Missing source = no-op build script.
-    let source = match env::var_os("AFT_TOKENIZER_CLAUDE_JS").map(PathBuf::from) {
-        Some(explicit) => {
-            if !explicit.exists() {
-                println!(
-                    "cargo:warning=AFT_TOKENIZER_CLAUDE_JS={} does not exist; using vendored claude_data.rs",
-                    explicit.display()
-                );
-                return;
-            }
-            explicit
-        }
-        None => match locate_default_source(workspace_root) {
-            Some(path) => path,
-            None => return,
-        },
+    let Some(source) = regeneration_source(
+        workspace_root,
+        env::var_os("AFT_TOKENIZER_CLAUDE_JS").map(PathBuf::from),
+        &mut std::io::stdout(),
+    ) else {
+        return;
     };
 
     println!("cargo:rerun-if-changed={}", source.display());
@@ -137,6 +127,27 @@ fn main() {
         dest.display(),
         source.display()
     );
+}
+
+fn regeneration_source(
+    workspace_root: &Path,
+    explicit: Option<PathBuf>,
+    out: &mut impl Write,
+) -> Option<PathBuf> {
+    let input = explicit
+        .clone()
+        .unwrap_or_else(|| workspace_root.join("tmp/ai-tokenizer-pkg/package/dist/encoding"));
+    // Register the optional input before discovery can return early, so a newly
+    // installed encoding is picked up without touching the vendored Rust source.
+    writeln!(out, "cargo:rerun-if-changed={}", input.display()).unwrap();
+    match explicit {
+        Some(path) if path.exists() => Some(path),
+        Some(path) => {
+            writeln!(out, "cargo:warning=AFT_TOKENIZER_CLAUDE_JS={} does not exist; using vendored claude_data.rs", path.display()).unwrap();
+            None
+        }
+        None => locate_default_source(workspace_root),
+    }
 }
 
 fn locate_default_source(workspace_root: &Path) -> Option<PathBuf> {
@@ -240,7 +251,7 @@ fn parse_js_u32(input: &str) -> u32 {
 }
 
 fn parse_js_string_literal(input: &str) -> (String, usize) {
-    let mut chars = input.char_indices();
+    let mut chars = input.char_indices().peekable();
     assert_eq!(chars.next().map(|(_, ch)| ch), Some('"'));
 
     let mut output = String::new();
@@ -267,10 +278,39 @@ fn parse_js_string_literal(input: &str) -> (String, usize) {
                         output.push(char::from_u32(value).expect("valid hex escape"));
                     }
                     'u' => {
-                        let mut value = 0;
-                        for _ in 0..4 {
-                            let digit = chars.next().expect("missing unicode escape digit").1;
-                            value = value * 16 + hex_value(digit);
+                        let mut value = 0_u32;
+                        if chars.peek().is_some_and(|(_, ch)| *ch == '{') {
+                            chars.next();
+                            let mut digits = 0;
+                            loop {
+                                let digit = chars.next().expect("unterminated unicode escape").1;
+                                if digit == '}' {
+                                    assert!(digits > 0, "empty unicode escape");
+                                    break;
+                                }
+                                digits += 1;
+                                value = value
+                                    .checked_mul(16_u32)
+                                    .and_then(|value| value.checked_add(hex_value(digit)))
+                                    .expect("unicode escape too large");
+                            }
+                        } else {
+                            for _ in 0..4 {
+                                let digit = chars.next().expect("missing unicode escape digit").1;
+                                value = value * 16 + hex_value(digit);
+                            }
+                            if (0xD800..=0xDBFF).contains(&value) {
+                                assert_eq!(chars.next().map(|(_, ch)| ch), Some('\\'));
+                                assert_eq!(chars.next().map(|(_, ch)| ch), Some('u'));
+                                let mut low = 0;
+                                for _ in 0..4 {
+                                    let digit =
+                                        chars.next().expect("missing low surrogate digit").1;
+                                    low = low * 16 + hex_value(digit);
+                                }
+                                assert!((0xDC00..=0xDFFF).contains(&low), "invalid low surrogate");
+                                value = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+                            }
                         }
                         output.push(char::from_u32(value).expect("valid unicode escape"));
                     }
@@ -287,4 +327,77 @@ fn parse_js_string_literal(input: &str) -> (String, usize) {
 fn hex_value(ch: char) -> u32 {
     ch.to_digit(16)
         .unwrap_or_else(|| panic!("invalid hex escape digit: {ch}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_regeneration_source_is_watched() {
+        let root = std::env::temp_dir().join(format!("aft-tokenizer-watch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("tmp")).unwrap();
+        let mut out = Vec::new();
+        assert!(regeneration_source(&root, None, &mut out).is_none());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "cargo:rerun-if-changed={}\n",
+                root.join("tmp/ai-tokenizer-pkg/package/dist/encoding")
+                    .display()
+            )
+        );
+        let encoding = root.join("tmp/ai-tokenizer-pkg/package/dist/encoding");
+        fs::create_dir_all(&encoding).unwrap();
+        let source = encoding.join("claude-new.js");
+        fs::write(&source, "").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(regeneration_source(&root, None, &mut out), Some(source));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("cargo:rerun-if-changed={}\n", encoding.display())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn js_invalid_unicode_escape_is_rejected() {
+        for input in [
+            r#""\uD83D\u0041""#,
+            r#""\uDE00""#,
+            r#""\u{}""#,
+            r#""\u{110000}""#,
+        ] {
+            assert!(std::panic::catch_unwind(|| parse_js_string_literal(input)).is_err());
+        }
+    }
+
+    #[test]
+    fn js_unicode_surrogates_decode_as_one_scalar() {
+        assert_eq!(
+            parse_js_string_literal(r#""\uD83D\uDE00"tail"#),
+            ("😀".into(), 14)
+        );
+    }
+
+    #[test]
+    fn js_braced_unicode_escape_decodes_as_one_scalar() {
+        assert_eq!(
+            parse_js_string_literal(r#""\u{0001F600}""#),
+            ("😀".into(), 14)
+        );
+        assert_eq!(
+            parse_js_string_literal(r#""\u{1F600}"tail"#),
+            ("😀".into(), 11)
+        );
+    }
+
+    #[test]
+    fn js_existing_escapes_and_raw_utf8_are_preserved() {
+        assert_eq!(
+            parse_js_string_literal(r#""é\u2014\x41"tail"#),
+            ("é—A".into(), 14)
+        );
+    }
 }

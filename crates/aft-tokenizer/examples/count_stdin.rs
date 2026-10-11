@@ -16,8 +16,6 @@ fn main() -> io::Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        // Tiny hand-rolled JSON read so we don't pull serde into the
-        // dev-only binary.
         let (label, text) = parse_label_text(trimmed).expect("invalid input line");
         let tokens = aft_tokenizer::count_tokens(&text);
         writeln!(
@@ -31,7 +29,7 @@ fn main() -> io::Result<()> {
 }
 
 fn parse_label_text(line: &str) -> Option<(String, String)> {
-    let value: serde_json_lite::Value = serde_json_lite::from_str(line).ok()?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let obj = value.as_object()?;
     let label = obj.get("label")?.as_str()?.to_string();
     let text = obj.get("text")?.as_str()?.to_string();
@@ -56,151 +54,28 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-mod serde_json_lite {
-    //! Minimal JSON reader for `{ "label": "...", "text": "..." }` only.
-    //! Skips anything more elaborate; sufficient for our NDJSON usage.
+#[cfg(test)]
+mod tests {
+    use super::parse_label_text;
 
-    use std::collections::HashMap;
-
-    #[derive(Debug)]
-    pub enum Value {
-        String(String),
-        Object(HashMap<String, Value>),
+    #[test]
+    fn json_input_preserves_unicode_and_surrogate_pairs() {
+        let expected = ("é😀".to_string(), "a — b → c 😀".to_string());
+        assert_eq!(
+            parse_label_text(r#"{"label":"é😀","text":"a — b → c 😀"}"#),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_label_text(
+                r#"{"label":"\u00e9\ud83d\ude00","text":"a \u2014 b \u2192 c \ud83d\ude00"}"#
+            ),
+            Some(expected)
+        );
     }
 
-    impl Value {
-        pub fn as_object(&self) -> Option<&HashMap<String, Value>> {
-            if let Value::Object(o) = self {
-                Some(o)
-            } else {
-                None
-            }
-        }
-        pub fn as_str(&self) -> Option<&str> {
-            if let Value::String(s) = self {
-                Some(s)
-            } else {
-                None
-            }
-        }
-    }
-
-    pub fn from_str(input: &str) -> Result<Value, String> {
-        let mut p = Parser {
-            s: input.as_bytes(),
-            i: 0,
-        };
-        p.skip_ws();
-        let v = p.value()?;
-        p.skip_ws();
-        if p.i != p.s.len() {
-            return Err(format!("trailing data at offset {}", p.i));
-        }
-        Ok(v)
-    }
-
-    struct Parser<'a> {
-        s: &'a [u8],
-        i: usize,
-    }
-
-    impl<'a> Parser<'a> {
-        fn skip_ws(&mut self) {
-            while self.i < self.s.len() && matches!(self.s[self.i], b' ' | b'\t' | b'\n' | b'\r') {
-                self.i += 1;
-            }
-        }
-        fn expect(&mut self, c: u8) -> Result<(), String> {
-            if self.i < self.s.len() && self.s[self.i] == c {
-                self.i += 1;
-                Ok(())
-            } else {
-                Err(format!("expected {} at offset {}", c as char, self.i))
-            }
-        }
-        fn value(&mut self) -> Result<Value, String> {
-            self.skip_ws();
-            if self.i >= self.s.len() {
-                return Err("unexpected eof".into());
-            }
-            match self.s[self.i] {
-                b'"' => Ok(Value::String(self.string()?)),
-                b'{' => self.object(),
-                other => Err(format!("unexpected byte {} at {}", other as char, self.i)),
-            }
-        }
-        fn object(&mut self) -> Result<Value, String> {
-            self.expect(b'{')?;
-            self.skip_ws();
-            let mut map = HashMap::new();
-            if self.i < self.s.len() && self.s[self.i] == b'}' {
-                self.i += 1;
-                return Ok(Value::Object(map));
-            }
-            loop {
-                self.skip_ws();
-                let key = self.string()?;
-                self.skip_ws();
-                self.expect(b':')?;
-                let val = self.value()?;
-                map.insert(key, val);
-                self.skip_ws();
-                if self.i < self.s.len() && self.s[self.i] == b',' {
-                    self.i += 1;
-                    continue;
-                }
-                self.expect(b'}')?;
-                break;
-            }
-            Ok(Value::Object(map))
-        }
-        fn string(&mut self) -> Result<String, String> {
-            self.expect(b'"')?;
-            let mut out = String::new();
-            while self.i < self.s.len() {
-                match self.s[self.i] {
-                    b'"' => {
-                        self.i += 1;
-                        return Ok(out);
-                    }
-                    b'\\' => {
-                        self.i += 1;
-                        if self.i >= self.s.len() {
-                            return Err("eof in escape".into());
-                        }
-                        match self.s[self.i] {
-                            b'"' => out.push('"'),
-                            b'\\' => out.push('\\'),
-                            b'/' => out.push('/'),
-                            b'n' => out.push('\n'),
-                            b'r' => out.push('\r'),
-                            b't' => out.push('\t'),
-                            b'b' => out.push('\u{0008}'),
-                            b'f' => out.push('\u{000c}'),
-                            b'u' => {
-                                if self.i + 4 >= self.s.len() {
-                                    return Err("short unicode escape".into());
-                                }
-                                let hex = std::str::from_utf8(&self.s[self.i + 1..self.i + 5])
-                                    .map_err(|_| "non-utf8 unicode escape".to_string())?;
-                                let code = u32::from_str_radix(hex, 16)
-                                    .map_err(|_| "bad unicode escape".to_string())?;
-                                self.i += 4;
-                                if let Some(c) = char::from_u32(code) {
-                                    out.push(c);
-                                }
-                            }
-                            other => return Err(format!("bad escape \\{}", other as char)),
-                        }
-                        self.i += 1;
-                    }
-                    b => {
-                        out.push(b as char);
-                        self.i += 1;
-                    }
-                }
-            }
-            Err("unterminated string".into())
-        }
+    #[test]
+    fn json_input_requires_string_fields() {
+        assert_eq!(parse_label_text(r#"{"label":1,"text":"x"}"#), None);
+        assert_eq!(parse_label_text(r#"{"label":"x"}"#), None);
     }
 }
