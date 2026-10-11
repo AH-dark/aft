@@ -4259,7 +4259,11 @@ async fn drive_bash_fast_foreground_daemon(input: FakeDaemonInput) {
     let frame = read_frame_timeout(&mut stream, "fast bash response").await;
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 100);
-    assert!(!tool_result_is_error(&frame));
+    assert!(
+        !tool_result_is_error(&frame),
+        "fast bash error: {}",
+        tool_result_body(&frame)
+    );
     let text = tool_result_text(&frame);
     assert!(text.contains("subc-fast"), "unexpected bash text: {text:?}");
     assert_no_response_frame_within(
@@ -4290,7 +4294,11 @@ async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
     .await;
     let frame = read_frame_timeout(&mut stream, "promoted bash response").await;
     assert_eq!(frame.header.corr, 101);
-    assert!(!tool_result_is_error(&frame));
+    assert!(
+        !tool_result_is_error(&frame),
+        "promoted bash error: {}",
+        tool_result_body(&frame)
+    );
     let text = tool_result_text(&frame);
     assert!(
         text.contains("promoted to background"),
@@ -4354,7 +4362,11 @@ async fn drive_bash_block_to_completion_daemon(input: FakeDaemonInput) {
     .await;
     let frame = read_frame_timeout(&mut stream, "block-to-completion bash response").await;
     assert_eq!(frame.header.corr, 103);
-    assert!(!tool_result_is_error(&frame));
+    assert!(
+        !tool_result_is_error(&frame),
+        "block-to-completion bash error: {}",
+        tool_result_body(&frame)
+    );
     let text = tool_result_text(&frame);
     // The late child sentinel is terminal-event proof; no elapsed lower bound is
     // needed to show that block_to_completion waited for the process.
@@ -4387,7 +4399,11 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
     .await;
     let frame = read_frame_timeout(&mut stream, "wait:true bash response").await;
     assert_eq!(frame.header.corr, 117);
-    assert!(!tool_result_is_error(&frame));
+    assert!(
+        !tool_result_is_error(&frame),
+        "wait:true bash error: {}",
+        tool_result_body(&frame)
+    );
     let text = tool_result_text(&frame);
     assert!(
         text.contains("wait-early"),
