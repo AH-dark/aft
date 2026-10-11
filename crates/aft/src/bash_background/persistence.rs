@@ -1489,6 +1489,10 @@ pub fn delete_task_bundle_with_legacy_harness_root(
 ) -> io::Result<()> {
     validate_task_id(&paths.task_id)?;
     crate::gh_shim_ticket::revoke_task(&paths.task_id);
+    #[cfg(unix)]
+    if delete_task_tombstone(&paths.session_dir, &paths.task_id)? {
+        return Ok(());
+    }
     if task_layout_entry_exists(&paths.session_dir, &paths.task_id)? {
         return delete_task_bundle_at_root(paths);
     }
@@ -1498,21 +1502,28 @@ pub fn delete_task_bundle_with_legacy_harness_root(
     else {
         return Err(task_layout_not_found());
     };
-    if !task_layout_entry_exists(&legacy_session_dir, &paths.task_id)? {
-        return Err(task_layout_not_found());
+    if task_layout_entry_exists(&legacy_session_dir, &paths.task_id)? {
+        let resolved = resolve_task_layout(&legacy_session_dir, &paths.task_id)?;
+        if resolved.paths.layout != paths.layout {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "background task layout changed before deletion",
+            ));
+        }
+        return delete_resolved_task(&resolved);
     }
-
-    let resolved = resolve_task_layout(&legacy_session_dir, &paths.task_id)?;
-    if resolved.paths.layout != paths.layout {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "background task layout changed before deletion",
-        ));
+    #[cfg(unix)]
+    if delete_task_tombstone(&legacy_session_dir, &paths.task_id)? {
+        return Ok(());
     }
-    delete_resolved_task(&resolved)
+    Err(task_layout_not_found())
 }
 
 fn delete_task_bundle_at_root(paths: &TaskPaths) -> io::Result<()> {
+    #[cfg(unix)]
+    if delete_task_tombstone(&paths.session_dir, &paths.task_id)? {
+        return Ok(());
+    }
     #[cfg(windows)]
     if paths.layout == TaskLayout::Directory {
         return delete_windows_directory_bundle(paths);
@@ -1542,6 +1553,107 @@ fn task_layout_entry_exists(session_dir: &Path, task_id: &str) -> io::Result<boo
     match open_metadata_through_replacement(&session, &metadata) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn delete_task_tombstone(session_dir: &Path, task_id: &str) -> io::Result<bool> {
+    validate_task_id(task_id)?;
+    let session = match PinnedDir::open(session_dir) {
+        Ok(session) => session,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(name) = find_task_tombstone(&session, task_id)? else {
+        return Ok(false);
+    };
+    let task = match session.open_dir_at(&name) {
+        Ok(task) => task,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    validate_task_tombstone_metadata(&task, task_id)?;
+    remove_optional_task_directory(&task, IO_DIR, remove_tree_contents)?;
+    remove_optional_task_directory(&task, CONTROL_DIR, |control| {
+        let mut names = control.list_names()?;
+        names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));
+        for name in names {
+            control.remove_file(&name)?;
+        }
+        Ok(())
+    })?;
+
+    let current = session.open_dir_at(&name)?;
+    if !current.same_identity(&task)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "task tombstone identity changed before deletion",
+        ));
+    }
+    let name = os_cstring(&name)?;
+    let result =
+        unsafe { libc::unlinkat(session.file.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn find_task_tombstone(session: &PinnedDir, task_id: &str) -> io::Result<Option<OsString>> {
+    let prefix = task_tombstone_prefix(task_id);
+    let mut matches = session
+        .list_names()?
+        .into_iter()
+        .filter(|name| name.to_str().is_some_and(|name| name.starts_with(&prefix)));
+    let Some(name) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "multiple background task deletion tombstones found",
+        ));
+    }
+    Ok(Some(name))
+}
+
+#[cfg(unix)]
+fn validate_task_tombstone_metadata(task: &PinnedDir, task_id: &str) -> io::Result<()> {
+    let control = match task.open_dir_at(OsStr::new(CONTROL_DIR)) {
+        Ok(control) => control,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut file = match control.open_file(OsStr::new(METADATA_FILE), false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let metadata_path = control.path.join(METADATA_FILE);
+    let metadata = read_task_file(&mut file, &metadata_path)?;
+    if metadata.task_id != task_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "background task tombstone metadata identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_optional_task_directory(
+    task: &PinnedDir,
+    name: &str,
+    remove_contents: impl FnOnce(&PinnedDir) -> io::Result<()>,
+) -> io::Result<()> {
+    match task.open_dir_at(OsStr::new(name)) {
+        Ok(directory) => {
+            remove_contents(&directory)?;
+            remove_dir_entry(task, name)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -1784,9 +1896,18 @@ fn remove_tree_contents(dir: &PinnedDir) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn task_tombstone_prefix(task_id: &str) -> String {
+    format!(".aft-task-delete-{task_id}-")
+}
+
+#[cfg(unix)]
 fn rename_task_to_tombstone(task: &ResolvedTask) -> io::Result<OsString> {
     for _ in 0..32 {
-        let tombstone = random_temp_name()?;
+        let tombstone = OsString::from(format!(
+            "{}{}",
+            task_tombstone_prefix(&task.paths.task_id),
+            random_temp_name()?.to_string_lossy()
+        ));
         match task.dirs.session.open_dir_at(&tombstone) {
             Ok(_) => continue,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -3377,6 +3498,60 @@ mod tests {
             "task metadata must remain available so a later sweep can resolve and retry deletion"
         );
         assert_eq!(read_task_at(&task).unwrap().task_id, task.paths.task_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_cleanup_resumes_tombstone_after_io_removal_failure() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, metadata) = counted_task(storage.path());
+        write_task_at(&task, &metadata).unwrap();
+        fs::write(&task.paths.stdout, b"output held by a child").unwrap();
+        let original = task.paths.dir.clone();
+        let session = task.paths.session_dir.clone();
+
+        let error = remove_directory_task_with_io_cleanup(&task, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected failure after the task rename",
+            ))
+        })
+        .expect_err("the injected IO cleanup failure must abort the first deletion");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            !original.exists(),
+            "the failed deletion has renamed the task"
+        );
+
+        delete_task_bundle_with_legacy_harness_root(&task.paths, "counted", None)
+            .expect("a later cleanup pass must resume deletion from the renamed task");
+
+        assert_eq!(fs::read_dir(session).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_tombstone_cleanup_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let storage = tempfile::tempdir().unwrap();
+        let session_id = "session";
+        let session = session_tasks_dir(storage.path(), session_id);
+        fs::create_dir_all(&session).unwrap();
+        let task_id = valid_id(43);
+        let paths = TaskPaths::directory(session.clone(), &task_id);
+        let victim = storage.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), b"untouched").unwrap();
+        let tombstone = session.join(format!("{}test", task_tombstone_prefix(&task_id)));
+        symlink(&victim, &tombstone).unwrap();
+
+        assert!(delete_task_bundle_with_legacy_harness_root(&paths, session_id, None).is_err());
+        assert_eq!(fs::read(victim.join("keep")).unwrap(), b"untouched");
+        assert!(fs::symlink_metadata(&tombstone)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]
