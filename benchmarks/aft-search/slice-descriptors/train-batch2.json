@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Batch of four accepted fixes. Only the capped-availability commit touches a ranking-fenced file (commands/semantic_search/mod.rs): a capped identifier fallback keeps more_available true and an exhausted capped page discloses a lower-bound total; admission, lanes, weights, comparator, scores and page order are unchanged, so every benchmark row must stay byte-equal. The others: executor dispatch-loop liveness, scoped-inspect build gate with Tier-2 flight identity, and disk-floor test hook inheritance. The parity fixture file is not touched."
+}
