@@ -1,4 +1,5 @@
 import {
+  BashOutputPageDecoder,
   type BridgeRequestOptions,
   coerceBoolean,
   formatWatchWaited,
@@ -341,6 +342,8 @@ function formatWatchResultText(
     if (waited.reason === "matched") {
       const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
       text += `\n${waitedText}; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
+    } else if (waited.reason === "timeout" && isTerminalStatus(data.status)) {
+      text += `\n${waitedText}; watch limit reached while scanning captured output. The task already exited; the pattern scan is incomplete. Use a longer watch or paged raw output to inspect the remaining bytes.`;
     } else if (waited.reason === "timeout" && role === "worker") {
       // A watch deadline is not a failure of the command, and a delegated
       // worker that reads it as one declares a failed result mid-run. Tell it
@@ -433,6 +436,7 @@ export async function waitForBashStatus(
     ...extra,
   });
   let spillCursor: OutputCursor = { output: 0, stderr: 0 };
+  const decoders = { output: new BashOutputPageDecoder(), stderr: new BashOutputPageDecoder() };
   const scanState: OutputScanState = {
     output: { text: "", baseOffset: 0 },
     stderr: { text: "", baseOffset: 0 },
@@ -495,7 +499,7 @@ export async function waitForBashStatus(
       }
       const terminal = isTerminalStatus(data.status);
       if (waitFor) {
-        const scan = await readNewTaskOutput(data, spillCursor);
+        const scan = await readNewTaskOutput(data, spillCursor, decoders);
         if (scan) {
           spillCursor = scan.nextCursor;
           // Independent buffers prevent a stdout suffix and stderr prefix from
@@ -539,7 +543,9 @@ export async function waitForBashStatus(
           }
         }
       }
-      if (terminal) {
+      const outputPending =
+        !!waitFor && (data.output_has_more === true || data.stderr_has_more === true);
+      if (terminal && !outputPending) {
         sawTerminal = true;
         consumeBgCompletion(runtime.sessionID, taskId);
         await markBgCompletionDelivered(
@@ -563,6 +569,7 @@ export async function waitForBashStatus(
       if (watchClock.now() >= deadline && !waitPastDeadline) {
         return withWaited(data, waited("timeout"));
       }
+      if (outputPending) continue;
       await pause(waitPastDeadline);
     }
   } finally {
@@ -573,6 +580,7 @@ export async function waitForBashStatus(
 async function readNewTaskOutput(
   data: Record<string, unknown>,
   cursor: OutputCursor,
+  decoders: Record<OutputStream, BashOutputPageDecoder>,
 ): Promise<{ chunks: OutputScanChunk[]; nextCursor: OutputCursor } | undefined> {
   const stdoutBytes =
     typeof data.output_chunk_base64 === "string"
@@ -582,20 +590,30 @@ async function readNewTaskOutput(
     typeof data.stderr_chunk_base64 === "string"
       ? Buffer.from(data.stderr_chunk_base64, "base64")
       : Buffer.alloc(0);
-  if (stdoutBytes.length + stderrBytes.length === 0) return undefined;
+  const terminal = isTerminalStatus(data.status);
+  const stdout = decoders.output.decode(
+    stdoutBytes,
+    cursor.output,
+    terminal && data.output_has_more !== true,
+  );
+  const stderr = decoders.stderr.decode(
+    stderrBytes,
+    cursor.stderr,
+    terminal && data.stderr_has_more !== true,
+  );
   const chunks: OutputScanChunk[] = [];
-  if (stdoutBytes.length > 0) {
+  if (stdout.text.length > 0) {
     chunks.push({
       stream: "output",
-      text: stdoutBytes.toString("utf8"),
-      baseOffset: cursor.output,
+      text: stdout.text,
+      baseOffset: stdout.baseOffset,
     });
   }
-  if (stderrBytes.length > 0) {
+  if (stderr.text.length > 0) {
     chunks.push({
       stream: "stderr",
-      text: stderrBytes.toString("utf8"),
-      baseOffset: cursor.stderr,
+      text: stderr.text,
+      baseOffset: stderr.baseOffset,
     });
   }
   return {

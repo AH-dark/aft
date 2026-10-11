@@ -122,6 +122,7 @@ struct StreamScan {
     buffer: Vec<u8>,
     base: u64,
     next: u64,
+    has_more: bool,
 }
 
 fn parse_params(req: &RawRequest) -> Result<BashWatchParams, String> {
@@ -293,64 +294,74 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
     let worker_cancellation = cancellation.clone();
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     let thread_id = id.clone();
-    std::thread::spawn(move || {
-        crate::sandbox_spawn::with_authenticated_principal(principal, || {
-            // Configure acknowledges the route before its replay tail finishes.
-            // Resolve the durable record before starting the wait, off executor
-            // slots, and without replaying unrelated tasks or relaxing the session.
-            if registry.observed_status(&task_id, &session, 0).is_none() {
-                registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
-                if let Err(error) = registry.recover_watch_task(
-                    &storage_dir,
-                    &session,
-                    &task_id,
-                    project_root.as_deref(),
-                    harness.as_deref(),
-                ) {
-                    let _ = tx.send(Response::error(&thread_id, "task_recovery_failed", error));
+    if let Err(error) = crate::bash_background::worker_thread::spawn(
+        crate::bash_background::worker_thread::Worker::Watch,
+        move || {
+            crate::sandbox_spawn::with_authenticated_principal(principal, || {
+                // Configuration can acknowledge the caller before persisted tasks
+                // have been loaded. Resolve just this task's record in the watch
+                // thread, rather than occupying an execution worker or loading
+                // unrelated tasks. Keep lookup restricted to the caller's session.
+                if registry.observed_status(&task_id, &session, 0).is_none() {
+                    registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
+                    if let Err(error) = registry.recover_watch_task(
+                        &storage_dir,
+                        &session,
+                        &task_id,
+                        project_root.as_deref(),
+                        harness.as_deref(),
+                    ) {
+                        let _ = tx.send(Response::error(&thread_id, "task_recovery_failed", error));
+                        return;
+                    }
+                }
+                if registry.observed_status(&task_id, &session, 0).is_none() {
+                    let _ = tx.send(Response::error(
+                        &thread_id,
+                        "task_not_found",
+                        format_unknown_task_message(&task_id),
+                    ));
                     return;
                 }
-            }
-            if registry.observed_status(&task_id, &session, 0).is_none() {
-                let _ = tx.send(Response::error(
-                    &thread_id,
-                    "task_not_found",
-                    format_unknown_task_message(&task_id),
-                ));
-                return;
-            }
-            let watch = WatchJob {
-                registry,
-                task_id,
-                session,
-                pattern,
-                limit_ms,
-                worker,
-                worker_limit_ms,
-                primary_cap_ms,
-            };
-            let Some(waited) = watch.wait(&worker_cancellation) else {
-                // Cancelled: the transport already answered the call.
-                return;
-            };
-            // The task was already resolved under this route's identity. Do not
-            // re-adopt another session's task through status's relaxed fallback if
-            // the record disappears while the watch is waiting.
-            let snapshot =
-                watch
-                    .registry
-                    .observed_status(&watch.task_id, &watch.session, PREVIEW_BYTES);
-            let response = match snapshot {
-                Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
-                None => Response::error(
-                    &thread_id,
-                    "task_not_found",
-                    format_unknown_task_message(&watch.task_id),
-                ),
-            };
-            let _ = tx.send(response);
-        })
-    });
+                let watch = WatchJob {
+                    registry,
+                    task_id,
+                    session,
+                    pattern,
+                    limit_ms,
+                    worker,
+                    worker_limit_ms,
+                    primary_cap_ms,
+                };
+                let Some(waited) = watch.wait(&worker_cancellation) else {
+                    // Cancelled: the transport already answered the call.
+                    return;
+                };
+                // The task was already resolved under this route's identity. Do not
+                // re-adopt another session's task through status's relaxed fallback if
+                // the record disappears while the watch is waiting.
+                let snapshot =
+                    watch
+                        .registry
+                        .observed_status(&watch.task_id, &watch.session, PREVIEW_BYTES);
+                let response = match snapshot {
+                    Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
+                    None => Response::error(
+                        &thread_id,
+                        "task_not_found",
+                        format_unknown_task_message(&watch.task_id),
+                    ),
+                };
+                let _ = tx.send(response);
+            })
+        },
+    ) {
+        return DispatchOutcome::Immediate(Response::error(
+            &id,
+            "internal_error",
+            format!("failed to start bash watch worker: {error}"),
+        ));
+    }
 
     let mut settled = false;
     let disconnect_id = id.clone();
@@ -424,13 +435,16 @@ impl WatchJob {
             let snapshot = self
                 .registry
                 .observed_status(&self.task_id, &self.session, 0);
-            let terminal = snapshot
+            let mut terminal = snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.info.status.is_terminal());
             if let (Some(pattern), Some(snapshot)) = (&self.pattern, &snapshot) {
                 if let Some(found) = self.scan(pattern, snapshot, &mut stdout, &mut stderr) {
                     return Some(waited(WaitReason::Matched, Some(found)));
                 }
+                // Task exit is not the end of a paged scan. Check unread
+                // captured bytes before reporting a terminal non-match.
+                terminal &= !stdout.has_more && !stderr.has_more;
             }
             let now = Instant::now();
             let kill_remaining = if self.worker {
@@ -443,6 +457,9 @@ impl WatchJob {
                 wait_limit_outcome(now >= deadline, terminal, self.worker, kill_remaining)
             {
                 return Some(waited(reason, None));
+            }
+            if stdout.has_more || stderr.has_more {
+                continue;
             }
             let pause = if now >= deadline {
                 // The command is about to be killed; keep polling until the
@@ -483,14 +500,16 @@ impl WatchJob {
             if pty && index == 1 {
                 break;
             }
-            let Ok((bytes, next)) = self.registry.read_artifact_range(
-                &self.task_id,
-                &self.session,
-                artifact,
-                scan.next,
-            ) else {
+            let Ok(page) =
+                self.registry
+                    .read_artifact_page(&self.task_id, &self.session, artifact, scan.next)
+            else {
+                scan.has_more = false;
                 continue;
             };
+            scan.has_more = page.has_more;
+            let bytes = page.bytes;
+            let next = page.next_offset;
             if bytes.is_empty() {
                 continue;
             }
@@ -574,6 +593,9 @@ impl WatchJob {
                     "\n{waited_text}; matched {}{stream} at offset {offset}.",
                     Value::String(matched.clone())
                 ));
+            }
+            WaitReason::Timeout if !running => {
+                text.push_str(&format!("\n{waited_text}; watch limit reached while scanning captured output. The task already exited; the pattern scan is incomplete. Use a longer watch or paged raw output to inspect the remaining bytes."));
             }
             WaitReason::Timeout if self.worker => {
                 text.push_str(&format!(
@@ -733,6 +755,140 @@ mod tests {
             "timeout_ms": MAX_WATCH_TIMEOUT_MS,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn approved_watch_worker_admission_failure_is_immediate_internal_error() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), storage.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::bash_background::worker_thread::with_refusal(
+                crate::bash_background::worker_thread::Worker::Watch,
+                || handle_deferred(&request(TASK, SESSION), ctx),
+            )
+        }));
+        assert!(
+            result.is_ok(),
+            "worker admission panicked instead of answering the call"
+        );
+        let DispatchOutcome::Immediate(response) = result.unwrap() else {
+            panic!("a refused worker must not leave a pending response");
+        };
+        assert!(!response.success);
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["code"], "internal_error");
+        assert!(wire["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected worker admission failure"));
+    }
+
+    fn approved_terminal_watch_fixture() -> (tempfile::TempDir, WatchJob, BgTaskSnapshot) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path(), dir.path());
+        let bound = principal(dir.path());
+        with_authenticated_principal(bound, || {
+            persist_failed_task(&ctx);
+            let storage = crate::bash_background::task_storage_dir(&ctx);
+            let session = crate::bash_background::persistence::session_tasks_dir(&storage, SESSION);
+            let layout =
+                crate::bash_background::persistence::resolve_task_layout(&session, TASK).unwrap();
+            let mut output = vec![b'x'; 3 * 64 * 1024];
+            output[65534..65545].copy_from_slice(b"FINAL-MATCH");
+            std::fs::write(&layout.paths.stdout, output).unwrap();
+            std::fs::write(&layout.paths.stderr, "").unwrap();
+            ctx.bash_background()
+                .recover_watch_task(&storage, SESSION, TASK, Some(dir.path()), Some("runner"))
+                .unwrap();
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(TASK, SESSION, 0)
+                .unwrap();
+            let job = WatchJob {
+                registry: ctx.bash_background().clone(),
+                task_id: TASK.into(),
+                session: SESSION.into(),
+                pattern: Some(WaitPattern::Substring(
+                    regex::bytes::Regex::new("FINAL-MATCH").unwrap(),
+                    11,
+                )),
+                limit_ms: 30_000,
+                worker: false,
+                worker_limit_ms: 1_800_000,
+                primary_cap_ms: 120_000,
+            };
+            (dir, job, snapshot)
+        })
+    }
+
+    #[test]
+    fn approved_watch_scan_buffer_is_bounded_across_pages() {
+        let (_dir, job, snapshot) = approved_terminal_watch_fixture();
+        let mut stdout = StreamScan::default();
+        let mut stderr = StreamScan::default();
+        let mut matched = None;
+        for _ in 0..8 {
+            matched = job.scan(
+                job.pattern.as_ref().unwrap(),
+                &snapshot,
+                &mut stdout,
+                &mut stderr,
+            );
+            assert!(
+                stdout.buffer.len() <= 64 * 1024 + 11,
+                "scan allocated an unbounded output suffix: {}",
+                stdout.buffer.len()
+            );
+            if matched.is_some() {
+                break;
+            }
+        }
+        assert_eq!(matched, Some(("FINAL-MATCH".into(), 65534, Some("stdout"))));
+    }
+
+    #[test]
+    fn approved_terminal_watch_drains_pages_before_reporting_exit() {
+        let (_dir, job, _snapshot) = approved_terminal_watch_fixture();
+        let result = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        assert!(matches!(result.reason, WaitReason::Matched));
+        assert_eq!(
+            result.matched,
+            Some(("FINAL-MATCH".into(), 65534, Some("stdout")))
+        );
+    }
+
+    #[test]
+    fn approved_paged_watch_obeys_cancellation_and_its_original_deadline() {
+        let (_dir, mut job, _snapshot) = approved_terminal_watch_fixture();
+        job.pattern = Some(WaitPattern::Substring(
+            regex::bytes::Regex::new("NEVER").unwrap(),
+            5,
+        ));
+        let cancelled = crate::executor::JobCancellation::new();
+        cancelled.request_cancel();
+        assert!(job.wait(&cancelled).is_none());
+        job.limit_ms = 0;
+        let result = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        assert!(matches!(result.reason, WaitReason::Timeout));
+        assert!(result.matched.is_none());
+    }
+
+    #[test]
+    fn approved_terminal_paging_timeout_does_not_claim_task_is_running() {
+        let (_dir, mut job, snapshot) = approved_terminal_watch_fixture();
+        job.pattern = Some(WaitPattern::Substring(
+            regex::bytes::Regex::new("NEVER").unwrap(),
+            5,
+        ));
+        job.limit_ms = 0;
+        let result = job.wait(&crate::executor::JobCancellation::new()).unwrap();
+        let text = job.render(&snapshot, &result);
+        assert!(
+            !text.contains("still running"),
+            "terminal paging produced a false liveness claim: {text}"
+        );
+        assert!(text.contains("captured output"));
     }
 
     async fn watch_with_deadline(ctx: Arc<AppContext>, request: RawRequest) -> Response {

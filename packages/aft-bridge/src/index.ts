@@ -9,7 +9,6 @@
 
 // --- logger contract ---
 export { setActiveLogger } from "./active-logger.js";
-// --- bash output hints (shared by both plugin hosts) ---
 export {
   formatForegroundResult,
   formatSeconds,
@@ -61,6 +60,8 @@ export {
   bashHostFallbackAskPattern,
   runBashHostFallback,
 } from "./bash-host-fallback.js";
+// --- bash output hints (shared by both plugin hosts) ---
+export { BashOutputPageDecoder } from "./bash-output-page.js";
 // --- binary identity (no-exec cache trust) ---
 export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
 export {

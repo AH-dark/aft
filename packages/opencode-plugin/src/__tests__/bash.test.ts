@@ -1870,6 +1870,91 @@ describe("bash_status tool", () => {
     }
   });
 
+  test("approved watch drains terminal byte pages before declaring exit", async () => {
+    let polls = 0;
+    const { watchTool, calls } = makeCtx((command) => {
+      if (command !== "bash_status") return { success: true };
+      const first = polls++ === 0;
+      return {
+        success: true,
+        status: "completed",
+        exit_code: 0,
+        mode: "pipes",
+        output_chunk_base64: Buffer.from(first ? "prefix " : "READY").toString("base64"),
+        output_next_offset: first ? 7 : 12,
+        output_has_more: first,
+        stderr_chunk_base64: "",
+        stderr_next_offset: 0,
+        stderr_has_more: false,
+      };
+    });
+    const result = await watchTool.execute(
+      { taskId: "bash-approved-pages", pattern: "READY" },
+      createMockSdkContext(),
+    );
+    expect(result).toContain('matched "READY" in stdout at offset 7');
+    expect(polls).toBe(2);
+    expect(calls.filter((call) => call.cmd === "bash_status")[1]?.params.output_offset).toBe(7);
+  });
+
+  test("approved watch preserves UTF-8 characters split across byte pages", async () => {
+    let polls = 0;
+    const bytes = Buffer.from("ok € done");
+    const { watchTool } = makeCtx((command) => {
+      if (command !== "bash_status") return { success: true };
+      const first = polls++ === 0;
+      return {
+        success: true,
+        status: first ? "running" : "completed",
+        exit_code: first ? null : 0,
+        mode: "pipes",
+        output_chunk_base64: (first ? bytes.subarray(0, 4) : bytes.subarray(4)).toString("base64"),
+        output_next_offset: first ? 4 : bytes.length,
+        output_has_more: first,
+        stderr_chunk_base64: "",
+        stderr_next_offset: 0,
+        stderr_has_more: false,
+      };
+    });
+    const result = await watchTool.execute(
+      { taskId: "bash-approved-utf8", pattern: "€" },
+      createMockSdkContext(),
+    );
+    expect(result).toContain('matched "€" in stdout at offset 3');
+    expect(polls).toBe(2);
+  });
+
+  test("approved terminal paging timeout never claims the task is still running", async () => {
+    const real = { now: watchClock.now, sleep: watchClock.sleep };
+    let now = 0;
+    watchClock.now = () => now;
+    watchClock.sleep = async () => {};
+    try {
+      const { watchTool } = makeCtx((command) => {
+        if (command !== "bash_status") return { success: true };
+        now = 2;
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          mode: "pipes",
+          output_chunk_base64: Buffer.from("page").toString("base64"),
+          output_next_offset: 4,
+          output_has_more: true,
+        };
+      });
+      const result = await watchTool.execute(
+        { taskId: "bash-approved-expired", pattern: "NEVER", timeoutMs: 1 },
+        createMockSdkContext(),
+      );
+      expect(result).not.toContain("still running");
+      expect(result).toContain("captured output");
+    } finally {
+      watchClock.now = real.now;
+      watchClock.sleep = real.sleep;
+    }
+  });
+
   test("bash_watch on PIPED bash with pattern reads output_path and matches", async () => {
     const outputPath = await spill("one\ntwo\nthree\n");
     try {

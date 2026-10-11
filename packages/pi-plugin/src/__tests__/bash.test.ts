@@ -1877,6 +1877,115 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("approved watch drains terminal byte pages before declaring exit", async () => {
+    let polls = 0;
+    const calls: Array<Record<string, unknown>> = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        if (command !== "bash_status") return { success: true };
+        calls.push(params);
+        const first = polls++ === 0;
+        return {
+          success: true,
+          status: "completed",
+          exit_code: 0,
+          mode: "pipes",
+          output_chunk_base64: Buffer.from(first ? "prefix " : "READY").toString("base64"),
+          output_next_offset: first ? 7 : 12,
+          output_has_more: first,
+          stderr_chunk_base64: "",
+          stderr_next_offset: 0,
+          stderr_has_more: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const tools = new Map<string, MockToolDef>();
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = await tools
+      .get("bash_watch")!
+      .execute("call", { task_id: "bash-approved-pages", pattern: "READY" }, undefined, undefined, {
+        cwd: projectRoot,
+      });
+    expect(toolText(result)).toContain('matched "READY" in stdout at offset 7');
+    expect(polls).toBe(2);
+    expect(calls[1]?.output_offset).toBe(7);
+  });
+
+  test("approved watch preserves UTF-8 characters split across byte pages", async () => {
+    let polls = 0;
+    const bytes = Buffer.from("ok € done");
+    const bridge = {
+      send: async (command: string) => {
+        if (command !== "bash_status") return { success: true };
+        const first = polls++ === 0;
+        return {
+          success: true,
+          status: first ? "running" : "completed",
+          exit_code: first ? null : 0,
+          mode: "pipes",
+          output_chunk_base64: (first ? bytes.subarray(0, 4) : bytes.subarray(4)).toString(
+            "base64",
+          ),
+          output_next_offset: first ? 4 : bytes.length,
+          output_has_more: first,
+          stderr_chunk_base64: "",
+          stderr_next_offset: 0,
+          stderr_has_more: false,
+        };
+      },
+    } as unknown as BinaryBridge;
+    const tools = new Map<string, MockToolDef>();
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const result = await tools
+      .get("bash_watch")!
+      .execute("call", { task_id: "bash-approved-utf8", pattern: "€" }, undefined, undefined, {
+        cwd: projectRoot,
+      });
+    expect(toolText(result)).toContain('matched "€" in stdout at offset 3');
+    expect(polls).toBe(2);
+  });
+
+  test("approved terminal paging timeout never claims the task is still running", async () => {
+    const { watchClock } = await import("@cortexkit/aft-bridge");
+    const real = { now: watchClock.now, sleep: watchClock.sleep };
+    let now = 0;
+    watchClock.now = () => now;
+    watchClock.sleep = async () => {};
+    try {
+      const bridge = {
+        send: async (command: string) => {
+          if (command !== "bash_status") return { success: true };
+          now = 2;
+          return {
+            success: true,
+            status: "completed",
+            exit_code: 0,
+            mode: "pipes",
+            output_chunk_base64: Buffer.from("page").toString("base64"),
+            output_next_offset: 4,
+            output_has_more: true,
+          };
+        },
+      } as unknown as BinaryBridge;
+      const tools = new Map<string, MockToolDef>();
+      registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+      const result = await tools
+        .get("bash_watch")!
+        .execute(
+          "call",
+          { task_id: "bash-approved-expired", pattern: "NEVER", timeout_ms: 1 },
+          undefined,
+          undefined,
+          { cwd: projectRoot },
+        );
+      expect(toolText(result)).not.toContain("still running");
+      expect(toolText(result)).toContain("captured output");
+    } finally {
+      watchClock.now = real.now;
+      watchClock.sleep = real.sleep;
+    }
+  });
+
   test("bash_watch exit-only returns waited exited details", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
