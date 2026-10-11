@@ -398,14 +398,14 @@ impl DispatchLivenessAtomics {
 /// stalled loop may be blocked on or holding.
 pub struct DispatchLoopLiveness {
     origin: Instant,
-    /// Milliseconds since `origin` when the loop last received or finished an
-    /// event.
+    /// Milliseconds since `origin` when the loop last became ready to receive
+    /// or finished an event.
     last_progress_ms: AtomicU64,
-    /// True from the moment the loop receives an event until it has processed
-    /// it and released the scheduler lock.
+    /// True from channel readiness (or a due retry) until the loop has
+    /// processed the event and released the scheduler lock.
     in_event: AtomicBool,
-    /// Clone of the scheduler's event receiver, used only for `len()`: events
-    /// sent but not yet received are work the loop owes. It never receives.
+    /// Clone of the scheduler's event receiver. Readiness waits and watchdog
+    /// queue checks never dequeue; only the scheduler consumes events.
     event_rx: Receiver<SchedulerEvent>,
 }
 
@@ -423,6 +423,24 @@ impl DispatchLoopLiveness {
         duration_millis_u64(self.origin.elapsed())
     }
 
+    fn wait_for_event(&self, next_retry_at: Option<Instant>) -> bool {
+        let mut select = crossbeam_channel::Select::new();
+        select.recv(&self.event_rx);
+        let ready = match next_retry_at {
+            Some(at) => select
+                .ready_timeout(at.saturating_duration_since(Instant::now()))
+                .is_ok(),
+            None => {
+                select.ready();
+                true
+            }
+        };
+        // Readiness does not dequeue. Publish the active marker first so the
+        // watchdog cannot see an empty queue with an unmarked received event.
+        self.begin_event();
+        ready
+    }
+
     fn begin_event(&self) {
         self.last_progress_ms
             .store(self.now_ms(), Ordering::Relaxed);
@@ -435,17 +453,19 @@ impl DispatchLoopLiveness {
         self.in_event.store(false, Ordering::Release);
     }
 
-    /// Time since the loop last received or finished an event.
+    /// Time since the loop last became ready to receive or finished an event.
     pub fn progress_age(&self) -> Duration {
         let last = self.last_progress_ms.load(Ordering::Relaxed);
         Duration::from_millis(self.now_ms().saturating_sub(last))
     }
 
     /// The loop owes work when it is inside an event or events are queued for
-    /// it. An idle scheduler parked in `recv()` with an empty channel owes
+    /// it. An idle scheduler waiting for readiness with an empty channel owes
     /// nothing, however long ago it last ran.
     pub fn has_pending_work(&self) -> bool {
-        self.in_event.load(Ordering::Acquire) || !self.event_rx.is_empty()
+        // Sample the queue before the marker: receiving the last queued event
+        // publishes the marker before emptying the queue.
+        !self.event_rx.is_empty() || self.in_event.load(Ordering::Acquire)
     }
 }
 
@@ -3156,18 +3176,23 @@ fn scheduler_loop(
     loop {
         // A bind waiting out a retry time has no event to wake the loop, so
         // the loop wakes itself when the earliest one comes due.
-        let event = match next_retry_at {
-            Some(at) => match event_rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+        let event = if loop_liveness.wait_for_event(next_retry_at) {
+            // Select readiness can be spurious. Do not block with the active
+            // marker set when there is actually no event to process.
+            match event_rx.try_recv() {
                 Ok(event) => event,
-                Err(RecvTimeoutError::Timeout) => SchedulerEvent::Wake,
-                Err(RecvTimeoutError::Disconnected) => break,
-            },
-            None => match event_rx.recv() {
-                Ok(event) => event,
-                Err(_) => break,
-            },
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    loop_liveness.end_event();
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    loop_liveness.end_event();
+                    break;
+                }
+            }
+        } else {
+            SchedulerEvent::Wake
         };
-        loop_liveness.begin_event();
         let shutdown;
         {
             let mut state = state.lock();

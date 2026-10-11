@@ -171,6 +171,54 @@ fn scheduler_event_batch_leaves_excess_wakes_for_the_next_lock_turn() {
 }
 
 #[test]
+fn dispatch_loop_liveness_pending_survives_receive_handoff() {
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let liveness = DispatchLoopLiveness::new(event_rx.clone());
+    assert!(!liveness.has_pending_work());
+    event_tx.send(SchedulerEvent::Wake).expect("queued wake");
+    assert!(liveness.has_pending_work());
+
+    assert!(liveness.wait_for_event(None));
+    let _event = event_rx.recv().expect("receive wake");
+    assert!(
+        liveness.has_pending_work(),
+        "dequeue must not hide work before the scheduler takes its state lock"
+    );
+    liveness.end_event();
+    assert!(!liveness.has_pending_work());
+}
+
+#[test]
+fn dispatch_loop_liveness_receiving_queued_work_advances_progress() {
+    let (event_tx, event_rx) = crossbeam_channel::unbounded();
+    let mut liveness = DispatchLoopLiveness::new(event_rx.clone());
+    liveness.origin = Instant::now() - Duration::from_secs(1);
+    event_tx.send(SchedulerEvent::Wake).expect("queued wake");
+    assert!(liveness.has_pending_work());
+    assert_eq!(liveness.last_progress_ms.load(Ordering::Relaxed), 0);
+
+    // Receiving is progress, even if the scheduler next blocks on its mutex.
+    // Age measured from observing a queued wake is not the blocked-loop age.
+    assert!(liveness.wait_for_event(None));
+    assert!(liveness.last_progress_ms.load(Ordering::Relaxed) >= 1000);
+    let _event = event_rx.recv().expect("receive wake");
+    assert!(liveness.has_pending_work());
+    liveness.end_event();
+    assert!(!liveness.has_pending_work());
+}
+
+#[test]
+fn dispatch_loop_liveness_due_retry_is_pending_until_processed() {
+    let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+    let liveness = DispatchLoopLiveness::new(event_rx);
+    assert!(!liveness.has_pending_work());
+    assert!(!liveness.wait_for_event(Some(Instant::now())));
+    assert!(liveness.has_pending_work());
+    liveness.end_event();
+    assert!(!liveness.has_pending_work());
+}
+
+#[test]
 fn dispatch_loop_liveness_is_pending_only_while_the_loop_owes_work() {
     let executor = test_executor(2, 1, 1, 2);
     let liveness = executor.dispatch_loop_liveness();
@@ -182,7 +230,10 @@ fn dispatch_loop_liveness_is_pending_only_while_the_loop_owes_work() {
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     let holder = executor.hold_dispatch_loop_for_test(release_rx);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !liveness.has_pending_work() {
+    // Queued work is pending too, but its receipt advances the progress clock.
+    // Wait for both the active marker and dequeue before measuring the
+    // mutex-blocked interval; a spurious readiness wake owes no event.
+    while !liveness.in_event.load(Ordering::Acquire) || !liveness.event_rx.is_empty() {
         assert!(
             Instant::now() < deadline,
             "held scheduler never read as pending"
@@ -203,7 +254,7 @@ fn dispatch_loop_liveness_is_pending_only_while_the_loop_owes_work() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(liveness.progress_age() < Duration::from_secs(5));
+    assert!(!liveness.in_event.load(Ordering::Acquire));
 }
 
 #[test]
