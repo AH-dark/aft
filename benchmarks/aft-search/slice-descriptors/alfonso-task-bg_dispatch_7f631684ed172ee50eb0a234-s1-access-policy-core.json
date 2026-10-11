@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The ranking-fenced lib.rs change only registers AccessPolicy and its test module. Search ranking and routing are unchanged; benchmark rows must remain byte-identical. The remaining changes centralize filesystem access checks and compile existing native shell restrictions from the route policy."
+}

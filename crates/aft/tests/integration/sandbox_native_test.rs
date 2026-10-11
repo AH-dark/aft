@@ -710,21 +710,10 @@ fn db_hints_native_sandbox_reads_allowed_schema_and_refuses_denied_schema() {
         "schema-denied",
         "sqlite3 private/store.db 'SELECT substrate FROM tasks'",
     );
-    #[cfg(target_os = "linux")]
-    {
-        // project/private is configured as sandbox.read_deny. Landlock cannot
-        // exclude it from an enclosing writable project, so refuse launch rather
-        // than grant writes to the protected directory.
-        assert_eq!(denied["code"], "sandbox_unavailable", "{denied}");
-        assert!(!denied.to_string().contains("tasks: id TEXT, kind TEXT"));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        assert_eq!(denied["status"], "failed", "{denied}");
-        let output = denied["output"].as_str().unwrap();
-        assert!(output.contains("no such column: substrate"), "{output}");
-        assert!(!output.contains("[aft: no column"), "{output}");
-    }
+    assert_eq!(denied["status"], "failed", "{denied}");
+    let output = denied["output"].as_str().unwrap();
+    assert!(output.contains("no such column: substrate"), "{output}");
+    assert!(!output.contains("[aft: no column"), "{output}");
     assert!(aft.shutdown().success());
 }
 
@@ -1005,7 +994,7 @@ fn native_sandbox_denies_credentials_allows_git_metadata_and_denies_hooks_on_mac
 
 #[cfg(target_os = "linux")]
 #[test]
-fn native_read_floor_refuses_overlapping_writes_and_skips_home_symlinks() {
+fn native_read_floor_splits_project_denies_and_skips_home_symlinks() {
     skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
@@ -1036,44 +1025,27 @@ fn native_read_floor_refuses_overlapping_writes_and_skips_home_symlinks() {
         "configure failed: {configured:?}"
     );
 
-    let read = foreground(
-        &mut aft,
-        "project-read-deny",
-        &format!("cat {}", quote(&private.join("token"))),
-    );
-    assert_eq!(read["code"], "sandbox_unavailable", "{read:?}");
+    for (id, path) in [
+        ("home-symlink-secret", shortcut.join("id_test")),
+        ("project-read-deny", private.join("token")),
+    ] {
+        let read = foreground(&mut aft, id, &format!("cat {}", quote(&path)));
+        assert_eq!(read["status"], "failed", "denied read succeeded: {read:?}");
+    }
 
-    let written = private.join("must-not-be-written");
+    let written = private.join("write-still-allowed");
     let write = foreground(
         &mut aft,
         "project-read-deny-write",
         &format!("printf allowed > {}", quote(&written)),
     );
-    assert_eq!(write["code"], "sandbox_unavailable", "{write:?}");
-    assert!(!written.exists());
     assert_eq!(
-        std::fs::read_to_string(private.join("token")).unwrap(),
-        "private"
+        write["status"], "completed",
+        "write should remain allowed: {write:?}"
     );
+    assert_eq!(std::fs::read_to_string(written).unwrap(), "allowed");
 
-    // Clear the configured project/private read_deny so launch is possible again.
-    // The home/.ssh credential restriction must still block home/shortcut reads
-    // without blocking ordinary system reads.
-    assert_eq!(
-        configure_native(&mut aft, &project, &storage, true)["success"],
-        true
-    );
-    let read = foreground(
-        &mut aft,
-        "home-symlink-secret",
-        &format!("cat {}", quote(&shortcut.join("id_test"))),
-    );
-    assert_eq!(
-        read["status"], "failed",
-        "credential read succeeded: {read:?}"
-    );
-
-    let etc = foreground(&mut aft, "system-read", "cat /etc/passwd");
+    let etc = foreground(&mut aft, "system-read", "cat /etc/hostname");
     assert_eq!(etc["status"], "completed", "system read failed: {etc:?}");
     assert!(aft.shutdown().success());
 }

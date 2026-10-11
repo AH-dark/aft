@@ -45,6 +45,9 @@ pub struct AccessPolicy {
     pub roots: Vec<PathBuf>,
     pub outside: AccessDecision,
     pub absolute_floor: Vec<PathBuf>,
+    /// Built-in protected paths only. User read_deny retains the native shell's
+    /// existing read-only restriction rather than denying the enclosing write root.
+    pub shell_write_floor: Vec<PathBuf>,
     pub private_stores: SandboxDataPolicy,
     pub grants: Vec<AccessGrant>,
     /// Shell-only configured write exceptions; they do not grant access to private stores.
@@ -59,7 +62,7 @@ impl AccessPolicy {
             .into_iter()
             .map(|root| crate::inspect::job::normalize_path(&root))
             .collect::<Vec<_>>();
-        let absolute_floor = [
+        let shell_write_floor = [
             ".ssh",
             ".aws",
             ".gnupg",
@@ -69,17 +72,10 @@ impl AccessPolicy {
         ]
         .into_iter()
         .map(|path| home.join(path))
-        .chain(
-            config
-                .sandbox
-                .read_deny
-                .iter()
-                .map(|path| expand_home(path, home)),
-        )
         .map(|path| policy_path(&path))
         .collect::<Vec<_>>();
         #[cfg(target_os = "linux")]
-        let absolute_floor = absolute_floor
+        let shell_write_floor = shell_write_floor
             .into_iter()
             .chain(
                 [
@@ -90,7 +86,15 @@ impl AccessPolicy {
                 .into_iter()
                 .map(|path| policy_path(&path)),
             )
-            .collect();
+            .collect::<Vec<_>>();
+        let mut absolute_floor = shell_write_floor.clone();
+        absolute_floor.extend(
+            config
+                .sandbox
+                .read_deny
+                .iter()
+                .map(|path| policy_path(&expand_home(path, home))),
+        );
         let mut deny = vec![
             home.join(".local/share/cortexkit"),
             home.join(".local/state/cortexkit"),
@@ -154,6 +158,7 @@ impl AccessPolicy {
                 AccessDecision::Ask
             },
             absolute_floor,
+            shell_write_floor,
             grants: Vec::new(),
             shell_write_allow: config
                 .sandbox
@@ -245,7 +250,7 @@ impl AccessPolicy {
         );
         let mut profile = SandboxProfile::build(
             writable,
-            self.absolute_floor.clone(),
+            self.shell_write_floor.clone(),
             Vec::new(),
             Vec::new(),
             self.absolute_floor.clone(),
@@ -574,6 +579,32 @@ mod tests {
             ),
             AccessDecision::Allow
         );
+    }
+
+    #[test]
+    fn user_read_deny_does_not_become_a_shell_write_floor() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("worktree");
+        let denied = root.join("private");
+        let temp = fixture.path().join("task-temp");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let mut config = Config::default();
+        config.sandbox.read_deny = vec![denied.clone()];
+        let policy = AccessPolicy::from_config(
+            &config,
+            &fixture.path().join("store"),
+            vec![root.clone()],
+            &fixture.path().join("home"),
+        );
+        let profile = policy.compile_shell(temp, Vec::new(), Vec::new()).unwrap();
+        let denied = denied.canonicalize().unwrap();
+        assert!(profile.read_deny.contains(&denied));
+        assert!(
+            !profile.write_deny.contains(&denied),
+            "user read_deny must not reject an enclosing writable project"
+        );
+        assert_eq!(profile.writable_roots, vec![root.canonicalize().unwrap()]);
     }
 
     #[test]

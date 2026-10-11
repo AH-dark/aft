@@ -1382,7 +1382,7 @@ fn access_policy_compiled_file_grant_does_not_widen_shell_writes() {
 }
 
 #[test]
-fn access_policy_read_deny_inside_worktree_is_unreadable_from_shell() {
+fn access_policy_builtin_floor_inside_worktree_refuses_shell_launch() {
     skip_if_landlock_absent!();
     use aft::access_policy::{
         AccessDecision, AccessGrant, AccessOperation, AccessPolicy, GrantKind,
@@ -1393,30 +1393,23 @@ fn access_policy_read_deny_inside_worktree_is_unreadable_from_shell() {
     let temp = base.join("task-temp");
     fs::create_dir(&root).unwrap();
     fs::create_dir(&temp).unwrap();
-    let denied = root.join("floor");
+    fs::create_dir(root.join(".ssh")).unwrap();
+    let denied = root.join(".ssh/id_test");
     fs::write(&denied, "must-not-leak").unwrap();
     let mut config = aft::config::Config::default();
     config.project_root = Some(root.clone());
-    config.sandbox.read_deny = vec![denied.clone()];
-    let ctx = aft::context::AppContext::new(Box::new(aft::language::StubProvider), config.clone());
-    assert_eq!(
-        ctx.validate_read_path("floor", "session", &denied)
-            .unwrap_err()
-            .data["code"],
-        "denied_floor"
-    );
-    let mut policy = AccessPolicy::from_config(
-        &config,
-        &base.join("store"),
-        vec![root.clone()],
-        &base.join("home"),
-    );
+    let mut policy =
+        AccessPolicy::from_config(&config, &base.join("store"), vec![root.clone()], &root);
     policy.outside = AccessDecision::Allow;
     policy.grants.push(AccessGrant {
         path: root.clone(),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Write,
     });
+    assert_eq!(
+        policy.decide(AccessOperation::Read, &denied, true),
+        AccessDecision::Deny(aft::access_policy::AccessDenial::Floor)
+    );
     let profile = policy.compile_shell(temp, Vec::new(), Vec::new()).unwrap();
     #[cfg(target_os = "linux")]
     let profile = {
