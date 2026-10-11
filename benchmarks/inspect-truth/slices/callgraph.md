@@ -2,6 +2,8 @@
 
 Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
+**Measurement boundary:** the tables and judgments below still describe engine candidate `a37cdbe83`. Scoped engine repairs are now implemented at `8035691a2b288875959cfd7c102d31bab678df8f`, with before-fix reds, mutation controls and legacy/view parity. Their corpus effect is **not yet measured**; the next Linux review collection must build `8035691a2b288875959cfd7c102d31bab678df8f` or the later report-only branch HEAD, which has identical engine source. Existing judgments and raw origins are retained, and no collection was rerun here.
+
 ## Before
 
 | repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |
@@ -58,7 +60,7 @@ Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
 ## Measured delivery and target verdicts
 
-Baseline `13dd9cb71` and engine candidate `a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` were collected on Linux and retained in this worktree alongside their oracles. The tables above are a **local re-score of those captures**, not a new collection. Subsequent commits change only the collection harness, tests, provenance descriptors, judgments and this report; no engine source changed during row review.
+Baseline `13dd9cb71` and engine candidate `a37cdbe83ec281fd7a13fe76b83d5b1eae96deae` were collected on Linux and retained in this worktree alongside their oracles. The tables above are a **local re-score of those captures**, not a new collection. Subsequent row-review commits changed only the collection harness, tests, provenance descriptors, judgments and this report. A later scoped engine repair is documented below; its results must not be inferred from these older tables.
 
 | Acceptance | Before | After | Verdict |
 |---|---:|---:|---|
@@ -204,3 +206,32 @@ Every control staged the live implementation first, captured a nonempty unstaged
 | Non-Go root preservation | `callgraph_non_go_exported_variable_retains_view_root_flag` — TypeScript Public lost its existing root |
 
 An initial module-map mutation was **undefended**: direct-callers assertions also accept name-match edges. The fixture was strengthened to check the real `refs.status = resolved`, and the same mutation then failed it. A preliminary view-macro mutation did not reach its intended assertion because the stronger Go parity check first exposed lost value-ref provenance in view projection; after that projection fix, the macro control failed specifically on missing m! -> helper. Two initial view-root controls were also undefended because actual materialization copied `exported` into the root flag and bypassed the serialized evidence. The real-view unimported-package fixture exposed that bug; after the Go-only fix, omitting serialized main-package roots fails the Boot assertion. A binder-only flag control remains redundant on the materialization path. These preliminary runs are not counted as successful proofs. The declaration carries their outcomes and the successful replacements.
+
+## Scoped mechanism repairs completed after the measured revision
+
+The four requested mechanisms are implemented and verified without blanket roots at engine commit `8035691a2b288875959cfd7c102d31bab678df8f`. The corpus tables remain historical until the new engine tip is rerun. The eleven Go interface-contract rows and six Rust trait/generic rows remain the **interface-liveness follow-up**, owned by the scanner/typed-dispatch layers (`inspect/scanners/dead_code.rs` and `callgraph_store/dispatch.rs`), unchanged by this work.
+
+| Mechanism | Diagnosis and repair | Before/after fixture |
+|---|---|---|
+| Nested Rust use-tree aliases | Walk the use AST recursively once at extraction, emitting canonical leaf bindings with distinct source spans. Preserve visibility, aliases, self and wildcard leaves. Both bare imports and qualified facade calls resolve. View indexes choose the most-specific Rust re-export module, not a lexically earlier parent from its dependency set. | `callgraph_rust_nested_use_tree_aliases_match_legacy_and_view` was red on the missing main-to-generator edge; now generators plus transitive lookup/digits are live on both stores while spare remains dead. |
+| Cross-file/nested macros | Persist macro-use module declarations and resolve owners through lexical module ancestors, including nested macro-use imports. Macros remain non-root intermediates; uninvoked exported macros keep their helpers dead. | `callgraph_rust_cross_file_exported_nested_macros_match_legacy_and_view` was red on stranded helpers; now main -> outer!, outer! -> inner! and both helper edges survive on both stores. The no-invocation half remains dead. |
+| Go init functions | Package-initialization edges include init owners only when their package becomes live, like variable initializers. Multiple init declarations in one file share an owner but merge all outgoing bodies instead of overwriting the first. | `callgraph_go_imported_init_functions_match_legacy_and_view` was red on Events/OtherEvents. Both are live only in the imported half; legacy/view findings agree. |
+| Fluent HTTP callback registration | Traced before fixing: ordinary wrapper calls were extracted, but the outer fluent selector skipped the computed receiver containing `http.HandlerFunc(GoGetHandler)`. Walk computed receivers while continuing to treat pure dotted names as one reference. | `callgraph_go_fluent_http_callback_trace_and_view_parity` was red at the extraction trace. It now checks a resolved value-ref row, the stored GitController -> GoGetHandler edge on both surfaces, and live handler/dead unregistered control. |
+
+### View persistence collision and upgrade safety
+
+The nested macro fixture exposed a view-only collision: two template calls occupy one opaque AST ordinal. Structural import/re-export facts can also share an ordinal. The old bound key and emission lookup used only that ordinal, replacing one fact with another. AST ordinals remain unchanged in parse blobs. Singleton references retain their old bound IDs; colliding facts receive deterministic disambiguated keys derived from source byte span, caller, kind and preserved path text. Hashing uses canonical source facts, never rowids, time, machine paths or randomized map iteration; deterministic probing prevents numeric key collisions. The unique-call primary in a collision group retains its existing dispatch-site key.
+
+`callgraph_view_collision_keys_are_stable_and_previous_rows_are_refused` checks repeated extraction, distinct collision keys, unchanged singleton keys, and both outer-macro body edges in an actual view. It then stores an old-scheme row in a ready database stamped with the previous fingerprint and proves the current reader refuses it before querying rows. Restoring the previous `v14-go-package-initializers-rust-aliases` build-output version makes that test fail because its fingerprint then admits the old row-ID scheme as current instead of requiring a rebuild.
+
+The current versions are `v15-nested-use-macro-imports-go-init-callbacks`, `callgraph-v4-nested-use-macro-imports-go-init-callbacks`, and active-view `ruled-callgraph-v5-nested-use-macro-imports-go-init-callbacks`. They invalidate prior parse keys and derived database fingerprints, so old IDs/surface snapshots cannot seed a current read. Rebuilding remains a one-time cost per file content/language/current producer, followed by reuse. The previous-producer lookup fixture now targets the immediately preceding versions. Earlier upgrade-version descriptions in this report describe the measured `a37cdbe83` revision.
+
+### Gates and mutation controls for the scoped repairs
+
+- Cargo 1.99.0, all Cargo jobs on `linux,4c`: resolver module **26 passed**, actual crate-internal manifest integration module **7 passed**, callgraph navigation integration **58 passed**, binary fixtures **122 passed**.
+- Mandatory full gate ran: TLS prerequisite **1 passed**, tokenizer **3 passed**, Biome **711 files checked**, main library **5712 passed, 2 failed, 50 ignored**. The two failures were `blackholed_backend_never_blocks_status_or_search` (the assertion rejects Linux's Network is unreachable/os error 101 wording) and `storage_debug_archive_ignores_public_member_modes` (archive fixture ENOENT); neither involves the changed callgraph code. Later full-gate phases were not reached. Retained log: `local-ignore/callgraph/evidence/rust-gate-mechanism-repairs.stdout`.
+- An initial `--test integration -- join_manifest_test` filter ran zero tests and is not counted as a pass; that file is included as `callgraph_store::join::manifest_integration_tests`, whose seven tests were then run successfully.
+- Rustfmt 1.10.0-stable format/check and diff checks passed. Fresh scoped diagnostics were authoritative for 15 files with zero errors/warnings; unrelated Tier-2 inspect categories were unavailable. Source comments were reviewed without flags.
+- Eight independent controls were staged safely, showed nonempty mutation diffs and restored empty diffs. Each selected one named test, and only that test failed; others were filtered. Controls removed recursive leaves, Rust-specific view target selection, macro-use linking, init roots, multiple-init body merging, fluent receiver traversal, collision disambiguation and the upgraded admission floor. Detailed evidence is in the delivery declaration. The restored 26-test resolver module passed afterward.
+
+No benchmark re-collection or interface/trait liveness change was made. The existing 32 Go judgments and 21 ripgrep explanations describe the actual dead-code findings captured at the older engine revision `a37cdbe83`; they are retained even if a newer engine removes those findings. Engine revision `8035691a2b288875959cfd7c102d31bab678df8f` is ready for the next Linux corpus collection. No improved counts or precision are claimed until that run completes.
