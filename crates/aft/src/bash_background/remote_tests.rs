@@ -3833,3 +3833,47 @@ async fn runon_non_git_workdir_is_refused_by_name_before_dispatch() {
         "a non-git cwd must never dispatch"
     );
 }
+
+#[tokio::test]
+async fn exec_remote_run_scope_revocation_reports_reason() {
+    let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task = start(&registry, dir.path(), daemon.connection.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if registry
+                .task(&task)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .job_id
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let killing = registry.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        killing.kill_for_scope_revocation(&task, "session").unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert_eq!(done.info.status_reason.as_deref(), Some("scope revoked"));
+    assert!(daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, body)| body["method"] == "exec.cancel"));
+}

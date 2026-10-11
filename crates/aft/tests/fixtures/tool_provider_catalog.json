@@ -16,13 +16,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "350fb75c50e58ce9f8b520bd8eadcbcfc6236e22d0cf4700b7decbb67947407f",
-      "catalog_digest": "350fb75c50e58ce9f8b520bd8eadcbcfc6236e22d0cf4700b7decbb67947407f",
+      "generation": "ed15908dfdffa1f061e1c82a7009af10278f34911e40e457d9788444ee5f43c6",
+      "catalog_digest": "ed15908dfdffa1f061e1c82a7009af10278f34911e40e457d9788444ee5f43c6",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -35,6 +39,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -111,6 +119,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -161,6 +174,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -188,6 +205,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -266,6 +287,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -288,6 +313,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -321,6 +351,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -345,6 +380,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -388,6 +428,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -428,6 +473,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -517,6 +567,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -572,6 +626,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -638,6 +697,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -657,6 +720,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -717,6 +784,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -780,6 +851,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -810,6 +885,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -837,6 +916,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -919,6 +1002,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -963,6 +1050,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -994,6 +1085,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1016,6 +1111,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -1115,13 +1214,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "4b2a3607de1cd98a05bae9cb7e46e7a5a6373f520c592f18c3f6794e0a87626d",
-      "catalog_digest": "4b2a3607de1cd98a05bae9cb7e46e7a5a6373f520c592f18c3f6794e0a87626d",
+      "generation": "acf46ebd3c746c242f09e8d7f8b9dbd91a8e3ea8fd0bd92edd36e1c59e4c1744",
+      "catalog_digest": "acf46ebd3c746c242f09e8d7f8b9dbd91a8e3ea8fd0bd92edd36e1c59e4c1744",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -1134,6 +1237,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -1210,6 +1317,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -1260,6 +1372,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1287,6 +1403,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1365,6 +1485,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -1387,6 +1511,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -1420,6 +1549,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -1444,6 +1578,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -1487,6 +1626,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1527,6 +1671,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -1616,6 +1765,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -1671,6 +1824,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -1737,6 +1895,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -1756,6 +1918,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -1816,6 +1982,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -1879,6 +2049,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -1909,6 +2083,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -1936,6 +2114,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -2018,6 +2200,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -2062,6 +2248,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2093,6 +2283,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2115,6 +2309,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -2216,13 +2414,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "01c3ae4c0037e9f96dd4cb3239da2f13017e395ddf1f8905406aa478cc5faa42",
-      "catalog_digest": "01c3ae4c0037e9f96dd4cb3239da2f13017e395ddf1f8905406aa478cc5faa42",
+      "generation": "322399b9bfb83ac771d10b217b650af0c1dd98c985ac189823eb7a82f7f7fa7e",
+      "catalog_digest": "322399b9bfb83ac771d10b217b650af0c1dd98c985ac189823eb7a82f7f7fa7e",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -2235,6 +2437,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -2285,6 +2492,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2312,6 +2523,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2390,6 +2605,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -2412,6 +2631,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -2445,6 +2669,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -2469,6 +2698,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -2512,6 +2746,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2552,6 +2791,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -2641,6 +2885,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -2696,6 +2944,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -2762,6 +3015,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -2781,6 +3038,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -2841,6 +3102,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -2904,6 +3169,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -2934,6 +3203,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -2961,6 +3234,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -3043,6 +3320,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -3087,6 +3368,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3118,6 +3403,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3140,6 +3429,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -3240,13 +3533,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "2f983b658ade30ec929daefa92c7ff759a0cff9e23d4d91525aa2c3919edbb7f",
-      "catalog_digest": "2f983b658ade30ec929daefa92c7ff759a0cff9e23d4d91525aa2c3919edbb7f",
+      "generation": "8d3197e1af37148eda76b21af9c8780515ff46370b21c3902b156dcf0bbfc9b7",
+      "catalog_digest": "8d3197e1af37148eda76b21af9c8780515ff46370b21c3902b156dcf0bbfc9b7",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -3259,6 +3556,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -3335,6 +3636,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -3385,6 +3691,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3412,6 +3722,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3490,6 +3804,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -3512,6 +3830,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -3545,6 +3868,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -3569,6 +3897,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -3612,6 +3945,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -3701,6 +4039,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -3756,6 +4098,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -3822,6 +4169,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -3841,6 +4192,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -3901,6 +4256,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -3964,6 +4323,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -3994,6 +4357,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -4021,6 +4388,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -4103,6 +4474,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -4147,6 +4522,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4178,6 +4557,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4200,6 +4583,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -4300,13 +4687,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7dfaa9d6fad5ed7cb2bada18cda1487e56a89e6ac67aa635743a1d02e2e15812",
-      "catalog_digest": "7dfaa9d6fad5ed7cb2bada18cda1487e56a89e6ac67aa635743a1d02e2e15812",
+      "generation": "b66d9d857a1ec2ba9e8ef24096bb8c226decd569cf5921f62eb7aa0cbe97c852",
+      "catalog_digest": "b66d9d857a1ec2ba9e8ef24096bb8c226decd569cf5921f62eb7aa0cbe97c852",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -4319,6 +4710,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -4395,6 +4790,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -4445,6 +4845,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4472,6 +4876,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4550,6 +4958,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -4572,6 +4984,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -4605,6 +5022,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -4629,6 +5051,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -4669,6 +5096,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -4758,6 +5190,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -4813,6 +5249,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -4879,6 +5320,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -4898,6 +5343,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -4958,6 +5407,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5021,6 +5474,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -5051,6 +5508,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -5078,6 +5539,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -5160,6 +5625,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -5204,6 +5673,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5235,6 +5708,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5257,6 +5734,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -5358,13 +5839,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a9b01fb2f6a5eebeb1af9bf10964792785c11ac13d5a9c59c22c8bb11c8bd79b",
-      "catalog_digest": "a9b01fb2f6a5eebeb1af9bf10964792785c11ac13d5a9c59c22c8bb11c8bd79b",
+      "generation": "b6208191455f95811c2c142ec3cc6f778a0b97ecce54319dc9e84567495a7a83",
+      "catalog_digest": "b6208191455f95811c2c142ec3cc6f778a0b97ecce54319dc9e84567495a7a83",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -5377,6 +5862,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -5453,6 +5942,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -5503,6 +5997,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5530,6 +6028,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5608,6 +6110,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -5630,6 +6136,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -5663,6 +6174,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -5687,6 +6203,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -5730,6 +6251,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -5819,6 +6345,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -5885,6 +6416,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -5904,6 +6439,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -5964,6 +6503,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -6027,6 +6570,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -6057,6 +6604,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -6084,6 +6635,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -6166,6 +6721,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -6210,6 +6769,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6241,6 +6804,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6263,6 +6830,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -6363,13 +6934,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "8073e148aa79511b8d42a989405eba3ff9fa74318f705f73b186c1e55d116ad7",
-      "catalog_digest": "8073e148aa79511b8d42a989405eba3ff9fa74318f705f73b186c1e55d116ad7",
+      "generation": "b7b0816a81662331dee4a419c736c3abdf7dd077ce54ee1f9f7b8a69326b18e4",
+      "catalog_digest": "b7b0816a81662331dee4a419c736c3abdf7dd077ce54ee1f9f7b8a69326b18e4",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -6382,6 +6957,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -6458,6 +7037,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -6508,6 +7092,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -6535,6 +7123,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -6613,6 +7205,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -6635,6 +7231,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -6668,6 +7269,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -6692,6 +7298,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -6732,6 +7343,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -6821,6 +7437,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -6887,6 +7508,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -6906,6 +7531,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -6966,6 +7595,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -7029,6 +7662,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -7059,6 +7696,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -7086,6 +7727,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -7168,6 +7813,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -7212,6 +7861,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7243,6 +7896,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7265,6 +7922,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -7365,13 +8026,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9158ae4493eccf93b38a5ef49e78f6f5d11ffb817114de6ecee30ac38df8b9de",
-      "catalog_digest": "9158ae4493eccf93b38a5ef49e78f6f5d11ffb817114de6ecee30ac38df8b9de",
+      "generation": "029678ea7ca29fa5e6f23e27c018d6b44ac1bdfbec85a64b060d608ef5e3492a",
+      "catalog_digest": "029678ea7ca29fa5e6f23e27c018d6b44ac1bdfbec85a64b060d608ef5e3492a",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -7384,6 +8049,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -7460,6 +8129,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -7510,6 +8184,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7537,6 +8215,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7615,6 +8297,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -7637,6 +8323,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -7670,6 +8361,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -7694,6 +8390,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -7737,6 +8438,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -7792,6 +8497,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -7858,6 +8568,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -7877,6 +8591,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -7937,6 +8655,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -8000,6 +8722,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -8030,6 +8756,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -8057,6 +8787,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -8139,6 +8873,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -8183,6 +8921,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8214,6 +8956,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8236,6 +8982,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -8336,13 +9086,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "67c91a7cd5b160091832a7ef85df7b5ff49b63c6c473c9aeaa0fabee7b19adb5",
-      "catalog_digest": "67c91a7cd5b160091832a7ef85df7b5ff49b63c6c473c9aeaa0fabee7b19adb5",
+      "generation": "debe1f660734f64f39b3bb588e249846bf83d7ca8722d69cbf0eaec2bc324777",
+      "catalog_digest": "debe1f660734f64f39b3bb588e249846bf83d7ca8722d69cbf0eaec2bc324777",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -8355,6 +9109,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -8431,6 +9189,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -8481,6 +9244,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8508,6 +9275,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8586,6 +9357,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -8608,6 +9383,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -8641,6 +9421,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -8665,6 +9450,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -8705,6 +9495,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -8760,6 +9554,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -8826,6 +9625,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -8845,6 +9648,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -8905,6 +9712,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -8968,6 +9779,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -8998,6 +9813,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -9025,6 +9844,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -9107,6 +9930,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -9151,6 +9978,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9182,6 +10013,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9204,6 +10039,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9301,13 +10140,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "080995b9163f96930bf76811a588f292216e981982b993f68ef33b9f9daf2ce5",
-      "catalog_digest": "080995b9163f96930bf76811a588f292216e981982b993f68ef33b9f9daf2ce5",
+      "generation": "00107d5c1b31f49cd453c51cf682ebc88d3db170691b15b2a3de6d0302f274f0",
+      "catalog_digest": "00107d5c1b31f49cd453c51cf682ebc88d3db170691b15b2a3de6d0302f274f0",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -9320,6 +10163,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -9396,6 +10243,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -9465,6 +10316,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -9515,6 +10371,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9542,6 +10402,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9620,6 +10484,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -9642,6 +10510,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -9675,6 +10548,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -9699,6 +10577,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -9742,6 +10625,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -9782,6 +10670,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -9871,6 +10764,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -9926,6 +10823,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -9992,6 +10894,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -10011,6 +10917,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -10071,6 +10981,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -10134,6 +11048,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -10164,6 +11082,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -10191,6 +11113,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -10273,6 +11199,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -10317,6 +11247,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10348,6 +11282,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10370,6 +11308,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10470,13 +11412,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e63fdc26d41beb3a48631b72bed236c271beb7eb5854848c7fe2395a6f1d37c4",
-      "catalog_digest": "e63fdc26d41beb3a48631b72bed236c271beb7eb5854848c7fe2395a6f1d37c4",
+      "generation": "a211a843533a3e53b3072dc3e35bb3768afcf21a9329c41ec4d2c6a8d4b57fc2",
+      "catalog_digest": "a211a843533a3e53b3072dc3e35bb3768afcf21a9329c41ec4d2c6a8d4b57fc2",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -10489,6 +11435,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -10565,6 +11515,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -10634,6 +11588,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -10684,6 +11643,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10711,6 +11674,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10789,6 +11756,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -10811,6 +11782,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -10844,6 +11820,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -10868,6 +11849,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -10911,6 +11897,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -10951,6 +11942,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -11040,6 +12036,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -11095,6 +12095,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -11161,6 +12166,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -11180,6 +12189,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -11240,6 +12253,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -11303,6 +12320,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -11333,6 +12354,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -11360,6 +12385,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -11442,6 +12471,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -11486,6 +12519,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11517,6 +12554,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11539,6 +12580,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11641,13 +12686,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9ae865082482ebd51b9b8545685272c5e3de5759ed0e95441f698536171a4f39",
-      "catalog_digest": "9ae865082482ebd51b9b8545685272c5e3de5759ed0e95441f698536171a4f39",
+      "generation": "7ebe15115f870201da2169e75a0b9f122394f52a6185c1b70b7d229a19b3e57b",
+      "catalog_digest": "7ebe15115f870201da2169e75a0b9f122394f52a6185c1b70b7d229a19b3e57b",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -11660,6 +12709,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -11729,6 +12782,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -11779,6 +12837,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11806,6 +12868,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11884,6 +12950,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -11906,6 +12976,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -11939,6 +13014,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -11963,6 +13043,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -12006,6 +13091,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -12046,6 +13136,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -12135,6 +13230,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -12190,6 +13289,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -12256,6 +13360,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -12275,6 +13383,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -12335,6 +13447,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -12398,6 +13514,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -12428,6 +13548,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -12455,6 +13579,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -12537,6 +13665,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -12581,6 +13713,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12612,6 +13748,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12634,6 +13774,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12735,13 +13879,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "bb857ba6659c446dca89fe828c72829da52f8be69948a477002cace4c8803922",
-      "catalog_digest": "bb857ba6659c446dca89fe828c72829da52f8be69948a477002cace4c8803922",
+      "generation": "033b817f00b76df7d9bd68532073b32a7f63c86e1d3df74766ccd2918eb96415",
+      "catalog_digest": "033b817f00b76df7d9bd68532073b32a7f63c86e1d3df74766ccd2918eb96415",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -12754,6 +13902,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -12830,6 +13982,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -12899,6 +14055,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -12949,6 +14110,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -12976,6 +14141,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -13054,6 +14223,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -13076,6 +14249,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -13109,6 +14287,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -13133,6 +14316,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -13176,6 +14364,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -13265,6 +14458,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -13320,6 +14517,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -13386,6 +14588,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -13405,6 +14611,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -13465,6 +14675,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -13528,6 +14742,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -13558,6 +14776,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -13585,6 +14807,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -13667,6 +14893,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -13711,6 +14941,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13742,6 +14976,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13764,6 +15002,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -13865,13 +15107,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "581dfb64f69323cd3808ee7a32e3c3c51d68fc86aebf0a0913596ad09f29e824",
-      "catalog_digest": "581dfb64f69323cd3808ee7a32e3c3c51d68fc86aebf0a0913596ad09f29e824",
+      "generation": "d670c93c6705592b767dec752d945234412fba0b4294f0da16ac50c70d9edc20",
+      "catalog_digest": "d670c93c6705592b767dec752d945234412fba0b4294f0da16ac50c70d9edc20",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -13884,6 +15130,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -13960,6 +15210,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14029,6 +15283,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -14079,6 +15338,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -14106,6 +15369,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -14184,6 +15451,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -14206,6 +15477,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -14239,6 +15515,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -14263,6 +15544,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -14303,6 +15589,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -14392,6 +15683,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -14447,6 +15742,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -14513,6 +15813,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -14532,6 +15836,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -14592,6 +15900,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -14655,6 +15967,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -14685,6 +16001,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -14712,6 +16032,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -14794,6 +16118,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -14838,6 +16166,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14869,6 +16201,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14891,6 +16227,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -14993,13 +16333,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e5fc165be869ef52a4b239eb3d50b9020b4c1059e07d868570a235adf7247dec",
-      "catalog_digest": "e5fc165be869ef52a4b239eb3d50b9020b4c1059e07d868570a235adf7247dec",
+      "generation": "33c3cd577ad4f24b4ef0c0eb84d0fc66434bd260f497962dfab2cc141e03545f",
+      "catalog_digest": "33c3cd577ad4f24b4ef0c0eb84d0fc66434bd260f497962dfab2cc141e03545f",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -15012,6 +16356,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -15088,6 +16436,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15157,6 +16509,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -15207,6 +16564,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15234,6 +16595,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15312,6 +16677,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -15334,6 +16703,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -15367,6 +16741,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -15391,6 +16770,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -15434,6 +16818,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -15523,6 +16912,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -15589,6 +16983,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -15608,6 +17006,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -15668,6 +17070,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -15731,6 +17137,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -15761,6 +17171,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -15788,6 +17202,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -15870,6 +17288,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -15914,6 +17336,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15945,6 +17371,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -15967,6 +17397,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16068,13 +17502,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "52d1152b5caf008d49d20dc7c113eb71befa891eee5ad7fe274f335eeb7ae4a6",
-      "catalog_digest": "52d1152b5caf008d49d20dc7c113eb71befa891eee5ad7fe274f335eeb7ae4a6",
+      "generation": "00ed247fc0ef3668ad365f2e868a03cc0bb350b98ddc747d92cdd60930e5ce2e",
+      "catalog_digest": "00ed247fc0ef3668ad365f2e868a03cc0bb350b98ddc747d92cdd60930e5ce2e",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -16087,6 +17525,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -16163,6 +17605,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -16232,6 +17678,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -16282,6 +17733,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16309,6 +17764,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16387,6 +17846,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -16409,6 +17872,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -16442,6 +17910,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -16466,6 +17939,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -16506,6 +17984,11 @@
           "name": "zoom",
           "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -16595,6 +18078,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -16661,6 +18149,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -16680,6 +18172,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -16740,6 +18236,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -16803,6 +18303,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -16833,6 +18337,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -16860,6 +18368,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -16942,6 +18454,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -16986,6 +18502,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17017,6 +18537,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17039,6 +18563,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17140,13 +18668,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "dcfb643a6fd4ce76d1660edeaad180d7974bfa687f650d783d661e2e31f768e4",
-      "catalog_digest": "dcfb643a6fd4ce76d1660edeaad180d7974bfa687f650d783d661e2e31f768e4",
+      "generation": "973b70ec4db8f4a16e3f4085f39343a3a742ca9594900f6880232d5e938a3a19",
+      "catalog_digest": "973b70ec4db8f4a16e3f4085f39343a3a742ca9594900f6880232d5e938a3a19",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -17159,6 +18691,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -17235,6 +18771,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -17304,6 +18844,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -17354,6 +18899,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17381,6 +18930,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17459,6 +19012,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -17481,6 +19038,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -17514,6 +19076,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -17538,6 +19105,11 @@
           "name": "search",
           "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -17581,6 +19153,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -17636,6 +19212,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -17702,6 +19283,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -17721,6 +19306,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -17781,6 +19370,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -17844,6 +19437,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -17874,6 +19471,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -17901,6 +19502,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -17983,6 +19588,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -18027,6 +19636,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18058,6 +19671,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18080,6 +19697,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18181,13 +19802,17 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "825f93c5c7968f2544bf826574305f6615dc36d5b188337c5e2e9e10810d1cdb",
-      "catalog_digest": "825f93c5c7968f2544bf826574305f6615dc36d5b188337c5e2e9e10810d1cdb",
+      "generation": "af6654865e8229b9c21d12224eb27cbf3d386fa6f051e3032e5e2c8b69013476",
+      "catalog_digest": "af6654865e8229b9c21d12224eb27cbf3d386fa6f051e3032e5e2c8b69013476",
       "tools": [
         {
           "name": "status",
           "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [],
           "description": "Show AFT status, index health, cache usage, and runtime details",
           "input_schema": {
@@ -18200,6 +19825,10 @@
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 2,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -18276,6 +19905,10 @@
           "name": "powershell",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -18345,6 +19978,11 @@
           "name": "read",
           "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "result_ops": [
             "prepend",
             "append"
@@ -18395,6 +20033,10 @@
           "name": "write",
           "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18422,6 +20064,10 @@
           "name": "edit",
           "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18500,6 +20146,10 @@
           "name": "apply_patch",
           "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.edit/v1"
           ],
@@ -18522,6 +20172,11 @@
           "name": "grep",
           "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -18555,6 +20210,11 @@
           "name": "glob",
           "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.search/v1"
           ],
@@ -18579,6 +20239,11 @@
           "name": "outline",
           "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.outline/v1"
           ],
@@ -18619,6 +20284,10 @@
           "name": "inspect",
           "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.diagnostics/v1"
           ],
@@ -18674,6 +20343,11 @@
           "name": "callgraph",
           "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode",
+            "flow"
+          ],
           "capabilities": [
             "code.callgraph/v1"
           ],
@@ -18740,6 +20414,10 @@
           "name": "conflicts",
           "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:git.conflicts/v1"
           ],
@@ -18759,6 +20437,10 @@
           "name": "ast_search",
           "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -18819,6 +20501,10 @@
           "name": "ast_replace",
           "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
@@ -18882,6 +20568,10 @@
           "name": "delete",
           "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -18912,6 +20602,10 @@
           "name": "move",
           "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "code.files/v1"
           ],
@@ -18939,6 +20633,10 @@
           "name": "import",
           "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:code.imports/v1"
           ],
@@ -19021,6 +20719,10 @@
           "name": "safety",
           "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "aft:safety/v1"
           ],
@@ -19065,6 +20767,10 @@
           "name": "bash_status",
           "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19096,6 +20802,10 @@
           "name": "bash_kill",
           "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],
@@ -19118,6 +20828,10 @@
           "name": "bash_write",
           "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
           "semantics": 1,
+          "modes": [
+            "classic",
+            "codemode"
+          ],
           "capabilities": [
             "shell.exec/v1"
           ],

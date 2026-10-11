@@ -301,6 +301,17 @@ fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)>
                     1
                 };
                 let mut entry = CatalogTool::new(name.clone(), digest, semantics, schema);
+                let mut modes = vec![cortexkit_role_tool_provider::CallMode::Classic];
+                if name != "bash_watch" {
+                    modes.push(cortexkit_role_tool_provider::CallMode::Codemode);
+                }
+                if matches!(
+                    name.as_str(),
+                    "read" | "grep" | "glob" | "search" | "outline" | "zoom" | "callgraph"
+                ) {
+                    modes.push(cortexkit_role_tool_provider::CallMode::Flow);
+                }
+                entry.modes = Some(modes);
                 if !tag.is_empty() {
                     entry.capabilities.push((*tag).into());
                 }
@@ -579,6 +590,32 @@ pub(super) fn catalog_for_request(
 /// The role comes from the call's preset ([`resolve_caller_role`]). A call
 /// that names the `reader` preset is refused any tool outside that preset, by
 /// name; every other role may call any tool the catalog serves.
+pub(super) fn admit_call_mode(
+    name: &str,
+    mode: &cortexkit_role_tool_provider::CallMode,
+) -> Result<(), ErrorBody> {
+    use cortexkit_role_tool_provider::{catalog::serves_call_mode, CallMode};
+    let tool = served_tools(CatalogPreset::Head)
+        .iter()
+        .find(|tool| tool.catalog.name == name)
+        .or_else(|| {
+            served_tools(CatalogPreset::Worker)
+                .iter()
+                .find(|tool| tool.catalog.name == name)
+        });
+    if tool.is_some_and(|tool| serves_call_mode(&tool.catalog, mode))
+        || (*mode == CallMode::Classic && tool.is_none())
+    {
+        return Ok(());
+    }
+    let mut error = ErrorBody::new(
+        cortexkit_role_tool_provider::errors::CALL_MODE_UNSUPPORTED,
+        "tool does not serve the bind's call mode",
+    );
+    error.detail = Some(json!({"tool":name, "mode":mode}));
+    Err(error)
+}
+
 pub(super) fn admit(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
     scoped_route: bool,
@@ -1734,6 +1771,73 @@ pub(super) fn resolve_caller_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn catalog_modes_match_exact_tool_table_and_keep_all_classic_tools() {
+        use cortexkit_role_tool_provider::{
+            catalog::{check_modes, serves_call_mode},
+            CallMode,
+        };
+        let table = [
+            ("status", false),
+            ("bash", false),
+            ("powershell", false),
+            ("read", true),
+            ("write", false),
+            ("edit", false),
+            ("apply_patch", false),
+            ("grep", true),
+            ("glob", true),
+            ("search", true),
+            ("outline", true),
+            ("zoom", true),
+            ("inspect", false),
+            ("callgraph", true),
+            ("conflicts", false),
+            ("ast_search", false),
+            ("ast_replace", false),
+            ("delete", false),
+            ("move", false),
+            ("import", false),
+            ("safety", false),
+            ("bash_status", false),
+            ("bash_kill", false),
+            ("bash_write", false),
+        ];
+        let head = tools(&[], true);
+        assert_eq!(head.len(), table.len());
+        for (name, flow) in table {
+            let tool = head.iter().find(|tool| tool.name == name).unwrap();
+            let expected = if flow {
+                vec![CallMode::Classic, CallMode::Codemode, CallMode::Flow]
+            } else {
+                vec![CallMode::Classic, CallMode::Codemode]
+            };
+            assert_eq!(tool.modes.as_ref(), Some(&expected), "{name}");
+            check_modes(tool).unwrap();
+            assert!(serves_call_mode(tool, &CallMode::Classic), "{name}");
+            assert!(
+                !serves_call_mode(tool, &CallMode::Unknown("future".into())),
+                "{name}"
+            );
+        }
+        for preset in [CatalogPreset::Worker, CatalogPreset::Reader] {
+            for tool in tools_for_session(preset, &[], true, false) {
+                check_modes(&tool).unwrap();
+                assert!(serves_call_mode(&tool, &CallMode::Classic));
+                if tool.name == "bash_watch" {
+                    assert_eq!(tool.modes, Some(vec![CallMode::Classic]));
+                } else {
+                    assert_eq!(
+                        tool.modes,
+                        head.iter()
+                            .find(|head| head.name == tool.name)
+                            .unwrap()
+                            .modes
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn ledger_scope_owner_and_route_principal_have_identical_canonical_bytes() {
@@ -1744,16 +1848,13 @@ mod tests {
             },
             subc_protocol::Principal::Unverified,
         ] {
-            let stamp = subc_protocol::scope::ScopeStamp {
-                owner: principal.clone(),
-                scope_ref: "scope".into(),
-                scope_epoch: 7,
-                kind: subc_protocol::scope::ScopeKind::Head,
-                parent: None,
-                parent_state: None,
-                attributes: Default::default(),
-                owner_authorized: true,
-            };
+            let stamp = subc_protocol::scope::ScopeStamp::new(
+                principal.clone(),
+                "scope",
+                7,
+                subc_protocol::scope::ScopeKind::Head,
+            )
+            .with_owner_authorized(true);
             assert_eq!(
                 ledger_scope(&stamp).owner.as_bytes(),
                 super::super::principal_id(&Some(principal))
@@ -2889,6 +2990,7 @@ mod tests {
             admission_facts: Default::default(),
             scope: Some(stamp.clone()),
             role_versions: None,
+            call_mode: None,
         };
         let decoded: subc_protocol::session::ModuleControlRequest =
             serde_json::from_slice(&serde_json::to_vec(&bind).unwrap()).unwrap();
@@ -3141,6 +3243,8 @@ mod route_tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::new(disabled),
             scope,
+            run_scope: OnceLock::new(),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
         }));
         exchange_with_actor(body, identity, ctx, metrics, |request, _| {
@@ -3393,6 +3497,8 @@ mod route_tests {
             consumer_elicitation_capable: false,
             disabled_tools: Arc::default(),
             scope: None,
+            run_scope: OnceLock::new(),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
             made_tool_call: AtomicBool::new(false),
         }));
         // Wait on filesystem evidence, not on the command's completion. The

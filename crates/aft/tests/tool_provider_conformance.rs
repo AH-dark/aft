@@ -1441,6 +1441,29 @@ async fn bind_route_stamped_with_elicitation(
     stamp: &RouteStamp,
     elicitation: bool,
 ) -> Result<Route, HarnessError> {
+    bind_route_stamped_with_mode(
+        handle,
+        project,
+        harness,
+        session,
+        role_versions,
+        stamp,
+        elicitation,
+        None,
+    )
+    .await
+}
+
+async fn bind_route_stamped_with_mode(
+    handle: &Process,
+    project: &Path,
+    harness: &str,
+    session: &str,
+    role_versions: Option<BTreeMap<String, String>>,
+    stamp: &RouteStamp,
+    elicitation: bool,
+    mode: Option<cortexkit_role_tool_provider::CallMode>,
+) -> Result<Route, HarnessError> {
     let mut wire = handle.stream.lock().await;
     let channel = wire.next_channel;
     wire.next_channel += 1;
@@ -1460,19 +1483,23 @@ async fn bind_route_stamped_with_elicitation(
             .scope
             .as_ref()
             .map(|scope| {
-                Ok(subc_protocol::scope::ScopeStamp {
-                    owner: decode_principal(&scope.owner)?,
-                    scope_ref: scope.scope_ref.clone(),
-                    scope_epoch: scope.scope_epoch,
-                    kind: subc_protocol::scope::ScopeKind::Head,
-                    parent: None,
-                    parent_state: None,
-                    attributes: Default::default(),
-                    owner_authorized: true,
-                })
+                Ok(subc_protocol::scope::ScopeStamp::new(
+                    decode_principal(&scope.owner)?,
+                    scope.scope_ref.clone(),
+                    scope.scope_epoch,
+                    subc_protocol::scope::ScopeKind::Head,
+                )
+                .with_owner_authorized(true)
+                .with_attributes(
+                    subc_protocol::scope::ScopeAttributes::new().with_flow_id(
+                        (mode == Some(cortexkit_role_tool_provider::CallMode::Flow))
+                            .then(|| "mode-flow".into()),
+                    ),
+                ))
             })
             .transpose()?,
         role_versions,
+        call_mode: mode,
     };
     write_frame(
         &mut wire.stream,
@@ -1689,6 +1716,7 @@ impl ToolRoute for Route {
 impl ToolProviderSubject for Subject {
     fn capabilities(&self) -> BTreeSet<Capability> {
         BTreeSet::from([
+            Capability::CallModes,
             Capability::DisableTool,
             Capability::Cancellation,
             Capability::CallKey,
@@ -1726,6 +1754,46 @@ impl ToolProviderSubject for Subject {
         } else {
             ("status".into(), json!({}))
         }
+    }
+    fn call_mode_probe(&self) -> Option<cortexkit_role_tool_provider_conformance::CallModeProbe> {
+        if self.preset == Some("reader") {
+            return None;
+        }
+        Some(cortexkit_role_tool_provider_conformance::CallModeProbe {
+            call: (
+                "bash".into(),
+                serde_json::json!({"command":"echo mode-probe"}),
+            ),
+            unlisted_mode: cortexkit_role_tool_provider::CallMode::Flow,
+        })
+    }
+    async fn route_with_mode(
+        &self,
+        handle: &Process,
+        stamp: &RouteStamp,
+        mode: &cortexkit_role_tool_provider::CallMode,
+    ) -> Result<Route, HarnessError> {
+        let mut stamp = stamp.clone();
+        if *mode == cortexkit_role_tool_provider::CallMode::Flow {
+            stamp.scope = Some(cortexkit_role_harness::ScopeStamp {
+                owner: "direct".into(),
+                scope_ref: "mode-flow".into(),
+                scope_epoch: 1,
+            });
+        }
+        let mut route = bind_route_stamped_with_mode(
+            handle,
+            &handle.root.join("project"),
+            "runner",
+            "conformance-session",
+            Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+            &stamp,
+            false,
+            Some(mode.clone()),
+        )
+        .await?;
+        route.scoped_preset = self.preset.or(Some("head"));
+        Ok(route)
     }
     fn slow_call(&self) -> Option<CallSpec> {
         Some((
@@ -1803,8 +1871,14 @@ async fn conformance_inventory(subject: Subject) {
     let expected = |field| {
         serde_json::from_value::<BTreeSet<String>>(fixtures["slice_a"][field].clone()).unwrap()
     };
-    assert_eq!(enabled, expected("enabled_cases"));
-    assert_eq!(skipped, expected("skipped_cases"));
+    let mut expected_enabled = expected("enabled_cases");
+    let mut expected_skipped = expected("skipped_cases");
+    if subject.call_mode_probe().is_none() {
+        expected_enabled.remove("call_mode_matches_catalog");
+        expected_skipped.insert("call_mode_matches_catalog".into());
+    }
+    assert_eq!(enabled, expected_enabled);
+    assert_eq!(skipped, expected_skipped);
     // Every route is bound with role_versions {"tool-provider": "v1"}, so the
     // real module admits these calls under the v1 grammar. Every enabled case
     // must pass; the provider conforms for the capabilities it declares and

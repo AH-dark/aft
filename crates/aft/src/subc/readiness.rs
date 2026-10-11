@@ -472,13 +472,13 @@ pub(super) struct PendingControlReplies {
 }
 
 impl PendingControlReplies {
-    fn register(&self, corr: u64) -> oneshot::Receiver<Frame> {
+    pub(super) fn register(&self, corr: u64) -> oneshot::Receiver<Frame> {
         let (tx, rx) = oneshot::channel();
         self.lock().insert(corr, tx);
         rx
     }
 
-    fn remove(&self, corr: u64) {
+    pub(super) fn remove(&self, corr: u64) {
         self.lock().remove(&corr);
     }
 

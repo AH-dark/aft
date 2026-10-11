@@ -104,6 +104,7 @@ async fn bind(
             admission_facts: Default::default(),
             scope: None,
             role_versions: None,
+            call_mode: None,
         })
         .unwrap(),
         out,

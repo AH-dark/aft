@@ -819,6 +819,7 @@ mod tests {
                 admission_facts: Default::default(),
                 scope: None,
                 role_versions: None,
+                call_mode: None,
             })
             .unwrap(),
         )
@@ -1121,6 +1122,7 @@ mod tests {
             admission_facts: Default::default(),
             scope: None,
             role_versions: None,
+            call_mode: None,
         };
         let frame = Frame::build(
             FrameType::Request,

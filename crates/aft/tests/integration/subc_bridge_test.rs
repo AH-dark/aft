@@ -3094,6 +3094,7 @@ async fn drive_undecodable_control_request_daemon(input: FakeDaemonInput) {
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     })
     .expect("route bind body");
     // The control request is internally tagged (`op`), so the bind fields sit
@@ -3669,6 +3670,7 @@ async fn drive_s1_rejection_daemon(
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     };
     send_frame(
         &mut stream,
@@ -3923,6 +3925,7 @@ async fn drive_readiness_daemon(
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     };
     send_frame(
         &mut stream,
@@ -10247,6 +10250,7 @@ async fn send_route_bind_with_elicitation_capability(
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     };
     send_frame(
         stream,
@@ -11241,6 +11245,7 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     };
     send_frame(
         &mut stream,
@@ -12864,6 +12869,7 @@ async fn send_management_route_bind_with_harness(
             admission_facts: Default::default(),
             scope: None,
             role_versions: None,
+            call_mode: None,
         },
     )
     .await;
@@ -13071,6 +13077,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     };
     send_frame(
         stream,
@@ -14914,3 +14921,7 @@ async fn drive_read_after_external_restore_daemon(input: FakeDaemonInput) {
 
     send_connection_goodbye(&mut stream).await;
 }
+
+#[cfg(unix)]
+#[path = "scope_revocation_test.rs"]
+mod scope_revocation_test;

@@ -27,6 +27,8 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         spawn_principal: AuthenticatedPrincipal::FirstParty,
         consumer_elicitation_capable: false,
         disabled_tools: Arc::new(vec![]),
+        run_scope: OnceLock::new(),
+        call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: None,
         made_tool_call: AtomicBool::new(false),
     }));
@@ -129,6 +131,8 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         spawn_principal: AuthenticatedPrincipal::FirstParty,
         consumer_elicitation_capable: false,
         disabled_tools: Arc::new(vec![]),
+        run_scope: OnceLock::new(),
+        call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: None,
         made_tool_call: AtomicBool::new(false),
     }));

@@ -1047,6 +1047,11 @@ fn format_bash_status(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let mut text = format!("Task {task_id}: {status}");
+    if status == "killed"
+        && data.get("status_reason").and_then(Value::as_str) == Some("scope revoked")
+    {
+        text.push_str(" (scope revoked)");
+    }
     if let Some(exit_code) = data.get("exit_code").and_then(Value::as_i64) {
         text.push_str(&format!(" (exit {exit_code})"));
     }
@@ -4859,5 +4864,26 @@ mod model_flag_tests {
             Path::new("."),
         );
         assert!(context.callgraph_include_unresolved);
+    }
+}
+
+#[cfg(test)]
+mod run_scope_status_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bash_status_names_scope_revocation() {
+        let data =
+            json!({"task_id":"bash-dead", "status":"killed", "status_reason":"scope revoked"});
+        let text = format_bash_status(&data, None, false, false);
+        assert!(text.contains("killed (scope revoked)"), "{text}");
+        let ordinary = format_bash_status(
+            &json!({"task_id":"bash-dead", "status":"killed"}),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(ordinary, "Task bash-dead: killed");
     }
 }

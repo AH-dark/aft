@@ -5520,6 +5520,19 @@ impl BgTaskRegistry {
         }
     }
 
+    pub(crate) fn kill_for_scope_revocation(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<BgTaskSnapshot, String> {
+        self.kill_with_status_reason(
+            task_id,
+            session_id,
+            BgTaskStatus::Killed,
+            Some("scope revoked".into()),
+        )
+    }
+
     pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
         self.kill_with_status(task_id, session_id, BgTaskStatus::Killed)
     }
@@ -7041,6 +7054,17 @@ impl BgTaskRegistry {
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         #[cfg(unix)]
         if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
+            if reason.as_deref() == Some("scope revoked") {
+                let mut db = DeferredDbWrites::new(self, &task);
+                let mut state = task
+                    .lock_state()
+                    .map_err(|_| "background task lock poisoned")?;
+                if !state.metadata.is_terminal() {
+                    state.metadata.status_reason = reason.clone();
+                    self.persist_task_locked(&task, &state.metadata, &mut db)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             return self.kill_remote_task(&task);
         }
         let mut terminalized = false;
@@ -8193,6 +8217,37 @@ impl BgTaskRegistry {
             .lock()
             .ok()
             .and_then(|tasks| tasks.get(task_id).cloned())
+    }
+
+    /// Check tracked work without recovering task records or reading output.
+    /// A terminal shell can leave descendants alive, so refresh a surviving or
+    /// unknown process-group sample before treating the whole task as finished.
+    /// Run this outside the SUBC connection's frame-reading loop: state locks and process-group sampling can wait.
+    pub(crate) fn has_live_task_processes(&self, task_id: &str, session_id: &str) -> bool {
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return false;
+        };
+        let needs_sample = {
+            let state = task
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.metadata.status.is_terminal() {
+                return true;
+            }
+            state.metadata.mode == BgMode::Pipes
+                && state.metadata.pgid.is_some()
+                && (state
+                    .metadata
+                    .live_descendants
+                    .as_ref()
+                    .is_none_or(|members| !members.is_empty())
+                    || state.metadata.live_descendants_omitted > 0)
+        };
+        needs_sample
+            && self
+                .sample_task_process_group(&task)
+                .is_none_or(|(members, omitted)| !members.is_empty() || omitted > 0)
     }
 
     /// True when the task has reached a terminal state or is no longer in the

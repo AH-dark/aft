@@ -1235,6 +1235,7 @@ async fn bind_route(stream: &mut TcpStream, root: &Path, v1: bool) {
         consumer_capabilities: None,
         admission_facts: Default::default(),
         scope: None,
+        call_mode: None,
         role_versions: v1
             .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
     };

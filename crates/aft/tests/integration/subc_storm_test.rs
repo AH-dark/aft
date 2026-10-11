@@ -2462,6 +2462,7 @@ fn send_bind_epoch(
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     };
     send_control(tx, corr, request);
 }
@@ -2498,6 +2499,7 @@ async fn write_measure_bind(
         admission_facts: Default::default(),
         scope: None,
         role_versions: None,
+        call_mode: None,
     };
     let frame = Frame::build(
         FrameType::Request,

@@ -395,27 +395,38 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // budget. A daemon that predates the field ignores it and treats the
     // module as ready, which is the behaviour before readiness existed.
     //
-    // `capabilities.provides` lists `tool-provider/v1`: that catalog entry is
-    // how a session starter discovers a tool provider before it builds a
-    // worker's fetch plan. Without it, no worker gets a plan, so its calls
-    // carry no preset and run as `head`. Nothing goes in `requires`.
+    // `capabilities.provides` lists `tool-provider/v1` so agent startup can
+    // discover AFT and build a worker's tool-fetch plan. Without that plan,
+    // worker calls name no preset and use the default `head` agent catalog.
+    //
+    // `call-modes/v1` requests the bind mode and run deadline. AFT checks
+    // each tool's modes and confirms a run scope has ended before killing
+    // its processes.
+    // Nothing goes in `requires`.
+    //
     // The builder leaves `self_signals` and `provenance` unset; `provenance`
     // is added at HELLO time by `declare_provenance`, because where the launch
     // nonce came from is a fact about the running process, not the build.
-    // `consumes` is descriptive (the
-    // daemon doesn't read it) and lists the modules AFT opens routes to: the
+    //
+    // `consumes` is descriptive:
+    // the daemon doesn't read it. It lists the modules AFT opens routes to: the
     // fleet status holder always, and synapse only when it is the configured
     // embedding backend. The manifest is static, so the config-dependent synapse
     // route is declared unconditionally. Neither is a `capabilities.requires`
     // entry, because a required capability with no provider would hold AFT
-    // not-ready. A subc daemon older than 0.17.20 refuses this manifest, so
-    // that version is the floor.
+    // not-ready.
+    //
+    // A subc daemon older than 0.17.20 refuses this manifest, so that version
+    // is the minimum supported daemon version.
     ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
         .ready(false)
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
-            provides: vec![cortexkit_role_tool_provider::PROVIDES.to_string()],
+            provides: vec![
+                cortexkit_role_tool_provider::PROVIDES.to_string(),
+                cortexkit_role_tool_provider::CALL_MODES_CAPABILITY.to_string(),
+            ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
@@ -668,12 +679,15 @@ mod tests {
     fn build_manifest_lists_tool_provider_capability_without_requirements() {
         let manifest = build_manifest_for_host(true);
         let capabilities = manifest.capabilities.as_ref().expect("capabilities");
-        assert_eq!(capabilities.provides, vec!["tool-provider/v1".to_string()]);
+        assert_eq!(
+            capabilities.provides,
+            vec!["tool-provider/v1".to_string(), "call-modes/v1".to_string()]
+        );
         assert!(capabilities.requires.is_empty());
         let wire = serde_json::to_value(&manifest).unwrap();
         assert_eq!(
             wire.pointer("/capabilities/provides"),
-            Some(&serde_json::json!(["tool-provider/v1"]))
+            Some(&serde_json::json!(["tool-provider/v1", "call-modes/v1"]))
         );
     }
 
@@ -940,7 +954,7 @@ mod tests {
         assert_eq!(
             top.insert(
                 "capabilities".to_string(),
-                json!({"provides": ["tool-provider/v1"], "requires": [], "must_never_reach": []}),
+                json!({"provides": ["tool-provider/v1", "call-modes/v1"], "requires": [], "must_never_reach": []}),
             ),
             None
         );

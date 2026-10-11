@@ -869,12 +869,10 @@ mod tests {
     }
 
     fn status_catalog_entry(module_id: &str, operation: &str) -> subc_client_rs::CatalogEntry {
-        subc_client_rs::CatalogEntry {
-            module_id: module_id.to_string(),
-            ready: true,
-            not_ready: None,
-            module_version: None,
-            roles: vec![ProviderRole::ManagementSurface {
+        serde_json::from_value(json!({
+            "module_id": module_id,
+            "ready": true,
+            "roles": [ProviderRole::ManagementSurface {
                 operations: vec![ManagementOperation {
                     name: operation.to_string(),
                     kind: ManagementOperationKind::Query,
@@ -885,10 +883,9 @@ mod tests {
                 identity_scope: Vec::new(),
                 concurrency: Default::default(),
             }],
-            control_ops: Vec::new(),
-            capabilities: None,
-            self_signals: None,
-        }
+            "control_ops": [],
+        }))
+        .unwrap()
     }
 
     struct RejectingConsumer {

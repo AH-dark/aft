@@ -1694,6 +1694,11 @@ impl BgTaskRegistry {
                     }
                 }
             }
+            if status == BgTaskStatus::Killed
+                && state.metadata.status_reason.as_deref() == Some("scope revoked")
+            {
+                reason = Some("scope revoked".into());
+            }
             state.metadata.mark_terminal(status, code, reason.clone());
             append_output_loss(&mut state.metadata);
             if let Some(reason) = reason {

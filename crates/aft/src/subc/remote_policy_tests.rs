@@ -21,6 +21,8 @@ fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdenti
         },
         consumer_elicitation_capable: false,
         disabled_tools: Arc::new(vec![]),
+        run_scope: OnceLock::new(),
+        call_mode: subc_protocol::call_mode::CallMode::Classic,
         scope: scoped.then_some(scope),
         made_tool_call: AtomicBool::new(false),
     }))
@@ -934,6 +936,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         registry.begin_wait_mode_session("session", &task);
         bash::detach_held_bash_in_background(
             drain::BashDetachTarget {
+                run_scoped: false,
                 registry: registry.clone(),
                 task_id: task.clone(),
                 session_id: "session".into(),

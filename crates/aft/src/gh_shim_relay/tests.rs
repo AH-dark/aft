@@ -771,22 +771,20 @@ fn facade_reply_prefers_direct_fields_over_inner_result_content() {
 /// A stamp as the daemon puts it on a head's tool route, owned by
 /// prefrontal-core.
 fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeStamp {
-    ScopeStamp {
-        owner: subc_protocol::Principal::Reserved {
+    ScopeStamp::new(
+        subc_protocol::Principal::Reserved {
             module_id: PREFRONTAL_MODULE_ID.to_string(),
         },
-        scope_ref: "head-ref-1".to_string(),
-        scope_epoch: 7,
-        kind: subc_protocol::scope::ScopeKind::Head,
-        parent: None,
-        parent_state: None,
-        attributes: subc_protocol::scope::ScopeAttributes {
-            agent_id: agent.map(str::to_string),
-            delegates,
-            flow_id: None,
-        },
-        owner_authorized,
-    }
+        "head-ref-1",
+        7,
+        subc_protocol::scope::ScopeKind::Head,
+    )
+    .with_attributes(
+        subc_protocol::scope::ScopeAttributes::new()
+            .with_agent_id(agent.map(str::to_string))
+            .with_delegates(delegates),
+    )
+    .with_owner_authorized(owner_authorized)
 }
 
 fn delegating_stamp() -> ScopeStamp {

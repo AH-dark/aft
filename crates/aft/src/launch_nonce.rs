@@ -223,7 +223,7 @@ mod tests {
         let declared = build_facts(Some("not-a-git-sha"))
             .with_launch_nonce_source(Some(LaunchNonceSource::Fd));
         assert_eq!(declared.build_git_sha, None);
-        assert_eq!(declared.wire_crate_version.as_deref(), Some("0.29.0"));
+        assert_eq!(declared.wire_crate_version.as_deref(), Some("0.31.0"));
         assert_eq!(declared.launch_nonce_source, Some(LaunchNonceSource::Fd));
     }
 
@@ -232,7 +232,7 @@ mod tests {
         let _serial = serial();
         let _none = install_for_tests(None);
         let assert_build_facts = |declared: &ManifestProvenance| {
-            assert_eq!(declared.wire_crate_version.as_deref(), Some("0.29.0"));
+            assert_eq!(declared.wire_crate_version.as_deref(), Some("0.31.0"));
             let sha = declared.build_git_sha.as_deref().expect("build Git SHA");
             assert_eq!(sha.len(), 40);
             assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()));

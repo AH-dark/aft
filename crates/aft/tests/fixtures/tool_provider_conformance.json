@@ -2,19 +2,19 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.5.2",
+      "version": "0.7.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "0d3a631807c4f69a1f055e7e1eed592c7b4b28a47157b1d1ecbd65dfe15cc175",
+      "checksum": "60e9b39e9efd8d14b6705fc362a9c6afae7ad4ffb4179787e6dbd0c723ba27a9",
       "dependency_kind": "normal",
-      "release_tag": "cortexkit-role-tool-provider-v0.5.2"
+      "release_tag": "cortexkit-role-tool-provider-v0.7.2"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.5.2",
+      "version": "0.7.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "8b0ba5ed4b08f304c91d4b6f3542dd1eb228bfd90143e39b76d9346a71553e0e",
+      "checksum": "20d31ccc5eb0d9b6f80b7d18a24c497d57ea987ed7b019963ac0ea089fb53b97",
       "dependency_kind": "dev",
-      "release_tag": "cortexkit-role-tool-provider-conformance-v0.5.2"
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.7.1"
     },
     {
       "name": "cortexkit-role-harness",
@@ -59,7 +59,9 @@
       "call_key_malformed_refused",
       "call_key_well_formed_accepted",
       "schema_pin_current_accepted",
-      "schema_pin_malformed_refused"
+      "schema_pin_malformed_refused",
+      "catalog_modes_valid",
+      "call_mode_matches_catalog"
     ],
     "skipped_cases": [
       "withdraw_unknown_call",
@@ -75,14 +77,16 @@
       "late_results_ack",
       "late_results_incarnation_change_refused",
       "crash_after_prepared_not_started",
-      "crash_after_authorized_not_started"
+      "crash_after_authorized_not_started",
+      "tool_result_content_v1_valid"
     ],
     "capabilities": [
       "disable_tool",
       "cancellation",
       "call_key",
       "schema_pin",
-      "system_text"
+      "system_text",
+      "call_modes"
     ]
   },
   "slice_b": {
@@ -136,9 +140,13 @@
       "late_results_ack",
       "late_results_incarnation_change_refused",
       "crash_after_prepared_not_started",
-      "crash_after_authorized_not_started"
+      "crash_after_authorized_not_started",
+      "catalog_modes_valid",
+      "call_mode_matches_catalog"
     ],
-    "skipped_cases": [],
+    "skipped_cases": [
+      "tool_result_content_v1_valid"
+    ],
     "capabilities": [
       "disable_tool",
       "cancellation",
@@ -148,7 +156,8 @@
       "held_calls",
       "scope_stamp",
       "late_results",
-      "approval_execution"
+      "approval_execution",
+      "call_modes"
     ]
   }
 }
