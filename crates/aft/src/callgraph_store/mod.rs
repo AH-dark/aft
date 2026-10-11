@@ -3716,6 +3716,7 @@ struct DbFileIndex {
     node_kind_by_id: HashMap<String, String>,
     module_targets: HashMap<String, Option<String>>,
     declared_module_targets: HashMap<String, Option<String>>,
+    macro_use_module_targets: BTreeSet<String>,
     reexports: Vec<ReexportIndex>,
 }
 
@@ -3748,6 +3749,7 @@ struct ProjectIndex<'a> {
 /// refreshes use the in-memory index, while cold builds query only the rows
 /// needed by the active caller from SQLite.
 trait ResolverIndex {
+    fn macro_use_modules(&self, file: &str) -> Vec<String>;
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String>;
     fn caller_data(&self, file: &str) -> Option<&FileCallData>;
     fn lang_for(&self, file: &str) -> Option<LangId>;
@@ -3771,6 +3773,11 @@ trait ResolverIndex {
 }
 
 impl ResolverIndex for ProjectIndex<'_> {
+    fn macro_use_modules(&self, file: &str) -> Vec<String> {
+        self.file_index(file)
+            .map(|index| index.macro_use_module_targets.iter().cloned().collect())
+            .unwrap_or_default()
+    }
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
         let paths = FactPaths {
             root: &self.project_root,
@@ -4176,6 +4183,11 @@ impl DiskProjectIndex<'_> {
 }
 
 impl ResolverIndex for DiskProjectIndex<'_> {
+    fn macro_use_modules(&self, file: &str) -> Vec<String> {
+        self.file_index(file)
+            .map(|index| index.macro_use_module_targets.iter().cloned().collect())
+            .unwrap_or_default()
+    }
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
         let disk = DiskFacts::new(self.project_root);
         let paths = FactPaths {
@@ -10210,7 +10222,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v14-go-package-initializers-rust-aliases";
+const BUILD_OUTPUT_VERSION: &str = "v15-nested-use-macro-imports-go-init-callbacks";
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
@@ -12387,7 +12399,11 @@ fn build_rust_module_refs(
                     caller_file: rel_path.to_string(),
                     kind: "module".to_string(),
                     short_name: Some(module_name.clone()),
-                    full_ref: Some(module_name.clone()),
+                    full_ref: Some(if rust_module_has_macro_use(source, node) {
+                        format!("#[macro_use] mod {module_name};")
+                    } else {
+                        module_name.clone()
+                    }),
                     module_path: Some(module_name.clone()),
                     import_kind: Some("module".to_string()),
                     local_name: Some(module_name.clone()),
@@ -12529,6 +12545,29 @@ fn rust_module_path_override<'a>(source: &'a str, module: Node<'_>) -> Option<&'
     None
 }
 
+pub(super) fn rust_module_has_macro_use(source: &str, module: Node<'_>) -> bool {
+    let mut previous = module.prev_sibling();
+    while let Some(attribute) = previous {
+        if matches!(attribute.kind(), "line_comment" | "block_comment") {
+            previous = attribute.prev_sibling();
+            continue;
+        }
+        if attribute.kind() != "attribute_item" {
+            break;
+        }
+        if node_text(attribute, source)
+            .trim()
+            .strip_prefix("#[")
+            .and_then(|body| body.strip_suffix(']'))
+            .is_some_and(|body| body.trim() == "macro_use")
+        {
+            return true;
+        }
+        previous = attribute.prev_sibling();
+    }
+    false
+}
+
 fn rust_path_attribute(attribute: &str) -> Option<&str> {
     let body = attribute.trim().strip_prefix("#[")?.strip_suffix(']')?;
     let (name, value) = body.split_once('=')?;
@@ -12551,18 +12590,18 @@ fn extend_rust_imports_with_nested_uses(source: &str, data: &mut FileCallData) {
 }
 
 fn extend_rust_imports_from_tree(source: &str, root: Node<'_>, data: &mut FileCallData) {
-    let mut seen = data
-        .import_block
-        .imports
-        .iter()
-        .map(|import| (import.byte_range.start, import.byte_range.end))
-        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
     let mut nested_imports = Vec::new();
     collect_rust_use_imports(source, root, &mut seen, &mut nested_imports);
     if nested_imports.is_empty() {
         return;
     }
 
+    // Replace use declarations with their leaf bindings once, at extraction.
+    // Other import forms retain their original representation.
+    data.import_block
+        .imports
+        .retain(|import| !seen.contains(&(import.byte_range.start, import.byte_range.end)));
     data.import_block.imports.extend(nested_imports);
     data.import_block
         .imports
@@ -12580,7 +12619,31 @@ fn collect_rust_use_imports(
         let range = node.byte_range();
         if seen.insert((range.start, range.end)) {
             if let Some(import) = rust_import_from_use_node(source, node) {
-                imports.push(import);
+                let paths = node
+                    .child_by_field_name("argument")
+                    .map(|argument| rust_use_leaf_paths(source, argument))
+                    .unwrap_or_default();
+                if paths.is_empty() {
+                    imports.push(import);
+                } else {
+                    for (path, range) in paths {
+                        let mut leaf = import.clone();
+                        leaf.byte_range = range;
+                        leaf.module_path = path.clone();
+                        leaf.raw_text = format!(
+                            "{}use {path};",
+                            leaf.default_import
+                                .as_ref()
+                                .map(|v| format!("{v} "))
+                                .unwrap_or_default()
+                        );
+                        leaf.names = Vec::new();
+                        if let ImportForm::RustUse { named, .. } = &mut leaf.form {
+                            named.clear();
+                        }
+                        imports.push(leaf);
+                    }
+                }
             }
         }
     }
@@ -12619,6 +12682,80 @@ fn rust_import_from_use_node(source: &str, node: Node<'_>) -> Option<ImportState
             named: names,
         },
     })
+}
+
+fn rust_use_leaf_paths(source: &str, root: Node<'_>) -> Vec<(String, std::ops::Range<usize>)> {
+    fn path_text(source: &str, node: Node<'_>) -> String {
+        if node.kind() == "scoped_identifier" {
+            let prefix = node
+                .child_by_field_name("path")
+                .map(|path| path_text(source, path))
+                .unwrap_or_default();
+            let name = node
+                .child_by_field_name("name")
+                .map(|name| node_text(name, source))
+                .unwrap_or_default();
+            format!("{prefix}::{name}")
+        } else {
+            node_text(node, source).to_string()
+        }
+    }
+    fn walk(
+        source: &str,
+        node: Node<'_>,
+        prefix: &str,
+        paths: &mut Vec<(String, std::ops::Range<usize>)>,
+    ) {
+        if node.kind() == "scoped_use_list" {
+            let path = node
+                .child_by_field_name("path")
+                .map(|path| path_text(source, path))
+                .unwrap_or_default();
+            let joined = if prefix.is_empty() {
+                path
+            } else {
+                format!("{prefix}::{path}")
+            };
+            if let Some(list) = node.child_by_field_name("list") {
+                walk(source, list, &joined, paths);
+            }
+        } else if node.kind() == "use_list" {
+            for child in node.named_children(&mut node.walk()) {
+                if !matches!(child.kind(), "line_comment" | "block_comment") {
+                    walk(source, child, prefix, paths);
+                }
+            }
+        } else {
+            let (path, alias) = if node.kind() == "use_as_clause" {
+                (
+                    node.child_by_field_name("path")
+                        .map(|p| path_text(source, p))
+                        .unwrap_or_default(),
+                    node.child_by_field_name("alias")
+                        .map(|a| node_text(a, source)),
+                )
+            } else {
+                (path_text(source, node), None)
+            };
+            let mut joined = if path == "self" && !prefix.is_empty() {
+                prefix.to_string()
+            } else if prefix.is_empty() {
+                path
+            } else {
+                format!("{prefix}::{path}")
+            };
+            if let Some(alias) = alias {
+                joined.push_str(" as ");
+                joined.push_str(alias);
+            }
+            if !joined.is_empty() {
+                paths.push((joined, node.byte_range()));
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    walk(source, root, "", &mut paths);
+    paths
 }
 
 fn import_byte_range_from_imports(imports: &[ImportStatement]) -> Option<std::ops::Range<usize>> {
@@ -13484,6 +13621,18 @@ fn resolve_rust_target<I: ResolverIndex>(
     caller_data: &FileCallData,
     raw: &RawRef,
 ) -> Option<(String, String, String)> {
+    if short_name.ends_with('!') && !full_ref.contains("::") {
+        if index.node_for_symbol(caller_file, short_name).is_some() {
+            return Some((
+                "resolved_local".to_string(),
+                caller_file.to_string(),
+                short_name.to_string(),
+            ));
+        }
+        if let Some(file) = rust_macro_use_target(index, caller_file, short_name) {
+            return Some(("resolved".to_string(), file, short_name.to_string()));
+        }
+    }
     if full_ref.contains("::") {
         if let Some((target_file, target_symbol)) =
             rust_target_for_qualified(index, caller_file, full_ref, short_name, caller_data, raw)
@@ -13512,6 +13661,40 @@ fn resolve_rust_target<I: ResolverIndex>(
     }
 
     resolve_local_target(index, caller_file, full_ref, short_name, caller_data)
+}
+
+fn rust_macro_use_target<I: ResolverIndex>(
+    index: &I,
+    caller_file: &str,
+    name: &str,
+) -> Option<String> {
+    let mut scope = Some(caller_file.to_string());
+    let mut visited_scopes = BTreeSet::new();
+    while let Some(file) = scope {
+        if !visited_scopes.insert(file.clone()) {
+            break;
+        }
+        let mut queue = index.macro_use_modules(&file);
+        let mut visited_modules = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        while let Some(module) = queue.pop() {
+            if !visited_modules.insert(module.clone()) {
+                continue;
+            }
+            if index.node_for_symbol(&module, name).is_some() {
+                targets.insert(module.clone());
+            }
+            queue.extend(index.macro_use_modules(&module));
+        }
+        if targets.len() == 1 {
+            return targets.into_iter().next();
+        }
+        if !targets.is_empty() {
+            return None;
+        }
+        scope = index.module_parent(&file).map(|(parent, _)| parent);
+    }
+    None
 }
 
 fn rust_unique_file_level_function(
@@ -14663,11 +14846,13 @@ impl DbFileIndex {
             node_kind_by_id: HashMap::new(),
             module_targets: HashMap::new(),
             declared_module_targets: HashMap::new(),
+            macro_use_module_targets: BTreeSet::new(),
             reexports: Vec::new(),
         }
     }
 
     fn from_extract(project_root: &Path, extract: &FileExtract, facts: &FactPaths<'_>) -> Self {
+        let module_memo = callgraph::ModuleResolutionMemo::default();
         let mut node_by_scoped = HashMap::new();
         let mut node_by_bare = HashMap::new();
         for node in &extract.nodes {
@@ -14693,6 +14878,7 @@ impl DbFileIndex {
         }
         let mut module_targets = HashMap::new();
         let mut declared_module_targets = HashMap::new();
+        let mut macro_use_module_targets = BTreeSet::new();
         let mut reexports = Vec::new();
         for raw_ref in &extract.raw_refs {
             if !matches!(raw_ref.kind.as_str(), "import" | "reexport" | "module") {
@@ -14701,12 +14887,33 @@ impl DbFileIndex {
             let Some(module_path) = &raw_ref.module_path else {
                 continue;
             };
-            let target_file =
-                module_target_from_dependencies(project_root, &raw_ref.dependencies, facts);
+            let target_file = if extract.lang == LangId::Rust && raw_ref.kind == "reexport" {
+                // Dependency sets include parent-module candidates. Their lexical
+                // order is not Rust resolution order: retain the most-specific
+                // module target for each flattened re-export leaf.
+                module_ref_target(
+                    project_root,
+                    &extract.rel_path,
+                    &raw_ref.kind,
+                    module_path,
+                    &module_memo,
+                    facts,
+                    |file| facts.is_file(&project_root.join(file)),
+                )
+            } else {
+                module_target_from_dependencies(project_root, &raw_ref.dependencies, facts)
+            };
             module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
             if raw_ref.kind == "module" {
+                if raw_ref
+                    .full_ref
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("#[macro_use]"))
+                {
+                    macro_use_module_targets.extend(target_file.iter().cloned());
+                }
                 declared_module_targets
                     .entry(module_path.clone())
                     .or_insert_with(|| target_file.clone());
@@ -14725,6 +14932,7 @@ impl DbFileIndex {
             node_kind_by_id,
             module_targets,
             declared_module_targets,
+            macro_use_module_targets,
             reexports,
         }
     }
@@ -14848,6 +15056,14 @@ impl DbFileIndex {
             .entry(module_path.clone())
             .or_insert_with(|| target_file.clone());
         if raw.kind == "module" {
+            if raw
+                .full_ref
+                .as_deref()
+                .is_some_and(|text| text.starts_with("#[macro_use]"))
+            {
+                self.macro_use_module_targets
+                    .extend(target_file.iter().cloned());
+            }
             self.declared_module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
@@ -25211,10 +25427,13 @@ edition = "2021"
         let source = b"package main\nvar Boot = Register()\n";
         for (old_version, current_version) in [
             (
-                "callgraph-v2",
+                "callgraph-v3-package-initializers-macro-owners",
                 crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
             ),
-            ("ruled-callgraph-v3", crate::views::callgraph::PRODUCER),
+            (
+                "ruled-callgraph-v4-package-initializers-macro-owners",
+                crate::views::callgraph::PRODUCER,
+            ),
         ] {
             let old = CallgraphKey::from_bytes(source, "go", old_version).full_key();
             store
@@ -25239,6 +25458,299 @@ edition = "2021"
             .entry_point_symbols
             .get(&root.join("entry.ts"))
             .is_some_and(|roots| roots.contains("Public")));
+    }
+
+    #[test]
+    fn callgraph_go_imported_init_functions_match_legacy_and_view() {
+        for imported in [true, false] {
+            let dir = tempdir().unwrap();
+            let root = dir.path();
+            let manifest = write_file(root, "go.mod", "module example.com/app\n");
+            let import = if imported {
+                "import _ \"example.com/app/cmd\"\n"
+            } else {
+                ""
+            };
+            let main = write_file(
+                root,
+                "main.go",
+                &format!("package main\n{import}func main() {{}}\n"),
+            );
+            let cmd = write_file(root, "cmd/init.go", "package cmd\nfunc init() { Events() }\nfunc init() { OtherEvents() }\nfunc Events() {}\nfunc OtherEvents() {}\n");
+            let (_, legacy) = go_fixture_store(root, &[main.clone(), cmd.clone()]);
+            let view = callgraph_fixture_view(root, &[main, cmd, manifest]);
+            let cold = callgraph_fixture_scan(root, legacy);
+            let viewed = callgraph_fixture_scan(root, view);
+            for symbol in ["Events", "OtherEvents"] {
+                assert_eq!(
+                    callgraph_fixture_has(&cold, "items", symbol),
+                    !imported,
+                    "{cold}"
+                );
+                assert_eq!(
+                    callgraph_fixture_has(&viewed, "items", symbol),
+                    !imported,
+                    "{viewed}"
+                );
+            }
+            assert_eq!(cold["items"], viewed["items"]);
+        }
+    }
+
+    #[test]
+    fn callgraph_go_fluent_http_callback_trace_and_view_parity() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let manifest = write_file(root, "go.mod", "module example.com/app\n");
+        let main = write_file(
+            root,
+            "main.go",
+            "package main\nimport \"example.com/app/web\"\nfunc main() { web.NewRouter() }\n",
+        );
+        let router = write_file(root, "web/router.go", "package web\nimport \"net/http\"\nfunc NewRouter() { GitController(nil, nil) }\nfunc GitController(_ interface{}, r *Router) { r.Handle(\"/\", withParams(withAccess(http.HandlerFunc(GoGetHandler)))).Methods(\"GET\") }\nfunc withParams(h http.Handler) http.Handler { return h }\nfunc withAccess(h http.Handler) http.Handler { return h }\ntype Router struct{}\n");
+        let handler = write_file(
+            root,
+            "web/handler.go",
+            "package web\nfunc GoGetHandler() {}\nfunc UnregisteredHandler() {}\n",
+        );
+        let extract = build_file_extract(root, &router).unwrap();
+        assert!(extract.data.calls_by_symbol["GitController"]
+            .iter()
+            .any(|site| site.callee_name == "withParams"));
+        assert!(extract.data.value_refs_by_symbol.get("GitController").is_some_and(|sites|
+            sites.iter().any(|site| site.full_callee == "GoGetHandler")),
+            "trace: ordinary wrapper calls were extracted, but the fluent selector pruned its callback argument");
+        let (store, legacy) =
+            go_fixture_store(root, &[main.clone(), router.clone(), handler.clone()]);
+        let status: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM refs WHERE kind='value_ref' AND full_ref='GoGetHandler'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "resolved");
+        let view = callgraph_fixture_view(root, &[main, router, handler, manifest]);
+        for snapshot in [&legacy, &view] {
+            assert!(snapshot
+                .outbound_calls
+                .iter()
+                .any(|call| call.caller_symbol == "GitController"
+                    && call.provenance == "value_ref"
+                    && call.target.ends_with("handler.go::GoGetHandler")));
+        }
+        let cold = callgraph_fixture_scan(root, legacy);
+        let viewed = callgraph_fixture_scan(root, view);
+        assert!(
+            !callgraph_fixture_has(&cold, "items", "GoGetHandler"),
+            "{cold}"
+        );
+        assert!(
+            callgraph_fixture_has(&cold, "items", "UnregisteredHandler"),
+            "{cold}"
+        );
+        assert_eq!(cold["items"], viewed["items"]);
+    }
+
+    #[test]
+    fn callgraph_rust_nested_use_tree_aliases_match_legacy_and_view() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "nested-alias-bin");
+        let main = write_file(root, "src/main.rs", "mod flags;\nuse crate::flags::{complete::{bash::generate as direct_bash}, doc::{help::{generate as direct_help}}};\nfn main() { flags::generate_complete_bash(); flags::generate_help(); flags::generate_version(); direct_bash(); direct_help(); }\n");
+        let flags = write_file(root, "src/flags.rs", "mod complete;\nmod doc;\npub(crate) use crate::flags::{complete::{bash::generate as generate_complete_bash}, doc::{help::{generate as generate_help}, version::{generate as generate_version}}};\n");
+        let complete = write_file(root, "src/flags/complete.rs", "pub(crate) mod bash;\n");
+        let bash = write_file(
+            root,
+            "src/flags/complete/bash.rs",
+            "pub(crate) fn generate() {}\npub(crate) fn spare() {}\n",
+        );
+        let doc = write_file(
+            root,
+            "src/flags/doc.rs",
+            "pub(crate) mod help;\npub(crate) mod version;\n",
+        );
+        let help = write_file(
+            root,
+            "src/flags/doc/help.rs",
+            "pub(crate) fn generate() { lookup(); }\npub(crate) fn lookup() {}\n",
+        );
+        let version = write_file(
+            root,
+            "src/flags/doc/version.rs",
+            "pub(crate) fn generate() { digits(); }\npub(crate) fn digits() {}\n",
+        );
+        let files = vec![main, flags, complete, bash, doc, help, version];
+        let (store, legacy) = go_fixture_store(root, &files);
+        assert_direct_caller(
+            &store,
+            "src/flags/complete/bash.rs",
+            "generate",
+            "src/main.rs",
+            "main",
+        );
+        let mut inputs = files;
+        inputs.push(root.join("Cargo.toml"));
+        let view = callgraph_fixture_view(root, &inputs);
+        assert!(
+            view.outbound_calls
+                .iter()
+                .any(|call| call.caller_symbol == "main"
+                    && call.target.ends_with("complete/bash.rs::generate")),
+            "nested alias view trace: {:?}",
+            view.outbound_calls
+        );
+        let cold = callgraph_fixture_scan(root, legacy);
+        let viewed = callgraph_fixture_scan(root, view);
+        for symbol in ["generate", "lookup", "digits"] {
+            assert!(!callgraph_fixture_has(&cold, "items", symbol), "{cold}");
+        }
+        assert!(callgraph_fixture_has(&cold, "items", "spare"), "{cold}");
+        assert_eq!(cold["items"], viewed["items"]);
+    }
+
+    #[test]
+    fn callgraph_rust_cross_file_exported_nested_macros_match_legacy_and_view() {
+        for invoked in [true, false] {
+            let dir = tempdir().unwrap();
+            let root = dir.path();
+            write_rust_manifest(root, "cross-file-macro-bin");
+            let invocation = if invoked { "outer!();" } else { "" };
+            let main = write_file(
+                root,
+                "src/main.rs",
+                &format!("#[macro_use]\nmod messages;\nfn main() {{ {invocation} }}\n"),
+            );
+            let messages = write_file(root, "src/messages.rs", "#[macro_export]\nmacro_rules! inner { () => { crate::messages::helper(); } }\n#[macro_export]\nmacro_rules! outer { () => { inner!(); crate::messages::other_helper(); } }\npub(crate) fn helper() {}\npub(crate) fn other_helper() {}\npub(crate) fn spare() {}\n");
+            let trace = build_file_extract(root, &messages).unwrap();
+            assert!(
+                trace
+                    .data
+                    .macro_body_calls_by_macro
+                    .get("outer!")
+                    .is_some_and(|sites| sites.iter().any(|site| site.callee_name == "inner!")),
+                "nested macro extraction trace: {:?}",
+                trace.data.macro_body_calls_by_macro
+            );
+            let (_, legacy) = go_fixture_store(root, &[main.clone(), messages.clone()]);
+            let view = callgraph_fixture_view(root, &[main, messages, root.join("Cargo.toml")]);
+            for (surface, snapshot) in [("legacy", &legacy), ("view", &view)] {
+                assert!(
+                    snapshot
+                        .outbound_calls
+                        .iter()
+                        .any(|call| call.caller_symbol == "outer!"
+                            && call.target.ends_with("::inner!")),
+                    "nested macro {surface} trace: {:?}",
+                    snapshot.outbound_calls
+                );
+            }
+            let cold = callgraph_fixture_scan(root, legacy);
+            let viewed = callgraph_fixture_scan(root, view);
+            for symbol in ["helper", "other_helper"] {
+                assert_eq!(
+                    callgraph_fixture_has(&cold, "items", symbol),
+                    !invoked,
+                    "{cold}"
+                );
+                assert_eq!(
+                    callgraph_fixture_has(&viewed, "items", symbol),
+                    !invoked,
+                    "{viewed}"
+                );
+            }
+            assert!(callgraph_fixture_has(&cold, "items", "spare"), "{cold}");
+            assert_eq!(cold["items"], viewed["items"]);
+        }
+    }
+
+    #[test]
+    fn callgraph_view_collision_keys_are_stable_and_previous_rows_are_refused() {
+        let source = "#[macro_export]\nmacro_rules! outer { () => { helper(); other_helper(); } }\npub(crate) fn helper() {}\npub(crate) fn other_helper() {}\npub(crate) fn anchor() { helper(); }\n";
+        let blob = join::CallgraphBlob::extract(source, "rust", crate::views::callgraph::PRODUCER)
+            .unwrap();
+        let repeated =
+            join::CallgraphBlob::extract(source, "rust", crate::views::callgraph::PRODUCER)
+                .unwrap();
+        let parse = blob.parse().unwrap();
+        let keys = parse.reference_keys();
+        assert_eq!(keys, repeated.parse().unwrap().reference_keys());
+        assert_eq!(keys.len(), keys.iter().collect::<BTreeSet<_>>().len());
+        let mut counts = BTreeMap::new();
+        for reference in &parse.refs {
+            *counts.entry(reference.ordinal).or_insert(0usize) += 1;
+        }
+        assert!(counts.values().any(|count| *count > 1));
+        assert!(counts.values().any(|count| *count == 1));
+        for (reference, key) in parse.refs.iter().zip(&keys) {
+            if counts[&reference.ordinal] == 1 {
+                assert_eq!(*key, reference.ordinal);
+            }
+        }
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_rust_manifest(root, "old-reference-view");
+        let main = write_file(
+            root,
+            "src/main.rs",
+            "#[macro_use]\nmod macros;\nfn main() { outer!(); }\n",
+        );
+        let macros = write_file(root, "src/macros.rs", source);
+        let snapshot = callgraph_fixture_view(root, &[main, macros, root.join("Cargo.toml")]);
+        assert_eq!(
+            snapshot
+                .outbound_calls
+                .iter()
+                .filter(|c| c.caller_symbol == "outer!")
+                .count(),
+            2
+        );
+        let views = root.join("views");
+        let database = manifest_view_database_path(&views, "parity").unwrap();
+        let conn = Connection::open(&database).unwrap();
+        let old_ordinal = parse
+            .refs
+            .iter()
+            .find(|r| r.caller_symbol.as_deref() == Some("outer!"))
+            .unwrap()
+            .ordinal;
+        let old_id = format!("view:src/macros.rs:{old_ordinal}");
+        conn.execute("DELETE FROM refs WHERE caller_file='src/macros.rs'", [])
+            .unwrap();
+        conn.execute("INSERT INTO refs(ref_id,caller_file,kind,full_ref,line,byte_start,byte_end,status,provenance) VALUES (?1,'src/macros.rs','call','old_scheme_only',1,0,0,'resolved','treesitter+resolver')", [&old_id]).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT full_ref FROM refs WHERE ref_id=?1",
+                [&old_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "old_scheme_only"
+        );
+        conn.execute(
+            "UPDATE meta SET v=?1 WHERE k='fingerprint'",
+            [schema_fingerprint_for(
+                "v14-go-package-initializers-rust-aliases",
+            )],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            matches!(
+                ReadonlyCallGraphStore::open_manifest_view(
+                    root.to_path_buf(),
+                    "parity".into(),
+                    views,
+                    "parity",
+                    None
+                ),
+                Err(CallGraphStoreError::Unavailable(_))
+            ),
+            "previous reference-ID scheme must be rebuilt before any current view read"
+        );
     }
 
     #[test]
@@ -26015,6 +26527,7 @@ mod reexport_resolution_tests {
             node_kind_by_id: HashMap::new(),
             module_targets: HashMap::new(),
             declared_module_targets: HashMap::new(),
+            macro_use_module_targets: BTreeSet::new(),
             reexports: reexport_targets
                 .iter()
                 .map(|target| ReexportIndex {

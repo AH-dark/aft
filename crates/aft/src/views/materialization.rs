@@ -1454,13 +1454,14 @@ impl EmissionParse {
         let refs_by_ordinal = blob
             .parse()
             .into_iter()
-            .flat_map(|parse| parse.refs.iter().enumerate())
-            .fold(HashMap::new(), |mut by_ordinal, (position, reference)| {
-                // Match the cold writer's original first-reference lookup when
-                // structural references share an AST ordinal.
-                by_ordinal.entry(reference.ordinal).or_insert(position);
-                by_ordinal
-            });
+            .flat_map(|parse| parse.reference_keys().into_iter().enumerate())
+            .fold(
+                HashMap::new(),
+                |mut by_ordinal, (position, reference_key)| {
+                    by_ordinal.insert(reference_key, position);
+                    by_ordinal
+                },
+            );
         Self {
             blob,
             refs_by_ordinal,
