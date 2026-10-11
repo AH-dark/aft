@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { posix, resolve, win32 } from "node:path";
 
 /**
  * The single TypeScript project-root canonicalizer, mirroring the Rust
@@ -24,7 +24,7 @@ import { resolve } from "node:path";
  * scope always agree for the same project.
  */
 export function canonicalizeProjectRoot(dir: string): string {
-  const trimmed = dir.replace(/[/\\]+$/, "");
+  const trimmed = trimProjectRootSeparators(dir);
   let canonical: string;
   try {
     canonical = realpathSync(trimmed);
@@ -32,6 +32,13 @@ export function canonicalizeProjectRoot(dir: string): string {
     canonical = resolve(trimmed);
   }
   return normalizeWindowsRoot(canonical);
+}
+
+/** Keep the parser's root separator: removing it changes an absolute root into a cwd-relative path. */
+export function trimProjectRootSeparators(dir: string, platform = process.platform): string {
+  const root = (platform === "win32" ? win32 : posix).parse(dir).root;
+  const trimmed = dir.replace(/[/\\]+$/, "");
+  return trimmed.length < root.length ? root : trimmed;
 }
 
 /**
