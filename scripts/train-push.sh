@@ -222,7 +222,7 @@ red_is_skew() {
     # failure from changing an ordinary red result into an unknown verdict.
     # GitHub job logs often contain ANSI color escapes, which gh must allow.
     if job_log="$(gh_query_or_refuse "log for CI run $run_id job $job_id" "$OPERATOR_GH" \
-      run view --repo "$repo_slug" --job "$job_id" --log --allow-escape-sequences)"; then
+      api --allow-escape-sequences "repos/$repo_slug/actions/jobs/$job_id/logs")"; then
       if printf '%s\n' "$job_log" | skew_log_tail; then
         return 0
       fi

@@ -83,6 +83,23 @@ if [ "${1:-}" = "run" ] && [ "${2:-}" = "rerun" ]; then
   exit 0
 fi
 
+# `gh run view` has its own option set; reject API-only flags instead of letting
+# this fixture silently accept a command that real gh would refuse.
+if [ "${1:-}" = "run" ] && [ "${2:-}" = "view" ]; then
+  option_value=""
+  for arg in "$@"; do
+    if [ -n "$option_value" ]; then
+      option_value=""
+      continue
+    fi
+    case "$arg" in
+      --repo|--json|--jq|--attempt|--job) option_value="$arg" ;;
+      --log|--log-failed|--exit-status|--verbose|--web) ;;
+      --*) echo "unknown flag: $arg" >&2; exit 2 ;;
+    esac
+  done
+fi
+
 hook="$STATE/on-watch.sh"
 if [ -x "$hook" ]; then
   mv "$hook" "$STATE/on-watch.running"
@@ -111,8 +128,8 @@ if [ "$log_failed" -eq 1 ]; then
   exit 0
 fi
 
-# Job log (`run view --job <id> --log`): the fixture's log_tail file stands in
-# for the failing job's whole log; the script judges only its last lines.
+# Keep a response for `run view --job <id> --log` so the fake can expose any
+# regression that bypasses the logs API route assertion.
 job_id=""
 for arg in "$@"; do
   [ "$prev" = "--job" ] && job_id="$arg"
@@ -127,8 +144,22 @@ if [ -n "$job_id" ]; then
   exit 0
 fi
 
-# The jobs API the skew check reads step names from.
+# The jobs API supplies failed step names; the logs endpoint supplies output.
 if [ "${1:-}" = "api" ]; then
+  api_path=""
+  for arg in "$@"; do
+    case "$arg" in
+      repos/*/actions/jobs/*/logs) api_path="$arg" ;;
+    esac
+  done
+  if [ -n "$api_path" ]; then
+    if [ -f "$STATE/fail_job_log" ]; then
+      echo 'HTTP 500: job log unavailable' >&2
+      exit 1
+    fi
+    cat "$STATE/log_tail" 2>/dev/null || true
+    exit 0
+  fi
   cat "$STATE/job_steps" 2>/dev/null || true
   exit 0
 fi
@@ -1210,10 +1241,11 @@ test_skew_log_query_fallback() {
   else
     fail "a failed skew-log query skips classification and preserves the ordinary CI-red exit (rc=$LAST_RC)"
   fi
-  if grep -q -- '--allow-escape-sequences' "$dir/ci-state/gh-calls"; then
-    ok 'the skew-log query permits ANSI escape sequences'
+  if grep -Fq -- 'api --allow-escape-sequences repos/example/repo/actions/jobs/9007/logs' \
+    "$dir/ci-state/gh-calls"; then
+    ok 'the failed skew-log query uses gh api with ANSI escapes allowed'
   else
-    fail 'the skew-log query permits ANSI escape sequences'
+    fail 'the failed skew-log query uses gh api with ANSI escapes allowed'
   fi
 }
 
@@ -1571,11 +1603,17 @@ add_train_commit "$dir/work" "skew-log"
 echo "Build and test (macOS)|9004" > "$dir/ci-state/failed_job"
 echo "failure" > "$dir/ci-state/conclusion"
 printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
-printf 'compile ok\nunit tests ok\nerror: Cargo.lock has drifted from the committed manifests; run cargo update -w\n' > "$dir/ci-state/log_tail"
+printf 'compile ok\nunit tests ok\n\033[31merror: Cargo.lock has drifted from the committed manifests; run cargo update -w\033[0m\n' > "$dir/ci-state/log_tail"
 run_train "$dir" skew-log
 expect_rc 1 "a log-tail skew red exits 1"
 expect_out "red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry" \
   "a lockfile drift line in the failing log's tail is classed as skew"
+if grep -Fq -- 'api --allow-escape-sequences repos/example/repo/actions/jobs/9004/logs' \
+  "$dir/ci-state/gh-calls"; then
+  ok "ANSI-colored job logs are read through gh api with escape sequences allowed"
+else
+  fail "ANSI-colored job logs are read through gh api with escape sequences allowed"
+fi
 
 # --- red that is a plain test failure: never classed as skew ----------------
 dir="$(new_fixture skew-not)"
