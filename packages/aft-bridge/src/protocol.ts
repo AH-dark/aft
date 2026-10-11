@@ -172,3 +172,20 @@ export interface BgCompletion {
   live_descendants_omitted?: number;
   live_descendants_summary?: string;
 }
+
+const TERMINAL_BASH_STATUSES = new Set([
+  "completed",
+  "failed",
+  "killed",
+  "timed_out",
+  "fate_unknown",
+]);
+
+/** Daemon terminal states; standalone compatibility callers can opt into historical aliases. */
+export function isTerminalBashStatus(status: unknown, compatibilityAliases = false): boolean {
+  return (
+    typeof status === "string" &&
+    (TERMINAL_BASH_STATUSES.has(status) ||
+      (compatibilityAliases && (status === "cancelled" || status === "timeout")))
+  );
+}

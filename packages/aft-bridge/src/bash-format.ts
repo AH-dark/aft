@@ -1,6 +1,8 @@
 /** Shared pure formatting helpers for host bash tool wrappers. */
 
 /** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
+import { isTerminalBashStatus } from "./protocol.js";
+
 export function formatSeconds(ms: number): string {
   return `${Number((ms / 1000).toFixed(1))}s`;
 }
@@ -30,13 +32,7 @@ export function formatForegroundResult(data: Record<string, unknown>): string {
 }
 
 export function isTerminalStatus(status: unknown): boolean {
-  return (
-    status === "completed" ||
-    status === "failed" ||
-    status === "killed" ||
-    status === "timed_out" ||
-    status === "fate_unknown"
-  );
+  return isTerminalBashStatus(status);
 }
 
 export function sleep(ms: number): Promise<void> {

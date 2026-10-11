@@ -491,7 +491,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
     onBashCompletion: (completion, bridge) => {
       const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
-      void handlePushedBgCompletion(
+      return handlePushedBgCompletion(
         {
           ctx,
           directory,
@@ -503,7 +503,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
     onBashLongRunning: (reminder, bridge) => {
       const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
-      void handlePushedBgLongRunning(
+      return handlePushedBgLongRunning(
         {
           ctx,
           directory,
@@ -516,7 +516,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     onBashPatternMatch: (frame, bridge) => {
       const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
       const liveSession = getActiveSessionId();
-      void handlePushedPatternMatch(
+      return handlePushedPatternMatch(
         {
           ctx,
           directory,

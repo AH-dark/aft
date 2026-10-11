@@ -371,7 +371,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // from that bridge, so draining/acking against a session-dir cache fallback
       // can target the wrong project on cold/stale cache.
       const sessionDir = bridge.getCwd();
-      void handlePushedBgCompletion(
+      return handlePushedBgCompletion(
         {
           ctx,
           directory: sessionDir,
@@ -383,7 +383,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     },
     onBashLongRunning: (reminder, bridge) => {
       const sessionDir = bridge.getCwd();
-      void handlePushedBgLongRunning(
+      return handlePushedBgLongRunning(
         {
           ctx,
           directory: sessionDir,
@@ -396,7 +396,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     onBashPatternMatch: (frame, bridge) => {
       const sessionDir = bridge.getCwd();
       const liveSession = getActiveSessionId();
-      void handlePushedPatternMatch(
+      return handlePushedPatternMatch(
         {
           ctx,
           directory: sessionDir,

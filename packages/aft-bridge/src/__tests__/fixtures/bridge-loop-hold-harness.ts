@@ -12,7 +12,7 @@
  *   HARNESS_MODE    "idle": one call completes, then the script ends with the
  *                   warm child still running;
  *                   "busy-gap": the first call is still in flight while the
- *                   bridge awaits the host's configure-warnings handler, which
+ *                   bridge awaits a version-check test gate, which
  *                   settles only when the stub pushes a status frame a second
  *                   later; no request timer is armed during that wait.
  *                   The bridge is shut down after the call, so this mode's
@@ -44,19 +44,24 @@ async function main(): Promise<void> {
   bridge = new BinaryBridge(binaryPath as string, process.cwd(), {
     timeoutMs: 20_000,
     maxRestarts: 0,
-    onConfigureWarnings: () =>
+
+    onBashCompletion: (completion) => {
+      emit("bash-completed", `task=${String(completion.task_id)}`);
+    },
+  });
+
+  if (mode === "busy-gap") {
+    // Version checking remains in the readiness barrier; host notifications do not.
+    (bridge as any).checkVersion = () =>
       new Promise<void>((resolve) => {
-        emit("configure-warnings-waiting");
+        emit("version-check-waiting");
         const unsubscribe = bridge.subscribeStatus(() => {
           unsubscribe();
           emit("status-frame");
           resolve();
         });
-      }),
-    onBashCompletion: (completion) => {
-      emit("bash-completed", `task=${String(completion.task_id)}`);
-    },
-  });
+      });
+  }
 
   const response =
     mode === "background-task"
