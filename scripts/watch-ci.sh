@@ -40,9 +40,9 @@ if [ -z "${REPO:-}" ]; then
     exit 2
   }
 fi
-# Which workflow gates a landing. A sha can carry runs from several workflows
-# (cost-gate, testbox), so resolving a run BY SHA has to name the gating one or
-# it can latch a run that says nothing about the tests.
+# Which workflow gates a landing. A sha can carry runs from several workflows,
+# so resolving a run BY SHA has to name the gating one or it can latch a run
+# that says nothing about the tests.
 WORKFLOW="${WATCH_CI_WORKFLOW:-tests.yml}"
 # Which trigger produced the run. A sha is not unique across triggers either: a
 # commit that a schedule (or workflow_dispatch) later re-ran carries several

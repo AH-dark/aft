@@ -119,6 +119,10 @@ for arg in "$@"; do
   prev="$arg"
 done
 if [ -n "$job_id" ]; then
+  if [ -f "$STATE/fail_job_log" ]; then
+    echo 'HTTP 500: job log unavailable' >&2
+    exit 1
+  fi
   cat "$STATE/log_tail" 2>/dev/null || true
   exit 0
 fi
@@ -127,6 +131,20 @@ fi
 if [ "${1:-}" = "api" ]; then
   cat "$STATE/job_steps" 2>/dev/null || true
   exit 0
+fi
+
+# Inject one transient rate-limit response, or a permanent stream of network
+# errors, only after watch-ci has completed its own green-run query.
+if [ "$json" = "databaseId,headSha,headBranch" ] && [ -f "$STATE/watch_seen" ]; then
+  if [ -f "$STATE/fail_rate_limit_once" ] && [ ! -f "$STATE/rate_limit_seen" ]; then
+    : > "$STATE/rate_limit_seen"
+    echo 'API rate limit exceeded' >&2
+    exit 1
+  fi
+  if [ -f "$STATE/fail_network_always" ]; then
+    echo 'dial tcp: i/o timeout' >&2
+    exit 1
+  fi
 fi
 
 # Fault injection: a field listed in fail_json makes the combined `run view`
@@ -138,6 +156,7 @@ if [ "${1:-}" = "run" ] && [ "${2:-}" = "view" ] && [ -f "$STATE/fail_json" ] &&
 fi
 
 if [ "$json" = "status,conclusion,jobs,url" ]; then
+  : > "$STATE/watch_seen"
   watch_status="$(cat "$STATE/watch_status" 2>/dev/null || echo completed)"
   printf '%s\n' "$watch_status" > "$STATE/recorded_status"
   if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
@@ -292,6 +311,19 @@ new_fixture() {
   cp "$SCRIPT_DIR/check-path-deps.py" "$dir/work/scripts/check-path-deps.py"
   cp "$SCRIPT_DIR/lib/operator-gh.sh" "$dir/work/scripts/lib/operator-gh.sh"
   cp "$SCRIPT_DIR/lib/workflow-gates.py" "$dir/work/scripts/lib/workflow-gates.py"
+  cat > "$dir/work/scripts/align-governed-docs.sh" <<'ALIGN'
+#!/usr/bin/env bash
+set -euo pipefail
+echo called >> "$TRAIN_PUSH_TEST_STATE/align-calls"
+printf 'fresh alignment\n' > docs/v0.49-agent-surface-manifest.json
+git add docs/v0.49-agent-surface-manifest.json
+git commit -qm "Align governed publication manifests"
+printf 'fresh release manifest\n' > docs/v0.49-release-manifest.json
+printf 'fresh release evidence\n' > docs/v0.49-release-evidence.json
+git add docs/v0.49-release-manifest.json docs/v0.49-release-evidence.json
+git commit -qm "Align release manifest and evidence"
+ALIGN
+  chmod +x "$dir/work/scripts/align-governed-docs.sh"
   git -C "$dir/work" add base.txt .github/workflows/tests.yml scripts
   git -C "$dir/work" commit -qm "base"
   git -C "$dir/work" remote add origin "$dir/origin.git"
@@ -356,6 +388,7 @@ run_train() {
       TRAIN_PUSH_TEST_BRANCH="train/${1:-}" \
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
       TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+      TRAIN_PUSH_GH_RETRY_DELAYS="${TRAIN_PUSH_TEST_GH_RETRY_DELAYS:-30 60 120 240}" \
       WATCH_CI_RESOLVE_ATTEMPTS=1 \
        WATCH_CI_RESOLVE_SLEEP=0 \
        WATCH_CI_POLL_SLEEP=0.02 \
@@ -691,6 +724,107 @@ PY
   [ -f "$dir/child/parent-fix.txt" ] || fail "restack lost the parent's fix"
 }
 
+test_stack_align_restack() {
+  local dir pid new_parent old_align_one old_align_two hand_subject old_child child_sha pushed
+  dir="$(stack_child_fixture stack-align)"
+  mkdir -p "$dir/child/docs"
+  printf 'child manifest\n' > "$dir/child/docs/v0.49-agent-surface-manifest.json"
+  git -C "$dir/child" add docs/v0.49-agent-surface-manifest.json
+  git -C "$dir/child" commit -qm "Align governed publication manifests"
+  old_align_one="$(git -C "$dir/child" rev-parse HEAD)"
+  printf 'child release manifest\n' > "$dir/child/docs/v0.49-release-manifest.json"
+  git -C "$dir/child" add docs/v0.49-release-manifest.json
+  git -C "$dir/child" commit -qm "Align release manifest and evidence"
+  old_align_two="$(git -C "$dir/child" rev-parse HEAD)"
+  printf 'manual work\n' > "$dir/child/manual.txt"
+  git -C "$dir/child" add manual.txt
+  git -C "$dir/child" commit -qm "Align governed publication manifests"
+
+  # Record the original parent base and let the child finish its first CI run.
+  TRAIN_PUSH_TEST_PARENT_ATTEMPTS=2 start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+
+  # The new parent tip changes the same governed files as both generated commits.
+  mkdir -p "$dir/parent/docs"
+  printf 'parent manifest\n' > "$dir/parent/docs/v0.49-agent-surface-manifest.json"
+  printf 'parent release manifest\n' > "$dir/parent/docs/v0.49-release-manifest.json"
+  git -C "$dir/parent" add docs/v0.49-agent-surface-manifest.json docs/v0.49-release-manifest.json
+  git -C "$dir/parent" commit -qm "parent: refresh governed manifests"
+  new_parent="$(git -C "$dir/parent" rev-parse HEAD)"
+  git -C "$dir/parent" push -q origin HEAD:refs/heads/train/parent
+  complete_stack_ci "$dir" parent success
+  TRAIN_PUSH_TEST_CWD="$dir/parent" run_train "$dir" parent --land
+  expect_rc 0 "parent with refreshed governed manifests lands before child restack"
+
+  rm -f "$dir/child.rc" "$dir/child.out"
+  rm -f "$dir/ci-state/runs"/*.json
+  old_child="$(git -C "$dir/child" rev-parse HEAD)"
+  start_stack_train "$dir" child child --restack
+  pid="$STACK_PID"
+  pushed=0
+  for _ in $(seq 1 100); do
+    child_sha="$(origin_ref "$dir" refs/heads/train/child)"
+    if [ -n "$child_sha" ] && [ "$child_sha" != "$old_child" ] &&
+      [ "$(python3 - "$dir/ci-state/runs" <<'PY'
+import json, pathlib, sys
+print(sum(json.loads(p.read_text())['branch'] == 'train/child' for p in pathlib.Path(sys.argv[1]).glob('*.json')))
+PY
+)" -gt 0 ]; then
+      pushed=1
+      break
+    fi
+    [ -f "$dir/child.rc" ] && break
+    sleep 0.02
+  done
+  if [ "$pushed" -ne 1 ]; then
+    join_stack_train "$dir" "$pid" child
+    fail "restacking conflicting generated Align commits succeeds"
+    return
+  fi
+  complete_stack_ci "$dir" child success
+  join_stack_train "$dir" "$pid" child
+  if [ "$LAST_RC" -eq 0 ]; then
+    ok "restacking conflicting generated Align commits succeeds"
+  else
+    fail "restacking conflicting generated Align commits succeeds"
+    return
+  fi
+  [ "$(python3 - "$dir/child" "$new_parent" <<'PY'
+import subprocess, sys
+repo, base = sys.argv[1:]
+allowed = {
+    'docs/v0.49-agent-prefix-capture.json',
+    'docs/v0.49-agent-surface-manifest.json',
+    'docs/v0.49-legacy-vocabulary-allowlist.json',
+    'docs/v0.49-release-evidence.json',
+    'docs/v0.49-release-manifest.json',
+}
+commits = subprocess.check_output(['git', '-C', repo, 'rev-list', '--reverse', f'{base}..HEAD'], text=True).splitlines()
+count = 0
+for commit in commits:
+    subject = subprocess.check_output(['git', '-C', repo, 'show', '-s', '--format=%s', commit], text=True).strip()
+    paths = subprocess.check_output(['git', '-C', repo, 'diff-tree', '--root', '--no-commit-id', '--no-renames', '--name-only', '-r', commit], text=True).splitlines()
+    if subject in {'Align governed publication manifests', 'Align release manifest and evidence'} and paths and set(paths) <= allowed:
+        count += 1
+print(count)
+PY
+)" = 1 ] ||
+    fail "restack leaves exactly one fresh Align commit"
+  [ "$(cat "$dir/ci-state/align-calls" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] ||
+    fail "restack runs governed-doc alignment exactly once"
+  hand_subject="$(git -C "$dir/child" log -1 --format=%s HEAD -- manual.txt)"
+  if [ -f "$dir/child/manual.txt" ] && [ "$hand_subject" = "Align governed publication manifests" ]; then
+    ok "an exact-subject hand commit touching an ungoverned file is retained"
+  else
+    fail "an exact-subject hand commit touching an ungoverned file is retained"
+  fi
+  ! git -C "$dir/child" merge-base --is-ancestor "$old_align_one" HEAD &&
+    ! git -C "$dir/child" merge-base --is-ancestor "$old_align_two" HEAD ||
+    fail "the old generated Align commits are not replayed"
+}
+
 test_stack_chain() {
   local dir base p1 p2 p3 s1 s2 s3
   dir="$(new_stack_fixture stack-chain)"
@@ -1024,6 +1158,7 @@ run_stack_tests() {
   test_stack_base_not_on_main
   test_stack_parent_red
   test_stack_changed_parent
+  test_stack_align_restack
   test_stack_abandoned_parent
   test_stack_name_lock
   test_stack_name_lock_recovery
@@ -1035,10 +1170,61 @@ run_stack_tests() {
   test_stack_chain
   test_ci_conclusion_guard
 }
+
+test_skew_log_query_fallback() {
+  local dir
+  dir="$(new_fixture skew-log-query-fallback)"
+  add_train_commit "$dir/work" skew-log-query-fallback
+  echo 'Unit (ubuntu-latest)|9007' > "$dir/ci-state/failed_job"
+  echo failure > "$dir/ci-state/conclusion"
+  printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+  : > "$dir/ci-state/fail_job_log"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' run_train "$dir" skew-log-query-fallback
+  if [ "$LAST_RC" -eq 1 ] && [[ "$LAST_OUT" == *'skew check skipped'* ]] &&
+    [[ "$LAST_OUT" == *'Unit (ubuntu-latest)'* ]] &&
+    [[ "$LAST_OUT" != *'version/lock skew'* ]]; then
+    ok 'a failed skew-log query skips classification and preserves the ordinary CI-red exit'
+  else
+    fail "a failed skew-log query skips classification and preserves the ordinary CI-red exit (rc=$LAST_RC)"
+  fi
+  if grep -q -- '--allow-escape-sequences' "$dir/ci-state/gh-calls"; then
+    ok 'the skew-log query permits ANSI escape sequences'
+  else
+    fail 'the skew-log query permits ANSI escape sequences'
+  fi
+}
+
+test_gh_query_retry() {
+  local dir query_count
+
+  dir="$(new_fixture gh-rate-limit-retry)"
+  add_train_commit "$dir/work" gh-rate-limit-retry
+  : > "$dir/ci-state/fail_rate_limit_once"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' run_train "$dir" gh-rate-limit-retry
+  if [ "$LAST_RC" -eq 0 ] && [[ "$LAST_OUT" == *'failed transiently; retrying (attempt 2 of 5 after 0s)'* ]]; then
+    ok 'a GitHub rate-limit response retries and the successful query can land'
+  else
+    fail "a GitHub rate-limit response retries and the successful query can land (rc=$LAST_RC)"
+  fi
+
+  dir="$(new_fixture gh-network-retry)"
+  add_train_commit "$dir/work" gh-network-retry
+  : > "$dir/ci-state/fail_network_always"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' run_train "$dir" gh-network-retry
+  query_count="$(grep -c -- '--json databaseId,headSha,headBranch' "$dir/ci-state/gh-calls")"
+  if [ "$LAST_RC" -eq 5 ] && [[ "$LAST_OUT" == *'could not query CI runs for'* ]] &&
+    [[ "$LAST_OUT" == *'dial tcp: i/o timeout'* ]] && [ "$query_count" -eq 6 ]; then
+    ok 'a persistent network error retries four times then exits 5 with the upstream error'
+  else
+    fail "a persistent network error retries four times then exits 5 with the upstream error (rc=$LAST_RC calls=$query_count)"
+  fi
+}
+
 case "${TRAIN_PUSH_TEST_CASE:-}" in
   stack-base) test_stack_base_not_on_main ;;
   stack-red) test_stack_parent_red ;;
   stack-changed) test_stack_changed_parent ;;
+  stack-align) test_stack_align_restack ;;
   stack-chain) test_stack_chain ;;
   stack-abandoned) test_stack_abandoned_parent ;;
   stack-name-lock) test_stack_name_lock ;;
@@ -1049,9 +1235,11 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   fetch-retry) test_fetch_race_retry ;;
   fetch-boundaries) test_fetch_failure_boundaries ;;
   ci-conclusion) test_ci_conclusion_guard ;;
+  skew-log-fallback) test_skew_log_query_fallback ;;
+  gh-retry) test_gh_query_retry ;;
   stacked) run_stack_tests ;;
 esac
-if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ]; then
+if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ]; then
   [ "$failures" = 0 ] || exit 1
   echo "train-push.test.sh: stacked cases passed ($checks checks)"
   exit 0

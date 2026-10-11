@@ -34,8 +34,7 @@
 # a live train resume at the wrong offset and die on a syntax error in code it
 # never reached - "line 789: syntax error near unexpected token `('" in a file
 # that passes `bash -n` before and after. A rename into place (new inode) leaves
-# the live run on the old bytes. Measured both ways by BROCA; AFT restored bytes
-# under a live train once. Nothing lands from such a death: it happens before
+# the live run on the old bytes. Nothing lands from such a death: it happens before
 # the landing push, and the ref left behind is the recoverable repush state.
 #
 # A MERGE IS ITSELF A TRAIN PUSH. Under required status checks, a merge commit
@@ -118,6 +117,7 @@
 #      conflicted
 #   4  CI is green, but landing failed; re-run with --land to finish without
 #      paying for another CI run
+#   5  a GitHub CLI query failed and was refused rather than treated as empty
 set -euo pipefail
 
 # Run from a private copy of this file. bash reads a script incrementally, so an
@@ -204,20 +204,33 @@ skew_log_tail() {
 red_is_skew() {
   local run_id="$1"
   local failing_pairs="$2"
-  local line job_id job_steps
+  local line job_id job_steps job_log log_rc
   if printf '%s\n' "$failing_pairs" | grep -Eqi "$skew_pattern"; then
     return 0
   fi
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     job_id="${line##*|}"
-    job_steps="$("$OPERATOR_GH" api "repos/$repo_slug/actions/jobs/$job_id" \
-      --jq '.steps[] | select(.conclusion=="failure") | .name' 2>/dev/null || true)"
+    job_steps="$(gh_query_or_refuse "failed steps for CI job $job_id" "$OPERATOR_GH" \
+      api "repos/$repo_slug/actions/jobs/$job_id" \
+      --jq '.steps[] | select(.conclusion=="failure") | .name')" || return "$?"
     if printf '%s\n' "$job_steps" | grep -Eqi "$skew_pattern"; then
       return 0
     fi
-    if "$OPERATOR_GH" run view --repo "$repo_slug" --job "$job_id" --log 2>/dev/null | skew_log_tail; then
-      return 0
+    # A log is advisory skew evidence, not the CI verdict. Give transient log
+    # failures the same bounded retry as other reads, but keep a final read
+    # failure from changing an ordinary red result into an unknown verdict.
+    # GitHub job logs often contain ANSI color escapes, which gh must allow.
+    if job_log="$(gh_query_or_refuse "log for CI run $run_id job $job_id" "$OPERATOR_GH" \
+      run view --repo "$repo_slug" --job "$job_id" --log --allow-escape-sequences)"; then
+      if printf '%s\n' "$job_log" | skew_log_tail; then
+        return 0
+      fi
+    else
+      log_rc=$?
+      [ "$log_rc" -eq 5 ] || return "$log_rc"
+      printf 'train-push: skew check skipped for CI job %s: its log could not be read after bounded retries\n' \
+        "$job_id" >&2
     fi
   done <<< "$failing_pairs"
   return 1
@@ -227,6 +240,69 @@ say() { printf 'train-push: %s\n' "$1"; }
 refuse() {
   printf 'train-push: refusing — %s\n' "$1" >&2
   exit 2
+}
+
+# A failed GitHub query is not an empty result: empty run lists and unreadable
+# conclusions have different safety meanings. Retry transient service and
+# network errors a bounded number of times, then preserve the upstream error.
+gh_query_or_refuse() {
+  local context="$1"
+  shift
+  local attempt=1 rc output diagnostic_file error_line error_text delay total_delay=0
+  local transient_error
+  local -a delays
+
+  read -r -a delays <<< "${TRAIN_PUSH_GH_RETRY_DELAYS:-30 60 120 240}"
+  if [ "${#delays[@]}" -ne 4 ]; then
+    refuse "TRAIN_PUSH_GH_RETRY_DELAYS must contain four nonnegative integers"
+  fi
+  for delay in "${delays[@]}"; do
+    [[ "$delay" =~ ^[0-9]+$ ]] ||
+      refuse "TRAIN_PUSH_GH_RETRY_DELAYS must contain four nonnegative integers"
+    total_delay=$((total_delay + delay))
+  done
+  [ "$total_delay" -le 600 ] ||
+    refuse "TRAIN_PUSH_GH_RETRY_DELAYS must total no more than 600 seconds"
+
+  transient_error='rate.?limit|secondary[[:space:]]+rate|abuse[[:space:]]+detection|http[[:space:]]+(429|5[0-9][0-9])|status[[:space:]]+code:[[:space:]]*(429|5[0-9][0-9])|network[[:space:]]+(is[[:space:]]+)?unreachable|temporary[[:space:]]+failure|could[[:space:]]+not[[:space:]]+(resolve|connect)|no[[:space:]]+such[[:space:]]+host|connection[[:space:]]+(refused|reset|closed|aborted|timed[[:space:]]+out)|timed[[:space:]]+out|timeout|context[[:space:]]+deadline[[:space:]]+exceeded|dial[[:space:]]+(tcp|udp)|failed[[:space:]]+to[[:space:]]+connect|tls[[:space:]]+handshake|unexpected[[:space:]]+eof|i/o[[:space:]]+timeout|server[[:space:]]+misbehaving|remote[[:space:]]+end[[:space:]]+hung[[:space:]]+up|broken[[:space:]]+pipe|socket[[:space:]]+hang[[:space:]]+up|proxy.*(error|failed)'
+  while :; do
+    diagnostic_file="$(mktemp "${TMPDIR:-/tmp}/train-push-gh.XXXXXX")" || {
+      printf 'train-push: could not query %s: could not create a diagnostic file\n' "$context" >&2
+      return 5
+    }
+    if output="$("$@" 2>"$diagnostic_file")"; then
+      [ ! -s "$diagnostic_file" ] || cat "$diagnostic_file" >&2
+      rm -f "$diagnostic_file"
+      printf '%s\n' "$output"
+      return 0
+    else
+      rc=$?
+    fi
+
+    error_line="$(head -n 1 "$diagnostic_file" 2>/dev/null || true)"
+    if [ -z "$error_line" ] && [ -n "$output" ]; then
+      error_line="${output%%$'\n'*}"
+    fi
+    error_line="${error_line:-gh exited $rc without an error message}"
+    error_text="$(cat "$diagnostic_file" 2>/dev/null || true)"
+    [ -z "$output" ] || error_text="$error_text $output"
+    error_text="$(printf '%s' "$error_text" | tr '[:upper:]' '[:lower:]')"
+    rm -f "$diagnostic_file"
+
+    if [[ "$error_text" =~ $transient_error ]] && [ "$attempt" -le "${#delays[@]}" ]; then
+      delay="${delays[$((attempt - 1))]}"
+      printf 'train-push: GitHub query for %s failed transiently; retrying (attempt %s of %s after %ss)\n' \
+        "$context" "$((attempt + 1))" "$((${#delays[@]} + 1))" "$delay" >&2
+      sleep "$delay" || {
+        printf 'train-push: could not query %s: sleep before retry failed\n' "$context" >&2
+        return 5
+      }
+      attempt=$((attempt + 1))
+      continue
+    fi
+    printf 'train-push: could not query %s: %s\n' "$context" "$error_line" >&2
+    return 5
+  done
 }
 
 # Linked worktrees share refs/remotes even though their HEADs are independent.
@@ -483,8 +559,7 @@ fi
 # Read the default branch off the remote. Every later message, the moved-branch
 # check and the fast-forward target all come from this one answer.
 resolve_default_branch() {
-  local ref
-  local name
+  local ref name
 
   ref="$(git -C "$REPO" symbolic-ref -q "refs/remotes/$remote/HEAD" 2>/dev/null || true)"
   name="${ref#refs/remotes/"$remote"/}"
@@ -493,20 +568,25 @@ resolve_default_branch() {
     return 0
   fi
 
-  name="$("$OPERATOR_GH" repo view "$repo_slug" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)"
+  name="$(gh_query_or_refuse "default branch for $repo_slug" "$OPERATOR_GH" \
+    repo view "$repo_slug" --json defaultBranchRef --jq '.defaultBranchRef.name')" || return "$?"
   [ -n "$name" ] || return 1
   printf '%s\n' "$name"
 }
 
 resolve_ci_run() {
   local sha="$1" branch="${2:-$train_ref}"
-  "$OPERATOR_GH" run list --repo "$repo_slug" --workflow "$tests_workflow_name" \
+  local run_ids
+  run_ids="$(gh_query_or_refuse "CI runs for $sha" "$OPERATOR_GH" run list \
+    --repo "$repo_slug" --workflow "$tests_workflow_name" \
     --event "${WATCH_CI_EVENT:-push}" --limit 40 --json databaseId,headSha,headBranch \
-    --jq ".[] | select(.headSha==\"$sha\" and .headBranch==\"$branch\") | .databaseId" 2>/dev/null | head -1
+    --jq ".[] | select(.headSha==\"$sha\" and .headBranch==\"$branch\") | .databaseId")" || return "$?"
+  printf '%s\n' "$run_ids" | sed -n '1p'
 }
 
 ci_run_attempt() {
-  "$OPERATOR_GH" run view "$1" --repo "$repo_slug" --json attempt --jq '.attempt' 2>/dev/null
+  gh_query_or_refuse "attempt for CI run $1" "$OPERATOR_GH" run view "$1" \
+    --repo "$repo_slug" --json attempt --jq '.attempt'
 }
 
 wait_for_new_run_attempt() {
@@ -516,7 +596,7 @@ wait_for_new_run_attempt() {
   local wait_seconds="${TRAIN_PUSH_RERUN_SLEEP:-2}"
   local current_attempt
   for _ in $(seq 1 "$attempts"); do
-    current_attempt="$(ci_run_attempt "$run_id" || true)"
+    current_attempt="$(ci_run_attempt "$run_id")" || return "$?"
     if [[ "$current_attempt" =~ ^[0-9]+$ ]] && [ "$current_attempt" -gt "$previous_attempt" ]; then
       printf '%s\n' "$current_attempt"
       return 0
@@ -535,8 +615,9 @@ wait_for_run_attempt_completion() {
   local wait_seconds="${TRAIN_PUSH_RERUN_WAIT_SLEEP:-10}"
   local status
   for _ in $(seq 1 "$attempts"); do
-    status="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" --attempt "$attempt" \
-      --json status --jq '.status' 2>/dev/null || true)"
+    status="$(gh_query_or_refuse "status for CI run $run_id attempt $attempt" "$OPERATOR_GH" \
+      run view "$run_id" --repo "$repo_slug" --attempt "$attempt" \
+      --json status --jq '.status')" || return "$?"
     [ "$status" = "completed" ] && return 0
     sleep "$wait_seconds"
   done
@@ -553,8 +634,9 @@ rerun_existing_run() {
   local remaining_actions
   local -a failed_job_ids=() cancelled_job_ids=()
 
-  bad_jobs="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .conclusion + "|" + (.databaseId|tostring)] | .[]' 2>/dev/null || true)"
+  bad_jobs="$(gh_query_or_refuse "jobs for CI run $run_id" "$OPERATOR_GH" \
+    run view "$run_id" --repo "$repo_slug" --json jobs \
+    --jq '[.jobs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .conclusion + "|" + (.databaseId|tostring)] | .[]')" || return "$?"
   while IFS='|' read -r conclusion job_id; do
     [ -n "$job_id" ] || continue
     case "$job_id" in *[!0-9]*) continue ;; esac
@@ -577,10 +659,10 @@ rerun_existing_run() {
       printf 'train-push: could not rerun failed jobs for run %s\n' "$run_id" >&2
       return 1
     }
-    current_attempt="$(wait_for_new_run_attempt "$run_id" "$current_attempt")" || return 1
+    current_attempt="$(wait_for_new_run_attempt "$run_id" "$current_attempt")" || return "$?"
     remaining_actions=$((remaining_actions - 1))
     if [ "$remaining_actions" -gt 0 ]; then
-      wait_for_run_attempt_completion "$run_id" "$current_attempt" || return 1
+      wait_for_run_attempt_completion "$run_id" "$current_attempt" || return "$?"
     fi
   fi
   if [ "${#cancelled_job_ids[@]}" -gt 0 ]; then
@@ -590,10 +672,10 @@ rerun_existing_run() {
         printf 'train-push: could not rerun cancelled job %s for run %s\n' "$job_id" "$run_id" >&2
         return 1
       }
-      current_attempt="$(wait_for_new_run_attempt "$run_id" "$current_attempt")" || return 1
+      current_attempt="$(wait_for_new_run_attempt "$run_id" "$current_attempt")" || return "$?"
       remaining_actions=$((remaining_actions - 1))
       if [ "$remaining_actions" -gt 0 ]; then
-        wait_for_run_attempt_completion "$run_id" "$current_attempt" || return 1
+        wait_for_run_attempt_completion "$run_id" "$current_attempt" || return "$?"
       fi
     done
   fi
@@ -601,7 +683,8 @@ rerun_existing_run() {
 }
 
 ci_run_url() {
-  "$OPERATOR_GH" run view "$1" --repo "$repo_slug" --json url --jq '.url' 2>/dev/null || true
+  gh_query_or_refuse "URL for CI run $1" "$OPERATOR_GH" run view "$1" \
+    --repo "$repo_slug" --json url --jq '.url'
 }
 
 report_existing_red() {
@@ -770,13 +853,15 @@ wait_for_parent() {
     fi
     [ -n "$tip" ] || refuse_stack "parent $parent_name is abandoned or landed at a different sha"
     [ "$tip" = "$parent_base" ] || refuse_stack "parent $parent_name changed to $tip"
-    rid="$(resolve_ci_run "$parent_base" "train/$parent_name" || true)"
+    rid="$(resolve_ci_run "$parent_base" "train/$parent_name")"
     if [ -n "$rid" ]; then
-      verdict="$("$OPERATOR_GH" run view "$rid" --repo "$repo_slug" --json status,conclusion \
-        --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+      verdict="$(gh_query_or_refuse "verdict for parent CI run $rid" "$OPERATOR_GH" \
+        run view "$rid" --repo "$repo_slug" --json status,conclusion \
+        --jq '[.status, (.conclusion // "")] | @tsv')" || return "$?"
       IFS=$'\t' read -r status conclusion <<< "$verdict"
-      bad="$("$OPERATOR_GH" run view "$rid" --repo "$repo_slug" --json jobs \
-        --jq '[.jobs[] | select(.conclusion=="failure") | .name] | join("; ")' 2>/dev/null || true)"
+      bad="$(gh_query_or_refuse "jobs for parent CI run $rid" "$OPERATOR_GH" \
+        run view "$rid" --repo "$repo_slug" --json jobs \
+        --jq '[.jobs[] | select(.conclusion=="failure") | .name] | join("; ")')" || return "$?"
       if { [ -n "$bad" ] && [ "$bad" != null ]; } ||
         { [ "$status" = completed ] && [ "$conclusion" != success ]; }; then
         refuse "parent $parent_name is red; fix and repush it, then restack $train_name (own CI green: $run_url; scripts/train-push.sh $train_name --restack)"
@@ -797,13 +882,39 @@ require_ci_success() {
   local sha="$1" rid verdict
   rid="$(resolve_ci_run "$sha")"
   [ -n "$rid" ] || refuse "no CI run resolved for tested $remote/$train_ref at $sha"
-  verdict="$("$OPERATOR_GH" run view "$rid" --repo "$repo_slug" --json status,conclusion \
-    --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+  verdict="$(gh_query_or_refuse "verdict for CI run $rid" "$OPERATOR_GH" \
+    run view "$rid" --repo "$repo_slug" --json status,conclusion \
+    --jq '[.status, (.conclusion // "")] | @tsv')" || return "$?"
   [ "$verdict" = $'completed\tsuccess' ] || refuse "CI run $rid for $sha did not conclude success; not landing"
+}
+
+is_governed_align_commit() {
+  local commit="$1" subject path count=0
+  subject="$(git -C "$REPO" show -s --format=%s "$commit")" || return 1
+  case "$subject" in
+    "Align governed publication manifests"|"Align release manifest and evidence") ;;
+    *) return 1 ;;
+  esac
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case "$path" in
+      docs/v0.49-agent-prefix-capture.json|\
+      docs/v0.49-agent-surface-manifest.json|\
+      docs/v0.49-legacy-vocabulary-allowlist.json|\
+      docs/v0.49-release-evidence.json|\
+      docs/v0.49-release-manifest.json) ;;
+      *) return 1 ;;
+    esac
+    count=$((count + 1))
+  done < <(git -C "$REPO" diff-tree --root --no-commit-id --no-renames --name-only -r "$commit")
+  [ "$count" -gt 0 ]
 }
 
 restack_child() {
   local target target_name old_base="$parent_base" merges before="$head_sha"
+  local commit align_count=0 alignment_base alignment_head new_align_count
+  local align_tmp align_drop_file align_editor
+  local -a align_drop_shas=()
   target_name="${parent_arg:-$parent_name}"
   target="$(git -C "$REPO" rev-parse --verify -q "refs/remotes/$remote/train/$target_name" || true)"
   if [ -z "$target" ]; then
@@ -816,10 +927,71 @@ restack_child() {
     refuse "cannot restack onto a train that already contains this child"
   merges="$(git -C "$REPO" rev-list --merges "$old_base..$head_sha")"
   [ -z "$merges" ] || refuse "child carries merge commit(s); not rebasing because merge-only resolutions would be lost; restack by hand"
+  for commit in $(git -C "$REPO" rev-list --reverse "$old_base..$before"); do
+    if is_governed_align_commit "$commit"; then
+      align_drop_shas+=("$commit")
+      align_count=$((align_count + 1))
+    fi
+  done
+  if [ "$align_count" -gt 0 ] && [ ! -x "$REPO/scripts/align-governed-docs.sh" ]; then
+    refuse "restack found generated Align commit(s), but scripts/align-governed-docs.sh is unavailable"
+  fi
   say "restacking $train_name: replay only $old_base..$head_sha onto $target"
-  if ! git -C "$REPO" rebase --onto "$target" "$old_base"; then
+  if [ "$align_count" -gt 0 ]; then
+    align_tmp="$(mktemp -d "${TMPDIR:-/tmp}/train-push-align.XXXXXX")"
+    align_drop_file="$align_tmp/drop-commits"
+    align_editor="$align_tmp/sequence-editor"
+    printf '%s\n' "${align_drop_shas[@]}" > "$align_drop_file"
+    cat > "$align_editor" <<'EDITOR'
+#!/usr/bin/env bash
+set -euo pipefail
+python3 - "$1" "${TRAIN_PUSH_ALIGN_DROP_FILE:?}" <<'PY'
+import pathlib, re, sys
+
+todo = pathlib.Path(sys.argv[1])
+drops = [line.strip() for line in pathlib.Path(sys.argv[2]).read_text().splitlines() if line.strip()]
+rewritten = []
+for line in todo.read_text().splitlines(keepends=True):
+    ending = line[len(line.rstrip("\r\n")):]
+    content = line[:-len(ending)] if ending else line
+    match = re.match(r"^(\s*)pick(\s+)([0-9a-f]+)(.*)$", content)
+    if match and any(commit.startswith(match.group(3)) for commit in drops):
+        content = f"{match.group(1)}drop{match.group(2)}{match.group(3)}{match.group(4)}"
+    rewritten.append(content + ending)
+todo.write_text("".join(rewritten))
+PY
+EDITOR
+    chmod +x "$align_editor"
+    if ! TRAIN_PUSH_ALIGN_DROP_FILE="$align_drop_file" GIT_SEQUENCE_EDITOR="$align_editor" \
+      git -C "$REPO" rebase -i --onto "$target" "$old_base"; then
+      rm -rf "$align_tmp"
+      git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
+      refuse "restack conflicted; rebase aborted (was $before); resolve by hand and repush"
+    fi
+    rm -rf "$align_tmp"
+  elif ! git -C "$REPO" rebase --onto "$target" "$old_base"; then
     git -C "$REPO" rebase --abort >/dev/null 2>&1 || true
     refuse "restack conflicted; rebase aborted (was $before); resolve by hand and repush"
+  fi
+  if [ "$align_count" -gt 0 ]; then
+    alignment_base="$(git -C "$REPO" rev-parse HEAD)"
+    say "regenerating governed docs after dropping $align_count generated Align commit(s)"
+    if ! (cd "$REPO" && scripts/align-governed-docs.sh); then
+      refuse "governed-doc alignment failed after restack; inspect the rebased tree before repushing"
+    fi
+    alignment_head="$(git -C "$REPO" rev-parse HEAD)"
+    if [ "$alignment_head" != "$alignment_base" ]; then
+      new_align_count=0
+      for commit in $(git -C "$REPO" rev-list --reverse "$alignment_base..$alignment_head"); do
+        is_governed_align_commit "$commit" ||
+          refuse "governed-doc alignment created an unexpected commit ($commit); inspect the rebased tree"
+        new_align_count=$((new_align_count + 1))
+      done
+      if [ "$new_align_count" -gt 1 ]; then
+        git -C "$REPO" reset --soft "$alignment_base"
+        git -C "$REPO" commit -qm "Align governed publication manifests"
+      fi
+    fi
   fi
   head_sha="$(git -C "$REPO" rev-parse HEAD)"
   [ "$head_sha" != "$before" ] || refuse "restack did not change the sha; resume with scripts/train-push.sh $train_name (same-sha CI recovery)"
@@ -874,7 +1046,14 @@ push_log="$(mktemp "${TMPDIR:-/tmp}/train-push-push.XXXXXX")"
 trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"' EXIT
 
 fetch_remote -q --prune "$remote" || refuse "git fetch $remote failed"
-default_branch="$(resolve_default_branch || true)"
+if default_branch="$(resolve_default_branch)"; then
+  :
+else
+  default_branch_rc=$?
+  [ "$default_branch_rc" -ne 1 ] ||
+    refuse "could not determine $remote's default branch (run: git remote set-head $remote -a)"
+  exit "$default_branch_rc"
+fi
 if [ -z "$default_branch" ]; then
   refuse "could not determine $remote's default branch (run: git remote set-head $remote -a)"
 fi
@@ -914,18 +1093,19 @@ if [ "$recover_existing" -eq 1 ]; then
   rerun_attempt=""
 
   if [ -n "$run_id" ]; then
-    verdict="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" \
-      --json status,conclusion --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+    verdict="$(gh_query_or_refuse "verdict for CI run $run_id" "$OPERATOR_GH" \
+      run view "$run_id" --repo "$repo_slug" \
+      --json status,conclusion --jq '[.status, (.conclusion // "")] | @tsv')" || exit "$?"
     IFS=$'\t' read -r run_status run_conclusion <<< "$verdict"
     run_url="$(ci_run_url "$run_id")"
   fi
 
   if [ "$run_status" = "completed" ] && [ "$run_conclusion" != "success" ]; then
-    old_attempt="$(ci_run_attempt "$run_id" || true)"
+    old_attempt="$(ci_run_attempt "$run_id")" || exit "$?"
     if ! [[ "$old_attempt" =~ ^[0-9]+$ ]]; then
       refuse "could not read the current attempt for completed run $run_id"
     fi
-    rerun_attempt="$(rerun_existing_run "$run_id" "$old_attempt")" || exit 1
+    rerun_attempt="$(rerun_existing_run "$run_id" "$old_attempt")" || exit "$?"
     say "sha already ran in ${run_url:-run $run_id} ($run_conclusion); rerunning its failed and cancelled jobs (attempt $rerun_attempt)"
   fi
 
@@ -1270,9 +1450,10 @@ run_trigger_probe() {
   want_name="$(sed -n 's/^name:[[:space:]]*//p' "$tests_workflow" | head -1 | sed 's/^["'"'"']//; s/["'"'"']$//')"
   [ -n "$want_name" ] || want_name="$tests_workflow"
   for _attempt in $(seq 1 "$probe_attempts"); do
-    rid="$("$OPERATOR_GH" run list --repo "$repo_slug" \
+    rid="$(gh_query_or_refuse "trigger-probe CI runs for $probe_sha" "$OPERATOR_GH" run list \
+      --repo "$repo_slug" \
       --branch "$probe_ref" --limit 20 --json databaseId,headSha,workflowName \
-      --jq ".[] | select(.headSha==\"$probe_sha\" and .workflowName==\"$want_name\") | .databaseId" 2>/dev/null | head -1)"
+      --jq ".[] | select(.headSha==\"$probe_sha\" and .workflowName==\"$want_name\") | .databaseId")" || return "$?"
     [ -n "$rid" ] && break
     sleep "$probe_sleep"
   done
@@ -1465,11 +1646,14 @@ while true; do
       # name, so the job id is read back from the run's jobs listing: the skew
       # check needs it for the failing step names and the log tail.
       run_id="$(grep -o 'run=[0-9]\+' "$watch_log" 2>/dev/null | head -1 | sed 's/^run=//' || true)"
-      [ -n "$run_id" ] || run_id="$(resolve_ci_run "$head_sha")"
+      if [ -z "$run_id" ]; then
+        run_id="$(resolve_ci_run "$head_sha")" || exit "$?"
+      fi
       failing_pairs=""
       if [ -n "$run_id" ]; then
-        failing_pairs="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" --json jobs \
-          --jq '[.jobs[] | select(.conclusion=="failure") | .name + "|" + (.databaseId|tostring)] | .[]' 2>/dev/null || true)"
+        failing_pairs="$(gh_query_or_refuse "failed jobs for CI run $run_id" "$OPERATOR_GH" \
+          run view "$run_id" --repo "$repo_slug" --json jobs \
+          --jq '[.jobs[] | select(.conclusion=="failure") | .name + "|" + (.databaseId|tostring)] | .[]')" || exit "$?"
       fi
       failing="$(printf '%s\n' "$failing_pairs" | sed 's/|.*//' | sed '/^$/d' || true)"
       if [ -n "$failing" ]; then
@@ -1488,6 +1672,9 @@ while true; do
       # amount of retrying moves a lockfile - the fix is a bump commit.
       if red_is_skew "$run_id" "$failing_pairs"; then
         printf 'red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry\n' >&2
+      else
+        skew_rc=$?
+        [ "$skew_rc" -eq 1 ] || exit "$skew_rc"
       fi
       printf 'train-push: run %s\n' "$run_url" >&2
       printf 'train-push: %s/%s still holds %s — fix, commit, and re-run: scripts/train-push.sh %s\n' \
