@@ -11542,10 +11542,11 @@ impl AppContext {
         };
         let identify = move |resolved: PathBuf| {
             if preserve_final {
-                let normalized = normalize_path(&resolved);
-                match (normalized.parent(), normalized.file_name()) {
+                // Resolve the parent before removing dot components: link/.. can
+                // name the target's parent, not the link's containing directory.
+                match (resolved.parent(), resolved.file_name()) {
                     (Some(parent), Some(name)) => policy_path(parent).join(name),
-                    _ => policy_path(&normalized),
+                    _ => policy_path(&resolved),
                 }
             } else {
                 policy_path(&resolved)

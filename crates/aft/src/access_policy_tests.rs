@@ -345,3 +345,32 @@ fn access_policy_restricted_floor_refusal_keeps_legacy_bytes() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn access_policy_preserved_location_resolves_parent_before_dotdot() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("worktree");
+    let store = fixture.path().join("store");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir_all(store.join("child")).unwrap();
+    let denied = store.join("secret");
+    std::fs::write(&denied, "protected").unwrap();
+    std::fs::write(root.join("secret"), "own").unwrap();
+    std::os::unix::fs::symlink(store.join("child"), root.join("link")).unwrap();
+    let candidate = root.join("link/../secret");
+    let ctx = context(&root, &denied);
+    assert_eq!(
+        ctx.validate_write_location("parent-dotdot", &candidate)
+            .unwrap_err()
+            .data["code"],
+        "denied_floor"
+    );
+    let response = crate::commands::delete_file::handle_delete_file(
+        &request("delete_file", json!({"file": candidate})),
+        &ctx,
+    );
+    assert_eq!(response.data["code"], "denied_floor");
+    assert_eq!(std::fs::read_to_string(denied).unwrap(), "protected");
+    assert_eq!(std::fs::read_to_string(root.join("secret")).unwrap(), "own");
+}
