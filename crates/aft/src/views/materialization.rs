@@ -529,6 +529,11 @@ fn materialize_reading(
                     signature: symbol.signature.clone(),
                     exported: symbol.exported,
                     default_export: symbol.is_default_export,
+                    entry_point: if parse.language == "go" && symbol.kind == "variable" {
+                        parse.entry_point_symbols.contains(&symbol.scoped_name)
+                    } else {
+                        symbol.exported
+                    },
                 });
             }
             file_nodes.insert(symbol.scoped_name.clone(), id.clone());
@@ -558,7 +563,7 @@ fn materialize_reading(
              (id, file_path, name, scoped_name, kind, start_line, start_col, end_line,
               end_col, range_ordinal, signature, exported, is_default_export,
               is_type_like, is_callgraph_entry_point, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?12, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?15, ?14)",
         )?;
         owned_nodes.iter().try_fold(0, |count, row| {
             insert
@@ -577,6 +582,7 @@ fn materialize_reading(
                     i64::from(row.exported),
                     i64::from(row.default_export),
                     PROVENANCE_TREESITTER,
+                    i64::from(row.entry_point),
                 ])
                 .map(|written| count + written)
         })
@@ -1482,6 +1488,7 @@ struct OwnedNodeRow {
     signature: Option<String>,
     exported: bool,
     default_export: bool,
+    entry_point: bool,
 }
 
 struct PendingRefRow {
