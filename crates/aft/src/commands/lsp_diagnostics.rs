@@ -812,6 +812,7 @@ struct ServerStatusEntry {
 impl ServerStatusEntry {
     fn from_attempt(attempt: &crate::lsp::manager::ServerAttempt, scope: ServerScope) -> Self {
         let status = match &attempt.result {
+            ServerAttemptResult::InProgress { .. } => "start_in_progress".into(),
             ServerAttemptResult::ProjectClosed => {
                 "project closed; reopen the project and retry".into()
             }

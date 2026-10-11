@@ -214,6 +214,7 @@ fn classify_binary_source(
 
 fn spawn_status(result: &ServerAttemptResult) -> String {
     match result {
+        ServerAttemptResult::InProgress { .. } => "start_in_progress".into(),
         ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
         ServerAttemptResult::Ok { .. } => "ok".to_string(),
         ServerAttemptResult::NoRootMarker { .. } => "no_root_marker".to_string(),

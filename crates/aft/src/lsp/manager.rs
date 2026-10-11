@@ -96,6 +96,8 @@ pub enum ServerAttemptResult {
     ProjectClosed,
     /// Server is running and ready to serve requests for this file.
     Ok { server_key: ServerKey },
+    /// Another caller owns an active start reservation; the client is not ready yet.
+    InProgress { server_key: ServerKey },
     /// No workspace root was found by walking up from the file looking for
     /// any of the server's configured root markers.
     NoRootMarker { looked_for: Vec<String> },
@@ -215,6 +217,7 @@ impl ApplicableServerFailure {
 #[derive(Clone, Debug, Default)]
 pub struct ApplicableServerStartOutcomes {
     pub successful: Vec<ServerKey>,
+    pub in_progress: Vec<ServerKey>,
     pub failures: Vec<ApplicableServerFailure>,
     /// The first producer whose startup could not complete before the inspect
     /// request's shared work deadline.
@@ -225,6 +228,7 @@ impl ServerAttemptResult {
     pub fn failure_reason(&self) -> String {
         match self {
             Self::ProjectClosed => "project closed; reopen the project and retry".into(),
+            Self::InProgress { .. } => "server startup is in progress; retry".into(),
             Self::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
             Self::SpawnFailed { reason, .. } => {
                 // Files outside every TypeScript project are a coverage gap,
@@ -808,7 +812,7 @@ pub struct LspManager {
     /// Per-(kind,root) cache of start failures. Once a server fails to start
     /// for a workspace root, later requests report the remembered failure
     /// instead of starting it again. Without this, every file open or
-    /// didChange retries `spawn_server` and logs a fresh ERROR — visible as
+    /// didChange retries startup and logs a fresh ERROR — visible as
     /// repeated `failed to spawn TypeScript Language Server: Could not find a
     /// valid TypeScript installation` lines per edit.
     ///
@@ -1120,9 +1124,12 @@ impl LspManager {
         result: ServerAttemptResult,
         durability: FailureDurability,
     ) -> ServerAttemptResult {
-        // Closing a route is not a failed executable. Reopening the project
-        // must permit an immediate start rather than replay a retry backoff.
-        if matches!(result, ServerAttemptResult::ProjectClosed) {
+        // A closed route or an active start reservation is not a failed
+        // executable. Reopening or waiting must not encounter a fabricated backoff.
+        if matches!(
+            result,
+            ServerAttemptResult::ProjectClosed | ServerAttemptResult::InProgress { .. }
+        ) {
             return result;
         }
         let now = self.retry_clock.now();
@@ -1454,54 +1461,37 @@ impl LspManager {
         &mut self,
         snapshot: &ApplicableServerSnapshot,
         config: &Config,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<Instant>,
     ) -> ApplicableServerStartOutcomes {
         let mut outcomes = ApplicableServerStartOutcomes {
             failures: snapshot.producer_failures.clone(),
             ..ApplicableServerStartOutcomes::default()
         };
         for candidate in &snapshot.candidates {
-            let initialize_timeout = deadline
-                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+            let initialize_timeout =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             if initialize_timeout.is_some_and(|remaining| remaining.is_zero()) {
                 outcomes.deadline_exceeded = Some(candidate.key.clone());
                 break;
             }
-            if self.clients.contains_key(&candidate.key) {
-                outcomes.successful.push(candidate.key.clone());
-                continue;
+            match self.begin_unlocked_start(candidate, config, false, deadline, &mut outcomes) {
+                Some(StartNext::Wait(_)) => {
+                    // Waiting with mutable manager access would prevent the
+                    // reservation owner from publishing its initialized client.
+                    outcomes.in_progress.push(candidate.key.clone());
+                }
+                Some(StartNext::Spawn(prepared)) => {
+                    self.finish_unlocked_start(
+                        candidate,
+                        prepared.run(initialize_timeout),
+                        deadline,
+                        &mut outcomes,
+                    );
+                }
+                None => {}
             }
-            self.log_transient_retry(&candidate.key);
-            match self.spawn_server_with_timeout(
-                &candidate.definition,
-                &candidate.key.root,
-                &candidate.source_file,
-                config,
-                initialize_timeout,
-            ) {
-                Ok(client) => {
-                    self.note_start_succeeded(&candidate.key);
-                    self.clients.insert(candidate.key.clone(), client);
-                    self.server_binaries
-                        .insert(candidate.key.clone(), candidate.definition.binary.clone());
-                    self.documents.entry(candidate.key.clone()).or_default();
-                    outcomes.successful.push(candidate.key.clone());
-                }
-                Err(failure) => {
-                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                        // A request-owned timeout says nothing durable about the
-                        // producer; a later call with a fresh budget may retry it.
-                        outcomes.deadline_exceeded = Some(candidate.key.clone());
-                        break;
-                    }
-                    let result = classify_spawn_error(&candidate.definition.binary, &failure.error);
-                    let result =
-                        self.record_failed_spawn(&candidate.key, result, failure.durability);
-                    outcomes.failures.push(ApplicableServerFailure {
-                        server_key: candidate.key.clone(),
-                        result,
-                    });
-                }
+            if outcomes.deadline_exceeded.is_some() {
+                break;
             }
         }
         outcomes
@@ -1517,7 +1507,7 @@ impl LspManager {
         candidate: &ApplicableServerCandidate,
         config: &Config,
         after_wait: bool,
-        deadline: Instant,
+        deadline: Option<Instant>,
         outcomes: &mut ApplicableServerStartOutcomes,
     ) -> Option<StartNext> {
         let key = &candidate.key;
@@ -1575,7 +1565,7 @@ impl LspManager {
         &mut self,
         candidate: &ApplicableServerCandidate,
         result: Result<LspClient, SpawnFailure>,
-        deadline: Instant,
+        deadline: Option<Instant>,
         outcomes: &mut ApplicableServerStartOutcomes,
     ) {
         let key = &candidate.key;
@@ -1664,10 +1654,10 @@ impl LspManager {
         &mut self,
         candidate: &ApplicableServerCandidate,
         failure: &StartFailure,
-        deadline: Instant,
+        deadline: Option<Instant>,
         outcomes: &mut ApplicableServerStartOutcomes,
     ) {
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             outcomes.deadline_exceeded = Some(candidate.key.clone());
             return;
         }
@@ -1854,13 +1844,9 @@ impl LspManager {
             })
     }
 
-    /// Detailed version of [`ensure_server_for_file`] that records every
-    /// matching server's outcome (`Ok` / `NoRootMarker` / `BinaryNotInstalled`
-    /// / `SpawnFailed`).
-    ///
-    /// Use this when the caller wants to honestly report _why_ a file has no
-    /// active server (e.g., to surface "bash-language-server not on PATH" to
-    /// the agent instead of silently returning `total: 0`).
+    /// Ensure every matching producer has a client or a recorded startup outcome.
+    /// A reservation owned by another caller is reported as `InProgress`, not as
+    /// ready or failed. Call the unlocked helper to wait for that reservation.
     pub fn ensure_server_for_file_detailed(
         &mut self,
         file_path: &Path,
@@ -1868,71 +1854,41 @@ impl LspManager {
     ) -> EnsureServerOutcomes {
         let defs = servers_for_file(file_path, config);
         let mut outcomes = EnsureServerOutcomes::default();
-
         for def in defs {
             let server_id = def.kind.id_str().to_string();
             let server_name = def.name.to_string();
-
             let Some(key) = server_key_for_definition(&def, file_path, config) else {
                 outcomes.attempts.push(ServerAttempt {
                     server_id,
                     server_name,
                     result: ServerAttemptResult::NoRootMarker {
-                        looked_for: def.root_markers.iter().map(|s| s.to_string()).collect(),
+                        looked_for: def
+                            .root_markers
+                            .iter()
+                            .map(|marker| marker.to_string())
+                            .collect(),
                     },
                 });
                 continue;
             };
-
-            if !self.clients.contains_key(&key) {
-                // If this server already failed to start for this root,
-                // return the remembered failure without retrying or
-                // re-logging. This prevents per-edit ERROR spam when the
-                // user's environment is missing a dependency the LSP needs
-                // (the typescript-language-server "Could not find a valid
-                // TypeScript installation" case is the canonical example).
-                // A transient failure is retried once its backoff window has
-                // passed.
-                if let Some(cached) = self.failure_to_replay(&key) {
-                    outcomes.attempts.push(ServerAttempt {
-                        server_id,
-                        server_name,
-                        result: cached,
-                    });
-                    continue;
+            let result = match self.begin_file_server_start(&def, &key, file_path, config) {
+                FileServerStart::Running => None,
+                FileServerStart::Wait(_) => Some(ServerAttemptResult::InProgress {
+                    server_key: key.clone(),
+                }),
+                FileServerStart::Failed(result) => Some(result),
+                FileServerStart::Spawn(prepared) => {
+                    self.finish_file_server_start(&def, &key, prepared.run(None))
                 }
-
-                // A spurious ServerExited can drop the client without killing
-                // the child. Reap any still-tracked processes for this pair
-                // before spawning a replacement, otherwise leaked servers
-                // accumulate on a live worktree.
-                self.reap_unreferenced_children_for(&key);
-                self.log_transient_retry(&key);
-
-                match self.spawn_server(&def, &key.root, file_path, config) {
-                    Ok(client) => {
-                        self.note_start_succeeded(&key);
-                        self.clients.insert(key.clone(), client);
-                        self.server_binaries.insert(key.clone(), def.binary.clone());
-                        self.documents.entry(key.clone()).or_default();
-                    }
-                    Err(failure) => {
-                        slog_error!("failed to spawn {}: {}", def.name, failure.error);
-                        let result = classify_spawn_error(&def.binary, &failure.error);
-                        // Remember the failure so subsequent file events skip
-                        // this (kind, root) pair instead of producing a fresh
-                        // spawn attempt + ERROR log per request.
-                        let result = self.record_failed_spawn(&key, result, failure.durability);
-                        outcomes.attempts.push(ServerAttempt {
-                            server_id,
-                            server_name,
-                            result,
-                        });
-                        continue;
-                    }
-                }
+            };
+            if let Some(result) = result {
+                outcomes.attempts.push(ServerAttempt {
+                    server_id,
+                    server_name,
+                    result,
+                });
+                continue;
             }
-
             outcomes.attempts.push(ServerAttempt {
                 server_id,
                 server_name,
@@ -1942,7 +1898,6 @@ impl LspManager {
             });
             outcomes.successful.push(key);
         }
-
         outcomes
     }
 
@@ -5403,32 +5358,6 @@ impl LspManager {
         }
     }
 
-    fn spawn_server(
-        &mut self,
-        def: &ServerDef,
-        root: &Path,
-        source_file: &Path,
-        config: &Config,
-    ) -> Result<LspClient, StartFailure> {
-        self.spawn_server_with_timeout(def, root, source_file, config, None)
-    }
-
-    fn spawn_server_with_timeout(
-        &mut self,
-        def: &ServerDef,
-        root: &Path,
-        source_file: &Path,
-        config: &Config,
-        initialize_timeout: Option<std::time::Duration>,
-    ) -> Result<LspClient, StartFailure> {
-        let prepared = self
-            .prepare_spawn(def, root, source_file, config)
-            .map_err(prepare_failure)?;
-        prepared
-            .run(initialize_timeout)
-            .map_err(|failure| self.absorb_spawn_failure(failure))
-    }
-
     /// Gather everything a spawn needs from manager state, so the spawn and
     /// its `initialize` handshake can run without the manager lock.
     fn prepare_spawn(
@@ -5951,6 +5880,7 @@ fn recoverable_pull_rejection(err: &LspError) -> bool {
 
 fn server_attempt_result_reason(result: &ServerAttemptResult) -> String {
     match result {
+        ServerAttemptResult::InProgress { .. } => "start_in_progress".into(),
         ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
         ServerAttemptResult::SpawnFailed { binary, reason } => {
             format!("spawn_failed: {binary} ({reason})")
@@ -6605,10 +6535,13 @@ pub fn start_applicable_server_unlocked(
             outcomes.deadline_exceeded = Some(candidate.key.clone());
             return outcomes;
         }
-        let next =
-            manager
-                .lock()
-                .begin_unlocked_start(candidate, config, waited, deadline, &mut outcomes);
+        let next = manager.lock().begin_unlocked_start(
+            candidate,
+            config,
+            waited,
+            Some(deadline),
+            &mut outcomes,
+        );
         match next {
             None => return outcomes,
             Some(StartNext::Wait(signal)) => {
@@ -6636,7 +6569,7 @@ pub fn start_applicable_server_unlocked(
                     manager.lock().finish_unlocked_start(
                         &candidate,
                         result,
-                        deadline,
+                        Some(deadline),
                         &mut completed,
                     );
                     reservation.key = None;
@@ -7260,7 +7193,7 @@ fn delay_applicability_walk_for_test() {
     }
 }
 
-/// Classify an error returned by `spawn_server` into a structured
+/// Classify a prepared server's startup error into a structured
 /// `ServerAttemptResult`. The two interesting cases for callers are:
 /// - `BinaryNotInstalled` — the server's binary couldn't be resolved on PATH
 ///   or via override. The agent can be told "install bash-language-server".
@@ -7368,6 +7301,10 @@ fn env_binary_override_from(
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
 mod regression_tests;
+
+#[cfg(all(test, unix))]
+#[path = "startup_regression_tests.rs"]
+mod startup_regression_tests;
 
 #[cfg(test)]
 mod env_binary_override_tests {
