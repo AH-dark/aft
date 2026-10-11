@@ -29,6 +29,7 @@ class HostClient implements SubcClientLike {
     [];
   readonly reads: unknown[] = [];
   readonly toolBodies: unknown[] = [];
+  readonly toolChannels: number[] = [];
   readonly closedRoutes: number[] = [];
   readonly modules = new Map<number, string>();
   answer: unknown = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
@@ -36,6 +37,8 @@ class HostClient implements SubcClientLike {
   requestError: SubcError | undefined;
   scopeOpenError: SubcError | undefined;
   scopeOpenGate: Promise<void> | undefined;
+  toolOpenGate: Promise<void> | undefined;
+  toolGate: Promise<void> | undefined;
   subscriptionChannels: number[] = [];
 
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts?: RouteOpenOptions) {
@@ -43,6 +46,7 @@ class HostClient implements SubcClientLike {
     const channel = this.opens.length;
     if (target.module_id === "prefrontal-core" && this.scopeOpenError) throw this.scopeOpenError;
     if (target.module_id === "prefrontal-core") await this.scopeOpenGate;
+    if (target.module_id === "aft") await this.toolOpenGate;
     if (opts?.scope && this.refusal) throw new SubcError("carrier refused", this.refusal);
     this.modules.set(channel, target.module_id);
     return { channel, epoch: 1 } as RouteHandle;
@@ -55,6 +59,8 @@ class HostClient implements SubcClientLike {
       return this.answer;
     }
     this.toolBodies.push(body);
+    this.toolChannels.push(route.channel);
+    await this.toolGate;
     if (this.requestError) {
       const error = this.requestError;
       this.requestError = undefined;
@@ -97,6 +103,56 @@ function fakeClock() {
   return {
     advance: (ms: number) => {
       now += ms;
+    },
+  };
+}
+
+function retryClock() {
+  const clock = fakeClock();
+  const pending = new Map<ReturnType<typeof setTimeout>, { at: number; fire: () => void }>();
+  const active = new Set<ReturnType<typeof setTimeout>>();
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  const retryDelays = new Set([5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000]);
+  const set = spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+    const delayMs = delay ?? 0;
+    if (!retryDelays.has(delayMs)) {
+      const timer = realSet(() => {
+        active.delete(timer);
+        callback(...args);
+      }, delay);
+      active.add(timer);
+      return timer;
+    }
+    const timer = realSet(() => {}, 3_600_000);
+    timer.unref();
+    active.add(timer);
+    pending.set(timer, { at: Date.now() + delayMs, fire: () => callback(...args) });
+    return timer;
+  });
+  const clear = spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+    pending.delete(timer as ReturnType<typeof setTimeout>);
+    active.delete(timer as ReturnType<typeof setTimeout>);
+    realClear(timer);
+  });
+  restoreClocks.push(() => {
+    for (const timer of active) realClear(timer);
+    clear.mockRestore();
+    set.mockRestore();
+  });
+  return {
+    pending,
+    active,
+    async tick(ms: number) {
+      clock.advance(ms);
+      for (const [timer, task] of [...pending]) {
+        if (task.at > Date.now()) continue;
+        pending.delete(timer);
+        active.delete(timer);
+        realClear(timer);
+        task.fire();
+      }
+      for (let turn = 0; turn < 64; turn++) await Promise.resolve();
     },
   };
 }
@@ -233,6 +289,211 @@ test("a timed out head scope lookup retries and binds scoped after backoff", asy
   expect(client.reads).toHaveLength(1);
   expect(lines[0]).toMatch(/^subc head scope: session=head result=timeout after=\d+$/);
   expect(lines[1]).toBe("subc head scope: session=head result=scope ref=head-sco epoch=7");
+});
+
+test("head scope background retry upgrades a timed out bind without another bind", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  let release!: () => void;
+  client.scopeOpenGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  const oldChannel = client.opens.length;
+  expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+  release();
+  client.scopeOpenGate = undefined;
+  await clock.tick(0);
+  expect(clock.pending.size).toBe(1);
+  await clock.tick(5_000);
+  expect(client.reads).toHaveLength(1);
+  expect(client.closedRoutes).toContain(oldChannel);
+  expect(client.opens.filter((open) => open.target.module_id === "aft")).toHaveLength(1);
+  expect(clock.pending.size).toBe(0);
+  await bridge.toolCall("head", "read", {});
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  expect(client.toolChannels).toEqual([oldChannel, client.opens.length]);
+});
+
+test("head scope background swap preserves an in-flight held wait request", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  client.answer = new Error("startup unavailable");
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  const oldChannel = client.opens.length;
+  let release!: () => void;
+  client.toolGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const held = bridge.toolCall(
+    "head",
+    "bash",
+    { command: "held", wait: true },
+    { transportTimeoutMs: 120_000 },
+  );
+  for (let turn = 0; turn < 32; turn++) await Promise.resolve();
+  expect(client.toolChannels).toEqual([oldChannel, oldChannel]);
+  client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  await clock.tick(5_000);
+  expect(client.reads).toHaveLength(2);
+  expect(client.closedRoutes).not.toContain(oldChannel);
+  client.toolGate = undefined;
+  await bridge.toolCall("head", "read", {});
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  expect(client.closedRoutes).not.toContain(oldChannel);
+  release();
+  expect((await held).text).toBe("ok");
+  expect(client.closedRoutes.filter((channel) => channel === oldChannel)).toHaveLength(1);
+});
+
+test("head scope shutdown cancels a pending background retry timer", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  client.answer = new Error("startup unavailable");
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  expect(clock.pending.size).toBe(1);
+  await pool.shutdown();
+  expect(clock.pending.size).toBe(0);
+  await clock.tick(300_000);
+  expect(client.reads).toHaveLength(1);
+});
+
+test("head scope late fallback open adopts a recovered scope before dispatch", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  client.answer = new Error("startup unavailable");
+  let release!: () => void;
+  client.toolOpenGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const first = pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  await clock.tick(0);
+  const fallbackChannel = client.opens.length;
+  expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+  client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  await clock.tick(5_000);
+  expect(client.reads).toHaveLength(2);
+  client.toolOpenGate = undefined;
+  release();
+  expect((await first).text).toBe("ok");
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  expect(client.toolChannels).not.toContain(fallbackChannel);
+  expect(client.closedRoutes).toContain(fallbackChannel);
+});
+
+test("head scope background retries stop on explicit absence or carrier refusal", async () => {
+  const clock = retryClock();
+  for (const stop of ["no_scope", "refusal"]) {
+    const { client, pool } = setup();
+    client.answer = {};
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    await bridge.toolCall("head", "read", {});
+    expect(clock.pending.size).toBe(1);
+    client.answer =
+      stop === "no_scope"
+        ? { answer: "no_scope" }
+        : { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+    if (stop === "refusal") client.refusal = "scope_carrier_denied";
+    await clock.tick(5_000);
+    await bridge.toolCall("head", "read", {});
+    expect(clock.pending.size).toBe(0);
+    await clock.tick(300_000);
+    expect(client.reads).toHaveLength(2);
+    expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+    await pool.shutdown();
+  }
+});
+
+test("head scope shutdown cancels an in-flight background lookup and its deadline", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  client.answer = new Error("startup unavailable");
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  let release!: () => void;
+  client.scopeOpenGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await clock.tick(5_000);
+  expect(clock.active.size).toBe(1);
+  const lookupChannel = client.opens.length;
+  const stopping = pool.shutdown();
+  await clock.tick(0);
+  try {
+    expect(clock.active.size).toBe(0);
+  } finally {
+    release();
+    await stopping;
+  }
+  await clock.tick(0);
+  expect(client.closedRoutes).toContain(lookupChannel);
+  expect(client.reads).toHaveLength(1);
+});
+
+test("head scope last route-close push cancels autonomous retries", async () => {
+  const clock = retryClock();
+  const { client, pool, push } = setup();
+  client.answer = new Error("startup unavailable");
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  expect(clock.pending.size).toBe(1);
+  push({
+    op: "route.closed",
+    body: { channels: [client.opens.length], reason: "provider_terminated" },
+  });
+  expect(clock.pending.size).toBe(0);
+  await clock.tick(300_000);
+  expect(client.reads).toHaveLength(1);
+});
+
+test("head scope background failures retain exponential backoff", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  client.answer = new Error("startup unavailable");
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  await clock.tick(5_000);
+  expect(client.reads).toHaveLength(2);
+  await clock.tick(9_999);
+  expect(client.reads).toHaveLength(2);
+  client.answer = {};
+  await clock.tick(1);
+  expect(client.reads).toHaveLength(3);
+  await clock.tick(19_999);
+  expect(client.reads).toHaveLength(3);
+  client.answer = { answer: "no_scope" };
+  await clock.tick(1);
+  expect(client.reads).toHaveLength(4);
+  expect(clock.pending.size).toBe(0);
+});
+
+test("head scope retry survives one root close and stops when the last route closes", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  client.answer = new Error("startup unavailable");
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  expect(clock.pending.size).toBe(1);
+  await pool.closeSession(TEST_PROJECT_ROOT, "head");
+  expect(clock.pending.size).toBe(1);
+  await pool.closeSession(TEST_OTHER_ROOT, "head");
+  expect(clock.pending.size).toBe(0);
+  await clock.tick(300_000);
+  expect(client.reads).toHaveLength(1);
+});
+
+test("head scope background swap rebinds the bg_events subscription consistently", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup("pi", true);
+  client.answer = new Error("startup unavailable");
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  await clock.tick(0);
+  const oldSubscription = client.subscriptionChannels[0];
+  expect(client.subscriptionChannels).toHaveLength(1);
+  client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  await clock.tick(5_000);
+  expect(client.subscriptionChannels).toHaveLength(2);
+  expect(client.closedRoutes).toContain(oldSubscription);
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
 });
 
 test("head scope lookup errors are retried rather than cached", async () => {

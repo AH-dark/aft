@@ -361,6 +361,8 @@ type HostScopeResult =
 interface HostScopeState {
   answer?: HostScopeAnswer;
   pending?: Promise<RouteScope | undefined>;
+  retryTimer?: ReturnType<typeof setTimeout>;
+  lookupAbort?: AbortController;
   retryAt: number;
   retryMs: number;
 }
@@ -1097,6 +1099,8 @@ interface DetachedSession {
  * channel instead of caching a stale route.
  */
 interface RouteEntry {
+  /** Scope used to bind this tool carrier; absent on a fallback route. */
+  hostScope?: RouteScope;
   /** Route provenance prevents late work from touching a successor generation. */
   readonly canonicalRoot: CanonicalRootPath;
   readonly generation?: RootGeneration;
@@ -2081,6 +2085,7 @@ export class SubcTransportPool implements AftTransportPool {
       this.sessions.delete(record.identityKey);
       this.removeIndexMembership(record);
     }
+    this.stopUnusedHostScopeRetry(record.identity.session);
   }
 
   /**
@@ -2106,6 +2111,7 @@ export class SubcTransportPool implements AftTransportPool {
     const routeEntry = record.routeEntry;
     record.routeEntry = null;
     if (routeEntry) routeEntry.closed = true;
+    this.stopUnusedHostScopeRetry(record.identity.session);
     return { record, bgSub, routeEntry };
   }
 
@@ -2163,6 +2169,17 @@ export class SubcTransportPool implements AftTransportPool {
   private releaseRouteRequest(record: SessionRecord, entry: RouteEntry): void {
     entry.inflight -= 1;
     this.closeRetiredRoute(record, entry);
+  }
+
+  private retireHostToolRoute(record: SessionRecord): void {
+    const entry = record.routeEntry;
+    if (!entry) return;
+    entry.closed = true;
+    entry.closedBy ??= "route replaced";
+    record.routeEntry = null;
+    record.retiredRoutes.add(entry);
+    this.closeRetiredRoute(record, entry);
+    this.stopUnusedHostScopeRetry(record.identity.session);
   }
 
   /** Open or reuse a route while guarding every lifecycle boundary. */
@@ -2340,11 +2357,7 @@ export class SubcTransportPool implements AftTransportPool {
 
       const clearRouteEntry = (entry: RouteEntry): void => {
         if (record.routeEntry !== entry) return;
-        entry.closed = true;
-        entry.closedBy ??= "route replaced";
-        record.routeEntry = null;
-        record.retiredRoutes.add(entry);
-        this.closeRetiredRoute(record, entry);
+        this.retireHostToolRoute(record);
       };
 
       const handleRequestFailure = (error: unknown, entry: RouteEntry): void => {
@@ -2630,7 +2643,7 @@ export class SubcTransportPool implements AftTransportPool {
       closedBy: null,
     };
     this.assertRootCanAttach(record.canonicalRoot);
-    const opening = this.openHostToolRoute(client, identity, record)
+    const opening = this.openHostToolRoute(client, identity, record, entry)
       .then((route) => {
         if (
           !this.isCurrentSession(record.identityKey, record) ||
@@ -2647,6 +2660,15 @@ export class SubcTransportPool implements AftTransportPool {
         entry.handle = route;
         entry.opening = null;
         this.noteClientAlive(client);
+        const state = this.hostScopeCache.get(identity.session);
+        if (state) this.scheduleHostScopeRetry(identity.session, state);
+        if (
+          state?.answer?.result === "scope" &&
+          !entry.hostScope &&
+          !this.hostScopeRefusals.has(identity.session)
+        ) {
+          this.promoteHostScope(identity.session);
+        }
         return route;
       })
       .catch((error) => {
@@ -2656,6 +2678,7 @@ export class SubcTransportPool implements AftTransportPool {
           entry.closed = true;
           record.routeEntry = null;
         }
+        this.stopUnusedHostScopeRetry(identity.session);
         if (
           !this.isCurrentSession(record.identityKey, record) &&
           !(error instanceof RouteTornDownError)
@@ -2689,23 +2712,106 @@ export class SubcTransportPool implements AftTransportPool {
     // Backoff skips the lookup, not the bind, so an unavailable core cannot delay every root.
     if (Date.now() < state.retryAt) return Promise.resolve(undefined);
     const current = state;
-    const lookup = this.readHostScope(client, identity).then((outcome) => {
+    clearTimeout(current.retryTimer);
+    current.retryTimer = undefined;
+    const abort = new AbortController();
+    current.lookupAbort = abort;
+    const lookup = this.readHostScope(client, identity, abort.signal).then((outcome) => {
       // A scope-close push may invalidate the session while the management request is in flight.
       if (this.hostScopeCache.get(identity.session) !== current) return undefined;
       current.pending = undefined;
+      current.lookupAbort = undefined;
+      if (abort.signal.aborted) return undefined;
       this.logHostScopeOutcome(identity.session, outcome);
       if (outcome.result === "scope" || outcome.result === "no_scope") {
         current.answer = outcome;
         current.retryAt = 0;
         current.retryMs = HOST_SCOPE_RETRY_FLOOR_MS;
+        if (outcome.result === "scope") this.promoteHostScope(identity.session);
       } else {
         current.retryAt = Date.now() + current.retryMs;
         current.retryMs = Math.min(current.retryMs * 2, HOST_SCOPE_RETRY_CAP_MS);
+        this.scheduleHostScopeRetry(identity.session, current);
       }
       return outcome.result === "scope" ? outcome.scope : undefined;
     });
     current.pending = lookup;
     return lookup;
+  }
+
+  private unscopedHostRecord(session: string): SessionRecord | undefined {
+    for (const record of this.sessions.values()) {
+      const entry = record.routeEntry;
+      if (
+        record.identity.session === session &&
+        !record.closed &&
+        entry &&
+        !entry.closed &&
+        !entry.hostScope &&
+        entry.client === this.client &&
+        (entry.handle || entry.opening)
+      )
+        return record;
+    }
+    return undefined;
+  }
+
+  private cancelHostScopeRetry(state: HostScopeState): void {
+    clearTimeout(state.retryTimer);
+    state.retryTimer = undefined;
+    state.lookupAbort?.abort();
+  }
+
+  private stopUnusedHostScopeRetry(session: string): void {
+    const state = this.hostScopeCache.get(session);
+    if (state && !this.unscopedHostRecord(session)) this.cancelHostScopeRetry(state);
+  }
+
+  private scheduleHostScopeRetry(session: string, state: HostScopeState): void {
+    if (
+      this.shuttingDown ||
+      this.hostScopeCache.get(session) !== state ||
+      state.answer ||
+      state.pending ||
+      state.retryTimer ||
+      this.hostScopeRefusals.has(session) ||
+      !this.unscopedHostRecord(session)
+    )
+      return;
+    // A head can keep its tool route for its whole life, so recovery cannot rely on another bind.
+    state.retryTimer = setTimeout(
+      () => {
+        state.retryTimer = undefined;
+        const record = this.unscopedHostRecord(session);
+        const entry = record?.routeEntry;
+        if (this.shuttingDown || this.hostScopeCache.get(session) !== state || !record || !entry)
+          return;
+        void this.hostScope(entry.client, record.identity).catch((error) => {
+          warn(
+            `subc head scope: background retry failed code=${error instanceof Error ? error.name : "Error"}`,
+          );
+        });
+      },
+      Math.max(0, state.retryAt - Date.now()),
+    );
+    state.retryTimer.unref();
+  }
+
+  private promoteHostScope(session: string): void {
+    for (const record of this.sessions.values()) {
+      const entry = record.routeEntry;
+      if (record.identity.session !== session || !entry?.handle || entry.hostScope) continue;
+      // Retirement stops new dispatches; the existing request counter defers closure of held waits.
+      this.retireHostToolRoute(record);
+      const sub = record.bgSub;
+      if (!sub) continue;
+      // The old subscription must finish closing before its normal attach path opens a scoped one.
+      void sub.stop().then(() => {
+        if (record.bgSub !== sub) return;
+        record.bgSub = null;
+        this.ensureBgSubscription(record.identity, record);
+      });
+    }
   }
 
   private logHostScopeOutcome(session: string, outcome: HostScopeResult): void {
@@ -2737,12 +2843,22 @@ export class SubcTransportPool implements AftTransportPool {
   private async readHostScope(
     client: SubcClientLike,
     identity: BindIdentity,
+    signal: AbortSignal,
   ): Promise<HostScopeResult> {
     const startedAt = Date.now();
     const timeout = (): HostScopeResult => ({ result: "timeout", afterMs: Date.now() - startedAt });
     let expired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const abort = new AbortController();
+    let cancel!: () => void;
+    const cancelled = new Promise<HostScopeResult>((resolve) => {
+      cancel = () => {
+        expired = true;
+        abort.abort();
+        resolve({ result: "error", code: "AbortError", afterMs: Date.now() - startedAt });
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+    });
     const read = async (): Promise<HostScopeResult> => {
       let route: RouteHandle | undefined;
       try {
@@ -2798,9 +2914,10 @@ export class SubcTransportPool implements AftTransportPool {
       }
     };
     try {
-      // Keep the two-second bind budget even during core startup; transient failures retry on later binds.
+      // Keep the two-second bind budget during core startup; fallback routes retry in the background.
       return await Promise.race([
         read(),
+        cancelled,
         new Promise<HostScopeResult>((resolve) => {
           timer = setTimeout(() => {
             expired = true;
@@ -2811,6 +2928,7 @@ export class SubcTransportPool implements AftTransportPool {
       ]);
     } finally {
       clearTimeout(timer);
+      signal.removeEventListener("abort", cancel);
     }
   }
 
@@ -2818,6 +2936,7 @@ export class SubcTransportPool implements AftTransportPool {
     client: SubcClientLike,
     identity: BindIdentity,
     record: SessionRecord,
+    entry?: RouteEntry,
   ): Promise<RouteHandle> {
     if (
       !this.hostScopes ||
@@ -2828,23 +2947,26 @@ export class SubcTransportPool implements AftTransportPool {
         consumerIdentity: this.consumerIdentity,
       });
     }
-    return this.openScopedHostToolRoute(client, identity, record);
+    return this.openScopedHostToolRoute(client, identity, record, entry);
   }
 
   private async openScopedHostToolRoute(
     client: SubcClientLike,
     identity: BindIdentity,
     record: SessionRecord,
+    entry?: RouteEntry,
   ): Promise<RouteHandle> {
     const scope = await this.hostScope(client, identity);
     this.assertRecordLive(record);
     if (scope) {
       try {
-        return await client.routeOpen(
+        const route = await client.routeOpen(
           { kind: "tool_provider", module_id: AFT_MODULE_ID },
           identity,
           { consumerIdentity: this.consumerIdentity, scope },
         );
+        if (entry) entry.hostScope = scope;
+        return route;
       } catch (error) {
         if (!(error instanceof SubcError) || !error.code || isSocketDeathError(error)) throw error;
         this.assertRecordLive(record);
@@ -2852,6 +2974,8 @@ export class SubcTransportPool implements AftTransportPool {
           this.hostScopeRefusals.add(identity.session);
           warn(`subc head scope: scoped bind refused code=${error.code}; binding unscoped`);
         }
+        const state = this.hostScopeCache.get(identity.session);
+        if (state) this.cancelHostScopeRetry(state);
         // The refusal set remembers the downgrade without misreporting it as core's no_scope answer.
       }
     }
@@ -2862,22 +2986,32 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private invalidateHostScope(session: string): void {
+    const state = this.hostScopeCache.get(session);
+    if (state) this.cancelHostScopeRetry(state);
     this.hostScopeCache.delete(session);
     this.hostScopeRefusals.delete(session);
     for (const record of this.sessions.values()) {
       if (record.identity.session !== session || !record.routeEntry) continue;
-      const entry = record.routeEntry;
-      entry.closed = true;
-      entry.closedBy ??= "route replaced";
-      record.routeEntry = null;
-      record.retiredRoutes.add(entry);
-      this.closeRetiredRoute(record, entry);
+      this.retireHostToolRoute(record);
     }
   }
 
   private onScopeRouteClose(push: ControlPush): void {
+    if (push.op !== "route.closed") return;
     const reason = routeCloseReason(push);
-    if (!reason?.startsWith("scope_")) return;
+    if (!reason?.startsWith("scope_")) {
+      for (const record of this.sessions.values()) {
+        const state = this.hostScopeCache.get(record.identity.session);
+        const route = record.routeEntry?.handle;
+        if (!state || state.answer || !route) continue;
+        if (
+          (Array.isArray(push.body.channels) && push.body.channels.includes(route.channel)) ||
+          (!Array.isArray(push.body.channels) && push.body.module_id === AFT_MODULE_ID)
+        )
+          this.retireHostToolRoute(record);
+      }
+      return;
+    }
     const sessions = new Set<string>();
     for (const record of this.sessions.values()) {
       const routes = [record.routeEntry?.handle, record.bgSub?.attachedRoute].filter(
@@ -3018,6 +3152,7 @@ export class SubcTransportPool implements AftTransportPool {
       record.routeEntry = null;
       this.deleteSessionIfEmpty(record.identityKey, record);
     }
+    for (const session of this.hostScopeCache.keys()) this.stopUnusedHostScopeRetry(session);
     this.transportFailures = 0;
     try {
       client.close();
@@ -3197,6 +3332,10 @@ export class SubcTransportPool implements AftTransportPool {
     this.generationRejections.clear();
     this.observedStarts.clear();
     this.dormantRoots.clear();
+    const scopeLookups = [...this.hostScopeCache.values()].flatMap((state) => {
+      this.cancelHostScopeRetry(state);
+      return state.pending ? [state.pending] : [];
+    });
     this.hostScopeCache.clear();
     this.hostScopeRefusals.clear();
     this.hostScopeOutcomes.clear();
@@ -3218,7 +3357,11 @@ export class SubcTransportPool implements AftTransportPool {
     const client = this.client;
     this.client = null;
     const pending = [...this.pendingRootCleanups];
-    await Promise.allSettled([...detached.map((owner) => this.cleanupDetached(owner)), ...pending]);
+    await Promise.allSettled([
+      ...detached.map((owner) => this.cleanupDetached(owner)),
+      ...pending,
+      ...scopeLookups,
+    ]);
     if (client) {
       try {
         client.close();
@@ -3229,14 +3372,20 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   async closeSession(projectRoot: string, session: string): Promise<void> {
-    this.hostScopeCache.delete(session);
-    this.hostScopeRefusals.delete(session);
     const identity: BindIdentity = {
       project_root: canonicalizeProjectRoot(projectRoot),
       harness: this.harness,
       session: session && session.length > 0 ? session : DEFAULT_SESSION_ID,
     };
     const owner = this.detachSession(identityKey(identity), "session_closed");
+    if (
+      ![...this.sessions.values()].some((record) => record.identity.session === identity.session)
+    ) {
+      const state = this.hostScopeCache.get(identity.session);
+      if (state) this.cancelHostScopeRetry(state);
+      this.hostScopeCache.delete(identity.session);
+      this.hostScopeRefusals.delete(identity.session);
+    }
     if (owner) await this.cleanupDetached(owner);
   }
 }
