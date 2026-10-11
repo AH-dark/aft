@@ -1079,8 +1079,6 @@ fn execution_error_response(request_id: &str, native: bool, message: String) -> 
         // The spawned child may already have executed, so do not claim it never
         // ran or advise disabling sandbox protection.
         Response::error(request_id, "internal_error", message)
-    } else if message.contains("startup deadline expired") {
-        Response::error(request_id, "bash_start_deadline", message)
     } else if native {
         Response::error(
             request_id,

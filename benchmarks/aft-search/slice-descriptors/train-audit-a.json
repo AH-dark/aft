@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "Train A contains the remaining non-search external-audit patches. Its sole ranking-fenced source change is section 16's shared exact_lane/memo type re-export, type-identity regression, and test-only gating of unused age-policy sweep wrappers. Candidate generation, routing, scoring, and ranked rendering are unchanged by this mechanical hunk. Git identity and parent-preserving search-index adapters are deferred to train B conservatively because they can alter index admission or reuse. This descriptor asserts byte-identical ranked behavior; the benchmark has not been run and is reserved for the maintainer's replay."
+}

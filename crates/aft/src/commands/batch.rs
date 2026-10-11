@@ -1067,7 +1067,14 @@ mod audit_regressions {
             serde_json::json!({"match": "one", "replacement": ""}),
             serde_json::json!({"oldString": "one", "newString": ""}),
         ] {
-            assert!(resolve_edit(source, &edit::LineOffsets::new(source), &edit, 0, "explicit-delete").is_ok());
+            assert!(resolve_edit(
+                source,
+                &edit::LineOffsets::new(source),
+                &edit,
+                0,
+                "explicit-delete"
+            )
+            .is_ok());
         }
     }
 
@@ -1149,7 +1156,13 @@ mod audit_regressions {
             edit.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            let result = resolve_edit("é\ntext\n", &edit::LineOffsets::new("é\ntext\n"), &edit, 0, "empty-match");
+            let result = resolve_edit(
+                "é\ntext\n",
+                &edit::LineOffsets::new("é\ntext\n"),
+                &edit,
+                0,
+                "empty-match",
+            );
             assert!(matches!(result, Err(response) if response.data["code"] == "invalid_request"));
         }
     }

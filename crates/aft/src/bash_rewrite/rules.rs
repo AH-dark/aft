@@ -1433,9 +1433,12 @@ mod tests {
             },
         );
         for command in ["ls -R", "ls -aR", "ls -Ra ."] {
-            assert!(super::ls_request(command, &ctx).is_none(), "{command}");
+            assert!(
+                super::ls_request_from_parsed(super::parse(command).as_ref(), &ctx).is_none(),
+                "{command}"
+            );
         }
-        assert!(super::ls_request("ls -a", &ctx).is_some());
+        assert!(super::ls_request_from_parsed(super::parse("ls -a").as_ref(), &ctx).is_some());
     }
 
     // The oracle needs a real POSIX bash. On Windows `bash` on PATH is often the
