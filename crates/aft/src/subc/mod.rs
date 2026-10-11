@@ -2352,10 +2352,9 @@ fn reap_idle_roots_with_presence(
         if deleted {
             match executor.try_retire_idle_actor_in_background(&root_id) {
                 Some(true) => {
-                    crate::db::remote_exec::forget_root_in_background(
-                        ctx.db(),
-                        root_id.as_path().display().to_string(),
-                    );
+                    // Removing a project's directory retires its local actor,
+                    // not the daemon's worker session. If that session reconnects,
+                    // its saved catalog settings must still be available.
                     live_roots.remove(&root_id);
                     forgotten_deleted_roots.push(root_id.clone());
                 }
@@ -5577,7 +5576,6 @@ where
                 // only spawn their work, and only when it is due.
                 if let Some(db) = shared_app.try_db() {
                     crate::db::write_ledger::maybe_spawn_fold(db.clone());
-                    crate::db::remote_exec::maybe_spawn_sweep(db.clone());
                     crate::db::compression_events::maybe_spawn_retention(
                         db,
                         retention_registries,

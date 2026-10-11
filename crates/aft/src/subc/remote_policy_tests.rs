@@ -278,6 +278,95 @@ fn enabled_worker_sessions_offer_runon_and_guidance_from_the_persisted_plan() {
 
 #[cfg(unix)]
 #[test]
+fn exec_remote_catalog_params_survive_long_idle_rebind() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let worker = identity(root.path(), "long-lived-worker", 7, true);
+    let ctx = context(root.path(), storage.path(), None);
+    catalog(fetch(&plan("broca-worker")), &worker, &ctx).unwrap();
+    ctx.db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .execute("UPDATE remote_exec_policies SET last_used=1", [])
+        .unwrap();
+    drop(ctx);
+
+    let restarted = context(root.path(), storage.path(), None);
+    let rebound = identity(root.path(), "long-lived-worker", 7, true);
+    let launch = lookup(&restarted, &source(&rebound, Some("worker")))
+        .expect("a live scope's catalog params must not expire while its worker is idle");
+    let config = restarted.config();
+    let routed = crate::bash_background::with_remote_policy(Some(launch), || {
+        crate::bash_background::remote_for_runon(&config, "linux,4c", false, false, false)
+    })
+    .expect("the rebound worker must still have a remote runner");
+    assert_eq!(routed.requested_vcpus, Some(4));
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_remote_catalog_params_survive_root_reclaim_and_rebind() {
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().to_owned();
+    let storage = tempfile::tempdir().unwrap();
+    let worker = identity(&root_path, "rebound-worker", 7, true);
+    let root_id = worker.root.clone();
+    let ctx = Arc::new(context(&root_path, storage.path(), None));
+    catalog(fetch(&plan("broca-worker")), &worker, &ctx).unwrap();
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));
+    let mut live_roots = HashMap::from([(root_id.clone(), RootMeta::new(Instant::now()))]);
+    let metrics = DispatchPathMetrics::new();
+    root.close().unwrap();
+
+    // Supply two observations of the missing directory so actor retirement
+    // does not depend on background filesystem probes. Removing and recreating
+    // the worktree does not end the worker scope.
+    for generation in 1..=2 {
+        let outcome = reap_idle_roots_with_presence(
+            Instant::now(),
+            &mut live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+            &metrics,
+            &RootPresence::probe(generation, [&root_id]),
+        );
+        assert_eq!(
+            outcome.forgotten_deleted_roots.len(),
+            (generation - 1) as usize
+        );
+    }
+    assert!(!executor.actor_registered(&root_id));
+    assert!(live_roots.is_empty());
+    drop(executor);
+    drop(ctx);
+
+    std::fs::create_dir(&root_path).unwrap();
+    let restarted = context(&root_path, storage.path(), None);
+    let rebound = identity(&root_path, "rebound-worker", 7, true);
+    let launch = lookup(&restarted, &source(&rebound, Some("worker")))
+        .expect("root reclamation must not erase a live scope's catalog params");
+    let config = restarted.config();
+    let routed = crate::bash_background::with_remote_policy(Some(launch), || {
+        crate::bash_background::remote_for_runon(&config, "linux,4c", false, false, false)
+    })
+    .expect("the rebound worker must still have a remote runner without another catalog fetch");
+    assert_eq!(routed.requested_vcpus, Some(4));
+    let db = restarted.db().unwrap();
+    let conn = db.lock().unwrap();
+    let key = key(&rebound, Some("worker")).unwrap();
+    assert_eq!(
+        store::forget_scope(&conn, &key.owner, &key.scope_ref, key.epoch).unwrap(),
+        1
+    );
+    assert!(store::lookup(&conn, &key, 1).unwrap().is_none());
+    std::fs::remove_dir(&root_path).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn enabled_head_sessions_offer_runon_and_guidance_from_user_config() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
