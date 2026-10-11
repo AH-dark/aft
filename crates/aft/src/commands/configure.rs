@@ -6473,17 +6473,9 @@ impl ConfigureMaintenanceContinuation {
 #[derive(Debug, Default)]
 pub(crate) struct ConfigureMaintenanceState {
     jobs: VecDeque<ConfigureMaintenanceContinuation>,
-    detach_storage_sweeps: bool,
 }
 
 impl ConfigureMaintenanceState {
-    pub(crate) fn standalone() -> Self {
-        Self {
-            detach_storage_sweeps: true,
-            ..Self::default()
-        }
-    }
-
     fn absorb_enqueued(&mut self, ctx: &AppContext) {
         self.jobs.extend(
             ctx.drain_configure_maintenance()
@@ -6560,11 +6552,7 @@ pub(crate) fn drain_standalone_configure_prefix(
                 return ran_prefix;
             }
 
-            match run_configure_maintenance_unit(
-                ctx,
-                &mut continuation,
-                state.detach_storage_sweeps,
-            ) {
+            match run_configure_maintenance_unit(ctx, &mut continuation) {
                 ConfigureMaintenanceUnitResult::Continue
                     if continuation.stage.is_non_yielding_prefix() => {}
                 ConfigureMaintenanceUnitResult::Continue => {
@@ -6610,8 +6598,7 @@ pub(crate) fn drain_deferred_configure_maintenance_unit(
         return false;
     }
 
-    let result =
-        run_configure_maintenance_unit(ctx, &mut continuation, state.detach_storage_sweeps);
+    let result = run_configure_maintenance_unit(ctx, &mut continuation);
     match result {
         ConfigureMaintenanceUnitResult::Continue => state.jobs.push_front(continuation),
         ConfigureMaintenanceUnitResult::Complete => {}
@@ -6861,11 +6848,13 @@ fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
 fn run_configure_maintenance_unit(
     ctx: &AppContext,
     continuation: &mut ConfigureMaintenanceContinuation,
-    detach_storage_sweeps: bool,
 ) -> ConfigureMaintenanceUnitResult {
     let stage = continuation.stage;
     ctx.note_configure_tail_stage(Some(stage.label()));
-    if stage != ConfigureMaintenanceStage::DatabaseRuntime {
+    if !matches!(
+        stage,
+        ConfigureMaintenanceStage::DatabaseRuntime | ConfigureMaintenanceStage::StorageSweeps
+    ) {
         wait_on_configure_tail_stage_gate_for_test(&continuation.job.canonical_cache_root, stage);
     }
     // Maintenance units run on whatever executor thread drains the tail, and
@@ -6874,7 +6863,7 @@ fn run_configure_maintenance_unit(
     // a callgraph rebuild is never attributed to an unrelated session.
     let session = Some(continuation.job.session_id.clone());
     let result = log_ctx::with_session(session, || {
-        run_configure_maintenance_unit_inner(ctx, continuation, detach_storage_sweeps)
+        run_configure_maintenance_unit_inner(ctx, continuation)
     });
     ctx.note_configure_tail_stage(None);
     record_configure_unit_for_test(&continuation.job, stage);
@@ -7012,7 +7001,6 @@ pub(crate) fn configure_unit_records_for_root(root: &Path) -> Vec<ConfigureUnitR
 fn run_configure_maintenance_unit_inner(
     ctx: &AppContext,
     continuation: &mut ConfigureMaintenanceContinuation,
-    detach_storage_sweeps: bool,
 ) -> ConfigureMaintenanceUnitResult {
     let job = &continuation.job;
     match continuation.stage {
@@ -7213,18 +7201,7 @@ fn run_configure_maintenance_unit_inner(
                 ctx.configure_generation_flag(),
                 job.generation,
             );
-            if detach_storage_sweeps {
-                spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
-            } else {
-                run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
-            }
-            if let Some(view) = ctx.view_runtime_snapshot() {
-                if detach_storage_sweeps {
-                    thread::spawn(move || run_configure_view_sweep(&view));
-                } else {
-                    run_configure_view_sweep(&view);
-                }
-            }
+            spawn_configure_storage_sweeps(job, ctx.view_runtime_snapshot());
             continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
         }
         ConfigureMaintenanceStage::ProcessFlags => {
@@ -7787,12 +7764,31 @@ fn finish_configure_view_load(ctx: &AppContext, result: Result<PreparedConfigure
     }
 }
 
-fn spawn_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
-    let storage_root = storage_root.to_path_buf();
+fn spawn_configure_storage_sweeps(
+    job: &ConfigureMaintenanceJob,
+    view: Option<ViewRuntimeSnapshot>,
+) {
+    // A maintenance drain holds the actor's shared gate. Keeping disk sweeps
+    // there makes a queued writer block every later reader until the sweep
+    // finishes. The worker owns only immutable sweep inputs, never the actor
+    // gate or lifecycle admission; the view snapshot keeps its query pin live.
+    let storage_root = job.storage_root.clone();
+    let root = job.canonical_cache_root.clone();
+    let harness = job.harness.clone();
+    let session = Some(job.session_id.clone());
     let thread_name = format!("aft-storage-sweep-{}", std::process::id());
     if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
-        delay_configure_storage_sweeps_for_debug();
-        run_configure_storage_sweeps(&storage_root, harness);
+        log_ctx::with_session(session, || {
+            wait_on_configure_tail_stage_gate_for_test(
+                &root,
+                ConfigureMaintenanceStage::StorageSweeps,
+            );
+            delay_configure_storage_sweeps_for_debug();
+            run_configure_storage_sweeps(&storage_root, harness);
+            if let Some(view) = view {
+                run_configure_view_sweep(&view);
+            }
+        });
     }) {
         slog_warn!("failed to spawn configure storage maintenance thread: {error}");
     }
@@ -9166,7 +9162,7 @@ mod tests {
             }))
         };
         assert!(handle_configure_for_test(&configure(root.path()), &ctx).success);
-        let mut state = super::ConfigureMaintenanceState::standalone();
+        let mut state = super::ConfigureMaintenanceState::default();
         state.absorb_enqueued(&ctx);
         let old = state.jobs.front_mut().unwrap();
         old.stage = ConfigureMaintenanceStage::ViewLoad;
@@ -9230,7 +9226,7 @@ mod tests {
             )
             .success
         );
-        let mut state = super::ConfigureMaintenanceState::standalone();
+        let mut state = super::ConfigureMaintenanceState::default();
         state.absorb_enqueued(&ctx);
         let job = &state.jobs.front().unwrap().job;
         let input = super::ConfigureViewInput::capture(&ctx, job);
@@ -9321,7 +9317,7 @@ mod tests {
 
         let restarted = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         assert!(handle_configure_for_test(&configure, &restarted).success);
-        let mut state = super::ConfigureMaintenanceState::standalone();
+        let mut state = super::ConfigureMaintenanceState::default();
         state.absorb_enqueued(&restarted);
         let job = &state.jobs.front().unwrap().job;
         let input = super::ConfigureViewInput::capture(&restarted, job);

@@ -17505,6 +17505,74 @@ mod tests {
                 .any(|blocker| blocker == "rerun_as_exclusive_writer")
     }
 
+    #[test]
+    fn storage_sweeps_do_not_hold_bind_or_bash_admission() {
+        let mut fixture = HeldConfigureTail::start("storage_sweeps");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let generation = fixture.ctx.configure_generation();
+        let rebind = fixture.submit_bind(fixture.bind_request(1, "opencode"));
+        let rebound =
+            runtime.block_on(async { tokio::time::timeout(Duration::from_secs(1), rebind).await });
+        assert!(
+            rebound.is_ok(),
+            "an equivalent bind waited on the held storage sweep"
+        );
+        assert!(rebound.unwrap().unwrap().success);
+        assert_eq!(fixture.ctx.configure_generation(), generation);
+
+        // Even a bind that needs exclusive use must not wait for sweep I/O.
+        // Leaving that writer queued would also fence off bash's shared admission.
+        let bind = fixture.submit_bind(fixture.bind_request(2, "pi"));
+        let bound =
+            runtime.block_on(async { tokio::time::timeout(Duration::from_secs(1), bind).await });
+        let bash_started = Instant::now();
+        let bash = database_wire_tool(
+            &fixture.executor,
+            &fixture.configured,
+            "bash",
+            Duration::from_millis(500),
+        );
+        let bash_latency = bash_started.elapsed();
+        fixture.release_tail();
+        assert!(
+            bound.is_ok(),
+            "a config-changing bind waited on the held storage sweep: {bound:?}; bash={bash}"
+        );
+        assert!(bound.unwrap().unwrap().success);
+        assert_eq!(
+            bash["success"], true,
+            "bash waited on the held storage sweep: {bash}"
+        );
+        assert!(
+            bash_latency < Duration::from_secs(1),
+            "bash admission took {bash_latency:?}"
+        );
+    }
+
+    #[test]
+    fn equivalent_new_session_without_a_watcher_does_not_require_exclusive_use() {
+        let mut fixture = HeldConfigureTail::start("view_load");
+        fixture.ctx.stop_watcher_runtime();
+        let generation = fixture.ctx.configure_generation();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let bind = fixture.submit_bind(fixture.bind_request(1, "opencode"));
+        let bound =
+            runtime.block_on(async { tokio::time::timeout(Duration::from_secs(1), bind).await });
+        fixture.release_tail();
+        assert!(
+            bound.is_ok(),
+            "an unchanged root took the exclusive barrier"
+        );
+        assert!(bound.unwrap().unwrap().success);
+        assert_eq!(fixture.ctx.configure_generation(), generation);
+    }
+
     /// A bind that changes the root's configuration (here its harness) must
     /// not re-establish the root beside a running tail of the previous
     /// configuration: it hands its worker back, waits in the actor's queue as

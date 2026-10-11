@@ -452,7 +452,7 @@ pub struct StandaloneConfigureMaintenance {
 impl Default for StandaloneConfigureMaintenance {
     fn default() -> Self {
         Self {
-            inner: crate::commands::configure::ConfigureMaintenanceState::standalone(),
+            inner: crate::commands::configure::ConfigureMaintenanceState::default(),
         }
     }
 }
