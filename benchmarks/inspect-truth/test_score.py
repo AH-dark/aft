@@ -1,11 +1,13 @@
 """Offline regression fixtures for the inspect-truth collection and score gate."""
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import Mock, patch
@@ -346,6 +348,157 @@ class CheckoutFixtures(ScoreFixtureBase):
         except subprocess.TimeoutExpired:
             self.fail("Undrained AFT stderr blocked the configure response")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class OfflineCallgraphRerunFixtures(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        script = Path(__file__).with_name("rerun-callgraph-corpus.sh").read_text()
+        python = script.split("<<'PY'\n", 1)[1].rsplit("\nPY\n", 1)[0]
+        self.driver = {"__name__": "offline_rerun_fixture"}
+        exec(compile(python, "rerun-callgraph-corpus.sh", "exec"), self.driver)
+        self.corpus = self.root / "copied-corpus"
+        self.judgments = self.root / "judgments"
+        self.judgments.mkdir()
+        self.specs, self.originals, entries, outputs = [], {}, [], {}
+        for name in self.driver["REPOS"]:
+            lang = "go" if name == "soft-serve" else "rust"
+            path = "src/a.go" if lang == "go" else "src/a.rs"
+            repo = self.corpus / name
+            (repo / "src").mkdir(parents=True)
+            (repo / path).write_text("pub fn X() {}\npub fn Y() {}\n")
+            (repo / ".cortexkit").mkdir()
+            (repo / ".cortexkit" / "aft.jsonc").write_bytes(b"original config\n")
+            spec = {"name": name, "commit": "pin-" + name, "languages": [
+                {"language": lang, "include_paths": ["src/"], "oracle": {}}]}
+            self.specs.append(spec)
+            row = {"file": path, "symbol": "X", "line": 1, "kind": "function"}
+            for revision in (harness.BASELINE_COMMIT, "aaaaaaaaa"):
+                directory = self.corpus / "_results" / name / revision
+                directory.mkdir(parents=True)
+                record = {"commit": spec["commit"], "items": {"dead_code": [row]},
+                          "project_summary": {c: {"count": 1 if c == "dead_code" else 0}
+                                              for c in harness.AFT_CATEGORIES}}
+                (directory / "aft.json").write_text(json.dumps(record))
+                oracle = {lang: {"buckets": {"dead_code": [], "todos": []}}}
+                (directory / "oracle.json").write_text(json.dumps(oracle))
+                for source in directory.iterdir():
+                    self.originals[source] = source.read_bytes()
+            entries.append({"repo": name, "category": "dead_code", "side": "aft",
+                            "path": path, "symbol": "X", "verdict": "aft_false_positive",
+                            "note": "fixture row judgment"})
+            outputs[name] = "target/old-origin/_results/" + name + "/aaaaaaaaa"
+        (self.judgments / "fixture.json").write_text(json.dumps({"entries": entries, "after_outputs": outputs}))
+        self.base, self.candidate = self.root / "base", self.root / "candidate"
+        self.base.write_bytes(b"base binary fixture")
+        self.candidate.write_bytes(b"candidate binary fixture")
+        self.output = self.root / "new-output"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_driver(self, candidate_rows=0, unknown=False, tamper=False):
+        sessions = []
+        def session(binary, repo, storage):
+            rows = []
+            count = 1 if binary == self.base else candidate_rows
+            extension = "go" if repo.name == "soft-serve" else "rs"
+            for symbol in ["X", "Y"][:count]:
+                rows.append({"file": f"src/a.{extension}", "symbol": symbol, "line": 1, "kind": "function"})
+            response = {"success": True, "summary": {c: {"count": len(rows) if c == "dead_code" else 0}
+                        for c in harness.AFT_CATEGORIES}, "details": {"dead_code": rows}}
+            if unknown and binary == self.candidate:
+                response["summary"]["dead_code"] = {"status": "unavailable"}
+            client = Mock()
+            client.configure.return_value = {"success": True}
+            client.inspect.return_value = response
+            client.calls = 1
+            sessions.append((binary, repo, storage))
+            if tamper and len(sessions) == 1:
+                if tamper == "binary":
+                    self.candidate.write_bytes(self.candidate.read_bytes() + b"changed")
+                else:
+                    original = self.corpus / "_results" / "ripgrep" / harness.BASELINE_COMMIT / "oracle.json"
+                    original.write_bytes(original.read_bytes() + b"\n")
+            return client
+        def git(repo, *args):
+            if args == ("rev-parse", "HEAD"):
+                return "pin-" + repo.name
+            if args == ("status", "--porcelain", "--untracked-files=no"):
+                return ""
+            raise AssertionError(f"unexpected Git command: {args}")
+        info = lambda binary, baseline=False: {"path": str(binary), "version": "aft 0.58.2" if baseline else "aft 0.59.0", "sha256": self.driver["sha256"](binary)}
+        with patch.object(harness, "git_output", side_effect=git), \
+                patch.object(harness, "tracked_files", return_value=["src/a.rs"]), \
+                patch.object(harness, "AftSession", side_effect=session), \
+                patch.object(harness, "fetch", side_effect=AssertionError("no fetch")), \
+                patch.object(harness, "install", side_effect=AssertionError("no install")), \
+                patch.object(harness, "run_oracles", side_effect=AssertionError("no oracle rerun")), \
+                patch.dict(self.driver, binary_info=info), redirect_stdout(io.StringIO()):
+            code = self.driver["rerun"](harness, self.corpus, self.specs, self.base,
+                                        self.candidate, self.output, self.judgments)
+        return code, sessions
+
+    def test_fresh_both_sides_preserve_origins_and_relocate_judgments(self):
+        code, sessions = self.run_driver()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sessions), 6)
+        self.assertEqual([row[0] for row in sessions], [self.base, self.candidate] * 3)
+        self.assertEqual(len({row[2] for row in sessions}), 6)
+        for source, previous in self.originals.items():
+            self.assertEqual(source.read_bytes(), previous)
+        for spec in self.specs:
+            self.assertEqual((self.corpus / spec["name"] / ".cortexkit" / "aft.jsonc").read_bytes(), b"original config\n")
+        relocated = json.loads((self.output / "judgments" / "fixture.json").read_text())
+        original = json.loads((self.judgments / "fixture.json").read_text())
+        self.assertEqual(relocated["entries"], original["entries"])
+        self.assertTrue(all(str(self.corpus) in value for value in relocated["after_outputs"].values()))
+        cells = json.loads((self.output / "cell-diff.json").read_text())
+        counts = [cell for cell in cells if cell["category"] == "dead_code" and cell["metric"] == "aft_count"]
+        self.assertEqual([(cell["before"], cell["after"], cell["delta"]) for cell in counts], [(1, 0, -1)] * 3)
+
+    def test_missing_origin_fails_before_output_or_collection(self):
+        (self.corpus / "_results" / "ripgrep" / "aaaaaaaaa" / "aft.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.run_driver()
+        self.assertFalse(self.output.exists())
+
+    def test_lowered_cell_returns_failure_without_changing_scorer(self):
+        for spec in self.specs:
+            original = self.corpus / "_results" / spec["name"] / harness.BASELINE_COMMIT / "oracle.json"
+            oracle = json.loads(original.read_text())
+            lang = spec["languages"][0]["language"]
+            oracle[lang]["buckets"]["dead_code"] = [{"category": "dead_code", "path": "src/a.go" if lang == "go" else "src/a.rs", "symbol": "X", "line": 1}]
+            original.write_text(json.dumps(oracle))
+        code, _ = self.run_driver(candidate_rows=2)
+        self.assertEqual(code, 1)
+        run = json.loads((self.output / "run.json").read_text())
+        self.assertFalse(run["cell_rule_passed"])
+        self.assertTrue(any(cell["metric"] == "precision" and cell["lowered"] for cell in json.loads((self.output / "cell-diff.json").read_text())))
+
+    def test_unknown_bucket_returns_incomplete_not_success(self):
+        code, _ = self.run_driver(unknown=True)
+        self.assertEqual(code, 2)
+        self.assertFalse(json.loads((self.output / "run.json").read_text())["complete"])
+
+    def test_changed_binary_is_not_reported_as_a_success(self):
+        with self.assertRaisesRegex(ValueError, "candidate binary changed"):
+            self.run_driver(tamper="binary")
+        self.assertFalse((self.output / "results.md").exists())
+
+    def test_changed_immutable_input_is_not_reported_as_a_success(self):
+        with self.assertRaisesRegex(ValueError, "immutable judgment/oracle input changed"):
+            self.run_driver(tamper=True)
+        self.assertFalse((self.output / "results.md").exists())
+
+    def test_collector_config_restored_on_exception(self):
+        repo = self.corpus / "ripgrep"
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            with self.driver["preserved_config"](repo):
+                (repo / ".cortexkit" / "aft.jsonc").write_bytes(b"temporary\n")
+                raise RuntimeError("interrupted")
+        self.assertEqual((repo / ".cortexkit" / "aft.jsonc").read_bytes(), b"original config\n")
 
 
 if __name__ == "__main__":
