@@ -91,7 +91,10 @@ impl WindowsShell {
     /// Returns owned strings so callers can pass temporary wrapper paths.
     pub(crate) fn pty_wrapper_args(&self, wrapper_path: &Path) -> Vec<String> {
         match self {
-            WindowsShell::Cmd => vec!["/c".into(), wrapper_path.display().to_string()],
+            // `/D` skips the registry AutoRun command, as the non-PTY cmd
+            // invocations do, so a configured AutoRun cannot run ahead of the
+            // wrapper.
+            WindowsShell::Cmd => vec!["/D".into(), "/c".into(), wrapper_path.display().to_string()],
             WindowsShell::Pwsh | WindowsShell::Powershell => vec![
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
@@ -786,9 +789,15 @@ mod tests {
     #[test]
     fn pty_wrapper_args_are_owned_and_shell_specific() {
         let wrapper = PathBuf::from(r"C:\tmp\task.bat");
+        // `/D` must come before `/c`: cmd reads its switches up to `/c`, and
+        // without `/D` it runs the registry AutoRun command before the wrapper.
         assert_eq!(
             WindowsShell::Cmd.pty_wrapper_args(&wrapper),
-            vec!["/c".to_string(), wrapper.display().to_string()]
+            vec![
+                "/D".to_string(),
+                "/c".to_string(),
+                wrapper.display().to_string()
+            ]
         );
         assert_eq!(
             WindowsShell::Pwsh.pty_wrapper_args(&wrapper),
