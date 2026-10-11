@@ -1166,6 +1166,11 @@ pub(crate) struct CompletedRustCheck {
 }
 
 impl CompletedRustCheck {
+    #[cfg(all(test, unix))]
+    pub(crate) fn began_for_test(&self) -> Option<SystemTime> {
+        self.began
+    }
+
     pub(crate) fn in_memory(root: &Path, checkout: &Path, mut runtime: Runtime) -> Option<Self> {
         let root = canonical(root)?;
         let checkout = canonical(checkout)?;

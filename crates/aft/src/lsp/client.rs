@@ -12,6 +12,7 @@ use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use super::events::{LspEventSender, ReceivedLspEvent, RustCheckBegin, ServerInstanceId};
 use super::writer::LspWriter;
 use crate::lsp::child_registry::LspChildRegistry;
 use crate::lsp::jsonrpc::{
@@ -712,6 +713,7 @@ pub(crate) struct RustWorkspaceState {
 
 /// A client connected to one language server process.
 pub struct LspClient {
+    instance: ServerInstanceId,
     pub(crate) runtime_note: Option<String>,
     pub(crate) rust_cargo_disabled_for_worker: bool,
     kind: ServerKind,
@@ -775,13 +777,11 @@ pub struct LspClient {
     /// drained. Events wait in the channel until a caller drains them, so a
     /// begin drained after a save was sent may have been sent by the server
     /// before the save, for a run of the files before the edit; comparing
-    /// this count, taken when the save is sent, with
-    /// `rust_check_begins_drained` tells the two apart.
+    /// this count, taken when the save is sent, with each event's reader
+    /// ordinal distinguishes checks that began before and after the save.
     rust_check_begins_read: Arc<AtomicU64>,
-    rust_check_begin_times: Arc<Mutex<HashMap<u64, SystemTime>>>,
     pub(crate) completed_rust_check: Option<super::completed_rust_check::CompletedRustCheck>,
-    /// How many check-run begin notifications have been drained (see
-    /// [`LspClient::record_rust_progress`]).
+    #[cfg(all(test, unix))]
     rust_check_begins_drained: u64,
     /// How the server asked to hear about saves (`textDocumentSync.save` in
     /// its initialize response). `None` until `initialize` succeeds, and when
@@ -885,6 +885,64 @@ impl LspClient {
         args: &[String],
         env: &HashMap<String, String>,
         event_tx: Sender<LspEvent>,
+        child_registry: LspChildRegistry,
+        reclaim_root: Option<&Path>,
+        worker_policy: bool,
+        capacity: &Arc<RustAnalyzerCapacity>,
+    ) -> io::Result<Self> {
+        Self::spawn_with_event_sender(
+            kind,
+            root,
+            binary,
+            args,
+            env,
+            LspEventSender::Standalone(event_tx),
+            ServerInstanceId::next(),
+            child_registry,
+            reclaim_root,
+            worker_policy,
+            capacity,
+        )
+    }
+
+    pub(crate) fn spawn_managed_with_reclaim_root(
+        kind: ServerKind,
+        root: PathBuf,
+        binary: &Path,
+        args: &[String],
+        env: &HashMap<String, String>,
+        event_tx: Sender<ReceivedLspEvent>,
+        instance: ServerInstanceId,
+        child_registry: LspChildRegistry,
+        reclaim_root: Option<&Path>,
+        worker_policy: bool,
+    ) -> io::Result<Self> {
+        Self::spawn_with_event_sender(
+            kind,
+            root,
+            binary,
+            args,
+            env,
+            LspEventSender::Managed {
+                sender: event_tx,
+                instance,
+            },
+            instance,
+            child_registry,
+            reclaim_root,
+            worker_policy,
+            rust_analyzer_capacity(),
+        )
+    }
+
+    fn spawn_with_event_sender(
+        kind: ServerKind,
+        root: PathBuf,
+        binary: &Path,
+        args: &[String],
+        env: &HashMap<String, String>,
+        event_tx: LspEventSender,
+        instance: ServerInstanceId,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
         worker_policy: bool,
@@ -1017,8 +1075,6 @@ impl LspClient {
         let reader_root = root.clone();
         let rust_check_begins_read = Arc::new(AtomicU64::new(0));
         let reader_check_begins = Arc::clone(&rust_check_begins_read);
-        let rust_check_begin_times = Arc::new(Mutex::new(HashMap::new()));
-        let reader_check_begin_times = Arc::clone(&rust_check_begin_times);
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -1044,18 +1100,24 @@ impl LspClient {
                     }
                     Ok(Some(ServerMessage::Notification { method, params })) => {
                         reader_writer.note_received();
-                        if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
+                        let begin = if method == "$/progress"
+                            && is_rust_check_begin(params.as_ref())
+                        {
                             let ordinal = reader_check_begins.fetch_add(1, Ordering::SeqCst) + 1;
-                            if let Ok(mut times) = reader_check_begin_times.lock() {
-                                times.insert(ordinal, SystemTime::now());
-                            }
-                        }
-                        let _ = event_tx.send(LspEvent::Notification {
-                            server_kind: reader_kind.clone(),
-                            root: reader_root.clone(),
-                            method,
-                            params,
-                        });
+                            let began = SystemTime::now();
+                            Some(RustCheckBegin { ordinal, began })
+                        } else {
+                            None
+                        };
+                        let _ = event_tx.send_with_begin(
+                            LspEvent::Notification {
+                                server_kind: reader_kind.clone(),
+                                root: reader_root.clone(),
+                                method,
+                                params,
+                            },
+                            begin,
+                        );
                     }
                     Ok(Some(ServerMessage::Request { id, method, params })) => {
                         reader_writer.note_received();
@@ -1117,6 +1179,7 @@ impl LspClient {
         Ok(Self {
             _rust_analyzer_permit: rust_analyzer_permit,
             rust_cargo_disabled_for_worker: worker_policy,
+            instance,
             runtime_note: None,
             kind,
             root,
@@ -1138,8 +1201,8 @@ impl LspClient {
             rust_flycheck_started_at: None,
             rust_save: None,
             rust_check_begins_read,
-            rust_check_begin_times,
             completed_rust_check: None,
+            #[cfg(all(test, unix))]
             rust_check_begins_drained: 0,
             save_notification: None,
             rust_checks_on_save: false,
@@ -1410,24 +1473,41 @@ impl LspClient {
     /// Record one rust-analyzer `$/progress` notification. Only check runs
     /// are tracked: rust-analyzer names their token `rust-analyzer/flycheck/N`
     /// and titles them with the check command (`cargo check`, `cargo clippy`).
+    #[cfg(all(test, unix))]
     pub(crate) fn record_rust_progress(&mut self, token: &str, kind: &str, title: Option<&str>) {
+        let begin = if kind == "begin" && is_rust_check_progress(token, title) {
+            self.rust_check_begins_drained += 1;
+            Some(RustCheckBegin {
+                ordinal: self.rust_check_begins_drained,
+                began: SystemTime::now(),
+            })
+        } else {
+            None
+        };
+        self.record_rust_progress_at(token, kind, title, begin);
+    }
+
+    /// Apply the begin ordinal and timestamp assigned by the reader, not a
+    /// count reconstructed from drains that may omit another instance's events.
+    pub(crate) fn record_rust_progress_at(
+        &mut self,
+        token: &str,
+        kind: &str,
+        title: Option<&str>,
+        begin: Option<RustCheckBegin>,
+    ) {
         if !matches!(&self.kind, ServerKind::Rust) {
             return;
         }
         match kind {
             "begin" => {
                 if is_rust_check_progress(token, title) {
-                    self.rust_check_begins_drained += 1;
-                    let ordinal = self.rust_check_begins_drained;
-                    let began = self
-                        .rust_check_begin_times
-                        .lock()
-                        .ok()
-                        .and_then(|mut times| times.remove(&ordinal));
+                    let Some(begin) = begin else {
+                        return;
+                    };
+                    let ordinal = begin.ordinal;
                     if let Some(cache) = self.completed_rust_check.as_mut() {
-                        if let Some(began) = began {
-                            cache.begin(began);
-                        }
+                        cache.begin(begin.began);
                     }
                     self.rust_flycheck_running
                         .insert(token.to_string(), ordinal);
@@ -2071,6 +2151,10 @@ impl LspClient {
 
     pub fn state(&self) -> ServerState {
         self.state
+    }
+
+    pub(crate) fn instance_id(&self) -> ServerInstanceId {
+        self.instance
     }
 
     pub fn kind(&self) -> ServerKind {

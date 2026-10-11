@@ -196,14 +196,16 @@ fn overflow_drift_scan_hashes_each_path_once_across_servers() {
 
 #[cfg(unix)]
 fn sleeping_rust_client(manager: &LspManager, root: &Path) -> LspClient {
-    LspClient::spawn(
+    LspClient::spawn_managed_with_reclaim_root(
         ServerKind::Rust,
         root.to_path_buf(),
         Path::new("sh"),
         &["-c".into(), "exec sleep 60".into()],
         &HashMap::new(),
         manager.event_sender_for_test(),
+        ServerInstanceId::next(),
         manager.child_registry.clone(),
+        None,
     )
     .unwrap()
 }

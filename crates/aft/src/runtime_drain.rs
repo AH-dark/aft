@@ -7972,14 +7972,16 @@ mod idle_lsp_tests {
     fn spawn_sleep_client(ctx: &AppContext, root: std::path::PathBuf) -> u32 {
         let registry = LspChildRegistry::new();
         ctx.lsp().set_child_registry(registry.clone());
-        let client = LspClient::spawn(
+        let client = LspClient::spawn_managed_with_reclaim_root(
             ServerKind::TypeScript,
             root,
             Path::new("sh"),
             &["-c".to_string(), "exec sleep 60".to_string()],
             &HashMap::new(),
             ctx.lsp().event_sender_for_test(),
+            crate::lsp::events::ServerInstanceId::next(),
             registry,
+            None,
         )
         .expect("spawn idle-lsp stand-in");
         let pid = client.child_pid();

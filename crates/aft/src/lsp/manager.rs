@@ -23,6 +23,7 @@ use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
 use crate::lsp::document::{DiskSnapshot, DocumentStore};
+use crate::lsp::events::{ReceivedLspEvent, RustCheckBegin, ServerInstanceId};
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftDocumentDiagnosticRequest, AftWorkspaceDiagnosticParams,
@@ -688,7 +689,7 @@ pub(crate) struct PostEditDiagnosticsWait {
     expected_versions: Vec<(ServerKey, i32)>,
     pre_snapshot: HashMap<ServerKey, PreEditSnapshot>,
     responses_at_start: HashMap<ServerKey, u64>,
-    event_rx: Receiver<LspEvent>,
+    event_rx: Receiver<ReceivedLspEvent>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
     deadline: std::time::Instant,
@@ -701,7 +702,7 @@ impl PostEditDiagnosticsWait {
         std::time::Instant::now() >= self.deadline
     }
 
-    pub(crate) fn next_event(&self) -> Option<LspEvent> {
+    pub(crate) fn next_event(&self) -> Option<ReceivedLspEvent> {
         let remaining = self
             .deadline
             .saturating_duration_since(std::time::Instant::now());
@@ -722,7 +723,7 @@ impl PostEditDiagnosticsWait {
 /// returns when an event arrives or another drain path handled one, so the
 /// caller re-checks at once instead of sleeping a fixed interval.
 pub(crate) struct LspEventWait {
-    event_rx: Receiver<LspEvent>,
+    event_rx: Receiver<ReceivedLspEvent>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
 }
@@ -731,7 +732,7 @@ impl LspEventWait {
     /// Block until an event arrives, another drain handles one, or `until`.
     /// A returned event must be passed to
     /// [`LspManager::handle_waited_event`].
-    pub(crate) fn next_event(&self, until: Instant) -> Option<LspEvent> {
+    pub(crate) fn next_event(&self, until: Instant) -> Option<ReceivedLspEvent> {
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return None;
@@ -793,8 +794,8 @@ pub struct LspManager {
     /// Stored publishDiagnostics payloads across all servers.
     diagnostics: DiagnosticsStore,
     /// Unified event channel — all server reader threads send here.
-    event_tx: Sender<LspEvent>,
-    event_rx: Receiver<LspEvent>,
+    event_tx: Sender<ReceivedLspEvent>,
+    event_rx: Receiver<ReceivedLspEvent>,
     /// One-slot wake channels for post-edit waits that released the manager
     /// mutex. Drains notify them after handling an event, so a waiter cannot
     /// sleep through a diagnostics update consumed by another drain path.
@@ -1545,6 +1546,7 @@ impl LspManager {
                 self.starting.insert(
                     key.clone(),
                     StartReservation {
+                        instance: prepared.instance,
                         deferred_events: Vec::new(),
                         clients_generation: self.clients_generation,
                         signal: Arc::new(StartSignal::default()),
@@ -1642,7 +1644,7 @@ impl LspManager {
             return;
         };
         for event in &reservation.deferred_events {
-            self.handle_event(event);
+            self.handle_received_event(event);
         }
         reservation.signal.finish();
     }
@@ -1699,6 +1701,7 @@ impl LspManager {
                 self.starting.insert(
                     key.clone(),
                     StartReservation {
+                        instance: prepared.instance,
                         deferred_events: Vec::new(),
                         clients_generation: self.clients_generation,
                         signal: Arc::new(StartSignal::default()),
@@ -3128,21 +3131,26 @@ impl LspManager {
         let mut events = Vec::new();
         let mut diagnostics_changed = false;
         let mut accepted_snapshots = Vec::new();
-        while events.len() < max_events {
+        let mut consumed = 0;
+        while consumed < max_events {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
             };
+            consumed += 1;
+            let current_instance = self.received_instance_is_current(&event);
             // `handle_event` returns the file of a stored publish; the
             // snapshot reuses it instead of parsing the payload again.
-            if let Some(file) = self.handle_event(&event) {
+            if let Some(file) = self.handle_received_event(&event) {
                 diagnostics_changed = true;
-                if let Some(snapshot) = self.accepted_live_publish_snapshot(&event, &file) {
+                if let Some(snapshot) = self.accepted_live_publish_snapshot(&event.event, &file) {
                     accepted_snapshots.push(snapshot);
                 }
             }
-            events.push(event);
+            if current_instance {
+                events.push(event.event);
+            }
         }
-        let has_more = events.len() >= max_events && !self.event_rx.is_empty();
+        let has_more = consumed >= max_events && !self.event_rx.is_empty();
         self.send_due_rust_saves();
         for client in self.clients.values_mut() {
             if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
@@ -3280,13 +3288,17 @@ impl LspManager {
     #[doc(hidden)]
     pub fn enqueue_event_for_test(&self, event: LspEvent) {
         self.event_tx
-            .send(event)
+            .send(ReceivedLspEvent {
+                event,
+                instance: None,
+                rust_check_begin: None,
+            })
             .expect("LSP event receiver should remain connected");
     }
 
     // Used only by the Unix-gated child-spawning test modules.
     #[cfg(all(test, unix))]
-    pub(crate) fn event_sender_for_test(&self) -> Sender<LspEvent> {
+    pub(crate) fn event_sender_for_test(&self) -> Sender<ReceivedLspEvent> {
         self.event_tx.clone()
     }
 
@@ -3488,10 +3500,10 @@ impl LspManager {
     pub(crate) fn poll_post_edit_diagnostics_wait(
         &mut self,
         wait: &mut PostEditDiagnosticsWait,
-        event: Option<LspEvent>,
+        event: Option<ReceivedLspEvent>,
     ) -> bool {
         if let Some(event) = event {
-            self.handle_event(&event);
+            self.handle_received_event(&event);
         }
 
         for (key, target_version) in &wait.expected_versions {
@@ -3609,9 +3621,9 @@ impl LspManager {
 
     /// Handle an event an [`LspEventWait`] took off the channel, then drain
     /// whatever else is queued.
-    pub(crate) fn handle_waited_event(&mut self, event: Option<LspEvent>) {
+    pub(crate) fn handle_waited_event(&mut self, event: Option<ReceivedLspEvent>) {
         if let Some(event) = event {
-            self.handle_event(&event);
+            self.handle_received_event(&event);
         }
         self.drain_events();
     }
@@ -3737,7 +3749,7 @@ impl LspManager {
             match self.event_rx.recv_timeout(timeout) {
                 Ok(event) => {
                     if matches!(
-                        self.handle_event(&event),
+                        self.handle_received_event(&event),
                         Some(ref published_file) if published_file.as_path() == lookup_path.as_path()
                     ) {
                         break;
@@ -4761,7 +4773,7 @@ impl LspManager {
         let mut saw_file_diagnostics = false;
         while let Ok(event) = self.event_rx.try_recv() {
             if matches!(
-                self.handle_event(&event),
+                self.handle_received_event(&event),
                 Some(ref published_file) if published_file.as_path() == file_path
             ) {
                 saw_file_diagnostics = true;
@@ -4848,7 +4860,25 @@ impl LspManager {
         }
     }
 
-    fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
+    fn received_instance_is_current(&self, event: &ReceivedLspEvent) -> bool {
+        let Some(instance) = event.instance else {
+            // Only explicitly injected test events lack receipt identity. Managed
+            // readers always attach the instance allocated before their spawn.
+            return true;
+        };
+        let key = Self::event_key(&event.event);
+        if let Some(client) = self.clients.get(&key) {
+            return client.instance_id() == instance;
+        }
+        if let Some(reservation) = self.starting.get(&key) {
+            return reservation.instance == instance;
+        }
+        // Failed starts still have an exit report to settle after their reservation
+        // is released, but no orphaned notification may recreate diagnostic state.
+        matches!(event.event, LspEvent::ServerExited { .. })
+    }
+
+    fn event_key(event: &LspEvent) -> ServerKey {
         let (LspEvent::Notification {
             server_kind, root, ..
         }
@@ -4858,16 +4888,45 @@ impl LspManager {
         | LspEvent::ServerExited {
             server_kind, root, ..
         }) = event;
-        let event_key = ServerKey {
+        ServerKey {
             kind: server_kind.clone(),
             root: root.clone(),
-        };
-        if !self.clients.contains_key(&event_key) {
-            if let Some(reservation) = self.starting.get_mut(&event_key) {
+        }
+    }
+
+    fn handle_received_event(&mut self, event: &ReceivedLspEvent) -> Option<PathBuf> {
+        if !self.received_instance_is_current(event) {
+            if let LspEvent::ServerExited { pid, reason, .. } = &event.event {
+                if let Some(report) = self.pending_exit_reports.remove(pid) {
+                    self.record_exit_log_line(report.log_line(&reason.to_string()));
+                }
+            }
+            return None;
+        }
+        let key = Self::event_key(&event.event);
+        if !self.clients.contains_key(&key) {
+            if let Some(reservation) = self.starting.get_mut(&key) {
                 reservation.deferred_events.push(event.clone());
                 return None;
             }
         }
+        self.handle_event_payload(&event.event, event.rust_check_begin)
+    }
+
+    #[cfg(test)]
+    fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
+        self.handle_received_event(&ReceivedLspEvent {
+            event: event.clone(),
+            instance: None,
+            rust_check_begin: None,
+        })
+    }
+
+    fn handle_event_payload(
+        &mut self,
+        event: &LspEvent,
+        begin: Option<RustCheckBegin>,
+    ) -> Option<PathBuf> {
         let published_file = match event {
             LspEvent::Notification {
                 server_kind,
@@ -4892,7 +4951,7 @@ impl LspManager {
                 method,
                 params: Some(params),
             } if method == "$/progress" => {
-                self.handle_rust_progress(root.clone(), params);
+                self.handle_rust_progress(root.clone(), params, begin);
                 None
             }
             LspEvent::ServerExited {
@@ -5070,7 +5129,12 @@ impl LspManager {
         Some(file)
     }
 
-    fn handle_rust_progress(&mut self, root: PathBuf, params: &serde_json::Value) {
+    fn handle_rust_progress(
+        &mut self,
+        root: PathBuf,
+        params: &serde_json::Value,
+        begin: Option<RustCheckBegin>,
+    ) {
         let token = match params.get("token") {
             Some(serde_json::Value::String(token)) => token.clone(),
             Some(serde_json::Value::Number(token)) => token.to_string(),
@@ -5098,7 +5162,7 @@ impl LspManager {
                     title.unwrap_or("-")
                 );
             }
-            client.record_rust_progress(&token, kind, title);
+            client.record_rust_progress_at(&token, kind, title, begin);
             if kind == "end"
                 && value
                     .get("message")
@@ -5461,6 +5525,7 @@ impl LspManager {
 
         Ok(PreparedSpawn {
             rust_worker_policy: self.rust_worker_policy(),
+            instance: ServerInstanceId::next(),
             kind: def.kind.clone(),
             binary_name: def.binary.clone(),
             root: root.to_path_buf(),
@@ -6189,6 +6254,7 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
     rust_worker_policy: Arc<std::sync::atomic::AtomicBool>,
+    instance: ServerInstanceId,
     kind: ServerKind,
     /// The installable binary name, used in failure reasons.
     binary_name: String,
@@ -6196,7 +6262,7 @@ struct PreparedSpawn {
     binary: PathBuf,
     args: Vec<String>,
     env: HashMap<String, String>,
-    event_tx: Sender<LspEvent>,
+    event_tx: Sender<ReceivedLspEvent>,
     child_registry: LspChildRegistry,
     reclaim_root: PathBuf,
     initialization_options: Option<serde_json::Value>,
@@ -6292,13 +6358,14 @@ impl PreparedSpawn {
                     })
                 })
                 .flatten();
-        let mut client = match LspClient::spawn_with_reclaim_root(
+        let mut client = match LspClient::spawn_managed_with_reclaim_root(
             self.kind.clone(),
             self.root.clone(),
             &self.binary,
             &self.args,
             &self.env,
             self.event_tx,
+            self.instance,
             self.child_registry,
             Some(&self.reclaim_root),
             worker,
@@ -6475,11 +6542,12 @@ impl StartSignal {
 
 /// A server whose start is running without the manager lock.
 struct StartReservation {
+    instance: ServerInstanceId,
     /// Events from this server that arrived before its client was published.
     /// Handling them earlier would find no client for the key, so a
     /// rust-analyzer quiescence notice, for example, would be lost; they are
     /// replayed once the start finishes.
-    deferred_events: Vec<LspEvent>,
+    deferred_events: Vec<ReceivedLspEvent>,
     /// `LspManager::clients_generation` when the start began.
     clients_generation: u64,
     signal: Arc<StartSignal>,
@@ -7306,6 +7374,10 @@ mod regression_tests;
 #[path = "startup_regression_tests.rs"]
 mod startup_regression_tests;
 
+#[cfg(all(test, unix))]
+#[path = "instance_regression_tests.rs"]
+mod instance_regression_tests;
+
 #[cfg(test)]
 mod env_binary_override_tests {
     use super::*;
@@ -7366,14 +7438,16 @@ mod project_applicability_tests {
         manager.store_project_applicability(snapshot);
         // A live transport plus a stored empty report models an authoritative
         // producer without involving a real language server or SDK discovery.
-        let client = LspClient::spawn(
+        let client = LspClient::spawn_managed_with_reclaim_root(
             ServerKind::TypeScript,
             ts.root.clone(),
             Path::new("/bin/sh"),
             &["-c".into(), "while read line; do :; done".into()],
             &HashMap::new(),
             manager.event_tx.clone(),
+            ServerInstanceId::next(),
             LspChildRegistry::new(),
+            None,
         )
         .unwrap();
         manager.insert_client_for_test(client);
@@ -7966,6 +8040,7 @@ mod unlocked_start_tests {
         manager.starting.insert(
             key.clone(),
             StartReservation {
+                instance: super::ServerInstanceId::next(),
                 deferred_events: Vec::new(),
                 clients_generation: manager.clients_generation,
                 signal: Arc::clone(&signal),
@@ -8188,15 +8263,12 @@ mod clear_diagnostics_tests {
             version: Some(1),
         })
         .unwrap();
-        manager
-            .event_tx
-            .send(LspEvent::Notification {
-                server_kind: ServerKind::TypeScript,
-                root,
-                method: "textDocument/publishDiagnostics".into(),
-                params: Some(params),
-            })
-            .unwrap();
+        manager.enqueue_event_for_test(LspEvent::Notification {
+            server_kind: ServerKind::TypeScript,
+            root,
+            method: "textDocument/publishDiagnostics".into(),
+            params: Some(params),
+        });
 
         let parses_before = PUBLISH_DIAGNOSTICS_PARSES.with(std::cell::Cell::get);
         let drained = manager.drain_events();
@@ -8447,11 +8519,11 @@ mod server_exit_reap_tests {
 
     #[cfg(unix)]
     fn spawn_malformed_then_sleep_client(
-        event_tx: crossbeam_channel::Sender<LspEvent>,
+        event_tx: crossbeam_channel::Sender<super::ReceivedLspEvent>,
         registry: LspChildRegistry,
         root: std::path::PathBuf,
     ) -> LspClient {
-        LspClient::spawn(
+        LspClient::spawn_managed_with_reclaim_root(
             ServerKind::TypeScript,
             root,
             Path::new("sh"),
@@ -8461,7 +8533,9 @@ mod server_exit_reap_tests {
             ],
             &HashMap::new(),
             event_tx,
+            super::ServerInstanceId::next(),
             registry,
+            None,
         )
         .expect("spawn malformed-then-sleep stand-in")
     }

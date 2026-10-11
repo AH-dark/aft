@@ -4,6 +4,7 @@ pub(crate) mod completed_rust_check;
 pub mod diagnostics;
 pub mod document;
 pub mod environmental;
+pub(crate) mod events;
 pub mod jsonrpc;
 pub mod manager;
 pub mod pending_changes;
