@@ -952,7 +952,10 @@ fn go_initializer_edges(
             .or_default()
             .push(path);
     }
-    let mut query = conn.prepare("SELECT n.file_path, n.scoped_name FROM nodes n JOIN files f ON f.path=n.file_path WHERE f.lang='go' AND (?1 IS NULL OR n.file_path=?1) ORDER BY n.file_path, n.scoped_name")?;
+    // Initialization follows confirmed graph-edge owners or the package bridge. Giving
+    // every unused declaration a synthetic outgoing edge invents graph keys;
+    // a same-named interface method can then root an unrelated plain function.
+    let mut query = conn.prepare("SELECT n.file_path, n.scoped_name FROM nodes n JOIN files f ON f.path=n.file_path WHERE f.lang='go' AND (?1 IS NULL OR n.file_path=?1) AND (n.scoped_name='<go-package-init>' OR (n.kind='function' AND n.scoped_name='main') OR EXISTS(SELECT 1 FROM refs r WHERE r.caller_node=n.id AND r.kind IN ('call','value_ref') AND r.status IN ('resolved','resolved_local') AND r.target_node IS NOT NULL)) ORDER BY n.file_path, n.scoped_name")?;
     let callers = query
         .query_map([file], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

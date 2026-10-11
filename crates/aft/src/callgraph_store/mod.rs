@@ -10222,7 +10222,7 @@ fn ensure_database_ready(conn: &Connection) -> Result<()> {
 ///   completion does not duplicate documented methods.
 /// - v13: known interface contracts and their implementation fan-out retain
 ///   exact/dispatch provenance; a concrete trait call has only its actual target.
-const BUILD_OUTPUT_VERSION: &str = "v16-manifest-root-reexport-resolution";
+const BUILD_OUTPUT_VERSION: &str = "v17-go-initializer-owner-method-root-identity";
 
 fn schema_fingerprint() -> String {
     schema_fingerprint_for(BUILD_OUTPUT_VERSION)
@@ -25468,11 +25468,11 @@ edition = "2021"
         let source = b"package main\nvar Boot = Register()\n";
         for (old_version, current_version) in [
             (
-                "callgraph-v4-nested-use-macro-imports-go-init-callbacks",
+                "callgraph-v5-manifest-root-reexport-resolution",
                 crate::blob_store::CALLGRAPH_PRODUCER_VERSION,
             ),
             (
-                "ruled-callgraph-v5-nested-use-macro-imports-go-init-callbacks",
+                "ruled-callgraph-v6-manifest-root-reexport-resolution",
                 crate::views::callgraph::PRODUCER,
             ),
         ] {
@@ -25494,11 +25494,23 @@ edition = "2021"
         let dir = tempdir().unwrap();
         let root = dir.path();
         let file = write_file(root, "entry.ts", "export const Public = 1;\n");
-        let snapshot = callgraph_fixture_view(root, &[file]);
+        let rust = write_file(
+            root,
+            "entry.rs",
+            "pub struct Widget;\nimpl Widget { pub fn Method(&self) {} }\n",
+        );
+        let snapshot = callgraph_fixture_view(root, &[file, rust]);
         assert!(snapshot
             .entry_point_symbols
             .get(&root.join("entry.ts"))
             .is_some_and(|roots| roots.contains("Public")));
+        assert!(
+            snapshot
+                .entry_point_symbols
+                .get(&root.join("entry.rs"))
+                .is_some_and(|roots| roots.contains("Widget::Method")),
+            "non-Go exported methods retain their existing view root flag"
+        );
     }
 
     #[test]
@@ -25774,7 +25786,7 @@ edition = "2021"
         conn.execute(
             "UPDATE meta SET v=?1 WHERE k='fingerprint'",
             [schema_fingerprint_for(
-                "v14-go-package-initializers-rust-aliases",
+                "v16-manifest-root-reexport-resolution",
             )],
         )
         .unwrap();
@@ -25940,6 +25952,84 @@ edition = "2021"
         }
         assert!(callgraph_fixture_has(&cold, "items", "spare"), "{cold}");
         assert_eq!(cold["items"], viewed["items"]);
+    }
+
+    #[test]
+    fn callgraph_go_sort_dispatch_does_not_rescue_same_named_plain_function() {
+        for imported in [false, true] {
+            for body in ["return false", "return i < j", "println(i); return false"] {
+                let dir = tempdir().unwrap();
+                let root = dir.path();
+                let manifest = write_file(root, "go.mod", "module example.com/sort-collision\n");
+                let (main, method_file, source) = if imported {
+                    let main = write_file(root, "main.go", "package main\nimport (\"sort\"; \"example.com/sort-collision/items\")\nfunc main() { values := items.Values(); sort.Sort(values) }\n");
+                    let source = "package items\ntype Sortable []int\nfunc Values() Sortable { return Sortable{3,1,2} }\nfunc (s Sortable) Len() int { return len(s) }\nfunc (s Sortable) Less(i,j int) bool { return s[i]<s[j] }\nfunc (s Sortable) Swap(i,j int) { s[i],s[j]=s[j],s[i] }\nfunc (s Sortable) Unused() {}\nfunc Less(i,j int) bool { return false }\n";
+                    (main, "items/list.go", source)
+                } else {
+                    let source = "package main\nimport \"sort\"\ntype sortable []int\nfunc main() { values := sortable{3,1,2}; sort.Sort(values) }\nfunc (s sortable) Len() int { return len(s) }\nfunc (s sortable) Less(i,j int) bool { return s[i]<s[j] }\nfunc (s sortable) Swap(i,j int) { s[i],s[j]=s[j],s[i] }\nfunc (s sortable) Unused() {}\nfunc Less(i,j int) bool { return false }\n";
+                    (write_file(root, "main.go", source), "main.go", source)
+                };
+                let source = source.replace("return false", body);
+                let methods = write_file(root, method_file, &source);
+                let mut files = vec![main, methods];
+                files.sort();
+                files.dedup();
+                let (store, legacy) = go_fixture_store(root, &files);
+                let mut inputs = files;
+                inputs.push(manifest);
+                let view = callgraph_fixture_view(root, &inputs);
+                let conn = store.conn.lock().unwrap();
+                let mut query = conn
+                    .prepare(
+                        "SELECT count(*) FROM refs WHERE target_file=?1 AND target_symbol='Less'",
+                    )
+                    .unwrap();
+                assert_eq!(
+                    query
+                        .query_row([method_file], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    0,
+                    "there is no raw reference to the plain Less function"
+                );
+                drop(query);
+                drop(conn);
+                let go_type = if imported { "Sortable" } else { "sortable" };
+                for snapshot in [&legacy, &view] {
+                    assert!(!snapshot.outbound_calls.iter().any(|call| call.caller_file.ends_with(method_file)
+                    && call.caller_symbol == "Less" && call.provenance == "go_package_initializer"),
+                    "fabricating Less -> package-init creates a dispatch-root key for an unrelated plain function");
+                    assert!(
+                        !snapshot
+                            .entry_point_symbols
+                            .get(&root.join(method_file))
+                            .is_some_and(|roots| roots.contains("Less")
+                                || roots.contains(&format!("{go_type}::Unused"))),
+                        "exported Go method names are not unconditional projection roots"
+                    );
+                }
+                let cold = callgraph_fixture_scan(root, legacy);
+                let viewed = callgraph_fixture_scan(root, view);
+                let has = |payload: &serde_json::Value, symbol: &str, kind: &str| {
+                    payload["items"].as_array().unwrap().iter().any(|row| {
+                        row["file"] == method_file && row["symbol"] == symbol && row["kind"] == kind
+                    })
+                };
+                for payload in [&cold, &viewed] {
+                    assert!(has(payload, "Unused", "method"), "{payload}");
+                    assert!(
+                        has(payload, "Less", "function"),
+                        "plain Less rescued: {payload}"
+                    );
+                    for symbol in ["Len", "Less", "Swap"] {
+                        assert!(
+                            !has(payload, symbol, "method"),
+                            "used sort method {symbol} lost: {payload}"
+                        );
+                    }
+                }
+                assert_eq!(cold["items"], viewed["items"]);
+            }
+        }
     }
 
     #[test]
