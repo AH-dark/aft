@@ -2,7 +2,7 @@
 
 Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
-**Current delivery boundary:** the tables remain measured at pre-rebuild tip `9e8c83db7`. The later regression that falsely kept a plain `Less` function live through a same-named Go interface method is corrected at `e9fd4a6f27d168bf1cd7ba5b3ce984957ddae833` on the rebuilt branch; its Go corpus effect is not yet measured and must be re-collected before these numbers are attributed to the new tip.
+**Current delivery boundary:** the Before/After corpus accuracy tables below remain measured at pre-rebuild tip `9e8c83db7`. The later regression that falsely kept a plain `Less` function live through a same-named Go interface method is corrected at `e9fd4a6f27d168bf1cd7ba5b3ce984957ddae833` on the rebuilt branch; its Go corpus effect is not yet measured and must be re-collected before these numbers are attributed to the new tip. A later comparison-key-only correction at `3fa84869c` handles aliased project roots, with Tier-2 aggregate version 35 forcing a one-time recompute; that correction also awaits a new corpus run.
 
 ## Before
 
@@ -420,3 +420,47 @@ Cargo 1.99.0, all builds/tests serialized on remote Linux with four virtual CPUs
 Four new independent controls were red and restored from the staged live state with empty post-restore diffs: restoring synthetic edges from unused declarations such as `Less` to the package-init bridge fails the **original unchanged integration test**, restoring exported Go-method roots fails the new parity fixture, leaking the method flag rule into non-Go code fails only the Rust-method preservation control, and reverting the admission floor fails the previous-view rejection fixture. Each invocation selected one named test; other tests were filtered. The restored 28-test corpus-facing module passed afterward.
 
 Retained logs outside build directories: `local-ignore/callgraph/evidence/inspect-integration-go-sort-fix.stdout` and `rust-gate-go-sort-fix.stdout`. All entries in `judgments/callgraph.json` and the earlier judgment files remain attached to their original capture directories. No resolver or interface-contract policy was changed, no new corpus collection was run, and the coordinating review run must settle the new Go counts before release.
+
+## macOS CI initializer/callback failures: root-alias comparison fix
+
+The reported failures from CI run `38141144474`, macOS job `114475096520`, were inspected from the job log retained at `local-ignore/callgraph/evidence/ci-38141144474-macos-failures.log`. The full Linux `callgraph_store` lib suite was green before diagnosis, despite the reported native macOS failures. The restriction that prevents synthetic edges from unused declarations was left intact throughout the alias investigation.
+
+A Linux fixture that opens the same project through a directory symlink reproduced **both** failure modes. Its stored calls/value refs had correct target files, symbols and non-null target nodes; the main file was a liveness root. Nevertheless, Command/InitBackendContext and NewRouter/GitController/GoGetHandler all appeared dead. The reason was in scanner aggregation: contributions use canonical project-relative file identities, while the outbound-call grouping and lookup reconstructed lexical absolute keys. A snapshot caller under the physical root did not match a contribution reconstructed under the alias root. macOS `/var` versus `/private/var` is that exact shape.
+
+Source fix: **`3fa84869c13014fd0bb7cdd8c5431fd78f85048c`**. Only internal grouping/lookup comparison keys resolve symlinks to physical paths. Root aliases are rebased before a per-file memo lookup; each distinct caller file is probed once, not once per call. The lookup uses the contribution's already-existing relative identity. No caller path is rewritten, and no reported file spelling or persisted file-path key changes. If the OS cannot resolve a deleted or unreadable caller file to its physical path, grouping keeps the normalized lexical key, retains its edges and logs a fallback count.
+
+This comparison-key correction **alone** changes the alias reproduction from red to green, on both fresh legacy and actual view snapshots. The rule excluding unused declarations from synthetic initializer sources, the method-root flags, target resolution and receiver/interface liveness rules are unchanged. Thus it is a sufficient explanation for the two macOS symptoms, not an initializer/callback extraction failure. Native macOS confirmation still belongs to CI; no build/test load was placed on the shared Mac.
+
+`callgraph_go_initializer_and_callback_through_symlinked_root` covers blank-import package initialization and nested fluent HTTP callbacks together. It checks real resolved-ref targets, the main root, genuine live initializers/handlers, a dead spare, legacy/view equality, and identical reported file spellings when the same snapshot is scanned through the physical root. Separate scanner tests prove alias/physical/relative callers share one file probe and prove missing caller files retain both edges with one counted fallback. The plain-Less sort-collision cases, Cobra pair and original fluent fixture all remain green.
+
+### Cache invalidation and release notes
+
+The comparison fix changes materialized liveness, so `TIER2_CONTRIBUTION_CACHE_VERSION` advances **34 -> 35**. Only this semantic floor and its expected-version/legacy-hash tests changed in `inspect/cache.rs`. The aggregate hash is the cache identity of a whole-project rolled-up result; version 34 encoded the pre-fix interpretation. Rejecting that hash forces materialization with the corrected comparison keys. No path-valued cache key changes. Existing cached Tier-2 aggregates recompute once instead of bypassing corrected materialization with unchanged source hashes.
+
+Release notes must include both one-time costs: the existing v17 build-output and v6/v7 blob/view producer floors rebuild old callgraph evidence/views with corrected Go owner/root behavior, and Tier-2 version 35 recomputes stored aggregates once. Raw file facts and file-path spellings remain reusable/unchanged.
+
+### Final required tests for the alias correction
+
+Cargo 1.99.0, commands serialized on the Linux build host with four virtual CPUs (`linux,4c`):
+
+- complete lib `callgraph_store`: **270 passed, 6 ignored**;
+- all lib `inspect::scanners`: **92 passed**;
+- resolver/corpus-facing/view parity module: **29 passed**;
+- existing aggregate-version rejection gate: **1 passed**;
+- full inspect integration family: **311 passed, 6 ignored**;
+- full callgraph integration family: **112 passed, 2 ignored, 1 failed**, only the previously exact-base-reproduced TypeScript formatter home-path mismatch;
+- mandatory full repository gate: **5955 library tests passed, 4 failed, 50 ignored**, TLS **1 passed**, tokenizer **3 passed**, Biome **714 files**. Two failures are `blackholed_backend_never_blocks_status_or_search` (the assertion rejects the network-unreachable response) and `storage_debug_archive_ignores_public_member_modes` (expected archive path not found). The additional disabled-category metrics-deadline and bounded-worker verification failures both pass their focused one-test reruns. No unrelated correction was made; later full-gate phases were not reached.
+
+Four independent controls are red: retain the alias instead of canonicalizing the comparison root (both genuine Go paths become dead), clear the per-file memo on every call (three probes instead of one), lose the failed file's lexical fallback key (edge lookup disappears), and restore Tier-2 version 34 (legacy aggregate hash equals current). Every control staged the live state first, captured a nonempty mutation diff and restored an empty diff. Each ran only its named fixture, with no other failures.
+
+Retained logs: `local-ignore/callgraph/evidence/callgraph-store-alias-fix.stdout`, `inspect-integration-alias-fix.stdout`, and `rust-gate-alias-fix.stdout`. Existing corpus tables and judgment entries were left unchanged and still refer to their original measured revisions; no new corpus counts are claimed for the alias-key correction.
+
+## Self-contained offline corpus rerun delivery
+
+Runner commit: **`bb69d4394b6023326d834aad9535c9255a47b341`**. The executable `benchmarks/inspect-truth/rerun-callgraph-corpus.sh` accepts `BASE_BIN`, `CAND_BIN`, and `CORPUS_DIR`, with optional `OUT_DIR` and the candidate binary's source Git revision `CAND_REV`, obtained from its build record (omitted when unknown). It invokes the existing `run.py` collector for **fresh before and after captures**, with distinct storage, and delegates tables/scoring/cell-rule decisions to the unchanged score functions. It writes `results.json`, `results.md`, and per-cell before/after diffs in JSON and Markdown. It does not fetch, install or build anything.
+
+Both binaries use copied `oracle.json` records containing the previously computed authoritative Go/Rust findings rather than rerunning Go tools. This preserves the same denominator for each pinned repository and permits a no-network host without Go/Rust dependency caches. Go executables are unnecessary when those records exist. [The README](../README.md) lists the exact three source directories and seven baseline/judgment-origin directories to copy, the minimal two JSON files per origin, all committed harness dependencies and the runnable command. Runtime-only judgment descriptors relocate paths without changing an entry or revision. Configs and immutable original captures are preserved; binary and input hashes are checked after collection to reject mixed generations.
+
+Linux Python 3.14.4 ran **37 offline harness fixtures**, passing; Bash 5.3.9 syntax and help checks passed. Real local input preflight validated **3 pins, 3 oracle snapshots, 5 judgment descriptors and 14 immutable input-file hashes**, without collecting a binary. The fresh-collection, cell-rule exit propagation, frozen-input integrity and binary-integrity guards each have independent red controls, restored safely. The capture-reuse control deliberately replaces fresh binary execution with old captures. Its preliminary fake records lacked some category summaries, so the first red only observed an unknown bucket. After completing those synthetic summaries, the same substitution fails specifically on zero collector executions instead of six, independently defending fresh collection rather than scoring a proxy. No weak preliminary red is counted as a fresh-collection proof.
+
+Scoring code in `run.py` was not changed by the alias-key correction or offline runner additions. No actual new corpus collection was run here, and no push was performed.
