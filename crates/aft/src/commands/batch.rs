@@ -289,7 +289,7 @@ fn resolve_edit(
             .get("replacement")
             .or_else(|| edit_val.get("newString"))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .ok_or_else(|| Response::error(req_id, "invalid_request", format!("batch: edit[{}] requires a string 'replacement' or 'newString' (use an empty string to delete)", index)))?;
         let raw_occurrence_value = edit_val.get("occurrence");
         let replace_all = edit_val
             .get("replace_all")
@@ -513,7 +513,16 @@ fn resolve_edit(
         let content = edit_val
             .get("content")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .ok_or_else(|| {
+                Response::error(
+                    req_id,
+                    "invalid_request",
+                    format!(
+                        "batch: edit[{}] requires string 'content' (use an empty string to delete)",
+                        index
+                    ),
+                )
+            })?;
 
         let lines: Vec<&str> = source.lines().collect();
         let total_lines = lines.len();
@@ -1029,6 +1038,65 @@ mod a03_measurements {
 #[cfg(test)]
 mod audit_regressions {
     use super::*;
+
+    #[test]
+    fn batch_match_requires_explicit_string_replacement() {
+        let source = "one\ntwo\n";
+        let mut edits = vec![
+            serde_json::json!({"match": "one"}),
+            serde_json::json!({"oldString": "one"}),
+        ];
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(5),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            edits.push(serde_json::json!({"match": "one", "replacement": invalid}));
+            edits.push(serde_json::json!({"oldString": "one", "newString": invalid}));
+        }
+        for edit in edits {
+            assert!(
+                matches!(resolve_edit(source, &edit, 0, "required-text"), Err(response) if response.data["code"] == "invalid_request"),
+                "malformed edit must not become deletion: {edit}"
+            );
+        }
+        for edit in [
+            serde_json::json!({"match": "one", "replacement": ""}),
+            serde_json::json!({"oldString": "one", "newString": ""}),
+        ] {
+            assert!(resolve_edit(source, &edit, 0, "explicit-delete").is_ok());
+        }
+    }
+
+    #[test]
+    fn batch_range_requires_explicit_string_content() {
+        let source = "one\ntwo\n";
+        let mut edits = vec![serde_json::json!({"line_start": 1, "line_end": 1})];
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(5),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            edits.push(serde_json::json!({"line_start": 1, "line_end": 1, "content": invalid}));
+        }
+        for edit in edits {
+            assert!(
+                matches!(resolve_edit(source, &edit, 0, "required-text"), Err(response) if response.data["code"] == "invalid_request"),
+                "malformed edit must not become deletion: {edit}"
+            );
+        }
+        assert!(resolve_edit(
+            source,
+            &serde_json::json!({"line_start": 1, "line_end": 1, "content": ""}),
+            0,
+            "explicit-delete"
+        )
+        .is_ok());
+    }
 
     #[test]
     fn batch_many_edits_copy_the_file_once() {
