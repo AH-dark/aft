@@ -17,7 +17,7 @@ fn main() -> io::Result<()> {
             continue;
         }
         let (label, text) = parse_label_text(trimmed).expect("invalid input line");
-        let tokens = aft_tokenizer::count_tokens(&text);
+        let tokens = aft_tokenizer::count_tokens(&text).map_err(io::Error::other)?;
         writeln!(
             out,
             r#"{{"label":{},"tokens":{}}}"#,

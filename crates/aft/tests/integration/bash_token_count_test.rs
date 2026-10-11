@@ -105,7 +105,8 @@ fn repeat_hello_world_command(count: usize) -> String {
 #[test]
 fn bash_completed_frame_includes_token_counts() {
     let frame = run_background_command(&print_no_newline_command("hello world"));
-    let expected = aft_tokenizer::count_tokens("hello world") as u64;
+    let expected =
+        aft_tokenizer::count_tokens("hello world").expect("fixture must tokenize") as u64;
 
     assert_eq!(frame["original_tokens"], expected);
     assert_eq!(frame["compressed_tokens"], expected);
@@ -119,7 +120,7 @@ fn bash_completed_frame_token_count_below_cap() {
 
     assert_eq!(
         frame["original_tokens"],
-        aft_tokenizer::count_tokens(&output) as u64
+        aft_tokenizer::count_tokens(&output).expect("fixture must tokenize") as u64
     );
     assert!(frame["compressed_tokens"].as_u64().is_some());
     assert_eq!(frame["tokens_skipped"], false);
