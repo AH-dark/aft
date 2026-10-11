@@ -299,6 +299,13 @@ impl AllocatorMemorySnapshot {
             not_estimated: Some(reason),
         }
     }
+
+    fn unavailable(reason: &'static str) -> Self {
+        Self {
+            status: "unavailable",
+            ..Self::not_estimated(reason)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -923,10 +930,17 @@ fn allocator_observation(source: AllocatorSource) -> (AllocatorMemorySnapshot, O
         AllocatorSource::Cached => cached_allocator_observation()
             .map(|(snapshot, age_ms)| (snapshot, Some(age_ms)))
             .unwrap_or_else(|| {
-                (
-                    AllocatorMemorySnapshot::not_estimated("allocator_observation_unavailable"),
-                    None,
-                )
+                // A cold cache is not evidence that the allocator lacks counters.
+                // Keep the request path cheap while the first sample is pending.
+                let snapshot = if cfg!(any(
+                    target_os = "macos",
+                    all(target_os = "linux", target_env = "gnu")
+                )) {
+                    AllocatorMemorySnapshot::unavailable("allocator_observation_unavailable")
+                } else {
+                    AllocatorMemorySnapshot::not_estimated("allocator_observation_unavailable")
+                };
+                (snapshot, None)
             }),
         AllocatorSource::Measure => measure_allocator_observation(),
     }
@@ -1576,6 +1590,41 @@ mod tests {
     #[test]
     fn process_snapshot_preserves_negative_residuals() {
         assert_eq!(signed_difference(5, 8), -3);
+    }
+
+    #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+    #[test]
+    fn cached_allocator_before_first_publication_is_unavailable_not_unsupported() {
+        let _test_guard = allocator_observation_test_lock();
+        let publish_guard = ALLOCATOR_OBSERVATION_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_allocator_observation_for_test();
+        let calls_before = allocator_snapshot_calls_for_test();
+
+        // Hold publication at startup: a request can arrive before the sampler
+        // publishes its first reading, even on a measurable allocator.
+        let (allocator, age_ms) = allocator_observation(AllocatorSource::Cached);
+        assert_eq!(allocator.status, "unavailable");
+        assert_eq!(
+            allocator.not_estimated,
+            Some("allocator_observation_unavailable")
+        );
+        assert_eq!(allocator.bytes_in_use, None);
+        assert_eq!(allocator.size_allocated, None);
+        assert_eq!(allocator.retained_slack_bytes, None);
+        assert_eq!(age_ms, None);
+        assert_eq!(allocator_snapshot_calls_for_test(), calls_before);
+
+        drop(publish_guard);
+        publish_allocator_slack(&measured_allocator(100, 140), 0);
+        let (allocator, age_ms) = allocator_observation(AllocatorSource::Cached);
+        assert_eq!(allocator.status, "measured");
+        assert_eq!(allocator.not_estimated, None);
+        assert_eq!(allocator.bytes_in_use, Some(100));
+        assert_eq!(allocator.retained_slack_bytes, Some(40));
+        assert!(age_ms.is_some());
+        assert_eq!(allocator_snapshot_calls_for_test(), calls_before);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

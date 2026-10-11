@@ -1037,8 +1037,8 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
         }
         Value::Object(map) => {
             // Memory attribution is sampled independently in the direct and
-            // tool_call processes. Preserve its schema/status fields while
-            // masking every volatile byte/count number.
+            // tool_call processes. Preserve its schema and platform support
+            // while masking volatile counts and allocator sampling readiness.
             if let Some(memory) = map.get_mut("memory") {
                 mask_memory_snapshot(memory);
             }
@@ -1114,7 +1114,131 @@ fn mask_lifecycle_numbers(value: &mut Value) {
     }
 }
 
+fn allocator_parity_memory(status: &str) -> Value {
+    let measured = status == "measured";
+    let mut allocator = json!({
+        "status": status,
+        "bytes_in_use": if measured { Some(100) } else { None },
+        "size_allocated": if measured { Some(140) } else { None },
+        "retained_slack_bytes": if measured { Some(40) } else { None },
+        "retained_slack_label": aft::memory::ALLOCATOR_SLACK_LABEL,
+    });
+    if !measured {
+        allocator["not_estimated"] = json!("allocator_observation_unavailable");
+    }
+    json!({"process": {
+        "allocator": allocator,
+        "allocator_slack_measured": measured,
+        "allocator_observation_age_ms": if measured { Some(10) } else { None },
+    }})
+}
+
+#[test]
+fn allocator_parity_normalizes_cold_and_measured_observations() {
+    let mut measured = allocator_parity_memory("measured");
+    let mut cold = allocator_parity_memory("unavailable");
+    mask_memory_snapshot(&mut measured);
+    mask_memory_snapshot(&mut cold);
+    assert_eq!(measured, cold);
+    assert_eq!(
+        measured,
+        json!({"process": {
+            "allocator": {
+                "status": "<allocator_observation>",
+                "bytes_in_use": "<memory_number>",
+                "size_allocated": "<memory_number>",
+                "retained_slack_bytes": "<memory_number>",
+                "retained_slack_label": aft::memory::ALLOCATOR_SLACK_LABEL,
+            },
+            "allocator_slack_measured": "<allocator_slack_measured>",
+            "allocator_observation_age_ms": "<memory_number>",
+        }})
+    );
+}
+
+#[test]
+fn allocator_parity_preserves_unsupported_and_unknown_statuses() {
+    let mut measured = allocator_parity_memory("measured");
+    mask_memory_snapshot(&mut measured);
+    for status in ["not_estimated_on_this_platform", "unexpected_status"] {
+        let mut other = allocator_parity_memory(status);
+        // Test the class comparison independently of the macOS-only rejection.
+        mask_memory_snapshot_for_platform(&mut other, false);
+        assert_ne!(measured, other, "must preserve {status}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "macOS allocator must not be reported as unsupported")]
+fn allocator_parity_rejects_unsupported_status_on_macos() {
+    let mut memory = allocator_parity_memory("not_estimated_on_this_platform");
+    mask_memory_snapshot_for_platform(&mut memory, true);
+}
+
+#[test]
+fn allocator_parity_preserves_missing_fields_and_slack_label() {
+    let mut measured = allocator_parity_memory("measured");
+    mask_memory_snapshot(&mut measured);
+    for field in ["bytes_in_use", "size_allocated", "retained_slack_bytes"] {
+        let mut missing = allocator_parity_memory("unavailable");
+        missing["process"]["allocator"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        mask_memory_snapshot(&mut missing);
+        assert_ne!(measured, missing, "must preserve missing {field}");
+    }
+    let mut mislabeled = allocator_parity_memory("unavailable");
+    mislabeled["process"]["allocator"]["retained_slack_label"] = json!("resident memory");
+    mask_memory_snapshot(&mut mislabeled);
+    assert_ne!(measured, mislabeled);
+}
+
 fn mask_memory_snapshot(memory: &mut Value) {
+    mask_memory_snapshot_for_platform(memory, cfg!(target_os = "macos"));
+}
+
+fn mask_memory_snapshot_for_platform(memory: &mut Value, require_macos_allocator: bool) {
+    if let Some(process) = memory.get_mut("process").and_then(Value::as_object_mut) {
+        if let Some(allocator) = process.get_mut("allocator").and_then(Value::as_object_mut) {
+            let status = allocator.get("status").and_then(Value::as_str);
+            if require_macos_allocator {
+                assert_ne!(
+                    status,
+                    Some("not_estimated_on_this_platform"),
+                    "macOS allocator must not be reported as unsupported"
+                );
+            }
+            if matches!(status, Some("measured" | "unavailable")) {
+                // Separate processes may sample at different times. Only these
+                // two statuses describe sampling readiness rather than support.
+                if status == Some("unavailable")
+                    && allocator.get("not_estimated").and_then(Value::as_str)
+                        == Some("allocator_observation_unavailable")
+                {
+                    allocator.remove("not_estimated");
+                }
+                allocator.insert("status".to_string(), json!("<allocator_observation>"));
+                for field in ["bytes_in_use", "size_allocated", "retained_slack_bytes"] {
+                    if let Some(value) = allocator.get_mut(field) {
+                        if value.is_number() || value.is_null() {
+                            *value = json!("<memory_number>");
+                        }
+                    }
+                }
+                if let Some(value) = process.get_mut("allocator_slack_measured") {
+                    if value.is_boolean() {
+                        *value = json!("<allocator_slack_measured>");
+                    }
+                }
+                if let Some(value) = process.get_mut("allocator_observation_age_ms") {
+                    if value.is_number() || value.is_null() {
+                        *value = json!("<memory_number>");
+                    }
+                }
+            }
+        }
+    }
     if let Some(roots) = memory.get_mut("roots").and_then(Value::as_object_mut) {
         let values = std::mem::take(roots)
             .into_iter()
