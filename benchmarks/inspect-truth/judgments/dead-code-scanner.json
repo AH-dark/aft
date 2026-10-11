@@ -2,9 +2,9 @@
   "after_outputs": {
     "outline": "target/inspect-truth-corpus/_results/outline/715f01b05062908be3f9cd147f0e4399c40274ec",
     "typeorm": "target/inspect-truth-corpus/_results/typeorm/715f01b05062908be3f9cd147f0e4399c40274ec",
-    "ripgrep": "target/inspect-truth-corpus/_results/ripgrep/7306b6953ace4ad20e8b3108486e6b0d831d8af5",
-    "axum": "target/inspect-truth-corpus/_results/axum/7306b6953ace4ad20e8b3108486e6b0d831d8af5",
-    "soft-serve": "target/inspect-truth-corpus/_results/soft-serve/715f01b05062908be3f9cd147f0e4399c40274ec",
+    "ripgrep": "local-ignore/callgraph/corpus/_results/ripgrep/7306b6953ace4ad20e8b3108486e6b0d831d8af5",
+    "axum": "local-ignore/callgraph/corpus/_results/axum/7306b6953ace4ad20e8b3108486e6b0d831d8af5",
+    "soft-serve": "local-ignore/callgraph/corpus/_results/soft-serve/715f01b05062908be3f9cd147f0e4399c40274ec",
     "aft": "target/inspect-truth-corpus/_results/aft/7306b6953ace4ad20e8b3108486e6b0d831d8af5"
   },
   "entries": [
