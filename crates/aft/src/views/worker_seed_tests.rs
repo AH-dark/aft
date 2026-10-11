@@ -1,8 +1,12 @@
 use super::*;
 
 fn git(root: &Path, args: &[&str]) {
+    // Pin line endings: Windows runners default to core.autocrlf=true, which
+    // would check the worktree out with CRLF while the main checkout's files
+    // were written with LF, so every file would get a new content key.
     assert!(std::process::Command::new("git")
         .current_dir(root)
+        .args(["-c", "core.autocrlf=false"])
         .args(args)
         .status()
         .unwrap()
