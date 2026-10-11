@@ -1159,9 +1159,34 @@ fn harness_forces_untrusted(harness: &str) -> bool {
     harness.starts_with("fed:")
 }
 
+/// Reserved modules that are first-party only when they bind for one named
+/// harness, as exact `(module_id, harness)` pairs. A module that hosts a
+/// harness on someone's behalf earns first-party trust only once AFT has
+/// been checked against that harness; the same module binding for any other
+/// harness stays untrusted until its pair is added here. Matching is exact on
+/// both halves: no prefixes, no wildcards.
+///
+/// `thalamus-harness` (binary `ck-thalamus-harness`) is CortexKit's harness
+/// module, which hosts OpenCode for Alfonso. Its Pi adapter is not ready, so
+/// only the OpenCode pair is listed.
+const HARNESS_SCOPED_FIRST_PARTY_MODULES: &[(&str, &str)] = &[("thalamus-harness", "opencode")];
+
+fn reserved_module_is_first_party_on_harness(harness: &str, principal: &Option<Principal>) -> bool {
+    let Some(Principal::Reserved { module_id }) = principal else {
+        return false;
+    };
+    HARNESS_SCOPED_FIRST_PARTY_MODULES
+        .iter()
+        .any(|(allowed_module, allowed_harness)| {
+            module_id == allowed_module && harness == *allowed_harness
+        })
+}
+
 pub(super) fn trust_for_bind(harness: &str, principal: &Option<Principal>) -> BindTrust {
     if harness_forces_untrusted(harness) {
         BindTrust::Untrusted
+    } else if reserved_module_is_first_party_on_harness(harness, principal) {
+        BindTrust::FirstParty
     } else {
         trust_for_principal(principal)
     }
@@ -15469,6 +15494,124 @@ mod tests {
                 BindTrust::Untrusted,
                 "a non-allowlisted reserved module must stay untrusted on {harness}"
             );
+        }
+    }
+
+    fn reserved(module_id: &str) -> Option<Principal> {
+        Some(Principal::Reserved {
+            module_id: module_id.to_string(),
+        })
+    }
+
+    /// The harness module that hosts OpenCode must get exactly what the
+    /// direct OpenCode plugin gets. Every per-bind capability (structured
+    /// replies, bash observation, sandbox trust, host escalation, bash without
+    /// a permission ask) is decided from the `BindTrust` value alone, so the
+    /// test compares that value and each property derived from it, plus the
+    /// reply bytes, against a direct OpenCode bind.
+    #[test]
+    fn thalamus_harness_on_opencode_binds_like_the_direct_opencode_plugin() {
+        let direct = trust_for_bind("opencode", &Some(Principal::Direct));
+        let harness_module = trust_for_bind("opencode", &reserved("thalamus-harness"));
+        assert_eq!(direct, BindTrust::FirstParty);
+        assert_eq!(harness_module, BindTrust::FirstParty);
+        assert_eq!(harness_module.label(), direct.label());
+        assert_eq!(
+            harness_module.allows_bash_observation(),
+            direct.allows_bash_observation()
+        );
+        assert_eq!(harness_module.sandbox_trust(), direct.sandbox_trust());
+
+        let result = ToolCallResult {
+            text: "rendered text".to_string(),
+            response: Response::success("req-1", json!({ "matches": 3 })),
+        };
+        let frame_for = |trust| {
+            build_tool_response_frame(
+                PROTOCOL_VERSION,
+                route_key(1, 1),
+                7,
+                control_flags(),
+                &result,
+                trust,
+            )
+            .expect("tool response frame")
+            .body
+        };
+        let harness_body = frame_for(harness_module);
+        assert_eq!(harness_body, frame_for(direct));
+        let body: Value = serde_json::from_slice(&harness_body).unwrap();
+        assert!(
+            body.get("structuredContent").is_some(),
+            "a first-party bind must receive the structured reply: {body}"
+        );
+    }
+
+    /// Trust for the harness module is per harness: it hosts only OpenCode
+    /// today, so the same principal binding for any other harness, including
+    /// Pi whose adapter is not ready, must stay untrusted.
+    #[test]
+    fn thalamus_harness_stays_untrusted_on_other_harnesses() {
+        let principal = reserved("thalamus-harness");
+        for harness in ["pi", "runner", "mcp:claude", "OpenCode", "opencode ", ""] {
+            assert_eq!(
+                trust_for_bind(harness, &principal),
+                BindTrust::Untrusted,
+                "thalamus-harness must stay untrusted on harness {harness:?}"
+            );
+        }
+        // The principal alone, with no harness, never confers trust.
+        assert_eq!(trust_for_principal(&principal), BindTrust::Untrusted);
+        // The fed: override still wins over the harness-scoped pair.
+        assert_eq!(
+            trust_for_bind("fed:opencode", &principal),
+            BindTrust::Untrusted
+        );
+    }
+
+    /// The module id match is exact: look-alike ids on OpenCode gain nothing.
+    #[test]
+    fn look_alike_harness_module_ids_stay_untrusted_on_opencode() {
+        for module_id in [
+            "thalamus-harnesses",
+            "thalamus",
+            "thalamus-harness ",
+            "Thalamus-Harness",
+            "ck-thalamus-harness",
+            "opencode",
+        ] {
+            assert_eq!(
+                trust_for_bind("opencode", &reserved(module_id)),
+                BindTrust::Untrusted,
+                "reserved module id {module_id:?} must stay untrusted on opencode"
+            );
+        }
+    }
+
+    /// Adding a harness-scoped pair must not change any existing first-party
+    /// principal: each one stays first-party on every ordinary harness.
+    #[test]
+    fn existing_first_party_principals_are_unchanged_by_harness_scoped_modules() {
+        for harness in ["opencode", "pi", "runner", "mcp:claude"] {
+            assert_eq!(
+                trust_for_bind(harness, &Some(Principal::Direct)),
+                BindTrust::FirstParty,
+                "direct must stay first-party on {harness}"
+            );
+            for module_id in [
+                "llm-runner",
+                "aft",
+                "broca",
+                "alfonso-core",
+                "prefrontal",
+                "prefrontal-core",
+            ] {
+                assert_eq!(
+                    trust_for_bind(harness, &reserved(module_id)),
+                    BindTrust::FirstParty,
+                    "reserved module id {module_id:?} must stay first-party on {harness}"
+                );
+            }
         }
     }
 
