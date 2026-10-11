@@ -23,7 +23,7 @@ fn unique_failure_log(target_bytes: usize) -> String {
     output
 }
 
-fn operation(output: &str, registry: &FilterRegistry, exit_code: Option<i32>) -> Duration {
+fn operation(output: &str, registry: &FilterRegistry, exit_code: Option<i64>) -> Duration {
     let started = Instant::now();
     let result = compress_with_registry_exit_code(
         black_box("cargo build"),
