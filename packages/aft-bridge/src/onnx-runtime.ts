@@ -55,7 +55,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
 import { cachedFileSha256, sha256File, writeStampedFileDigest } from "./binary-identity.js";
-import { execFileSync } from "./child-process.js";
+import { execFile, execFileSync } from "./child-process.js";
 import { probeOnnxRuntimeLoadable } from "./onnx-probe.js";
 import { relativePathEscapesRoot } from "./path-display.js";
 import { withPathPrepended } from "./path-env.js";
@@ -67,7 +67,7 @@ import {
   privateCopyFileSync,
   privateMkdirSync,
 } from "./private-storage.js";
-import { execTarExtractionSync } from "./tar-executable.js";
+import { execTarExtraction } from "./tar-executable.js";
 
 const ORT_VERSION = "1.24.4";
 const ORT_REPO = "microsoft/onnxruntime";
@@ -950,7 +950,7 @@ async function downloadOnnxRuntime(
     log(`ONNX Runtime archive sha256=${archiveSha256}`);
 
     if (info.archiveType === "tgz") {
-      execTarExtractionSync(["xzf", archivePath, "-C", extractionRoot], 120_000, true);
+      await execTarExtraction(["xzf", archivePath, "-C", extractionRoot], 120_000, true);
     } else {
       await extractZipArchive(archivePath, extractionRoot);
     }
@@ -1146,13 +1146,15 @@ async function extractZipArchive(archivePath: string, destinationDir: string): P
   if (process.platform === "win32") {
     // Avoid PowerShell and PATH-resolved GNU tar. System32 bsdtar accepts
     // drive-letter paths and direct argv execution adds no shell parser.
-    execTarExtractionSync(["-xf", archivePath, "-C", destinationDir], 120_000);
+    await execTarExtraction(["-xf", archivePath, "-C", destinationDir], 120_000);
     return;
   }
 
-  execFileSync("unzip", ["-q", archivePath, "-d", destinationDir], {
-    stdio: "pipe",
-    timeout: 120_000,
+  await new Promise<void>((resolve, reject) => {
+    execFile("unzip", ["-q", archivePath, "-d", destinationDir], { timeout: 120_000 }, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
   });
 }
 
@@ -1357,6 +1359,7 @@ export function cleanupOnnxRuntime(storageDir: string): void {
  * an actual ONNX download. Don't use from production code.
  */
 export const __test__ = {
+  extractZipArchive,
   cleanupAbandonedOnnxAttempts,
   cleanupAbandonedStagingDirs,
   cleanupIncompleteTargetIfUnowned,
