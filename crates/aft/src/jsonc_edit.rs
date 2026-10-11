@@ -207,25 +207,39 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".to_string());
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or_default();
-    let temp = parent.join(format!(".{name}.tmp-{}-{nanos}", std::process::id()));
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
+    let temp = parent.join(format!(
+        ".{name}.tmp-{}-{:032x}",
+        std::process::id(),
+        u128::from_le_bytes(nonce)
+    ));
+    write_atomic_to_temp(path, contents, &temp)
+}
+
+fn write_atomic_to_temp(path: &Path, contents: &str, temp: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Acquire a private file before writing, and never clean up another writer's temp.
+    let mut file = crate::private_storage::options()
+        .write(true)
+        .create_new(true)
+        .open(temp)?;
     let result = (|| {
-        let mut file = std::fs::File::create(&temp)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
         if let Ok(metadata) = std::fs::metadata(path) {
-            std::fs::set_permissions(&temp, metadata.permissions())?;
+            std::fs::set_permissions(temp, metadata.permissions())?;
         }
-        std::fs::rename(&temp, path)?;
+        std::fs::rename(temp, path)?;
         crate::durability::sync_dir(parent)?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(temp);
     }
     result
 }
@@ -378,6 +392,72 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn atomic_write_does_not_touch_a_colliding_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.jsonc");
+        let temp = dir.path().join("occupied.tmp");
+        std::fs::write(&path, "old config").unwrap();
+        std::fs::write(&temp, "another writer").unwrap();
+        let error = write_atomic_to_temp(&path, "new config", &temp).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&temp).unwrap(), "another writer");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old config");
+    }
+
+    #[test]
+    fn atomic_write_cleans_its_temporary_after_failed_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("destination");
+        let temp = dir.path().join("owned.tmp");
+        std::fs::create_dir(&path).unwrap();
+        assert!(write_atomic_to_temp(&path, "config", &temp).is_err());
+        assert!(!temp.exists());
+        assert!(path.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_new_config_is_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "AFT_TEST_JSONC_PRIVATE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Only this isolated child changes umask; parallel tests keep theirs.
+            unsafe { libc::umask(0o022) };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("aft.jsonc");
+            write_atomic(&path, "private config").unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            write_atomic(&path, "replacement config").unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "jsonc_edit::tests::atomic_write_new_config_is_private_under_permissive_umask",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "private-config child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
