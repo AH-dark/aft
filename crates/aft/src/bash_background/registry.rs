@@ -40,7 +40,8 @@ use super::output::{
     STRUCTURED_OUTPUT_CAP_BYTES,
 };
 use super::persistence::{
-    allocate_task_layout, delete_resolved_task, delete_task_bundle, discover_task_ids,
+    allocate_task_layout, delete_resolved_task, delete_task_bundle,
+    delete_task_bundle_with_legacy_harness_root, discover_task_ids, is_task_layout_not_found,
     open_task_artifact, quarantine_invalid_entry, quarantine_task_layout, read_exit_marker,
     read_task_at, resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
     unix_millis, update_task_at, validate_task_id, write_kill_marker_if_absent, write_task_at,
@@ -5664,14 +5665,20 @@ impl BgTaskRegistry {
     }
 
     fn cleanup_finished_at(&self, older_than: Duration, now: Instant) {
-        self.cleanup_finished_at_with(older_than, now, delete_task_bundle);
+        self.cleanup_finished_at_with(older_than, now, |task| {
+            delete_task_bundle_with_legacy_harness_root(
+                &task.paths,
+                &task.session_id,
+                task.db_harness.as_deref(),
+            )
+        });
     }
 
     fn cleanup_finished_at_with(
         &self,
         older_than: Duration,
         now: Instant,
-        delete_bundle: impl Fn(&TaskPaths) -> std::io::Result<()>,
+        delete_bundle: impl Fn(&BgTask) -> std::io::Result<()>,
     ) {
         let cutoff = now.checked_sub(older_than);
         let candidates: Vec<_> = {
@@ -5718,7 +5725,7 @@ impl BgTaskRegistry {
             }
             let delete_result = if handles_released {
                 self.retire_watchdog_task(&task_id);
-                delete_bundle(&paths)
+                delete_bundle(&task)
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
@@ -5730,6 +5737,14 @@ impl BgTaskRegistry {
                     self.forget_finished_delete_attempts(&task_id);
                     self.remove_cleanup_task(&task);
                     log::debug!("deleted persisted background task bundle {task_id}");
+                }
+                Err(error) if is_task_layout_not_found(&error) => {
+                    self.forget_finished_delete_attempts(&task_id);
+                    self.remove_cleanup_task(&task);
+                    log::debug!(
+                        "skipping persisted background task bundle {task_id}: no recognized layout at {}",
+                        paths.dir.display()
+                    );
                 }
                 Err(error) => {
                     let attempts = self.note_finished_delete_attempt(&task_id);
@@ -12302,7 +12317,7 @@ mod tests {
         let task = registry.task_for_session(&task_id, "session").unwrap();
         let delete_attempted = AtomicBool::new(false);
         let delete_error = Mutex::new(None);
-        registry.cleanup_finished_at_with(Duration::ZERO, Instant::now(), |paths| {
+        registry.cleanup_finished_at_with(Duration::ZERO, Instant::now(), |candidate| {
             delete_attempted.store(true, Ordering::SeqCst);
             let state = task.state.lock().unwrap();
             assert!(
@@ -12325,7 +12340,7 @@ mod tests {
                 "cleanup must wait for the PTY reader's output-file handle"
             );
             drop(state);
-            match delete_task_bundle(paths) {
+            match delete_task_bundle(&candidate.paths) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     *delete_error.lock().unwrap() = Some(error.to_string());
@@ -12381,12 +12396,12 @@ mod tests {
         *task.terminal_at.lock().unwrap() = Some(Instant::now());
         let cleanup_now = Instant::now() + Duration::from_secs(1);
 
-        registry.cleanup_finished_at_with(Duration::ZERO, cleanup_now, |paths| {
+        registry.cleanup_finished_at_with(Duration::ZERO, cleanup_now, |candidate| {
             assert!(
                 task.state.lock().unwrap().io_handles.is_none(),
                 "cleanup must close preopened file and directory handles before deletion"
             );
-            delete_task_bundle(paths)
+            delete_task_bundle(&candidate.paths)
         });
 
         assert!(registry.task_for_session(&task_id, "session").is_none());
@@ -12453,6 +12468,98 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_finished_deletes_a_task_from_the_legacy_harness_root() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let task_id = random_slug();
+        let layout = create_task_layout(storage.path(), "session", &task_id).unwrap();
+        let paths = layout.paths.clone();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            "true".to_string(),
+            storage.path().to_path_buf(),
+            Some(storage.path().to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        metadata.harness = Some("pi".to_string());
+        write_task_at(&layout, &metadata).unwrap();
+        fs::write(&paths.stdout, "completed output\n").unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths.clone(), true)
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let clock_origin = Instant::now();
+        *task.terminal_at.lock().unwrap() = Some(clock_origin);
+
+        let legacy_session = storage
+            .path()
+            .join("pi")
+            .join("bash-tasks")
+            .join(crate::backup::hash_session("session"));
+        fs::create_dir_all(&legacy_session).unwrap();
+        let legacy_dir = legacy_session.join(&task_id);
+        let legacy_metadata = legacy_dir.join("control").join("metadata.json");
+        drop(layout);
+        fs::rename(&paths.dir, &legacy_dir).unwrap();
+        let cleanup_now = clock_origin + Duration::from_secs(24 * 60 * 60 + 1);
+
+        registry.cleanup_finished_at(
+            crate::bash_background::watchdog::FINISHED_RETENTION,
+            cleanup_now,
+        );
+
+        assert!(
+            registry.task_for_session(&task_id, "session").is_none(),
+            "an eligible task in the legacy harness root must be removed"
+        );
+        assert!(
+            !legacy_metadata.exists(),
+            "the task bundle in the legacy harness root must be deleted"
+        );
+        assert!(!legacy_dir.exists());
+    }
+
+    #[test]
+    fn cleanup_finished_skips_an_unrecognized_layout_without_retrying() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let (task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &storage,
+            "true",
+            "completed output\n",
+            "",
+            false,
+        );
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.completion_delivered = true;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        for file in super::super::persistence::task_bundle_files(&task.paths) {
+            if file.exists() {
+                fs::remove_file(file).unwrap();
+            }
+        }
+        let clock_origin = Instant::now();
+        *task.terminal_at.lock().unwrap() = Some(clock_origin);
+
+        registry.cleanup_finished_at(
+            crate::bash_background::watchdog::FINISHED_RETENTION,
+            clock_origin + Duration::from_secs(24 * 60 * 60 + 1),
+        );
+
+        assert!(registry.task_for_session(&task_id, "session").is_none());
+        assert_eq!(registry.finished_delete_attempt_count(&task_id), 0);
+    }
+
+    #[test]
     fn cleanup_finished_retries_a_transient_bundle_delete_failure() {
         let registry = BgTaskRegistry::default();
         let storage = tempfile::tempdir().unwrap();
@@ -12474,15 +12581,15 @@ mod tests {
         *task.terminal_at.lock().unwrap() = Some(clock_origin);
         let cleanup_now = clock_origin + Duration::from_secs(24 * 60 * 60 + 1);
         let delete_attempts = AtomicUsize::new(0);
-        let delete_with_one_transient_failure = |paths: &TaskPaths| {
+        let delete_with_one_transient_failure = |candidate: &BgTask| {
             if delete_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                fs::remove_file(&paths.stdout).unwrap();
+                fs::remove_file(&candidate.paths.stdout).unwrap();
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "injected transient bundle deletion failure",
                 ))
             } else {
-                delete_task_bundle(paths)
+                delete_task_bundle(&candidate.paths)
             }
         };
 
@@ -12534,9 +12641,9 @@ mod tests {
         *task.terminal_at.lock().unwrap() = Some(clock_origin);
         let cleanup_now = clock_origin + Duration::from_secs(1);
         let delete_attempts = AtomicUsize::new(0);
-        let delete_bundle = |paths: &TaskPaths| {
+        let delete_bundle = |candidate: &BgTask| {
             delete_attempts.fetch_add(1, Ordering::SeqCst);
-            delete_task_bundle(paths)
+            delete_task_bundle(&candidate.paths)
         };
 
         registry.cleanup_finished_at_with(Duration::ZERO, cleanup_now, delete_bundle);
@@ -12575,7 +12682,7 @@ mod tests {
         *task.terminal_at.lock().unwrap() = Some(clock_origin);
         let cleanup_now = clock_origin + Duration::from_secs(24 * 60 * 60 + 1);
         let delete_attempts = AtomicUsize::new(0);
-        let always_fail = |_: &TaskPaths| {
+        let always_fail = |_: &BgTask| {
             delete_attempts.fetch_add(1, Ordering::SeqCst);
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,

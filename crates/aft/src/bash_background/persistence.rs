@@ -30,6 +30,7 @@ pub const SCHEMA_VERSION: u32 = 7;
 const CONTROL_DIR: &str = "control";
 const IO_DIR: &str = "io";
 const METADATA_FILE: &str = "metadata.json";
+const TASK_LAYOUT_NOT_FOUND: &str = "background task layout not found";
 pub const COMMAND_FILE: &str = "command.sh";
 pub const WRAPPER_FILE: &str = "wrapper.sh";
 pub const ENVIRONMENT_FILE: &str = "environment.bin";
@@ -1004,7 +1005,7 @@ pub fn resolve_uninitialized_task_layout(
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "background task layout not found",
+        TASK_LAYOUT_NOT_FOUND,
     ))
 }
 
@@ -1477,6 +1478,41 @@ where
 pub fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
     validate_task_id(&paths.task_id)?;
     crate::gh_shim_ticket::revoke_task(&paths.task_id);
+    delete_task_bundle_at_root(paths)
+}
+
+/// Delete a task from the direct storage root or its harness-scoped legacy root.
+pub fn delete_task_bundle_with_legacy_harness_root(
+    paths: &TaskPaths,
+    session_id: &str,
+    harness: Option<&str>,
+) -> io::Result<()> {
+    validate_task_id(&paths.task_id)?;
+    crate::gh_shim_ticket::revoke_task(&paths.task_id);
+    if task_layout_entry_exists(&paths.session_dir, &paths.task_id)? {
+        return delete_task_bundle_at_root(paths);
+    }
+
+    let Some(legacy_session_dir) =
+        legacy_harness_session_dir(&paths.session_dir, session_id, harness)
+    else {
+        return Err(task_layout_not_found());
+    };
+    if !task_layout_entry_exists(&legacy_session_dir, &paths.task_id)? {
+        return Err(task_layout_not_found());
+    }
+
+    let resolved = resolve_task_layout(&legacy_session_dir, &paths.task_id)?;
+    if resolved.paths.layout != paths.layout {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "background task layout changed before deletion",
+        ));
+    }
+    delete_resolved_task(&resolved)
+}
+
+fn delete_task_bundle_at_root(paths: &TaskPaths) -> io::Result<()> {
     #[cfg(windows)]
     if paths.layout == TaskLayout::Directory {
         return delete_windows_directory_bundle(paths);
@@ -1489,6 +1525,59 @@ pub fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
         ));
     }
     delete_resolved_task(&resolved)
+}
+
+fn task_layout_entry_exists(session_dir: &Path, task_id: &str) -> io::Result<bool> {
+    let session = match PinnedDir::open(session_dir) {
+        Ok(session) => session,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match session.open_dir_at(OsStr::new(task_id)) {
+        Ok(_) => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = OsString::from(format!("{task_id}.json"));
+    match open_metadata_through_replacement(&session, &metadata) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn legacy_harness_session_dir(
+    session_dir: &Path,
+    session_id: &str,
+    harness: Option<&str>,
+) -> Option<PathBuf> {
+    let harness = harness?
+        .parse::<crate::harness::Harness>()
+        .ok()?
+        .storage_segment();
+    let session_hash = hash_session(session_id);
+    if session_dir.file_name() != Some(OsStr::new(&session_hash)) {
+        return None;
+    }
+    let task_root = session_dir.parent()?;
+    if task_root.file_name() != Some(OsStr::new("bash-tasks")) {
+        return None;
+    }
+    let storage_root = task_root.parent()?;
+    Some(
+        storage_root
+            .join(harness)
+            .join("bash-tasks")
+            .join(session_hash),
+    )
+}
+
+fn task_layout_not_found() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, TASK_LAYOUT_NOT_FOUND)
+}
+
+pub(crate) fn is_task_layout_not_found(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound && error.to_string() == TASK_LAYOUT_NOT_FOUND
 }
 
 #[cfg(windows)]
@@ -3288,6 +3377,38 @@ mod tests {
             "task metadata must remain available so a later sweep can resolve and retry deletion"
         );
         assert_eq!(read_task_at(&task).unwrap().task_id, task.paths.task_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_harness_root_fallback_refuses_a_task_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let storage = tempfile::tempdir().unwrap();
+        let session_id = "session";
+        let task_id = valid_id(33);
+        let paths = task_paths(storage.path(), session_id, &task_id).unwrap();
+        fs::create_dir_all(&paths.session_dir).unwrap();
+        let legacy_session = storage
+            .path()
+            .join("pi")
+            .join("bash-tasks")
+            .join(hash_session(session_id));
+        fs::create_dir_all(&legacy_session).unwrap();
+        let victim = storage.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), b"untouched").unwrap();
+        let task_link = legacy_session.join(&task_id);
+        symlink(&victim, &task_link).unwrap();
+
+        assert!(
+            delete_task_bundle_with_legacy_harness_root(&paths, session_id, Some("pi")).is_err()
+        );
+        assert_eq!(fs::read(victim.join("keep")).unwrap(), b"untouched");
+        assert!(fs::symlink_metadata(&task_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]
