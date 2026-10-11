@@ -1429,6 +1429,12 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                     let uri = document_uri(&params);
                     let version = document_version(&params);
+                    if std::env::var("AFT_FAKE_LSP_ECHO_CHANGES").ok().as_deref() == Some("1") {
+                        write_notification(
+                            &mut writer,
+                            &Notification::new("custom/documentChangedContents", params.clone()),
+                        )?;
+                    }
                     if let Some(uri) = uri.as_str() {
                         open_documents
                             .insert(uri.to_string(), (changed_diagnostics(), version.clone()));
