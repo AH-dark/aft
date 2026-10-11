@@ -1292,3 +1292,147 @@ fn p10_launcher_latency_delta_is_measured_over_twenty_iterations() {
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
+
+#[test]
+fn access_policy_compiled_file_grant_does_not_widen_shell_writes() {
+    skip_if_landlock_absent!();
+    use aft::access_policy::{AccessGrant, AccessOperation, AccessPolicy, GrantKind};
+    let fixture = tempfile::tempdir().unwrap();
+    let base = fixture.path().canonicalize().unwrap();
+    let root = base.join("worktree");
+    let outside = base.join("outside");
+    let directory = outside.join("approved-directory");
+    let temp = base.join("task-temp");
+    for path in [&root, &directory, &temp] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let file = outside.join("approved-file");
+    let sibling = outside.join("sibling");
+    fs::write(&file, "original").unwrap();
+    let mut policy = AccessPolicy::from_config(
+        &aft::config::Config::default(),
+        &base.join("store"),
+        vec![root.clone()],
+        &base.join("home"),
+    );
+    policy.grants = vec![
+        AccessGrant {
+            path: file.clone(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Write,
+        },
+        AccessGrant {
+            path: directory.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        },
+    ];
+    assert_eq!(
+        policy.decide(AccessOperation::Write, &file, false),
+        aft::access_policy::AccessDecision::Allow
+    );
+    let profile = policy.compile_shell(temp, Vec::new(), Vec::new()).unwrap();
+    #[cfg(target_os = "linux")]
+    let profile = {
+        let mut profile = profile;
+        profile.read_allow = linux_system_read_allow();
+        profile.read_allow.extend([root.clone(), directory.clone()]);
+        profile
+    };
+    let mut profile = InheritedProfile::new(&profile);
+    let output = launcher_command(
+        profile.fd(),
+        &[
+            "/bin/bash",
+            "-c",
+            &format!("printf forbidden > {}", shell_path(&file)),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_denied(&output, "file grant must remain in-process only");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+    profile.rewind();
+    let output = launcher_command(
+        profile.fd(),
+        &[
+            "/bin/bash",
+            "-c",
+            &format!("printf forbidden > {}", shell_path(&sibling)),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_denied(&output, "a file grant cannot grant its sibling");
+    assert!(!sibling.exists());
+    let approved = directory.join("new-file");
+    profile.rewind();
+    let output = launcher_command(
+        profile.fd(),
+        &[
+            "/bin/bash",
+            "-c",
+            &format!("printf approved > {}", shell_path(&approved)),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(output.status.success(), "directory grant: {:?}", output);
+    assert_eq!(fs::read_to_string(approved).unwrap(), "approved");
+}
+
+#[test]
+fn access_policy_read_deny_inside_worktree_is_unreadable_from_shell() {
+    skip_if_landlock_absent!();
+    use aft::access_policy::{
+        AccessDecision, AccessGrant, AccessOperation, AccessPolicy, GrantKind,
+    };
+    let fixture = tempfile::tempdir().unwrap();
+    let base = fixture.path().canonicalize().unwrap();
+    let root = base.join("worktree");
+    let temp = base.join("task-temp");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&temp).unwrap();
+    let denied = root.join("floor");
+    fs::write(&denied, "must-not-leak").unwrap();
+    let mut config = aft::config::Config::default();
+    config.project_root = Some(root.clone());
+    config.sandbox.read_deny = vec![denied.clone()];
+    let ctx = aft::context::AppContext::new(Box::new(aft::language::StubProvider), config.clone());
+    assert_eq!(
+        ctx.validate_read_path("floor", "session", &denied)
+            .unwrap_err()
+            .data["code"],
+        "denied_floor"
+    );
+    let mut policy = AccessPolicy::from_config(
+        &config,
+        &base.join("store"),
+        vec![root.clone()],
+        &base.join("home"),
+    );
+    policy.outside = AccessDecision::Allow;
+    policy.grants.push(AccessGrant {
+        path: root.clone(),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    });
+    let profile = policy.compile_shell(temp, Vec::new(), Vec::new()).unwrap();
+    #[cfg(target_os = "linux")]
+    let profile = {
+        let mut profile = profile;
+        profile.read_allow = linux_system_read_allow();
+        // Landlock cannot subtract a nested write floor from an enclosing root;
+        // launch validation must refuse this profile instead of weakening it.
+        profile
+    };
+    let profile = InheritedProfile::new(&profile);
+    let output = launcher_command(
+        profile.fd(),
+        &["/bin/bash", "-c", &format!("cat {}", shell_path(&denied))],
+    )
+    .output()
+    .unwrap();
+    assert_denied(&output, "absolute floor inside the worker's own worktree");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-leak"));
+}

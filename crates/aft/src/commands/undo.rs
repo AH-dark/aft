@@ -67,12 +67,19 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut save = |paths: &[PathBuf]| save_external_change(ctx, session, paths);
 
     let Some(file) = req.params.get("file").and_then(|v| v.as_str()) else {
-        if let Some(reason) = backup.take_latest_skipped_reason_for_undo(req.session(), None) {
-            return backup_skipped_response(req, reason);
-        }
         let intent_paths = backup
             .preview_last_operation_paths(req.session())
             .unwrap_or_default();
+        // Stored backup keys are just as untrusted as explicit tool arguments:
+        // authority may have changed since the snapshot was taken.
+        for path in &intent_paths {
+            if let Err(response) = ctx.validate_write_location(&req.id, path) {
+                return response;
+            }
+        }
+        if let Some(reason) = backup.take_latest_skipped_reason_for_undo(req.session(), None) {
+            return backup_skipped_response(req, reason);
+        }
         let _view_intent =
             crate::views::intent::record_paths(intent_paths.iter().map(|path| path.as_path()));
         return match backup.restore_last_operation_preserving(req.session(), &mut save) {

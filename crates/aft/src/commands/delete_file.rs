@@ -349,14 +349,36 @@ fn handle_delete_file_with_skip(
         .or_else(|| req.params.get("files"))
         .and_then(Value::as_array)
     {
+        // Decide the entire batch before any backup or unlink. A denied_floor
+        // response aborts without changing files; existing path_outside_root and
+        // ordinary target failures retain their per-file reporting.
+        let mut decisions = files
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(|file| ctx.validate_write_location(&req.id, Path::new(file)))
+            })
+            .collect::<Vec<_>>();
+        if let Some(index) = decisions.iter().position(|decision| {
+            matches!(decision, Some(Err(response)) if response.data["code"] == "denied_floor")
+        }) {
+            return decisions[index].take().expect("floor target has a decision").unwrap_err();
+        }
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
-        for value in files {
+        for (value, decision) in files.iter().zip(decisions) {
             let Some(file) = value.as_str() else {
                 skipped.push(serde_json::json!({"file": value, "reason": "not a string"}));
                 continue;
             };
-            match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget, forced_skip) {
+            let result = match decision.expect("string target has a decision") {
+                Ok(_) => {
+                    delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget, forced_skip)
+                }
+                Err(response) => Err(response),
+            };
+            match result {
                 Ok(result) => deleted.push(result),
                 Err(resp) => skipped.push(serde_json::json!({
                     "file": file,

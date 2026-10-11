@@ -53,8 +53,6 @@ use std::time::{Duration, Instant};
 use portable_pty::CommandBuilder;
 
 use crate::context::AppContext;
-#[cfg(unix)]
-use crate::sandbox_profile::SandboxDataPolicy;
 use crate::sandbox_profile::SandboxProfile;
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
@@ -1459,90 +1457,33 @@ fn build_native_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
-        let mut writable_roots = project_roots.clone();
-        writable_roots.extend(
-            ctx.config()
-                .sandbox
-                .write_allow
-                .iter()
-                .map(|path| expand_home(path, &home)),
-        );
-
-        let mut secret_floor = vec![
-            home.join(".ssh"),
-            home.join(".aws"),
-            home.join(".gnupg"),
-            home.join(".config/gcloud"),
-            home.join(".azure"),
-            home.join(".config/cortexkit"),
-        ];
-        // The resolver retains the trusted user-tier subc setting here even
-        // when semantic search is disabled. Match the bridge's HOME-relative
-        // expansion, not the command's cwd. Deny missing files too.
-        if let Some(path) = &ctx.config().semantic.subc_connection_file {
-            let path = expand_home(path, &home);
-            secret_floor.push(if path.is_absolute() {
-                path
-            } else {
-                home.join(path)
-            });
-        }
-        if let Some(path) = crate::environment::non_empty_os_var("SUBC_CONNECTION_FILE") {
-            secret_floor.push(PathBuf::from(path));
-        }
-        if let Some(path) = crate::environment::non_empty_os_var("XDG_RUNTIME_DIR") {
-            secret_floor.push(PathBuf::from(path).join("subc-connection.json"));
-        }
-        secret_floor.push(home.join(".local/share/cortexkit/run/subc-connection.json"));
-        // The credential floor denies both read and write. Linux rejects any
-        // writable overlap because Landlock cannot subtract write rights.
-        let mut write_deny = secret_floor.clone();
+        let mut policy = ctx.access_policy("").map_err(|response| {
+            response.data["message"]
+                .as_str()
+                .unwrap_or("access policy could not be resolved")
+                .to_string()
+        })?;
+        policy.roots = project_roots.clone();
+        policy
+            .private_stores
+            .read_allow
+            .extend(project_roots.iter().cloned());
+        policy.private_stores.read_allow.sort_unstable();
+        policy.private_stores.read_allow.dedup();
+        policy.private_stores.write_allow = project_roots.clone();
+        policy.private_stores.deny.push(session_store.clone());
         let mut write_deny_nested = Vec::new();
-        let mut read_deny = secret_floor;
+        let mut shell_write_deny = Vec::new();
+        let mut shell_read_deny = Vec::new();
         for (root, git_policy) in project_roots.iter().zip(&git_policies) {
             #[cfg(target_os = "linux")]
             write_deny_nested.push(root.join(".git"));
             write_deny_nested.push(root.join(".cortexkit"));
             #[cfg(target_os = "macos")]
-            write_deny.extend(git_policy.hooks.iter().cloned());
-            read_deny.extend(git_policy.hooks.iter().cloned());
+            shell_write_deny.extend(git_policy.hooks.iter().cloned());
+            shell_read_deny.extend(git_policy.hooks.iter().cloned());
         }
-        #[cfg(target_os = "linux")]
-        read_deny.extend([
-            PathBuf::from("/run/user"),
-            PathBuf::from("/run/credentials"),
-            PathBuf::from("/run/secrets"),
-        ]);
-        read_deny.extend(
-            ctx.config()
-                .sandbox
-                .read_deny
-                .iter()
-                .map(|path| expand_home(path, &home)),
-        );
-
         let storage = ctx.storage_dir();
-        let mut data_deny = vec![
-            home.join(".local/share/cortexkit"),
-            home.join(".local/state/cortexkit"),
-            storage.clone(),
-            session_store.clone(),
-        ];
-        for variable in ["XDG_DATA_HOME", "XDG_STATE_HOME"] {
-            if let Some(path) = crate::environment::non_empty_os_var(variable) {
-                let path = PathBuf::from(path);
-                if path.is_absolute() {
-                    data_deny.push(path.join("cortexkit"));
-                }
-            }
-        }
-        let mut data_read_allow = project_roots.clone();
-        data_read_allow.push(temp_dir.clone());
-        // Native launches disable path-based pipeline-status capture. stdout,
-        // stderr and markers use pre-opened descriptors, so only the private
-        // TMPDIR needs path access, not the containing io or session directory.
-        let mut data_write_allow = project_roots.clone();
-        data_write_allow.push(temp_dir.clone());
         let mut managed_paths = Vec::new();
         if ctx.config().github.shim {
             managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
@@ -1557,8 +1498,7 @@ fn build_native_profile(
         // Governance injection materializes these before resolving a spawn.
         // Do not grant a missing shim directory or a broad binary parent.
         managed_paths.retain(|path| path.exists());
-        write_deny.extend(managed_paths.iter().cloned());
-        data_read_allow.extend(managed_paths);
+        shell_write_deny.extend(managed_paths);
 
         let mut cache_roots = vec![
             home.join(".cargo/registry"),
@@ -1587,22 +1527,12 @@ fn build_native_profile(
             socket_deny.push(PathBuf::from(agent_socket));
         }
 
-        let mut profile = SandboxProfile::build(
-            writable_roots,
-            write_deny,
-            write_deny_nested,
-            Vec::new(),
-            read_deny,
-            socket_deny,
-            cache_roots,
-            temp_dir.clone(),
-        )
-        .map_err(|error| error.to_string())?;
-        profile.data_policy = SandboxDataPolicy {
-            deny: data_deny,
-            read_allow: data_read_allow,
-            write_allow: data_write_allow,
-        };
+        let mut profile = policy
+            .compile_shell(temp_dir.clone(), cache_roots, socket_deny)
+            .map_err(|error| error.to_string())?;
+        profile.write_deny.extend(shell_write_deny);
+        profile.write_deny_nested = write_deny_nested;
+        profile.read_deny.extend(shell_read_deny);
         profile = profile
             .canonicalize_for_launch()
             .map_err(|error| error.to_string())?;
@@ -2692,20 +2622,6 @@ fn normalized_relative_components(path: &Path) -> Result<Vec<&OsStr>, String> {
         }
     }
     Ok(components)
-}
-
-#[cfg(unix)]
-fn expand_home(path: &Path, home: &Path) -> PathBuf {
-    let mut components = path.components();
-    if components
-        .next()
-        .is_some_and(|component| component.as_os_str() == "~")
-    {
-        return components.fold(home.to_path_buf(), |resolved, component| {
-            resolved.join(component.as_os_str())
-        });
-    }
-    path.to_path_buf()
 }
 
 #[cfg(unix)]

@@ -46,6 +46,9 @@
 // a guarantee that every production path is panic-free; public accessors can
 // still require a configured context, and each invariant needs local review.
 
+pub mod access_policy;
+#[cfg(test)]
+mod access_policy_tests;
 pub mod agent_child_env;
 pub mod alert_records;
 pub mod alert_state;

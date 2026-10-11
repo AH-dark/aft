@@ -11373,8 +11373,8 @@ impl AppContext {
     /// path and checks it starts with the root. Returns the canonicalized path on
     /// success, or an error response on violation.
     ///
-    /// When no `project_root` is configured (direct CLI usage), all paths pass
-    /// through unrestricted for backward compatibility.
+    /// When no `project_root` is configured (direct CLI usage), outside asks retain
+    /// the unrestricted legacy behavior. The access-policy floor still applies.
     pub fn validate_path(
         &self,
         req_id: &str,
@@ -11401,6 +11401,7 @@ impl AppContext {
             path_for_resolution,
         }) = self.path_restriction_context(req_id, path)?
         else {
+            self.check_path_access(req_id, path, path, None, true)?;
             return Ok(path.to_path_buf());
         };
         let normalized = normalize_path(&path_for_resolution);
@@ -11417,10 +11418,7 @@ impl AppContext {
         };
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
-        if !resolved.starts_with(&resolved_root) {
-            return Err(path_error_response(req_id, path, &resolved_root));
-        }
-
+        self.check_path_access(req_id, path, &resolved, None, true)?;
         Ok(resolved)
     }
 
@@ -11451,8 +11449,9 @@ impl AppContext {
             path_for_resolution,
         }) = self.path_restriction_context(req_id, path)?
         else {
-            // When path restriction is disabled, callers receive the input path
-            // unchanged instead of an implicitly canonicalized filesystem path.
+            // Root restriction is disabled, so return the caller's input spelling
+            // unchanged. Canonical identities are used only for the policy check.
+            self.check_path_access(req_id, path, path, artifact_session_id, false)?;
             return Ok(path.to_path_buf());
         };
 
@@ -11487,17 +11486,128 @@ impl AppContext {
             resolve(req_id, &path_for_resolution, &resolved_root, &raw_root)?
         };
 
-        if !resolved.starts_with(&resolved_root) {
-            let is_owned_bash_artifact = artifact_session_id.is_some_and(|session_id| {
-                self.bash_background
-                    .is_session_owned_artifact_path(session_id, &resolved)
-            });
-            if !is_owned_bash_artifact {
-                return Err(path_error_response(req_id, path, &resolved_root));
+        self.check_path_access(req_id, path, &resolved, artifact_session_id, false)?;
+        Ok(resolved)
+    }
+
+    /// Use the effective configuration snapshot selected for the current tool route.
+    /// Untrusted subc calls may also force restrict_to_project_root for this request,
+    /// even when the user's configuration disables it.
+    pub fn access_policy(
+        &self,
+        req_id: &str,
+    ) -> Result<crate::access_policy::AccessPolicy, crate::protocol::Response> {
+        use crate::access_policy::{AccessDecision, AccessDenial, AccessPolicy};
+        let config = self.config();
+        let roots = config
+            .project_root
+            .as_ref()
+            .map(|root| vec![self.resolved_path_restriction_root(root)])
+            .unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let storage = self.storage_dir();
+        let force_restrict = self.request_force_restrict(req_id);
+        let build = move || {
+            let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
+            if force_restrict {
+                policy.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
+            }
+            policy
+        };
+        if crate::bounded_io::current().is_some() {
+            crate::bounded_io::run(Path::new("."), None, move |_| Ok(build())).map_err(|error| {
+                crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+            })
+        } else {
+            Ok(build())
+        }
+    }
+
+    fn check_path_access(
+        &self,
+        req_id: &str,
+        original: &Path,
+        resolved: &Path,
+        artifact_session: Option<&str>,
+        preserve_final: bool,
+    ) -> Result<(), crate::protocol::Response> {
+        use crate::access_policy::{policy_path, AccessDecision, AccessDenial, AccessOperation};
+        let operation = if artifact_session.is_some() {
+            AccessOperation::Read
+        } else {
+            AccessOperation::Write
+        };
+        let identify = move |resolved: PathBuf| {
+            if preserve_final {
+                let normalized = normalize_path(&resolved);
+                match (normalized.parent(), normalized.file_name()) {
+                    (Some(parent), Some(name)) => policy_path(parent).join(name),
+                    _ => policy_path(&normalized),
+                }
+            } else {
+                policy_path(&resolved)
+            }
+        };
+        let identity = if crate::bounded_io::current().is_some() {
+            crate::bounded_io::run(resolved, None, move |path| Ok(identify(path))).map_err(
+                |error| crate::protocol::Response::error(req_id, "read_blocked", error.to_string()),
+            )?
+        } else {
+            identify(resolved.to_path_buf())
+        };
+        let owned_artifact = artifact_session.is_some_and(|session| {
+            self.bash_background
+                .is_session_owned_artifact_path(session, &identity)
+        });
+        let policy = self.access_policy(req_id)?;
+        let decision = if preserve_final {
+            policy.decide_tree_write(&identity)
+        } else {
+            policy.decide(operation, &identity, owned_artifact)
+        };
+        // Preserve the existing path_outside_root response when root restriction
+        // already denied this path. The protected path is still rejected; changing
+        // the error spelling must never turn a floor denial into a consent request.
+        if decision == AccessDecision::Deny(AccessDenial::Floor)
+            && (self.config().restrict_to_project_root || self.request_force_restrict(req_id))
+            && !policy.roots.iter().any(|root| identity.starts_with(root))
+            && !(operation == AccessOperation::Read && owned_artifact)
+        {
+            let root = self
+                .config()
+                .project_root
+                .as_ref()
+                .map(|root| self.resolved_path_restriction_root(root));
+            if let Some(root) = root {
+                return Err(path_error_response(req_id, original, &root));
             }
         }
-
-        Ok(resolved)
+        match decision {
+            // For compatibility, treat Ask as Allow for configurations that do not
+            // restrict access to project roots. Restricted configurations produce
+            // Deny outside roots; protected paths are denied in every configuration.
+            AccessDecision::Allow | AccessDecision::Ask => Ok(()),
+            AccessDecision::Deny(AccessDenial::Floor) => Err(crate::protocol::Response::error(
+                req_id,
+                "denied_floor",
+                format!(
+                    "path '{}' is denied by the access policy floor",
+                    original.display()
+                ),
+            )),
+            AccessDecision::Deny(AccessDenial::OutsideRoots) => {
+                let root = self
+                    .config()
+                    .project_root
+                    .as_ref()
+                    .map(|root| self.resolved_path_restriction_root(root))
+                    .unwrap_or_default();
+                Err(path_error_response(req_id, original, &root))
+            }
+        }
     }
 
     /// Count active LSP server instances.
