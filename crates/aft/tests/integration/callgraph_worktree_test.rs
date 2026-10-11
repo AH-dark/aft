@@ -573,7 +573,12 @@ fn callgraph_worktree_without_owner_store_uses_own_view_or_legacy_refusal() {
         // ever existed, including when views are enabled.
         let ctx = configure(&checkout, &storage, views);
         for operation in OPERATIONS {
-            let response = query(&ctx, &checkout, operation, "ownerCaller");
+            // A view-backed reader is installed in the background after
+            // configure, so a first query may legitimately answer
+            // `callgraph_building`; wait that out, then assert the real answer.
+            let response = callgraph_when_ready(operation, || {
+                query(&ctx, &checkout, operation, "ownerCaller")
+            });
             if views {
                 assert!(response.success, "views={views}: {response:?}");
                 assert!(response.data.get("borrowed_callgraph").is_none());
