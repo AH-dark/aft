@@ -26108,7 +26108,9 @@ edition = "2021"
             let main = write_file(
                 root,
                 "main.go",
-                &format!("package main\n{import}func main() {{}}\n"),
+                &format!(
+                    "package main\n{import}func main() {{ control() }}\nfunc control() {{}}\n"
+                ),
             );
             let cmd = write_file(root, "cmd/command.go", "package cmd\nimport \"github.com/spf13/cobra\"\nvar Command = &cobra.Command{RunE: func() error { InitBackendContext(); return nil }}\nfunc InitBackendContext() {}\n");
             let (_, snapshot) = go_fixture_store(root, &[main.clone(), cmd.clone()]);

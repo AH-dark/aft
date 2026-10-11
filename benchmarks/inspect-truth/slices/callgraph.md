@@ -30,7 +30,7 @@ Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
 | repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ripgrep | rust | dead_code | scored | 16 | 0 | 0 (+0) | 0.00 | n/a | 0 | 16 | 0 |
+| ripgrep | rust | dead_code | scored | 4 | 0 | 0 (+0) | 0.00 | n/a | 0 | 4 | 0 |
 | ripgrep | rust | todos | scored | 11 | 11 | 11 (+0) | 1.00 | 1.00 | 0 | 0 | 11 |
 | axum | rust | dead_code | scored | 9 | 0 | 0 (+0) | 0.00 | n/a | 0 | 9 | 0 |
 | axum | rust | todos | scored | 5 | 5 | 5 (+0) | 1.00 | 1.00 | 0 | 0 | 5 |
@@ -38,16 +38,16 @@ Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 | soft-serve | go | dead_code (functions) | scored | 26 | 20 | 9 (+0) | 0.35 | 0.45 | 0 | 26 | 0 |
 | soft-serve | go | todos | scored | 33 | 33 | 33 (+0) | 1.00 | 1.00 | 0 | 0 | 33 |
 
-- ripgrep raw output: `local-ignore/callgraph/corpus/_results/ripgrep/213581cc831fcfdd33360168d1e31d47ca034b55` (corpus `3fce3b5bb0236da2df6d99672afb8a719642eca7`).
+- ripgrep raw output: `local-ignore/callgraph/corpus/_results/ripgrep/9e8c83db700b8dc26ba624e7d75d74518c4fe1ca` (corpus `3fce3b5bb0236da2df6d99672afb8a719642eca7`).
 - ripgrep baseline_aft_truncated_scopes (excluded from comparison): []
-- ripgrep judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 15, "inspect-tool.json": 0}
+- ripgrep judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 27, "inspect-tool.json": 0}
 - ripgrep/rust/dead_code languages_unsupported: [{"language": "ruby", "files": 1}]
 
-- axum raw output: `local-ignore/callgraph/corpus/_results/axum/213581cc831fcfdd33360168d1e31d47ca034b55` (corpus `f8b02f22cf10bee707bda19b58265b9e33677535`).
+- axum raw output: `local-ignore/callgraph/corpus/_results/axum/9e8c83db700b8dc26ba624e7d75d74518c4fe1ca` (corpus `f8b02f22cf10bee707bda19b58265b9e33677535`).
 - axum baseline_aft_truncated_scopes (excluded from comparison): []
 - axum judgments_unapplied: {"harness.json": 0, "callgraph.json": 0, "ts-liveness.json": 0, "dead-code-scanner.json": 1, "inspect-tool.json": 0}
 
-- soft-serve raw output: `local-ignore/callgraph/corpus/_results/soft-serve/213581cc831fcfdd33360168d1e31d47ca034b55` (corpus `37685d36f5b7bf0e32217ddd7c8e045c57772619`).
+- soft-serve raw output: `local-ignore/callgraph/corpus/_results/soft-serve/9e8c83db700b8dc26ba624e7d75d74518c4fe1ca` (corpus `37685d36f5b7bf0e32217ddd7c8e045c57772619`).
 - soft-serve baseline_aft_truncated_scopes (excluded from comparison): []
 - soft-serve judgments_unapplied: {"harness.json": 0, "callgraph.json": 3, "ts-liveness.json": 0, "dead-code-scanner.json": 2, "inspect-tool.json": 0}
 
@@ -55,7 +55,82 @@ Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
 - PASS: no cell lowered.
 
-## Latest measured revision: 213581cc8
+## Latest corpus measurement and rebuild on main
+
+The automatic tables above are **measured at `9e8c83db700b8dc26ba624e7d75d74518c4fe1ca`**, the pre-main-rebuild tip with the custom-crate-root repair. They were collected from a fresh Linux release build and re-scored locally from the retained captures. The branch rebuilt on current main has new commit identities and has **not** been re-collected; the measured success below is explicitly attached to the original tip, not silently attributed to the new branch.
+
+The commit columns identify the original extractor/initializer implementation (`a37cdbe83`), the nested-alias/macro/init/callback follow-up (`213581cc8`), and the manifest-declared crate-root repair (`9e8c83db7`). An `unapplied` judgment is an older annotated row absent from the output currently being scored; each JSON-file count measures such rows, not invalid judgments. Those entries remain valid against their own original capture directories.
+
+| Bucket | Baseline 13dd9cb71 | a37cdbe83 | 213581cc8 | Measured 9e8c83db7 | Verdict at measured tip |
+|---|---:|---:|---:|---:|---|
+| ripgrep dead_code | 52 | 21 | 16 | **4**; 4 judged, 0 unjudged | <=10 **PASS** |
+| axum dead_code | 55 | 10 | 9 | **9**; 9 judged, 0 unjudged | <=10 **PASS** |
+| soft-serve dead_code | 101 | 32 | 29 | **29**; 29 judged, 0 unjudged | Improved; no separate count threshold |
+| soft-serve function rows | 98 | 29 | 26 | **26**; 26 judged, 0 unjudged | Fully explained |
+| soft-serve function precision / recall | 0.05 / 0.25 | 0.31 / 0.45 | 0.35 / 0.45 | **0.35 / 0.45** | Precision <0.6 still missed and explained |
+| Todos: ripgrep / axum / soft-serve | 11 / 5 / 33 | 11 / 5 / 33 | 11 / 5 / 33 | **11 / 5 / 33** | Unchanged |
+| Cell rule | baseline | PASS | PASS | **PASS, no lowered precision/recall cell** | PASS |
+
+Ripgrep's **21 -> 16 -> 4** sequence is now measured, not predicted. The custom-root repair removed the ten generators reached through nested Rust aliases and their two ordinary callees (`generate_digits` and `lookup`) that were still reported in the 213581cc8 run. The four remaining findings are `flags/lowargs.rs::{new,disabled}` and `printer/src/util.rs::{from_sink_match,from_sink_context}`: exactly the deferred trait/caller-contract cases. No trait/interface liveness was changed to meet the count target. Existing judgments remain attached to their original after-output directories; rows absent from newer captures are unapplied, not deleted.
+
+Raw captures for this measurement are under `local-ignore/callgraph/corpus/_results/<repo>/9e8c83db700b8dc26ba624e7d75d74518c4fe1ca/`. Score JSON/Markdown are under `local-ignore/callgraph/score-s4b/`. The local re-score validated three baseline and three candidate repositories and every judgment file referring to these repositories against its original capture directory. Every candidate dead-code row, including the Go function-only bucket, has a recorded judgment; no such after row is unjudged. No new collection was run during the main rebuild.
+
+### New branch and conflict resolution
+
+New branch rebuilt from the original callgraph task branch onto main: **`alfonso/task/bg_dispatch_e643c2cb4cfca3665f1f47a0-callgraph-main-rebuilt`**.
+
+The original task branch was preserved. Its nine commits were replayed onto `origin/main` at `f2b0fdccda4e152eaa4ae1dcd7813b3eb80afc8d`. The only cherry-pick conflict was in `callgraph_store/dead_code_projection.rs`: main requires calls to be grouped in stored caller-file byte order so incremental snapshot replacement agrees with a full rebuild; this slice appends Go package-initialization edges to those calls. Sorting before appending the new edges would break the grouping. The merged sequence is:
+
+1. produce ordinary resolved/value/macro calls;
+2. append package-initialization edges;
+3. apply main's final stable caller-path sort using the stored byte-key order;
+4. return the complete projection.
+
+The merge preserves the same raw path-byte ordering for full and incrementally replaced snapshots, including names such as `a.b.rs` versus `a/child.rs`, whose component-wise Path ordering differs. Main's existing dotted/nested path test remains intact rather than being replaced by the older task file. The Go imported/unimported legacy/view fixture now also contains an ordinary root-file call and asserts caller-path grouping on both surfaces, so synthetic edges cannot undo main's sorting fix.
+
+While verification ran, main advanced with an unrelated sandbox change that tolerates a listed read-permission target disappearing before it is opened. The rebuilt branch was then rebased onto **`236b14b97a58fd793413b22894905eb4eca24547`**. A direct Git diff confirmed that all files mutated by the twelve controls were byte-for-byte unchanged by that sandbox-only advance; final fixtures and the repository gate were run on the resulting branch. No sandbox or publication-manifest changes were authored by this slice.
+
+### Rebuilt verification and twelve break controls
+
+All Cargo jobs were serialized on the remote Linux server with four virtual CPUs (`linux,4c`), Cargo 1.99.0. Final rebuilt checks:
+
+- resolver and legacy/view parity module: **27 passed**;
+- audit projection module, including main's dotted/nested splice and sorting tests: **10 passed**;
+- immutable manifest integration module: **7 passed**;
+- navigation integration: **58 passed**;
+- binary/watcher contracts: **132 passed**;
+- offline Python collection/scoring fixtures: **30 passed**, Python 3.14.4;
+- mandatory `bash scripts/rust-test-gate.sh`: **5953 library tests passed, 2 failed, 50 ignored**; TLS prerequisite **1 passed**, tokenizer **3 passed**, Biome **714 files checked**. The two failures remain `blackholed_backend_never_blocks_status_or_search` (its assertion rejects the network-unreachable backend response) and `storage_debug_archive_ignores_public_member_modes` (fixture archive path not found, OS error 2). Later full-gate phases were not reached. The gate is failed, not reported green.
+
+The final gate log is retained outside build directories at `local-ignore/callgraph/evidence/rust-gate-main-rebuilt.stdout`. Rustfmt 1.10.0-stable format/check and diff checks pass. The repository's inspection tool could not confirm a fresh Rust diagnostic snapshot because it could not fingerprint the changed input set; its editor diagnostics were provisional. Direct Rust compilation and test commands checked the actual rebuilt source instead.
+
+All **twelve documented successful break controls** were independently re-applied on the fresh-main rebuilt branch. Each named test alone failed; all other tests were filtered. Live files were staged first, nonempty mutation diffs captured, then restored with `git checkout -- <path>` plus `touch`; every post-restore unstaged diff was empty.
+
+| # | Neutralized behavior | Exact red fixture (rust_resolution_tests) |
+|---:|---|---|
+| 1 | Go package-var extraction | `callgraph_go_cobra_imported_initializer_live_unimported_dead` |
+| 2 | Rust use-as edge | `callgraph_rust_inline_use_alias_keeps_bin_function_live` |
+| 3 | Macro-body edges | `callgraph_rust_macro_body_live_only_with_invocation` |
+| 4 | go.mod aggregate hash input | `callgraph_go_mod_edit_re_resolves_and_invalidates_warmed_aggregate` |
+| 5 | Go value-reference extraction | `callgraph_go_main_boot_register_and_function_values` |
+| 6 | Go module-map invalidation | `callgraph_go_mod_refresh_drops_warmed_module_map` |
+| 7 | Go package-initializer graph edges | `callgraph_go_cobra_imported_initializer_live_unimported_dead` |
+| 8 | Stored Go import resolution | `callgraph_go_cobra_imported_initializer_live_unimported_dead` |
+| 9 | View macro serialization | `callgraph_view_macro_and_go_initializer_equal_cold_legacy` |
+| 10 | Serialized package-main roots | `callgraph_view_macro_and_go_initializer_equal_cold_legacy` |
+| 11 | Go-only materialization root flag | `callgraph_go_cobra_imported_initializer_live_unimported_dead` |
+| 12 | Preserve non-Go root behavior | `callgraph_non_go_exported_variable_retains_view_root_flag` |
+
+An additional merge-specific control removes main's final projection sort. Its first probe was undefended because an empty main function produced no ordinary root-file call; the fixture was strengthened with `main -> control()` so ordinary and synthetic rows genuinely interleave before sorting. The same control then failed only the Cobra parity fixture on “package initialization edges must preserve main's final caller-path grouping.” This is recorded separately from the twelve requested controls. Sorting was restored, and the final resolver/parity module passed.
+
+No push was performed. The measured pre-rebuild corpus target is satisfied for ripgrep/axum; the rebuilt branch preserves both changes under fixture and mutation verification but still requires its own collection before claiming those counts for the new commit identities.
+
+
+## Preserved historical verification record
+
+The following sections document earlier revisions and why each subsequent fix was needed. Their pending-collection statements and target misses are historical; the measured 9e8c83db7 result and main-rebuild boundary above supersede them. Original judgments and capture origins are unchanged.
+
+## Historical measured revision 213581cc8 and residual diagnosis
 
 The automatic tables above are **measured at `213581cc831fcfdd33360168d1e31d47ca034b55`**, using the retained Linux release captures and the same baseline/judgments. They do not measure the newer custom-crate-root repair at engine commit `ba586aa46f9698684b079ef30a03c3cc8f4a8b96`. Its fixtures and mutation control pass, but its corpus effect awaits the next Linux collection. Existing judgment entries and their original capture directories remain unchanged.
 
