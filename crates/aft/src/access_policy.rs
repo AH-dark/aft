@@ -440,37 +440,38 @@ mod tests {
     #[test]
     fn private_store_grants_cannot_add_carve_outs() {
         let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let mut policy = policy(root.path(), outside.path());
+        let outside_dir = tempfile::tempdir().unwrap();
+        // Production callers pass canonical policy identities. On macOS the temp
+        // directory is reached through the /var -> /private/var link, so use the
+        // same identity here.
+        let outside = policy_path(outside_dir.path());
+        let mut policy = policy(root.path(), &outside);
         policy.outside = AccessDecision::Allow;
-        policy.shell_write_allow.push(outside.path().to_path_buf());
+        policy.shell_write_allow.push(outside.clone());
         policy.grants.push(AccessGrant {
-            path: outside.path().to_path_buf(),
+            path: outside.clone(),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Write,
         });
         assert_eq!(
-            policy.decide(AccessOperation::Read, outside.path(), false),
+            policy.decide(AccessOperation::Read, &outside, false),
             AccessDecision::Deny(AccessDenial::Floor)
         );
         assert_eq!(
-            policy.decide(AccessOperation::Write, outside.path(), true),
+            policy.decide(AccessOperation::Write, &outside, true),
             AccessDecision::Deny(AccessDenial::Floor)
         );
         assert_eq!(
-            policy.decide(AccessOperation::Read, outside.path(), true),
+            policy.decide(AccessOperation::Read, &outside, true),
             AccessDecision::Allow
         );
-        policy
-            .private_stores
-            .read_allow
-            .push(outside.path().to_path_buf());
+        policy.private_stores.read_allow.push(outside.clone());
         assert_eq!(
-            policy.decide(AccessOperation::Read, outside.path(), false),
+            policy.decide(AccessOperation::Read, &outside, false),
             AccessDecision::Allow
         );
         assert_eq!(
-            policy.decide(AccessOperation::Write, outside.path(), false),
+            policy.decide(AccessOperation::Write, &outside, false),
             AccessDecision::Deny(AccessDenial::Floor)
         );
     }
