@@ -24,10 +24,14 @@ import {
   AuthError,
   type BindIdentity,
   type ConsumerIdentity,
+  type ControlPush,
   connectionFileExists,
   isConsumerReconnectTransient,
   type RequestOptions,
+  type RouteOpenOptions,
+  type RouteScope,
   type RouteTarget,
+  routeCloseReason,
   SocketTimeoutError,
   StaleRouteHandleError,
   SubcCallError,
@@ -321,7 +325,7 @@ export interface SubcClientLike {
   routeOpen(
     target: RouteTarget,
     identity: BindIdentity,
-    opts?: { consumerIdentity?: ConsumerIdentity | null },
+    opts?: RouteOpenOptions,
   ): Promise<RouteHandle>;
   request(route: RouteHandle, body: unknown, opts?: RequestOptions): Promise<unknown>;
   subscribe(
@@ -343,6 +347,7 @@ export interface SubcClientLike {
 
 /** The subc module id AFT registers under (matches the daemon manifest). */
 const AFT_MODULE_ID = "aft";
+const HOST_SCOPE_LOOKUP_TIMEOUT_MS = 2_000;
 
 /**
  * A run of consecutive per-call failures that got no answer (timeout / route
@@ -441,6 +446,8 @@ export interface SubcTransportPoolOptions {
    * production identity; null is used by hermetic tests that run inside another module.
    */
   consumerIdentity?: ConsumerIdentity | null;
+  /** Resolve existing host scopes before binding tool routes; enabled by the OpenCode and Pi plugins. */
+  hostScopes?: boolean;
   /** Handshake timeout forwarded to SubcClient.connect. */
   handshakeTimeoutMs?: number;
   /**
@@ -450,6 +457,7 @@ export interface SubcTransportPoolOptions {
   connect?: (opts: {
     connectionFile: string;
     handshakeTimeoutMs?: number;
+    onControlPush?: (push: ControlPush) => void;
   }) => Promise<SubcClientLike>;
   /**
    * Called when an idle bg-completion WAKE arrives for `(projectRoot, session)`
@@ -620,6 +628,7 @@ class BgSubscription {
   private current: SubcSubscriptionLike | null = null;
   /** Client carrying the live subscription route, counted when that client is dropped. */
   private attached: SubcClientLike | null = null;
+  private route: RouteHandle | null = null;
   private readonly loop: Promise<void>;
   private readonly lifecycleLogState = new Map<
     string,
@@ -631,7 +640,7 @@ class BgSubscription {
     private readonly identity: BindIdentity,
     private readonly acquireClient: () => Promise<SubcClientLike>,
     private readonly dropClient: (client: SubcClientLike, cause: ClientDropCause) => void,
-    private readonly consumerIdentity: ConsumerIdentity | null | undefined,
+    private readonly openRoute: (client: SubcClientLike) => Promise<RouteHandle>,
     private readonly onNudge: (observedEvent: boolean) => void,
     private readonly sleep: (ms: number) => Promise<void>,
     private readonly canAttach: () => boolean,
@@ -654,6 +663,10 @@ class BgSubscription {
   /** The client whose route currently carries this subscription, if any. */
   get attachedClient(): SubcClientLike | null {
     return this.attached;
+  }
+
+  get attachedRoute(): RouteHandle | null {
+    return this.route;
   }
 
   async stop(): Promise<void> {
@@ -794,11 +807,7 @@ class BgSubscription {
       try {
         // A dedicated route keeps bg_events independent of the tool route's
         // credit window while preserving the client's connection-bound handle.
-        route = await client.routeOpen(
-          { kind: "tool_provider", module_id: AFT_MODULE_ID },
-          this.identity,
-          { consumerIdentity: this.consumerIdentity },
-        );
+        route = await this.openRoute(client);
       } catch (err) {
         if (this.isCurrent() && this.onRootAttachFailure(err)) {
           if (reconnecting) giveUp("root-dormant");
@@ -860,6 +869,7 @@ class BgSubscription {
         });
         this.current = sub;
         this.attached = client;
+        this.route = route;
         stopDispatchProbe = this.startDispatchProbe(client, routeId);
         this.info("subscription-open", `subscription open channel=${routeId}`);
         if (reconnecting) {
@@ -910,6 +920,7 @@ class BgSubscription {
         stopDispatchProbe();
         this.current = null;
         this.attached = null;
+        this.route = null;
         safeCloseRoute(client, route);
       }
       await this.backoff(backoffAttempt++);
@@ -929,7 +940,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isRouteProvenAbsentError(err: unknown): boolean {
   return (
-    (err instanceof SubcError && err.code === "unknown_channel") ||
+    (err instanceof SubcError &&
+      (err.code === "unknown_channel" || err.code === "stale_route_epoch")) ||
     err instanceof StaleRouteHandleError
   );
 }
@@ -1310,9 +1322,14 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly connectionFile: string;
   private readonly handshakeTimeoutMs?: number;
   private readonly consumerIdentity: ConsumerIdentity | null | undefined;
+  private readonly hostScopes: boolean;
+  /** Scope identity is host-session-wide, even when the session uses multiple project roots. */
+  private readonly hostScopeCache = new Map<string, Promise<RouteScope | undefined>>();
+  private readonly hostScopeRefusals = new Set<string>();
   private readonly connectFn: (opts: {
     connectionFile: string;
     handshakeTimeoutMs?: number;
+    onControlPush?: (push: ControlPush) => void;
   }) => Promise<SubcClientLike>;
 
   private readonly onBgEventsNudge?: (projectRoot: string, session: string) => void;
@@ -1382,6 +1399,7 @@ export class SubcTransportPool implements AftTransportPool {
     this.harness = options.harness;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs;
     this.consumerIdentity = options.consumerIdentity;
+    this.hostScopes = options.hostScopes ?? false;
     this.connectFn = options.connect ?? ((opts) => SubcClient.connect(opts));
     this.onBgEventsNudge = options.onBgEventsNudge;
     this.onBgEventsNudgeRef = options.onBgEventsNudgeRef;
@@ -2318,6 +2336,9 @@ export class SubcTransportPool implements AftTransportPool {
           this.isCurrentSession(key, record) &&
           this.client === client &&
           !this.isReapInduced(record);
+        if (ownsClient && error instanceof SubcError && error.closeReason?.startsWith("scope_")) {
+          this.invalidateHostScope(identity.session);
+        }
         if (!aborted && ownsClient && isSocketDeathError(error)) {
           // Dropped before the route is cleared so the drop log counts it.
           this.dropClient(client, {
@@ -2432,6 +2453,13 @@ export class SubcTransportPool implements AftTransportPool {
           );
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           const ownsRoute = this.isCurrentSession(key, record) && this.client === client;
+          if (
+            ownsRoute &&
+            ((error instanceof SubcError && error.code === "stale_route_epoch") ||
+              error instanceof StaleRouteHandleError)
+          ) {
+            this.invalidateHostScope(identity.session);
+          }
           // A route that was bound before a module reload started gets its
           // requests refused by the daemon for as long as the drain lasts. The
           // refusal happens before the request is forwarded, so it is handled
@@ -2526,9 +2554,13 @@ export class SubcTransportPool implements AftTransportPool {
     if (this.shuttingDown) throw new SubcTransportShuttingDownError();
     if (this.client) return this.client;
     if (this.connecting) return this.connecting;
+    let owner: SubcClientLike | undefined;
     this.connecting = this.connectFn({
       connectionFile: this.connectionFile,
       handshakeTimeoutMs: this.handshakeTimeoutMs,
+      onControlPush: (push) => {
+        if (owner && this.client === owner) this.onScopeRouteClose(push);
+      },
     })
       .then((client) => {
         this.connecting = null;
@@ -2541,6 +2573,7 @@ export class SubcTransportPool implements AftTransportPool {
           throw new SubcTransportShuttingDownError();
         }
         this.client = client;
+        owner = client;
         this.hadWorkingClient = true;
         this.transportFailures = 0;
         return client;
@@ -2580,10 +2613,7 @@ export class SubcTransportPool implements AftTransportPool {
       closedBy: null,
     };
     this.assertRootCanAttach(record.canonicalRoot);
-    const opening = client
-      .routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
-        consumerIdentity: this.consumerIdentity,
-      })
+    const opening = this.openHostToolRoute(client, identity, record)
       .then((route) => {
         if (
           !this.isCurrentSession(record.identityKey, record) ||
@@ -2623,6 +2653,164 @@ export class SubcTransportPool implements AftTransportPool {
     entry.opening = opening;
     record.routeEntry = entry;
     return { route: await opening, entry };
+  }
+
+  private hostScope(
+    client: SubcClientLike,
+    identity: BindIdentity,
+  ): Promise<RouteScope | undefined> {
+    const cached = this.hostScopeCache.get(identity.session);
+    if (cached) return cached;
+    const lookup = this.readHostScope(client, identity);
+    this.hostScopeCache.set(identity.session, lookup);
+    return lookup;
+  }
+
+  private async readHostScope(
+    client: SubcClientLike,
+    identity: BindIdentity,
+  ): Promise<RouteScope | undefined> {
+    let expired = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const abort = new AbortController();
+    const read = async (): Promise<RouteScope | undefined> => {
+      let route: RouteHandle | undefined;
+      try {
+        route = await client.routeOpen(
+          { kind: "management_surface", module_id: "prefrontal-core" },
+          identity,
+          { consumerIdentity: this.consumerIdentity },
+        );
+        if (expired) return undefined;
+        const reply = await client.request(
+          route,
+          {
+            op: "session.scope_identity",
+            params: { harness: identity.harness, session: identity.session },
+          },
+          { timeoutMs: HOST_SCOPE_LOOKUP_TIMEOUT_MS, signal: abort.signal },
+        );
+        if (
+          !isRecord(reply) ||
+          !isRecord(reply.owner) ||
+          reply.owner.kind !== "reserved" ||
+          reply.owner.module_id !== "prefrontal-core" ||
+          typeof reply.ref !== "string" ||
+          reply.ref.length === 0 ||
+          !Number.isSafeInteger(reply.scope_epoch) ||
+          (reply.scope_epoch as number) < 0
+        )
+          return undefined;
+        return {
+          owner: { kind: "reserved", module_id: "prefrontal-core" },
+          ref: reply.ref,
+          scopeEpoch: reply.scope_epoch as number,
+        };
+      } catch {
+        // A missing or unavailable scope service must not disable the host's tools.
+        return undefined;
+      } finally {
+        if (route) safeCloseRoute(client, route);
+      }
+    };
+    try {
+      // Bound the whole lookup, including route.open, so an unavailable core cannot stall a bind.
+      return await Promise.race([
+        read(),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => {
+            expired = true;
+            abort.abort();
+            resolve(undefined);
+          }, HOST_SCOPE_LOOKUP_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private openHostToolRoute(
+    client: SubcClientLike,
+    identity: BindIdentity,
+    record: SessionRecord,
+  ): Promise<RouteHandle> {
+    if (
+      !this.hostScopes ||
+      !["opencode", "pi"].includes(identity.harness) ||
+      identity.session === DEFAULT_SESSION_ID
+    ) {
+      return client.routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
+        consumerIdentity: this.consumerIdentity,
+      });
+    }
+    return this.openScopedHostToolRoute(client, identity, record);
+  }
+
+  private async openScopedHostToolRoute(
+    client: SubcClientLike,
+    identity: BindIdentity,
+    record: SessionRecord,
+  ): Promise<RouteHandle> {
+    const lookup = this.hostScope(client, identity);
+    const scope = await lookup;
+    this.assertRecordLive(record);
+    if (scope) {
+      try {
+        return await client.routeOpen(
+          { kind: "tool_provider", module_id: AFT_MODULE_ID },
+          identity,
+          { consumerIdentity: this.consumerIdentity, scope },
+        );
+      } catch (error) {
+        if (!(error instanceof SubcError) || !error.code || isSocketDeathError(error)) throw error;
+        this.assertRecordLive(record);
+        if (!this.hostScopeRefusals.has(identity.session)) {
+          this.hostScopeRefusals.add(identity.session);
+          warn(`subc head scope: scoped bind refused code=${error.code}; binding unscoped`);
+        }
+        // Remember the downgrade for this host session, rather than retrying a denied carrier on every root.
+        if (this.hostScopeCache.get(identity.session) === lookup) {
+          this.hostScopeCache.set(identity.session, Promise.resolve(undefined));
+        }
+      }
+    }
+    this.assertRecordLive(record);
+    return client.routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
+      consumerIdentity: this.consumerIdentity,
+    });
+  }
+
+  private invalidateHostScope(session: string): void {
+    this.hostScopeCache.delete(session);
+    this.hostScopeRefusals.delete(session);
+    for (const record of this.sessions.values()) {
+      if (record.identity.session !== session || !record.routeEntry) continue;
+      const entry = record.routeEntry;
+      entry.closed = true;
+      entry.closedBy ??= "route replaced";
+      record.routeEntry = null;
+      record.retiredRoutes.add(entry);
+      this.closeRetiredRoute(record, entry);
+    }
+  }
+
+  private onScopeRouteClose(push: ControlPush): void {
+    const reason = routeCloseReason(push);
+    if (!reason?.startsWith("scope_")) return;
+    const sessions = new Set<string>();
+    for (const record of this.sessions.values()) {
+      const routes = [record.routeEntry?.handle, record.bgSub?.attachedRoute].filter(
+        (route): route is RouteHandle => route != null,
+      );
+      if (
+        (Array.isArray(push.body.channels) &&
+          routes.some((route) => (push.body.channels as unknown[]).includes(route.channel))) ||
+        (!Array.isArray(push.body.channels) && push.body.module_id === AFT_MODULE_ID)
+      )
+        sessions.add(record.identity.session);
+    }
+    for (const session of sessions) this.invalidateHostScope(session);
   }
 
   private ensureBgSubscription(identity: BindIdentity, record: SessionRecord): void {
@@ -2685,7 +2873,7 @@ export class SubcTransportPool implements AftTransportPool {
       identity,
       () => this.ensureClient(),
       (client, cause) => this.dropClient(client, cause),
-      this.consumerIdentity,
+      (client) => this.openHostToolRoute(client, identity, record),
       onNudge,
       this.bgBackoffSleep,
       () => this.rootCanAttach(record.canonicalRoot),
@@ -2929,6 +3117,8 @@ export class SubcTransportPool implements AftTransportPool {
     this.generationRejections.clear();
     this.observedStarts.clear();
     this.dormantRoots.clear();
+    this.hostScopeCache.clear();
+    this.hostScopeRefusals.clear();
 
     // Deregistration synchronously tombstones all registered roots and invokes
     // closeProjectRoot before this method reaches its first await.
@@ -2958,6 +3148,8 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   async closeSession(projectRoot: string, session: string): Promise<void> {
+    this.hostScopeCache.delete(session);
+    this.hostScopeRefusals.delete(session);
     const identity: BindIdentity = {
       project_root: canonicalizeProjectRoot(projectRoot),
       harness: this.harness,

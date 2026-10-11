@@ -214,6 +214,7 @@ async function createConcreteAftTransportPool(
       throw new Error(missing);
     }
     return new SubcTransportPool({
+      hostScopes: opts.harness === "opencode" || opts.harness === "pi",
       connectionFile,
       harness: opts.harness,
       consumerIdentity: opts.subcConsumerIdentity,

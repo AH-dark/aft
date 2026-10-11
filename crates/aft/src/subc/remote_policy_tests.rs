@@ -399,6 +399,94 @@ fn enabled_head_sessions_offer_runon_and_guidance_from_user_config() {
         .is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn stamped_host_heads_keep_role_tools_and_user_remote_runner() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_with_user_remote(root.path(), storage.path(), None, true);
+    for harness in ["opencode", "pi"] {
+        let mut plain = identity(root.path(), "host-head", 7, false);
+        let data = Arc::get_mut(&mut plain.0).unwrap();
+        data.harness = harness.into();
+        data.role = tool_provider::RouteRole::Legacy;
+        data.spawn_principal = AuthenticatedPrincipal::RouteBind {
+            trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+            route_channel: 41,
+            route_epoch: 1,
+            project_root: root.path().into(),
+            harness: harness.into(),
+            session_id: "host-head".into(),
+            principal_id: Some("direct".into()),
+        };
+        let mut stamped = identity(root.path(), "host-head", 7, false);
+        let data = Arc::get_mut(&mut stamped.0).unwrap();
+        data.harness = harness.into();
+        data.role = plain.role;
+        data.spawn_principal = plain.spawn_principal.clone();
+        data.scope = Some(
+            serde_json::from_value(json!({
+                "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+                "ref": "host-head", "scope_epoch": 7, "kind": "head",
+                "owner_authorized": true,
+                "attributes": {"agent_id": "head-agent", "delegates": true}
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            tool_provider::resolve_caller_role(Some("head"), stamped.scope.is_some(), false)
+                .unwrap(),
+            tool_provider::CallerRole::Head
+        );
+        assert!(key(&stamped, Some("head")).is_none());
+        let before = catalog(json!({"preset":"head"}), &plain, &ctx).unwrap();
+        let after = catalog(json!({"preset":"head"}), &stamped, &ctx).unwrap();
+        assert_eq!(
+            after, before,
+            "{harness}: stamping must not change the tool catalog"
+        );
+        assert_eq!(
+            bash_catalog_entry(&after)["input_schema"]["properties"]["runon"]["type"],
+            "string"
+        );
+        assert_eq!(stamped.trust, plain.trust);
+        assert_eq!(
+            stamped.consumer_elicitation_capable,
+            plain.consumer_elicitation_capable
+        );
+        let shell = serde_json::from_value(json!({
+            "name": "bash", "arguments": {"command": "true"},
+            "preset": "head", "call_key": "head-shell"
+        }))
+        .unwrap();
+        assert_eq!(
+            tool_provider::admission_trusted(&stamped, &shell),
+            tool_provider::admission_trusted(&plain, &shell)
+        );
+
+        let launch = lookup(&ctx, &source(&stamped, Some("head")))
+            .expect("a stamped host head keeps the user-configured remote runner without worker catalog params");
+        assert_eq!(launch.harness, harness);
+        assert_eq!(launch.session, "host-head");
+        let config = ctx.config();
+        let routed = crate::bash_background::with_remote_policy(Some(launch), || {
+            crate::bash_background::remote_for_runon(&config, "linux,4c", false, false, false)
+        })
+        .expect("a stamped head must not report that this session has no remote runner");
+        assert_eq!(routed.requested_vcpus, Some(4));
+    }
+    ctx.update_config(|config| config.remote_exec.enabled = false);
+    assert!(lookup(
+        &ctx,
+        &RemoteSource::Head {
+            harness: "opencode".into(),
+            session: "host-head".into()
+        }
+    )
+    .is_none());
+}
+
 // Remote routing runs only on Unix; the plan fixtures carry Unix sibling paths,
 // which a Windows decode rightly rejects as not absolute.
 #[cfg(unix)]

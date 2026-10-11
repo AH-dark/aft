@@ -848,6 +848,37 @@ fn a_delegating_stamped_route_sends_no_assertion_and_mints_nothing() {
     assert!(!lines[0].contains("head-ref-1"), "{}", lines[0]);
 }
 
+#[test]
+fn head_tool_and_background_routes_use_stamp_without_minting() {
+    for harness in ["opencode", "pi"] {
+        let session = format!("{harness}-head");
+        let ticket = crate::gh_shim_ticket::ScopedTicket::issue(&session, "head-write", "/p");
+        let transport = FakeTransport::scoped();
+        let mut routes = scopes_for(&session, Some(delegating_stamp()));
+        // The tool-call route and the idle completion subscription's separate route must carry the same stamp.
+        routes.push(&session, Some(delegating_stamp()));
+        let (reply, _) = run_with_scopes(
+            &transport,
+            &TokenCache::default(),
+            BOT_REQUEST_OPERATION,
+            bot_params(ticket.value().unwrap(), "head-write-nonce"),
+            NOW,
+            &routes,
+        );
+        assert!(reply.ok, "{:?}", reply.data);
+        assert_eq!(transport.count(Target::Prefrontal), 0);
+        assert_eq!(*transport.minted.lock().unwrap(), 0);
+        assert_eq!(transport.count(Target::Plexus), 1);
+        assert_eq!(
+            transport.plexus_scopes(),
+            vec![Some(scope_selector(&delegating_stamp()))]
+        );
+        assert!(transport.calls()[0].2["arguments"]
+            .get("assertion")
+            .is_none());
+    }
+}
+
 /// A session whose route carries no stamp keeps minting and sending the
 /// assertion on an unscoped route, even when the transport could scope it.
 #[test]
