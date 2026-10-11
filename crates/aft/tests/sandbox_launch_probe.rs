@@ -1427,5 +1427,17 @@ fn access_policy_builtin_floor_inside_worktree_refuses_shell_launch() {
     .output()
     .unwrap();
     assert_denied(&output, "absolute floor inside the worker's own worktree");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            output.status.code(),
+            Some(78),
+            "launch must refuse the overlapping built-in floor: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("sandbox_unavailable:"),
+            "{output:?}"
+        );
+    }
     assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-leak"));
 }
