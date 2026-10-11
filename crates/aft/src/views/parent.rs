@@ -140,7 +140,8 @@ fn is_repository(dir: &Path) -> bool {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))?;
     let home = PathBuf::from(home);
     Some(std::fs::canonicalize(&home).unwrap_or(home))
 }

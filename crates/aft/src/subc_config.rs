@@ -51,7 +51,8 @@ pub(crate) fn user_config_path_from(
 /// the integration tests inject a path instead of mutating env, which races).
 pub fn cortexkit_user_config_path() -> Option<PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"));
     user_config_path_from(xdg.as_deref(), home.as_deref())
 }
 

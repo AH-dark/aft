@@ -2663,7 +2663,8 @@ fn determine_rung_for_target(
 
 pub fn configured_connection_file() -> Option<PathBuf> {
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"));
     configured_connection_file_from(xdg_config_home.as_deref(), home.as_deref())
 }
 
@@ -2692,7 +2693,8 @@ fn configured_connection_file_from(
 /// determination treats as "no user config" (structural rungs decide).
 fn read_user_config_doc() -> Option<String> {
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"));
     let config_path =
         crate::subc_config::user_config_path_from(xdg_config_home.as_deref(), home.as_deref())?;
     fs::read_to_string(config_path).ok()
@@ -7581,6 +7583,58 @@ mod tests {
             expand_home_pattern("~/.gh-wrapper", Some(home), Some(&xdg)),
             home.join(".gh-wrapper").to_string_lossy(),
             "only the ~/.config/ prefix follows XDG_CONFIG_HOME"
+        );
+    }
+
+    #[test]
+    fn empty_home_uses_userprofile_for_config_and_parent_exclusion() {
+        const CHILD: &str = "AFT_TEST_EMPTY_HOME_PROFILE";
+        if let Some(profile) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let config_path = profile.join(".config/cortexkit/aft.jsonc");
+            let connection_path = profile.join("connection.json");
+            let doc = fs::read_to_string(&config_path).unwrap();
+            assert_eq!(
+                crate::subc_config::cortexkit_user_config_path(),
+                Some(config_path)
+            );
+            assert_eq!(configured_connection_file(), Some(connection_path));
+            assert_eq!(read_user_config_doc(), Some(doc));
+            assert!(crate::views::parent::discover(&profile, 1).is_none());
+
+            // With neither home available, do not read a config relative to cwd.
+            std::env::set_var("USERPROFILE", "");
+            assert_eq!(crate::subc_config::cortexkit_user_config_path(), None);
+            assert_eq!(configured_connection_file(), None);
+            assert_eq!(read_user_config_doc(), None);
+            return;
+        }
+
+        // A fresh process keeps HOME changes away from concurrently running tests.
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        fs::create_dir_all(profile.join(".config/cortexkit")).unwrap();
+        fs::create_dir_all(profile.join("checkout/.git")).unwrap();
+        let connection_path = profile.join("connection.json");
+        fs::write(&connection_path, "{}").unwrap();
+        let doc = serde_json::json!({"subc": {"connection_file": connection_path}}).to_string();
+        fs::write(profile.join(".config/cortexkit/aft.jsonc"), doc).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gh_shim::tests::empty_home_uses_userprofile_for_config_and_parent_exclusion",
+                "--nocapture",
+            ])
+            .env(CHILD, &profile)
+            .env("HOME", "")
+            .env("USERPROFILE", &profile)
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "empty-home child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
