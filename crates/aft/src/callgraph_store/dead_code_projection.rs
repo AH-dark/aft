@@ -938,12 +938,20 @@ fn go_initializer_edges(
     paths: &mut SnapshotPathResolver<'_>,
     file: Option<&str>,
 ) -> Result<Vec<CallgraphOutboundCall>> {
-    let disk = super::DiskFacts::new(paths.project_root);
-    let facts = super::facts::FactPaths {
-        root: paths.project_root,
-        facts: &disk,
-    };
-    let cache = super::WorkspaceCratePrefixCache::default();
+    let mut files = conn.prepare("SELECT path FROM files WHERE lang='go'")?;
+    let mut packages: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for path in files.query_map([], |row| row.get::<_, String>(0))? {
+        let path = path?;
+        packages
+            .entry(
+                Path::new(&path)
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf(),
+            )
+            .or_default()
+            .push(path);
+    }
     let mut query = conn.prepare("SELECT n.file_path, n.scoped_name FROM nodes n JOIN files f ON f.path=n.file_path WHERE f.lang='go' AND (?1 IS NULL OR n.file_path=?1) ORDER BY n.file_path, n.scoped_name")?;
     let callers = query
         .query_map([file], |row| {
@@ -951,27 +959,33 @@ fn go_initializer_edges(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut vars = conn.prepare("SELECT scoped_name FROM nodes WHERE file_path=?1 AND (kind='variable' OR scoped_name='<go-package-init>')")?;
-    let mut imports = conn.prepare("SELECT DISTINCT module_path FROM refs WHERE caller_file=?1 AND kind='import' AND module_path IS NOT NULL")?;
+    let mut imports = conn.prepare("SELECT DISTINCT target_file FROM refs WHERE caller_file=?1 AND kind='import' AND target_file IS NOT NULL AND status='resolved'")?;
     let mut targets_by_file = BTreeMap::new();
     let mut calls = Vec::new();
     for (caller_file, caller_symbol) in callers {
         if !targets_by_file.contains_key(&caller_file) {
-            let mut packages = super::go_package_files(&facts, &cache, &caller_file, None);
-            let modules = imports
+            let mut dirs = vec![Path::new(&caller_file)
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_path_buf()];
+            let imported_files = imports
                 .query_map([&caller_file], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            for module in modules {
-                packages.extend(super::go_package_files(
-                    &facts,
-                    &cache,
-                    &caller_file,
-                    Some(&module),
-                ));
+            for imported in imported_files {
+                dirs.push(
+                    Path::new(&imported)
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf(),
+                );
             }
-            packages.sort();
-            packages.dedup();
+            dirs.sort();
+            dirs.dedup();
             let mut targets = Vec::new();
-            for target_file in packages {
+            for target_file in dirs.iter().filter_map(|dir| packages.get(dir)).flatten() {
+                if !caller_file.ends_with("_test.go") && target_file.ends_with("_test.go") {
+                    continue;
+                }
                 for symbol in vars.query_map([&target_file], |row| row.get::<_, String>(0))? {
                     targets.push((target_file.clone(), symbol?));
                 }
