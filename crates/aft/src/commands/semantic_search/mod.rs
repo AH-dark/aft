@@ -5017,6 +5017,9 @@ fn run_engine_ranking(
         .map_err(|error| error.to_string())?;
     let results_list_envelope = match split {
         Some(split) if split.patterns.examination.capped => trailer.bounded_input_projection(),
+        _ if identifier_exact_capped && page.stop_state == paging::StopState::S2Exhausted => {
+            trailer.bounded_input_projection()
+        }
         _ => trailer.shared_envelope_projection(),
     };
 
@@ -5181,7 +5184,10 @@ fn run_engine_ranking(
     }
     Ok(EngineRanking {
         results,
-        more_available: page_end < page.reply.canonical_list.len()
+        // Lane exhaustion describes the materialized page, not the separately
+        // bounded identifier fallback. A cap cannot certify no further results.
+        more_available: identifier_exact_capped
+            || page_end < page.reply.canonical_list.len()
             || !matches!(page.stop_state, paging::StopState::S2Exhausted),
         engine_capped: identifier_exact_capped
             || matches!(page.stop_state, paging::StopState::S3DepthCap),
@@ -8426,6 +8432,85 @@ mod tests {
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+    }
+
+    #[test]
+    fn identifier_capped_exhausted_page_keeps_availability_and_budget_disclosure() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        // Exact evidence is depth-exempt. Exhausting that lane does not undo
+        // the separate cap on the identifier's lexical fallback input.
+        for index in 0..3201 {
+            std::fs::write(
+                root.join(format!("needle_{index:04}.rs")),
+                "// needle_symbol\n",
+            )
+            .unwrap();
+        }
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let extensions = crate::search_b2::install_defaults();
+        let plan = split_query_plan(
+            extensions,
+            "needle_symbol",
+            &extensions::Readiness::new(false, true, true),
+        );
+        assert_eq!(plan.shape, SearchShape::Identifier);
+        assert!(plan.contains(SearchLaneKind::Exact));
+        assert!(plan.contains(SearchLaneKind::Semantic));
+        assert!(!plan.contains(SearchLaneKind::Symbol));
+        let ranking = run_engine_ranking(
+            "identifier-capped-exhausted-page",
+            &ctx,
+            &root,
+            "needle_symbol",
+            "needle_symbol",
+            true,
+            Vec::new(),
+            paging::parse_public_page_request(&serde_json::json!({"offset": 3201, "topK": 1}))
+                .unwrap(),
+            extensions,
+            &plan,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ranking.exact_match_files, 3201);
+        assert!(ranking.results.is_empty());
+        assert!(ranking.engine_capped);
+        assert!(
+            ranking.more_available,
+            "a capped engine cannot claim exhaustion"
+        );
+        assert_eq!(
+            ranking.results_list_envelope.total,
+            crate::list_envelope::Total::AtLeast(3201)
+        );
+        assert!(ranking
+            .results_list_envelope
+            .causes
+            .contains(&crate::list_envelope::Reason::Budget));
+
+        let first_page = run_engine_ranking(
+            "identifier-capped-first-page",
+            &ctx,
+            &root,
+            "needle_symbol",
+            "needle_symbol",
+            true,
+            Vec::new(),
+            paging::parse_public_page_request(&serde_json::json!({"topK": 5})).unwrap(),
+            extensions,
+            &plan,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first_page.results.len(), 5);
+        for (index, result) in first_page.results.iter().enumerate() {
+            assert_eq!(result.file, root.join(format!("needle_{index:04}.rs")));
+            assert!(result.exact);
+        }
     }
 
     fn install_warm_callgraph_store(ctx: &AppContext, project_root: &Path) {

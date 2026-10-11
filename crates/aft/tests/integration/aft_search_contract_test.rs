@@ -437,48 +437,23 @@ fn install_lexical_index_entries(ctx: &AppContext, entries: &[(std::path::PathBu
 }
 
 fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
+    let (base_url, _, handle) = start_counted_mock_embedding_server();
+    (base_url, handle)
+}
+
+fn start_counted_mock_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     start_mock_embedding_server_with_response(
         "200 OK",
         r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#,
     )
 }
 
-fn start_no_request_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind no-request embedding server");
-    listener
-        .set_nonblocking(true)
-        .expect("set no-request server nonblocking");
-    let address = listener.local_addr().expect("no-request server address");
-    let requests = Arc::new(AtomicUsize::new(0));
-    let requests_for_thread = Arc::clone(&requests);
-    let handle = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    requests_for_thread.fetch_add(1, Ordering::SeqCst);
-                    let mut request = [0_u8; 4096];
-                    let _ = stream.read(&mut request);
-                    let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("accept no-request embedding connection: {error}"),
-            }
-        }
-    });
-    (format!("http://{address}"), requests, handle)
-}
-
 fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
-    start_mock_embedding_server_with_response("400 Bad Request", r#"{"error":"embedding boom"}"#)
+    let (base_url, _, handle) = start_mock_embedding_server_with_response(
+        "400 Bad Request",
+        r#"{"error":"embedding boom"}"#,
+    );
+    (base_url, handle)
 }
 
 fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
@@ -517,12 +492,17 @@ fn start_recovering_slow_embedding_server() -> (String, Arc<AtomicUsize>, thread
 fn start_mock_embedding_server_with_response(
     status: &str,
     body: &str,
-) -> (String, thread::JoinHandle<()>) {
+) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
     let addr = listener.local_addr().expect("embedding server addr");
     let status = status.to_string();
     let body = body.to_string();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_for_thread = Arc::clone(&requests);
     let handle = thread::spawn(move || {
+        // Setup may take arbitrarily long before search embeds its query. Keep
+        // the listener alive until that request, and drain its body before
+        // replying so a split HTTP write cannot be reset by an early close.
         let (mut stream, _) = listener.accept().expect("accept embedding request");
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -555,6 +535,7 @@ fn start_mock_embedding_server_with_response(
             }
         }
 
+        requests_for_thread.fetch_add(1, Ordering::SeqCst);
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
@@ -565,7 +546,7 @@ fn start_mock_embedding_server_with_response(
             .expect("write embedding response");
     });
 
-    (format!("http://{addr}"), handle)
+    (format!("http://{addr}"), requests, handle)
 }
 
 fn path_ends_with(file: &str, suffix: &str) -> bool {
@@ -2101,7 +2082,7 @@ fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
 #[test]
 fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped_with_semantic() {
     let (project, entries) = project_with_repeated_needle_files(210);
-    let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
+    let (base_url, embedding_requests, handle) = start_counted_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index_entries(&ctx, &entries);
     *ctx.semantic_index_status()
@@ -2117,7 +2098,7 @@ fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped_with_
     let raw_response = handle_semantic_search(&identifier_request, &ctx);
     let rendered = aft::subc_format::format_response("search", &raw_response, false);
     let response = response_value(raw_response);
-    handle.join().expect("negative embedding server thread");
+    handle.join().expect("embedding server thread");
 
     assert_eq!(
         response["success"], true,
@@ -2286,7 +2267,7 @@ fn identifier_ready_reports_no_more_available_when_under_top_k_with_semantic() {
         16,
     )
     .expect("build semantic index");
-    let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
+    let (base_url, embedding_requests, handle) = start_counted_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index(&ctx, &source_file, source);
     *ctx.semantic_index_status()
@@ -2299,7 +2280,7 @@ fn identifier_ready_reports_no_more_available_when_under_top_k_with_semantic() {
     let mut identifier_request = request_with_top_k("needle_symbol", None, 5);
     identifier_request.id = "identifier-ready-under-top-k-with-semantic".to_string();
     let response = response_value(handle_semantic_search(&identifier_request, &ctx));
-    handle.join().expect("negative embedding server thread");
+    handle.join().expect("embedding server thread");
 
     assert_eq!(
         response["success"], true,
@@ -2398,7 +2379,7 @@ fn auto_short_identifier_tokens_use_literal_scan() {
 #[test]
 fn identifier_ready_reports_complete_success_with_semantic() {
     let (project, source_file, source) = project_with_needle();
-    let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
+    let (base_url, embedding_requests, handle) = start_counted_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index(&ctx, &source_file, source);
     *ctx.semantic_index_status()
@@ -2412,7 +2393,7 @@ fn identifier_ready_reports_complete_success_with_semantic() {
     let mut identifier_request = request("needle_symbol");
     identifier_request.id = "identifier-ready-complete-with-semantic".to_string();
     let response = response_value(handle_semantic_search(&identifier_request, &ctx));
-    handle.join().expect("negative embedding server thread");
+    handle.join().expect("embedding server thread");
 
     assert_eq!(
         response["success"], true,
