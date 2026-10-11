@@ -20622,16 +20622,12 @@ mod refresh_worker_tests {
 
     #[test]
     fn trace_data_same_file_hops_spend_depth() {
-        let (_temp, root, callgraph_dir, source) = ready_store_fixture();
-        fs::write(
-            &source,
+        let (_temp, root, callgraph_dir, source) = ready_store_fixture_with_source(
             "fn entry() {\n    let x = 1;\n    first(x);\n}\nfn first(p: i32) {\n    second(p);\n}\nfn second(q: i32) {\n    let _ = q;\n}\n",
-        )
-        .unwrap();
+        );
         let store = CallGraphStore::open_ready(callgraph_dir, root)
             .unwrap()
             .unwrap();
-        store.refresh_files(std::slice::from_ref(&source)).unwrap();
         let trace = |depth| {
             crate::commands::callgraph_store_adapter::trace_data_result(
                 &store,
@@ -20752,6 +20748,12 @@ mod refresh_worker_tests {
     }
 
     fn ready_store_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        ready_store_fixture_with_source("fn entry() { old_leaf(); }\nfn old_leaf() {}\n")
+    }
+
+    fn ready_store_fixture_with_source(
+        contents: &str,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let temp = tempdir().unwrap();
         let root = temp.path().join("root");
         fs::create_dir_all(&root).unwrap();
@@ -20763,7 +20765,7 @@ mod refresh_worker_tests {
             .join("callgraph")
             .join(artifact_key);
         let source = root.join("main.rs");
-        fs::write(&source, "fn entry() { old_leaf(); }\nfn old_leaf() {}\n").unwrap();
+        fs::write(&source, contents).unwrap();
         let (store, _) = CallGraphStore::cold_build_with_lease(
             callgraph_dir.clone(),
             root.clone(),

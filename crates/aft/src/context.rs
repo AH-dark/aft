@@ -130,6 +130,8 @@ fn replace_pinned_config(key: usize, config: &Arc<Config>) {
     });
 }
 
+// `try_update` is only available from Rust 1.99; retain checked allocation on the 1.92 MSRV.
+#[allow(deprecated)]
 fn next_config_pin_identity() -> usize {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     // A pin can survive moving or dropping its context. Addresses are reusable,
