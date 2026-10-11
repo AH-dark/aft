@@ -126,18 +126,30 @@ export class SubcFrameReadTimeoutError extends SubcCallError {
   }
 }
 
-function isFrameTimeoutMessage(message: unknown): boolean {
+/**
+ * Matches the frame-body read timeout raised by subc-client (socket.ts:185/190):
+ * "timed out waiting for <N> bytes".
+ *
+ * Excludes connect timeouts ("timed out connecting to ...") and write timeouts
+ * ("timed out writing to subc"): connect timeouts are provably pre-send, while
+ * write timeouts keep their existing transport classification.
+ */
+function isFrameBodyReadTimeoutMessage(message: unknown): boolean {
   return (
     typeof message === "string" &&
     (/timed out waiting for \d+ bytes/i.test(message) ||
-      /timed out waiting for frame body bytes/i.test(message))
+      message.includes("timed out waiting for frame body bytes"))
   );
 }
 
 export function isSubcFrameReadTimeoutError(error: unknown): boolean {
   if (error instanceof SubcFrameReadTimeoutError) return true;
-  if (error instanceof SocketTimeoutError) return true;
-  if (error instanceof SubcError && isFrameTimeoutMessage(error.message)) return true;
+  if (error instanceof SocketTimeoutError && isFrameBodyReadTimeoutMessage(error.message)) {
+    return true;
+  }
+  if (error instanceof SubcError && isFrameBodyReadTimeoutMessage(error.message)) {
+    return true;
+  }
   if (error instanceof SubcCallError) {
     if (error.code === "frame_read_timeout") return true;
     if (
@@ -147,17 +159,7 @@ export function isSubcFrameReadTimeoutError(error: unknown): boolean {
     ) {
       return true;
     }
-    if (isFrameTimeoutMessage(error.message)) return true;
-  }
-  if (error instanceof Error) {
-    if (
-      error.cause !== undefined &&
-      error.cause !== error &&
-      isSubcFrameReadTimeoutError(error.cause)
-    ) {
-      return true;
-    }
-    if (isFrameTimeoutMessage(error.message)) return true;
+    if (isFrameBodyReadTimeoutMessage(error.message)) return true;
   }
   return false;
 }

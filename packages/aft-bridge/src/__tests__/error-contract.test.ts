@@ -437,6 +437,23 @@ describe("adaptToolError", () => {
     }
   });
 
+  test("connect and write SocketTimeoutErrors keep previous transport-dead classification and are NOT mapped to outcome_unknown", () => {
+    const connectTimeout = new SocketTimeoutError("timed out connecting to 127.0.0.1:12345");
+    const writeTimeout = new SocketTimeoutError("timed out writing to subc");
+
+    for (const error of [connectTimeout, writeTimeout]) {
+      expect(isSubcFrameReadTimeoutError(error)).toBe(false);
+      expect(classifyBashHostFallbackError(error)).toBe("transport down");
+      expect(isBashTransportDeadError(error)).toBe(true);
+
+      const adapted = adaptToolError("bash", error) as Error;
+      expect(adapted).not.toBeInstanceOf(SubcFrameReadTimeoutError);
+      expect(adapted.message).toContain(BASH_TRANSPORT_DISPOSITION);
+      expect(adapted.message).not.toContain(BASH_FRAME_READ_TIMEOUT_DISPOSITION);
+      expect(adapted.message).not.toContain(SUBC_FRAME_READ_TIMEOUT_DISPOSITION);
+    }
+  });
+
   test("a frame-read timeout on bash gets the unknown-outcome bash disposition", () => {
     const original = new SubcFrameReadTimeoutError(
       new SubcError("timed out waiting for 359 bytes", undefined, undefined, "connection_lost"),
