@@ -46,7 +46,8 @@ function reclaimDeadOwner(path: string): boolean {
     if (path.endsWith("clear.lock") && (lines[3] !== "clearing" || !lines[4])) return false;
     if (lines[4] && lines[4] !== hostname()) return false;
     if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-    // Windows PID-zero probes can be ambiguous; existing records need explicit recovery.
+    // Windows signal-zero probes may misreport liveness. Before removing abandoned
+    // records, an operator must confirm all cache writers and descendants have stopped.
     if (process.platform === "win32") return false;
     try {
       process.kill(pid, 0);
@@ -70,7 +71,7 @@ function reclaimDeadOwner(path: string): boolean {
   }
 }
 
-/** Recovery itself is serialized outside the trees that cache clearing removes. */
+/** Store the mutation gate outside lsp-packages/lsp-binaries so clearing payloads cannot remove the lock coordinating them. */
 function underRecoveryLease<T>(work: () => T, root = stateDir()): T | null {
   const gate = join(root, "recovery.lock");
   let fd: number;
@@ -82,7 +83,8 @@ function underRecoveryLease<T>(work: () => T, root = stateDir()): T | null {
     return null;
   }
   try {
-    // Do not steal this short-lived gate. A crash here requires explicit recovery.
+    // Never steal this gate by age. After a crash, stop writers on every host
+    // sharing this cache and verify their descendants stopped before removing it.
     writeFileSync(fd, owner);
     return work();
   } catch {
@@ -150,7 +152,8 @@ export function acquireLspInstallLease(
     const legacy = join(legacyDir, ".aft-installing");
     if (!reclaimDeadOwner(external) || !reclaimDeadOwner(legacy)) return null;
     const owner = `${process.pid}\n${new Date().toISOString()}\n${randomUUID()}\ninstalling\n${hostname()}\n`;
-    // Tests can interleave another admission at the inspection/publication boundary.
+    // Tests can attempt a clear or another install after checking existing claims
+    // but before this writer publishes its claim, while the mutation gate is held.
     beforePublish?.();
     publish(external, owner);
     try {
