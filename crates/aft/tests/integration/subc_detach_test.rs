@@ -555,7 +555,7 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
 fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
     // Four independent slow servers distinguish one shared budget from a
     // per-server budget while keeping the negative control below the hang cap.
-    drain_with_live_lsp_servers_and_writer("", false, "40", None, None, 4);
+    drain_with_live_lsp_servers_and_writer("", false, "40", None, false, 4);
 }
 
 /// Servers that ignore the Shutdown request and SIGTERM, and linger after
@@ -588,7 +588,7 @@ fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
 
 #[test]
 fn subc_drain_with_slow_writer_persists_terminal_line() {
-    drain_with_live_lsp_servers_and_writer("", false, "1000", Some("1000"), Some("450"), 34);
+    drain_with_live_lsp_servers_and_writer("", false, "1000", Some("1000"), true, 34);
 }
 
 /// Bind independent roots that each start a fake rust-analyzer which never
@@ -597,7 +597,7 @@ fn subc_drain_with_slow_writer_persists_terminal_line() {
 /// `NAME=value` assignments for the fake servers, including deterministic
 /// startup and exit delays.
 fn drain_with_live_lsp_servers(server_env: &str, active_ort: bool) {
-    drain_with_live_lsp_servers_and_writer(server_env, active_ort, "40", None, None, 34);
+    drain_with_live_lsp_servers_and_writer(server_env, active_ort, "40", None, false, 34);
 }
 
 fn drain_with_live_lsp_servers_and_writer(
@@ -605,7 +605,7 @@ fn drain_with_live_lsp_servers_and_writer(
     active_ort: bool,
     writer_delay: &str,
     flush_hold: Option<&str>,
-    index_delay: Option<&str>,
+    phase_rendezvous: bool,
     server_count: usize,
 ) {
     assert!(
@@ -663,8 +663,7 @@ fn drain_with_live_lsp_servers_and_writer(
             true,
             writer_delay,
             flush_hold,
-            index_delay,
-            index_delay.map(|_| phase_events_path.as_path()),
+            phase_rendezvous.then_some(phase_events_path.as_path()),
         );
         let mut stream = accept_module(&listener).await;
         for (index, project) in projects.iter().enumerate() {
@@ -713,7 +712,7 @@ fn drain_with_live_lsp_servers_and_writer(
             elapsed.as_millis()
         );
         let log = std::fs::read_to_string(&stderr_path).unwrap();
-        if index_delay.is_some() {
+        if phase_rendezvous {
             let events = std::fs::read_to_string(&phase_events_path)
                 .expect("shutdown phase event hook recorded its boundaries");
             assert_shutdown_phases_overlap(&events);
@@ -810,6 +809,10 @@ fn log_tail(log: &str) -> String {
 
 fn assert_shutdown_phases_overlap(events: &str) {
     let events = events.lines().collect::<Vec<_>>();
+    assert!(
+        !events.iter().any(|event| event.ends_with(":peer_timeout")),
+        "shutdown phases did not rendezvous within the LSP shutdown budget: {events:?}"
+    );
     let position = |event: &str| {
         let positions = events
             .iter()
@@ -822,14 +825,16 @@ fn assert_shutdown_phases_overlap(events: &str) {
 
     let index_start = position("index_flush:start");
     let index_end = position("index_flush:end");
+    let index_peer = position("index_flush:peer_started");
     let lsp_start = position("lsp_shutdown:start");
     let lsp_end = position("lsp_shutdown:end");
+    let lsp_peer = position("lsp_shutdown:peer_started");
     assert!(
-        index_start < index_end,
+        index_start < index_peer && index_peer < index_end,
         "invalid index flush interval: {events:?}"
     );
     assert!(
-        lsp_start < lsp_end,
+        lsp_start < lsp_peer && lsp_peer < lsp_end,
         "invalid LSP shutdown interval: {events:?}"
     );
     assert!(
@@ -921,7 +926,6 @@ impl ModuleProcess {
             "40",
             None,
             None,
-            None,
         )
     }
 
@@ -935,7 +939,6 @@ impl ModuleProcess {
         busy_index: bool,
         writer_delay: &str,
         flush_hold: Option<&str>,
-        index_delay: Option<&str>,
         phase_events_path: Option<&Path>,
     ) -> Self {
         use std::os::unix::process::CommandExt;
@@ -969,11 +972,12 @@ impl ModuleProcess {
             command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "450");
             command.env("AFT_TEST_LOG_WRITER_DELAY_MS", writer_delay);
         }
-        if let Some(delay) = index_delay {
-            command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", delay);
-        }
         if let Some(path) = phase_events_path {
+            // Prove simultaneous phase entry without keeping index flush open
+            // for an arbitrary sleep that can expire before its peer runs.
+            command.env("AFT_TEST_EXIT_INDEX_DELAY_MS", "0");
             command.env("AFT_TEST_EXIT_PHASE_EVENTS", path);
+            command.env("AFT_TEST_EXIT_PHASE_RENDEZVOUS", "1");
         }
         if let Some(hold) = flush_hold {
             // A writer this slow cannot acknowledge a flush inside the exit
