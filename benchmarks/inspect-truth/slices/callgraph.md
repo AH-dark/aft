@@ -2,6 +2,8 @@
 
 Baseline: 0.58.2 (`13dd9cb71`). Both tables use this revision of `run.py score`.
 
+**Current delivery boundary:** the tables remain measured at pre-rebuild tip `9e8c83db7`. The later regression that falsely kept a plain `Less` function live through a same-named Go interface method is corrected at `e9fd4a6f27d168bf1cd7ba5b3ce984957ddae833` on the rebuilt branch; its Go corpus effect is not yet measured and must be re-collected before these numbers are attributed to the new tip.
+
 ## Before
 
 | repo | language | category | status | AFT | oracle | agreed (+file) | precision | recall | oracle_rows_judged_out | aft_rows_judged | aft_rows_unjudged |
@@ -371,3 +373,50 @@ The current versions are `v15-nested-use-macro-imports-go-init-callbacks`, `call
 - Eight independent controls were staged safely, showed nonempty mutation diffs and restored empty diffs. Each selected one named test, and only that test failed; others were filtered. Controls removed recursive leaves, Rust-specific view target selection, macro-use linking, init roots, multiple-init body merging, fluent receiver traversal, collision disambiguation and the upgraded admission floor. Detailed evidence is in the delivery declaration. The restored 26-test resolver module passed afterward.
 
 No benchmark re-collection or interface/trait liveness change was made. The existing 32 Go judgments and 21 ripgrep explanations describe the actual dead-code findings captured at the older engine revision `a37cdbe83`; they are retained even if a newer engine removes those findings. Engine revision `8035691a2b288875959cfd7c102d31bab678df8f` is ready for the next Linux corpus collection. No improved counts or precision are claimed until that run completes.
+
+## Same-name Go dispatch regression: traced and corrected
+
+Engine correction: **`e9fd4a6f27d168bf1cd7ba5b3ce984957ddae833`** on the rebuilt branch. The prior corpus tables are retained as historical measurements; this change moves Go projection/root semantics and awaits a new corpus run.
+
+### Actual edge/root cause
+
+The unchanged main integration fixture `inspect_dead_code_keeps_go_sort_interface_methods_live` was reproduced red: only the unused method `Unused` was reported, while the unrelated plain `Less` function was incorrectly live. A reduced fixture traced all stored references and the fixture's outgoing graph edges **before repair**:
+
+- `sort.Sort` was unresolved external dispatch, not a call to plain `Less`;
+- no stored ref targeted `Less`, and there were no explicit projection roots;
+- the slice fabricated `Less -> <go-package-init>` from the unused plain function, because it generated initialization edges from every declaration;
+- that outgoing edge introduced a graph-source key named `Less`. The scanner's existing live sort-method name could then adopt that key as a dispatch root, despite having no real reference to the plain function.
+
+The source fix is therefore **not** a change to interface-contract liveness or to the resolver's target binding. Initialization edges now originate only from the package bridge, `main`, or an owner with an already confirmed call/value edge to an indexed definition. Unresolved local identifiers and builtin/external-only calls do not qualify. Package bridges still initialize package variables, init functions and imported package bridges, so empty imported files and initializer-only packages retain their required execution behavior. The imported/unimported initialization, Cobra, Boot/Register and callback fixtures all remain green.
+
+### Actual-view parity and narrow flag correction
+
+The new parity fixture also exposed an independent view-root issue: materialization copied `exported` into every Go method's root flag. It rooted both `Unused` and a bare `Less` name regardless of the legacy graph. The existing Go-variable exception now also applies to **Go methods only**: use the serialized explicit roots rather than export capitalization. Every other language and symbol kind keeps its previous flag.
+
+`callgraph_go_sort_dispatch_does_not_rescue_same_named_plain_function` has six variants: same-file `package main` and a separately imported `items` package, each with a constant-false plain Less body, unresolved parameter comparisons, or a builtin-only call. Both the fresh legacy-store build and a database materialized from immutable view blobs must produce snapshots that:
+
+- contain no fabricated initializer edge owned by the plain `Less`;
+- keep the plain `Less` function and `Unused` method dead;
+- retain live `Len`, `Less` and `Swap` methods through the used sort interface;
+- return identical findings, including the exported methods on the imported package's used receiver type.
+
+The non-Go preservation fixture retains its TypeScript exported-variable assertion and now also checks a Rust exported method's existing root flag. A method-only language-fence mutant leaves the TypeScript variable intact but makes the Rust method assertion fail, so method preservation is independently defended.
+
+### Existing-view invalidation
+
+The legacy/derived database build fingerprint is `v17-go-initializer-owner-method-root-identity`; immutable blob lookup keys use producer `callgraph-v6-go-initializer-owner-method-root-identity`; active view manifest headers and attachment keys use `ruled-callgraph-v7-go-initializer-owner-method-root-identity`. The previous-view rejection fixture now stamps the immediately preceding v16 fingerprint; the current reader refuses it, and reverting the floor to v16 makes the fixture red. Previous producer keys are lookup misses. Old views therefore rebuild the changed Go owner/root interpretation rather than reusing it. The rebuild remains one time per file content/language/current producer, followed by reuse.
+
+### Gates and controls
+
+Cargo 1.99.0, all builds/tests serialized on remote Linux with four virtual CPUs:
+
+- full integration **inspect** family: **311 passed, 6 ignored, 0 failed**, including the unchanged main sort-interface fixture;
+- full integration **callgraph** family: **112 passed, 2 ignored, 1 failed**. The sole failure is `subc_format_test::callgraph_format_matches_typescript_golden_fixtures`: seven TypeScript formatting cases expect `<PROJECT_ROOT>` but receive a home-abbreviated `~/tmp/...` path. Restoring all five changed source files to exact prior HEAD `481b7ede9` (apart from a nonexecuting control comment) reproduces the same failure. No formatter/test expectation was changed;
+- corpus-facing resolver/legacy-view fixtures: **28 passed**;
+- binary/watcher fixtures: **132 passed**;
+- mandatory full Rust gate: **5954 library tests passed, 2 failed, 50 ignored**, TLS **1 passed**, tokenizer **3 passed**, Biome **714 files checked**. The two failures remain the semantic-backend response assertion and missing storage archive fixture; later phases were not reached;
+- rustfmt 1.10.0-stable format/check and diff checks passed. Editor diagnostics were provisional; direct compilation checked the actual source.
+
+Four new independent controls were red and restored from the staged live state with empty post-restore diffs: restoring synthetic edges from unused declarations such as `Less` to the package-init bridge fails the **original unchanged integration test**, restoring exported Go-method roots fails the new parity fixture, leaking the method flag rule into non-Go code fails only the Rust-method preservation control, and reverting the admission floor fails the previous-view rejection fixture. Each invocation selected one named test; other tests were filtered. The restored 28-test corpus-facing module passed afterward.
+
+Retained logs outside build directories: `local-ignore/callgraph/evidence/inspect-integration-go-sort-fix.stdout` and `rust-gate-go-sort-fix.stdout`. All entries in `judgments/callgraph.json` and the earlier judgment files remain attached to their original capture directories. No resolver or interface-contract policy was changed, no new corpus collection was run, and the coordinating review run must settle the new Go counts before release.
