@@ -348,6 +348,22 @@ export interface SubcClientLike {
 /** The subc module id AFT registers under (matches the daemon manifest). */
 const AFT_MODULE_ID = "aft";
 const HOST_SCOPE_LOOKUP_TIMEOUT_MS = 2_000;
+const HOST_SCOPE_RETRY_FLOOR_MS = 5_000;
+const HOST_SCOPE_RETRY_CAP_MS = 300_000;
+
+type HostScopeAnswer = { result: "scope"; scope: RouteScope } | { result: "no_scope" };
+type HostScopeResult =
+  | HostScopeAnswer
+  | { result: "error"; code: string; afterMs: number }
+  | { result: "timeout"; afterMs: number }
+  | { result: "malformed" };
+
+interface HostScopeState {
+  answer?: HostScopeAnswer;
+  pending?: Promise<RouteScope | undefined>;
+  retryAt: number;
+  retryMs: number;
+}
 
 /**
  * A run of consecutive per-call failures that got no answer (timeout / route
@@ -1324,8 +1340,9 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly consumerIdentity: ConsumerIdentity | null | undefined;
   private readonly hostScopes: boolean;
   /** Scope identity is host-session-wide, even when the session uses multiple project roots. */
-  private readonly hostScopeCache = new Map<string, Promise<RouteScope | undefined>>();
+  private readonly hostScopeCache = new Map<string, HostScopeState>();
   private readonly hostScopeRefusals = new Set<string>();
+  private readonly hostScopeOutcomes = new Map<string, string>();
   private readonly connectFn: (opts: {
     connectionFile: string;
     handshakeTimeoutMs?: number;
@@ -2659,21 +2676,74 @@ export class SubcTransportPool implements AftTransportPool {
     client: SubcClientLike,
     identity: BindIdentity,
   ): Promise<RouteScope | undefined> {
-    const cached = this.hostScopeCache.get(identity.session);
-    if (cached) return cached;
-    const lookup = this.readHostScope(client, identity);
-    this.hostScopeCache.set(identity.session, lookup);
+    if (this.hostScopeRefusals.has(identity.session)) return Promise.resolve(undefined);
+    let state = this.hostScopeCache.get(identity.session);
+    if (!state) {
+      state = { retryAt: 0, retryMs: HOST_SCOPE_RETRY_FLOOR_MS };
+      this.hostScopeCache.set(identity.session, state);
+    }
+    if (state.answer) {
+      return Promise.resolve(state.answer.result === "scope" ? state.answer.scope : undefined);
+    }
+    if (state.pending) return state.pending;
+    // Backoff skips the lookup, not the bind, so an unavailable core cannot delay every root.
+    if (Date.now() < state.retryAt) return Promise.resolve(undefined);
+    const current = state;
+    const lookup = this.readHostScope(client, identity).then((outcome) => {
+      // A scope-close push may invalidate the session while the management request is in flight.
+      if (this.hostScopeCache.get(identity.session) !== current) return undefined;
+      current.pending = undefined;
+      this.logHostScopeOutcome(identity.session, outcome);
+      if (outcome.result === "scope" || outcome.result === "no_scope") {
+        current.answer = outcome;
+        current.retryAt = 0;
+        current.retryMs = HOST_SCOPE_RETRY_FLOOR_MS;
+      } else {
+        current.retryAt = Date.now() + current.retryMs;
+        current.retryMs = Math.min(current.retryMs * 2, HOST_SCOPE_RETRY_CAP_MS);
+      }
+      return outcome.result === "scope" ? outcome.scope : undefined;
+    });
+    current.pending = lookup;
     return lookup;
+  }
+
+  private logHostScopeOutcome(session: string, outcome: HostScopeResult): void {
+    let key: string;
+    let detail: string;
+    switch (outcome.result) {
+      case "scope":
+        key = JSON.stringify([outcome.result, outcome.scope.ref, outcome.scope.scopeEpoch]);
+        detail = `scope ref=${outcome.scope.ref.slice(0, 8)} epoch=${outcome.scope.scopeEpoch}`;
+        break;
+      case "error":
+        key = JSON.stringify([outcome.result, outcome.code]);
+        detail = `error code=${outcome.code} after=${outcome.afterMs}`;
+        break;
+      case "timeout":
+        key = outcome.result;
+        detail = `timeout after=${outcome.afterMs}`;
+        break;
+      default:
+        key = outcome.result;
+        detail = outcome.result;
+    }
+    // Elapsed time varies on every retry; only a changed answer or error code merits another line.
+    if (this.hostScopeOutcomes.get(session) === key) return;
+    this.hostScopeOutcomes.set(session, key);
+    log(`subc head scope: session=${session} result=${detail}`);
   }
 
   private async readHostScope(
     client: SubcClientLike,
     identity: BindIdentity,
-  ): Promise<RouteScope | undefined> {
+  ): Promise<HostScopeResult> {
+    const startedAt = Date.now();
+    const timeout = (): HostScopeResult => ({ result: "timeout", afterMs: Date.now() - startedAt });
     let expired = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const abort = new AbortController();
-    const read = async (): Promise<RouteScope | undefined> => {
+    const read = async (): Promise<HostScopeResult> => {
       let route: RouteHandle | undefined;
       try {
         route = await client.routeOpen(
@@ -2681,7 +2751,7 @@ export class SubcTransportPool implements AftTransportPool {
           identity,
           { consumerIdentity: this.consumerIdentity },
         );
-        if (expired) return undefined;
+        if (expired) return timeout();
         const reply = await client.request(
           route,
           {
@@ -2690,6 +2760,7 @@ export class SubcTransportPool implements AftTransportPool {
           },
           { timeoutMs: HOST_SCOPE_LOOKUP_TIMEOUT_MS, signal: abort.signal },
         );
+        if (isRecord(reply) && reply.answer === "no_scope") return { result: "no_scope" };
         if (
           !isRecord(reply) ||
           !isRecord(reply.owner) ||
@@ -2700,28 +2771,41 @@ export class SubcTransportPool implements AftTransportPool {
           !Number.isSafeInteger(reply.scope_epoch) ||
           (reply.scope_epoch as number) < 0
         )
-          return undefined;
+          return { result: "malformed" };
         return {
-          owner: { kind: "reserved", module_id: "prefrontal-core" },
-          ref: reply.ref,
-          scopeEpoch: reply.scope_epoch as number,
+          result: "scope",
+          scope: {
+            owner: { kind: "reserved", module_id: "prefrontal-core" },
+            ref: reply.ref,
+            scopeEpoch: reply.scope_epoch as number,
+          },
         };
-      } catch {
+      } catch (error) {
         // A missing or unavailable scope service must not disable the host's tools.
-        return undefined;
+        if (expired) return timeout();
+        return {
+          result: "error",
+          code:
+            error instanceof SubcError && error.code
+              ? error.code
+              : error instanceof Error
+                ? error.name
+                : "Error",
+          afterMs: Date.now() - startedAt,
+        };
       } finally {
         if (route) safeCloseRoute(client, route);
       }
     };
     try {
-      // Bound the whole lookup, including route.open, so an unavailable core cannot stall a bind.
+      // Keep the two-second bind budget even during core startup; transient failures retry on later binds.
       return await Promise.race([
         read(),
-        new Promise<undefined>((resolve) => {
+        new Promise<HostScopeResult>((resolve) => {
           timer = setTimeout(() => {
             expired = true;
             abort.abort();
-            resolve(undefined);
+            resolve(timeout());
           }, HOST_SCOPE_LOOKUP_TIMEOUT_MS);
         }),
       ]);
@@ -2752,8 +2836,7 @@ export class SubcTransportPool implements AftTransportPool {
     identity: BindIdentity,
     record: SessionRecord,
   ): Promise<RouteHandle> {
-    const lookup = this.hostScope(client, identity);
-    const scope = await lookup;
+    const scope = await this.hostScope(client, identity);
     this.assertRecordLive(record);
     if (scope) {
       try {
@@ -2769,10 +2852,7 @@ export class SubcTransportPool implements AftTransportPool {
           this.hostScopeRefusals.add(identity.session);
           warn(`subc head scope: scoped bind refused code=${error.code}; binding unscoped`);
         }
-        // Remember the downgrade for this host session, rather than retrying a denied carrier on every root.
-        if (this.hostScopeCache.get(identity.session) === lookup) {
-          this.hostScopeCache.set(identity.session, Promise.resolve(undefined));
-        }
+        // The refusal set remembers the downgrade without misreporting it as core's no_scope answer.
       }
     }
     this.assertRecordLive(record);
@@ -3119,6 +3199,7 @@ export class SubcTransportPool implements AftTransportPool {
     this.dormantRoots.clear();
     this.hostScopeCache.clear();
     this.hostScopeRefusals.clear();
+    this.hostScopeOutcomes.clear();
 
     // Deregistration synchronously tombstones all registered roots and invokes
     // closeProjectRoot before this method reaches its first await.

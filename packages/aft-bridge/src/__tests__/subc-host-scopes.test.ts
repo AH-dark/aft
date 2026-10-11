@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -83,10 +83,35 @@ class HostClient implements SubcClientLike {
 
 const pools: SubcTransportPool[] = [];
 const originalLogger = getActiveLogger();
+const restoreClocks: Array<() => void> = [];
 afterEach(async () => {
   await Promise.all(pools.splice(0).map((pool) => pool.shutdown()));
+  for (const restore of restoreClocks.splice(0).reverse()) restore();
   setActiveLogger(originalLogger);
 });
+
+function fakeClock() {
+  let now = Date.now();
+  const clock = spyOn(Date, "now").mockImplementation(() => now);
+  restoreClocks.push(() => clock.mockRestore());
+  return {
+    advance: (ms: number) => {
+      now += ms;
+    },
+  };
+}
+
+function scopeLogs() {
+  const lines: string[] = [];
+  setActiveLogger({
+    log: (line: string) => {
+      if (line.startsWith("subc head scope:")) lines.push(line);
+    },
+    error() {},
+    warn() {},
+  } satisfies Logger);
+  return lines;
+}
 
 function setup(harness = "opencode", background = false) {
   const client = new HostClient();
@@ -189,6 +214,159 @@ test("a stalled scope lookup falls back and closes its late management route", a
   expect(client.closedRoutes).toEqual([1]);
 });
 
+test("a timed out head scope lookup retries and binds scoped after backoff", async () => {
+  const clock = fakeClock();
+  const lines = scopeLogs();
+  const { client, pool } = setup();
+  let release!: () => void;
+  client.scopeOpenGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+  release();
+  for (let turn = 0; turn < 32; turn++) await Promise.resolve();
+  expect(client.closedRoutes).toEqual([1]);
+  clock.advance(5_000);
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  expect(client.reads).toHaveLength(1);
+  expect(lines[0]).toMatch(/^subc head scope: session=head result=timeout after=\d+$/);
+  expect(lines[1]).toBe("subc head scope: session=head result=scope ref=head-sco epoch=7");
+});
+
+test("head scope lookup errors are retried rather than cached", async () => {
+  for (const source of ["route", "request"]) {
+    const clock = fakeClock();
+    const { client, pool } = setup();
+    if (source === "route")
+      client.scopeOpenError = new SubcError("unavailable", "target_unavailable");
+    else client.answer = new Error("lookup failed");
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+    expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+    client.scopeOpenError = undefined;
+    client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+    clock.advance(5_000);
+    await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+    expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  }
+});
+
+test("explicit no_scope is cached across head binds", async () => {
+  const clock = fakeClock();
+  const lines = scopeLogs();
+  const { client, pool } = setup();
+  client.answer = { answer: "no_scope" };
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  clock.advance(300_000);
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  expect(client.reads).toHaveLength(1);
+  expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+  expect(lines).toEqual(["subc head scope: session=head result=no_scope"]);
+});
+
+test("malformed head scope replies are retried rather than cached", async () => {
+  for (const answer of [
+    undefined,
+    { answer: "unknown" },
+    { owner: scope.owner, ref: scope.ref, scope_epoch: -1 },
+  ]) {
+    const clock = fakeClock();
+    const { client, pool } = setup();
+    client.answer = answer;
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+    expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+    client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+    clock.advance(5_000);
+    await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+    expect(client.reads).toHaveLength(2);
+    expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  }
+});
+
+test("head scope retries back off exponentially to five minutes without delaying binds", async () => {
+  const clock = fakeClock();
+  const { client, pool } = setup();
+  client.answer = new Error("lookup failed");
+  let bind = 0;
+  const rebind = () => {
+    const root = join(TEST_PROJECT_ROOT, `retry-${bind++}`);
+    mkdirSync(root, { recursive: true });
+    return pool.getBridge(root).toolCall("head", "read", {});
+  };
+  await rebind();
+  let reads = 1;
+  for (const delay of [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 300_000, 300_000]) {
+    clock.advance(delay - 1);
+    await rebind();
+    expect(client.reads).toHaveLength(reads);
+    clock.advance(1);
+    await rebind();
+    expect(client.reads).toHaveLength(++reads);
+  }
+  client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  clock.advance(300_000);
+  await rebind();
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+});
+
+test("head scope logs once per session outcome change without error messages or full refs", async () => {
+  const clock = fakeClock();
+  const lines = scopeLogs();
+  const { client, pool, push } = setup();
+  const request = client.request.bind(client);
+  let elapsed = 0;
+  spyOn(client, "request").mockImplementation(async (route, body) => {
+    clock.advance(++elapsed);
+    return request(route, body);
+  });
+  let bind = 0;
+  const rebind = () => {
+    const root = join(TEST_PROJECT_ROOT, `log-${bind++}`);
+    mkdirSync(root, { recursive: true });
+    return pool.getBridge(root).toolCall("head", "read", {});
+  };
+  client.answer = new SubcError("secret message", "target_unavailable");
+  await rebind();
+  clock.advance(5_000);
+  await rebind();
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toMatch(
+    /^subc head scope: session=head result=error code=target_unavailable after=\d+$/,
+  );
+  client.answer = new Error("another secret");
+  clock.advance(10_000);
+  await rebind();
+  expect(lines[1]).toMatch(/^subc head scope: session=head result=error code=Error after=\d+$/);
+  client.answer = {};
+  clock.advance(20_000);
+  await rebind();
+  clock.advance(40_000);
+  await rebind();
+  expect(lines).toHaveLength(3);
+  expect(lines[2]).toBe("subc head scope: session=head result=malformed");
+  client.answer = { owner: scope.owner, ref: "private-ref-123456", scope_epoch: 7 };
+  clock.advance(80_000);
+  await rebind();
+  expect(lines[3]).toBe("subc head scope: session=head result=scope ref=private- epoch=7");
+  const channel = client.opens.length;
+  push({ op: "route.closed", body: { channels: [channel], reason: "scope_ended" } });
+  await rebind();
+  expect(lines).toHaveLength(4);
+  client.answer = { owner: scope.owner, ref: "private-ref-123456", scope_epoch: 8 };
+  push({ op: "route.closed", body: { channels: [client.opens.length], reason: "scope_ended" } });
+  await rebind();
+  expect(lines[4]).toBe("subc head scope: session=head result=scope ref=private- epoch=8");
+  client.answer = { answer: "no_scope" };
+  push({ op: "route.closed", body: { channels: [client.opens.length], reason: "scope_ended" } });
+  await rebind();
+  expect(lines[5]).toBe("subc head scope: session=head result=no_scope");
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("other-head", "read", {});
+  expect(lines[6]).toBe("subc head scope: session=other-head result=no_scope");
+  expect(lines).toHaveLength(7);
+});
+
 test("no_scope, missing prefrontal and lookup errors preserve an unscoped bind", async () => {
   for (const answer of [
     { answer: "no_scope" },
@@ -217,9 +395,9 @@ test("a scoped open carrier refusal falls back unscoped and logs its code once",
   client.refusal = "scope_carrier_denied";
   const bridge = pool.getBridge(TEST_PROJECT_ROOT);
   await bridge.toolCall("head", "read", {});
-  await bridge.toolCall("head", "read", {});
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
   const tools = client.opens.filter((open) => open.target.module_id === "aft");
-  expect(tools.map((open) => open.opts?.scope)).toEqual([scope, undefined]);
+  expect(tools.map((open) => open.opts?.scope)).toEqual([scope, undefined, undefined]);
   expect(warnings).toHaveLength(1);
   expect(warnings[0]).toContain("scope_carrier_denied");
 });
