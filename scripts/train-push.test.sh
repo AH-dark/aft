@@ -503,6 +503,9 @@ if args[:2] == ['run', 'rerun']:
 if args[:2] == ['run', 'list']:
     sha = re.search(r'headSha=="([0-9a-f]+)"', query).group(1)
     branch = re.search(r'headBranch=="([^"]+)"', query).group(1)
+    if branch == 'train/parent' and (state / 'fail_parent_query_network').exists():
+        print('dial tcp: i/o timeout while resolving parent CI run', file=sys.stderr)
+        sys.exit(1)
     matches = [r for r in runs if r['sha'] == sha and r['branch'] == branch]
     if matches:
         print(max(matches, key=lambda r: r['id'])['id'])
@@ -1137,6 +1140,25 @@ test_stack_remote_read_failures() {
   done
 }
 
+test_stack_parent_query_network_failure() {
+  local dir pid query_count
+  dir="$(stack_child_fixture stack-parent-query-error)"
+  : > "$dir/ci-state/fail_parent_query_network"
+  TRAIN_PUSH_TEST_GH_RETRY_DELAYS='0 0 0 0' TRAIN_PUSH_TEST_PARENT_ATTEMPTS=4 \
+    start_stack_train "$dir" child child --on parent
+  pid="$STACK_PID"
+  if wait_stack_push "$dir" child; then complete_stack_ci "$dir" child success; fi
+  join_stack_train "$dir" "$pid" child
+  query_count="$(grep -c 'headBranch=="train/parent"' "$dir/ci-state/gh-calls")"
+  if [ "$LAST_RC" -eq 5 ] && [[ "$LAST_OUT" == *'could not query CI runs for'* ]] &&
+    [[ "$LAST_OUT" == *'dial tcp: i/o timeout while resolving parent CI run'* ]] &&
+    [ "$query_count" -eq 5 ]; then
+    ok 'a persistent parent-run network error exits 5 after bounded retries'
+  else
+    fail "a persistent parent-run network error exits 5 after bounded retries (rc=$LAST_RC calls=$query_count)"
+  fi
+}
+
 test_ci_conclusion_guard() {
   local dir base
   dir="$(new_fixture ci-conclusion)"
@@ -1165,6 +1187,7 @@ run_stack_tests() {
   test_stack_poll_without_fetch
   test_stack_unseen_remote_head
   test_stack_remote_read_failures
+  test_stack_parent_query_network_failure
   test_fetch_race_retry
   test_fetch_failure_boundaries
   test_stack_chain
@@ -1232,6 +1255,7 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   stack-polling) test_stack_poll_without_fetch ;;
   stack-unseen-head) test_stack_unseen_remote_head ;;
   stack-remote-errors) test_stack_remote_read_failures ;;
+  stack-parent-query-error) test_stack_parent_query_network_failure ;;
   fetch-retry) test_fetch_race_retry ;;
   fetch-boundaries) test_fetch_failure_boundaries ;;
   ci-conclusion) test_ci_conclusion_guard ;;

@@ -853,7 +853,7 @@ wait_for_parent() {
     fi
     [ -n "$tip" ] || refuse_stack "parent $parent_name is abandoned or landed at a different sha"
     [ "$tip" = "$parent_base" ] || refuse_stack "parent $parent_name changed to $tip"
-    rid="$(resolve_ci_run "$parent_base" "train/$parent_name")"
+    rid="$(resolve_ci_run "$parent_base" "train/$parent_name")" || return "$?"
     if [ -n "$rid" ]; then
       verdict="$(gh_query_or_refuse "verdict for parent CI run $rid" "$OPERATOR_GH" \
         run view "$rid" --repo "$repo_slug" --json status,conclusion \
@@ -1691,8 +1691,12 @@ while true; do
   say "CI green: $run_url"
 
   if [ -n "$parent_name" ]; then
-    wait_for_parent "$verified_sha" "$run_url"
-    break
+    if wait_for_parent "$verified_sha" "$run_url"; then
+      break
+    else
+      parent_wait_rc=$?
+      exit "$parent_wait_rc"
+    fi
   fi
 
   # Re-check right before the push, not just at the start of the script.
