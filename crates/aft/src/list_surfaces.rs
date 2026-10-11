@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "standalone_input.rs",
+        enclosing_item: "read_bounded_line, room, push",
+        location_or_primitive: "MAX_LINE_BYTES / MAX_RETAINED_BYTES / MAX_RETAINED_ITEMS / MAX_HELD_BYTES / MAX_HELD_ITEMS",
+        reason: "transport admission and allocation bounds, not result-list cuts; oversized frames and excess held requests receive explicit errors, retained input keeps its budget charge across queue moves",
+    },
+    ExclusionEntry {
         file: "commands/configure.rs",
         enclosing_item: "view_working_tree_refresh_path",
         location_or_primitive: "max_examined .take()",
