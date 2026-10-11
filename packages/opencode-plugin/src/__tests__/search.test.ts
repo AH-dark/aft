@@ -618,6 +618,17 @@ describe("searchTools", () => {
       expect(toolCallCalls.at(-1)?.rawArgs.path).toBeDefined();
     }
   });
+
+  test("absolute glob splitting preserves POSIX suffix escapes", async () => {
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+      success: true,
+      text: "",
+    }));
+    await tools.glob.execute({ pattern: `${projectRoot}/src/file\\?.ts` }, createMockSdkContext());
+    expect(toolCallCalls.at(-1)?.rawArgs.pattern).toBe(
+      process.platform === "win32" ? "?.ts" : "file\\?.ts",
+    );
+  });
 });
 
 describe("splitIncludeArg", () => {

@@ -258,8 +258,14 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
       let globPath = args.path ? String(args.path) : undefined;
 
       if (!globPath && (path.isAbsolute(globPattern) || path.win32.isAbsolute(globPattern))) {
-        // Glob separators are forward slashes on both hosts, including native Windows paths.
-        globPattern = globPattern.replaceAll("\\", "/");
+        // Windows separators normalize to slashes; POSIX backslashes may be literal names or glob escapes.
+        if (
+          process.platform === "win32" ||
+          /^[A-Za-z]:[\\/]/.test(globPattern) ||
+          globPattern.startsWith("\\\\")
+        ) {
+          globPattern = globPattern.replaceAll("\\", "/");
+        }
         // Find the last directory component before any glob metacharacters.
         // Exact absolute paths need the same split because the bridge matches
         // glob patterns relative to the search path.
