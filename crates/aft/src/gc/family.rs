@@ -46,7 +46,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, OptionalExtension};
 
@@ -178,6 +178,16 @@ pub struct FamilySweepReport {
     pub marked_keys: usize,
     pub deleted_blobs: usize,
     pub deleted_bytes: u64,
+    pub examined_blobs: usize,
+    pub examined_roots: usize,
+    pub skipped_live: usize,
+    pub skipped_recent: usize,
+    pub skipped_mount_mismatch: usize,
+    pub skipped_protected: usize,
+    /// Logical lengths from a bounded metadata-only pre-removal walk.
+    pub removed_root_bytes: u64,
+    /// Removed roots whose byte walk could not finish; not counted as zero bytes.
+    pub unmeasured_removed_roots: usize,
     pub deleted_segments: usize,
     pub reclaimed_pins: usize,
     pub reclaimed_readers: usize,
@@ -292,7 +302,7 @@ pub fn sweep_family_bounded(
             report.stopped_early = true;
             break;
         }
-        deregister_if_missing(registry, member, observer, &mut report)?;
+        deregister_if_missing(registry, member, observer, &bounds, &mut report)?;
     }
     lease.release();
     Ok(report)
@@ -354,6 +364,7 @@ fn delete_unmarked(
             report.stopped_early = true;
             break;
         }
+        report.examined_blobs += 1;
         // The epoch check happens in the DELETE itself, not here: a touch can
         // land between this listing and the delete.
         if marked.contains(row.key.as_bytes()) {
@@ -667,27 +678,60 @@ fn deregister_if_missing(
     registry: &FamilyRegistry,
     member: &MemberRecord,
     observer: Option<&dyn SweepObserver>,
+    bounds: &SweepBounds,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
-    let missing = root_is_missing(member)
-        && member.root.as_ref().is_some_and(|root| {
-            crate::storage_retention::missing_root_due(
+    use crate::storage_retention::RootEligibility;
+    report.examined_roots += 1;
+    let eligibility = if root_is_missing(member) {
+        member.root.as_ref().map_or(RootEligibility::Live, |root| {
+            crate::storage_retention::missing_root_eligibility(
                 registry.storage(),
                 root,
                 member.last_bind_ms,
             )
-        });
+        })
+    } else {
+        RootEligibility::Live
+    };
+    match eligibility {
+        RootEligibility::Live => report.skipped_live += 1,
+        RootEligibility::Recent => report.skipped_recent += 1,
+        RootEligibility::MountMismatch => report.skipped_mount_mismatch += 1,
+        RootEligibility::Due => {}
+    }
+    let missing = eligibility == RootEligibility::Due;
     let counted = registry.with_barrier(|tx| count_missing_sweep(tx, member, missing))?;
+    let mut bytes = None;
     let outcome = match counted {
         Deregistration::Due { recorded } => {
             observe(observer, SweepStep::RemovalPending);
+            // Byte accounting is advisory. An incomplete walk must not weaken
+            // or replace the protection checks in remove_if_still_due.
+            bytes = crate::storage_retention::retention_tree_bytes(
+                &member.view_dir,
+                bounds
+                    .deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(5)),
+            )
+            .ok();
             registry.with_barrier(|tx| remove_if_still_due(tx, &member.scope, recorded))?
         }
         other => other,
     };
     match outcome {
-        Deregistration::Retained => report.missing_root_retained.push(member.scope.clone()),
-        Deregistration::Removed => report.deregistered.push(member.scope.clone()),
+        Deregistration::Retained => {
+            report.skipped_protected += 1;
+            report.missing_root_retained.push(member.scope.clone());
+        }
+        Deregistration::Removed => {
+            if let Some(bytes) = bytes {
+                report.removed_root_bytes += bytes;
+            } else {
+                report.unmeasured_removed_roots += 1;
+            }
+            report.deregistered.push(member.scope.clone());
+        }
         Deregistration::Present | Deregistration::Gone | Deregistration::Due { .. } => {}
     }
     Ok(())

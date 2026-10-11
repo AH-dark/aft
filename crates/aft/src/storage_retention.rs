@@ -42,6 +42,8 @@ pub(crate) struct Binding {
     #[serde(default)]
     volume: Option<(PathBuf, u64)>,
     #[serde(default)]
+    stable_volume: Option<VolumeIdentity>,
+    #[serde(default)]
     linked_worktree: bool,
 }
 
@@ -60,10 +62,66 @@ pub(crate) struct SweepReport {
     pub pruned_bindings: usize,
     pub skipped_live: usize,
     pub skipped_recent: usize,
+    pub skipped_mount_mismatch: usize,
     pub skipped_protected: usize,
+    pub unmeasured_removed_roots: usize,
     pub stopped_early: bool,
     pub cancelled: bool,
     pub errors: Vec<String>,
+    pub domains: BTreeMap<String, DomainReport>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct DomainReport {
+    /// Root directory entries (or blob rows for the blobs domains) evaluated.
+    pub examined: usize,
+    pub skipped_recent: usize,
+    pub skipped_live: usize,
+    pub skipped_mount_mismatch: usize,
+    pub skipped_protected: usize,
+    pub removed_roots: usize,
+    pub removed_bytes: u64,
+    pub unmeasured_removed_roots: usize,
+}
+
+impl DomainReport {
+    fn from_report(report: &SweepReport) -> Self {
+        Self {
+            examined: report.examined,
+            skipped_recent: report.skipped_recent,
+            skipped_live: report.skipped_live,
+            skipped_mount_mismatch: report.skipped_mount_mismatch,
+            skipped_protected: report.skipped_protected,
+            removed_roots: report.removed_roots,
+            removed_bytes: report.removed_bytes,
+            unmeasured_removed_roots: report.unmeasured_removed_roots,
+        }
+    }
+
+    fn difference(&self, before: &Self) -> Self {
+        Self {
+            examined: self.examined - before.examined,
+            skipped_recent: self.skipped_recent - before.skipped_recent,
+            skipped_live: self.skipped_live - before.skipped_live,
+            skipped_mount_mismatch: self.skipped_mount_mismatch - before.skipped_mount_mismatch,
+            skipped_protected: self.skipped_protected - before.skipped_protected,
+            removed_roots: self.removed_roots - before.removed_roots,
+            removed_bytes: self.removed_bytes - before.removed_bytes,
+            unmeasured_removed_roots: self.unmeasured_removed_roots
+                - before.unmeasured_removed_roots,
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.examined += other.examined;
+        self.skipped_recent += other.skipped_recent;
+        self.skipped_live += other.skipped_live;
+        self.skipped_mount_mismatch += other.skipped_mount_mismatch;
+        self.skipped_protected += other.skipped_protected;
+        self.removed_roots += other.removed_roots;
+        self.removed_bytes += other.removed_bytes;
+        self.unmeasured_removed_roots += other.unmeasured_removed_roots;
+    }
 }
 
 #[derive(Default)]
@@ -71,8 +129,6 @@ struct State {
     startup_observed_at: Option<Instant>,
     last_run: Option<Instant>,
     running: bool,
-    domain: usize,
-    entries: Option<ReadDir>,
     report: Option<SweepReport>,
 }
 
@@ -206,6 +262,10 @@ pub(crate) fn record_bind(storage: &Path, root: &Path, artifact_key: &str) -> io
     let scope = crate::path_identity::project_scope_key(&root);
     let binding = Binding {
         volume: volume_anchor(&root),
+        stable_volume: Some(VolumeIdentity {
+            uuid: volume_uuid(&root),
+            boot_id: boot_id(),
+        }),
         linked_worktree: linked_worktree_at_bind(&root),
         root,
         artifact_key: artifact_key.to_owned(),
@@ -303,60 +363,249 @@ fn device(_path: &Path) -> Option<u64> {
     None
 }
 
-fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
-    let dev = device(root)?;
-    let mut anchor = root;
-    while let Some(parent) = anchor.parent() {
-        if device(parent) != Some(dev) {
-            break;
-        }
-        anchor = parent;
-    }
-    Some((anchor.to_path_buf(), dev))
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct VolumeIdentity {
+    uuid: Option<String>,
+    boot_id: Option<String>,
 }
 
-fn missing_and_old(binding: &Binding, now: u64) -> bool {
+#[cfg(target_os = "macos")]
+fn mount_point(path: &Path) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // statfs returns the actual mount, including the APFS Data volume behind
+    // firmlinks; walking lexical parents can instead end at the system snapshot.
+    let info = unsafe {
+        if libc::statfs(path.as_ptr(), info.as_mut_ptr()) != 0 {
+            return None;
+        }
+        info.assume_init()
+    };
+    let bytes = unsafe { CStr::from_ptr(info.f_mntonname.as_ptr()) }.to_bytes();
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(target_os = "macos")]
+fn volume_uuid(path: &Path) -> Option<String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut attributes = libc::attrlist {
+        bitmapcount: 5,
+        reserved: 0,
+        commonattr: 0,
+        volattr: 0x8000_0000 | 0x0004_0000, // ATTR_VOL_INFO | ATTR_VOL_UUID
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    // getattrlist packs a four-byte length followed by the 16-byte volume UUID.
+    let mut buffer = [0_u8; 20];
+    let result = unsafe {
+        libc::getattrlist(
+            path.as_ptr(),
+            (&mut attributes as *mut libc::attrlist).cast(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+        )
+    };
+    if result != 0
+        || u32::from_ne_bytes(buffer[..4].try_into().ok()?) != 20
+        || buffer[4..].iter().all(|b| *b == 0)
+    {
+        return None;
+    }
+    Some(buffer[4..].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(target_os = "linux")]
+fn volume_uuid(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = device(path)?;
+    for entry in fs::read_dir("/dev/disk/by-uuid").ok()? {
+        let entry = entry.ok()?;
+        if fs::metadata(entry.path()).ok()?.rdev() == dev {
+            return entry.file_name().to_str().map(str::to_owned);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn volume_uuid(path: &Path) -> Option<String> {
+    device(path).map(|serial| format!("windows-volume-serial:{serial}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn volume_uuid(_path: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn boot_id() -> Option<String> {
+    let mut buffer = [0_u8; 128];
+    let mut size = buffer.len();
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || size > buffer.len() {
+        return None;
+    }
+    std::str::from_utf8(&buffer[..size])
+        .ok()
+        .map(|s| s.trim_end_matches('\0').to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn boot_id() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn boot_id() -> Option<String> {
+    None
+}
+
+fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let anchor = mount_point(root)?;
+        return Some((anchor.clone(), device(&anchor)?));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let dev = device(root)?;
+        let mut anchor = root;
+        while let Some(parent) = anchor.parent() {
+            if device(parent) != Some(dev) {
+                break;
+            }
+            anchor = parent;
+        }
+        Some((anchor.to_path_buf(), dev))
+    }
+}
+
+fn mount_matches(binding: &Binding) -> bool {
+    #[cfg(target_os = "macos")]
+    let boot_volume = mount_point(Path::new("/")).as_deref() == Some(Path::new("/"));
+    #[cfg(not(target_os = "macos"))]
+    let boot_volume = false;
+    mount_matches_with(
+        binding,
+        &volume_uuid,
+        &device,
+        boot_id().as_deref(),
+        boot_volume,
+    )
+}
+
+fn mount_matches_with(
+    binding: &Binding,
+    uuid_at: &dyn Fn(&Path) -> Option<String>,
+    device_at: &dyn Fn(&Path) -> Option<u64>,
+    current_boot: Option<&str>,
+    boot_volume: bool,
+) -> bool {
+    let Some((anchor, dev)) = &binding.volume else {
+        // Memo/owner bindings without volume information are accepted only for
+        // managed worker paths, never for an unattributed external checkout.
+        return binding
+            .root
+            .to_string_lossy()
+            .contains("/cortexkit/alfonso/worktrees/");
+    };
+    if let Some(identity) = &binding.stable_volume {
+        if let Some(uuid) = &identity.uuid {
+            return uuid_at(anchor).as_ref() == Some(uuid)
+                || binding
+                    .root
+                    .parent()
+                    .is_some_and(|parent| uuid_at(parent).as_ref() == Some(uuid));
+        }
+        // Without a UUID, a device number is useful only within the recorded boot.
+        return identity.boot_id.is_some()
+            && identity.boot_id.as_deref() == current_boot
+            && device_at(anchor) == Some(*dev);
+    }
+    if boot_volume && anchor == Path::new("/") {
+        // Legacy boot-volume bindings cannot represent an unmounted external
+        // disk. The running system snapshot may receive a new st_dev at reboot.
+        return true;
+    }
+    device_at(anchor) == Some(*dev)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootEligibility {
+    Due,
+    Live,
+    Recent,
+    MountMismatch,
+}
+
+fn binding_eligibility(binding: &Binding, now: u64) -> RootEligibility {
+    binding_eligibility_with_mount(binding, now, mount_matches(binding))
+}
+
+fn binding_eligibility_with_mount(binding: &Binding, now: u64, mounted: bool) -> RootEligibility {
+    if !matches!(binding.root.try_exists(), Ok(false)) {
+        return RootEligibility::Live;
+    }
+    if !mounted {
+        return RootEligibility::MountMismatch;
+    }
     let grace = if binding.linked_worktree {
         LINKED_WORKTREE_GRACE_MS
     } else {
         ROOT_GRACE_MS
     };
     if now.saturating_sub(binding.last_bound_ms) < grace {
-        return false;
-    }
-    if !matches!(binding.root.try_exists(), Ok(false)) {
-        return false;
-    }
-    match &binding.volume {
-        Some((anchor, dev)) => device(anchor) == Some(*dev),
-        // Old memo records have no mount identity. Never infer a disappeared
-        // external/network mount is a deleted checkout from its path alone.
-        None => binding
-            .root
-            .to_string_lossy()
-            .contains("/cortexkit/alfonso/worktrees/"),
+        RootEligibility::Recent
+    } else {
+        RootEligibility::Due
     }
 }
 
+fn missing_and_old(binding: &Binding, now: u64) -> bool {
+    binding_eligibility(binding, now) == RootEligibility::Due
+}
+
 pub(crate) fn missing_root_due(storage: &Path, root: &Path, last_bind_ms: u64) -> bool {
+    missing_root_eligibility(storage, root, last_bind_ms) == RootEligibility::Due
+}
+
+pub(crate) fn missing_root_eligibility(
+    storage: &Path,
+    root: &Path,
+    last_bind_ms: u64,
+) -> RootEligibility {
     let root = crate::root_cache::canonical_root(root);
     let scope = missing_root_scope_key(&root);
-    match read_json::<Binding>(&storage.join(format!("retention/roots/{scope}.json"))) {
-        Ok(mut binding) => {
-            binding.last_bound_ms = binding.last_bound_ms.max(last_bind_ms);
-            missing_and_old(&binding, crate::pins::now_ms())
-        }
-        Err(_) => missing_and_old(
-            &Binding {
-                root,
-                artifact_key: String::new(),
-                last_bound_ms: last_bind_ms,
-                volume: None,
-                linked_worktree: false,
-            },
-            crate::pins::now_ms(),
-        ),
-    }
+    let mut binding = read_json::<Binding>(&storage.join(format!("retention/roots/{scope}.json")))
+        .unwrap_or_else(|_| Binding {
+            root,
+            artifact_key: String::new(),
+            last_bound_ms: last_bind_ms,
+            volume: None,
+            stable_volume: None,
+            linked_worktree: false,
+        });
+    binding.last_bound_ms = binding.last_bound_ms.max(last_bind_ms);
+    binding_eligibility(&binding, crate::pins::now_ms())
 }
 
 // A missing checkout still needs the identity spelling used when it was bound.
@@ -430,6 +679,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
                 artifact_key: entry.key,
                 last_bound_ms: entry.recorded_at_ms,
                 volume: None,
+                stable_volume: None,
                 linked_worktree: false,
             };
             result
@@ -454,7 +704,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
         if binding.linked_worktree {
             linked_roots.insert(
                 crate::root_cache::canonical_root(&binding.root),
-                binding.volume.clone(),
+                (binding.volume.clone(), binding.stable_volume.clone()),
             );
         }
         let scope = entry
@@ -487,6 +737,7 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
             artifact_key: entry.file_name().to_string_lossy().into_owned(),
             last_bound_ms: owner.heartbeat_at_ms,
             volume: None,
+            stable_volume: None,
             linked_worktree: false,
         };
         result
@@ -503,12 +754,13 @@ fn bindings(storage: &Path) -> io::Result<BTreeMap<String, Vec<Binding>>> {
     // identifies same-root legacy copies that did not record either fact.
     for records in result.values_mut() {
         for binding in records {
-            if let Some(volume) =
+            if let Some((volume, stable_volume)) =
                 linked_roots.get(&crate::root_cache::canonical_root(&binding.root))
             {
                 binding.linked_worktree = true;
                 if binding.volume.is_none() {
                     binding.volume = volume.clone();
+                    binding.stable_volume = stable_volume.clone();
                 }
             }
         }
@@ -536,53 +788,143 @@ fn domain_paths(storage: &Path) -> io::Result<Vec<(PathBuf, bool)>> {
     Ok(result)
 }
 
-/// Keep the directory iterator itself between passes. No whole-store collect,
-/// sort or offset skip precedes the limit, and old roots cannot starve behind a
-/// prefix of live ones. Iterators are dropped on cancellation or enumeration end.
-fn next_batch(
+/// A lexical entry name, rather than a ReadDir offset, survives process and
+/// directory replacement. New names behind the cursor are visited on the next lap.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct TraversalCursor {
+    domain: PathBuf,
+    last_processed: Option<PathBuf>,
+}
+
+struct TraversalEntry {
+    directory: PathBuf,
+    flat: bool,
+    entry: fs::DirEntry,
+    after: TraversalCursor,
+}
+
+struct TraversalBatch {
+    entries: Vec<TraversalEntry>,
+    end: TraversalCursor,
+    cursor_path: PathBuf,
+}
+
+/// Retain at most `limit` names, ordered lexically after the last processed name.
+/// Directory enumeration is metadata-only; no cache payload or SQLite file is opened.
+fn traversal_batch(
     storage: &Path,
     domains: &[(PathBuf, bool)],
-) -> io::Result<Vec<(PathBuf, bool, fs::DirEntry)>> {
-    let mut states = states()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let state = states.entry(storage.to_path_buf()).or_default();
-    let mut result = Vec::new();
-    let mut visited = 0;
-    while result.len() < PASS_ENTRIES && visited < domains.len() {
-        state.domain %= domains.len();
-        let (directory, flat) = &domains[state.domain];
-        if state.entries.is_none() {
-            match fs::read_dir(directory) {
-                Ok(entries) => state.entries = Some(entries),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    state.domain += 1;
-                    visited += 1;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let Some(entries) = state.entries.as_mut() else {
-            continue;
-        };
-        let mut exhausted = false;
-        for _ in 0..(PASS_ENTRIES - result.len()) {
-            match entries.next() {
-                Some(entry) => result.push((directory.clone(), *flat, entry?)),
-                None => {
-                    exhausted = true;
-                    break;
-                }
-            }
-        }
-        if exhausted {
-            state.entries = None;
-            state.domain += 1;
-            visited += 1;
-        }
+    kind: &str,
+    limit: usize,
+) -> io::Result<TraversalBatch> {
+    let cursor_path = storage
+        .join("retention/cursors")
+        .join(format!("{kind}.json"));
+    let mut cursor: TraversalCursor = match read_json(&cursor_path) {
+        Ok(cursor) => cursor,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => TraversalCursor::default(),
+        Err(error) => return Err(error),
+    };
+    let mut domain = domains
+        .iter()
+        .position(|(path, _)| path.strip_prefix(storage).ok() == Some(cursor.domain.as_path()))
+        .unwrap_or(0);
+    if domains.is_empty() {
+        return Ok(TraversalBatch {
+            entries: Vec::new(),
+            end: cursor,
+            cursor_path,
+        });
     }
-    Ok(result)
+    let mut result = Vec::new();
+    for _ in 0..domains.len() {
+        let (directory, flat) = &domains[domain];
+        let relative = directory
+            .strip_prefix(storage)
+            .map_err(io::Error::other)?
+            .to_path_buf();
+        if cursor.domain != relative {
+            cursor = TraversalCursor {
+                domain: relative.clone(),
+                last_processed: None,
+            };
+        }
+        let remaining = limit - result.len();
+        let mut names = BTreeMap::new();
+        match fs::read_dir(directory) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let name = PathBuf::from(entry.file_name());
+                    if cursor
+                        .last_processed
+                        .as_ref()
+                        .is_some_and(|last| name <= *last)
+                    {
+                        continue;
+                    }
+                    names.insert(name, entry);
+                    if names.len() > remaining {
+                        names.pop_last();
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        for (name, entry) in names {
+            cursor.last_processed = Some(name);
+            result.push(TraversalEntry {
+                directory: directory.clone(),
+                flat: *flat,
+                entry,
+                after: cursor.clone(),
+            });
+        }
+        if result.len() == limit {
+            break;
+        }
+        domain = (domain + 1) % domains.len();
+        cursor = TraversalCursor {
+            domain: domains[domain]
+                .0
+                .strip_prefix(storage)
+                .map_err(io::Error::other)?
+                .to_path_buf(),
+            last_processed: None,
+        };
+    }
+    Ok(TraversalBatch {
+        entries: result,
+        end: cursor,
+        cursor_path,
+    })
+}
+
+fn next_batch(storage: &Path, domains: &[(PathBuf, bool)]) -> io::Result<TraversalBatch> {
+    traversal_batch(storage, domains, "roots", PASS_ENTRIES)
+}
+
+fn visit_one_family(
+    storage: &Path,
+    domain: &str,
+    kind: &str,
+    cancelled: &dyn Fn() -> bool,
+    mut work: impl FnMut(&fs::DirEntry) -> io::Result<()>,
+) -> io::Result<()> {
+    let batch = traversal_batch(storage, &[(storage.join(domain), false)], kind, 1)?;
+    if cancelled() {
+        return Ok(());
+    }
+    let Some(item) = batch.entries.into_iter().next() else {
+        return atomic_json(&batch.cursor_path, &batch.end);
+    };
+    let result = work(&item.entry);
+    if !cancelled() {
+        // Advance even when family work fails, so later families can still run.
+        atomic_json(&batch.cursor_path, &item.after)?;
+    }
+    result
 }
 
 fn protected(cache: &Path) -> io::Result<bool> {
@@ -673,6 +1015,10 @@ pub(crate) fn remove_directory_if_closed(cache: &Path) -> io::Result<()> {
     fs::remove_dir_all(cache)
 }
 
+pub(crate) fn retention_tree_bytes(directory: &Path, deadline: Instant) -> io::Result<u64> {
+    tree_files(directory, deadline).map(|files| files.iter().map(|(_, bytes)| bytes).sum())
+}
+
 fn eligible(
     storage: &Path,
     key: &str,
@@ -691,7 +1037,11 @@ fn eligible(
         if records.iter().all(|binding| missing_and_old(binding, now)) {
             return Ok(true);
         }
-        report.skipped_recent += 1;
+        if records.iter().any(|binding| !mount_matches(binding)) {
+            report.skipped_mount_mismatch += 1;
+        } else {
+            report.skipped_recent += 1;
+        }
         return Ok(false);
     }
     let path = storage
@@ -889,6 +1239,14 @@ fn candidate(
 }
 
 pub(crate) fn run_pass(storage: &Path, cancelled: &dyn Fn() -> bool) -> SweepReport {
+    run_pass_with_clock(storage, cancelled, &Instant::now)
+}
+
+fn run_pass_with_clock(
+    storage: &Path,
+    cancelled: &dyn Fn() -> bool,
+    clock: &dyn Fn() -> Instant,
+) -> SweepReport {
     let mut report = SweepReport {
         at_ms: crate::pins::now_ms(),
         ..Default::default()
@@ -900,18 +1258,40 @@ pub(crate) fn run_pass(storage: &Path, cancelled: &dyn Fn() -> bool) -> SweepRep
         prune_bindings(storage, cancelled, &mut report)?;
         let history = bindings(storage)?;
         let domains = domain_paths(storage)?;
+        for (directory, _) in &domains {
+            report
+                .domains
+                .entry(
+                    directory
+                        .strip_prefix(storage)
+                        .map_err(io::Error::other)?
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .or_default();
+        }
         let deadline = Instant::now() + PASS_BUDGET;
         let batch = next_batch(storage, &domains)?;
-        report.stopped_early = batch.len() == PASS_ENTRIES;
-        for (directory, flat, entry) in batch {
+        report.stopped_early = batch.entries.len() == PASS_ENTRIES;
+        let mut completed = true;
+        for item in batch.entries {
+            let TraversalEntry {
+                directory,
+                flat,
+                entry,
+                after,
+            } = item;
             if cancelled() {
                 report.cancelled = true;
+                completed = false;
                 break;
             }
-            if Instant::now() >= deadline {
+            if clock() >= deadline {
                 report.stopped_early = true;
+                completed = false;
                 break;
             }
+            let before = DomainReport::from_report(&report);
             report.examined += 1;
             let name = entry.file_name().to_string_lossy().into_owned();
             let key = if flat {
@@ -919,30 +1299,40 @@ pub(crate) fn run_pass(storage: &Path, cancelled: &dyn Fn() -> bool) -> SweepRep
             } else {
                 &name
             };
-            if !key_valid(key) || (!flat && !entry.file_type()?.is_dir()) {
-                continue;
-            }
-            if flat && !(name.ends_with(".current") || name == format!("{key}.sqlite")) {
-                continue;
-            }
-            if let Err(error) = candidate(
-                storage,
-                &directory,
-                key,
-                flat,
-                &history,
-                report.at_ms,
-                deadline,
-                cancelled,
-                &mut report,
-            ) {
-                report.skipped_protected += 1;
-                if report.errors.len() < 16 {
-                    report
-                        .errors
-                        .push(format!("{}: {error}", entry.path().display()));
+            if key_valid(key)
+                && (flat || entry.file_type()?.is_dir())
+                && (!flat || name.ends_with(".current") || name == format!("{key}.sqlite"))
+            {
+                if let Err(error) = candidate(
+                    storage,
+                    &directory,
+                    key,
+                    flat,
+                    &history,
+                    report.at_ms,
+                    deadline,
+                    cancelled,
+                    &mut report,
+                ) {
+                    report.skipped_protected += 1;
+                    if report.errors.len() < 16 {
+                        report
+                            .errors
+                            .push(format!("{}: {error}", entry.path().display()));
+                    }
                 }
             }
+            let delta = DomainReport::from_report(&report).difference(&before);
+            report
+                .domains
+                .entry(after.domain.to_string_lossy().into_owned())
+                .or_default()
+                .add(&delta);
+            // A prefetched name is committed only after its candidate was examined.
+            atomic_json(&batch.cursor_path, &after)?;
+        }
+        if completed {
+            atomic_json(&batch.cursor_path, &batch.end)?;
         }
         Ok(())
     })();
@@ -965,7 +1355,6 @@ pub(crate) fn run_pass(storage: &Path, cancelled: &dyn Fn() -> bool) -> SweepRep
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = states.entry(storage.to_path_buf()).or_default();
     if report.cancelled {
-        state.entries = None;
         state.last_run = None;
     }
     state.report = Some(report.clone());
@@ -977,79 +1366,91 @@ fn collect_one_v2_family(
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
-    static FAMILIES: OnceLock<Mutex<HashMap<PathBuf, ReadDir>>> = OnceLock::new();
-    let mut families = FAMILIES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !families.contains_key(storage) {
-        match fs::read_dir(storage.join("blobs/v2")) {
-            Ok(entries) => {
-                families.insert(storage.to_path_buf(), entries);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        }
-    }
-    let next = families.get_mut(storage).and_then(Iterator::next);
-    if next.is_none() {
-        families.remove(storage);
-    }
-    drop(families);
-    let Some(entry) = next else { return Ok(()) };
-    let entry = entry?;
-    let family = entry.file_name().to_string_lossy().into_owned();
-    if !key_valid(&family) || !entry.file_type()?.is_dir() || cancelled() {
-        return Ok(());
-    }
-    let registry = crate::views::registry::FamilyRegistry::open_existing(storage, &family)
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let Some(registry) = registry else {
-        return Ok(());
-    };
-    let deadline = Instant::now() + PASS_BUDGET;
-    for member in registry
-        .members_bounded(HISTORY_ENTRIES)
-        .map_err(|error| io::Error::other(error.to_string()))?
-    {
-        if cancelled() || Instant::now() >= deadline {
-            report.stopped_early = true;
+    visit_one_family(storage, "blobs/v2", "families-v2", cancelled, |entry| {
+        let family = entry.file_name().to_string_lossy().into_owned();
+        if !key_valid(&family) || !entry.file_type()?.is_dir() || cancelled() {
             return Ok(());
         }
-        // V2 pin admission uses this same registry barrier. It cannot race the
-        // generation protection snapshot and removal under the pointer lock.
-        if let Some(store) = crate::views::ViewStore::existing_dir(member.view_dir) {
-            let removed = registry
-                .with_barrier(|_| {
-                    store
-                        .sweep_generations_locked()
-                        .map_err(crate::views::registry::RegistryError::View)
-                })
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            report.removed_generations += removed;
+        let registry = crate::views::registry::FamilyRegistry::open_existing(storage, &family)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let Some(registry) = registry else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + PASS_BUDGET;
+        for member in registry
+            .members_bounded(HISTORY_ENTRIES)
+            .map_err(|error| io::Error::other(error.to_string()))?
+        {
+            if cancelled() || Instant::now() >= deadline {
+                report.stopped_early = true;
+                return Ok(());
+            }
+            // V2 pin admission uses this same registry barrier. It cannot race the
+            // generation protection snapshot and removal under the pointer lock.
+            if let Some(store) = crate::views::ViewStore::existing_dir(member.view_dir) {
+                let removed = registry
+                    .with_barrier(|_| {
+                        store
+                            .sweep_generations_locked()
+                            .map_err(crate::views::registry::RegistryError::View)
+                    })
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                report.removed_generations += removed;
+            }
         }
-    }
-    if cancelled() {
-        return Ok(());
-    }
-    let swept = crate::gc::family::sweep_family_bounded(
-        &registry,
-        None,
-        crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
-        crate::gc::family::SweepBounds {
-            max_rows_per_store: 4096,
-            max_entries_per_dir: 4096,
-            deadline: Some(deadline),
-        },
-        None,
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    report.removed_roots += swept.deregistered.len();
-    report.removed_blobs += swept.deleted_blobs;
-    report.removed_blob_payload_bytes += swept.deleted_bytes;
-    report.blob_reclaim_deferred |= swept.reclaim_deferred;
-    report.stopped_early |= swept.stopped_early;
-    Ok(())
+        if cancelled() {
+            return Ok(());
+        }
+        let swept = crate::gc::family::sweep_family_bounded(
+            &registry,
+            None,
+            crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
+            crate::gc::family::SweepBounds {
+                max_rows_per_store: 4096,
+                max_entries_per_dir: 4096,
+                deadline: Some(deadline),
+            },
+            None,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        report.removed_roots += swept.deregistered.len();
+        report.examined += swept.examined_roots;
+        report.skipped_live += swept.skipped_live;
+        report.skipped_recent += swept.skipped_recent;
+        report.skipped_mount_mismatch += swept.skipped_mount_mismatch;
+        report.skipped_protected += swept.skipped_protected;
+        report.removed_bytes += swept.removed_root_bytes;
+        report.unmeasured_removed_roots += swept.unmeasured_removed_roots;
+        report
+            .domains
+            .entry("views/v2".to_owned())
+            .or_default()
+            .add(&DomainReport {
+                examined: swept.examined_roots,
+                skipped_live: swept.skipped_live,
+                skipped_recent: swept.skipped_recent,
+                skipped_mount_mismatch: swept.skipped_mount_mismatch,
+                skipped_protected: swept.skipped_protected,
+                removed_roots: swept.deregistered.len(),
+                removed_bytes: swept.removed_root_bytes,
+                unmeasured_removed_roots: swept.unmeasured_removed_roots,
+            });
+        report
+            .domains
+            .entry("blobs/v2".to_owned())
+            .or_default()
+            .add(&DomainReport {
+                examined: swept.examined_blobs,
+                removed_bytes: swept.deleted_bytes,
+                ..Default::default()
+            });
+        report.removed_blobs += swept.deleted_blobs;
+        report.examined_blobs += swept.examined_blobs;
+        report.removed_blob_payload_bytes += swept.deleted_bytes;
+        report.blob_reclaim_deferred |= swept.reclaim_deferred;
+        report.stopped_early |= swept.stopped_early;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1075,6 +1476,276 @@ mod storage_retention_tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("payload.bin"), b"rebuildable").unwrap();
         path
+    }
+
+    #[test]
+    fn traversal_resumes_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        for i in 0..130 {
+            cache(temp.path(), "inspect", &format!("{i:016x}"));
+        }
+        let first = run_pass(temp.path(), &|| false);
+        assert_eq!(first.examined, PASS_ENTRIES, "{first:?}");
+        states().lock().unwrap().remove(temp.path());
+        let second = run_pass(temp.path(), &|| false);
+        assert_eq!(second.examined, PASS_ENTRIES, "{second:?}");
+        assert_eq!(
+            fs::read_dir(temp.path().join("retention/unknown"))
+                .unwrap()
+                .count(),
+            128
+        );
+    }
+
+    #[test]
+    fn traversal_preserves_unprocessed_batch_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            cache(temp.path(), "inspect", &format!("{i:016x}"));
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let now = Instant::now();
+        let first = run_pass_with_clock(temp.path(), &|| false, &|| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                now
+            } else {
+                now + PASS_BUDGET * 2
+            }
+        });
+        assert_eq!(first.examined, 1, "{first:?}");
+        let second = run_pass(temp.path(), &|| false);
+        assert_eq!(second.examined, 9, "{second:?}");
+        let cursor: TraversalCursor =
+            read_json(&temp.path().join("retention/cursors/roots.json")).unwrap();
+        assert!(
+            cursor.last_processed.is_none(),
+            "completed lap did not reset"
+        );
+    }
+
+    #[test]
+    fn family_traversal_resumes_after_restart_for_both_layouts() {
+        let temp = tempfile::tempdir().unwrap();
+        for (domain, kind) in [("blobs", "families-v1"), ("blobs/v2", "families-v2")] {
+            for i in 0..3 {
+                fs::create_dir_all(temp.path().join(domain).join(format!("{i:016x}"))).unwrap();
+            }
+            let mut visited = Vec::new();
+            for _ in 0..2 {
+                visit_one_family(temp.path(), domain, kind, &|| false, |entry| {
+                    visited.push(entry.file_name());
+                    Ok(())
+                })
+                .unwrap();
+                states().lock().unwrap().remove(temp.path());
+            }
+            assert_eq!(
+                visited,
+                ["0000000000000000", "0000000000000001"].map(std::ffi::OsString::from)
+            );
+        }
+    }
+
+    #[test]
+    fn stable_volume_change_with_parent_continuity_is_eligible() {
+        let (temp, root, scope) = fixture();
+        let mut binding: Binding =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        binding.volume = Some((temp.path().join("old-anchor"), 10));
+        binding.stable_volume = Some(VolumeIdentity {
+            uuid: Some("original-volume".to_owned()),
+            boot_id: Some("old-boot".to_owned()),
+        });
+        fs::remove_dir(&root).unwrap();
+        let mounted = mount_matches_with(
+            &binding,
+            &|path| {
+                Some(
+                    if Some(path) == root.parent() {
+                        "original-volume"
+                    } else {
+                        "replacement-volume"
+                    }
+                    .to_owned(),
+                )
+            },
+            &|_| Some(11),
+            Some("new-boot"),
+            false,
+        );
+        assert_eq!(
+            binding_eligibility_with_mount(&binding, ROOT_GRACE_MS, mounted),
+            RootEligibility::Due
+        );
+    }
+
+    #[test]
+    fn stable_volume_replacement_is_blocked_even_if_device_is_reused() {
+        let (temp, root, scope) = fixture();
+        let mut binding: Binding =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        binding.volume = Some((temp.path().to_path_buf(), 10));
+        binding.stable_volume = Some(VolumeIdentity {
+            uuid: Some("original-volume".to_owned()),
+            boot_id: Some("old-boot".to_owned()),
+        });
+        fs::remove_dir(&root).unwrap();
+        let mounted = mount_matches_with(
+            &binding,
+            &|_| Some("replacement-volume".to_owned()),
+            &|_| Some(10),
+            Some("new-boot"),
+            false,
+        );
+        assert_eq!(
+            binding_eligibility_with_mount(&binding, ROOT_GRACE_MS, mounted),
+            RootEligibility::MountMismatch
+        );
+    }
+
+    #[test]
+    fn device_fallback_requires_same_boot_and_device() {
+        let (temp, _root, scope) = fixture();
+        let mut binding: Binding =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        binding.volume = Some((temp.path().to_path_buf(), 10));
+        binding.stable_volume = Some(VolumeIdentity {
+            uuid: None,
+            boot_id: Some("same-boot".to_owned()),
+        });
+        assert!(mount_matches_with(
+            &binding,
+            &|_| None,
+            &|_| Some(10),
+            Some("same-boot"),
+            false
+        ));
+        assert!(!mount_matches_with(
+            &binding,
+            &|_| None,
+            &|_| Some(10),
+            Some("new-boot"),
+            false
+        ));
+        assert!(!mount_matches_with(
+            &binding,
+            &|_| None,
+            &|_| Some(11),
+            Some("same-boot"),
+            false
+        ));
+    }
+
+    #[test]
+    fn sweep_reports_examined_and_skip_reasons_per_domain() {
+        let temp = tempfile::tempdir().unwrap();
+        for (i, live, mismatch) in [(0, false, false), (1, true, false), (2, false, true)] {
+            let root = temp.path().join(format!("checkout-{i}"));
+            fs::create_dir_all(&root).unwrap();
+            let scope = crate::path_identity::project_scope_key(&root);
+            record_bind(temp.path(), &root, &scope).unwrap();
+            let record = temp.path().join(format!("retention/roots/{scope}.json"));
+            let mut binding: Binding = read_json(&record).unwrap();
+            binding.last_bound_ms = 0;
+            if mismatch {
+                binding.volume = Some((temp.path().join("Volumes/X"), u64::MAX));
+                binding.stable_volume = None;
+            }
+            atomic_json(&record, &binding).unwrap();
+            cache(temp.path(), "inspect", &scope);
+            if !live {
+                fs::remove_dir(root).unwrap();
+            }
+        }
+        cache(temp.path(), "inspect", "0000000000000000");
+        let report = run_pass(temp.path(), &|| false);
+        let domain = &report.domains["inspect"];
+        assert_eq!(
+            (
+                domain.examined,
+                domain.skipped_live,
+                domain.skipped_recent,
+                domain.skipped_mount_mismatch,
+                domain.removed_roots
+            ),
+            (4, 1, 1, 1, 1),
+            "{report:?}"
+        );
+        assert_eq!(domain.removed_bytes, b"rebuildable".len() as u64);
+        let log = serde_json::to_value(&report).unwrap();
+        assert_eq!(log["domains"]["inspect"]["skipped_mount_mismatch"], 1);
+    }
+
+    #[test]
+    fn unproven_mount_change_is_blocked_and_counted() {
+        let (temp, root, scope) = fixture();
+        let record = temp.path().join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        binding.volume = Some((temp.path().join("Volumes/X"), u64::MAX));
+        binding.stable_volume = None;
+        atomic_json(&record, &binding).unwrap();
+        fs::remove_dir(root).unwrap();
+        cache(temp.path(), "inspect", &scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.skipped_mount_mismatch, 1, "{report:?}");
+        assert_eq!(report.domains["inspect"].skipped_mount_mismatch, 1);
+        assert_eq!(report.skipped_recent, 0, "{report:?}");
+        assert_eq!(report.removed_roots, 0);
+        assert!(temp.path().join("inspect").join(scope).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_legacy_boot_device_change_is_eligible() {
+        let (temp, root, scope) = fixture();
+        let record = temp.path().join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        binding.volume = Some((PathBuf::from("/"), device(Path::new("/")).unwrap() + 1));
+        binding.stable_volume = None;
+        atomic_json(&record, &binding).unwrap();
+        fs::remove_dir(root).unwrap();
+        cache(temp.path(), "inspect", &scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(
+            missing_root_due(temp.path(), &binding.root, 0),
+            "{report:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_volume_identity_follows_data_volume_firmlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let anchor = volume_anchor(temp.path()).unwrap().0;
+        assert_eq!(anchor, Path::new("/System/Volumes/Data"));
+        let uuid = volume_uuid(temp.path()).expect("APFS UUID unavailable");
+        assert_eq!(volume_uuid(&anchor), Some(uuid.clone()));
+        assert_eq!(volume_anchor(Path::new("/Users")).unwrap().0, anchor);
+        assert_eq!(volume_uuid(Path::new("/Users")), Some(uuid));
+        assert!(boot_id().is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_stable_uuid_survives_device_change() {
+        let (temp, root, scope) = fixture();
+        let record = temp.path().join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        assert!(binding.stable_volume.as_ref().unwrap().uuid.is_some());
+        binding.volume.as_mut().unwrap().1 += 1;
+        atomic_json(&record, &binding).unwrap();
+        fs::remove_dir(root).unwrap();
+        cache(temp.path(), "inspect", &scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert_eq!(report.skipped_mount_mismatch, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unproven_external_device_change_is_blocked() {
+        unproven_mount_change_is_blocked_and_counted();
     }
 
     #[test]
@@ -1673,6 +2344,40 @@ mod storage_retention_tests {
         assert!(registry.member(&scope).unwrap().is_some());
         assert!(path.exists());
     }
+
+    #[test]
+    fn v2_mount_mismatch_is_counted_and_keeps_member() {
+        let (temp, root, scope) = fixture();
+        let registry = crate::views::registry::FamilyRegistry::open(temp.path(), &scope).unwrap();
+        let view = registry.register_view(&scope, &root).unwrap();
+        let path = view.view_dir().to_path_buf();
+        drop(view);
+        registry
+            .with_barrier(|tx| {
+                tx.execute("UPDATE members SET last_bind_ms = 0", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let record = temp.path().join(format!("retention/roots/{scope}.json"));
+        let mut binding: Binding = read_json(&record).unwrap();
+        binding.last_bound_ms = 0;
+        binding.volume = Some((temp.path().join("Volumes/X"), u64::MAX));
+        binding.stable_volume = None;
+        atomic_json(&record, &binding).unwrap();
+        fs::remove_dir(root).unwrap();
+        let report = crate::gc::family::sweep_family(
+            &registry,
+            None,
+            crate::gc::family::FamilySweepPolicy { byte_budget: 0 },
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.examined_roots, 1);
+        assert_eq!(report.skipped_mount_mismatch, 1, "{report:?}");
+        assert_eq!(report.skipped_recent, 0);
+        assert!(registry.member(&scope).unwrap().is_some());
+        assert!(path.exists());
+    }
 }
 
 fn collect_one_family(
@@ -1680,49 +2385,38 @@ fn collect_one_family(
     cancelled: &dyn Fn() -> bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
-    // One family per pass, with a retained iterator rather than a sorted scan.
-    static FAMILIES: OnceLock<Mutex<HashMap<PathBuf, ReadDir>>> = OnceLock::new();
-    let families = FAMILIES.get_or_init(Default::default);
-    let mut families = families
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !families.contains_key(storage) {
-        match fs::read_dir(storage.join("blobs")) {
-            Ok(entries) => {
-                families.insert(storage.to_path_buf(), entries);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
+    visit_one_family(storage, "blobs", "families-v1", cancelled, |entry| {
+        let family = entry.file_name().to_string_lossy().into_owned();
+        if !key_valid(&family) || !entry.file_type()?.is_dir() || cancelled() {
+            return Ok(());
         }
-    }
-    let next = families.get_mut(storage).and_then(Iterator::next);
-    if next.is_none() {
-        families.remove(storage);
-    }
-    drop(families);
-    let Some(entry) = next else { return Ok(()) };
-    let entry = entry?;
-    let family = entry.file_name().to_string_lossy().into_owned();
-    if !key_valid(&family) || !entry.file_type()?.is_dir() || cancelled() {
-        return Ok(());
-    }
-    let swept = crate::gc::sweep_bounded(
-        crate::gc::SweepRequest {
-            storage,
-            family: &family,
-            view_dir: &storage.join("views/retention-no-view"),
-            byte_budget: 0,
-            now_ms: report.at_ms,
-            references: Default::default(),
-        },
-        cancelled,
-    )
-    .map_err(|error| io::Error::other(error.to_string()))?;
-    report.examined_blobs += swept.examined_blobs;
-    report.removed_blobs += swept.deleted_blobs;
-    report.removed_blob_payload_bytes += swept.deleted_bytes;
-    report.blob_reclaim_deferred |= swept.reclaim_deferred;
-    Ok(())
+        let swept = crate::gc::sweep_bounded(
+            crate::gc::SweepRequest {
+                storage,
+                family: &family,
+                view_dir: &storage.join("views/retention-no-view"),
+                byte_budget: 0,
+                now_ms: report.at_ms,
+                references: Default::default(),
+            },
+            cancelled,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        report.examined_blobs += swept.examined_blobs;
+        report.removed_blobs += swept.deleted_blobs;
+        report.removed_blob_payload_bytes += swept.deleted_bytes;
+        report.blob_reclaim_deferred |= swept.reclaim_deferred;
+        report
+            .domains
+            .entry("blobs".to_owned())
+            .or_default()
+            .add(&DomainReport {
+                examined: swept.examined_blobs,
+                removed_bytes: swept.deleted_bytes,
+                ..Default::default()
+            });
+        Ok(())
+    })
 }
 
 // Forget history only after its checkout-private caches and registry member

@@ -390,9 +390,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, next_batch, tree_files, run_pass, prune_bindings",
+        enclosing_item: "bounded_dirs, traversal_batch, next_batch, tree_files, run_pass_with_clock, prune_bindings",
         location_or_primitive: "PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",
-        reason: "internal disk-maintenance walks, not tool-result lists; bounds apply before filtering and incomplete protection snapshots refuse deletion; health reports examined, removed and stopped-early counts",
+        reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports examined, removed and stopped-early counts",
     },
     ExclusionEntry {
         file: "views/registry.rs",
