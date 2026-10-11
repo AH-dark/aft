@@ -3026,7 +3026,7 @@ impl InspectManager {
                 return result;
             }
         };
-        delay_tier2_reuse_for_debug(&job.project_root);
+        delay_tier2_reuse_for_debug(&job);
         if options.has_force_paths() {
             if let Ok(cached) = load_contribution_freshness(cache.as_ref(), job.category) {
                 let (remaining, downgraded) = downgrade_unchanged_forced_paths_with_freshness(
@@ -4341,13 +4341,17 @@ fn panic_tier2_reuse_for_debug(job: &InspectJob) {
     }
 }
 
-fn delay_tier2_reuse_for_debug(project_root: &Path) {
+fn delay_tier2_reuse_for_debug(job: &InspectJob) {
     #[cfg(not(debug_assertions))]
-    let _ = project_root;
+    let _ = job;
     #[cfg(debug_assertions)]
     {
+        let project_root = &job.project_root;
         if std::env::var_os("AFT_TEST_TIER2_REUSE_GATE_ROOT").is_some()
             && env_project_root_matches("AFT_TEST_TIER2_REUSE_GATE_ROOT", project_root)
+            && std::env::var("AFT_TEST_TIER2_REUSE_GATE_CATEGORY")
+                .ok()
+                .is_none_or(|category| category == job.category.as_str())
         {
             let ready = std::env::var_os("AFT_TEST_TIER2_REUSE_GATE_READY").map(PathBuf::from);
             let release = std::env::var_os("AFT_TEST_TIER2_REUSE_GATE_RELEASE").map(PathBuf::from);

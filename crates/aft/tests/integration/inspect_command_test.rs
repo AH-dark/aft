@@ -1338,29 +1338,57 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
 #[test]
 fn scoped_inspect_building_discloses_progress_and_last_complete() {
     let _env_lock = env_serial_lock();
-    let (temp, root) = fixture_project();
-    write_file(&root, "src/foo.ts", duplicate_fixture_source());
-    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
-    configure_fake_scope_lsp(&ctx);
-    let ready = temp.path().join("ready");
-    let release = temp.path().join("release");
-    let _root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_ROOT", &root.to_string_lossy());
-    let _ready = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_READY", &ready.to_string_lossy());
-    let _release = EnvVarGuard::set(
-        "AFT_TEST_TIER2_REUSE_GATE_RELEASE",
-        &release.to_string_lossy(),
-    );
     for has_previous in [false, true] {
-        if has_previous {
-            fs::remove_file(&ready).unwrap();
-            fs::remove_file(&release).unwrap();
-            write_file(&root, "src/foo.ts", alternate_duplicate_fixture_source());
-        }
+        let (temp, root) = fixture_project();
+        write_file(&root, "src/foo.ts", duplicate_fixture_source());
+        let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+        configure_fake_scope_lsp(&ctx);
         let manager = ctx.inspect_manager();
+        manager.set_automatic_tier2_refresh_allowed(false);
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
+        let _root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_ROOT", &root.to_string_lossy());
+        let _ready = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_READY", &ready.to_string_lossy());
+        let _category = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_CATEGORY", "duplicates");
+        let _release = EnvVarGuard::set(
+            "AFT_TEST_TIER2_REUSE_GATE_RELEASE",
+            &release.to_string_lossy(),
+        );
         let snapshot = tier2_snapshot(&root, &ctx.inspect_dir());
         let scope = JobScope::for_project(root.clone());
+        // Other categories may start before the duplicates worker. Their gate
+        // events must not stand in for the duplicates build this test observes.
+        fs::write(&release, b"release").unwrap();
+        let other_category = manager.tier2_run_with_reuse(
+            snapshot.clone(),
+            InspectCategory::DeadCode,
+            scope.clone(),
+            None,
+        );
+        assert!(
+            matches!(other_category, JobOutcome::Fresh { .. }),
+            "{other_category:?}"
+        );
+        assert!(
+            !ready.exists(),
+            "a dead_code build signalled the duplicates gate"
+        );
+        if has_previous {
+            let seed = manager.tier2_run_with_reuse(
+                snapshot.clone(),
+                InspectCategory::Duplicates,
+                scope.clone(),
+                None,
+            );
+            assert!(matches!(seed, JobOutcome::Fresh { .. }), "{seed:?}");
+            fs::remove_file(&ready).unwrap();
+            write_file(&root, "src/foo.ts", alternate_duplicate_fixture_source());
+        }
+        fs::remove_file(&release).unwrap();
+        // Run inline on the joined thread so builder cleanup finishes before
+        // the fixture drops its process-wide hook values.
         let worker = thread::spawn(move || {
-            manager.tier2_run_with_reuse_blocking(snapshot, InspectCategory::Duplicates, scope)
+            manager.tier2_run_with_reuse(snapshot, InspectCategory::Duplicates, scope, None)
         });
         wait_for_path_event(&ready, "Tier-2 gate");
         let response = inspect_tool_call(
@@ -1381,7 +1409,18 @@ fn scoped_inspect_building_discloses_progress_and_last_complete() {
         };
         // Always release before assertions: a regression must not strand the worker.
         fs::write(&release, b"release").unwrap();
-        worker.join().unwrap();
+        let outcome = worker.join().unwrap();
+        // The unscoped request also starts other enabled categories. Drain them
+        // before dropping the process-wide hook values.
+        let hang_deadline = Instant::now() + Duration::from_secs(90);
+        while ctx.inspect_manager().tier2_any_in_flight() {
+            assert!(
+                Instant::now() < hang_deadline,
+                "timed out draining Tier-2 workers after gate release"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(outcome, JobOutcome::Fresh { .. }), "{outcome:?}");
         if let Some(unscoped) = unscoped {
             assert_eq!(unscoped["success"], true, "{unscoped:#}");
             assert_eq!(
@@ -1400,7 +1439,10 @@ fn scoped_inspect_building_discloses_progress_and_last_complete() {
         assert_eq!(response["scope_files"], 1, "{response:#}");
         let summary = &response["summary"]["duplicates"];
         assert_eq!(summary["building"]["state"], "building", "{response:#}");
-        assert!(summary["building"]["progress"].is_string(), "{response:#}");
+        assert_eq!(
+            summary["building"]["progress"], "checking cache for 1 source files",
+            "{response:#}"
+        );
         assert!(
             summary["building"].get("estimated_remaining_ms").is_some(),
             "{response:#}"
@@ -1422,6 +1464,10 @@ fn scoped_inspect_building_discloses_progress_and_last_complete() {
             "{text}"
         );
         if has_previous {
+            assert!(
+                summary["building"]["estimated_remaining_ms"].is_number(),
+                "{response:#}"
+            );
             assert_eq!(summary["last_complete"]["stale"], true, "{response:#}");
             assert!(
                 summary["last_complete"]["age_s"].is_number(),
@@ -1433,6 +1479,10 @@ fn scoped_inspect_building_discloses_progress_and_last_complete() {
             );
             assert!(text.contains("last complete result is stale"), "{text}");
         } else {
+            assert!(
+                summary["building"]["estimated_remaining_ms"].is_null(),
+                "{response:#}"
+            );
             assert!(summary.get("last_complete").is_none(), "{response:#}");
         }
     }
