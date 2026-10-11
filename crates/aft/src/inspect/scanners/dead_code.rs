@@ -252,6 +252,12 @@ impl DeadCodeFileAnalyzer {
         }
 
         let metadata = fs::metadata(file).ok();
+        #[cfg(test)]
+        AFTER_SOURCE_METADATA.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let Ok(source) = fs::read_to_string(file) else {
             return FileAnalysis::default();
         };
@@ -349,8 +355,13 @@ impl DeadCodeFileAnalyzer {
         };
 
         let analysis = FileAnalysis {
-            freshness: metadata.map(|metadata| crate::cache_freshness::FileFreshness {
-                mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+            // Keep the analyzed buffer's hash even if the metadata lookup
+            // failed. A missing timestamp requires content verification.
+            freshness: Some(crate::cache_freshness::FileFreshness {
+                mtime: metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH),
                 size: source.len() as u64,
                 content_hash: cache_freshness::hash_bytes(source.as_bytes()),
             }),
@@ -6287,6 +6298,7 @@ struct ParsedTarget {
 
 #[cfg(test)]
 thread_local! {
+    static AFTER_SOURCE_METADATA: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_ANALYSIS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static REACHABLE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SORT_KEY_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -6326,6 +6338,48 @@ mod tests {
                 .map(|call| call.caller_file.clone())
                 .collect::<Vec<_>>(),
             original
+        );
+    }
+
+    #[test]
+    fn audit05_freshness_survives_missing_pre_read_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        let source = "pub fn old() {}\n";
+        let create_path = path.clone();
+        AFTER_SOURCE_METADATA.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(create_path, source).unwrap();
+            }))
+        });
+        let save_path = path.clone();
+        AFTER_ANALYSIS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(save_path, "pub fn new() {}\n").unwrap();
+            }))
+        });
+        let job = job(
+            dir.path(),
+            vec![path.clone()],
+            snapshot(vec![], vec![], vec![]),
+        );
+        let contribution = gather_file_contribution(
+            &job,
+            &path,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &mut DeadCodeFileAnalyzer::default(),
+        );
+        assert_eq!(
+            contribution.freshness.content_hash,
+            cache_freshness::hash_bytes(source.as_bytes())
+        );
+        assert_eq!(contribution.freshness.mtime, std::time::UNIX_EPOCH);
+        assert_eq!(
+            cache_freshness::verify_file(&path, &contribution.freshness),
+            crate::cache_freshness::FreshnessVerdict::Stale
         );
     }
 
