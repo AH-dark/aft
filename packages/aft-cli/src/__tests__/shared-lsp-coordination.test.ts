@@ -25,8 +25,8 @@ async function cacheFixture(fn: (root: string) => void): Promise<void> {
 }
 
 describe("LSP cache concurrency regressions awaiting protocol design", () => {
-  // Open design: cross-plugin exclusion must recover dead owners automatically
-  // without a delayed stale-lock reaper removing a live writer's newer claim.
+  // Design question: how can Pi and OpenCode recover a crashed install owner's
+  // lock automatically without stale recovery deleting a live installer's lock?
   test.skip("OpenCode cannot reclaim an aged lease held by a live Pi writer", async () => {
     await cacheFixture((root) => {
       const lock = join(root, "lsp-packages", "fixture", ".aft-installing");
@@ -47,8 +47,8 @@ describe("LSP cache concurrency regressions awaiting protocol design", () => {
     });
   });
 
-  // Open design: install/clear admission needs one shared, crash-recoverable
-  // barrier outside the payload directories that clearing removes.
+  // Design question: which shared lock outside the deleted cache directories can
+  // prevent install/clear overlap and automatically recover after its holder crashes?
   test.skip("external clear reports active entries without deleting a live install", async () => {
     await cacheFixture((root) => {
       const entry = join(root, "lsp-packages", "fixture");
