@@ -87,6 +87,23 @@ struct Waiter {
     tx: WaiterTx,
 }
 
+#[derive(Default)]
+struct InFlightRegistration {
+    // Workers retain this token after publication so late cleanup cannot match
+    // a replacement registered under the same key.
+    identity: Arc<()>,
+    waiters: Vec<Waiter>,
+}
+
+impl InFlightRegistration {
+    fn new(waiters: Vec<Waiter>) -> Self {
+        Self {
+            identity: Arc::new(()),
+            waiters,
+        }
+    }
+}
+
 struct CachedContributionFreshness {
     file_path: PathBuf,
     freshness: FileFreshness,
@@ -673,16 +690,20 @@ fn callgraph_store_ready_for_dead_code(callgraph_dir: PathBuf, project_root: Pat
 struct Tier2FlightExitGuard<'a> {
     manager: &'a InspectManager,
     key: JobKey,
+    identity: Option<Arc<()>>,
 }
 
 impl Drop for Tier2FlightExitGuard<'_> {
     fn drop(&mut self) {
-        self.manager.finish_tier2_flight(
-            &self.key,
-            JobOutcome::Failed {
-                message: "tier2 reuse worker exited without publishing a result".to_string(),
-            },
-        );
+        if let Some(identity) = &self.identity {
+            self.manager.finish_tier2_flight_if_current(
+                &self.key,
+                Some(identity),
+                JobOutcome::Failed {
+                    message: "tier2 reuse worker exited without publishing a result".to_string(),
+                },
+            );
+        }
     }
 }
 
@@ -715,7 +736,7 @@ pub struct InspectManager {
     result_rx: Receiver<InspectResult>,
     #[allow(dead_code)]
     pool: Arc<rayon::ThreadPool>,
-    in_flight: Mutex<HashMap<JobKey, Vec<Waiter>>>,
+    in_flight: Mutex<HashMap<JobKey, InFlightRegistration>>,
     in_flight_changed: Condvar,
     caches: Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
     /// One root-scoped dead-code graph projection. It is cleared with the
@@ -1020,13 +1041,32 @@ impl InspectManager {
     }
 
     fn tier2_flight_exit_guard(&self, key: JobKey) -> Tier2FlightExitGuard<'_> {
-        Tier2FlightExitGuard { manager: self, key }
+        let identity = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .map(|registration| Arc::clone(&registration.identity));
+        Tier2FlightExitGuard {
+            manager: self,
+            key,
+            identity,
+        }
     }
 
-    /// Record the attempt outcome and wake leftover waiters. Idempotent: a
-    /// second call after the completion router already ran is a no-op.
+    /// Publish a reuse outcome to the currently registered waiters. Exit guards
+    /// also match the registration identity before publishing their failure.
     fn finish_tier2_flight(&self, key: &JobKey, outcome: JobOutcome) {
-        let Some(waiters) = self.take_waiters(key) else {
+        self.finish_tier2_flight_if_current(key, None, outcome);
+    }
+
+    fn finish_tier2_flight_if_current(
+        &self,
+        key: &JobKey,
+        identity: Option<&Arc<()>>,
+        outcome: JobOutcome,
+    ) {
+        let Some(waiters) = self.take_waiters(key, identity) else {
             return;
         };
         let succeeded = matches!(
@@ -1042,12 +1082,25 @@ impl InspectManager {
         Self::deliver_waiters(waiters, outcome);
     }
 
-    fn take_waiters(&self, key: &JobKey) -> Option<Vec<Waiter>> {
-        let waiters = self
+    fn take_waiters(&self, key: &JobKey, identity: Option<&Arc<()>>) -> Option<Vec<Waiter>> {
+        let mut in_flight = self
             .in_flight
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Publication removes the key before the worker exits. Match its retained
+        // token under the removal lock so late cleanup cannot consume a new flight.
+        if let Some(identity) = identity {
+            if !in_flight
+                .get(key)
+                .is_some_and(|registration| Arc::ptr_eq(&registration.identity, identity))
+            {
+                return None;
+            }
+        }
+        let waiters = in_flight
+            .remove(key)
+            .map(|registration| registration.waiters);
+        drop(in_flight);
         if waiters.is_some() {
             self.in_flight_changed.notify_all();
         }
@@ -1719,7 +1772,7 @@ impl InspectManager {
         };
         let permit_slot = Arc::new(Mutex::new(Some(permit)));
         let worker_permit_slot = Arc::clone(&permit_slot);
-        in_flight.insert(key.clone(), Vec::new());
+        in_flight.insert(key.clone(), InFlightRegistration::new(Vec::new()));
         drop(in_flight);
         self.record_flight_start(&key);
 
@@ -1825,7 +1878,7 @@ impl InspectManager {
             if in_flight.contains_key(&key) {
                 continue;
             }
-            in_flight.insert(key.clone(), Vec::new());
+            in_flight.insert(key.clone(), InFlightRegistration::new(Vec::new()));
             started.push(key);
             submission.newly_queued_categories.push(category);
         }
@@ -2246,7 +2299,7 @@ impl InspectManager {
                 message: "inspect job cancelled because its project root was unbound".to_string(),
             };
             self.record_builder_attempt_outcome(&result.key, &outcome);
-            if let Some(waiters) = self.take_waiters(&result.key) {
+            if let Some(waiters) = self.take_waiters(&result.key, None) {
                 Self::deliver_waiters(waiters, outcome);
             }
             discarded += 1;
@@ -2665,13 +2718,16 @@ impl InspectManager {
             .in_flight
             .lock()
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
-        if let Some(waiters) = in_flight.get_mut(key) {
-            waiters.push(Waiter { tx: waiter_tx });
+        if let Some(registration) = in_flight.get_mut(key) {
+            registration.waiters.push(Waiter { tx: waiter_tx });
             self.in_flight_changed.notify_all();
             return Ok(false);
         }
 
-        in_flight.insert(key.clone(), vec![Waiter { tx: waiter_tx }]);
+        in_flight.insert(
+            key.clone(),
+            InFlightRegistration::new(vec![Waiter { tx: waiter_tx }]),
+        );
         drop(in_flight);
         self.record_flight_start(key);
         Ok(true)
@@ -2699,7 +2755,7 @@ impl InspectManager {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             loop {
                 match in_flight.get(&job.key) {
-                    Some(waiters) if waiters.is_empty() => {}
+                    Some(registration) if registration.waiters.is_empty() => {}
                     _ => return,
                 }
                 let now = Instant::now();
@@ -3798,12 +3854,15 @@ impl InspectManager {
             .in_flight
             .lock()
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
-        if let Some(waiters) = in_flight.get_mut(&key) {
-            waiters.push(Waiter { tx: waiter_tx });
+        if let Some(registration) = in_flight.get_mut(&key) {
+            registration.waiters.push(Waiter { tx: waiter_tx });
             return Ok(());
         }
 
-        in_flight.insert(key.clone(), vec![Waiter { tx: waiter_tx }]);
+        in_flight.insert(
+            key.clone(),
+            InFlightRegistration::new(vec![Waiter { tx: waiter_tx }]),
+        );
         drop(in_flight);
         self.record_flight_start(&key);
 
@@ -3817,7 +3876,7 @@ impl InspectManager {
             let outcome = JobOutcome::Failed {
                 message: message.clone(),
             };
-            if let Some(waiters) = self.take_waiters(&key) {
+            if let Some(waiters) = self.take_waiters(&key, None) {
                 Self::deliver_waiters(waiters, outcome);
             }
             self.clear_builder_state(&key);
@@ -3841,7 +3900,7 @@ impl InspectManager {
         if in_flight.contains_key(&key) {
             return Ok(());
         }
-        in_flight.insert(key.clone(), Vec::new());
+        in_flight.insert(key.clone(), InFlightRegistration::new(Vec::new()));
         drop(in_flight);
         self.record_flight_start(&key);
 
@@ -3992,7 +4051,7 @@ impl InspectManager {
     fn route_completion(&self, result: InspectResult) {
         let outcome = self.completion_outcome(result.clone());
         self.record_builder_attempt_outcome(&result.key, &outcome);
-        if let Some(waiters) = self.take_waiters(&result.key) {
+        if let Some(waiters) = self.take_waiters(&result.key, None) {
             Self::deliver_waiters(waiters, outcome);
         }
     }
@@ -7683,6 +7742,79 @@ mod guard_tests {
             "quick reuse must clear the builder registry on the way out"
         );
         assert!(!manager.tier2_any_in_flight());
+    }
+
+    #[test]
+    fn unfinished_tier2_flight_guard_publishes_failure() {
+        let manager = InspectManager::new();
+        let key = JobKey::for_project_category(InspectCategory::Duplicates);
+        let (tx, rx) = bounded(1);
+        assert!(manager.register_tier2_reuse_waiter(&key, tx).unwrap());
+        drop(manager.tier2_flight_exit_guard(key));
+        let outcome = rx.try_recv().expect("guard published its terminal outcome");
+        assert!(
+            matches!(
+                outcome,
+                JobOutcome::Failed { ref message }
+                    if message == "tier2 reuse worker exited without publishing a result"
+            ),
+            "{outcome:?}"
+        );
+        assert!(!manager.tier2_any_in_flight());
+        assert_eq!(manager.reuse_completion_count(), 1);
+    }
+
+    #[test]
+    fn completed_tier2_flight_guard_preserves_replacement_flight() {
+        let manager = InspectManager::new();
+        let key = JobKey::for_project_category(InspectCategory::Duplicates);
+        let (first_tx, first_rx) = bounded(1);
+        assert!(manager.register_tier2_reuse_waiter(&key, first_tx).unwrap());
+        let first_guard = manager.tier2_flight_exit_guard(key.clone());
+        manager.finish_tier2_flight(
+            &key,
+            JobOutcome::Fresh {
+                payload: serde_json::json!({"flight": "first"}),
+            },
+        );
+        assert!(matches!(first_rx.try_recv(), Ok(JobOutcome::Fresh { .. })));
+
+        let (replacement_tx, replacement_rx) = bounded(1);
+        assert!(manager
+            .register_tier2_reuse_waiter(&key, replacement_tx)
+            .unwrap());
+        let replacement_guard = manager.tier2_flight_exit_guard(key.clone());
+        // Completion wakes callers before the old worker's exit guard drops.
+        // A caller may register a new flight under the same key in that gap.
+        drop(first_guard);
+        assert!(
+            manager.tier2_any_in_flight(),
+            "the completed flight's guard removed its replacement"
+        );
+        assert_eq!(
+            manager.tier2_builder_state(InspectCategory::Duplicates),
+            InspectBuilderState::Building
+        );
+        assert!(matches!(
+            replacement_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Empty)
+        ));
+        assert_eq!(manager.reuse_completion_count(), 1);
+
+        manager.finish_tier2_flight(
+            &key,
+            JobOutcome::Fresh {
+                payload: serde_json::json!({"flight": "replacement"}),
+            },
+        );
+        drop(replacement_guard);
+        let outcome = replacement_rx.try_recv().expect("replacement published");
+        assert_eq!(
+            outcome.payload(),
+            Some(&serde_json::json!({"flight": "replacement"}))
+        );
+        assert!(!manager.tier2_any_in_flight());
+        assert_eq!(manager.reuse_completion_count(), 2);
     }
 
     #[test]
