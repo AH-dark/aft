@@ -155,7 +155,7 @@ fn committed_spawn_failure_preserves_visible_record() {
     );
 }
 
-fn with_missing_live_layout(run: impl FnOnce(&crate::context::AppContext, &str)) {
+fn with_live_task(run: impl FnOnce(&crate::context::AppContext, &str)) {
     let _storage_env = crate::test_env::without_storage_override();
     let storage = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config {
@@ -174,38 +174,25 @@ fn with_missing_live_layout(run: impl FnOnce(&crate::context::AppContext, &str))
     let launched = crate::commands::bash::handle(&request, &ctx);
     assert!(launched.success, "{:?}", launched.data);
     let id = launched.data["task_id"].as_str().unwrap().to_string();
-    let session = session_tasks_dir(storage.path(), "typed-error");
-    let task = resolve_task_layout(&session, &id).unwrap();
-    let parked = storage.path().join("parked-layout");
-    struct Restore<'a> {
-        ctx: &'a crate::context::AppContext,
-        id: String,
-        original: PathBuf,
-        parked: PathBuf,
-    }
-    impl Drop for Restore<'_> {
+    struct KillOnDrop<'a>(&'a crate::context::AppContext, String);
+    impl Drop for KillOnDrop<'_> {
         fn drop(&mut self) {
-            let _ = fs::rename(&self.parked, &self.original);
-            let _ = self.ctx.bash_background().kill(&self.id, "typed-error");
+            let _ = self.0.bash_background().kill(&self.1, "typed-error");
         }
     }
-    let _restore = Restore {
-        ctx: &ctx,
-        id: id.clone(),
-        original: task.paths.dir.clone(),
-        parked: parked.clone(),
-    };
-    fs::rename(&task.paths.dir, parked).unwrap();
+    let _cleanup = KillOnDrop(&ctx, id.clone());
     run(&ctx, &id);
 }
 
 #[test]
 fn kill_persistence_failure_is_not_task_absence() {
-    with_missing_live_layout(|ctx, id| {
+    with_live_task(|ctx, id| {
         let req = serde_json::from_value(serde_json::json!({
             "id": "typed-kill", "command": "bash_kill", "session_id": "typed-error", "params": { "task_id": id }
         })).unwrap();
-        let reply = crate::commands::bash_kill::handle(&req, ctx);
+        let reply = with_task_io_fault(TaskIoFault::RecordWriteNotFound, || {
+            crate::commands::bash_kill::handle(&req, ctx)
+        });
         assert_eq!(reply.data["code"], "kill_failed", "{:?}", reply.data);
         assert!(reply.data["message"]
             .as_str()
@@ -216,24 +203,28 @@ fn kill_persistence_failure_is_not_task_absence() {
 
 #[test]
 fn promote_persistence_failure_is_not_task_absence() {
-    with_missing_live_layout(|ctx, id| {
+    with_live_task(|ctx, id| {
         let req = serde_json::from_value(serde_json::json!({
             "id": "typed-promote", "command": "bash_promote", "session_id": "typed-error", "params": { "task_id": id }
         })).unwrap();
-        let reply = crate::commands::bash_promote::handle(&req, ctx);
+        let reply = with_task_io_fault(TaskIoFault::RecordWriteNotFound, || {
+            crate::commands::bash_promote::handle(&req, ctx)
+        });
         assert_eq!(reply.data["code"], "execution_failed", "{:?}", reply.data);
         assert!(reply.data["message"]
             .as_str()
             .unwrap()
             .contains("failed to promote"));
-        let detached = crate::commands::bash_orchestrate::detach_wait_mode_bash(
-            ctx,
-            id,
-            "typed-error",
-            "typed-detach",
-            false,
-            true,
-        );
+        let detached = with_task_io_fault(TaskIoFault::RecordWriteNotFound, || {
+            crate::commands::bash_orchestrate::detach_wait_mode_bash(
+                ctx,
+                id,
+                "typed-error",
+                "typed-detach",
+                false,
+                true,
+            )
+        });
         assert_eq!(
             detached.data["code"], "execution_failed",
             "{:?}",

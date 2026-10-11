@@ -1393,6 +1393,21 @@ pub fn write_task_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Resul
 fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io::Result<()> {
     crate::production_storage::refuse_write(&dir.path().join(name))?;
     #[cfg(test)]
+    TASK_IO_FAULT.with(|slot| {
+        if matches!(slot.get(), Some(TaskIoFault::RecordWriteNotFound)) {
+            // Fail one record write without moving live output directories.
+            // Keep "not found" in the storage diagnostic to exercise typed
+            // task-absence classification, not just generic write failures.
+            slot.set(None);
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "injected task record storage not found",
+            ))
+        } else {
+            Ok(())
+        }
+    })?;
+    #[cfg(test)]
     if task.status == BgTaskStatus::Running {
         task_io_fault_for_test(true)?;
     }
@@ -1422,6 +1437,7 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
 #[derive(Clone, Copy)]
 pub(crate) enum TaskIoFault {
     LayoutEnospc,
+    RecordWriteNotFound,
     OutputHandlesEnospc,
     OutputHandlesMisleadingText,
     RunningEnospc,
