@@ -10367,6 +10367,10 @@ fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
 }
 
 #[cfg(test)]
+#[path = "default_kill_test.rs"]
+pub(crate) mod default_kill_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fs;

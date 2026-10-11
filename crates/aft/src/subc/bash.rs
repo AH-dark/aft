@@ -143,19 +143,19 @@ struct DeferredWaitObservation {
 /// stops the frame loop, so no route's frames are read or written until the
 /// lock frees. Here the frame loop only awaits.
 ///
-/// `renew_window` is set for a capped blocking wait: the caller is
-/// waiting on its command, so each wake keeps the task's default hard kill at
-/// least that far away, and the kill cannot fire before the cap hands control
-/// back to the caller.
+/// For a delegated worker's capped blocking wait, `renew_window` keeps the
+/// task's default hard kill at least that far away. Primary sessions also have
+/// a wait cap, but retain their original hard-kill limit.
 async fn observe_deferred_bash_wait(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
     session_id: String,
     wait_mode: bool,
+    worker_session: bool,
     renew_window: Option<Duration>,
 ) -> DeferredWaitObservation {
     tokio::task::spawn_blocking(move || {
-        if let Some(window) = renew_window {
+        if let Some(window) = renew_window.filter(|_| worker_session) {
             registry.renew_hard_kill(&task_id, &session_id, window);
         }
         let target_finished = registry
@@ -174,6 +174,50 @@ async fn observe_deferred_bash_wait(
         target_finished: true,
         detach_pending: false,
     })
+}
+
+#[cfg(test)]
+mod default_kill_tests {
+    use super::*;
+
+    async fn deferred_wait_limit(worker_session: bool, explicit_timeout: Option<u64>) -> u64 {
+        let (_dir, ctx, task) =
+            crate::bash_background::registry::default_kill_tests::wait_fixture(explicit_timeout);
+        let registry = ctx.bash_background();
+        registry.begin_wait_mode_session(&task.session_id, &task.task_id);
+        assert!(registry.signal_wait_mode_detach(&task.session_id));
+        let observation = observe_deferred_bash_wait(
+            registry.clone(),
+            task.task_id.clone(),
+            task.session_id.clone(),
+            true,
+            worker_session,
+            Some(Duration::from_millis(1_800_000)),
+        )
+        .await;
+        assert!(!observation.target_finished);
+        assert!(observation.detach_pending);
+        registry.end_wait_mode_session(&task.session_id, &task.task_id);
+        registry
+            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .unwrap()
+            .limit_ms
+    }
+
+    #[tokio::test]
+    async fn head_deferred_wait_preserves_default_hard_kill() {
+        assert_eq!(deferred_wait_limit(false, None).await, 1_800_000);
+    }
+
+    #[tokio::test]
+    async fn worker_deferred_wait_renews_default_hard_kill() {
+        assert!(deferred_wait_limit(true, None).await >= 1_801_900);
+    }
+
+    #[tokio::test]
+    async fn worker_deferred_wait_preserves_explicit_hard_kill() {
+        assert_eq!(deferred_wait_limit(true, Some(45_000)).await, 45_000);
+    }
 }
 
 /// Hands a held call's command to the background the way a drain detach does
@@ -1358,6 +1402,7 @@ async fn run_deferred_bash_wait(
                     task_id.clone(),
                     session_id.clone(),
                     detach_on_user_message,
+                    worker_session,
                     worker_cap_ms.map(Duration::from_millis),
                 )
                 .await

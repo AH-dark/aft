@@ -486,10 +486,9 @@ pub fn build_bash_outcome(
     let session_id_for_poll = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
-        // A caller blocked on its command is waiting on it: keep its default
-        // hard kill at least one wait limit away, so the kill cannot fire
-        // before the cap hands control back.
-        if let Some(cap_ms) = worker_cap_ms {
+        // All blocking calls have a wait cap, but only delegated workers renew
+        // the default hard kill. A primary session keeps its original limit.
+        if let Some(cap_ms) = worker_cap_ms.filter(|_| worker_session) {
             ctx.bash_background().renew_hard_kill(
                 &task_id_for_poll,
                 &session_id_for_poll,
@@ -644,8 +643,8 @@ pub(crate) fn decide_bash_step(
 /// Moves a foreground command to the background at the end of its wait.
 /// `capped_worker_wait` marks a blocking call that hit the configured
 /// wait limit (`wait_window_ms` is then that limit): it gets its
-/// own reply, and its hard kill is pushed one more limit away so the caller
-/// has time to wait again.
+/// own reply. For delegated workers only, its hard kill is pushed one more
+/// limit away so the worker has time to wait again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn promote_bash(
     ctx: &AppContext,
@@ -660,11 +659,13 @@ pub(crate) fn promote_bash(
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) if capped_worker_wait => {
-            ctx.bash_background().renew_hard_kill(
-                task_id,
-                session_id,
-                Duration::from_millis(wait_window_ms),
-            );
+            if worker_session {
+                ctx.bash_background().renew_hard_kill(
+                    task_id,
+                    session_id,
+                    Duration::from_millis(wait_window_ms),
+                );
+            }
             let snapshot = ctx.bash_background().observed_status(
                 task_id,
                 session_id,
