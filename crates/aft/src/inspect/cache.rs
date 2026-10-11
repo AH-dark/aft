@@ -3,7 +3,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const INSPECT_SQLITE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
@@ -13,17 +15,22 @@ const INSPECT_WRITER_LEASE_TIMEOUT: Duration = Duration::from_secs(2);
 // had no file newer than seven days. Scope keys hash canonical checkout paths,
 // so reclaimed worktrees cannot ever reach their old directories again. This is
 // a structural fix for that permanent accumulation, not a user-facing knob.
+#[cfg(test)]
 const INSPECT_SCOPE_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Bound one process-wide pass so a slow filesystem cannot stall publication;
 /// the first-level cursor resumes the remaining scope directories next time.
+#[cfg(test)]
 const INSPECT_SCOPE_SWEEP_LIMIT: usize = 200;
+#[cfg(test)]
 const INSPECT_SCOPE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
+#[cfg(test)]
 struct InspectScopeSweepCursor {
     last_name: Option<String>,
 }
 
+#[cfg(test)]
 static INSPECT_SCOPE_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, InspectScopeSweepCursor>>> =
     OnceLock::new();
 
@@ -1819,6 +1826,7 @@ fn gc_old_inspect_generations(inspect_dir: &Path, project_key: &str, current: &s
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 pub(crate) struct InspectScopeSweepSummary {
     removed: usize,
     bytes: u64,
@@ -1830,11 +1838,13 @@ pub(crate) struct InspectScopeSweepSummary {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct InspectScopeFileStats {
     newest_file: Option<SystemTime>,
     bytes: u64,
 }
 
+#[cfg(test)]
 enum InspectScopeWalk {
     Complete(InspectScopeFileStats),
     BudgetExceeded,
@@ -1842,6 +1852,7 @@ enum InspectScopeWalk {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 enum InspectScopeCandidateResult {
     #[default]
     Processed,
@@ -1859,7 +1870,7 @@ enum InspectScopeCandidateResult {
 /// after a large or slow first-level directory exceeds its wall-clock budget.
 // The standalone age-policy fixtures still exercise this helper. Runtime
 // eviction uses storage_retention and its durable root/binding checks.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn sweep_inspect_scope_dirs(
     inspect_root: &Path,
     live_scope_keys: &HashSet<String>,
@@ -1872,6 +1883,7 @@ pub(crate) fn sweep_inspect_scope_dirs(
     )
 }
 
+#[cfg(test)]
 fn sweep_inspect_scope_dirs_with_limits(
     inspect_root: &Path,
     live_scope_keys: &HashSet<String>,
@@ -1953,6 +1965,7 @@ fn sweep_inspect_scope_dirs_with_limits(
     summary
 }
 
+#[cfg(test)]
 fn inspect_scope_candidate(
     scope_dir: &Path,
     scope_name: &str,
@@ -2000,6 +2013,7 @@ fn inspect_scope_candidate(
     }
 }
 
+#[cfg(test)]
 fn inspect_scope_file_stats(scope_dir: &Path, deadline: Instant) -> InspectScopeWalk {
     if Instant::now() >= deadline {
         return InspectScopeWalk::BudgetExceeded;
@@ -2055,6 +2069,7 @@ fn inspect_scope_file_stats(scope_dir: &Path, deadline: Instant) -> InspectScope
     InspectScopeWalk::Complete(stats)
 }
 
+#[cfg(test)]
 fn merge_scope_file_stats(stats: &mut InspectScopeFileStats, child: InspectScopeFileStats) {
     stats.bytes = stats.bytes.saturating_add(child.bytes);
     if child.newest_file > stats.newest_file {

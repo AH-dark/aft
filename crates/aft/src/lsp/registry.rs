@@ -2901,9 +2901,4 @@ mod tests {
             Some(valid.join("svelte-language-server").as_path())
         );
     }
-
-    // Avoid unused-import warning on platforms where probe_dir's Windows
-    // branch is dead code.
-    #[allow(dead_code)]
-    fn _path_buf_used(_p: PathBuf) {}
 }

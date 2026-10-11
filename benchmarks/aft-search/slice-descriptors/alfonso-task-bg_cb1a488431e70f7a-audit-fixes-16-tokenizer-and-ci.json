@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "The fenced file replaces duplicate exact_lane and memo module declarations with re-exports of the existing semantic-search modules, adds a shared-type identity regression, and gates obsolete age-policy sweep fixtures and their private dependencies to test builds. No candidate generation, scoring, routing or rendering changes are intended. This descriptor requires byte-equivalent search results; the landing train must run the complete search-quality replay before accepting parity. It does not claim that replay has already run."
+}

@@ -367,13 +367,6 @@ pub(crate) fn install_index_build(scope: IndexBuildScope) -> IndexBuildGuard {
     IndexBuildGuard { previous }
 }
 
-/// Run `f` with `scope` as the current index-build attempt on this thread.
-#[allow(dead_code)]
-pub(crate) fn with_index_build<R>(scope: IndexBuildScope, f: impl FnOnce() -> R) -> R {
-    let _guard = install_index_build(scope);
-    f()
-}
-
 /// Emits `build_failed` if the attempt returns without a terminal event.
 pub(crate) struct IndexBuildFailureGuard {
     armed: bool,

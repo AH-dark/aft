@@ -20,10 +20,7 @@ use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 
-#[path = "commands/semantic_search/exact_lane.rs"]
-pub mod exact_lane;
-#[path = "commands/semantic_search/memo.rs"]
-pub mod memo;
+pub use crate::commands::semantic_search::{exact_lane, memo};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactPassMatch {
@@ -87,7 +84,9 @@ const POSTING_BYTES: usize = 6;
 const ARTIFACT_CACHE_KEY_MEMO_FILE: &str = "cache-keys.json";
 const ARTIFACT_CACHE_KEY_MEMO_EVICTION_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(test)]
 const INDEX_ORPHAN_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+#[cfg(test)]
 const INDEX_ORPHAN_SWEEP_LIMIT: usize = 200;
 const TRANSIENT_SEARCH_CACHE_PREFIX: &str = "aft-search-cache.";
 /// Our scratch caches live in one directory of our own inside the system
@@ -110,6 +109,7 @@ const TRANSIENT_SEARCH_CACHE_SCAN_LIMIT: usize = 2_048;
 const TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
+#[cfg(test)]
 static INDEX_ORPHAN_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
 static TRANSIENT_SEARCH_CACHE_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, String>>> =
     OnceLock::new();
@@ -154,6 +154,7 @@ struct ArtifactCacheKeyMemoState {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct IndexOrphanSweepSummary {
     scanned: usize,
     removed: usize,
@@ -6686,7 +6687,7 @@ fn artifact_key_looks_valid(key: &str) -> bool {
 /// so a concurrent publisher leaves the directory for a later maintenance pass.
 // Retained for isolated cache-lock fixtures; production eviction is scheduled
 // through storage_retention rather than inferring abandonment from payload age.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
     let index_root = storage_root.join("index");
     let referenced_keys = match referenced_artifact_cache_keys(storage_root) {
@@ -6817,6 +6818,7 @@ pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
 /// Return durable cache keys referenced by `cache-keys.json` without deriving new
 /// identities. Maintenance sweeps use this read-only snapshot as their liveness
 /// boundary so a failed or corrupt memo leaves artifacts untouched.
+#[cfg(test)]
 pub(crate) fn referenced_artifact_cache_keys(
     storage_root: &Path,
 ) -> std::io::Result<HashSet<String>> {
@@ -6847,6 +6849,7 @@ pub(crate) fn referenced_artifact_cache_keys(
 
 /// Return keys derived by this process. They supplement the durable memo during
 /// maintenance, protecting an active root before its next memo write completes.
+#[cfg(test)]
 pub(crate) fn derived_artifact_cache_keys() -> HashSet<String> {
     DERIVED_CACHE_KEYS
         .get()
@@ -6855,6 +6858,7 @@ pub(crate) fn derived_artifact_cache_keys() -> HashSet<String> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn try_acquire_index_orphan_sweep_locks(
     cache_dir: &Path,
 ) -> Option<(fs_lock::LockGuard, fs_lock::LockGuard)> {
@@ -6867,6 +6871,7 @@ fn try_acquire_index_orphan_sweep_locks(
     Some((cache_lock, writer_lease))
 }
 
+#[cfg(test)]
 fn newest_index_cache_file_mtime(cache_dir: &Path) -> Result<Option<SystemTime>, ()> {
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(cache_dir).map_err(|_| ())?;
     let mut newest = None;
@@ -6874,6 +6879,7 @@ fn newest_index_cache_file_mtime(cache_dir: &Path) -> Result<Option<SystemTime>,
     Ok(newest)
 }
 
+#[cfg(test)]
 fn newest_index_cache_file_mtime_inner(
     directory: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
@@ -8043,6 +8049,19 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_namespaces_share_type_identity() {
+        use std::any::TypeId;
+        assert_eq!(
+            TypeId::of::<super::exact_lane::ExactLane>(),
+            TypeId::of::<crate::commands::semantic_search::exact_lane::ExactLane>()
+        );
+        assert_eq!(
+            TypeId::of::<super::memo::ExactMemoStore>(),
+            TypeId::of::<crate::commands::semantic_search::memo::ExactMemoStore>()
+        );
+    }
+
     #[test]
     fn perf_audit_empty_filters_skip_path_keys() {
         let root = Path::new("/project");
