@@ -145,9 +145,9 @@ fn outline_mode_for_call(bare_name: &str, arguments: &Value, _project_root: &Pat
 }
 
 fn executed_outline_mode(data: &Value) -> OutlineMode {
-    // Files tables return files/envelope/unchecked-file fields; directory walks
-    // mark discovered. Use the completed reply to choose the renderer, not the
-    // requested mode or a new stat of a changed or remote target.
+    // files, files_list_envelope, or unchecked_files identify a files-table reply;
+    // discovered=true identifies a directory-discovery reply. Select its renderer
+    // from that completed reply, without consulting request hints or the target.
     if data.get("files").is_some_and(Value::is_array)
         || data
             .get("files_list_envelope")

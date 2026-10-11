@@ -3198,7 +3198,8 @@ async fn handle_bash_elicitation_reply(
 
     // Replies, cancellation, and drain all remove the pending permission entry
     // before answering; only the first removal can send its tool terminal.
-    // Only the ledger-ready channel can mark a server-side storage failure.
+    // Only results returned through LedgerEdge::ready can set authorization_failed;
+    // consumer-sent elicitation errors still take the ordinary denial path.
     if authorization_failed {
         let completion = bash::bash_authorization_failed_completion(
             pending.route,
