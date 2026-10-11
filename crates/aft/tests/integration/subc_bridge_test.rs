@@ -3212,6 +3212,34 @@ fn subc_bridge_bash_wait_true_waits_for_terminal() {
 }
 
 #[test]
+fn subc_bridge_bash_wait_true_outlasts_slow_startup_reply() {
+    run_subc_bridge_test_inner(
+        "subc_bridge_bash_wait_true_outlasts_slow_startup_reply",
+        Duration::from_secs(30),
+        || vec![set_test_foreground_wait_ms(100)],
+        drive_bash_wait_true_daemon,
+        |_, _, _| {},
+        true,
+        None,
+        slow_bash_startup_reply_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
+    );
+}
+
+fn slow_bash_startup_reply_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    let is_bash = req.command == "bash";
+    let response = bridge_dispatch(req, ctx);
+    if is_bash && response.success && response.data["status"] == "running" {
+        // The process is committed, but the spawn job has not returned yet.
+        // Hold that reply past the ordinary foreground window, not the command timeout.
+        thread::sleep(Duration::from_millis(300));
+    }
+    response
+}
+
+#[test]
 fn subc_bridge_repeat_breaker_uses_shared_transport_fixture() {
     run_subc_bridge_test_with_env(
         "subc_bridge_repeat_breaker_uses_shared_transport_fixture",

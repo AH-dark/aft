@@ -619,8 +619,27 @@ pub(super) fn submit_deferred_bash(
             return;
         }
     };
+    let raw_args = arguments
+        .get("params")
+        .filter(|params| params.is_object())
+        .unwrap_or(&arguments);
+    let blocking_intent = ["wait", "block_to_completion"].iter().any(|key| {
+        raw_args
+            .get(*key)
+            .and_then(crate::subc_translate::model_boolean)
+            == Some(true)
+    });
+    let blocking_cap_ms = crate::commands::bash_orchestrate::blocking_wait_cap_ms(
+        blocking_intent,
+        crate::commands::bash_orchestrate::worker_wait_max_ms(&spawn_ctx),
+    );
+    // The short foreground window belongs only to nonblocking calls. A blocking
+    // call keeps the existing 15 s startup admission budget, then waits for a
+    // committed command until its blocking cap, even if startup bookkeeping is slow.
     let startup_window = if server_completion {
         20_000
+    } else if blocking_intent {
+        15_000.min(blocking_cap_ms.expect("blocking wait cap"))
     } else {
         crate::commands::bash_orchestrate::resolve_foreground_wait_window_ms(
             spawn_ctx.config().foreground_wait_window_ms,
@@ -883,10 +902,7 @@ pub(super) fn submit_deferred_bash(
                     // regardless of the route's cancellation policy. Reaching
                     // that cap hands back a task id without killing the command;
                     // the command's own timeout still governs its lifetime.
-                    let worker_cap_ms = crate::commands::bash_orchestrate::blocking_wait_cap_ms(
-                        settings.block_to_completion || settings.wait,
-                        crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
-                    );
+                    let worker_cap_ms = blocking_cap_ms;
                     let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
                         crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
                             ctx.config().foreground_wait_window_ms,
@@ -986,13 +1002,16 @@ pub(super) fn submit_deferred_bash(
                 // file read or a small edit; give it a short bounded wait.
                 let settled = if outcome == crate::bash_background::StartupOutcome::Inline {
                     tokio::time::timeout(INLINE_STARTUP_SETTLE, &mut spawn_future).await.ok()
+                } else if !server_completion && matches!(outcome, crate::bash_background::StartupOutcome::Task(_)) && blocking_cap_ms.is_some() {
+                    let wait_deadline = received_at + Duration::from_millis(blocking_cap_ms.unwrap());
+                    tokio::time::timeout_at(wait_deadline.into(), &mut spawn_future).await.ok()
                 } else {
                     None
                 };
                 match settled {
                     Some(response) => response,
                     None => {
-                        let response = startup_deadline_response(&request_id, &outcome, startup_window, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed));
+                        let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed));
                         log::warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"));
                         send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), Some(bash_result_from_response(response, &format_context)), false).await;
                         answered_startup = true;
@@ -1012,21 +1031,33 @@ pub(super) fn submit_deferred_bash(
                 ..
             }) = spawn_control
             {
-                detach_held_bash_in_background(
-                    drain::BashDetachTarget {
-                        task_id,
-                        session_id,
-                        wait_mode: detach_on_user_message,
-                        worker_session,
-                        server_completion,
-                        registry: spawn_ctx.bash_background().clone(),
-                        request_id,
-                        ver,
-                        flags,
-                        format_context,
-                    },
-                    false,
-                );
+                let target = drain::BashDetachTarget {
+                    task_id,
+                    session_id,
+                    wait_mode: detach_on_user_message,
+                    worker_session,
+                    server_completion,
+                    registry: spawn_ctx.bash_background().clone(),
+                    request_id,
+                    ver,
+                    flags,
+                    format_context,
+                };
+                if let Some(cap) = blocking_cap_ms.filter(|_| worker_session && !server_completion)
+                {
+                    // Keep a delegated worker's implicit command timeout at least
+                    // one wait interval away; an explicit timeout is never extended.
+                    tokio::task::spawn_blocking(move || {
+                        target.registry.renew_hard_kill(
+                            &target.task_id,
+                            &target.session_id,
+                            Duration::from_millis(cap),
+                        );
+                        detach_held_bash_sync(target, false);
+                    });
+                } else {
+                    detach_held_bash_in_background(target, false);
+                }
             }
             return;
         }
@@ -1201,6 +1232,7 @@ fn startup_deadline_response(
     request_id: &str,
     outcome: &crate::bash_background::StartupOutcome,
     startup_window: u64,
+    blocking_cap_ms: Option<u64>,
     server_completion: bool,
     worker_session: bool,
     bash_watch_available: bool,
@@ -1210,6 +1242,17 @@ fn startup_deadline_response(
 ) -> Response {
     use crate::bash_background::StartupOutcome;
     match outcome {
+        StartupOutcome::Task(task_id) if !server_completion && blocking_cap_ms.is_some() => {
+            let cap = blocking_cap_ms.unwrap();
+            Response::success(request_id, json!({
+                "output": crate::commands::bash_orchestrate::format_worker_wait_limit_message(
+                    task_id, cap, cap, "", bash_watch_available,
+                ),
+                "duration_ms": cap,
+                "task_id": task_id,
+                "status": "running",
+            }))
+        }
         StartupOutcome::Task(task_id) if !server_completion => deadline_handoff_response(
             request_id,
             task_id,
@@ -3081,6 +3124,182 @@ mod grant_path_tests {
             TaskIoFault::RunningDelay(Duration::from_millis(1200)),
             || running_bash_stub(req, ctx),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocking_bash_startup_ignores_the_foreground_window() {
+        for (blocking_flag, value, nested) in [
+            ("wait", json!(true), false),
+            ("block_to_completion", json!(true), false),
+            ("wait", json!("true"), true),
+            ("block_to_completion", json!(1), false),
+        ] {
+            let (_dir, root) = super::super::test_support::test_root("blocking-startup");
+            let ctx = super::super::test_support::test_ctx();
+            ctx.update_config(|config| {
+                config.foreground_wait_window_ms = 500;
+                config.project_root = Some(root.as_path().into());
+                config.sandbox.enabled = false;
+            });
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(root.clone(), ctx);
+            let mut arguments = json!({"command": "printf startup-terminal", "timeout": 5000});
+            arguments[blocking_flag] = value;
+            if nested {
+                arguments = json!({"params": arguments});
+            }
+            let mut replies =
+                deadline_test_call(&executor, &root, slow_running_record_stub, arguments);
+            let done = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = done.response_for_test();
+            assert!(response.success, "{blocking_flag}: {response:?}");
+            assert_eq!(
+                response.data["status"], "completed",
+                "{blocking_flag}: {response:?}"
+            );
+            assert!(response.data["output"]
+                .as_str()
+                .unwrap()
+                .contains("startup-terminal"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocking_bash_startup_ignores_the_foreground_window_before_commit() {
+        let (_dir, root) = super::super::test_support::test_root("blocking-precommit-startup");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 100;
+            config.project_root = Some(root.as_path().into());
+            config.sandbox.enabled = false;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let mut replies = deadline_test_call(
+            &executor,
+            &root,
+            slow_starting_record_stub,
+            json!({"command": "printf startup-terminal", "wait": true, "timeout": 5000}),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("startup-terminal"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocking_bash_startup_still_obeys_the_wait_cap() {
+        let (_dir, root) = super::super::test_support::test_root("blocking-startup-cap");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 100;
+            config.bash.worker_wait_max_ms = 500;
+            config.project_root = Some(root.as_path().into());
+            config.sandbox.enabled = false;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut replies = deadline_test_call(
+            &executor,
+            &root,
+            slow_running_record_stub,
+            json!({"command": "sleep 2", "wait": true, "timeout": 5000}),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(1), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "running", "{response:?}");
+        let output = response.data["output"].as_str().unwrap();
+        assert!(output.contains("0.5s"), "{response:?}");
+        assert!(output.contains("wait limit"), "{response:?}");
+        assert!(
+            !output.contains("Foreground bash didn't finish"),
+            "{response:?}"
+        );
+        let task_id = response.data["task_id"].as_str().unwrap();
+        assert_eq!(
+            wait_for_terminal(&ctx, task_id).await,
+            crate::bash_background::BgTaskStatus::Completed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocking_committed_startup_waits_past_the_admission_budget() {
+        let (_dir, root) = super::super::test_support::test_root("blocking-committed-startup");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 100;
+            config.bash.worker_wait_max_ms = 20_000;
+            config.project_root = Some(root.as_path().into());
+            config.sandbox.enabled = false;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        // Leave 500 ms to commit; the running-record delay crosses the separate
+        // 15 s admission deadline while the blocking cap still has time left.
+        let mut replies = deadline_test_call_received(
+            &executor,
+            &root,
+            slow_running_record_stub,
+            json!({"command": "printf committed-terminal", "wait": true, "timeout": 5000}),
+            Instant::now() - Duration::from_millis(14_500),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("committed-terminal"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocking_bash_still_fences_expired_startup_admission() {
+        let (dir, root) = super::super::test_support::test_root("blocking-expired-startup");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 100;
+            config.bash.worker_wait_max_ms = 20_000;
+            config.project_root = Some(root.as_path().into());
+            config.sandbox.enabled = false;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let mut replies = deadline_test_call_received(
+            &executor,
+            &root,
+            running_bash_stub,
+            json!({"command": "printf ran > started-command", "wait": true, "timeout": 5000}),
+            Instant::now() - Duration::from_millis(15_100),
+        );
+        let done = tokio::time::timeout(Duration::from_secs(1), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_not_started_refusal(done.response_for_test());
+        assert!(!dir.path().join("started-command").exists());
     }
 
     /// The starting-record delay the boundary test is sweeping. Only that
