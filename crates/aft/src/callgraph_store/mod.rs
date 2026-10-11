@@ -3736,8 +3736,8 @@ struct ProjectIndex<'a> {
     /// Stored file indexes loaded on demand, for an incremental refresh. Files
     /// in `files` take precedence over it.
     lazy: Option<Rc<LazyDbFileIndexes<'a>>>,
-    /// Root-scoped map shared by successive refresh-worker batches. Cargo.toml
-    /// watcher events replace the cache before another batch can resolve refs.
+    /// Root-scoped maps shared by successive refresh-worker batches. Cargo.toml
+    /// and go.mod watcher events replace them before another batch resolves refs.
     /// Cold/direct refreshes use a private cache so each refresh builds and uses
     /// its own workspace mapping.
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
@@ -12204,9 +12204,8 @@ fn build_call_refs(
 }
 
 /// Refs for calls written directly in `macro_rules!` templates. The refs table
-/// keeps no caller symbol column (only a caller node, and a macro is not a
-/// node), so the macro name (`name!`) is kept in `local_name`, which call refs
-/// otherwise fill with the callee name.
+/// uses the macro's `name!` node as the caller. Keep that name in `local_name`
+/// too, so readers of legacy macro refs without a caller node can recover it.
 fn build_macro_body_call_refs(
     rel_path: &str,
     data: &FileCallData,
@@ -13080,6 +13079,30 @@ fn surface_fingerprint(
 }
 
 fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> {
+    if raw.kind == "import" && index.lang_for(&raw.caller_file) == Some(LangId::Go) {
+        let files = raw
+            .module_path
+            .as_deref()
+            .map(|module| index.go_package_files(&raw.caller_file, Some(module)))
+            .unwrap_or_default();
+        let target_file = files.first().cloned();
+        let mut dependencies = raw.dependencies.clone();
+        dependencies.extend(files);
+        return Ok(ResolvedRef {
+            status: if target_file.is_some() {
+                "resolved"
+            } else {
+                "unresolved"
+            }
+            .to_string(),
+            raw,
+            target_file,
+            target_node: None,
+            target_symbol: None,
+            dependencies,
+            edge: None,
+        });
+    }
     if !matches!(
         raw.kind.as_str(),
         "call" | "value_ref" | MACRO_BODY_CALL_REF_KIND
@@ -25136,6 +25159,13 @@ edition = "2021"
                 if language == LangId::Go {
                     assert!(
                         snapshot
+                            .entry_point_symbols
+                            .get(&root.join("main.go"))
+                            .is_some_and(|roots| roots.contains("Boot")),
+                        "package main initializer Boot must be a liveness root"
+                    );
+                    assert!(
+                        snapshot
                             .outbound_calls
                             .iter()
                             .any(|call| call.provenance == "value_ref"
@@ -25200,6 +25230,18 @@ edition = "2021"
     }
 
     #[test]
+    fn callgraph_non_go_exported_variable_retains_view_root_flag() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let file = write_file(root, "entry.ts", "export const Public = 1;\n");
+        let snapshot = callgraph_fixture_view(root, &[file]);
+        assert!(snapshot
+            .entry_point_symbols
+            .get(&root.join("entry.ts"))
+            .is_some_and(|roots| roots.contains("Public")));
+    }
+
+    #[test]
     fn callgraph_go_cobra_imported_initializer_live_unimported_dead() {
         for imported in [true, false] {
             let dir = tempdir().unwrap();
@@ -25216,7 +25258,7 @@ edition = "2021"
                 &format!("package main\n{import}func main() {{}}\n"),
             );
             let cmd = write_file(root, "cmd/command.go", "package cmd\nimport \"github.com/spf13/cobra\"\nvar Command = &cobra.Command{RunE: func() error { InitBackendContext(); return nil }}\nfunc InitBackendContext() {}\n");
-            let (_, snapshot) = go_fixture_store(root, &[main, cmd]);
+            let (_, snapshot) = go_fixture_store(root, &[main.clone(), cmd.clone()]);
             let has_var_owner = snapshot.outbound_calls.iter().any(|call| {
                 call.caller_symbol == "Command" && call.target.ends_with("::InitBackendContext")
             });
@@ -25232,6 +25274,14 @@ edition = "2021"
                 "test_only_items",
                 "InitBackendContext"
             ));
+            let viewed_snapshot = callgraph_fixture_view(root, &[main, cmd, root.join("go.mod")]);
+            let view_roots = format!("{:?}", viewed_snapshot.entry_point_symbols);
+            let viewed = callgraph_fixture_scan(root, viewed_snapshot);
+            assert_eq!(
+                payload["items"], viewed["items"],
+                "Go view and legacy initializer liveness differ: {view_roots}"
+            );
+            assert_eq!(payload["test_only_items"], viewed["test_only_items"]);
         }
     }
 

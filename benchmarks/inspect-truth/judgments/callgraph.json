@@ -1,0 +1,23 @@
+{
+  "after_outputs": {},
+  "entries": [],
+  "status": "not_measured",
+  "owner": "chair",
+  "reason": "The chair took ownership of Linux corpus collection and scoring because the worker runner does not transfer ignored baseline/corpus inputs or return release binaries. No rows, scores, NewServer classification or cell verdicts are invented.",
+  "baseline_revision": "13dd9cb71a7bbf9076377ac1ba1717dabf15e586",
+  "baseline_archive": "local-ignore/callgraph/baseline-source",
+  "corpus": [
+    {"repo": "ripgrep", "language": "rust", "revision": "3fce3b5bb0236da2df6d99672afb8a719642eca7", "source": "local-ignore/callgraph/corpus/ripgrep", "status": "owed_to_chair"},
+    {"repo": "axum", "language": "rust", "revision": "f8b02f22cf10bee707bda19b58265b9e33677535", "source": "local-ignore/callgraph/corpus/axum", "status": "owed_to_chair"},
+    {"repo": "soft-serve", "language": "go", "revision": "37685d36f5b7bf0e32217ddd7c8e045c57772619", "source": "local-ignore/callgraph/corpus/soft-serve", "status": "owed_to_chair"},
+    {"repo": "aft", "language": "rust", "baseline": "new, no baseline", "status": "not_measured"}
+  ],
+  "acceptance_owed": [
+    "No lowered precision or recall cell under the reviewed spec's zero-count exception.",
+    "soft-serve dead_code (functions) precision >= 0.6, or row-by-row explanation; NewServer is not test-only.",
+    "ripgrep and axum dead_code count <= 10 each with aft_rows_unjudged: 0, or row-by-row explanation of missed targets.",
+    "If local AFT is included: Rust count <= rustc + 10, all relevant rows judged, unsupported-language gap retained, unchanged checkout status."
+  ],
+  "recipe": "benchmarks/inspect-truth/slices/callgraph.md",
+  "release_note": "Both legacy and active-view callgraph producer keys changed. Existing stores/views rebuild their callgraph evidence once; identical file content/language/current-producer keys then reuse the rebuilt parse blobs. The one-time cost is per file content, not per inspect."
+}
