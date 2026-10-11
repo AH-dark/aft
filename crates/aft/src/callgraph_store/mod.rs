@@ -26032,6 +26032,78 @@ edition = "2021"
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn callgraph_go_initializer_and_callback_through_symlinked_root() {
+        let temp = tempdir().unwrap();
+        let physical = temp.path().join("physical");
+        fs::create_dir(&physical).unwrap();
+        let root = temp.path().join("alias");
+        std::os::unix::fs::symlink(&physical, &root).unwrap();
+        let manifest = write_file(&root, "go.mod", "module example.com/app\n");
+        let main = write_file(&root, "main.go", "package main\nimport (_ \"example.com/app/cmd\"; \"example.com/app/web\")\nfunc main() { web.NewRouter() }\n");
+        let cmd = write_file(&root, "cmd/command.go", "package cmd\nvar Command = func() { InitBackendContext() }\nfunc InitBackendContext() {}\n");
+        let router = write_file(&root, "web/router.go", "package web\nimport \"net/http\"\nfunc NewRouter() { GitController(nil) }\nfunc GitController(r *Router) { r.Handle(\"/\", http.HandlerFunc(GoGetHandler)).Methods(\"GET\") }\ntype Router struct{}\n");
+        let handler = write_file(
+            &root,
+            "web/handler.go",
+            "package web\nfunc GoGetHandler() {}\nfunc Spare() {}\n",
+        );
+        let files = vec![main.clone(), cmd, router, handler];
+        let (store, legacy) = go_fixture_store(&root, &files);
+        assert!(
+            legacy
+                .entry_points
+                .contains(&fs::canonicalize(main).unwrap()),
+            "main must remain a root across path aliases: {:?}",
+            legacy.entry_points
+        );
+        let conn = store.conn.lock().unwrap();
+        let mut refs = conn.prepare("SELECT full_ref,status,target_file,target_symbol,target_node FROM refs WHERE kind IN ('call','value_ref','import')").unwrap();
+        let trace = refs
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        drop(refs);
+        drop(conn);
+        let mut inputs = files;
+        inputs.push(manifest);
+        let view = callgraph_fixture_view(&root, &inputs);
+        let cold = callgraph_fixture_scan(&root, legacy);
+        let viewed = callgraph_fixture_scan(&root, view);
+        for payload in [&cold, &viewed] {
+            for symbol in [
+                "Command",
+                "InitBackendContext",
+                "NewRouter",
+                "GitController",
+                "GoGetHandler",
+            ] {
+                assert!(
+                    !callgraph_fixture_has(payload, "items", symbol),
+                    "alias trace {trace:?}; {payload}"
+                );
+            }
+            assert!(callgraph_fixture_has(payload, "items", "Spare"));
+        }
+        assert_eq!(cold["items"], viewed["items"]);
+        let physical_snapshot = project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        let physical_result = callgraph_fixture_scan(&physical, physical_snapshot);
+        assert_eq!(
+            cold["items"], physical_result["items"],
+            "comparison-key normalization must not change reported file spellings"
+        );
+    }
+
     #[test]
     fn callgraph_go_cobra_imported_initializer_live_unimported_dead() {
         for imported in [true, false] {

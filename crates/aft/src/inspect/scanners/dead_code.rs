@@ -41,7 +41,11 @@ const RUST_MACRO_REF_SHAPE_STRUCT: &str = "struct";
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 
 type ExportNode = (String, String);
-type OutboundCallsByCallerFile<'a> = BTreeMap<PathBuf, Vec<&'a CallgraphOutboundCall>>;
+struct OutboundCallsByCallerFile<'a> {
+    by_file: BTreeMap<String, Vec<&'a CallgraphOutboundCall>>,
+    canonicalization_attempts: usize,
+    lexical_fallbacks: usize,
+}
 type MethodNamesByLanguage = BTreeMap<String, BTreeSet<String>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -493,14 +497,54 @@ fn group_outbound_calls_by_caller_file<'a>(
     project_root: &Path,
     outbound_calls: &'a [CallgraphOutboundCall],
 ) -> OutboundCallsByCallerFile<'a> {
-    let mut by_file: OutboundCallsByCallerFile<'a> = BTreeMap::new();
+    let lexical_root = normalize_path(project_root);
+    let canonical_root = canonicalize_normalized(project_root);
+    let mut by_file: BTreeMap<String, Vec<&'a CallgraphOutboundCall>> = BTreeMap::new();
+    let mut comparison_keys = BTreeMap::new();
+    let mut attempts = 0;
+    let mut fallbacks = 0;
     for call in outbound_calls {
-        by_file
-            .entry(normalize_absolute(project_root, &call.caller_file))
-            .or_default()
-            .push(call);
+        let absolute = normalize_absolute(project_root, &call.caller_file);
+        // Rebase a root alias before memoization, so its physical and alias
+        // spellings share one file probe. Keys never become reported or persisted paths.
+        let comparison_path = absolute
+            .strip_prefix(&lexical_root)
+            .map(|relative| canonical_root.join(relative))
+            .unwrap_or(absolute);
+        let key = comparison_keys
+            .entry(comparison_path.clone())
+            .or_insert_with(|| {
+                attempts += 1;
+                let path = match fs::canonicalize(&comparison_path) {
+                    Ok(canonical) => normalize_path(&canonical),
+                    Err(_) => {
+                        fallbacks += 1;
+                        comparison_path
+                    }
+                };
+                path.strip_prefix(&canonical_root)
+                    .or_else(|_| path.strip_prefix(&lexical_root))
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            });
+        by_file.entry(key.clone()).or_default().push(call);
     }
-    by_file
+    let grouped = OutboundCallsByCallerFile {
+        by_file,
+        canonicalization_attempts: attempts,
+        lexical_fallbacks: fallbacks,
+    };
+    crate::slog_debug!(
+        "dead-code caller comparison keys: {} distinct file probes, {} lexical fallbacks",
+        grouped.canonicalization_attempts,
+        grouped.lexical_fallbacks
+    );
+    if grouped.lexical_fallbacks > 0 {
+        crate::slog_warn!("dead-code caller comparison: retained lexical keys for {} deleted or unreadable caller files",
+            grouped.lexical_fallbacks);
+    }
+    grouped
 }
 
 fn gather_file_contribution(
@@ -1429,10 +1473,9 @@ fn materialize_dead_code_contributions(
                     .cloned()
                     .unwrap_or_default();
             }
-            let absolute_file = project_root.join(&contribution.file);
-            let normalized_file = normalize_absolute(project_root, &absolute_file);
             let outbound_calls_for_file = outbound_calls_by_caller_file
-                .get(&normalized_file)
+                .by_file
+                .get(&contribution.file)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let mut exports = oxc_by_file
@@ -5989,6 +6032,48 @@ struct ParsedTarget {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn caller_comparison_keys_memoize_root_aliases_without_rewriting_calls() {
+        let (temp, root, _) = fixture_project(&[("src/a.rs", "pub fn run() {}\n")]);
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let mut calls = vec![
+            outbound(&alias, "src/a.rs", "run", "helper"),
+            outbound(&root, "src/a.rs", "run", "other"),
+            outbound(&root, "src/a.rs", "run", "last"),
+        ];
+        calls[2].caller_file = PathBuf::from("src/a.rs");
+        let original = calls
+            .iter()
+            .map(|call| call.caller_file.clone())
+            .collect::<Vec<_>>();
+        let grouped = group_outbound_calls_by_caller_file(&alias, &calls);
+        assert_eq!(grouped.canonicalization_attempts, 1);
+        assert_eq!(grouped.lexical_fallbacks, 0);
+        assert_eq!(grouped.by_file["src/a.rs"].len(), 3);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.caller_file.clone())
+                .collect::<Vec<_>>(),
+            original
+        );
+    }
+
+    #[test]
+    fn caller_comparison_keys_keep_and_count_missing_file_edges() {
+        let (_temp, root, _) = fixture_project(&[("src/present.rs", "pub fn run() {}\n")]);
+        let calls = vec![
+            outbound(&root, "src/missing.rs", "run", "helper"),
+            outbound(&root, "src/missing.rs", "run", "other"),
+        ];
+        let grouped = group_outbound_calls_by_caller_file(&root, &calls);
+        assert_eq!(grouped.canonicalization_attempts, 1);
+        assert_eq!(grouped.lexical_fallbacks, 1);
+        assert_eq!(grouped.by_file["src/missing.rs"].len(), 2);
+    }
 
     fn reachability_fixture(edges: &[(&str, &str)], roots: &[&str]) -> ReachabilityState {
         let mut by_source = BTreeMap::<ExportNode, BTreeSet<ExportNode>>::new();
