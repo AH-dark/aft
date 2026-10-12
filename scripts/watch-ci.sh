@@ -44,6 +44,13 @@ fi
 # so resolving a run BY SHA has to name the gating one or it can latch a run
 # that says nothing about the tests.
 WORKFLOW="${WATCH_CI_WORKFLOW:-tests.yml}"
+if [ -z "${WATCH_CI_WORKFLOW:-}" ]; then
+  workflow_root="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$PWD")"
+  if [ ! -f "$workflow_root/.github/workflows/tests.yml" ]; then
+    echo "watch-ci: default workflow .github/workflows/tests.yml does not exist; set WATCH_CI_WORKFLOW to the workflow that gates a landing" >&2
+    exit 2
+  fi
+fi
 # Which trigger produced the run. A sha is not unique across triggers either: a
 # commit that a schedule (or workflow_dispatch) later re-ran carries several
 # runs of the same workflow with possibly different conclusions, and the
@@ -75,6 +82,13 @@ if [ -n "$WATCH_ATTEMPT" ]; then
 fi
 HEARTBEAT_TMP=""
 SLEEP_PID=""
+GH_ERROR_FILE="$(mktemp "${TMPDIR:-/tmp}/watch-ci-gh-error.XXXXXX")" || {
+  echo "watch-ci: could not create a GitHub CLI diagnostic file" >&2
+  exit 5
+}
+GH_ERROR_ATTEMPTS=0
+GH_ERROR_MAX_ATTEMPTS=4
+GH_LAST_ERROR=""
 
 watcher_start_time() {
   ps -p "$$" -o lstart= 2>/dev/null | awk '{$1=$1; print}'
@@ -88,6 +102,7 @@ cleanup_watch() {
   fi
   [ -z "$HEARTBEAT_TMP" ] || rm -f "$HEARTBEAT_TMP"
   [ -z "$HEARTBEAT" ] || rm -f "$HEARTBEAT"
+  [ -z "$GH_ERROR_FILE" ] || rm -f "$GH_ERROR_FILE"
 }
 trap cleanup_watch EXIT
 trap 'exit 129' HUP
@@ -123,6 +138,21 @@ watch_run_view() {
   fi
 }
 
+watch_run_view_checked() {
+  if RUN_VIEW=$(watch_run_view "$@" 2>"$GH_ERROR_FILE"); then
+    GH_ERROR_ATTEMPTS=0
+    GH_LAST_ERROR=""
+    return 0
+  else
+    GH_RC=$?
+  fi
+  GH_LAST_ERROR="$(tail -n 1 "$GH_ERROR_FILE" 2>/dev/null || true)"
+  if [ -z "$GH_LAST_ERROR" ]; then
+    GH_LAST_ERROR="${RUN_VIEW:-gh exited $GH_RC without an error message}"
+  fi
+  return 1
+}
+
 poll_delay_cap() {
   awk -v delay="$1" -v maximum="$POLL_MAX_SLEEP" \
     'BEGIN { if (delay > maximum) delay = maximum; printf "%.3f", delay }'
@@ -143,6 +173,23 @@ poll_error_wait() {
   POLL_DELAY="$(poll_delay_double "$POLL_DELAY")"
 }
 
+# A failed gh query is not evidence that the run is still progressing. Keep
+# polling transient outages with back-off, but stop before a broken CLI call
+# can keep a train waiting forever.
+poll_gh_error_wait() {
+  GH_ERROR_ATTEMPTS=$((GH_ERROR_ATTEMPTS + 1))
+  if [ "$GH_ERROR_ATTEMPTS" -ge "$GH_ERROR_MAX_ATTEMPTS" ]; then
+    printf 'watch-ci: GitHub CLI query failed after %s attempts: %s\n' \
+      "$GH_ERROR_ATTEMPTS" "$GH_LAST_ERROR" >&2
+    exit 5
+  fi
+  watch_sleep "$POLL_DELAY" || {
+    printf 'watch-ci: sleep before GitHub CLI retry failed: %s\n' "$GH_LAST_ERROR" >&2
+    exit 5
+  }
+  POLL_DELAY="$(poll_delay_double "$POLL_DELAY")"
+}
+
 undetermined() {
   echo "CI_UNDETERMINED run=$RID reason='$1'${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}" >&2
   exit 3
@@ -152,10 +199,8 @@ ARG="${1:-}"
 RID=""
 WATCH_SHA=""
 # The only positional is a numeric run id or a commit sha. A flag-shaped or
-# otherwise unrecognized arg (e.g. a misremembered --sha invocation) would
-# otherwise become the "run id", drive `"$OPERATOR_GH" run view` into
-# poll-error, and spin this watch forever - hanging any chain that expects it
-# to exit and notify.
+# otherwise unrecognized argument would be passed to gh as a run id and cause
+# pointless API failures; reject it here so callers get a clear usage message.
 #
 # Run ids are decimal and around 11 digits; a sha is 7-40 hex characters. The
 # two only overlap for an all-decimal sha, so length decides that case: a
@@ -216,9 +261,9 @@ while true; do
   # Keep all fields needed for this tick in one response. Besides reducing API
   # traffic, this prevents status, jobs, and conclusion from describing
   # different moments of the run.
-  if ! RUN_VIEW=$(watch_run_view "$RID" --repo "$REPO" \
-    --json status,conclusion,jobs,url 2>/dev/null); then
-    poll_error_wait
+  if ! watch_run_view_checked "$RID" --repo "$REPO" \
+    --json status,conclusion,jobs,url; then
+    poll_gh_error_wait
     continue
   fi
   if ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
@@ -276,10 +321,13 @@ while true; do
       echo "settling: waiting for run completion so a rerun is accepted"
       while true; do
         write_heartbeat
-        if ! RUN_VIEW=$(watch_run_view "$RID" --repo "$REPO" \
-          --json status,conclusion,jobs,url 2>/dev/null) ||
-          ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
-            <<< "$RUN_VIEW" 2>/dev/null) ||
+        if ! watch_run_view_checked "$RID" --repo "$REPO" \
+          --json status,conclusion,jobs,url; then
+          poll_gh_error_wait
+          continue
+        fi
+        if ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
+          <<< "$RUN_VIEW" 2>/dev/null) ||
           ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
           poll_error_wait
           continue
@@ -300,6 +348,14 @@ while true; do
     if ! JOB_COUNT=$(jq -er '.jobs | length' <<< "$RUN_VIEW" 2>/dev/null) \
       || ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || [ "$JOB_COUNT" -eq 0 ]; then
       undetermined "could not list the run's jobs (conclusion=$CONC)"
+    fi
+    if ! GATING_JOB_COUNT=$(jq -er '[.jobs[] | select((.conclusion | type) == "string" and .conclusion != "skipped")] | length' \
+      <<< "$RUN_VIEW" 2>/dev/null) \
+      || ! [[ "$GATING_JOB_COUNT" =~ ^[0-9]+$ ]]; then
+      undetermined "could not read gating job conclusions (conclusion=$CONC)"
+    fi
+    if [ "$GATING_JOB_COUNT" -eq 0 ]; then
+      undetermined "no gating job ran"
     fi
     if [ "$CONC" = "success" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"

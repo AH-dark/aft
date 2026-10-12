@@ -4,7 +4,7 @@
 Run with WATCH_CI_LIVE_TESTS=1 python3 scripts/test-watch-ci.py.
 Requires upstream gh authentication and a successful recent CI run whose commit
 is present locally. WATCH_CI_WORKFLOW can select the workflow; otherwise the suite
-uses tests.yml or ci.yml, whichever exists in this checkout. REPO can override the
+uses tests.yml and refuses if that default is absent. REPO can override the
 GitHub repository inferred from origin. Tests create only disposable local refs.
 
 Two of the five cases discriminate the resolver defect (an abbreviated sha and an
@@ -72,10 +72,9 @@ class WatchCiLiveTests(unittest.TestCase):
             repo = match[1].removesuffix(".git")
         workflow = cls.env.get("WATCH_CI_WORKFLOW")
         if not workflow:
-            workflow = next((name for name in ("tests.yml", "ci.yml")
-                             if (ROOT / ".github/workflows" / name).is_file()), None)
-        if not workflow:
-            raise RuntimeError("set WATCH_CI_WORKFLOW to the workflow being tested")
+            workflow = "tests.yml"
+            if not (ROOT / ".github/workflows" / workflow).is_file():
+                raise RuntimeError("default workflow tests.yml is absent; set WATCH_CI_WORKFLOW to the workflow being tested")
         cls.env.update({
             "REPO": repo,
             "WATCH_CI_WORKFLOW": workflow,

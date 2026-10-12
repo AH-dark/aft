@@ -35,7 +35,7 @@ Usage:
 
 from __future__ import annotations
 
-import fnmatch
+import re
 import sys
 from typing import Any
 
@@ -270,11 +270,53 @@ def branch_patterns_include(ref: str, patterns: list[str]) -> bool:
     included = False
     for pattern in patterns:
         if pattern.startswith("!"):
-            if fnmatch.fnmatchcase(ref, pattern[1:]):
+            if _github_pattern_matches(ref, pattern[1:]):
                 included = False
-        elif fnmatch.fnmatchcase(ref, pattern):
+        elif _github_pattern_matches(ref, pattern):
             included = True
     return included
+
+
+def _github_pattern_matches(ref: str, pattern: str) -> bool:
+    """Match a branch filter using GitHub's slash-aware glob operators."""
+    parts = ["^"]
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if char == "*":
+            if i + 1 < len(pattern) and pattern[i + 1] == "*":
+                parts.append(".*")
+                i += 2
+            else:
+                parts.append("[^/]*")
+                i += 1
+        elif char == "?":
+            parts.append("[^/]")
+            i += 1
+        elif char == "[":
+            end = pattern.find("]", i + 1)
+            if end == -1:
+                parts.append(r"\[")
+                i += 1
+                continue
+            body = pattern[i + 1 : end]
+            negated = body.startswith("!")
+            if negated:
+                body = body[1:]
+            if not body:
+                parts.append(r"\[")
+                i += 1
+                continue
+            # Preserve ranges while quoting regex metacharacters that have no
+            # glob meaning. A slash is never part of a GitHub path component.
+            body = body.replace("\\", r"\\").replace("^", r"\^").replace("]", r"\]")
+            parts.append("(?=[^/])[" + ("^" if negated else "") + body + "]")
+            i = end + 1
+        else:
+            parts.append(re.escape(char))
+            i += 1
+    parts.append("$")
+    return re.fullmatch("".join(parts), ref) is not None
 
 
 def step_label(step: Any) -> str:

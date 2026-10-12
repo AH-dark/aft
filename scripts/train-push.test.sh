@@ -318,6 +318,19 @@ fail() {
 }
 ok() { checks=$((checks + 1)); printf 'train-push.test.sh: ok — %s\n' "$1"; }
 
+if [ "${TRAIN_PUSH_TEST_CASE:-}" = "unused-source-export" ]; then
+  if grep -q 'TRAIN_PUSH_SOURCE=' "$TRAIN_PUSH"; then
+    fail 'the unused TRAIN_PUSH_SOURCE export is absent'
+  else
+    ok 'the unused TRAIN_PUSH_SOURCE export is absent'
+  fi
+  if [ "$failures" -ne 0 ]; then
+    exit 1
+  fi
+  echo "train-push.test.sh: isolated unused source export check passed"
+  exit 0
+fi
+
 # Build a fixture: a bare repo playing origin, a work clone holding the train,
 # and a second clone that stands in for whoever else pushes to main.
 new_fixture() {

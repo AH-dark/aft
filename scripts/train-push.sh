@@ -129,7 +129,7 @@ set -euo pipefail
 if [ -z "${TRAIN_PUSH_EXEC_COPY:-}" ]; then
   train_push_copy="$(mktemp "${TMPDIR:-/tmp}/train-push.XXXXXX")"
   cp "${BASH_SOURCE[0]}" "$train_push_copy"
-  TRAIN_PUSH_EXEC_COPY="$train_push_copy" TRAIN_PUSH_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" \
+  TRAIN_PUSH_EXEC_COPY="$train_push_copy" \
     exec bash "$train_push_copy" "$@"
 fi
 trap 'rm -f "$TRAIN_PUSH_EXEC_COPY"' EXIT
