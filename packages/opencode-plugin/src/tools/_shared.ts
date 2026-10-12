@@ -29,6 +29,7 @@ import {
   adaptToolError,
   canonicalizeProjectRoot,
   decodeFileUrl,
+  HOST_TOOL_NAMES_FIELD,
   isBashTransportDeadError,
   timeoutForCommand,
   WORKER_SESSION_FIELD,
@@ -295,6 +296,11 @@ export async function callBridge(
   if (workerSession) {
     merged[WORKER_SESSION_FIELD] = true;
   }
+  // Like the role, the host's names for AFT's tools (set on OpenCode 2 only)
+  // travel with every request.
+  if (ctx.hostToolNames) {
+    merged[HOST_TOOL_NAMES_FIELD] = ctx.hostToolNames;
+  }
   const timeoutMs = timeoutForCommand(command);
   const sendOptions = {
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
@@ -352,8 +358,10 @@ export async function callToolCall(
     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
     configureWarningClient: ctx.client,
     ...(runtime.effectAbort ? { abortSignal: runtime.effectAbort } : {}),
-    // The caller's role travels in the tool_call envelope, beside the session.
+    // The caller's role travels in the tool_call envelope, beside the session,
+    // and so do the host's names for AFT's tools (OpenCode 2 only).
     ...(workerSession ? { workerSession: true } : {}),
+    ...(ctx.hostToolNames ? { hostToolNames: ctx.hostToolNames } : {}),
     ...options,
   };
   markBridgeStart();

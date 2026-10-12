@@ -130,6 +130,8 @@ export interface V2HostOptions {
   permissions?: Array<{ action: string; resource: string; effect: string }>;
   /** Files written into the project before the host starts. */
   files?: Record<string, string>;
+  /** User-tier AFT config, written under the host's own XDG_CONFIG_HOME. */
+  userAftConfig?: Record<string, unknown>;
 }
 
 export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
@@ -151,6 +153,13 @@ export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
   );
   const git = spawnSync("git", ["init", "-q"], { cwd: project, encoding: "utf8" });
   if (git.status !== 0) throw new Error(`could not initialize the project: ${git.stderr}`);
+  if (options.userAftConfig) {
+    await mkdir(join(dirs.config, "cortexkit"), { recursive: true });
+    await writeFile(
+      join(dirs.config, "cortexkit", "aft.jsonc"),
+      JSON.stringify(options.userAftConfig),
+    );
+  }
   for (const [name, contents] of Object.entries(options.files ?? {})) {
     await writeFile(join(project, name), contents);
   }

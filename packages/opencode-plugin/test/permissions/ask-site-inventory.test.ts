@@ -10,6 +10,7 @@ import {
   V2_BUILTIN_REPLACEMENTS,
   V2_PERMISSION_ASK_INVENTORY,
 } from "../../src/tools/hoisted/v2.js";
+import { v2HostToolName } from "../../src/v2-host-tool-names.js";
 
 const ROOT = resolve(import.meta.dir, "../..");
 const ASK_SITE_FIXTURE = {
@@ -92,9 +93,13 @@ describe("OpenCode V2 permission inventory", () => {
       registerAftTools(context, { directory: "/work/project" }, definitions) as Effect.Effect<void>,
     );
 
-    expect(removed).toEqual(V2_BUILTIN_REPLACEMENTS);
+    // The removal and the registration use the OpenCode 2 name, which for
+    // apply_patch is `patch`.
+    expect(removed).toEqual(V2_BUILTIN_REPLACEMENTS.map(v2HostToolName));
     expect(removed).not.toContain("aft_delete");
     expect(removed).not.toContain("aft_move");
-    expect(added).toEqual([...V2_BUILTIN_REPLACEMENTS, ...V2_AFT_FILESYSTEM_TOOLS]);
+    expect(added).toEqual(
+      [...V2_BUILTIN_REPLACEMENTS, ...V2_AFT_FILESYSTEM_TOOLS].map(v2HostToolName),
+    );
   });
 });

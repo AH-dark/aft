@@ -75,4 +75,22 @@ describe("BinaryBridge toolCall transport", () => {
     // worker_session is part of the request, not a transport option.
     expect(bridge.calls[0]?.options).toBeUndefined();
   });
+
+  test("puts the host's tool names in the tool_call envelope beside the session", async () => {
+    const bridge = new MockBridge({ id: "1", success: true, text: "ok" });
+    const names = { bash: "shell", apply_patch: "patch" };
+
+    await bridge.toolCall("session-123", "edit", { patch: "p" }, { hostToolNames: names });
+    await bridge.toolCall("session-456", "edit", { patch: "p" });
+
+    expect(bridge.calls[0]?.params).toEqual({
+      name: "edit",
+      arguments: { patch: "p" },
+      session_id: "session-123",
+      host_tool_names: names,
+    });
+    expect(bridge.calls[0]?.options).toBeUndefined();
+    // A call that names no tools sends none, and AFT keeps its own names.
+    expect(bridge.calls[1]?.params).not.toHaveProperty("host_tool_names");
+  });
 });

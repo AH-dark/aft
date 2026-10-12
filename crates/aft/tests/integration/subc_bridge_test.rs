@@ -2992,6 +2992,23 @@ fn subc_bridge_disabled_tools_are_refused_at_dispatch() {
     );
 }
 
+/// Two sessions bound to one root, one from an OpenCode 2 head that sends its
+/// tool names (`shell`, `patch`) on each call and one that sends none: each
+/// reply names the caller's own tools however the calls interleave.
+#[test]
+fn subc_bridge_host_tool_names_follow_each_route_not_the_root() {
+    // Backups off (a user-only setting), so a destructive hashline edit is
+    // refused with the steering that names the patch tool.
+    run_subc_bridge_production_test_with_user_config(
+        "subc_bridge_host_tool_names_follow_each_route_not_the_root",
+        Duration::from_secs(60),
+        r#"{ "backup": { "enabled": false } }"#,
+        drive_host_tool_names_per_route_daemon,
+        |_, _, _| {},
+        hashline_bridge_dispatch,
+    );
+}
+
 #[test]
 fn subc_bridge_registered_hashline_bash_cat_starts_with_tag_header() {
     run_subc_bridge_production_test_with_dispatch(
@@ -12557,6 +12574,180 @@ async fn drive_disabled_tools_daemon(input: FakeDaemonInput) {
     .await;
     assert_tool_success(&delete, "delete after reconnect");
     assert!(!victim.exists(), "the allowed delete must run");
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// Send one call with the envelope the plugins add (`edit_slot_survives`,
+/// plus `host_tool_names` when `names` is set). Returns the whole reply frame.
+async fn call_with_host_tool_names(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    names: Option<&Value>,
+    label: &str,
+) -> Frame {
+    let mut body = json!({
+        "name": name,
+        "arguments": arguments,
+        "edit_slot_survives": true,
+    });
+    if let Some(names) = names {
+        body["host_tool_names"] = names.clone();
+    }
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("host tool names call body"),
+        )
+        .expect("host tool names call frame"),
+    )
+    .await;
+    let frame = read_frame_timeout(stream, label).await;
+    assert_eq!(
+        frame.header.channel, channel,
+        "unexpected channel for {label}"
+    );
+    assert_eq!(frame.header.corr, corr, "unexpected corr for {label}");
+    frame
+}
+
+async fn drive_host_tool_names_per_route_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    std::fs::write(root1.join("probe.txt"), "rewrite-probe-line\n").expect("write probe");
+    std::fs::write(root1.join("hashline.txt"), "alpha\nbeta\n").expect("write hashline target");
+    let doc = json!({
+        "edit_mode": "hashline",
+        "bash": { "rewrite": true, "background": false },
+        "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+    });
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        "opencode-2-session",
+        doc.clone(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+    send_route_bind_with_session_and_doc(&mut stream, 2, 11, &root1, "default-names-session", doc)
+        .await;
+    expect_route_bind_ack(&mut stream, 11).await;
+
+    let v2_names = json!({ "bash": "shell", "apply_patch": "patch" });
+    let mut corr = 100_u64;
+    for (channel, names) in [
+        (1_u16, Some(&v2_names)),
+        (2, None),
+        (1, Some(&v2_names)),
+        (2, None),
+    ] {
+        let (shell, patch) = if names.is_some() {
+            ("shell", "patch")
+        } else {
+            ("bash", "apply_patch")
+        };
+        let label = format!("route {channel} ({shell})");
+
+        // A `cat` the engine rewrites into a read; its footer names this
+        // route's own command tool.
+        corr += 1;
+        let bash = call_with_host_tool_names(
+            &mut stream,
+            channel,
+            corr,
+            "bash",
+            json!({ "command": "cat probe.txt", "foreground_orchestrate": true, "compressed": false }),
+            names,
+            &format!("{label} bash rewrite"),
+        )
+        .await;
+        let text = tool_result_text(&bash);
+        assert!(text.contains("rewrite-probe-line"), "{label}: {text:?}");
+        assert!(
+            text.contains(&format!("Prefer `read` tool over {shell}.")),
+            "{label} bash footer: {text:?}"
+        );
+
+        // The hashline steering that names the patch tool.
+        corr += 1;
+        let read = call_with_host_tool_names(
+            &mut stream,
+            channel,
+            corr,
+            "read",
+            json!({ "filePath": "hashline.txt" }),
+            names,
+            &format!("{label} tagged read"),
+        )
+        .await;
+        let tag = tool_response_json(&read)["hashline_tag"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: read has no tag: {read:?}"))
+            .to_string();
+        corr += 1;
+        let edit = call_with_host_tool_names(
+            &mut stream,
+            channel,
+            corr,
+            "edit",
+            json!({ "patch": format!("*** Begin Patch\n[hashline.txt#{tag}]\nPUT 1:\n+omega\n*** End Patch") }),
+            names,
+            &format!("{label} refused edit"),
+        )
+        .await;
+        let body = String::from_utf8_lossy(&edit.body).to_string();
+        assert!(
+            body.contains(&format!(
+                "enable backups or use {patch} for this destructive change"
+            )),
+            "{label} hashline steering: {body}"
+        );
+        let other = if names.is_some() {
+            "use apply_patch"
+        } else {
+            "use patch"
+        };
+        assert!(!body.contains(other), "{label} hashline steering: {body}");
+
+        // The PowerShell refusal names the command tool. Only a host without
+        // `pwsh` refuses; elsewhere the command runs and there is nothing to word.
+        corr += 1;
+        let pwsh = call_with_host_tool_names(
+            &mut stream,
+            channel,
+            corr,
+            "bash",
+            json!({ "command": "Write-Output hi", "shell": "powershell", "foreground_orchestrate": true }),
+            names,
+            &format!("{label} powershell"),
+        )
+        .await;
+        let text = tool_result_text(&pwsh);
+        let refused = text.contains("PowerShell (pwsh) is not installed");
+        eprintln!("[host-tool-names] {label}: powershell refusal checked={refused}");
+        if refused {
+            assert!(
+                text.contains(&format!("call the {shell} tool without")),
+                "{label} powershell refusal: {text:?}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(root1.join("hashline.txt")).expect("read hashline target"),
+        "alpha\nbeta\n",
+        "every refused edit leaves the file alone"
+    );
 
     send_connection_goodbye(&mut stream).await;
 }

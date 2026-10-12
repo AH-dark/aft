@@ -31,7 +31,18 @@ export interface ToolCallOptions extends AftTransportOptions {
    * WORKER_SESSION_FIELD.
    */
   workerSession?: boolean;
+  /**
+   * The names the caller's host registered AFT's command and patch tools
+   * under, placed beside the session as HOST_TOOL_NAMES_FIELD; see there.
+   */
+  hostToolNames?: HostToolNames;
 }
+
+/**
+ * What a host calls AFT's `bash` and `apply_patch` tools, keyed by AFT's own
+ * name. OpenCode 2 registers them as `shell` and `patch`.
+ */
+export type HostToolNames = Readonly<Partial<Record<"bash" | "apply_patch", string>>>;
 
 /**
  * Request field that tells AFT the caller is a delegated worker (subagent)
@@ -42,6 +53,16 @@ export interface ToolCallOptions extends AftTransportOptions {
  * request from a worker, next to `session_id`; absent means primary.
  */
 export const WORKER_SESSION_FIELD = "worker_session";
+
+/**
+ * Request field that tells AFT what the caller's host calls AFT's command and
+ * patch tools, so text AFT writes for the agent ("Prefer `read` tool over
+ * bash.") names the tool the agent can call. It belongs to the caller, not the
+ * project: one AFT process serves every host and session bound to a root, so
+ * the plugin sets it on each request, next to `session_id`, like
+ * WORKER_SESSION_FIELD. Absent means AFT's own names, `bash` and `apply_patch`.
+ */
+export const HOST_TOOL_NAMES_FIELD = "host_tool_names";
 
 /**
  * Tool-call body field naming the catalog preset the caller runs under

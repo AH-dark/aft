@@ -73,7 +73,8 @@ for (const reduced of [false, true]) {
         { directory: "/configured/project" },
         definitions,
       );
-      const bash = projected.get("bash")!;
+      // OpenCode 2 registers AFT's bash under the host's own name, `shell`.
+      const bash = projected.get("shell")!;
       const schema = tool.schema.toJSONSchema(bash.input as never, { io: "input" }) as {
         properties: Record<string, unknown>;
       };
@@ -124,7 +125,7 @@ test("real OpenCode registration preserves narrowed wording and reprojects the l
       add: (definition) => projected.set(definition.name, definition),
       remove: () => {},
     });
-    const bash = projected.get("bash")!;
+    const bash = projected.get("shell")!;
     const schema = tool.schema.toJSONSchema(bash.input as never, { io: "input" }) as {
       properties: Record<string, unknown>;
     };

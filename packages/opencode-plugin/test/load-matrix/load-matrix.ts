@@ -1355,13 +1355,15 @@ function expectPaintedBadge(
 }
 
 /**
- * A second plugin that claims the `bash` tool name before AFT loads.
+ * A second plugin that claims the `shell` and `patch` tool names before AFT
+ * loads. On OpenCode 2 AFT registers its bash as `shell` and its apply_patch
+ * as `patch`, the names the host's own built-ins use too.
  *
  * Its subject is what the host does when two registrations want one name. It
  * also registers `aft_load_matrix_rival` under a name nobody contests, so a
- * census that is missing its `bash` but still holds that tool says the rival
+ * census that is missing its `shell` but still holds that tool says the rival
  * plugin really did register and was overwritten -- as opposed to never having
- * registered at all, which looks the same from the `bash` entry alone.
+ * registered at all, which looks the same from the `shell` entry alone.
  *
  * The census runs from inside the host, through the same `tool.list` the host
  * gives every plugin, so it reports the registry the host actually holds
@@ -1405,10 +1407,11 @@ export default {
   id: "aft.load-matrix.tool-ownership-rival",
   effect: (context) => Effect.gen(function* () {
     yield* context.tool.transform((editor) => {
-      editor.add(stub("bash", "RIVAL BASH"));
+      editor.add(stub("shell", "RIVAL SHELL"));
+      editor.add(stub("patch", "RIVAL PATCH"));
       editor.add(stub("aft_load_matrix_rival", "RIVAL CONTROL"));
     });
-    record("ownership-claimed:bash");
+    record("ownership-claimed:shell,patch");
     yield* Effect.forkScoped(Effect.gen(function* () {
       const deadline = Date.now() + 90_000;
       let tools = yield* context.tool.list();
@@ -2523,6 +2526,41 @@ export default { id: original.id, effect };
     expect(result.status).toBe(0);
   }, 180_000);
 
+  test("GA host offers AFT's shell and patch, runs shell through AFT and files it under shell", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const result = await withOperatorCanary("v2-host-tool-names", () =>
+      run("bun", ["test", "src/__tests__/e2e/v2-host-tool-names.test.ts"], pluginRoot, {
+        env: { ...process.env, AFT_V2_HOST_BINARY: v2Binary(v2) },
+        timeoutMs: 270_000,
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-host-tool-names-host-transcript]\n${transcript}`);
+    expect(transcript).toContain("1 pass");
+    expect(transcript).toContain("0 fail");
+    expect(result.status).toBe(0);
+  }, 300_000);
+
+  // The subc daemon serves every head bound to a project from one AFT module,
+  // so this row binds an OpenCode 1-style head beside the GA host's session on
+  // one root and checks each keeps its own tool names. The e2e test starts its
+  // own isolated daemon and skips, saying why, when no subc-core binary is
+  // available (set SUBC_CORE_BIN).
+  test("GA host on the subc daemon keeps its tool names beside an OpenCode 1 head", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const result = await withOperatorCanary("v2-subc-tool-names", () =>
+      run("bun", ["test", "src/__tests__/e2e/v2-subc-tool-names.test.ts"], pluginRoot, {
+        env: { ...process.env, AFT_V2_HOST_BINARY: v2Binary(v2) },
+        timeoutMs: 270_000,
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-subc-tool-names-host-transcript]\n${transcript}`);
+    expect(transcript).toContain("1 pass");
+    expect(transcript).toContain("0 fail");
+    expect(result.status).toBe(0);
+  }, 300_000);
+
   test("GA TUI host mounts the sidebar and its status command without a keymap error", async () => {
     const { v2 } = await ensureHostInstalls();
     const packageRoot = await copyInstalledPlugin(v2, "v2-tui-keymap");
@@ -2706,7 +2744,7 @@ export default { id: original.id, effect };
     expect(events).toBe("");
   }, 240_000);
 
-  test("GA host holds AFT's bash when another plugin claimed that name first", async () => {
+  test("GA host holds AFT's shell and patch when another plugin claimed those names first", async () => {
     const { v2 } = await ensureHostInstalls();
     const packageRoot = await copyInstalledPlugin(v2, "v2-tool-ownership");
     const rivalRoot = await writeV2ToolOwnershipRival(v2, "v2-tool-ownership-rival");
@@ -2730,7 +2768,7 @@ export default { id: original.id, effect };
       timeoutMs: 240_000,
     });
 
-    expect(events).toContain("ownership-claimed:bash\n");
+    expect(events).toContain("ownership-claimed:shell,patch\n");
     expect(events).toContain("ownership-census-complete\n");
 
     const census = new Map<string, Set<string>>();
@@ -2743,29 +2781,31 @@ export default { id: original.id, effect };
     }
     const describe = (name: string): string[] => [...(census.get(name) ?? [])];
     console.log(
-      `[v2-tool-ownership-census]\nbash=${JSON.stringify(describe("bash"))}\nshell=${JSON.stringify(
-        describe("shell"),
+      `[v2-tool-ownership-census]\nshell=${JSON.stringify(describe("shell"))}\npatch=${JSON.stringify(
+        describe("patch"),
       )}\nrival=${JSON.stringify(describe("aft_load_matrix_rival"))}`,
     );
 
     // The rival's uncontested tool is the control: it proves the rival plugin
-    // registered successfully here, so its `bash` was overwritten by AFT's
-    // rather than never having been registered at all.
+    // registered successfully here, so its `shell` and `patch` were
+    // overwritten by AFT's rather than never having been registered at all.
     expect(describe("aft_load_matrix_rival")).toEqual(["RIVAL CONTROL"]);
     expect(census.has("aft_outline")).toBe(true);
 
-    // The answer this row exists for: the host holds AFT's bash, not the
-    // registration that claimed the name first.
-    const bash = describe("bash");
-    expect(bash).toHaveLength(1);
-    expect(bash[0]).toStartWith("Execute shell commands.");
-    expect(bash).not.toContain("RIVAL BASH");
-
-    // The host's own shell surface is registered as `shell`, so nothing the
-    // host owns is displaced by AFT taking `bash`.
+    // The answer this row exists for: when the rival plugin and the host's
+    // own built-ins (this config leaves the built-in shell and patch plugins
+    // on) registered `shell` and `patch` before AFT, each name holds exactly
+    // one tool, and it is AFT's: its description, not the rival's or the host's.
     const shell = describe("shell");
     expect(shell).toHaveLength(1);
-    expect(shell[0]).toStartWith("Execute a shell command");
+    expect(shell[0]).toStartWith("Execute shell commands.");
+    const patch = describe("patch");
+    expect(patch).toHaveLength(1);
+    expect(patch[0]).toStartWith("Use the `patch` tool to edit files.");
+
+    // AFT's OpenCode 1 names are not registered beside them.
+    expect(census.has("bash")).toBe(false);
+    expect(census.has("apply_patch")).toBe(false);
   }, 300_000);
 
   test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {
@@ -2996,6 +3036,8 @@ export default entry;
       "v2-permission-prompt",
       "v2-synthetic-completion",
       "v2-completion-detach",
+      "v2-host-tool-names",
+      "v2-subc-tool-names",
       "v2-tui-keymap",
       "v2-theme-capture",
       "v2-tui-light-theme",

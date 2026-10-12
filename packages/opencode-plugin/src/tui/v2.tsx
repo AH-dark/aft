@@ -333,10 +333,13 @@ function AftStatusCommands(props: { context: V2TuiContext; rpc: AftRpcClient }) 
 const HOST_TOOL_OVERLAP_TOAST_MS = 15_000;
 
 /**
- * Show the server's one-off built-in tool overlap notice as a toast. A toast
- * reaches the person at the terminal and nothing else; the server sends this
- * at most once per host process, so every TUI subscribed at that moment shows
- * it once. A host without a toast surface shows nothing.
+ * Show a server's one-off built-in tool overlap notice as a toast. A toast
+ * reaches the person at the terminal and nothing else. The current server no
+ * longer sends this notice: on OpenCode 2 AFT registers its command and patch
+ * tools as `shell` and `patch`, replacing the host's built-ins instead of
+ * sitting beside them. The subscription stays so a TUI still shows the notice
+ * from an older AFT server running in the same host during an upgrade. A host
+ * without a toast surface shows nothing.
  */
 export function subscribeV2HostToolOverlapToast(
   context: Pick<V2TuiContext, "ui">,

@@ -28,6 +28,9 @@ pub struct RewriteRequest {
     pub branch_id: &'static str,
     pub decision_class_id: &'static str,
     pub params: Value,
+    /// The caller's names for AFT's command and patch tools, which the footer
+    /// of a rewritten command names (see [`crate::host_tool_names`]).
+    pub host_tool_names: crate::host_tool_names::HostToolNames,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +71,14 @@ pub fn try_rewrite(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
-    try_rewrite_for_request(command, "bash_rewrite", session_id, ctx, principal)
+    try_rewrite_for_request(
+        command,
+        "bash_rewrite",
+        session_id,
+        &crate::host_tool_names::HostToolNames::default(),
+        ctx,
+        principal,
+    )
 }
 
 /// Make the rewrite decision for one public bash request. A native route is
@@ -79,6 +89,7 @@ pub fn try_rewrite_for_request(
     command: &str,
     request_id: &str,
     session_id: Option<&str>,
+    host_tool_names: &crate::host_tool_names::HostToolNames,
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
@@ -91,5 +102,5 @@ pub fn try_rewrite_for_request(
         );
         return None;
     }
-    dispatch::dispatch_for_request(command, request_id, session_id, ctx)
+    dispatch::dispatch_for_request(command, request_id, session_id, host_tool_names, ctx)
 }

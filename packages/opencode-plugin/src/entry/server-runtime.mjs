@@ -18,7 +18,10 @@ import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers, v2PromptChannelFor } from "../tools/hoisted/v2.js";
-import { registerV2HostToolOverlapNotice } from "../v2-host-tool-overlap.js";
+import {
+  renameV2ToolReferences,
+  V2_HOST_TOOL_NAMES,
+} from "../v2-host-tool-names.js";
 import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
 import { registerV2ToolHooks } from "../v2-tool-hooks.js";
 import { registerV2WorkflowHints } from "../v2-workflow-hints.js";
@@ -42,7 +45,6 @@ const defaults = {
   registerPromptHook: registerV2PromptDetachHook,
   registerToolHooks: registerV2ToolHooks,
   registerWorkflowHints: registerV2WorkflowHints,
-  registerHostToolOverlapNotice: registerV2HostToolOverlapNotice,
   // The prompt server comes from the user-only `opencode` block of the
   // Location's config; without it AFT finds the server it runs inside.
   // `getConfig` returns the Location's current config, which a live reload
@@ -117,6 +119,12 @@ async function bootLocation(context, location, dependencies) {
     client: context,
     config,
     hashlineEffective: openCodeHashlineEffective(config),
+    // The engine's reply text names AFT's command and patch tools ("Prefer
+    // `read` tool over bash."), and on OpenCode 2 they are `shell` and
+    // `patch`. Every tool request sends this map, beside its session; it is
+    // never configure state, because one AFT process can serve an OpenCode 1
+    // head, an OpenCode 2 session and a Pi session on the same project.
+    hostToolNames: V2_HOST_TOOL_NAMES,
     storageDir: environment.storageDir,
     isProjectEnabled,
   };
@@ -129,7 +137,9 @@ async function bootLocation(context, location, dependencies) {
   const { hashlineEditRegistered } = applyToolSurfaceOverrides(pool, config, registeredTools);
   reportHashlineDowngrade(config, registeredTools, notify);
   toolContext.hashlineEffective = hashlineEditRegistered;
-  const hintsBlock = buildHintsForRegisteredTools(config, registeredTools, hashlineEditRegistered);
+  // The hints are written for OpenCode 1's tool names; name OpenCode 2's.
+  const hints = buildHintsForRegisteredTools(config, registeredTools, hashlineEditRegistered);
+  const hintsBlock = hints === null ? null : renameV2ToolReferences(hints);
   // Keep this Location's live config keys current when a config file changes.
   // The finalizer that releases the bridge also stops the watch.
   const liveConfigReload = dependencies.startLiveConfigReload({
@@ -241,17 +251,13 @@ export function makeServerEffect(overrides = {}) {
         runtime.tools,
         runtime.consumers,
       );
-      yield* dependencies.registerToolHooks(context, runtime.toolContext, new Set(Object.keys(runtime.tools)));
-      yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
-      // Tell the user once when the host's own patch or shell tool still runs
-      // beside AFT's apply_patch or bash. Checked on the first prompt, once
-      // every plugin has registered its tools, and shown by AFT's TUI plugin
-      // as a toast; nothing is written into the session, which the model reads.
-      yield* dependencies.registerHostToolOverlapNotice(
+      yield* dependencies.registerToolHooks(
         context,
+        runtime.toolContext,
         new Set(Object.keys(runtime.tools)),
-        (message) => rpc.emitHostToolOverlap({ message }),
+        runtime.tools.bash?.description,
       );
+      yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
     });
   };
 }

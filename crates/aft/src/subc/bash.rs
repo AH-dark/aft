@@ -786,6 +786,17 @@ pub(super) fn submit_deferred_bash(
                             Value::Bool(true),
                         );
                     }
+                    // Likewise the caller's tool names, taken from the call body
+                    // (kept on the call's format context), never from the arguments.
+                    translated
+                        .args
+                        .remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+                    if let Some(names) = &format_context_for_spawn.host_tool_names {
+                        translated.args.insert(
+                            crate::host_tool_names::HOST_TOOL_NAMES_FIELD.to_string(),
+                            serde_json::json!(names),
+                        );
+                    }
                     if let Some(scope) = &run_scope {
                         if let Err(error) = scope.cached_budget().and_then(|budget| budget.constrain_bash(&mut translated.args)) {
                             return finish_bash_spawn_immediate(
@@ -3531,6 +3542,7 @@ mod grant_path_tests {
             "echo fenced >> notes.txt",
             &req.id,
             req.session_id.as_deref(),
+            &req.host_tool_names(),
             ctx,
             &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
         )
@@ -3543,6 +3555,7 @@ mod grant_path_tests {
             "echo fenced >> notes.txt",
             &req.id,
             req.session_id.as_deref(),
+            &req.host_tool_names(),
             ctx,
             &crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
         )

@@ -18,8 +18,8 @@ import { existsSync } from "node:fs";
 import { aftBinary, bootV2Host, toolResult, until } from "./v2-host.js";
 
 const hostBinary = process.env.AFT_V2_HOST_BINARY;
-/** The name AFT's command tool is registered under on OpenCode 2. */
-const COMMAND_TOOL = "bash";
+/** The name AFT's command tool (its `bash`) is registered under on OpenCode 2. */
+const COMMAND_TOOL = "shell";
 // Long enough that the waiting call is running before the task finishes: a
 // completion that arrives first has no wait to detach.
 const BACKGROUND = "sleep 8; echo background-done";

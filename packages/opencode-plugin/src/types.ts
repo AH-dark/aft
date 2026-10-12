@@ -1,4 +1,4 @@
-import type { AftTransportPool } from "@cortexkit/aft-bridge";
+import type { AftTransportPool, HostToolNames } from "@cortexkit/aft-bridge";
 import type { PluginInput } from "@opencode-ai/plugin";
 import type { AftConfig } from "./config.js";
 
@@ -21,6 +21,12 @@ export interface PluginContext {
   config: AftConfig;
   /** Whether hashline edit/read mode is active for this plugin registration. */
   hashlineEffective?: boolean;
+  /**
+   * What this host calls AFT's command and patch tools, sent on every request
+   * so AFT's reply text names them. Set by the OpenCode 2 runtime only; absent
+   * leaves AFT's own names.
+   */
+  hostToolNames?: HostToolNames;
   /** Absolute path to AFT's storage dir (e.g. ~/.local/share/opencode/storage/plugin/aft) */
   storageDir: string;
   /** Returns false when user and project config merge to `enabled: false` for this project. */

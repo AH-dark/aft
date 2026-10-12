@@ -109,6 +109,7 @@ pub fn handle_with_dispatch(
         // when the session connected (the root config).
         disabled_tools: None,
         worker_session: req.worker_session(),
+        host_tool_names: req.sent_host_tool_names(),
     };
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);

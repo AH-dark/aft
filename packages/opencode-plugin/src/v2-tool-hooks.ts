@@ -5,6 +5,11 @@ import { Effect, Schema } from "effect";
 import { prepareOpenCodeArguments } from "./normalize-schemas.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { rememberReadModel } from "./shared/read-vision.js";
+import {
+  aftToolNameForV2Host,
+  renameV2ToolReferences,
+  v2HostToolName,
+} from "./v2-host-tool-names.js";
 
 // The host catches this tagged failure as a failed tool call, not a session
 // defect. Use its public error shape without coupling to a second schema copy.
@@ -12,29 +17,75 @@ class ArgumentError extends Schema.TaggedError<ArgumentError>()("Tool.Error", {
   message: Schema.String,
 }) {}
 
-/** Match the host's GPT patch preference without touching tools AFT did not register. */
+/**
+ * Match the host's GPT patch preference without touching tools AFT did not
+ * register. `registeredTools` holds AFT names; `event.tools` is keyed by the
+ * names the host registered them under (`apply_patch` is `patch` there).
+ */
 function gateEditingTools(event: SessionContext, registeredTools: ReadonlySet<string>): void {
   const id = event.model.id;
   const prefersPatch = id.includes("gpt-") && !id.includes("oss") && !id.includes("gpt-4");
   for (const name of prefersPatch ? ["edit", "write"] : ["apply_patch"]) {
-    if (registeredTools.has(name)) delete event.tools[name];
+    if (registeredTools.has(name)) delete event.tools[v2HostToolName(name)];
   }
 }
 
-/** Port the V1 raw-argument, result-text and current-model seams to V2. */
+/**
+ * How the host's own shell tool describes itself. While OpenCode 2's built-in
+ * shell plugin is loaded (the user's config does not remove it with
+ * `-opencode.tool.shell`), its request hooks rewrite the description of
+ * whatever tool is named `shell` to this text on every model request, AFT's
+ * included. Only a description that starts this way is treated as the host's
+ * rewrite; another plugin's own `shell` is left alone.
+ */
+const HOST_SHELL_DESCRIPTION = /^Execute a shell command\b/;
+
+/**
+ * Put AFT's own description back on its `shell` tool after the host's
+ * built-in shell plugin rewrote it. AFT's hooks are registered after the
+ * built-in plugins' (the host loads built-ins first and runs hooks in
+ * registration order), so this runs after the rewrite it undoes.
+ */
+function restoreShellDescription(
+  event: SessionContext,
+  registeredTools: ReadonlySet<string>,
+  shellDescription: string | undefined,
+): void {
+  if (shellDescription === undefined || !registeredTools.has("bash")) return;
+  const shell = event.tools[v2HostToolName("bash")];
+  if (!shell || shell.description === shellDescription) return;
+  if (!HOST_SHELL_DESCRIPTION.test(shell.description)) return;
+  shell.description = shellDescription;
+}
+
+/**
+ * Register the OpenCode 2 hooks that do what AFT's OpenCode 1 hooks do:
+ * normalise a call's raw arguments before the host validates them, append the
+ * merge-conflict hint to a command's result text, gate the editing tools by
+ * model and remember the session's current model.
+ *
+ * `registeredTools` holds AFT tool names; the host's events name tools by the
+ * name they are registered under, which differs for `bash` (`shell`) and
+ * `apply_patch` (`patch`). `bashDescription` is the description AFT's bash
+ * tool was built with, as written for OpenCode 1.
+ */
 export function registerV2ToolHooks(
   context: unknown,
   runtime: { hashlineEffective?: boolean },
   registeredTools: ReadonlySet<string>,
+  bashDescription?: string,
 ) {
   const host = context as { tool?: ToolDomain; session?: SessionDomain };
+  const shellDescription =
+    bashDescription === undefined ? undefined : renameV2ToolReferences(bashDescription);
   return Effect.gen(function* () {
     if (typeof host.tool?.hook === "function") {
       yield* host.tool.hook("execute.before", (event) =>
         Effect.try({
           try: () => {
-            if (!registeredTools.has(event.tool)) return;
-            event.input = prepareOpenCodeArguments(event.tool, event.input, {
+            const name = aftToolNameForV2Host(event.tool);
+            if (!registeredTools.has(name)) return;
+            event.input = prepareOpenCodeArguments(name, event.input, {
               hashlineEffective: runtime.hashlineEffective,
             });
           },
@@ -46,7 +97,7 @@ export function registerV2ToolHooks(
       yield* host.tool.hook("execute.after", (event) =>
         Effect.sync(() => {
           if (
-            event.tool !== "bash" ||
+            aftToolNameForV2Host(event.tool) !== "bash" ||
             event.status !== "completed" ||
             !registeredTools.has("bash") ||
             !registeredTools.has("aft_conflicts")
@@ -72,12 +123,16 @@ export function registerV2ToolHooks(
       // Disabling the built-in patch plugin removes its gate, so AFT owns this one.
       for (const name of ["compaction", "generate"] as const) {
         yield* host.session.hook(name, (event) =>
-          Effect.sync(() => gateEditingTools(event, registeredTools)),
+          Effect.sync(() => {
+            gateEditingTools(event, registeredTools);
+            restoreShellDescription(event, registeredTools, shellDescription);
+          }),
         );
       }
       yield* host.session.hook("context", (event) =>
         Effect.sync(() => {
           gateEditingTools(event, registeredTools);
+          restoreShellDescription(event, registeredTools, shellDescription);
           rememberReadModel(context as object, event.sessionID, {
             providerID: event.model.providerID,
             modelID: event.model.id,

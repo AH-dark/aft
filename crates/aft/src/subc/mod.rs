@@ -8029,6 +8029,7 @@ async fn handle_tool_call(
             edit_slot_survives: None,
             preview: false,
             worker_session: false,
+            host_tool_names: None,
             preset: call.preset,
             v1_role: Some(role),
             call_key: call.call_key,
@@ -8197,6 +8198,11 @@ async fn handle_tool_call(
         identity.project_root.as_path(),
     );
     format_context.worker_session = role.is_worker();
+    format_context.host_tool_names = call.host_tool_names.as_ref().and_then(|field| {
+        crate::host_tool_names::HostToolNames::from_request_field(Some(field))
+            .map_err(|error| log::warn!("subc tool call: {error}; using the default tool names"))
+            .ok()
+    });
     format_context.bash_watch_available = Some(
         role.has_bash_watch()
             && crate::tool_gate::catalog_keeps("bash_watch", &identity.disabled_tools),
@@ -8537,6 +8543,7 @@ async fn handle_tool_call(
         standard_edit_grammar: identity.role == tool_provider::RouteRole::ToolProviderV1,
         disabled_tools: Some(Arc::clone(&identity.disabled_tools)),
         worker_session: role.is_worker(),
+        host_tool_names: format_context.host_tool_names.clone(),
     };
 
     let uses_deferred_response_seam = bare_name == "inspect"
@@ -9344,6 +9351,7 @@ fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcErro
                 edit_slot_survives: None,
                 preview: false,
                 worker_session: false,
+                host_tool_names: None,
                 preset: None,
                 v1_role: None,
                 call_key: None,
@@ -9408,6 +9416,13 @@ struct ToolCallRequest {
     /// [`ToolCallRequest::caller_role`].
     #[serde(default)]
     worker_session: bool,
+    /// The caller's names for AFT's command and patch tools (see
+    /// `RawRequest::host_tool_names`). The OpenCode 2 plugin sets it next to
+    /// the call on every request, like `worker_session`; a route serving
+    /// several hosts' sessions on one root therefore words each reply for its
+    /// own caller. Absent leaves the default names.
+    #[serde(default)]
+    host_tool_names: Option<Value>,
     /// The catalog preset the call names (subc-protocol 0.29's
     /// `ToolCallRequest.preset`, set by the consumer beside `call_key`). It
     /// decides the call's role; see `tool_provider::resolve_caller_role`.

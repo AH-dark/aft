@@ -19,6 +19,7 @@ import { type AftConfig, getConfigLoadNotices, loadAftConfig } from "../config.j
 import { buildOpenCodeToolMap, registerAftTools } from "../tool-registration.js";
 import type { V2ProviderTool } from "../tools/definitions/v2.js";
 import type { PluginContext } from "../types.js";
+import { v2HostToolName } from "../v2-host-tool-names.js";
 
 const HOSTS = ["apply_patch", "bash", "edit", "glob", "grep", "read", "write"];
 
@@ -131,7 +132,10 @@ describe("OpenCode feature-config registration", () => {
     });
 
     test(`V2 registers canonical tools minus resolved disables: ${name}`, () => {
-      expect(v2Names(loadWithUserConfig(user))).toEqual(expected(disabled));
+      // Same inventory, with bash and apply_patch under OpenCode 2's names.
+      expect(v2Names(loadWithUserConfig(user))).toEqual(
+        expected(disabled).map(v2HostToolName).sort(),
+      );
     });
   }
 

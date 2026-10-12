@@ -501,6 +501,34 @@ impl RawRequest {
         };
         flag(&self.params) || self.params.get("params").is_some_and(flag)
     }
+
+    /// The names the caller's host registered AFT's command and patch tools
+    /// under (see [`crate::host_tool_names`]), for reply text that tells the
+    /// agent which tool to call. Read from the `host_tool_names` envelope field,
+    /// at the top level or in a nested `params` object like
+    /// [`RawRequest::worker_session`]. Absent, or not a valid map, gives the
+    /// default names: the field only changes how text is worded, so a bad value
+    /// is logged and never fails the request.
+    pub fn host_tool_names(&self) -> crate::host_tool_names::HostToolNames {
+        self.sent_host_tool_names().unwrap_or_default()
+    }
+
+    /// The names from the `host_tool_names` envelope field, or `None` when the
+    /// request has no usable field. Lets a caller forward the names onward
+    /// only when the request carried them.
+    pub fn sent_host_tool_names(&self) -> Option<crate::host_tool_names::HostToolNames> {
+        use crate::host_tool_names::{HostToolNames, HOST_TOOL_NAMES_FIELD};
+        let field = self.params.get(HOST_TOOL_NAMES_FIELD).or_else(|| {
+            self.params
+                .get("params")
+                .and_then(|nested| nested.get(HOST_TOOL_NAMES_FIELD))
+        })?;
+        HostToolNames::from_request_field(Some(field))
+            .map_err(|error| {
+                log::warn!("request {}: {error}; using the default tool names", self.id);
+            })
+            .ok()
+    }
 }
 
 /// Request field that marks the caller as a delegated worker session; see
