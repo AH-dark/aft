@@ -89,6 +89,9 @@ CREATE TABLE IF NOT EXISTS sweep_lease (
 /// measurement. Disk-limit eviction never removes a view with a session row
 /// whose owner process is alive, and admission of a new view decides from
 /// the recorded disk use so that it never has to walk a directory.
+/// `usage_record.complete` says whether the last measurement read every
+/// view and the family store to the end; the rows of anything it could not
+/// read keep their previous values.
 ///
 /// The tables are created with `IF NOT EXISTS` by every writer that needs
 /// them, without a schema version bump: releases that predate them never
@@ -112,6 +115,11 @@ CREATE TABLE IF NOT EXISTS view_usage (
 CREATE TABLE IF NOT EXISTS family_usage (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     file_bytes INTEGER NOT NULL,
+    measured_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage_record (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    complete INTEGER NOT NULL,
     measured_at_ms INTEGER NOT NULL
 );
 "#;

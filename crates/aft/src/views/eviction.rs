@@ -164,6 +164,12 @@ impl DiskUsage {
     fn largest_view(&self) -> u64 {
         self.views.iter().map(|view| view.bytes).max().unwrap_or(0)
     }
+
+    /// True when every view directory was walked to the end, so that
+    /// `view_store_bytes` and `held_view_bytes` are totals and not a part.
+    fn views_complete(&self) -> bool {
+        self.views.iter().all(|view| view.complete)
+    }
 }
 
 /// How the family store's keys divide among the views that rely on them.
@@ -724,7 +730,17 @@ pub fn enforce(
     }
 
     report.after = measure(registry, deadline)?;
-    report.over_hard = over_hard((&report.after).into(), budget, 0);
+    // A measurement cut short by the deadline undercounts; the recorded
+    // totals keep the last complete value of whatever it could not read.
+    let totals = if report.after.complete {
+        (&report.after).into()
+    } else {
+        recorded_totals(registry)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| (&report.after).into())
+    };
+    report.over_hard = over_hard(totals, budget, 0);
     Ok(report)
 }
 
@@ -736,6 +752,10 @@ pub struct UsageTotals {
     pub held_view_bytes: u64,
     pub largest_view_bytes: u64,
     pub family_store_file_bytes: u64,
+    /// False when the measurement behind these totals could not read every
+    /// view or the family store to the end. Recorded totals then hold the
+    /// previous value of each part that was not read.
+    pub complete: bool,
 }
 
 impl From<&DiskUsage> for UsageTotals {
@@ -745,6 +765,7 @@ impl From<&DiskUsage> for UsageTotals {
             held_view_bytes: usage.held_view_bytes,
             largest_view_bytes: usage.largest_view(),
             family_store_file_bytes: usage.family_store.file_bytes,
+            complete: usage.complete,
         }
     }
 }
@@ -777,18 +798,30 @@ fn over_hard(totals: UsageTotals, budget: DiskBudget, reserve: u64) -> Vec<Strin
     reasons
 }
 
-/// Records `usage` in the registry, replacing the previous record, so that
-/// admission can decide without measuring. Views that left the registry
-/// drop out of the totals because admission joins on the member rows.
+/// Records `usage` in the registry so that admission can decide without
+/// measuring. Views that left the registry drop out of the totals because
+/// admission joins on the member rows.
+///
+/// Only what was measured to the end is written. A walk stopped by the
+/// deadline or a bound reports a part of the bytes (after the deadline,
+/// none at all), and recording that would let admission read a full family
+/// as empty. So a view or a family store measured incompletely keeps its
+/// previous row, and `usage_record.complete` is cleared to say the record
+/// is not one complete measurement.
 fn record_usage(registry: &FamilyRegistry, usage: &DiskUsage) -> RegistryResult<()> {
     let now = crate::pins::now_ms() as i64;
+    let views_complete = usage.views_complete();
     registry.with_barrier(|tx| {
         tx.execute_batch(super::registry::RUNTIME_SCHEMA)?;
-        tx.execute("DELETE FROM view_usage", [])?;
-        for view in &usage.views {
+        if views_complete {
+            tx.execute("DELETE FROM view_usage", [])?;
+        }
+        for view in usage.views.iter().filter(|view| view.complete) {
             tx.execute(
                 "INSERT INTO view_usage (scope, bytes, held, measured_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(scope) DO UPDATE SET bytes = excluded.bytes,
+                     held = excluded.held, measured_at_ms = excluded.measured_at_ms",
                 params![
                     view.scope,
                     i64::try_from(view.bytes).unwrap_or(i64::MAX),
@@ -797,14 +830,22 @@ fn record_usage(registry: &FamilyRegistry, usage: &DiskUsage) -> RegistryResult<
                 ],
             )?;
         }
+        if usage.family_store.complete {
+            tx.execute(
+                "INSERT INTO family_usage (singleton, file_bytes, measured_at_ms) VALUES (1, ?1, ?2)
+                 ON CONFLICT(singleton) DO UPDATE SET file_bytes = excluded.file_bytes,
+                     measured_at_ms = excluded.measured_at_ms",
+                params![
+                    i64::try_from(usage.family_store.file_bytes).unwrap_or(i64::MAX),
+                    now
+                ],
+            )?;
+        }
         tx.execute(
-            "INSERT INTO family_usage (singleton, file_bytes, measured_at_ms) VALUES (1, ?1, ?2)
-             ON CONFLICT(singleton) DO UPDATE SET file_bytes = excluded.file_bytes,
+            "INSERT INTO usage_record (singleton, complete, measured_at_ms) VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET complete = excluded.complete,
                  measured_at_ms = excluded.measured_at_ms",
-            params![
-                i64::try_from(usage.family_store.file_bytes).unwrap_or(i64::MAX),
-                now
-            ],
+            params![usage.complete, now],
         )?;
         Ok(())
     })
@@ -850,11 +891,30 @@ pub fn recorded_totals(registry: &FamilyRegistry) -> RegistryResult<Option<Usage
                 ))
             },
         )?;
+        // A record written before `usage_record` existed may hold a partial
+        // measurement, so it counts as incomplete.
+        let complete = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'usage_record'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+            && connection
+                .query_row(
+                    "SELECT complete FROM usage_record WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
         Ok(Some(UsageTotals {
             view_store_bytes: view_store_bytes.max(0) as u64,
             held_view_bytes: held_view_bytes.max(0) as u64,
             largest_view_bytes: largest_view_bytes.max(0) as u64,
             family_store_file_bytes: family_store_file_bytes.max(0) as u64,
+            complete,
         }))
     })
 }
@@ -893,7 +953,17 @@ pub fn admit_new_view(registry: &FamilyRegistry) -> RegistryResult<()> {
             "no eviction pass could start because its thread could not be created"
         }
     };
-    let reason = format!("{}; {}", reasons.join("; "), pass);
+    let reason = format!(
+        "{}; {}{}",
+        reasons.join("; "),
+        pass,
+        if totals.complete {
+            ""
+        } else {
+            "; the last disk measurement did not finish, so these totals keep earlier values \
+             for what it could not read"
+        }
+    );
     crate::slog_warn!(
         "view admission refused family={} {}",
         registry.family(),
@@ -1114,24 +1184,48 @@ pub(crate) fn wait_for_background_enforcement(registry: &FamilyRegistry) {
 }
 
 fn log_report(registry: &FamilyRegistry, report: &EnforcementReport) {
-    crate::slog_info!(
+    crate::slog_info!("{}", report_line(registry.family(), report));
+    for reason in &report.over_hard {
+        crate::slog_warn!("view disk limits family={} {}", registry.family(), reason);
+    }
+}
+
+/// A byte total for the log, or `unknown` when the walk behind it stopped
+/// before the end and the number is only a part.
+fn shown_bytes(bytes: u64, complete: bool) -> String {
+    if complete {
+        bytes.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn report_line(family: &str, report: &EnforcementReport) -> String {
+    let after_views = report.after.views_complete();
+    format!(
         "view disk limits family={} view_store_bytes={}->{} held_bytes={} family_store_bytes={}->{} \
          evicted={} held={} sweep_deleted_bytes={} sweep_error={} stopped_early={}",
-        registry.family(),
-        report.before.view_store_bytes,
-        report.after.view_store_bytes,
-        report.after.held_view_bytes,
-        report.before.family_store.file_bytes,
-        report.after.family_store.file_bytes,
+        family,
+        shown_bytes(
+            report.before.view_store_bytes,
+            report.before.views_complete()
+        ),
+        shown_bytes(report.after.view_store_bytes, after_views),
+        shown_bytes(report.after.held_view_bytes, after_views),
+        shown_bytes(
+            report.before.family_store.file_bytes,
+            report.before.family_store.complete
+        ),
+        shown_bytes(
+            report.after.family_store.file_bytes,
+            report.after.family_store.complete
+        ),
         report.evicted.len(),
         report.held.len(),
         report.sweep.as_ref().map_or(0, |sweep| sweep.deleted_bytes),
         report.sweep_error.as_deref().unwrap_or("none"),
         report.stopped_early
-    );
-    for reason in &report.over_hard {
-        crate::slog_warn!("view disk limits family={} {}", registry.family(), reason);
-    }
+    )
 }
 
 #[cfg(test)]
@@ -2157,5 +2251,109 @@ mod tests {
                 "a pass that ran is not due again before the interval"
             );
         }
+    }
+
+    /// The recorded totals without the completeness flag, which is the one
+    /// field an incomplete pass is expected to change.
+    fn recorded_bytes(registry: &FamilyRegistry) -> (u64, u64, u64, u64) {
+        let totals = recorded_totals(registry).unwrap().expect("recorded");
+        (
+            totals.view_store_bytes,
+            totals.held_view_bytes,
+            totals.largest_view_bytes,
+            totals.family_store_file_bytes,
+        )
+    }
+
+    /// A pass that reaches its deadline measures nothing to the end: every
+    /// walk after the deadline reports zero bytes. That must not replace the
+    /// recorded totals, which admission reads, and the log must not show the
+    /// partial sum as a total.
+    #[test]
+    fn a_pass_stopped_at_its_deadline_keeps_the_recorded_totals() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        for (seed, scope) in ["a", "b"].into_iter().enumerate() {
+            idle_view(&registry, scope, seed as u64, 64);
+        }
+        let complete = measure(&registry, None).unwrap();
+        assert!(complete.complete);
+        let before = recorded_bytes(&registry);
+        assert!(before.0 > 0 && before.3 > 0, "{before:?}");
+        assert!(recorded_totals(&registry).unwrap().unwrap().complete);
+
+        let report = enforce(
+            &registry,
+            EnforceOptions {
+                deadline: Some(Instant::now()),
+                observer: None,
+            },
+        )
+        .unwrap();
+
+        assert!(report.stopped_early && !report.after.complete);
+        assert_eq!(
+            report.after.view_store_bytes, 0,
+            "the walks after the deadline measured nothing"
+        );
+        assert_eq!(
+            recorded_bytes(&registry),
+            before,
+            "an incomplete measurement replaced the recorded totals"
+        );
+        assert!(
+            !recorded_totals(&registry).unwrap().unwrap().complete,
+            "the record says its last measurement did not finish"
+        );
+        let line = report_line(FAMILY, &report);
+        assert!(
+            line.contains("view_store_bytes=unknown->unknown held_bytes=unknown")
+                && line.contains("family_store_bytes=unknown->unknown"),
+            "{line}"
+        );
+        assert!(report.over_hard.is_empty());
+
+        // A later complete measurement replaces the record again. The family
+        // store's files have grown meanwhile (registry and write-ahead log
+        // writes), so only the view-store totals are compared.
+        measure(&registry, None).unwrap();
+        assert_eq!(recorded_bytes(&registry).0, before.0);
+        assert!(recorded_totals(&registry).unwrap().unwrap().complete);
+    }
+
+    /// Admission still refuses a family whose last complete record is over
+    /// the hard limit after a pass that stopped at its deadline, and says
+    /// that the last measurement did not finish.
+    #[test]
+    fn admission_refuses_over_the_last_complete_record_after_an_incomplete_pass() {
+        let storage = tempfile::tempdir().unwrap();
+        let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+        for (seed, scope) in ["a", "b"].into_iter().enumerate() {
+            idle_view(&registry, scope, seed as u64, 64);
+        }
+        let usage = measure(&registry, None).unwrap();
+        // No soft limit, so no pass evicts anything; the hard limit leaves
+        // no room for a new view the size of the largest one.
+        registry.set_disk_budget(budget(u64::MAX, usage.view_store_bytes));
+        enforce(
+            &registry,
+            EnforceOptions {
+                deadline: Some(Instant::now()),
+                observer: None,
+            },
+        )
+        .unwrap();
+        let new_root = storage.path().join("c");
+        fs::create_dir_all(&new_root).unwrap();
+
+        let refused = registry.register_view("c", &new_root).unwrap_err();
+
+        wait_for_background_enforcement(&registry);
+        let RegistryError::AdmissionQueued(reason) = &refused else {
+            panic!("unexpected error: {refused}");
+        };
+        assert!(reason.starts_with("queued: view store disk"), "{reason}");
+        assert!(reason.contains("did not finish"), "{reason}");
+        assert!(!registered(&registry, "c"));
     }
 }
