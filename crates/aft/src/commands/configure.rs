@@ -9398,9 +9398,12 @@ mod tests {
         };
         let projected = dead_code(store);
         // `projected` is Debug-formatted, which escapes Windows backslashes, so
-        // the expected path is Debug-formatted the same way.
+        // the expected tail is Debug-formatted the same way. Only the tail is
+        // compared: on Windows the root can carry a `\\?\` prefix that the
+        // stored file paths don't, and the equality below checks whole paths.
+        let worktree_lib = format!("{:?}", std::path::Path::new("linked").join("lib.rs"));
         assert!(
-            projected.contains(&format!("{:?}", cold.project_root().join("lib.rs"))),
+            projected.contains(worktree_lib.trim_matches('"')),
             "{projected}"
         );
         assert_eq!(projected, dead_code(cold));
