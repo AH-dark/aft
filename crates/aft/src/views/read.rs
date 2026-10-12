@@ -274,8 +274,8 @@ pub(crate) fn derived_built(view_dir: &std::path::Path, generation: &str) -> boo
 /// main's view missing, unpublished or not ready, another artifact family,
 /// different files, or a probe that could not finish.
 /// The caller then builds the worktree's own graph instead of guessing.
-/// Main's generation is pinned the same way sibling seeding pins its donor, and
-/// the pin lives as long as the returned reader.
+/// Main's generation gets a query pin, so generation sweeps do not delete its
+/// files while they are read, and the pin lives as long as the returned reader.
 pub(crate) fn main_checkout_callgraph(
     storage: &std::path::Path,
     project_root: &std::path::Path,
@@ -316,15 +316,17 @@ pub(crate) fn main_checkout_callgraph(
     let equal = match known {
         Some(equal) => equal,
         None => {
-            // An unknown readiness (a busy probe) is not cached: it is not an answer.
+            // A busy probe gives no verdict either way, so it is not cached;
+            // the next query probes again.
             let ready = crate::callgraph_store::manifest_view_database_ready(
                 &view_dir,
                 &generation,
                 std::time::Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
             )
             .ok()?;
-            // The derived file belongs to its owner generation; compare against the
-            // manifest it was built from, as sibling seeding does.
+            // A generation can reuse an earlier generation's derived database
+            // (`derived_owner`). Compare against the manifest that database was
+            // built from, as `sibling_checkout_seed` does before cloning it.
             let equal = ready
                 && view
                     .derived_owner(&generation)

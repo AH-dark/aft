@@ -1091,8 +1091,9 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         session_id: req.session_id.clone(),
         params: req.params.clone(),
     };
-    // The body below runs on a detached thread, where an on-demand call-graph
-    // build could not be started without publishing inline. Start it here.
+    // Start any on-demand call-graph build here, while this request still runs
+    // under its root actor. The body below runs on a detached thread without
+    // one, where starting the build would leave it to a later query instead.
     start_on_demand_callgraph_for_inspect(&ctx, &snapshot.config);
     let completion_request_id = request_id.clone();
     let shutdown_log = phase_log.clone();

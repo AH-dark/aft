@@ -7586,9 +7586,10 @@ fn open_view_runtime_for_configure(
     // Schedule a replacement before the warm reader rejects the old output.
     let callgraph_unready = input.callgraph
         && generation.as_deref().is_some_and(|generation| {
-            // A linked worktree publishes without a derived graph until a query
-            // needs one. Its absence is expected, and republishing would not
-            // build one.
+            // While the call graph is deferred (a linked worktree that no query
+            // has needed the graph of yet), a missing derived graph is expected:
+            // do not count it as unready. A republish would defer again; the
+            // first query that needs the graph is what starts its build.
             if input.defer_callgraph
                 && !crate::views::read::derived_built(view.view_dir(), generation)
             {
@@ -9450,7 +9451,8 @@ mod tests {
         );
         let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
         lazy_assert_same_graph(&store, &cold);
-        // Tier-2 dead code projects from the same main-checkout reader.
+        // Inspect's Tier-2 categories, such as dead code, also read the main
+        // checkout's graph for this worktree.
         let (inspect_store, _) = crate::inspect::current_view_projection_store_for_test(
             &fixture.linked,
             &fixture.borrower.config(),
@@ -9572,7 +9574,8 @@ mod tests {
             fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
             0
         );
-        // Generation cleanup has no derived database to remove and still works.
+        // Sweeping removes the superseded generation's manifest even though
+        // this worktree has no derived call-graph files to delete.
         view.sweep_generations().unwrap();
         assert!(!view
             .manifest_path(first.as_deref().unwrap())
