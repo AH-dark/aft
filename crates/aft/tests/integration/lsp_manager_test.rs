@@ -1135,15 +1135,18 @@ fn watched_file_batch_continues_after_a_server_rejects_send() {
         "protocol fixture requires Python"
     );
     let temp = tempdir().unwrap();
+    let root_spelling = temp.path().join("root-spelling");
+    fs::create_dir_all(&root_spelling).unwrap();
     let (_script_dir, script) = executable_protocol_server_script();
     let mut manager = LspManager::new();
     let mut config = Config::default();
     let mut sources = HashMap::new();
     for id in ["batch-a", "batch-b"] {
-        let root = temp.path().join(id);
+        let root = root_spelling.join("..").join(id);
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("marker.txt"), "marker").unwrap();
-        let source = root.join(format!("main.{id}"));
+        let key_root = canonicalize_lsp_root(&root);
+        let source = key_root.join(format!("main.{id}"));
         fs::write(&source, "content").unwrap();
         config.lsp_servers.push(UserServerDef {
             id: id.into(),
@@ -1156,7 +1159,8 @@ fn watched_file_batch_continues_after_a_server_rejects_send() {
             disabled: false,
         });
         manager.override_binary(ServerKind::Custom(Arc::from(id)), script.clone());
-        sources.insert(root, source);
+        // ServerKey uses canonical roots without Windows verbatim prefixes.
+        sources.insert(key_root, source);
     }
     for source in sources.values() {
         assert_eq!(manager.ensure_server_for_file(source, &config).len(), 1);

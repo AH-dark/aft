@@ -4491,6 +4491,28 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn high_fd_fixture() -> (RawFd, libc::rlim_t) {
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        // Keep coverage beyond the former 65,536 ceiling when the runner permits
+        // it. A smaller hard limit cannot open 70,000; use its last legal slot.
+        // Derive the fixture from the OS limit, not the sweep being tested.
+        let high_fd = if limit.rlim_max == libc::RLIM_INFINITY {
+            70_000
+        } else {
+            limit.rlim_max.saturating_sub(1).min(70_000) as RawFd
+        };
+        assert!(
+            high_fd > CHILD_FAILURE_FD + 1,
+            "descriptor limit is too small for the fixture"
+        );
+        (high_fd, limit.rlim_cur.max(high_fd as libc::rlim_t + 1))
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn marker_allowlist_closes_high_fds_and_preserves_markers() {
         use std::os::unix::process::CommandExt;
@@ -4498,11 +4520,11 @@ mod tests {
         let failure = tempfile::tempfile().unwrap();
         let source = tempfile::tempfile().unwrap();
         let source_fd = source.as_raw_fd();
+        let (high_fd, soft_limit) = high_fd_fixture();
         let mut command = Command::new("/bin/sh");
-        command.args([
-            "-c",
-            "test ! -e /proc/self/fd/70000 || exit 99; printf exit >&3; printf failure >&4",
-        ]);
+        command.arg("-c").arg(format!(
+            "test ! -e /proc/self/fd/{high_fd} || exit 99; printf exit >&3; printf failure >&4"
+        ));
         // Create the deliberately inheritable descriptor only in the child so
         // concurrent tests cannot accidentally inherit it.
         unsafe {
@@ -4511,11 +4533,11 @@ mod tests {
                 if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                limit.rlim_cur = limit.rlim_max;
+                limit.rlim_cur = soft_limit;
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::dup2(source_fd, 70_000) < 0 {
+                if libc::dup2(source_fd, high_fd) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -4545,18 +4567,21 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let source = tempfile::tempfile().unwrap();
         let source_fd = source.as_raw_fd();
+        let (high_fd, soft_limit) = high_fd_fixture();
         let fd_limit = descriptor_sweep_limit().unwrap();
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "test ! -e /proc/self/fd/70000"]);
+        command
+            .arg("-c")
+            .arg(format!("test ! -e /proc/self/fd/{high_fd}"));
         unsafe {
             command.pre_exec(move || {
                 let mut limit = std::mem::zeroed::<libc::rlimit>();
                 if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                limit.rlim_cur = limit.rlim_max;
+                limit.rlim_cur = soft_limit;
                 if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0
-                    || libc::dup2(source_fd, 70_000) < 0
+                    || libc::dup2(source_fd, high_fd) < 0
                 {
                     return Err(std::io::Error::last_os_error());
                 }
