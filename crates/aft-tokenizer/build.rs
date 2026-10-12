@@ -137,9 +137,9 @@ fn regeneration_source(
     let input = explicit
         .clone()
         .unwrap_or_else(|| workspace_root.join("tmp/ai-tokenizer-pkg/package/dist/encoding"));
-    // Register the optional input before discovery can return early, so a newly
-    // installed encoding is picked up without touching the vendored Rust source.
-    writeln!(out, "cargo:rerun-if-changed={}", input.display()).unwrap();
+    if let Some(watched_path) = existing_watch_path(workspace_root, &input) {
+        writeln!(out, "cargo:rerun-if-changed={}", watched_path.display()).unwrap();
+    }
     match explicit {
         Some(path) if path.exists() => Some(path),
         Some(path) => {
@@ -148,6 +148,27 @@ fn regeneration_source(
         }
         None => locate_default_source(workspace_root),
     }
+}
+
+fn existing_watch_path(workspace_root: &Path, input: &Path) -> Option<PathBuf> {
+    if input.exists() {
+        return Some(input.to_path_buf());
+    }
+
+    // Cargo treats a missing `rerun-if-changed` path as dirty on every build.
+    // Watch the nearest existing directory instead so a newly installed source
+    // is still noticed without recompiling every test target in a clean checkout.
+    let mut candidate = input.parent()?;
+    while candidate != workspace_root {
+        if !candidate.starts_with(workspace_root) {
+            return None;
+        }
+        if candidate.is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        candidate = candidate.parent()?;
+    }
+    None
 }
 
 fn locate_default_source(workspace_root: &Path) -> Option<PathBuf> {
@@ -337,16 +358,17 @@ mod tests {
     fn absent_regeneration_source_is_watched() {
         let root = std::env::temp_dir().join(format!("aft-tokenizer-watch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut out = Vec::new();
+        assert!(regeneration_source(&root, None, &mut out).is_none());
+        assert!(String::from_utf8(out).unwrap().is_empty());
+
         fs::create_dir_all(root.join("tmp")).unwrap();
         let mut out = Vec::new();
         assert!(regeneration_source(&root, None, &mut out).is_none());
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!(
-                "cargo:rerun-if-changed={}\n",
-                root.join("tmp/ai-tokenizer-pkg/package/dist/encoding")
-                    .display()
-            )
+            format!("cargo:rerun-if-changed={}\n", root.join("tmp").display())
         );
         let encoding = root.join("tmp/ai-tokenizer-pkg/package/dist/encoding");
         fs::create_dir_all(&encoding).unwrap();
