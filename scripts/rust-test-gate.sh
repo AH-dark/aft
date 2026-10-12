@@ -343,14 +343,15 @@ extract_nextest_archive_for_prewarm() {
 # locally and by workflows that do not opt into sharding.
 requested_phases="${AFT_GATE_PHASES:-all}"
 if [[ "$requested_phases" == "all" ]]; then
-  phase_enabled() { return 0; }
+  # `lib-shard` is opt-in; the ordinary all-phases gate remains unpartitioned.
+  phase_enabled() { [[ "$1" != "lib-shard" ]]; }
 else
   IFS=',' read -r -a selected_phases <<< "$requested_phases"
   for selected_phase in "${selected_phases[@]}"; do
     case "$selected_phase" in
-      lib|nextest|watcher|conformance|storm) ;;
+      lib|lib-shard|nextest|watcher|conformance|storm) ;;
       *)
-        echo "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, nextest, watcher, conformance, storm, or all)" >&2
+        echo "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, lib-shard, nextest, watcher, conformance, storm, or all)" >&2
         exit 2
         ;;
     esac
@@ -372,18 +373,44 @@ if phase_enabled lib; then
   # quiet, minutes under full-suite load — blew a 600s budget twice on
   # 2026-08-09). Isolation is the fix, not a bigger budget: run it alone
   # first (seconds when serial), then exclude it from the parallel phase.
-  run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
-    cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
-
-  if [[ "$unit_runner" == "nextest" ]]; then
-    run_phase "cargo nextest run --workspace --lib --bins --profile gate" \
-      cargo nextest run --workspace --lib --bins --profile gate -- \
-        --skip platform_verifier_tls_client_subprocess
+  if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
+    run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) platform_verifier_tls_client_subprocess (serial: keychain-latency-sensitive)" \
+      cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+        -E 'kind(lib)' -- platform_verifier_tls_client_subprocess
   else
-    run_phase "cargo test --workspace --lib --bins --quiet" \
-      cargo test --workspace --lib --bins --quiet -- \
-        --skip platform_verifier_tls_client_subprocess
+    run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
+      cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
   fi
+
+  # When lib-shard is selected, the archive-backed command below owns the rest
+  # of the unit inventory. Other callers keep the original whole-suite command.
+  if ! phase_enabled lib-shard; then
+    if [[ "$unit_runner" == "nextest" ]]; then
+      run_phase "cargo nextest run --workspace --lib --bins --profile gate" \
+        cargo nextest run --workspace --lib --bins --profile gate -- \
+          --skip platform_verifier_tls_client_subprocess
+    else
+      run_phase "cargo test --workspace --lib --bins --quiet" \
+        cargo test --workspace --lib --bins --quiet -- \
+          --skip platform_verifier_tls_client_subprocess
+    fi
+  fi
+fi
+
+if phase_enabled lib-shard; then
+  if [[ "$unit_runner" != "nextest" ]]; then
+    echo "The lib-shard phase requires AFT_UNIT_TEST_RUNNER=nextest" >&2
+    exit 2
+  fi
+  if [[ -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" || -z "${AFT_NEXTEST_PARTITION:-}" ]]; then
+    echo "The lib-shard phase requires AFT_NEXTEST_ARCHIVE_FILE and AFT_NEXTEST_PARTITION" >&2
+    exit 2
+  fi
+  run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E 'kind(lib) | kind(bin)' --partition $AFT_NEXTEST_PARTITION --profile gate" \
+    cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+      -E 'kind(lib) | kind(bin)' \
+      --partition "$AFT_NEXTEST_PARTITION" \
+      -- --skip platform_verifier_tls_client_subprocess
 fi
 
 if phase_enabled nextest && [[ "$(uname)" == "Darwin" && -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then

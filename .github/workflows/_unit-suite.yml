@@ -743,21 +743,18 @@ jobs:
           retention-days: 3
 
   # ---------------------------------------------------------------------------
-  # Rust integration tests on Windows
+  # Rust unit and integration tests on Windows
   # Catches platform-conditional code paths (#[cfg(target_os = "windows")])
   # and Windows process/path/signal differences. Same suite as Linux but on a
   # real Windows runner — does NOT spin up OpenCode, that's the e2e job.
   #
-  # The integration phase is the Windows critical path: recent warm-cache runs
-  # spent 9–16 minutes executing it, versus roughly four minutes compiling.
-  # Build its nextest archive once, then partition the same test inventory across
-  # three runners. Libtest phases remain together because their thousands of
-  # short tests are faster in one process, and watcher tests keep their existing
-  # single-threaded libtest execution.
+  # Build the full non-watcher nextest archive once. Integration and libtest
+  # cases run in separate three-way partitions; watcher tests retain their
+  # single-threaded libtest execution alongside the conformance gate.
   #
-  # These shards are blocking. Integration tests serialize filesystem
-  # paths through serde_json before writing NDJSON requests, so Windows
-  # backslashes are escaped correctly instead of being parsed as JSON escapes.
+  # These shards cover Windows-only cfg paths and native process/path/signal
+  # behavior. Integration tests send filesystem paths in NDJSON requests through
+  # serde_json, which escapes Windows backslashes as JSON string content.
   # ---------------------------------------------------------------------------
   unit-windows-nextest-archive:
     name: Cargo test archive (Windows)
@@ -791,11 +788,21 @@ jobs:
           curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
-      - name: Build nextest archive (Windows integration suite)
-        run: cargo nextest archive --workspace -E "kind(test) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
+      - name: Build nextest archive (Windows Rust suite)
+        run: cargo nextest archive --workspace -E "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)" --archive-file "$env:WINDOWS_NEXTEST_ARCHIVE"
         shell: pwsh
         env:
           WINDOWS_NEXTEST_ARCHIVE: ${{ runner.temp }}/windows-nextest.tar.zst
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Prove split Rust test inventory and hash partitions are exact
+        run: python scripts/rust-test-inventory-proof.py
+        shell: pwsh
+        env:
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
 
       - name: Report nextest archive size
         run: |
@@ -816,11 +823,42 @@ jobs:
 
   unit-windows-libtest:
     name: Cargo libtest + watcher (Windows)
+    if: always()
+    needs:
+      - unit-windows-nextest-archive
+      - unit-windows-libtest-shard
+      - unit-windows-watcher
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every Windows libtest lane
+        if: always()
+        shell: bash
+        env:
+          ARCHIVE_RESULT: ${{ needs.unit-windows-nextest-archive.result }}
+          SHARDS_RESULT: ${{ needs.unit-windows-libtest-shard.result }}
+          WATCHER_RESULT: ${{ needs.unit-windows-watcher.result }}
+        run: |
+          set -euo pipefail
+          for lane in ARCHIVE SHARDS WATCHER; do
+            result_var="${lane}_RESULT"
+            result="${!result_var}"
+            if [[ "$result" != "success" ]]; then
+              echo "Windows libtest lane $lane concluded $result" >&2
+              exit 1
+            fi
+          done
+
+  unit-windows-libtest-shard:
+    name: Cargo libtest shard ${{ matrix.shard }}/3 (Windows)
+    needs: unit-windows-nextest-archive
     runs-on: windows-2022
-    # A normal run takes about 18 minutes (build, lib tests, then the serial
-    # watcher suite). Windows runners vary by up to 1.6x in speed, which
-    # pushed a run with no failing test past a 25-minute limit.
-    timeout-minutes: 35
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
 
@@ -846,34 +884,71 @@ jobs:
           curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
           "$HOME/.cargo/bin/cargo-nextest" --version
 
-      - name: Rust libtest + watcher gate (Windows)
-        # Keep the libtest and watcher invocations from the normal gate exactly:
-        # libtest avoids per-test process fan-out, while watcher tests share
-        # fixtures and must remain single-threaded.
-        #
-        # Tee the output to a file because GitHub has repeatedly failed to serve
-        # this job's log: on trains 155 and 163 a failure here left only the
-        # annotation "Process completed with exit code 101", with `gh run view
-        # --job --log`, `--log-failed` and the raw actions/jobs/<id>/logs API all
-        # returning zero bytes. A Rust panic with no recoverable log names no
-        # test and no assertion, which makes any flake in this job
-        # undiagnosable; the artifact survives independently of the log service.
-        # pipefail keeps tee from masking the gate's exit code.
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-nextest-archive
+          path: ${{ runner.temp }}
+
+      - name: Rust libtest shard (nextest archive)
+        # Run `platform_verifier_tls_client_subprocess` once in shard one before
+        # hash partitioning. Its spawned system-trust check can hang when other
+        # tests contend with machine trust evaluation.
         run: |
           set -o pipefail
-          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/windows-libtest.log"
+          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/windows-libtest-shard-${{ matrix.shard }}.log"
         shell: bash
         env:
           AFT_TEST_DIAG: "1"
-          AFT_GATE_PHASES: lib,watcher,conformance
+          AFT_UNIT_TEST_RUNNER: nextest
+          AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+          NEXTEST_TEST_THREADS: "4"
 
-      - name: Upload Windows libtest output
+      - name: Upload Windows libtest shard output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-libtest-log
-          path: ${{ runner.temp }}/windows-libtest.log
+          name: windows-libtest-shard-${{ matrix.shard }}-log
+          path: ${{ runner.temp }}/windows-libtest-shard-${{ matrix.shard }}.log
+          if-no-files-found: warn
+
+  unit-windows-watcher:
+    name: Cargo watcher + conformance (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-windows-cargo
+          cache-on-failure: true
+
+      - name: Rust watcher + conformance gate (Windows)
+        # Keep watcher tests serial because they share fixtures. The conformance
+        # phase checks the provider contract and four bash-promotion/elicitation
+        # cases compiled only with test-timing-hooks.
+        run: |
+          set -o pipefail
+          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/windows-watcher-conformance.log"
+        shell: bash
+        env:
+          AFT_TEST_DIAG: "1"
+          AFT_GATE_PHASES: watcher,conformance
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+      - name: Upload Windows watcher + conformance output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-watcher-conformance-log
+          path: ${{ runner.temp }}/windows-watcher-conformance.log
           if-no-files-found: warn
 
   unit-windows-cargo:
