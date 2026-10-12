@@ -30,20 +30,24 @@ that call supplies an unchanged manifest.
 
 The original spike is pinned at `f9a62e5f6e6337249af61ea6c656b33cfc01c160`.
 Its captured 17 revisions / 5,411 source blobs were reused without regeneration.
-Baseline all-table comparison reproduced the original counts exactly:
+Baseline all-table comparison reproduced the original counts exactly. Case
+numbers identify the ten base-to-tip revision pairs in the overlay investigation;
+the tip column identifies each pair. Counts are distinct primary keys, not the
+two differing row versions. Ref categories are mutually exclusive: kind changes
+first, then status changes, then target-only changes.
 
-| Case | Edge keys | Ref keys | Total keys | Ref target-only | Ref status | Ref kind/resolution |
+| Case / tip | Edge keys | Ref keys | Total keys | Ref target-only | Ref status | Ref kind/resolution |
 |---|---:|---:|---:|---:|---:|---:|
-| 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-| 1 | 1 | 2 | 3 | 1 | 1 | 0 |
-| 2 | 0 | 0 | 0 | 0 | 0 | 0 |
-| 3 | 0 | 0 | 0 | 0 | 0 | 0 |
-| 4 | 0 | 0 | 0 | 0 | 0 | 0 |
-| 5 | 15 | 70 | 85 | 15 | 55 | 0 |
-| 6 | 40 | 150 | 190 | 40 | 110 | 0 |
-| 7 | 116 | 813 | 929 | 116 | 693 | 4 |
-| 8 | 23 | 65 | 88 | 23 | 42 | 0 |
-| 9 | 93 | 696 | 789 | 93 | 599 | 4 |
+| 0 / `1d5e0846fe17` | 0 | 0 | 0 | 0 | 0 | 0 |
+| 1 / `b4de1db5e0b7` | 1 | 2 | 3 | 1 | 1 | 0 |
+| 2 / `d78fd9dc8e3f` | 0 | 0 | 0 | 0 | 0 | 0 |
+| 3 / `437b6a53cfc2` | 0 | 0 | 0 | 0 | 0 | 0 |
+| 4 / `c070b741ed39` | 0 | 0 | 0 | 0 | 0 | 0 |
+| 5 / `36534036c2d9` | 15 | 70 | 85 | 15 | 55 | 0 |
+| 6 / `4f5e17028da2` | 40 | 150 | 190 | 40 | 110 | 0 |
+| 7 / `0c3974b20926` | 116 | 813 | 929 | 116 | 693 | 4 |
+| 8 / `e756124e9b50` | 23 | 65 | 88 | 23 | 42 | 0 |
+| 9 / `49daf5d12140` | 93 | 696 | 789 | 93 | 599 | 4 |
 | **Total** | **288** | **1,796** | **2,084** | **288** | **1,500** | **8** |
 
 Every key has both an incremental and a cold row: no missing/extra primary keys.
@@ -75,7 +79,8 @@ ordinal while keeping the caller's manifest entry unchanged.
 
 - A naturally extracted Rust macro with two resolved calls sharing an ordinal.
 - Two colliding resolved calls where the final target remains unchanged.
-- A final unresolved row, preserving the separate edge winner.
+- A final unresolved reference row that leaves the edge emitted by an earlier
+  resolved call intact, matching the existing cold writer's separate edge batch.
 - Mixed call/export-alias references sharing an ordinal.
 - Rebuilding a version-9 generation despite an identical manifest.
 
@@ -83,7 +88,8 @@ The fixtures clone an immutable seed with `generation::clone_derived`, patch the
 clone with its owner's manifest and compare against an independent cold build.
 The seed is also checked for immutability in the parametrized fixture.
 
-Sibling seeding is absent at this task's base. Inspection of commit
+Sibling seeding is absent from `assembly.rs` at baseline
+`a4decaeff44a2eee87f9befcbf797c2774f439cd`. Inspection of commit
 `2805f6775bee6b0c2e199f8ec409e7bf64dc7a27`, `assembly.rs:649-709`, confirms it
 supplies the sibling's path/manifest to the same clone and
 `apply_manifest_diff_profiled` path. The common writer and clone fixture therefore
@@ -118,8 +124,12 @@ and the temporary harness are not committed.
 
 ## Reproduction method
 
-The spike files were exported temporarily from the pinned spike commit, with its
-original test-only wiring, and were not landed. Commands use Linux, four vCPUs,
+The overlay investigation at the pinned `f9a62e5f6e6337249af61ea6c656b33cfc01c160`
+commit contains `crates/aft/src/callgraph_store/overlay_spike.rs`,
+`docs/investigations/callgraph-worktree-overlay-spike-2026-10.md` and
+`scripts/spikes/collect-callgraph-overlay.py`. These files were exported
+temporarily to reuse its original harness and captured dataset; its test-only
+wiring was also applied temporarily. None of that prototype was landed. Commands use Linux, four vCPUs,
 Rust/Cargo 1.99.0, and `CARGO_PROFILE_STAGE_DEBUG_ASSERTIONS=true`:
 
 ```sh
@@ -153,7 +163,8 @@ All Cargo gates ran on Linux with four requested vCPUs and Rust/Cargo 1.99.0:
   55 passed, zero failed.
 
 Before the fix, the resolved-last, unresolved-last and natural-macro parity tests
-failed with the same ref/edge differences as the captured branches. Mutation
+failed with incorrect ref statuses/targets and edge targets, matching the
+baseline differences classified above. Mutation
 proofs subsequently restored the unsafe `if same` skip: the macro,
 resolved-last, unresolved-last and mixed-reference-kind tests each failed in a
 separate exact-filter run (one failure and no other tests run per control).

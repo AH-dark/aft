@@ -1696,9 +1696,11 @@ fn colliding_relink_parity(last_resolves: bool, last_kind: join::BlobRefKind) {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     assert_eq!(calls.len(), 2);
-    // Force two independently resolved calls onto one stored identity, as Rust
-    // macro arguments do naturally. The final row is unchanged while target's
-    // symbol ordinal shifts; skipping that row must not change the winner.
+    // Give both calls the same persisted ref_id and edge_id by sharing their
+    // AST ordinal, as calls inside one Rust macro invocation do naturally.
+    // Only the first target's node ordinal changes. Skipping a later row that
+    // matches the base must not overwrite its resolved/unresolved ref fields
+    // or the last resolved call's edge; the cold snapshot checks both tables.
     parse.refs[calls[1]].ordinal = parse.refs[calls[0]].ordinal;
     parse.refs[calls[1]].kind = last_kind;
     if !last_resolves {
