@@ -57,14 +57,19 @@ associated tip file confirmed **every one of the 2,084 keys has multiple
 references at its ordinal**: 2,076 call-only collisions and eight call/export-alias
 collisions. The eight mixed-kind keys are in
 `crates/aft/tests/integration/inspect_tier2_reuse_test.rs` (four each in cases 7
-and 9). The export-alias extractor recognizes text inside those Rust fixtures;
-changing that extraction policy is outside this repair.
+and 9). In those eight groups, the export-alias references' `full_ref` text starts
+at the `exports_incremental_matches_cold(...)` substring of a Rust helper name
+and extends into its argument strings. These structural references share AST
+ordinals with the ordinary helper calls. Changing that extraction policy is
+outside this repair.
 
 For example, case 1's `warmup.rs:7842` is shared by `warmup_storage_dir()` and
 `aft::bash_background::storage_dir(None)` inside `assert_eq!`. The cold edge points
 to `warmup_storage_dir`, whereas incremental points to `storage_dir`.
 `warmup.rs:8002` is shared by `trigger_callgraph_warm(...)` and `Some(...)`;
-incremental persists resolved fields where cold keeps the final unresolved row.
+incremental keeps `status='resolved'` and the target node/file/symbol for
+`trigger_callgraph_warm`, whereas cold keeps the later `Some(...)` reference's
+`status='unresolved'` and null target node/file/symbol.
 
 There were **zero differences** in bindings, dependencies, surfaces, dispatch
 sites, unknown-live/dead-code tables, nodes, files, metadata or other derived
@@ -78,7 +83,8 @@ ordinal while keeping the caller's manifest entry unchanged.
 `materialization/tests.rs` adds all-schema/all-table logical parity tests for:
 
 - A naturally extracted Rust macro with two resolved calls sharing an ordinal.
-- Two colliding resolved calls where the final target remains unchanged.
+- Two resolved calls sharing the same ref/edge IDs through a duplicate ordinal:
+  the later call's target stays unchanged while the earlier target's node ID shifts.
 - A final unresolved reference row that leaves the edge emitted by an earlier
   resolved call intact, matching the existing cold writer's separate edge batch.
 - Mixed call/export-alias references sharing an ordinal.
@@ -102,7 +108,7 @@ claim that the absent sibling-discovery integration tests were run at this base.
 differing keys or rows in every derived table. These counts are direct
 incremental-vs-cold comparisons, not overlays derived from a cold fallback.
 
-| Case | Before: differing keys | After: differing keys | Rows checked |
+| Case | Before: incremental-vs-cold differing keys | After: incremental-vs-cold differing keys | Rows checked |
 |---|---:|---:|---:|
 | 0 | 0 | 0 | 1,780,921 |
 | 1 | 3 | 0 | 1,804,570 |
@@ -170,8 +176,10 @@ resolved-last, unresolved-last and mixed-reference-kind tests each failed in a
 separate exact-filter run (one failure and no other tests run per control).
 Restoring materialization version 9 independently failed
 `colliding_relink_legacy_generation_is_rebuilt_even_without_manifest_changes`.
-Each mutation was marked `NON-VACUITY BREAK`, run against staged live source, and
-restored with an empty `git diff --stat` before the final green gate.
+Each temporary source mutation was marked `NON-VACUITY BREAK` to identify the
+intentional restoration of incorrect behavior used to prove the tests fail. The
+mutations ran against staged live source and were restored with an empty
+`git diff --stat` before the final green gate.
 
 Editor diagnostics remained partial (`rust-analyzer` reported its cargo check
 running); the explicit package check above is the authoritative typecheck. No
