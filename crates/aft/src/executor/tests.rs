@@ -2761,15 +2761,17 @@ fn wait_for_cancellation_does_not_self_deadlock_when_its_root_vanishes_mid_wait(
     let started_waiter = Arc::clone(&started);
     thread::spawn(move || {
         started_waiter.wait();
-        // Long enough that the root is removed while this call is waiting.
-        let cancelled = waiter.wait_for_cancellation(Duration::from_millis(400));
+        // The root check runs after the wait, so the removal below must land
+        // before this wait ends. A 400 ms wait lost that race on a loaded
+        // Windows runner; 3 s leaves the removal ample margin.
+        let cancelled = waiter.wait_for_cancellation(Duration::from_secs(3));
         let _ = done_tx.send(cancelled);
     });
     started.wait();
     thread::sleep(Duration::from_millis(100));
     std::fs::remove_dir(&root).expect("remove root");
     let cancelled = done_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(Duration::from_secs(60))
         .expect("wait_for_cancellation deadlocked after its root was removed");
     assert!(cancelled, "a removed root cancels the waiting job");
     // A second signaller (the reaper, or an observer that signals) must not
