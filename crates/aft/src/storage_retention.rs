@@ -16,9 +16,15 @@ use serde::{Deserialize, Serialize};
 use crate::context::SubcLifecycleAdmission;
 
 pub(crate) const ROOT_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
-/// How long the caches of a deleted linked worktree are kept after its last
-/// bind. Every deleted-checkout decision reads this one constant.
-const LINKED_WORKTREE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+/// A deleted linked worktree (a worker checkout) has its caches removed on
+/// the first pass once this long has passed since its last bind. It is not
+/// zero so that a session that bound the checkout seconds before deletion
+/// can still finish, and a checkout recreated at the same path rebinds before
+/// its caches can be removed. With the 10-minute pass interval and the
+/// due-first lane, the caches go on the first pass after deletion. Every
+/// other check still applies: the root must be confirmed missing, its volume
+/// must match, and nothing may hold a writer, pin, reader or SQLite handle.
+const LINKED_WORKTREE_REBIND_MARGIN_MS: u64 = 10 * 60 * 1000;
 /// A checkout view folder (`views/<scope>`) that no family registry lists and
 /// no binding history describes was never tied to a checkout this storage
 /// knows about, typically an abandoned build. It is reclaimed once it has
@@ -619,7 +625,7 @@ fn binding_eligibility_with_mount(binding: &Binding, now: u64, mounted: bool) ->
         return RootEligibility::MountMismatch;
     }
     let grace = if binding.linked_worktree {
-        LINKED_WORKTREE_GRACE_MS
+        LINKED_WORKTREE_REBIND_MARGIN_MS
     } else {
         ROOT_GRACE_MS
     };
@@ -2442,19 +2448,20 @@ mod storage_retention_tests {
 
     fn deleted_checkout_fixture(
         linked: bool,
-        hours: u64,
+        minutes: u64,
         legacy: bool,
         history_copies: bool,
     ) -> (tempfile::TempDir, PathBuf, String, PathBuf) {
-        let (temp, root, scope) = bound_checkout_fixture(linked, hours, legacy, history_copies);
+        let (temp, root, scope) = bound_checkout_fixture(linked, minutes, legacy, history_copies);
         let path = cache(temp.path(), "views", &scope);
         fs::remove_dir_all(&root).unwrap();
         (temp, root, scope, path)
     }
 
+    /// A checkout last bound `minutes` ago.
     fn bound_checkout_fixture(
         linked: bool,
-        hours: u64,
+        minutes: u64,
         legacy: bool,
         history_copies: bool,
     ) -> (tempfile::TempDir, PathBuf, String) {
@@ -2497,7 +2504,7 @@ mod storage_retention_tests {
         record_bind(temp.path(), &root, &scope).unwrap();
         let record = temp.path().join(format!("retention/roots/{scope}.json"));
         let mut binding: serde_json::Value = read_json(&record).unwrap();
-        let last_bound = crate::pins::now_ms() - hours * 60 * 60 * 1000;
+        let last_bound = crate::pins::now_ms() - minutes * 60 * 1000;
         binding["last_bound_ms"] = last_bound.into();
         if legacy {
             binding.as_object_mut().unwrap().remove("linked_worktree");
@@ -2545,8 +2552,8 @@ mod storage_retention_tests {
     }
 
     #[test]
-    fn storage_retention_linked_worktree_25h_with_history_copies_is_reclaimed() {
-        let (temp, root, scope, path) = deleted_checkout_fixture(true, 25, false, true);
+    fn storage_retention_linked_worktree_past_margin_with_history_copies_is_reclaimed() {
+        let (temp, root, scope, path) = deleted_checkout_fixture(true, 11, false, true);
         let history = bindings(temp.path()).unwrap();
         // Each source contributes a scope and an artifact-key copy. Keep all
         // their timestamps, even though they describe the same checkout.
@@ -2583,8 +2590,17 @@ mod storage_retention_tests {
     }
 
     #[test]
-    fn storage_retention_linked_worktree_23h_is_kept() {
-        let (temp, root, _scope, path) = deleted_checkout_fixture(true, 23, false, false);
+    fn storage_retention_linked_worktree_inside_margin_is_kept() {
+        let (temp, root, _scope, path) = deleted_checkout_fixture(true, 9, false, false);
+        assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
+        assert!(path.exists());
+        assert!(!missing_root_due(temp.path(), &root, 0));
+    }
+
+    #[test]
+    fn storage_retention_present_linked_worktree_past_margin_is_kept() {
+        let (temp, root, scope) = bound_checkout_fixture(true, 11, false, true);
+        let path = cache(temp.path(), "views", &scope);
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
         assert!(!missing_root_due(temp.path(), &root, 0));
@@ -2592,12 +2608,12 @@ mod storage_retention_tests {
 
     #[test]
     fn storage_retention_linked_worktree_recent_owner_clock_still_keeps_root() {
-        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, false, true);
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 11, false, true);
         let owner = temp
             .path()
             .join(format!("artifact-owners/{scope}/owner.json"));
         let mut metadata: serde_json::Value = read_json(&owner).unwrap();
-        metadata["heartbeat_at_ms"] = (crate::pins::now_ms() - 23 * 60 * 60 * 1000).into();
+        metadata["heartbeat_at_ms"] = (crate::pins::now_ms() - 9 * 60 * 1000).into();
         atomic_json(&owner, &metadata).unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
@@ -2605,7 +2621,7 @@ mod storage_retention_tests {
 
     #[test]
     fn storage_retention_main_checkout_25h_is_kept() {
-        let (temp, _root, _scope, path) = deleted_checkout_fixture(false, 25, false, false);
+        let (temp, _root, _scope, path) = deleted_checkout_fixture(false, 25 * 60, false, false);
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
     }
@@ -2629,7 +2645,7 @@ mod storage_retention_tests {
 
     #[test]
     fn storage_retention_linked_worktree_unflagged_history_copies_keep_seven_days() {
-        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, true, true);
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25 * 60, true, true);
         let history = bindings(temp.path()).unwrap();
         assert_eq!(
             history[&scope].len(),
@@ -2642,7 +2658,7 @@ mod storage_retention_tests {
 
     #[test]
     fn storage_retention_legacy_binding_uses_seven_days() {
-        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, true, false);
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25 * 60, true, false);
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
         assert!(path.exists());
         let record = temp.path().join(format!("retention/roots/{scope}.json"));
@@ -2654,8 +2670,8 @@ mod storage_retention_tests {
     }
 
     #[test]
-    fn storage_retention_linked_worktree_25h_keeps_live_reader_and_mount_checks() {
-        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 25, false, true);
+    fn storage_retention_linked_worktree_past_margin_keeps_live_reader_and_mount_checks() {
+        let (temp, _root, scope, path) = deleted_checkout_fixture(true, 11, false, true);
         let _uuid = uuid_backed_binding(temp.path(), &scope);
         let marker = crate::root_cache::ReadMarker::create(&path, "query").unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 0);
@@ -2977,7 +2993,7 @@ mod storage_retention_tests {
 
     #[test]
     fn storage_retention_legacy_binding_of_a_present_worktree_is_upgraded() {
-        let (temp, root, scope) = bound_checkout_fixture(true, 25, true, false);
+        let (temp, root, scope) = bound_checkout_fixture(true, 11, true, false);
         let record_path = temp.path().join(format!("retention/roots/{scope}.json"));
         let legacy: serde_json::Value = read_json(&record_path).unwrap();
         let report = run_pass(temp.path(), &|| false);
