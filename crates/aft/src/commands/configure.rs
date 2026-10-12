@@ -9209,29 +9209,17 @@ mod tests {
     /// published directly before it binds, so a fixture that reads main's graph
     /// does not depend on how main's bind builds it.
     fn lazy_worktree(prepublish_main: bool) -> LazyWorktree {
+        lazy_worktree_with(prepublish_main, |_| {})
+    }
+
+    /// Like [`lazy_worktree`], but `before_bind` runs on the linked worktree
+    /// after it is created and before it binds, so a test can give it its own
+    /// commits that no watcher event ever reports.
+    fn lazy_worktree_with(prepublish_main: bool, before_bind: impl FnOnce(&Path)) -> LazyWorktree {
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         init_git_fixture(&main);
-        fs::write(main.join("lib.rs"), LAZY_LIB).unwrap();
-        assert!(git_command(&main)
-            .args(["add", "lib.rs"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(git_command(&main)
-            .args([
-                "-c",
-                "user.name=AFT Tests",
-                "-c",
-                "user.email=aft-tests@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "lib",
-            ])
-            .status()
-            .unwrap()
-            .success());
+        lazy_commit(&main, LAZY_LIB, "lib");
         let main = main.canonicalize().unwrap();
         let linked = temp.path().join("linked");
         assert!(git_command(&main)
@@ -9242,23 +9230,10 @@ mod tests {
             .unwrap()
             .success());
         let linked = linked.canonicalize().unwrap();
+        before_bind(&linked);
         let storage = temp.path().join("storage");
         if prepublish_main {
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
-                storage: storage.clone(),
-                project_root: main.clone(),
-                family: crate::search_index::artifact_cache_key(&main),
-                scope: crate::path_identity::project_scope_key(&main),
-                desired_head: crate::views::assembly::head_tree_fingerprint(
-                    &crate::alias::head_tree_entries(&main).unwrap(),
-                ),
-                changed_paths: BTreeSet::new(),
-                semantic_keys: Default::default(),
-                require_semantic: false,
-                allow_blob_put: true,
-                callgraph: true,
-            })
-            .unwrap();
+            lazy_publish(&main, &storage);
         }
         let owner = lazy_bind(&main, &storage, "lazy-owner");
         let borrower = lazy_bind(&linked, &storage, "lazy-linked");
@@ -9272,6 +9247,52 @@ mod tests {
             owner,
             borrower,
         }
+    }
+
+    /// Write `lib.rs` in `root` and commit it.
+    fn lazy_commit(root: &Path, contents: &str, message: &str) {
+        fs::write(root.join("lib.rs"), contents).unwrap();
+        assert!(git_command(root)
+            .args(["add", "lib.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git_command(root)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    /// Publish `root`'s view, with its call graph built, as its checkout's
+    /// current generation in `storage`.
+    fn lazy_publish(root: &Path, storage: &Path) {
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.to_path_buf(),
+                project_root: root.to_path_buf(),
+                family: crate::search_index::artifact_cache_key(root),
+                scope: crate::path_identity::project_scope_key(root),
+                desired_head: crate::views::assembly::head_tree_fingerprint(
+                    &crate::alias::head_tree_entries(root).unwrap(),
+                ),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        assert!(report.published, "{report:?}");
     }
 
     fn lazy_view_dir(storage: &Path, root: &Path) -> PathBuf {
@@ -9648,6 +9669,101 @@ mod tests {
         assert!(store
             .sqlite_path()
             .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)));
+    }
+
+    /// Query the worktree's call graph under a publication scope, as a daemon
+    /// request does: it must report building, never main's rows. Then wait for
+    /// the build and return the worktree's own graph.
+    fn lazy_query_builds_own_graph(
+        fixture: &LazyWorktree,
+    ) -> Arc<crate::callgraph_store::ReadonlyCallGraphStore> {
+        let access = {
+            let _scope = crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
+            fixture.borrower.callgraph_store_for_ops()
+        };
+        if let CallgraphStoreAccess::Ready(store) = &access {
+            panic!(
+                "the first query answered before any build, from {:?}",
+                store.sqlite_path()
+            );
+        }
+        assert!(matches!(access, CallgraphStoreAccess::Building));
+        lazy_wait_for_own_graph(&fixture.borrower);
+        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        assert!(
+            store
+                .sqlite_path()
+                .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)),
+            "answered from {:?}, not the worktree's own graph",
+            store.sqlite_path()
+        );
+        store
+    }
+
+    #[test]
+    fn linked_worktree_with_its_own_commit_is_never_answered_from_main_graph() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        // A worker branch whose commit adds a caller: it differs from main's
+        // published generation at bind, and no watcher event ever reports it.
+        let fixture = lazy_worktree_with(true, |linked| {
+            lazy_commit(
+                linked,
+                "pub fn caller() { target(); }\npub fn branch_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
+                "branch caller",
+            );
+        });
+        let store = lazy_query_builds_own_graph(&fixture);
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
+        assert!(crate::callgraph_store::CallGraphRead::node_for(
+            store.as_ref(),
+            Path::new("lib.rs"),
+            "branch_caller"
+        )
+        .is_ok());
+        // Tier-2 dead code does not read main's graph for it either.
+        assert!(crate::inspect::current_view_projection_store_for_test(
+            &fixture.linked,
+            &fixture.borrower.config(),
+        )
+        .is_some_and(|(store, _)| store
+            .sqlite_path()
+            .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked))));
+    }
+
+    #[test]
+    fn linked_worktree_stops_answering_from_main_graph_after_main_moves() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree(true);
+        // The worktree matches main's generation, so main answers and that
+        // verdict is cached.
+        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        assert!(store
+            .sqlite_path()
+            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
+        drop(store);
+        // Main moves on: a new commit removes the caller and main publishes a
+        // generation with different inputs.
+        lazy_commit(
+            &fixture.main,
+            "pub fn target() {}\nfn unused() {}\n",
+            "drop caller",
+        );
+        lazy_publish(&fixture.main, &fixture.storage);
+        // The worktree still has the caller; main's new graph must not answer.
+        let store = lazy_query_builds_own_graph(&fixture);
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
+        assert!(crate::callgraph_store::CallGraphRead::node_for(
+            store.as_ref(),
+            Path::new("lib.rs"),
+            "caller"
+        )
+        .is_ok());
     }
 
     #[test]
