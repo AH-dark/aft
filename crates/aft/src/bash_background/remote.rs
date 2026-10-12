@@ -1843,10 +1843,18 @@ fn build_remote_request(
         .map_err(|error| exec::Error::Protocol(error.to_string()))?;
     let session_worktree = worktree_root_containing(&session_root)?.unwrap_or(session_root);
     let Some(worktree_root) = worktree_root_containing(cwd)? else {
-        return Err(workdir_outside_session_repository());
+        return Err(workdir_outside_session_repository(
+            cwd,
+            None,
+            &session_worktree,
+        ));
     };
     if repository_root(&worktree_root) != repository_root(&session_worktree) {
-        return Err(workdir_outside_session_repository());
+        return Err(workdir_outside_session_repository(
+            cwd,
+            Some(&worktree_root),
+            &session_worktree,
+        ));
     }
 
     // The runner snapshots this key, so it must name the checkout containing cwd.
@@ -1878,11 +1886,35 @@ fn worktree_root_containing(path: &Path) -> Result<Option<PathBuf>, exec::Error>
     Ok(None)
 }
 
+/// The refusal for a runon workdir the runner cannot snapshot. It names the
+/// workdir and this session's checkout so the caller can see which path to
+/// change. `workdir_checkout` is the checkout containing the workdir when it is
+/// in one (it then belongs to a different repository than the session's).
 #[cfg(unix)]
-fn workdir_outside_session_repository() -> exec::Error {
-    exec::Error::Protocol(
-        "cwd resolves outside the workspace key: workdir is not inside this session's repository or one of its linked worktrees".into(),
-    )
+fn workdir_outside_session_repository(
+    workdir: &Path,
+    workdir_checkout: Option<&Path>,
+    session_checkout: &Path,
+) -> exec::Error {
+    // Show the resolved path: a symlinked or relative workdir is otherwise
+    // hard to compare with the session checkout.
+    let workdir = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    let reason = match workdir_checkout {
+        None => format!(
+            "workdir {} is not inside a git checkout; this session's checkout is {}",
+            workdir.display(),
+            session_checkout.display()
+        ),
+        Some(checkout) => format!(
+            "workdir {} is in the checkout {}, which belongs to a different repository than this session's checkout {}",
+            workdir.display(),
+            checkout.display(),
+            session_checkout.display()
+        ),
+    };
+    exec::Error::Protocol(format!("cwd resolves outside the workspace key: {reason}"))
 }
 
 #[cfg(unix)]

@@ -3015,26 +3015,52 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
     git_fixture(&unrelated);
     let main = main.canonicalize().unwrap();
     let unrelated = unrelated.canonicalize().unwrap();
-    let outside = temp.path().join("plain-outside");
-    std::fs::create_dir(&outside).unwrap();
 
-    for cwd in [&unrelated, &outside] {
-        let error = build_remote_request(
-            &main,
-            cwd,
-            "true",
-            BTreeMap::new(),
-            None,
-            &exec::PresetParams::default(),
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "workdir is not inside this session's repository or one of its linked worktrees"
-            ),
-            "unexpected refusal reason: {error}"
-        );
-    }
+    let error = build_remote_request(
+        &main,
+        &unrelated,
+        "true",
+        BTreeMap::new(),
+        None,
+        &exec::PresetParams::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(&format!(
+            "workdir {} is in the checkout {}, which belongs to a different repository than this session's checkout {}",
+            unrelated.display(),
+            unrelated.display(),
+            main.display()
+        )),
+        "unexpected refusal reason: {error}"
+    );
+
+    // The runner may place TMPDIR inside a checkout. Use the system's other
+    // Unix temporary root so this directory is in no checkout at all.
+    let outside = tempfile::Builder::new()
+        .prefix("aft-runon-plain-outside-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    assert!(worktree_root_containing(outside.path()).unwrap().is_none());
+    let error = build_remote_request(
+        &main,
+        outside.path(),
+        "true",
+        BTreeMap::new(),
+        None,
+        &exec::PresetParams::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(&format!(
+            "workdir {} is not inside a git checkout; this session's checkout is {}",
+            outside.path().canonicalize().unwrap().display(),
+            main.display()
+        )),
+        "unexpected refusal reason: {error}"
+    );
 }
 
 #[test]
@@ -4137,6 +4163,11 @@ async fn runon_non_git_workdir_is_refused_by_name_before_dispatch() {
     ] {
         assert!(done.output_preview.contains(expected), "{done:?}");
     }
+    let named = format!(
+        "workdir {} is not inside a git checkout; this session's checkout is ",
+        workdir.path().canonicalize().unwrap().display()
+    );
+    assert!(done.output_preview.contains(&named), "{done:?}");
     assert!(!marker.exists(), "a refused runon must never spawn locally");
     assert!(
         exec_runs(&daemon).is_empty(),
