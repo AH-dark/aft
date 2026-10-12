@@ -1762,7 +1762,11 @@ impl CallGraphStoreError {
         )
     }
 
-    pub(crate) fn is_transient_lock_contention(&self) -> bool {
+    /// SQLite reported the database busy or locked. A view reader opens
+    /// without a busy wait, so this is a moment of contention (a publication
+    /// checkpointing the database it reads), not a failure: commands report it
+    /// as a retryable `callgraph_building`.
+    pub fn is_transient_lock_contention(&self) -> bool {
         matches!(
             self,
             Self::Sqlite(rusqlite::Error::SqliteFailure(error, _))

@@ -8309,14 +8309,6 @@ impl AppContext {
                             }
                             CallgraphStoreAccess::Ready(Arc::new(store))
                         }
-                        // The reader opens without a busy wait. A publication's
-                        // post-commit checkpoint, or the last connection closing
-                        // its WAL, can hold the derived database locked for a
-                        // moment: report building so the caller asks again,
-                        // never fail the query with "database is locked".
-                        Err(error) if error.is_transient_lock_contention() => {
-                            CallgraphStoreAccess::Building
-                        }
                         Err(error) => CallgraphStoreAccess::Error(error),
                     };
                 }

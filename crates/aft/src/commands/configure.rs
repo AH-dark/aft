@@ -9880,29 +9880,6 @@ mod tests {
     }
 
     #[test]
-    fn views_reader_reports_building_while_its_derived_database_is_locked() {
-        let _artifact_guard = artifact_owner_test_lock();
-        let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree(true);
-        let owner = fixture.owner.as_ref().unwrap();
-        let writer = lazy_lock_derived(&fixture.storage, &fixture.main);
-        match owner.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Building => {}
-            CallgraphStoreAccess::Error(error) => {
-                panic!("a locked derived database failed the query: {error}")
-            }
-            _ => panic!("a locked derived database must report building"),
-        }
-        writer.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
-        let store = lazy_ready(owner.callgraph_store_for_ops());
-        assert!(store
-            .sqlite_path()
-            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
-    }
-
-    #[test]
     fn linked_worktree_waits_for_a_locked_main_graph_instead_of_building() {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
