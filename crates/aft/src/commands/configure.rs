@@ -9204,8 +9204,10 @@ mod tests {
 
     /// A main checkout and one linked worktree at the same commit, both bound
     /// with views on and their configure maintenance (including the first view
-    /// publication) drained.
-    fn lazy_worktree() -> LazyWorktree {
+    /// publication) drained. With `prepublish_main`, main's view and graph are
+    /// published directly before it binds, so a fixture that reads main's graph
+    /// does not depend on how main's bind builds it.
+    fn lazy_worktree(prepublish_main: bool) -> LazyWorktree {
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         init_git_fixture(&main);
@@ -9240,6 +9242,23 @@ mod tests {
             .success());
         let linked = linked.canonicalize().unwrap();
         let storage = temp.path().join("storage");
+        if prepublish_main {
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: main.clone(),
+                family: crate::search_index::artifact_cache_key(&main),
+                scope: crate::path_identity::project_scope_key(&main),
+                desired_head: crate::views::assembly::head_tree_fingerprint(
+                    &crate::alias::head_tree_entries(&main).unwrap(),
+                ),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        }
         let owner = lazy_bind(&main, &storage, "lazy-owner");
         let borrower = lazy_bind(&linked, &storage, "lazy-linked");
         assert!(!owner.callgraph_build_on_demand());
@@ -9408,7 +9427,7 @@ mod tests {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree();
+        let fixture = lazy_worktree(true);
         let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
         let view = crate::views::ViewStore::open(
             &fixture.storage,
@@ -9463,8 +9482,7 @@ mod tests {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree();
-        lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        let fixture = lazy_worktree(true);
         lazy_edit_through_watcher(
             &fixture,
             "pub fn caller() { target(); }\npub fn edited_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
@@ -9509,7 +9527,7 @@ mod tests {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree();
+        let fixture = lazy_worktree(true);
         let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
         let view = crate::views::ViewStore::open(
             &fixture.storage,
@@ -9568,7 +9586,7 @@ mod tests {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree();
+        let fixture = lazy_worktree(false);
         let view_dir = lazy_view_dir(&fixture.storage, &fixture.main);
         let generation = crate::views::ViewStore::open(
             &fixture.storage,
@@ -9593,7 +9611,7 @@ mod tests {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
-        let fixture = lazy_worktree();
+        let fixture = lazy_worktree(true);
         // A change the watcher saw means main's graph cannot answer.
         fixture.borrower.note_checkout_changed_for_callgraph();
         let barrier = Arc::new(std::sync::Barrier::new(2));
