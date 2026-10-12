@@ -2166,12 +2166,12 @@ fn build_health_diagnostic_rollup(
             .as_ref()
             .and_then(|entry| entry.artifact_key.clone())
             .unwrap_or_else(|| root_label.clone());
-        let census_memory = ctx.memory_root_snapshot();
+        let (census_memory, memory) = ctx.memory_root_snapshot_and_rollup();
         census_roots.insert(root_label.clone(), census_memory);
         let memory = if standing.is_some() {
-            ctx.memory_root_rollup().with_standing()
+            memory.with_standing()
         } else {
-            ctx.memory_root_rollup()
+            memory
         };
         let attributed_bytes = memory.attributed_bytes;
         memory_roots.insert(memory_key, memory);
@@ -3788,6 +3788,32 @@ mod tests {
             assert_eq!(report.metrics.unwrap()["root_count"], 1);
             assert!(cache.refresh_count_for_test() >= 2);
         });
+    }
+
+    #[test]
+    fn a_rollup_estimates_each_roots_memory_once() {
+        let (storage, root) = test_root("health-memory-once");
+        let mut config = crate::config::Config::default();
+        config.storage_dir = Some(storage.path().join("state"));
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, Arc::clone(&ctx)));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+
+        let before = crate::context::memory_estimate_walks_for_test();
+        cache.refresh(&executor, &app);
+
+        // The census row and the rollup row come from one walk of the root's
+        // indexes, not one walk each.
+        assert_eq!(
+            crate::context::memory_estimate_walks_for_test() - before,
+            1,
+            "one rollup walked the root's indexes more than once"
+        );
     }
 
     #[test]

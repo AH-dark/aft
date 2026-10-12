@@ -984,6 +984,46 @@ struct ConfigureWarmState {
     key: Option<String>,
 }
 
+/// How long a view's path-status summary is reused while its database files
+/// look unchanged. A bound on how late a missed change can show.
+const PATH_STATUS_REREAD_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Length and modification time of a view's derived database and of its
+/// write-ahead log, `None` for a file that does not exist.
+type PathStatusFiles = [Option<(u64, Option<std::time::SystemTime>)>; 2];
+
+fn path_status_files(view_dir: &Path) -> PathStatusFiles {
+    let state = |name: &str| {
+        std::fs::metadata(view_dir.join(name))
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()))
+    };
+    [state("derived.sqlite"), state("derived.sqlite-wal")]
+}
+
+/// The last path-status summary read for this root's view.
+#[derive(Debug)]
+struct PathStatusCache {
+    view_dir: PathBuf,
+    files: PathStatusFiles,
+    read_at: Instant,
+    summary: Option<crate::path_status::PathStatusSummary>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Path-status database reads made on this thread.
+    static PATH_STATUS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Walks of a root's resident indexes for a memory estimate made on this
+    /// thread.
+    static MEMORY_ESTIMATE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn memory_estimate_walks_for_test() -> usize {
+    MEMORY_ESTIMATE_WALKS.with(std::cell::Cell::get)
+}
+
 #[derive(Debug)]
 struct ConfigurePhaseTiming {
     phase: &'static str,
@@ -3319,6 +3359,8 @@ pub struct AppContext {
     /// language-server applicability walk stores its result only while it
     /// still matches (see `refresh_project_applicability`).
     project_applicability_epoch: Arc<AtomicU64>,
+    /// See `view_path_status_summary`.
+    view_path_status_cache: parking_lot::Mutex<Option<PathStatusCache>>,
     /// At most one diagnostics collector may outlive its caller's budget.
     /// Later edits queue their latest disk contents instead of growing a pool
     /// of threads waiting on a slow handshake or the same manager mutex.
@@ -3983,6 +4025,7 @@ impl AppContext {
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
+            view_path_status_cache: parking_lot::Mutex::new(None),
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
@@ -6928,9 +6971,7 @@ impl AppContext {
             .read()
             .unwrap_or_else(|error| error.into_inner());
         let state = state.as_ref()?;
-        let status = crate::path_status::PathStatusStore::open(&state.snapshot.view_dir)
-            .ok()
-            .and_then(|store| store.summary().ok());
+        let status = self.view_path_status_summary(&state.snapshot.view_dir);
         Some(ViewHealthSnapshot {
             generation: state
                 .snapshot
@@ -6948,6 +6989,46 @@ impl AppContext {
             failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
             cold_builds: crate::views::assembly::cold_build_counts(&state.snapshot.view_dir),
         })
+    }
+
+    /// The path-status summary of `view_dir`, read again only when its
+    /// database files changed since the last read, or after
+    /// [`PATH_STATUS_REREAD_INTERVAL`].
+    ///
+    /// The health rollup asks for this for every views-on root every few
+    /// seconds. Reading it opens the view's SQLite database, applies its
+    /// schema, queries it and closes it again, and closing the last
+    /// connection checkpoints the write-ahead log; doing that for every root
+    /// on every pass kept the rollup thread busy while nothing had changed.
+    fn view_path_status_summary(
+        &self,
+        view_dir: &Path,
+    ) -> Option<crate::path_status::PathStatusSummary> {
+        let files = path_status_files(view_dir);
+        if let Some(cached) = self.view_path_status_cache.lock().as_ref() {
+            if cached.view_dir == view_dir
+                && cached.files == files
+                && cached.read_at.elapsed() < PATH_STATUS_REREAD_INTERVAL
+            {
+                return cached.summary.clone();
+            }
+        }
+        #[cfg(test)]
+        PATH_STATUS_READS.with(|reads| reads.set(reads.get() + 1));
+        let summary = crate::path_status::PathStatusStore::open(view_dir)
+            .ok()
+            .and_then(|store| store.summary().ok());
+        // Opening and closing the database can itself create, checkpoint or
+        // remove its files, so the state to compare against next time is
+        // taken after the store is closed. A write that lands in between is
+        // picked up by the next change or by the reread interval.
+        *self.view_path_status_cache.lock() = Some(PathStatusCache {
+            view_dir: view_dir.to_path_buf(),
+            files: path_status_files(view_dir),
+            read_at: Instant::now(),
+            summary: summary.clone(),
+        });
+        summary
     }
 
     pub(crate) fn view_runtime_snapshot(&self) -> Option<ViewRuntimeSnapshot> {
@@ -11777,6 +11858,8 @@ impl AppContext {
     }
 
     fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 10] {
+        #[cfg(test)]
+        MEMORY_ESTIMATE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut semantic = match self.semantic_index.try_read() {
             Ok(index) => index
                 .as_ref()
@@ -11941,8 +12024,14 @@ impl AppContext {
     /// A contended subsystem is represented as `busy` rather than delaying the
     /// status control path.
     pub fn memory_root_snapshot(&self) -> crate::memory::RootMemorySnapshot {
+        Self::memory_root_snapshot_from(self.memory_estimates())
+    }
+
+    fn memory_root_snapshot_from(
+        estimates: [crate::memory::MemoryEstimate; 10],
+    ) -> crate::memory::RootMemorySnapshot {
         let [semantic, trigram, symbols, callgraph, callgraph_projection, inspect, bash, lsp, parser_pool, pending_install] =
-            self.memory_estimates();
+            estimates;
         crate::memory::RootMemorySnapshot::new(
             semantic,
             trigram,
@@ -11959,8 +12048,9 @@ impl AppContext {
 
     /// Pre-aggregate root memory for capped health diagnostics without building
     /// the rich per-subsystem detail that the status command returns.
-    pub(crate) fn memory_root_rollup(&self) -> crate::memory::RootMemoryRollup {
-        let estimates = self.memory_estimates();
+    fn memory_root_rollup_from(
+        estimates: &[crate::memory::MemoryEstimate; 10],
+    ) -> crate::memory::RootMemoryRollup {
         crate::memory::RootMemoryRollup::from_estimates(&[
             &estimates[0],
             &estimates[1],
@@ -11973,6 +12063,21 @@ impl AppContext {
             &estimates[8],
             &estimates[9],
         ])
+    }
+
+    /// Both [`Self::memory_root_snapshot`] and the health rollup's
+    /// pre-aggregated root memory from one estimate. Each estimate walks every entry of the root's
+    /// resident indexes, so the health rollup, which needs both every few
+    /// seconds for every root, takes them from one walk instead of two.
+    pub(crate) fn memory_root_snapshot_and_rollup(
+        &self,
+    ) -> (
+        crate::memory::RootMemorySnapshot,
+        crate::memory::RootMemoryRollup,
+    ) {
+        let estimates = self.memory_estimates();
+        let rollup = Self::memory_root_rollup_from(&estimates);
+        (Self::memory_root_snapshot_from(estimates), rollup)
     }
 
     /// Attribute all actor roots registered in this process. Standalone mode
@@ -12077,6 +12182,70 @@ mod core_regressions {
             !finished.contains("index_loading_state=0ms("),
             "steps belong to the phase that marked them: {finished}"
         );
+    }
+
+    /// The health rollup reads every views-on root's path-status summary
+    /// every few seconds. Reading it opens the view's database, so it is read
+    /// again only after that database changed; otherwise the last summary is
+    /// reused. The pass count and time are printed as the measurement.
+    #[test]
+    fn view_health_rereads_path_status_only_after_its_database_changes() {
+        const PASSES: usize = 50;
+        let ctx = context();
+        let storage = tempfile::tempdir().unwrap();
+        let scope = "0123456789abcdef";
+        let view_dir = storage.path().join("views").join(scope);
+        std::fs::create_dir_all(&view_dir).unwrap();
+        // An open writer keeps the write-ahead log in place, so each later
+        // write visibly grows it.
+        let mut writer = crate::path_status::PathStatusStore::open(&view_dir).unwrap();
+        writer.mark_pending(b"a.rs", "test", 1).unwrap();
+        ctx.update_config(|config| config.views.enabled = true);
+        ctx.install_view_runtime(
+            ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: storage.path().to_path_buf(),
+                family: "path-status-fixture".to_owned(),
+                scope: scope.to_owned(),
+                view_dir: view_dir.clone(),
+                generation: Some("1-fixture".to_owned()),
+                manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::GitHeadMetadata {
+                    head_path: PathBuf::new(),
+                    head_mtime: None,
+                    resolved_ref_path: None,
+                    resolved_ref_mtime: None,
+                },
+                pending_paths: BTreeSet::new(),
+                pending_inputs: Default::default(),
+            },
+            None,
+        );
+        let reads = || PATH_STATUS_READS.with(std::cell::Cell::get);
+
+        let before = reads();
+        let started = Instant::now();
+        for _ in 0..PASSES {
+            let health = ctx.view_health_snapshot().expect("view health");
+            assert_eq!(health.pending_paths, 1);
+        }
+        let elapsed = started.elapsed();
+        let database_reads = reads() - before;
+        eprintln!(
+            "view health: {PASSES} snapshots in {elapsed:?}, {database_reads} path-status database reads"
+        );
+
+        assert_eq!(database_reads, 1, "an unchanged database was read again");
+        writer.mark_pending(b"b.rs", "test", 1).unwrap();
+        assert_eq!(
+            ctx.view_health_snapshot()
+                .expect("view health")
+                .pending_paths,
+            2,
+            "a change to the database is read"
+        );
+        drop(writer);
     }
 
     #[test]
