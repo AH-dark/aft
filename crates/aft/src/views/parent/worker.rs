@@ -596,7 +596,7 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     // published files match; otherwise the child's call-graph plane reports
     // that the graph has not been built yet.
     if !super::super::read::derived_built(&view_dir, &generation) {
-        let main = store.load_manifest(&generation).ok().and_then(|manifest| {
+        let main = store.load_manifest(&generation).ok().map(|manifest| {
             super::super::read::main_checkout_callgraph(
                 &session.storage,
                 &child.root,
@@ -606,14 +606,19 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
             )
         });
         *write(&child.callgraph) = match main {
-            Some((opened, _)) => {
+            Some(super::super::read::MainCheckoutGraph::Answer(opened, _)) => {
                 child.loads.fetch_add(1, Ordering::SeqCst);
                 Plane::Ready(Arc::new(CallgraphChild {
                     store: Arc::new(opened),
                     generation,
                 }))
             }
-            None => Plane::Gap(super::super::read::CALLGRAPH_NOT_BUILT.into()),
+            Some(super::super::read::MainCheckoutGraph::Busy) => Plane::Gap(
+                "the main checkout's call graph is locked by a publication; retrying".into(),
+            ),
+            Some(super::super::read::MainCheckoutGraph::Unavailable) | None => {
+                Plane::Gap(super::super::read::CALLGRAPH_NOT_BUILT.into())
+            }
         };
         return;
     }

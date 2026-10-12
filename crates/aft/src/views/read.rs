@@ -261,7 +261,7 @@ pub(crate) fn derived_built(view_dir: &std::path::Path, generation: &str) -> boo
 }
 
 /// The main checkout's published call graph, opened to answer for the linked
-/// worktree at `project_root`, or `None` when it cannot answer for it.
+/// worktree at `project_root`, when it can answer for it.
 ///
 /// It answers only when the worktree's published `manifest` has exactly the
 /// main checkout's call-graph inputs: the same paths, modes and content keys.
@@ -269,11 +269,11 @@ pub(crate) fn derived_built(view_dir: &std::path::Path, generation: &str) -> boo
 /// Derived rows hold manifest-relative paths and the reader is bound to
 /// `project_root`, so answers name the worktree's files, not main's.
 ///
-/// `None` covers every case where equality is not proven: no main checkout
-/// (or `project_root` is main), a change the watcher saw in the worktree,
-/// main's view missing, unpublished or not ready, another artifact family,
-/// different files, or a probe that could not finish.
-/// The caller then builds the worktree's own graph instead of guessing.
+/// `Unavailable` covers every case where equality is not proven: no main
+/// checkout (or `project_root` is main), a change the watcher saw in the
+/// worktree, main's view missing, unpublished or not ready, another artifact
+/// family, different files, or a probe that failed. The caller then builds the
+/// worktree's own graph instead of guessing. A locked database is `Busy`.
 /// Main's generation gets a query pin, so generation sweeps do not delete its
 /// files while they are read, and the pin lives as long as the returned reader.
 pub(crate) fn main_checkout_callgraph(
@@ -282,21 +282,33 @@ pub(crate) fn main_checkout_callgraph(
     family: &str,
     own_generation: &str,
     manifest: &super::Manifest,
-) -> Option<(ReadonlyCallGraphStore, String)> {
-    let main_root = main_checkout_root(project_root)?;
+) -> MainCheckoutGraph {
+    use MainCheckoutGraph::{Answer, Busy, Unavailable};
+    let Some(main_root) = main_checkout_root(project_root) else {
+        return Unavailable;
+    };
     if main_root == project_root
         || checkout_diverged(project_root)
         || crate::search_index::artifact_cache_key(&main_root) != family
         || super::assembly::manifest_lacks_callgraph(manifest)
     {
-        return None;
+        return Unavailable;
     }
     let view_dir = storage
         .join("views")
         .join(crate::path_identity::project_scope_key(&main_root));
-    let view = super::ViewStore::existing_dir(view_dir.clone())?;
-    let generation = view.current_generation_read_only().ok()??;
-    let pin = QueryPin::acquire(&view_dir, &generation).ok()?;
+    let Some(view) = super::ViewStore::existing_dir(view_dir.clone()) else {
+        return Unavailable;
+    };
+    let generation = match view.current_generation_read_only() {
+        Ok(Some(generation)) => generation,
+        Ok(None) => return Unavailable,
+        Err(super::ViewError::Sqlite(error)) if crate::db::is_busy_error(&error) => return Busy,
+        Err(_) => return Unavailable,
+    };
+    let Ok(pin) = QueryPin::acquire(&view_dir, &generation) else {
+        return Unavailable;
+    };
     // Generations are immutable, so the verdict for this pair is cached and the
     // main manifest is read and compared once, not on every query.
     type Verdicts = std::collections::HashMap<(PathBuf, String, PathBuf, String), bool>;
@@ -316,14 +328,19 @@ pub(crate) fn main_checkout_callgraph(
     let equal = match known {
         Some(equal) => equal,
         None => {
-            // A busy probe gives no verdict either way, so it is not cached;
-            // the next query probes again.
-            let ready = crate::callgraph_store::manifest_view_database_ready(
+            // Main's publication can hold its derived database locked (a
+            // checkpoint or a writer) past the busy wait. That gives no verdict
+            // either way: it is not cached, and the caller retries instead of
+            // building a graph main may well be able to answer with.
+            let ready = match crate::callgraph_store::manifest_view_database_ready(
                 &view_dir,
                 &generation,
                 std::time::Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
-            )
-            .ok()?;
+            ) {
+                Ok(ready) => ready,
+                Err(error) if error.is_transient_lock_contention() => return Busy,
+                Err(_) => return Unavailable,
+            };
             // A generation can reuse an earlier generation's derived database
             // (`derived_owner`). Compare against the manifest that database was
             // built from, as `sibling_checkout_seed` does before cloning it.
@@ -345,17 +362,31 @@ pub(crate) fn main_checkout_callgraph(
         }
     };
     if !equal {
-        return None;
+        return Unavailable;
     }
-    let store = ReadonlyCallGraphStore::open_manifest_view(
+    match ReadonlyCallGraphStore::open_manifest_view(
         project_root.to_path_buf(),
         family.to_owned(),
         view_dir,
         &generation,
         Some(Arc::new(pin)),
-    )
-    .ok()?;
-    Some((store, generation))
+    ) {
+        Ok(store) => Answer(store, generation),
+        Err(error) if error.is_transient_lock_contention() => Busy,
+        Err(_) => Unavailable,
+    }
+}
+
+/// What the main checkout's published graph can do for a linked worktree.
+pub(crate) enum MainCheckoutGraph {
+    /// Main's graph answers for the worktree; the generation is main's.
+    Answer(ReadonlyCallGraphStore, String),
+    /// Equality is not proven: the worktree needs its own graph.
+    Unavailable,
+    /// A database of main's view was locked, so there is no verdict yet. The
+    /// caller reports the graph as building and asks again, rather than
+    /// failing the query or starting a build main may make unnecessary.
+    Busy,
 }
 
 /// Checkouts the file watcher saw change since this process loaded their

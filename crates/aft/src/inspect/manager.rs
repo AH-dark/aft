@@ -4839,13 +4839,17 @@ fn current_view_projection_store(
             let manifest = view
                 .load_manifest(&generation)
                 .map_err(|error| error.to_string())?;
-            let Some((store, main_generation)) = crate::views::read::main_checkout_callgraph(
-                &storage,
-                project_root,
-                &family,
-                &generation,
-                &manifest,
-            ) else {
+            let crate::views::read::MainCheckoutGraph::Answer(store, main_generation) =
+                crate::views::read::main_checkout_callgraph(
+                    &storage,
+                    project_root,
+                    &family,
+                    &generation,
+                    &manifest,
+                )
+            else {
+                // Unbuilt, or main's database is locked for now: both are a
+                // pending view the next scan asks about again.
                 note_checkout_view_refusal!(
                     "projection_not_built: root={project_root:?} generation={generation}"
                 );

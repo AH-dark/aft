@@ -9852,6 +9852,94 @@ mod tests {
         lazy_assert_same_graph(&store, &cold);
     }
 
+    /// Hold an exclusive write transaction on `root`'s current derived
+    /// call-graph database, so a reader without a busy wait gets
+    /// "database is locked" until the returned connection rolls back.
+    fn lazy_lock_derived(
+        storage: &Path,
+        root: &Path,
+    ) -> crate::db::file_identity::IdentityConnection {
+        let (generation, built) = lazy_current_generation(storage, root);
+        assert!(built, "{root:?} has a derived call graph to lock");
+        let view =
+            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
+                .unwrap();
+        crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
+        let writer = crate::db::file_identity::IdentityConnection::open(
+            &view.derived_path(&generation).unwrap(),
+            "lazy_callgraph_lock_test",
+        )
+        .unwrap();
+        // In WAL mode a writer never blocks readers; the rollback journal makes
+        // the exclusive lock visible to them, as a checkpoint resetting the WAL
+        // or the last connection closing it is.
+        writer
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        writer
+    }
+
+    #[test]
+    fn views_reader_reports_building_while_its_derived_database_is_locked() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree(true);
+        let owner = fixture.owner.as_ref().unwrap();
+        let writer = lazy_lock_derived(&fixture.storage, &fixture.main);
+        match owner.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Building => {}
+            CallgraphStoreAccess::Error(error) => {
+                panic!("a locked derived database failed the query: {error}")
+            }
+            _ => panic!("a locked derived database must report building"),
+        }
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        let store = lazy_ready(owner.callgraph_store_for_ops());
+        assert!(store
+            .sqlite_path()
+            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
+    }
+
+    #[test]
+    fn linked_worktree_waits_for_a_locked_main_graph_instead_of_building() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree(true);
+        // Main's publication holds its derived database while the worktree,
+        // whose files match main's, asks for callers.
+        let writer = lazy_lock_derived(&fixture.storage, &fixture.main);
+        match fixture.borrower.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Building => {}
+            CallgraphStoreAccess::Ready(store) => panic!(
+                "a locked main graph must report building, not answer from {:?}",
+                store.sqlite_path()
+            ),
+            CallgraphStoreAccess::Error(error) => {
+                panic!("a locked main graph failed the query: {error}")
+            }
+            _ => panic!("a locked main graph must report building"),
+        }
+        // A lock is no verdict: no build started, and main answers once free.
+        assert!(fixture.borrower.defer_callgraph_build());
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            0
+        );
+        assert_eq!(
+            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked)),
+            Vec::<String>::new()
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        assert!(store
+            .sqlite_path()
+            .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)));
+    }
+
     #[test]
     fn superseded_standalone_view_load_never_installs_its_snapshot() {
         let _env_guard = home_env_mutex();

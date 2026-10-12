@@ -8182,15 +8182,23 @@ impl AppContext {
         // Once a query has needed the worktree's own graph, answer from it
         // alone: main's graph never stands in for a build already under way.
         if !self.lazy_callgraph.demanded.load(Ordering::Acquire) {
-            if let Some((store, _)) = crate::views::read::main_checkout_callgraph(
+            match crate::views::read::main_checkout_callgraph(
                 &view.storage,
                 project_root,
                 &view.family,
                 generation,
                 manifest,
             ) {
-                self.note_callgraph_source("main_checkout_graph");
-                return CallgraphStoreAccess::Ready(Arc::new(store));
+                crate::views::read::MainCheckoutGraph::Answer(store, _) => {
+                    self.note_callgraph_source("main_checkout_graph");
+                    return CallgraphStoreAccess::Ready(Arc::new(store));
+                }
+                // Main's database is locked for now: ask again on the next
+                // query instead of failing or starting a build.
+                crate::views::read::MainCheckoutGraph::Busy => {
+                    return CallgraphStoreAccess::Building;
+                }
+                crate::views::read::MainCheckoutGraph::Unavailable => {}
             }
         }
         if demand {
@@ -8300,6 +8308,14 @@ impl AppContext {
                                 self.note_callgraph_source("own_graph");
                             }
                             CallgraphStoreAccess::Ready(Arc::new(store))
+                        }
+                        // The reader opens without a busy wait. A publication's
+                        // post-commit checkpoint, or the last connection closing
+                        // its WAL, can hold the derived database locked for a
+                        // moment: report building so the caller asks again,
+                        // never fail the query with "database is locked".
+                        Err(error) if error.is_transient_lock_contention() => {
+                            CallgraphStoreAccess::Building
                         }
                         Err(error) => CallgraphStoreAccess::Error(error),
                     };
