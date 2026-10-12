@@ -70,7 +70,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     if let Some(directory) = req.params.get("directory").and_then(|v| v.as_str()) {
-        let dir_path = match ctx.validate_path(&req.id, Path::new(directory)) {
+        let dir_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(directory)) {
             Ok(path) => path,
             Err(resp) => return resp,
         };
@@ -102,11 +102,16 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        let (file_outlines, skipped_files) =
-            match outline_many_files(&files, ctx, &req.id, project_root.as_deref()) {
-                Ok(result) => result,
-                Err(resp) => return resp,
-            };
+        let (file_outlines, skipped_files) = match outline_many_files(
+            &files,
+            ctx,
+            &req.id,
+            req.session(),
+            project_root.as_deref(),
+        ) {
+            Ok(result) => result,
+            Err(resp) => return resp,
+        };
 
         let walk_incomplete = discovery.walk_truncated
             || discovery.collection_truncated
@@ -142,11 +147,16 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             .filter_map(|file_val| file_val.as_str().map(String::from))
             .collect();
         let total_files_requested = files_arr.len();
-        let (file_outlines, skipped_files) =
-            match outline_many_files(&files, ctx, &req.id, project_root.as_deref()) {
-                Ok(result) => result,
-                Err(resp) => return resp,
-            };
+        let (file_outlines, skipped_files) = match outline_many_files(
+            &files,
+            ctx,
+            &req.id,
+            req.session(),
+            project_root.as_deref(),
+        ) {
+            Ok(result) => result,
+            Err(resp) => return resp,
+        };
 
         let rendered = format_multi_file_tree(
             &file_outlines,
@@ -236,8 +246,15 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let mut parser = FileParser::new();
-    let entries = match outline_structure_entries(&path, &symbols, &mut parser, ctx, &req.id, false)
-    {
+    let entries = match outline_structure_entries(
+        &path,
+        &symbols,
+        &mut parser,
+        ctx,
+        &req.id,
+        req.session(),
+        false,
+    ) {
         Ok(entries) => entries,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
@@ -298,7 +315,7 @@ fn resolve_file_or_url(
         .map_err(|error| Response::error(&req.id, "url_fetch_failed", error.to_string()));
     }
 
-    ctx.validate_path(&req.id, Path::new(file))
+    ctx.validate_read_path(&req.id, req.session(), Path::new(file))
 }
 
 /// Build a nested outline tree from a flat symbol list.
@@ -704,6 +721,7 @@ fn outline_structure_entries(
     parser: &mut FileParser,
     ctx: &AppContext,
     req_id: &str,
+    session_id: &str,
     collapse_tests: bool,
 ) -> Result<Vec<OutlineEntry>, AftError> {
     let Some(lang) = detect_language(path).filter(|lang| {
@@ -774,7 +792,7 @@ fn outline_structure_entries(
             // A test include is navigation metadata, not a requested file. A
             // denied or unavailable include must not hide the declaring file's
             // product API or bypass the project's path restrictions.
-            match ctx.validate_path(req_id, &included) {
+            match ctx.validate_read_path(req_id, session_id, &included) {
                 Ok(included) => {
                     let count = match outline_skip_reason(&included, Some(&mut *parser)) {
                         Some(reason) => Err(reason),
@@ -1235,7 +1253,7 @@ fn handle_outline_files_mode(
     let mut empty_targets = Vec::new();
 
     for target in targets {
-        let dir_path = match ctx.validate_path(&req.id, Path::new(&target)) {
+        let dir_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&target)) {
             Ok(path) => path,
             Err(response) => return response,
         };
@@ -2068,11 +2086,12 @@ fn outline_many_files(
     files: &[String],
     ctx: &AppContext,
     req_id: &str,
+    session_id: &str,
     project_root: Option<&Path>,
 ) -> Result<(Vec<FileOutline>, Vec<SkippedFile>), Response> {
     let paths = files
         .iter()
-        .map(|file| ctx.validate_path(req_id, Path::new(file)))
+        .map(|file| ctx.validate_read_path(req_id, session_id, Path::new(file)))
         .collect::<Result<Vec<_>, _>>()?;
     let display_root = project_root
         .filter(|root| paths.iter().all(|path| path.starts_with(root)))
@@ -2119,6 +2138,7 @@ fn outline_many_files(
                     batch_parser.as_mut().unwrap_or(&mut fallback_parser),
                     ctx,
                     req_id,
+                    session_id,
                     true,
                 );
                 match structure {
@@ -3421,7 +3441,8 @@ mod tests {
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, _) = outline_many_files(&files, &ctx, "budget", None).unwrap();
+        let (outlines, _) =
+            outline_many_files(&files, &ctx, "budget", "budget-session", None).unwrap();
         let rendered = format_multi_file_tree(&outlines, 550, 3, false);
         assert!(rendered.text.len() <= 550, "{} bytes", rendered.text.len());
         assert_eq!(rendered.shown, 2, "{}", rendered.text);
@@ -3933,8 +3954,9 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
-        let (outlines, skipped) = outline_many_files(&files, &ctx, "outline-fixture", None)
-            .expect("outline fixture files");
+        let (outlines, skipped) =
+            outline_many_files(&files, &ctx, "outline-fixture", "fixture-session", None)
+                .expect("outline fixture files");
         assert!(skipped.is_empty(), "{skipped:?}");
         format_multi_file_tree(&outlines, 30 * 1024, files.len(), false).text
     }

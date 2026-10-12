@@ -26,7 +26,7 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let file = Path::new(&params.file);
-    let validated = match ctx.validate_path(&req.id, file) {
+    let validated = match ctx.validate_read_path(&req.id, req.session(), file) {
         Ok(path) => path,
         Err(resp) => return resp,
     };

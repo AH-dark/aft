@@ -112,7 +112,7 @@ fn requested_scopes(
     };
     raw.iter()
         .map(|path| {
-            let validated = ctx.validate_path(&req.id, Path::new(path))?;
+            let validated = ctx.validate_read_path(&req.id, req.session(), Path::new(path))?;
             let absolute = if validated.is_relative() {
                 session.root().join(validated)
             } else {
@@ -121,6 +121,27 @@ fn requested_scopes(
             Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn artifact_read_parent_inspect_scope() {
+    crate::access_policy_tests::assert_artifact_read_policy(
+        |req, ctx| {
+            let config = ctx.config();
+            let parent = super::engine::tests::session(
+                config.project_root.as_deref().unwrap(),
+                config.storage_dir.as_deref().unwrap(),
+            );
+            drop(config);
+            match requested_scopes(req, ctx, &parent) {
+                Ok(_) => Response::success(&req.id, serde_json::json!({})),
+                Err(response) => response,
+            }
+        },
+        "inspect",
+        |path| serde_json::json!({"scope": path}),
+    );
 }
 
 pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Response {

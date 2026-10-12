@@ -114,6 +114,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         req.params.get("path"),
         max_results,
         &req.id,
+        req.session(),
     ) {
         Ok(scope) => scope,
         Err(response) => return response,

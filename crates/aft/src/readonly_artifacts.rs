@@ -479,7 +479,7 @@ fn semantic_index_location(
     Some((data_path, project_key))
 }
 
-fn expand_tilde(raw: &str) -> PathBuf {
+pub(crate) fn expand_tilde(raw: &str) -> PathBuf {
     if raw == "~" {
         return home_dir().unwrap_or_else(|| PathBuf::from(raw));
     }

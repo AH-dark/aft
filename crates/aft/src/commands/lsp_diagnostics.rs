@@ -113,7 +113,7 @@ fn handle_file_mode(
     severity_filter: SeverityFilter,
     wait_ms: u64,
 ) -> Response {
-    let canonical = match ctx.validate_path(&req.id, Path::new(file)) {
+    let canonical = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
         Ok(path) => normalize_query_path(&path),
         Err(resp) => return resp,
     };
@@ -320,7 +320,7 @@ fn handle_directory_mode(
     severity_filter: SeverityFilter,
     _wait_ms: u64,
 ) -> Response {
-    let canonical = match ctx.validate_path(&req.id, Path::new(directory)) {
+    let canonical = match ctx.validate_read_path(&req.id, req.session(), Path::new(directory)) {
         Ok(path) => normalize_query_path(&path),
         Err(resp) => return resp,
     };

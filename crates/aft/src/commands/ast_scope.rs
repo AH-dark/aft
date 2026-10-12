@@ -18,8 +18,11 @@ struct SearchRoot {
     label: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
+// Searches supply a read session; replacement scopes retain write authorization.
 pub(crate) fn collect_ast_files(
     req_id: &str,
+    read_session: Option<&str>,
     command: &str,
     ctx: &AppContext,
     project_root: &Path,
@@ -27,7 +30,7 @@ pub(crate) fn collect_ast_files(
     paths: &[String],
     globs: &[String],
 ) -> Result<AstScope, Response> {
-    let roots = resolve_roots(req_id, ctx, project_root, paths)?;
+    let roots = resolve_roots(req_id, read_session, ctx, project_root, paths)?;
 
     for root in &roots {
         if !root.path.exists() {
@@ -56,6 +59,7 @@ pub(crate) fn collect_ast_files(
 
 fn resolve_roots(
     req_id: &str,
+    read_session: Option<&str>,
     ctx: &AppContext,
     project_root: &Path,
     paths: &[String],
@@ -72,7 +76,10 @@ fn resolve_roots(
         match resolve_path_or_multi(
             path,
             project_root,
-            |candidate| ctx.validate_path(req_id, candidate),
+            |candidate| match read_session {
+                Some(session) => ctx.validate_read_path(req_id, session, candidate),
+                None => ctx.validate_path(req_id, candidate),
+            },
             req_id,
         )? {
             SearchPathResolution::Single(root) => roots.push(SearchRoot {
@@ -321,8 +328,16 @@ mod tests {
 
         let globs_before = work_counters::GLOB_BUILDS.with(|count| count.get());
         let canon_before = work_counters::FILE_CANONICALIZATIONS.with(|count| count.get());
-        let scope = match collect_ast_files("scope", "ast_search", &ctx, &root, &lang, &[], &globs)
-        {
+        let scope = match collect_ast_files(
+            "scope",
+            Some("scope-session"),
+            "ast_search",
+            &ctx,
+            &root,
+            &lang,
+            &[],
+            &globs,
+        ) {
             Ok(scope) => scope,
             Err(_) => panic!("scope collection failed"),
         };

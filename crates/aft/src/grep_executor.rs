@@ -168,9 +168,10 @@ pub fn resolve_grep_scope(
     paths: Option<&serde_json::Value>,
     max_results: usize,
     req_id: &str,
+    session_id: &str,
 ) -> Result<GrepScope, Response> {
     let project_root = project_root(ctx);
-    let search_roots = resolve_roots(ctx, paths, &project_root, req_id)?;
+    let search_roots = resolve_roots(ctx, paths, &project_root, req_id, session_id)?;
 
     if let Some(missing_root) = search_roots
         .iter()
@@ -412,6 +413,7 @@ fn resolve_roots(
     paths: Option<&serde_json::Value>,
     project_root: &Path,
     req_id: &str,
+    session_id: &str,
 ) -> Result<Vec<PathBuf>, Response> {
     let Some(paths) = paths else {
         return Ok(vec![resolve_search_scope(project_root, None).root]);
@@ -423,7 +425,7 @@ fn resolve_roots(
         return match resolve_path_or_multi(
             path,
             project_root,
-            |candidate| ctx.validate_path(req_id, candidate),
+            |candidate| ctx.validate_read_path(req_id, session_id, candidate),
             req_id,
         )? {
             SearchPathResolution::Single(root) => Ok(vec![root]),
@@ -440,7 +442,7 @@ fn resolve_roots(
                     "grep: path array entries must be strings",
                 ));
             };
-            let validated = ctx.validate_path(req_id, Path::new(path))?;
+            let validated = ctx.validate_read_path(req_id, session_id, Path::new(path))?;
             let raw = validated.to_string_lossy();
             roots.push(resolve_search_scope(project_root, Some(raw.as_ref())).root);
         }
@@ -2210,7 +2212,7 @@ mod tests {
         std::fs::create_dir_all(&right).expect("right");
         let paths = serde_json::json!([left.display().to_string(), right.display().to_string()]);
 
-        let scope = resolve_grep_scope(&ctx, Some(&paths), 10, "test").expect("scope");
+        let scope = resolve_grep_scope(&ctx, Some(&paths), 10, "test", "test").expect("scope");
 
         assert!(scope.multi_root);
         assert_eq!(scope.per_root_max, 20);
