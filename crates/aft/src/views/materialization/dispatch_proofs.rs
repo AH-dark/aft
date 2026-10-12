@@ -503,6 +503,91 @@ fn site_whose_caller_has_no_node_gets_no_method_call_edge() {
     );
 }
 
+/// Today's joins never resolve a reference at a method-call site's ordinal, so
+/// ordinary emission never writes an edge on a site's ref ID. This test plants
+/// such an edge, as a changed join could, and requires the pass to delete it
+/// exactly like the row-by-row writer does.
+#[test]
+fn ordinary_edge_on_a_method_call_site_ref_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob_path = dir.path().join("blobs.sqlite");
+    let connection = blobs(&blob_path);
+    let manifest = manifest_of(
+        &connection,
+        &[
+            ("types.ts", INTERFACE),
+            ("caller.ts", CALLER),
+            ("impl.ts", IMPLEMENTATION),
+        ],
+    );
+    drop(connection);
+    let base = dir.path().join("base.sqlite");
+    materialize_manifest_view_database(&base, &blob_path, &manifest).unwrap();
+    let ref_id: String = Connection::open(&base)
+        .unwrap()
+        .query_row(
+            "SELECT 'view:' || caller_file || ':' || ordinal FROM view_dispatch_sites
+             WHERE caller_file='caller.ts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let ordinary = format!(
+        "SELECT COUNT(*) FROM edges WHERE ref_id='{ref_id}' AND provenance='{PROVENANCE_TREESITTER}'"
+    );
+    let mut databases = Vec::new();
+    for row_by_row in [false, true] {
+        let database = dir
+            .path()
+            .join(format!("ordinary-edge-{row_by_row}.sqlite"));
+        std::fs::copy(&base, &database).unwrap();
+        let mut connection = Connection::open(&database).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO edges (edge_id, ref_id, source_node, target_node, target_file,
+                                    target_symbol, kind, line, provenance)
+                 SELECT 'edge:' || ?1, ?1, id, id, file_path, scoped_name, 'call', 2, ?2
+                 FROM nodes WHERE file_path='caller.ts' AND scoped_name='caller'",
+                params![ref_id, PROVENANCE_TREESITTER],
+            )
+            .unwrap();
+        assert_eq!(count_in(&transaction, &ordinary), 1, "the edge is planted");
+        if row_by_row {
+            transaction
+                .execute(
+                    "UPDATE meta SET v='stale' WHERE k='view_dispatch_signature'",
+                    [],
+                )
+                .unwrap();
+        }
+        let blobs = Connection::open(&blob_path).unwrap();
+        let reader = ManifestViewBlobReader::new(&blobs);
+        let changed = BTreeSet::new();
+        let planted = HashSet::from([ref_id.clone()]);
+        dispatch::WRITE_ROW_BY_ROW.with(|cell| cell.set(row_by_row));
+        let emitted = dispatch::emit(
+            &transaction,
+            &manifest,
+            &reader,
+            &dispatch::EmitScope {
+                changed_paths: Some(&changed),
+                ordinary_edge_refs: &planted,
+            },
+        );
+        dispatch::WRITE_ROW_BY_ROW.with(|cell| cell.set(false));
+        emitted.unwrap();
+        transaction.commit().unwrap();
+        databases.push(database);
+    }
+    assert_eq!(count(&databases[0], &ordinary), 0);
+    parity::assert_logical_parity(&databases[0], &databases[1]);
+}
+
+fn count_in(connection: &Connection, sql: &str) -> usize {
+    connection.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
 /// A cold build written by differences must equal the row-by-row writer, for
 /// TypeScript interface and unknown receivers and for a Rust macro whose
 /// method call shares its AST ordinal with an ordinary call.

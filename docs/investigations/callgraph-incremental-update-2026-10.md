@@ -143,10 +143,11 @@ Step 2 (`views::materialization::dispatch_proofs`):
 - Writing an edge for a caller with no node reddened only
   `site_whose_caller_has_no_node_gets_no_method_call_edge`.
 - Skipping the ordinary-edge delete for rewritten site refs reddened
-  nothing. Both joins force every reference at a method-call site's ordinal
-  to unresolved, so ordinary emission never writes an edge with a site's ref
-  ID. The delete is kept so that the result equals the row-by-row writer in
-  every case.
+  nothing at first. Both joins force every reference at a method-call site's
+  ordinal to unresolved, so ordinary emission never writes an edge with a
+  site's ref ID. `ordinary_edge_on_a_method_call_site_ref_is_deleted` now
+  plants such an edge, as a changed join could. With the delete skipped,
+  only that test fails (`left: 1, right: 0`).
 
 The row-by-row writer is kept, unchanged, for files in which two sites share
 an ordinal. There, only its statement order defines the result, including
