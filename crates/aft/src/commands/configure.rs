@@ -9179,7 +9179,8 @@ mod tests {
         main: PathBuf,
         linked: PathBuf,
         storage: PathBuf,
-        owner: Arc<AppContext>,
+        /// `None` when the main checkout was never bound in this process.
+        owner: Option<Arc<AppContext>>,
         borrower: Arc<AppContext>,
     }
 
@@ -9209,13 +9210,19 @@ mod tests {
     /// published directly before it binds, so a fixture that reads main's graph
     /// does not depend on how main's bind builds it.
     fn lazy_worktree(prepublish_main: bool) -> LazyWorktree {
-        lazy_worktree_with(prepublish_main, |_| {})
+        lazy_worktree_with(prepublish_main, true, |_, _| {})
     }
 
-    /// Like [`lazy_worktree`], but `before_bind` runs on the linked worktree
-    /// after it is created and before it binds, so a test can give it its own
-    /// commits that no watcher event ever reports.
-    fn lazy_worktree_with(prepublish_main: bool, before_bind: impl FnOnce(&Path)) -> LazyWorktree {
+    /// Like [`lazy_worktree`], but `before_bind` runs with the linked worktree
+    /// and the storage directory after the worktree is created and before it
+    /// binds, so a test can give it its own commits that no watcher event ever
+    /// reports, or a view an earlier process published. Without `bind_main`
+    /// the main checkout is never bound in this process.
+    fn lazy_worktree_with(
+        prepublish_main: bool,
+        bind_main: bool,
+        before_bind: impl FnOnce(&Path, &Path),
+    ) -> LazyWorktree {
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         init_git_fixture(&main);
@@ -9230,14 +9237,16 @@ mod tests {
             .unwrap()
             .success());
         let linked = linked.canonicalize().unwrap();
-        before_bind(&linked);
         let storage = temp.path().join("storage");
+        before_bind(&linked, &storage);
         if prepublish_main {
             lazy_publish(&main, &storage);
         }
-        let owner = lazy_bind(&main, &storage, "lazy-owner");
+        let owner = bind_main.then(|| lazy_bind(&main, &storage, "lazy-owner"));
         let borrower = lazy_bind(&linked, &storage, "lazy-linked");
-        assert!(!owner.callgraph_build_on_demand());
+        assert!(owner
+            .as_ref()
+            .is_none_or(|owner| !owner.callgraph_build_on_demand()));
         assert!(borrower.callgraph_build_on_demand());
         LazyWorktree {
             _temp: temp,
@@ -9630,8 +9639,9 @@ mod tests {
             "the main checkout's graph is built at bind, before any query: {:?}",
             lazy_derived_files(&view_dir)
         );
-        assert_eq!(fixture.owner.lazy_callgraph_builds_scheduled_for_test(), 0);
-        let store = lazy_ready(fixture.owner.callgraph_store_for_ops());
+        let owner = fixture.owner.as_ref().unwrap();
+        assert_eq!(owner.lazy_callgraph_builds_scheduled_for_test(), 0);
+        let store = lazy_ready(owner.callgraph_store_for_ops());
         assert!(store.sqlite_path().starts_with(&view_dir));
     }
 
@@ -9712,7 +9722,7 @@ mod tests {
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         // A worker branch whose commit adds a caller: it differs from main's
         // published generation at bind, and no watcher event ever reports it.
-        let fixture = lazy_worktree_with(true, |linked| {
+        let fixture = lazy_worktree_with(true, true, |linked, _| {
             lazy_commit(
                 linked,
                 "pub fn caller() { target(); }\npub fn branch_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
@@ -9769,6 +9779,77 @@ mod tests {
             "caller"
         )
         .is_ok());
+    }
+
+    /// The current generation of `root`'s view and whether it has a derived
+    /// call-graph database.
+    fn lazy_current_generation(storage: &Path, root: &Path) -> (String, bool) {
+        let view_dir = lazy_view_dir(storage, root);
+        let generation =
+            crate::views::ViewStore::open(storage, &crate::path_identity::project_scope_key(root))
+                .unwrap()
+                .current_generation()
+                .unwrap()
+                .expect("published view");
+        let built = crate::views::read::derived_built(&view_dir, &generation);
+        (generation, built)
+    }
+
+    #[test]
+    fn linked_worktree_with_a_graph_from_an_earlier_process_defers_its_next_publication() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        // An earlier daemon built this worktree's graph (the eager behaviour
+        // before graphs were built on first use, or a process that queried it).
+        // Then the worker committed, so this bind has a publication to make.
+        let mut earlier = None;
+        let fixture = lazy_worktree_with(true, true, |linked, storage| {
+            lazy_publish(linked, storage);
+            earlier = Some(lazy_current_generation(storage, linked));
+            lazy_commit(
+                linked,
+                "pub fn caller() { target(); }\npub fn branch_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
+                "branch caller",
+            );
+        });
+        let (earlier, earlier_built) = earlier.unwrap();
+        assert!(earlier_built, "the earlier process built a derived graph");
+        let (current, built) = lazy_current_generation(&fixture.storage, &fixture.linked);
+        assert_ne!(current, earlier, "the bind published the new commit");
+        assert!(
+            !built,
+            "no query needed the graph in this process, so the publication must not patch or rebuild it: {:?}",
+            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked))
+        );
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            0
+        );
+        // The first query builds it, and the result equals a cold build.
+        let store = lazy_query_builds_own_graph(&fixture);
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
+    }
+
+    #[test]
+    fn linked_worktree_defers_and_builds_on_first_query_when_main_is_not_bound() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        // Main is neither bound in this process nor published, so its graph
+        // cannot answer; the worktree still defers until a query needs it.
+        let fixture = lazy_worktree_with(false, false, |_, _| {});
+        assert!(fixture.owner.is_none());
+        let (_, built) = lazy_current_generation(&fixture.storage, &fixture.linked);
+        assert!(!built);
+        assert_eq!(
+            lazy_derived_files(&lazy_view_dir(&fixture.storage, &fixture.linked)),
+            Vec::<String>::new()
+        );
+        let store = lazy_query_builds_own_graph(&fixture);
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
     }
 
     #[test]
