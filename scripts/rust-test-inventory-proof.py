@@ -9,6 +9,8 @@ This script captures the current workspace inventory from `cargo test --workspac
 * `cargo nextest list --workspace -E 'kind(test) - binary(=watcher_integration)'`
 * `cargo test -p agent-file-tools --test watcher_integration`
 
+When `AFT_NEXTEST_ARCHIVE_FILE` is set, the archived test inventory is also
+compared by test identity with the two non-watcher nextest buckets.
 Doctests are checked as a separate cargo bucket only when the baseline inventory
 contains doctest cases.
 """
@@ -157,7 +159,9 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
 
 
 def parse_nextest_list(
-    output: str, allowed_suite_kinds: set[str] | None = None
+    output: str,
+    allowed_suite_kinds: set[str] | None = None,
+    matching_tests_only: bool = False,
 ) -> list[NextestEntry]:
     allowed_suite_kinds = allowed_suite_kinds or {"test"}
     payload = json.loads(output)
@@ -170,8 +174,45 @@ def parse_nextest_list(
         for name, testcase in suite_data.get("testcases", {}).items():
             if testcase.get("kind") != "test":
                 continue
+            if (
+                matching_tests_only
+                and testcase.get("filter-match", {}).get("status") != "matches"
+            ):
+                continue
             entries.append(NextestEntry(kind=suite_kind, suite=suite, name=name))
     return entries
+
+
+def partition_nextest_entries(
+    command: list[str], allowed_suite_kinds: set[str] | None = None
+) -> list[list[NextestEntry]]:
+    entries = []
+    for shard in range(1, 4):
+        command_args = [*command]
+        if "--" in command_args:
+            separator = command_args.index("--")
+            command_args[separator:separator] = ["--partition", f"hash:{shard}/3"]
+        else:
+            command_args.extend(["--partition", f"hash:{shard}/3"])
+        entries.append(
+            parse_nextest_list(
+                run_command(command_args, merge_stderr=False),
+                allowed_suite_kinds,
+                matching_tests_only=True,
+            )
+        )
+    return entries
+
+
+def partition_coverage_errors(
+    expected_entries: list[NextestEntry], partitions: list[list[NextestEntry]]
+) -> tuple[list[str], list[str], list[str]]:
+    expected = Counter(entry.key for entry in expected_entries)
+    actual = Counter(entry.key for partition in partitions for entry in partition)
+    missing = sorted(key for key, count in expected.items() if actual[key] < count)
+    duplicate = sorted(key for key, count in actual.items() if count > expected[key])
+    extra = sorted(key for key in actual if key not in expected)
+    return missing, duplicate, extra
 
 
 def summarize(counter: Counter[str]) -> list[str]:
@@ -181,18 +222,40 @@ def summarize(counter: Counter[str]) -> list[str]:
 baseline_output = run_command(["cargo", "test", "--workspace", "--", "--list"])
 baseline_entries = parse_cargo_list(baseline_output)
 
-unit_bin_output = run_command([
+unit_bin_command = [
     "cargo",
     "nextest",
     "list",
+    "--profile",
+    "gate",
     "--workspace",
     "--lib",
     "--bins",
     "-T",
     "json",
     "--cargo-quiet",
-], merge_stderr=False)
+]
+unit_bin_output = run_command(unit_bin_command, merge_stderr=False)
 unit_bin_entries = parse_nextest_list(unit_bin_output, {"lib", "bin"})
+unit_bin_partition_command = [
+    *unit_bin_command,
+    "--",
+    "--skip",
+    "platform_verifier_tls_client_subprocess",
+]
+unit_bin_partition_output = run_command(unit_bin_partition_command, merge_stderr=False)
+unit_bin_shardable_entries = parse_nextest_list(
+    unit_bin_partition_output, {"lib", "bin"}, matching_tests_only=True
+)
+unit_bin_partitions = partition_nextest_entries(
+    unit_bin_partition_command, {"lib", "bin"}
+)
+serial_tls_entries = [
+    entry
+    for entry in unit_bin_entries
+    if entry.kind == "lib"
+    and entry.name.endswith("platform_verifier_tls_client_subprocess")
+]
 
 doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "doc"]
 doc_entries: list[CargoEntry] = []
@@ -200,18 +263,44 @@ if doc_baseline_entries:
     doc_output = run_command(["cargo", "test", "--workspace", "--doc", "--", "--list"])
     doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
 
-nextest_output = run_command([
+nextest_command = [
     "cargo",
     "nextest",
     "list",
+    "--profile",
+    "gate",
     "--workspace",
     "-E",
     "kind(test) - binary(=watcher_integration)",
     "-T",
     "json",
     "--cargo-quiet",
-], merge_stderr=False)
+]
+nextest_output = run_command(nextest_command, merge_stderr=False)
 nextest_entries = parse_nextest_list(nextest_output)
+nextest_shardable_entries = parse_nextest_list(nextest_output, matching_tests_only=True)
+nextest_partitions = partition_nextest_entries(nextest_command)
+
+archive_path = os.environ.get("AFT_NEXTEST_ARCHIVE_FILE")
+archive_entries: list[NextestEntry] | None = None
+if archive_path:
+    archive_output = run_command(
+        [
+            "cargo",
+            "nextest",
+            "list",
+            "--archive-file",
+            archive_path,
+            "--profile",
+            "gate",
+            "-E",
+            "(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)",
+            "-T",
+            "json",
+        ],
+        merge_stderr=False,
+    )
+    archive_entries = parse_nextest_list(archive_output, {"lib", "bin", "test"})
 
 watcher_output = run_command([
     "cargo",
@@ -247,6 +336,23 @@ extra_keys = sorted(key for key in covered_keys if key not in baseline_keys)
 watcher_in_nextest = sorted(
     entry.key for entry in nextest_entries if entry.suite == "watcher_integration"
 )
+unit_partition_missing, unit_partition_duplicate, unit_partition_extra = partition_coverage_errors(
+    unit_bin_shardable_entries, unit_bin_partitions
+)
+nextest_partition_missing, nextest_partition_duplicate, nextest_partition_extra = partition_coverage_errors(
+    nextest_shardable_entries, nextest_partitions
+)
+watcher_in_nextest_partitions = sorted(
+    entry.key
+    for partition in nextest_partitions
+    for entry in partition
+    if entry.suite == "watcher_integration"
+)
+archive_inventory_errors = ([], [], [])
+if archive_entries is not None:
+    archive_inventory_errors = partition_coverage_errors(
+        unit_bin_entries + nextest_entries, [archive_entries]
+    )
 
 print("Baseline counts:", ", ".join(summarize(baseline_by_bucket)))
 print(
@@ -262,8 +368,29 @@ print(
 )
 print(f"Watcher tests in nextest inventory: {len(watcher_in_nextest)}")
 print(f"Doctest cases in baseline inventory: {len(doc_baseline_entries)}")
+print(
+    "Hash partition counts: "
+    f"nextest-lib-bin={','.join(str(len(partition)) for partition in unit_bin_partitions)}; "
+    f"nextest-integration={','.join(str(len(partition)) for partition in nextest_partitions)}"
+)
+if archive_entries is not None:
+    print(f"Archive inventory entries: {len(archive_entries)}")
 
-if uncovered or double_covered or extra_keys or watcher_in_nextest:
+if (
+    uncovered
+    or double_covered
+    or extra_keys
+    or watcher_in_nextest
+    or len(serial_tls_entries) != 1
+    or unit_partition_missing
+    or unit_partition_duplicate
+    or unit_partition_extra
+    or nextest_partition_missing
+    or nextest_partition_duplicate
+    or nextest_partition_extra
+    or watcher_in_nextest_partitions
+    or any(archive_inventory_errors)
+):
     print("\nInventory proof failed.")
     if uncovered:
         print(f"  uncovered ({len(uncovered)}):")
@@ -281,6 +408,39 @@ if uncovered or double_covered or extra_keys or watcher_in_nextest:
         print(f"  watcher leaked into nextest ({len(watcher_in_nextest)}):")
         for key in watcher_in_nextest[:20]:
             print(f"    {key}")
+    if len(serial_tls_entries) != 1:
+        print(
+            "  serial platform-verifier TLS test entries: "
+            f"expected 1, found {len(serial_tls_entries)}"
+        )
+    for label, missing, duplicate, extra in (
+        (
+            "nextest lib/bin partitions",
+            unit_partition_missing,
+            unit_partition_duplicate,
+            unit_partition_extra,
+        ),
+        (
+            "nextest integration partitions",
+            nextest_partition_missing,
+            nextest_partition_duplicate,
+            nextest_partition_extra,
+        ),
+    ):
+        for category, keys in (("uncovered", missing), ("repeated", duplicate), ("extra", extra)):
+            if keys:
+                print(f"  {label} {category} ({len(keys)}):")
+                for key in keys[:20]:
+                    print(f"    {key}")
+    if watcher_in_nextest_partitions:
+        print(f"  watcher leaked into nextest partitions ({len(watcher_in_nextest_partitions)}):")
+        for key in watcher_in_nextest_partitions[:20]:
+            print(f"    {key}")
+    for category, keys in zip(("uncovered", "repeated", "extra"), archive_inventory_errors):
+        if keys:
+            print(f"  archive inventory {category} ({len(keys)}):")
+            for key in keys[:20]:
+                print(f"    {key}")
     sys.exit(1)
 
 print("\nInventory proof passed: every baseline test is covered exactly once.")
