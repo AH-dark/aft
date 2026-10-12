@@ -1190,7 +1190,10 @@ fn candidate(
         let mut delta = DomainReport::from_report(report).difference(&before);
         delta.examined += 1;
         if result.is_err() {
-            // The caller counts a failed candidate as protected.
+            // The caller adds one to skipped_protected for a candidate that
+            // returned an error, after this wrapper has run. Add the same
+            // count here so the orphan_views figures stay a subset of the
+            // pass totals rather than disagreeing with them.
             delta.skipped_protected += 1;
         }
         report.orphan_views.add(&delta);
@@ -1342,7 +1345,12 @@ fn candidate_inner(
                 )
             }) && fs::metadata(path)
                 .and_then(|metadata| metadata.modified())
-                // An orphan's file that cannot be dated may be changing now.
+                // A file whose modification time cannot be read counts as
+                // recent for an orphan, so the orphan is kept: the file may be
+                // changing right now. For any other key this check runs only
+                // after the week-long observation grace has passed, and an
+                // undatable file (usually one removed since the walk) is
+                // treated as old, as it was before the orphan rule existed.
                 .map_or(*orphan, |mtime| {
                     std::time::SystemTime::now()
                         .duration_since(mtime)
@@ -1425,7 +1433,9 @@ fn due_keys(history: &BTreeMap<String, Vec<Binding>>, now: u64) -> Vec<String> {
         .iter()
         .filter(|(key, records)| {
             key_valid(key)
-                // Root presence is one stat; the full test may probe volumes.
+                // Checking that every root is gone takes one stat per record,
+                // so it runs first. missing_and_old may also probe the volume
+                // the root was on, and runs only for keys that pass it.
                 && records
                     .iter()
                     .all(|binding| matches!(binding.root.try_exists(), Ok(false)))
@@ -1451,8 +1461,9 @@ fn due_first(
     for key in due_keys(history, report.at_ms) {
         let mut present = false;
         for (directory, flat) in domains {
-            // Flat legacy domains keep several keys per directory; the
-            // lexical walk handles their file sets.
+            // A flat domain keeps the files of many keys side by side in one
+            // directory, with no folder per key, so this per-key folder check
+            // does not apply. The lexical walk handles those file sets.
             if *flat {
                 continue;
             }
@@ -2854,11 +2865,15 @@ mod storage_retention_tests {
         let temp = tempfile::tempdir().unwrap();
         let key = "0123456789abcdef";
         let view = cache(temp.path(), "views", key);
-        // A folder seen for the first time may belong to a build in progress.
+        // Expected: the first pass keeps the folder. A folder seen for the
+        // first time may belong to a build in progress, so it is counted as
+        // recent and its observation clock starts.
         let first = run_pass(temp.path(), &|| false);
         assert_eq!(first.removed_roots, 0, "{first:?}");
         assert_eq!(first.orphan_views.skipped_recent, 1, "{first:?}");
         assert!(view.exists());
+        // Expected: once the folder has been observed, and left unchanged, for
+        // over an hour, the next pass removes it and reports its bytes.
         age_orphan(temp.path(), &view, key);
         let second = run_pass(temp.path(), &|| false);
         assert_eq!(second.removed_roots, 1, "{second:?}");
@@ -2876,9 +2891,13 @@ mod storage_retention_tests {
         let scope = crate::path_identity::project_scope_key(&root);
         let view = cache(temp.path(), "views", &scope);
         age_orphan(temp.path(), &view, &scope);
-        // The pass judged the folder an orphan from the history it loaded at
-        // the start. A registration binds the root, under the family's
-        // artifact key, before deletion begins.
+        // The pass loads binding history when it starts, finds none for this
+        // folder, and so treats it as an orphan. While the pass is paused in
+        // its walk, a registration binds the checkout root. The binding is
+        // recorded under the family's artifact key (the key shared by every
+        // checkout of one repository), as configure and register_view do.
+        // Expected: the recheck under the barrier sees the new binding and
+        // keeps the folder.
         let (worker, release) = paused_pass(temp.path(), &view, "walk");
         record_bind(temp.path(), &root, "fedcba9876543210").unwrap();
         release.send(()).unwrap();
@@ -2900,6 +2919,8 @@ mod storage_retention_tests {
             b"not a registry database",
         )
         .unwrap();
+        // Expected: a registry that cannot be read might list this folder, so
+        // the folder is kept and counted as unknown, never as an orphan.
         let report = run_pass(temp.path(), &|| false);
         assert_eq!(report.removed_roots, 0, "{report:?}");
         assert_eq!(report.skipped_unknown, 1, "{report:?}");
@@ -2913,7 +2934,8 @@ mod storage_retention_tests {
         let scope = "0123456789abcdef";
         let registry =
             crate::views::registry::FamilyRegistry::open(temp.path(), "fedcba9876543210").unwrap();
-        // A missing root records no binding, so only the registry knows it.
+        // Registering with a root that does not exist records no binding, so
+        // the registry is the only record of this scope.
         drop(
             registry
                 .register_view(scope, &temp.path().join("missing"))
@@ -2921,6 +2943,9 @@ mod storage_retention_tests {
         );
         let view = cache(temp.path(), "views", scope);
         age_orphan(temp.path(), &view, scope);
+        // Expected: a folder that a registry lists is never an orphan. It keeps
+        // the week-long grace, so an hour-old folder is kept and the orphan
+        // counts stay at zero.
         let report = run_pass(temp.path(), &|| false);
         assert_eq!(report.removed_roots, 0, "{report:?}");
         assert_eq!(report.orphan_views.examined, 0, "{report:?}");
@@ -2931,11 +2956,18 @@ mod storage_retention_tests {
     fn storage_retention_due_caches_do_not_wait_for_the_lexical_walk() {
         let (temp, root, scope) = fixture();
         fs::remove_dir(root).unwrap();
-        // More fresh entries than one lexical batch, all ahead of the due key.
+        // The due key is the checkout's scope: its root is deleted and its
+        // binding is past the grace. A lexical batch is the set of
+        // PASS_ENTRIES cache names one pass takes in name order across the
+        // domains. Create more fresh view folders than one batch holds; their
+        // names sort before the due key's symbols cache, so the batch never
+        // reaches that cache.
         for number in 0..PASS_ENTRIES + 8 {
             cache(temp.path(), "views", &format!("{number:016x}"));
         }
         let path = cache(temp.path(), "symbols", &scope);
+        // Expected: the due-first lane removes the due key's cache in this
+        // same pass, without waiting for the batch to reach it.
         let report = run_pass(temp.path(), &|| false);
         assert_eq!(report.due_keys, 1, "{report:?}");
         assert_eq!(report.due_first.removed_roots, 1, "{report:?}");
