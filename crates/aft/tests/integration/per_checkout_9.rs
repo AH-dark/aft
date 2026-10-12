@@ -1578,9 +1578,13 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
         )],
     );
     publish_without_callgraph(&root, &storage);
+    // The republish with the call graph waits until this file exists, so the
+    // generation without call graph data stays current for as long as the
+    // checks below take, however slow the machine.
+    let publication_gate = base.join("publication.release");
     let mut aft = crate::helpers::AftProcess::spawn_with_env(&[(
-        "AFT_TEST_VIEW_PUBLICATION_DELAY_MS",
-        std::ffi::OsStr::new("8000"),
+        "AFT_TEST_VIEW_PUBLICATION_GATE_FILE",
+        publication_gate.as_os_str(),
     )]);
     let with_graph = Planes {
         trigram: true,
@@ -1599,13 +1603,6 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
         .to_string(),
     );
     assert_eq!(configured["success"], true, "{configured:#}");
-    // Configure finishes its view setup in background steps, one after each
-    // request; send a few requests so it loads the current generation (the
-    // one without call graph data) and starts republishing with the graph.
-    for _ in 0..40 {
-        aft.send(&json!({"id": "ping", "command": "ping"}).to_string());
-        thread::sleep(Duration::from_millis(20));
-    }
     let callers = json!({
         "id": "callers",
         "command": "callers",
@@ -1613,7 +1610,28 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
         "symbol": "target",
     })
     .to_string();
-    let answer = aft.send(&callers);
+    // Configure finishes its view setup in background steps, one after each
+    // request. Until it has loaded the current generation (the one without
+    // call graph data), callers answers `callgraph_building`; keep sending
+    // requests until it answers anything else. The held publication means
+    // that answer comes from the generation without call graph data.
+    let deadline = Instant::now() + DEADLINE;
+    let answer = loop {
+        aft.send(&json!({"id": "ping", "command": "ping"}).to_string());
+        let answer = aft.send(&callers);
+        if answer["code"] != "callgraph_building" {
+            break answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "configure never loaded the generation without call graph data; last answer: {answer:#}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        !current_generation_has_callgraph(&root, &storage),
+        "the generation without call graph data is no longer current"
+    );
     assert_eq!(answer["success"], false, "{answer:#}");
     assert_eq!(answer["code"], "callgraph_unavailable", "{answer:#}");
     assert!(
@@ -1643,6 +1661,8 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
             .contains("call graph is disabled (indexes.callgraph=false)"),
         "{zoom:#}"
     );
+    // Let the republish with call graph data run.
+    std::fs::write(&publication_gate, b"release").unwrap();
     // Once the republish with call graph data lands, callers answers. Right
     // after that publication its derived database is checkpointed, and a
     // reader that meets the checkpoint gets a retryable `callgraph_building`.

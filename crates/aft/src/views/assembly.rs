@@ -1362,7 +1362,19 @@ impl PublicationClosure for SqliteClosure {
 /// Integration tests make a publication slow on purpose, without a large
 /// checkout, by setting `AFT_TEST_VIEW_PUBLICATION_DELAY_MS`: requests must
 /// keep being answered while a publication runs.
+///
+/// Setting `AFT_TEST_VIEW_PUBLICATION_GATE_FILE` to a path holds every
+/// publication until that file exists. A test that must observe the state
+/// before a publication lands creates the file when it is done, so the window
+/// it observes stays open however slow the machine is, instead of closing
+/// after a fixed delay.
 fn publication_delay_for_test() {
+    if let Some(gate) = std::env::var_os("AFT_TEST_VIEW_PUBLICATION_GATE_FILE") {
+        let gate = std::path::PathBuf::from(gate);
+        while !gate.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     if let Some(millis) = std::env::var("AFT_TEST_VIEW_PUBLICATION_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
