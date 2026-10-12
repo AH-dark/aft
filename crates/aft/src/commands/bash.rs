@@ -116,7 +116,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(
             &req.id,
             "synthetic_load_refused",
-            "synthetic CPU load is not allowed on the shared machine; reproduce on the remote runner or prove the mechanism deterministically",
+            "synthetic CPU load is not allowed on shared machines, local or remote; prove the mechanism deterministically instead",
         );
     }
 
@@ -925,7 +925,7 @@ mod tests {
             assert_eq!(worker.data["code"], "synthetic_load_refused");
             assert_eq!(
                 worker.data["message"].as_str(),
-                Some("synthetic CPU load is not allowed on the shared machine; reproduce on the remote runner or prove the mechanism deterministically")
+                Some("synthetic CPU load is not allowed on shared machines, local or remote; prove the mechanism deterministically instead")
             );
 
             request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(false);

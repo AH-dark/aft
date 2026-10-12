@@ -108,7 +108,8 @@ fn executable_words(words: &Words) -> Option<(Vec<Option<String>>, bool)> {
     'wrappers: loop {
         let name = command_name(&words)?;
         let index = match name {
-            "env" | "nice" | "timeout" | "command" | "xargs" | "parallel" => {
+            "env" | "nice" | "timeout" | "command" | "xargs" | "parallel" | "exec" | "nohup"
+            | "setsid" | "stdbuf" | "time" | "caffeinate" => {
                 let mut index = 1;
                 while let Some(word) = words.get(index) {
                     let word = word.as_deref()?;
@@ -154,6 +155,13 @@ fn executable_words(words: &Words) -> Option<(Vec<Option<String>>, bool)> {
                     {
                         return None;
                     }
+                    if matches!(
+                        name,
+                        "exec" | "nohup" | "setsid" | "stdbuf" | "time" | "caffeinate"
+                    ) {
+                        index = execution_wrapper_option_end(&words, index)?;
+                        continue;
+                    }
                     index += 1;
                     if option_takes_value(name, word) {
                         words.get(index)?;
@@ -173,6 +181,100 @@ fn executable_words(words: &Words) -> Option<(Vec<Option<String>>, bool)> {
             _ => return Some((words, indirect)),
         };
         words = words.get(index..)?.to_vec();
+    }
+}
+
+/// Return the index after a known wrapper option and its value, if any. Return
+/// None for unknown options or non-literal values rather than guessing which
+/// later argument is the executable and falsely refusing an unrelated command.
+fn execution_wrapper_option_end(words: &Words, index: usize) -> Option<usize> {
+    let wrapper = words.first()?.as_deref()?;
+    let option = words.get(index)?.as_deref()?;
+    let (flag, attached) = if option.starts_with("--") {
+        let (flag, value) = option
+            .split_once('=')
+            .map_or((option, None), |(flag, value)| (flag, Some(value)));
+        if !execution_wrapper_option_takes_value(wrapper, flag)? {
+            return value.is_none().then_some(index + 1);
+        }
+        (flag, value)
+    } else {
+        let flags = option.strip_prefix('-')?;
+        let mut value_flag = None;
+        for (offset, _) in flags.char_indices() {
+            let flag = flags.get(offset..offset + 1)?;
+            if execution_wrapper_option_takes_value(wrapper, flag)? {
+                value_flag = Some((flag, &flags[offset + 1..]));
+                break;
+            }
+        }
+        let Some((flag, value)) = value_flag else {
+            return Some(index + 1);
+        };
+        (flag, (!value.is_empty()).then_some(value))
+    };
+    let (value, next) = match attached {
+        Some(value) => (value, index + 1),
+        None => (words.get(index + 1)?.as_deref()?, index + 2),
+    };
+    let valid = match wrapper.rsplit('/').next()? {
+        "stdbuf" => {
+            let suffix = value.trim_start_matches(|ch: char| ch.is_ascii_digit());
+            value == "L"
+                || (suffix.len() < value.len()
+                    && matches!(
+                        suffix,
+                        "" | "b"
+                            | "K"
+                            | "KB"
+                            | "kB"
+                            | "KiB"
+                            | "M"
+                            | "MB"
+                            | "MiB"
+                            | "G"
+                            | "GB"
+                            | "GiB"
+                            | "T"
+                            | "TB"
+                            | "TiB"
+                            | "P"
+                            | "PB"
+                            | "PiB"
+                            | "E"
+                            | "EB"
+                            | "EiB"
+                            | "Z"
+                            | "ZB"
+                            | "ZiB"
+                            | "Y"
+                            | "YB"
+                            | "YiB"
+                    ))
+        }
+        "caffeinate" if matches!(flag, "t" | "w") => value.parse::<u64>().is_ok(),
+        _ => true,
+    };
+    valid.then_some(next)
+}
+
+fn execution_wrapper_option_takes_value(wrapper: &str, option: &str) -> Option<bool> {
+    match (wrapper.rsplit('/').next()?, option) {
+        ("exec", "a") => Some(true),
+        ("exec", "c" | "l") => Some(false),
+        ("setsid", "f" | "w" | "c" | "--fork" | "--wait" | "--ctty") => Some(false),
+        ("stdbuf", "i" | "o" | "e" | "--input" | "--output" | "--error") => Some(true),
+        ("time", "p") => Some(false),
+        // The grammar represents Bash's time keyword as a command word. Only -p
+        // is a keyword option; the other options below belong to external time.
+        (
+            "time",
+            "a" | "v" | "q" | "l" | "--portability" | "--append" | "--verbose" | "--quiet",
+        ) if wrapper != "time" => Some(false),
+        ("time", "f" | "o" | "--format" | "--output") if wrapper != "time" => Some(true),
+        ("caffeinate", "d" | "i" | "m" | "s" | "u") => Some(false),
+        ("caffeinate", "t" | "w") => Some(true),
+        _ => None,
     }
 }
 
@@ -389,6 +491,38 @@ mod tests {
     fn synthetic_load_refuses_obvious_load_forms() {
         let refused = [
             "yes > /dev/null &",
+            "( exec yes > /dev/null ) &",
+            "for i in 1 2 3 4 5 6 7 8; do ( exec yes > /dev/null ) & done",
+            "exec yes",
+            "nohup yes > /dev/null &",
+            "setsid -f yes",
+            "stdbuf -o0 yes",
+            "time yes > /dev/null",
+            "caffeinate -i yes",
+            "nohup nice -n 5 yes",
+            "exec -a worker -c -l yes",
+            "exec -cla worker yes",
+            "exec -a'worker name' yes",
+            "exec -a yes stress",
+            "exec -- yes",
+            "nohup -- /usr/bin/yes",
+            "setsid --fork --wait yes",
+            "setsid -fw yes",
+            "stdbuf -i 0 -o L -e 1K yes",
+            "stdbuf --input=0 --output=L --error=1MiB yes",
+            "stdbuf --output 0 yes",
+            "stdbuf -i0 -oL -e0 yes",
+            "time -p yes",
+            "/usr/bin/time -p yes",
+            "/usr/bin/time -f '%e' -o timing.log yes",
+            "/usr/bin/time --format=%e --output=timing.log --append yes",
+            "/usr/bin/time -vpl yes",
+            "caffeinate -dimsu yes",
+            "caffeinate -t 10 -w 123 yes",
+            "caffeinate -it10 yes",
+            "nohup exec -a worker setsid -fw stdbuf -o0 /usr/bin/time -p caffeinate -i yes",
+            "exec dd if=/dev/zero of=/dev/null",
+            "nohup cat < /dev/urandom > /dev/null",
             "for i in $(seq 18); do yes > /dev/null & done",
             "/usr/bin/yes | head -c1G",
             "nice -n 19 stress-ng --cpu 8",
@@ -457,6 +591,41 @@ mod tests {
     fn synthetic_load_allows_non_load_and_small_bounded_forms() {
         let allowed = [
             "echo yes",
+            "exec 3>&1",
+            "exec bash",
+            "nohup cargo build",
+            "stdbuf -oL ./server",
+            "time cargo test",
+            "caffeinate -i cargo build",
+            "exec yes | head -n 3",
+            "exec -a yes bash",
+            "exec -a",
+            "exec -a yes",
+            "exec -a \"$NAME\" yes",
+            "exec -z yes",
+            "nohup --help yes",
+            "nohup -p yes",
+            "setsid --version yes",
+            "setsid --unknown yes",
+            "setsid --fork=yes yes",
+            "stdbuf -o",
+            "stdbuf -o yes stress",
+            "stdbuf -o \"$MODE\" yes",
+            "stdbuf --output= yes",
+            "stdbuf --unknown yes",
+            "time -f yes stress",
+            "/usr/bin/time -o yes cargo test",
+            "/usr/bin/time -f",
+            "/usr/bin/time -f \"$FORMAT\" yes",
+            "/usr/bin/time --help yes",
+            "/usr/bin/time --unknown yes",
+            "caffeinate -t yes stress",
+            "caffeinate -w \"$PID\" yes",
+            "caffeinate -t",
+            "caffeinate -z yes",
+            "nohup nice -n 5 yes | head -n 3",
+            "time -p yes | head -n 3",
+            "exec \"$COMMAND\" yes",
             "grep -r stress src",
             "cargo test stress",
             "cargo test stress_",
