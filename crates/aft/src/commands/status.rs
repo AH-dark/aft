@@ -472,6 +472,7 @@ impl AppContext {
             serde_json::Value::Null
         };
         let diagnostics_gaps = status_bar_values.diagnostics_gaps.clone();
+        let diagnostics_reason = status_bar_values.diagnostics_reason;
         let disabled_categories = status_bar_values.disabled_categories.clone();
         let mut status_bar_values = serde_json::json!({
             "errors": status_bar_values.errors,
@@ -486,6 +487,11 @@ impl AppContext {
         });
         if !disabled_categories.is_empty() {
             status_bar_values["disabled_categories"] = serde_json::json!(disabled_categories);
+        }
+        // Present only while `diagnostics` is "pending": names what the
+        // counts are waiting for (see `StatusBarCountValues::diagnostics_reason`).
+        if let Some(reason) = diagnostics_reason {
+            status_bar_values["diagnostics_reason"] = serde_json::json!(reason);
         }
         let memory_root = self
             .canonical_cache_root_opt()

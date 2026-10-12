@@ -1335,6 +1335,11 @@ impl LspManager {
         self.project_applicability = None;
     }
 
+    /// Whether a walk has recorded which servers apply to the project.
+    pub(crate) fn has_project_applicability(&self) -> bool {
+        self.project_applicability.is_some()
+    }
+
     /// A failed diagnostics producer differs from one still starting. Either
     /// prevents project totals, but only actual failures report producer_missing.
     pub(crate) fn project_diagnostics_authority(&self) -> (bool, Vec<serde_json::Value>) {

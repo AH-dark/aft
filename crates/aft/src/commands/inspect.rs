@@ -370,6 +370,42 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
     )
 }
 
+/// Configure records which language servers apply to the project on a
+/// background walk, and until it finishes the status bar reports project
+/// diagnostics as pending. A blocking inspect answers only once its analysis is
+/// current, so it waits for that walk, at most one phase wait of its request
+/// budget, and the status bar it leaves behind reads the walk's result instead
+/// of "pending". If the wait runs out, the inspect still answers for what it
+/// analyzed and the status bar says the walk is still running
+/// (`diagnostics_reason: applicability_walk_running`).
+fn wait_for_project_applicability_walk(ctx: &AppContext, deadline: InspectRequestDeadline) {
+    if !ctx
+        .config()
+        .inspect
+        .category_enabled(InspectCategory::Diagnostics)
+    {
+        return;
+    }
+    let wait_until = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
+    // Waits in short slices so a cancelled inspect stops waiting promptly.
+    const SLICE: Duration = Duration::from_millis(100);
+    loop {
+        let remaining = wait_until.saturating_duration_since(Instant::now());
+        if ctx.wait_for_project_applicability(remaining.min(SLICE)) {
+            return;
+        }
+        if inspect_cancellation_requested() {
+            return;
+        }
+        if remaining <= SLICE {
+            crate::slog_warn!(
+                "inspect: the language-server applicability walk is still running at the wait deadline; project diagnostics stay pending"
+            );
+            return;
+        }
+    }
+}
+
 /// Resolve the language servers an inspect should start, within the request
 /// deadline. A scoped inspect considers only files inside the scope: a server
 /// is selected only when at least one scoped file is one it handles, so a
@@ -463,7 +499,8 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     let scope = parse_scope(req, ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = if scoped_roots.is_some() && !diagnostics_selected(req) {
+    let reports_diagnostics = scoped_roots.is_none() || diagnostics_selected(req);
+    let applicability = if !reports_diagnostics {
         Ok(ApplicableServerSnapshot::default())
     } else {
         resolve_inspect_applicability(
@@ -475,9 +512,14 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
         )
     };
     let response = match applicability {
-        Ok(applicability) => {
-            run_blocking_inspect_body(req, ctx, applicability, phase_log, deadline)
-        }
+        Ok(applicability) => run_blocking_inspect_body(
+            req,
+            ctx,
+            applicability,
+            reports_diagnostics,
+            phase_log,
+            deadline,
+        ),
         Err(error) => build_inspect_terminal(
             &req.id,
             &phase_log,
@@ -1055,7 +1097,8 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let scope = parse_scope(req, &ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = if scoped_roots.is_some() && !diagnostics_selected(req) {
+    let reports_diagnostics = scoped_roots.is_none() || diagnostics_selected(req);
+    let applicability = if !reports_diagnostics {
         Ok(ApplicableServerSnapshot::default())
     } else {
         resolve_inspect_applicability(
@@ -1119,9 +1162,14 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         // phase logs, and terminals independent while bounding expensive work to
         // one detached inspect body per root.
         let mut response = match DeferredInspectRootPermit::acquire(root, deadline) {
-            Some(_permit) => {
-                run_blocking_inspect_body(&request, &ctx, applicability, phase_log, deadline)
-            }
+            Some(_permit) => run_blocking_inspect_body(
+                &request,
+                &ctx,
+                applicability,
+                reports_diagnostics,
+                phase_log,
+                deadline,
+            ),
             None if inspect_cancellation_requested() => {
                 build_inspect_terminal(&request.id, &phase_log, InspectTerminal::Interrupted)
             }
@@ -1271,10 +1319,14 @@ fn record_blocking_inspect_observations(
     }
 }
 
+/// `reports_diagnostics` is false only for a scoped inspect that did not
+/// select diagnostics; every other inspect first waits for the background
+/// applicability walk (see `wait_for_project_applicability_walk`).
 fn run_blocking_inspect_body(
     req: &RawRequest,
     ctx: &AppContext,
     applicability: ApplicableServerSnapshot,
+    reports_diagnostics: bool,
     phase_log: InspectPhaseLog,
     deadline: InspectRequestDeadline,
 ) -> Response {
@@ -1287,6 +1339,12 @@ fn run_blocking_inspect_body(
             &phase_log,
             request_deadline_terminal(next_phase(&applicability), deadline),
         );
+    }
+    if reports_diagnostics {
+        wait_for_project_applicability_walk(ctx, deadline);
+        if inspect_cancellation_requested() {
+            return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
+        }
     }
     let project_root = match build_snapshot(ctx) {
         Ok(snapshot) => snapshot.project_root,

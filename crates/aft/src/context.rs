@@ -528,6 +528,13 @@ pub struct StatusBarCountValues {
     pub todos: Option<usize>,
     pub tier2_stale: bool,
     pub diagnostics: Option<&'static str>,
+    /// Why `diagnostics` is `"pending"`: `applicability_walk_running` while
+    /// the background walk that decides which language servers apply to the
+    /// project has not finished, `applicability_unknown` when no such walk has
+    /// recorded a result (it failed or never ran), and
+    /// `producer_reports_pending` when an applicable server has not started,
+    /// is still warming up, or has not reported yet. `None` otherwise.
+    pub diagnostics_reason: Option<&'static str>,
     pub diagnostics_gaps: Vec<serde_json::Value>,
 }
 
@@ -1008,6 +1015,56 @@ struct PathStatusCache {
     files: PathStatusFiles,
     read_at: Instant,
     summary: Option<crate::path_status::PathStatusSummary>,
+}
+
+/// Progress of the background walks that record which language servers apply
+/// to the project (see `AppContext::refresh_project_applicability`), so a
+/// caller that reports diagnostics state can wait for the current walk instead
+/// of reporting "pending" while it runs.
+#[derive(Default)]
+struct ProjectApplicabilityProgress {
+    /// The highest walk epoch that has finished, however it ended.
+    settled: AtomicU64,
+    gate: parking_lot::Mutex<ApplicabilityWalkGate>,
+    /// Signalled when a walk settles or a test hold is released.
+    changed: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct ApplicabilityWalkGate {
+    /// Set by a test hold: walks pause before walking until it is released.
+    held: bool,
+    /// Callers currently inside `wait_for_project_applicability`.
+    waiters: usize,
+}
+
+impl ProjectApplicabilityProgress {
+    fn settle(&self, epoch: u64) {
+        self.settled.fetch_max(epoch, Ordering::SeqCst);
+        // Taking the lock after the store means a waiter that read the old
+        // value under the lock is already parked on the condvar.
+        let _gate = self.gate.lock();
+        self.changed.notify_all();
+    }
+
+    fn pause_while_held(&self) {
+        let mut gate = self.gate.lock();
+        while gate.held {
+            self.changed.wait(&mut gate);
+        }
+    }
+}
+
+/// Test hook: while this guard lives, every language-server applicability walk
+/// of its context pauses before walking. Dropping it releases them.
+#[doc(hidden)]
+pub struct ProjectApplicabilityHold(Arc<ProjectApplicabilityProgress>);
+
+impl Drop for ProjectApplicabilityHold {
+    fn drop(&mut self) {
+        self.0.gate.lock().held = false;
+        self.0.changed.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -3388,7 +3445,7 @@ pub struct AppContext {
     /// walk has finished, however it ended. When it has caught up with
     /// `project_applicability_epoch`, no walk for the current configuration
     /// is still running.
-    project_applicability_settled: Arc<AtomicU64>,
+    project_applicability_progress: Arc<ProjectApplicabilityProgress>,
     /// The last path-status summary read from this root's view database,
     /// with the state of the database files it was read from, so the health
     /// rollup reopens the database only after it changed (see
@@ -4059,7 +4116,7 @@ impl AppContext {
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
-            project_applicability_settled: Arc::new(AtomicU64::new(0)),
+            project_applicability_progress: Arc::default(),
             view_path_status_cache: parking_lot::Mutex::new(None),
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
@@ -4148,6 +4205,7 @@ impl AppContext {
                     tier2_stale: tier2.stale,
                     disabled_categories: Vec::new(),
                     diagnostics: None,
+                    diagnostics_reason: None,
                     diagnostics_gaps: Vec::new(),
                 }
             })
@@ -4168,17 +4226,24 @@ impl AppContext {
         let lsp = self.lsp_manager.try_lock()?;
         let diagnostics_generation = lsp.diagnostics_generation();
         let (authoritative, producer_gaps) = lsp.project_diagnostics_authority();
+        let pending_reason = if lsp.has_project_applicability() {
+            "producer_reports_pending"
+        } else if self.project_applicability_walk_running() {
+            "applicability_walk_running"
+        } else {
+            "applicability_unknown"
+        };
         let mask_failed = |mut counts: StatusBarCountValues| {
             if !authoritative {
                 counts.errors = None;
                 counts.warnings = None;
             }
-            counts.diagnostics = if !producer_gaps.is_empty() {
-                Some("producer_missing")
+            (counts.diagnostics, counts.diagnostics_reason) = if !producer_gaps.is_empty() {
+                (Some("producer_missing"), None)
             } else if !authoritative {
-                Some("pending")
+                (Some("pending"), Some(pending_reason))
             } else {
-                None
+                (None, None)
             };
             counts.diagnostics_gaps = producer_gaps.clone();
             counts.mask_disabled(&self.config().inspect)
@@ -4243,6 +4308,7 @@ impl AppContext {
             tier2_stale: tier2.stale,
             disabled_categories: Vec::new(),
             diagnostics: None,
+            diagnostics_reason: None,
             diagnostics_gaps: Vec::new(),
         };
 
@@ -6376,12 +6442,11 @@ impl AppContext {
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
         let Some(root) = config.project_root.clone() else {
-            self.project_applicability_settled
-                .fetch_max(epoch, Ordering::SeqCst);
+            self.project_applicability_progress.settle(epoch);
             return;
         };
         let epochs = Arc::clone(&self.project_applicability_epoch);
-        let settled = Arc::clone(&self.project_applicability_settled);
+        let progress = Arc::clone(&self.project_applicability_progress);
         let manager = Arc::clone(&self.lsp_manager);
         let status_context = self
             .status_emitter
@@ -6392,15 +6457,15 @@ impl AppContext {
         let spawned = std::thread::Builder::new()
             .name("aft-lsp-applicability".to_string())
             .spawn(move || {
-                // Records that this walk is over however it ends, so a test
+                // Records that this walk is over however it ends, so callers
                 // can wait for it (see `wait_for_project_applicability`).
-                struct Settled(Arc<AtomicU64>, u64);
+                struct Settled(Arc<ProjectApplicabilityProgress>, u64);
                 impl Drop for Settled {
                     fn drop(&mut self) {
-                        self.0.fetch_max(self.1, Ordering::SeqCst);
+                        self.0.settle(self.1);
                     }
                 }
-                let _settled = Settled(settled, epoch);
+                let settled = Settled(Arc::clone(&progress), epoch);
                 let current = || epochs.load(Ordering::SeqCst) == epoch;
                 if root_changed {
                     // The previous root's servers say nothing about this one.
@@ -6409,6 +6474,7 @@ impl AppContext {
                         lsp.clear_project_applicability();
                     }
                 }
+                progress.pause_while_held();
                 if !current() {
                     return;
                 }
@@ -6425,34 +6491,65 @@ impl AppContext {
                     let snapshot = lsp.classify_applicable_servers(walk, &config);
                     lsp.store_project_applicability(snapshot);
                 }
+                // Waiters only need the stored result; release them before
+                // publishing the status change.
+                drop(settled);
                 if let Some(ctx) = status_context.upgrade() {
                     ctx.signal_status_changed();
                 }
             });
         if let Err(error) = spawned {
-            self.project_applicability_settled
-                .fetch_max(epoch, Ordering::SeqCst);
+            self.project_applicability_progress.settle(epoch);
             crate::slog_warn!("could not start the language-server applicability walk: {error}");
         }
     }
 
+    /// Whether the applicability walk started by the latest configuration
+    /// publication is still running.
+    pub(crate) fn project_applicability_walk_running(&self) -> bool {
+        let latest = self.project_applicability_epoch.load(Ordering::SeqCst);
+        self.project_applicability_progress
+            .settled
+            .load(Ordering::SeqCst)
+            < latest
+    }
+
     /// Waits, at most `timeout`, until the language-server applicability walk
     /// started by the latest configuration publication has finished. Returns
-    /// whether it finished. For tests that read the status bar right after
-    /// configure.
-    #[doc(hidden)]
+    /// whether it finished. Callers that turn applicability into a reported
+    /// diagnostics state (blocking inspect, tests reading the status bar right
+    /// after configure) use it so a walk still running is not reported as
+    /// "pending" diagnostics.
     pub fn wait_for_project_applicability(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        loop {
-            let latest = self.project_applicability_epoch.load(Ordering::SeqCst);
-            if self.project_applicability_settled.load(Ordering::SeqCst) >= latest {
-                return true;
+        let progress = &self.project_applicability_progress;
+        let mut gate = progress.gate.lock();
+        gate.waiters += 1;
+        let finished = loop {
+            if !self.project_applicability_walk_running() {
+                break true;
             }
-            if Instant::now() >= deadline {
-                return false;
+            if progress.changed.wait_until(&mut gate, deadline).timed_out() {
+                break !self.project_applicability_walk_running();
             }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        };
+        gate.waiters -= 1;
+        finished
+    }
+
+    /// Test hook: pause this context's applicability walks before they walk
+    /// until the returned guard is dropped. A walk that clears the previous
+    /// root's result does so before pausing.
+    #[doc(hidden)]
+    pub fn hold_project_applicability_walks_for_test(&self) -> ProjectApplicabilityHold {
+        self.project_applicability_progress.gate.lock().held = true;
+        ProjectApplicabilityHold(Arc::clone(&self.project_applicability_progress))
+    }
+
+    /// Test hook: how many callers are inside `wait_for_project_applicability`.
+    #[doc(hidden)]
+    pub fn project_applicability_waiters_for_test(&self) -> usize {
+        self.project_applicability_progress.gate.lock().waiters
     }
 
     /// Publish `config` only if the published snapshot is still `expected`.

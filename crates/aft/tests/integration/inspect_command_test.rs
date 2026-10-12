@@ -5948,6 +5948,12 @@ fn scoped_typescript_inspect_preserves_missing_gopls_mask() {
     // Configure takes the project-wide applicability snapshot after the test's
     // deterministic binary overrides, so host-installed gopls is irrelevant.
     ctx.set_config(ctx.config().as_ref().clone());
+    // The status bar never waits for the background applicability walk this
+    // configuration publication started; it would read "pending" until then.
+    assert!(
+        ctx.wait_for_project_applicability(Duration::from_secs(30)),
+        "the language-server applicability walk did not finish"
+    );
     open_with_lsp(&ctx, &ts, "console.log('ts');\n");
     let before = ctx.status_bar_count_values();
     assert_eq!(before.diagnostics, Some("producer_missing"));
@@ -5968,6 +5974,181 @@ fn scoped_typescript_inspect_preserves_missing_gopls_mask() {
         (None, None, Some("producer_missing"))
     );
     assert_eq!(after.diagnostics_gaps, before.diagnostics_gaps);
+}
+
+/// `configured_context_with_diagnostics_timeout`, with every language-server
+/// applicability walk of the context held from before configure starts the
+/// first one, so the walk's result cannot land before the test releases it.
+fn configured_context_with_held_applicability(
+    root: &Path,
+    timeout_ms: u64,
+) -> (AppContext, aft::context::ProjectApplicabilityHold) {
+    crate::helpers::disable_in_process_file_watcher();
+    let storage_dir = root.join(".aft-test-storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config {
+            storage_dir: Some(storage_dir.clone()),
+            ..Config::default()
+        }),
+    );
+    ctx.isolate_cold_build_limiter_for_test(2);
+    let hold = ctx.hold_project_applicability_walks_for_test();
+    let configure = request(json!({
+        "id": "configure",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root.to_string_lossy(),
+        "storage_dir": storage_dir.to_string_lossy(),
+        "config": crate::helpers::user_config(serde_json::json!({
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+            "inspect": { "diagnostics_timeout_ms": timeout_ms }
+        })),
+    }));
+    let response = serde_json::to_value(handle_configure(&configure, &ctx))
+        .expect("configure response serializes");
+    assert_eq!(response["success"], true, "configure failed: {response:#}");
+    (ctx, hold)
+}
+
+/// A TypeScript file served by the fake server next to a Go module whose
+/// gopls is missing, configured while applicability walks are held. The walk
+/// that will run on release is the one for this final configuration.
+fn held_typescript_with_missing_gopls(
+    timeout_ms: u64,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    AppContext,
+    aft::context::ProjectApplicabilityHold,
+) {
+    let (temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", "{}");
+    let ts = write_file(&root, "src/main.ts", "console.log('ts');\n");
+    write_file(&root, "go.mod", "module example.test/app\n");
+    write_file(&root, "main.go", "package main\nfunc main() {}\n");
+    let (ctx, hold) = configured_context_with_held_applicability(&root, timeout_ms);
+    ctx.update_config(|config| {
+        config.disabled_lsp.insert("biome".into());
+        config.disabled_lsp.insert("oxlint".into());
+    });
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx.lsp()
+        .override_binary(ServerKind::Go, root.join("missing-gopls"));
+    // Supersedes configure's held walk with one for the configuration above.
+    ctx.set_config(ctx.config().as_ref().clone());
+    open_with_lsp(&ctx, &ts, "console.log('ts');\n");
+    (temp_dir, ts, ctx, hold)
+}
+
+fn assert_pending_on_running_walk(ctx: &AppContext) {
+    let values = ctx.status_bar_count_values();
+    assert_eq!(
+        (values.errors, values.diagnostics, values.diagnostics_reason),
+        (None, Some("pending"), Some("applicability_walk_running")),
+        "{values:?}"
+    );
+    let status = serde_json::to_value(aft::commands::status::handle_status(
+        &request(json!({"id": "status", "command": "status"})),
+        ctx,
+    ))
+    .unwrap();
+    let status_values = &status["status_bar_values"];
+    assert_eq!(status_values["diagnostics"], "pending", "{status:#}");
+    assert_eq!(
+        status_values["diagnostics_reason"], "applicability_walk_running",
+        "{status:#}"
+    );
+}
+
+/// Runs `scoped_ts` inspect on a thread and waits until it is either inside
+/// the applicability wait or finished. Returns whether it was seen waiting,
+/// the response, and the status values read as soon as it returned.
+fn scoped_inspect_against_held_walk(
+    ctx: &AppContext,
+    scoped_ts: &Path,
+    hold: aft::context::ProjectApplicabilityHold,
+    release_before_join: bool,
+) -> (bool, Value, aft::context::StatusBarCountValues) {
+    thread::scope(|threads| {
+        let inspect = threads.spawn(|| {
+            let response = handle_inspect_tool_call(
+                &request(json!({
+                    "id": "ts-held-walk", "command": "inspect",
+                    "sections": ["diagnostics"], "scope": scoped_ts,
+                })),
+                ctx,
+            );
+            // Read before anything else can release the walk.
+            (
+                serde_json::to_value(response).unwrap(),
+                ctx.status_bar_count_values(),
+            )
+        });
+        let hang_deadline = Instant::now() + Duration::from_secs(60);
+        let waited = loop {
+            if ctx.project_applicability_waiters_for_test() > 0 {
+                break true;
+            }
+            if inspect.is_finished() || Instant::now() >= hang_deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        if waited {
+            // Honest while the walk runs, even for a reader that does not wait.
+            assert_pending_on_running_walk(ctx);
+        }
+        let mut hold = Some(hold);
+        if release_before_join {
+            drop(hold.take());
+        }
+        let (response, values) = inspect.join().expect("inspect thread");
+        drop(hold);
+        (waited, response, values)
+    })
+}
+
+#[test]
+fn scoped_inspect_waits_for_the_applicability_walk_and_reports_missing_producer() {
+    let (_temp_dir, ts, ctx, hold) = held_typescript_with_missing_gopls(40_000);
+    let (waited, response, values) = scoped_inspect_against_held_walk(&ctx, &ts, hold, true);
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(
+        (values.diagnostics, values.diagnostics_reason),
+        (Some("producer_missing"), None),
+        "inspect answered before the applicability walk stored its result: {values:?}"
+    );
+    assert!(
+        values
+            .diagnostics_gaps
+            .iter()
+            .any(|gap| gap["producer"] == "gopls"),
+        "{values:?}"
+    );
+    assert!(waited, "inspect never waited for the applicability walk");
+}
+
+#[test]
+fn scoped_inspect_reports_pending_with_reason_when_the_walk_outlasts_its_wait() {
+    // 14 s budget: 9 s of work time, so the applicability wait gives up after
+    // about 4.5 s and leaves the rest for the scoped diagnostics.
+    let (_temp_dir, ts, ctx, hold) = held_typescript_with_missing_gopls(14_000);
+    let (waited, response, values) = scoped_inspect_against_held_walk(&ctx, &ts, hold, false);
+    assert!(waited, "inspect never waited for the applicability walk");
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(
+        (values.errors, values.diagnostics, values.diagnostics_reason),
+        (None, Some("pending"), Some("applicability_walk_running")),
+        "{values:?}"
+    );
+    // Once released, the walk's result replaces the pending state.
+    assert!(ctx.wait_for_project_applicability(Duration::from_secs(30)));
+    assert_eq!(
+        ctx.status_bar_count_values().diagnostics,
+        Some("producer_missing")
+    );
 }
 
 #[test]
