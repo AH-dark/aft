@@ -703,7 +703,12 @@ mod tests {
     fn audit11_batch_blob_reads_preserve_bytes_and_newline_path_framing() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = init_git_fixture();
-        let name = b"odd\nname\xff.bin";
+        // APFS refuses names that aren't valid UTF-8 (EILSEQ), so macOS keeps
+        // the newline framing check with a valid multi-byte name instead.
+        #[cfg(target_os = "macos")]
+        let name: &[u8] = "odd\nname\u{ff}.bin".as_bytes();
+        #[cfg(not(target_os = "macos"))]
+        let name: &[u8] = b"odd\nname\xff.bin";
         let bytes = b"\xef\xbb\xbfline\r\n\xfftail";
         fs::write(temp.path().join(path_from_git_bytes(name)), bytes).unwrap();
         let revision = commit_all(temp.path(), "bytes");
