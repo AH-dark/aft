@@ -363,6 +363,7 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
         &[],
         &[],
         &[],
+        false,
         None,
         None,
         None,
@@ -375,16 +376,20 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 /// diagnostics as pending. A blocking inspect answers only once its analysis is
 /// current, so it waits for that walk, at most one phase wait of its request
 /// budget, and the status bar it leaves behind reads the walk's result instead
-/// of "pending". If the wait runs out, the inspect still answers for what it
-/// analyzed and the status bar says the walk is still running
+/// of "pending".
+///
+/// Returns true when the walk was still running at the end of the wait. The
+/// inspect then reports diagnostics as unknown with a named gap
+/// (`applicability_walk_gap`), so its reply reads PARTIAL, and the status bar
+/// says the walk is still running
 /// (`diagnostics_reason: applicability_walk_running`).
-fn wait_for_project_applicability_walk(ctx: &AppContext, deadline: InspectRequestDeadline) {
+fn wait_for_project_applicability_walk(ctx: &AppContext, deadline: InspectRequestDeadline) -> bool {
     if !ctx
         .config()
         .inspect
         .category_enabled(InspectCategory::Diagnostics)
     {
-        return;
+        return false;
     }
     let wait_until = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
     // Waits in short slices so a cancelled inspect stops waiting promptly.
@@ -392,18 +397,50 @@ fn wait_for_project_applicability_walk(ctx: &AppContext, deadline: InspectReques
     loop {
         let remaining = wait_until.saturating_duration_since(Instant::now());
         if ctx.wait_for_project_applicability(remaining.min(SLICE)) {
-            return;
+            return false;
         }
         if inspect_cancellation_requested() {
-            return;
+            return true;
         }
         if remaining <= SLICE {
             crate::slog_warn!(
-                "inspect: the language-server applicability walk is still running at the wait deadline; project diagnostics stay pending"
+                "inspect: the language-server applicability walk is still running at the wait deadline; diagnostics reported as unknown"
             );
-            return;
+            return true;
         }
     }
+}
+
+/// The diagnostics gap an inspect reports when the project's language-server
+/// applicability walk outlasted its wait: which servers apply is not yet
+/// decided, so the diagnostics totals cannot be certified.
+fn applicability_walk_gap() -> Value {
+    serde_json::json!({
+        "kind": "applicability_pending",
+        "producer": "language-server applicability",
+        "reason": "applicability_walk_running: the walk that decides which language servers apply to this project has not finished",
+    })
+}
+
+/// Marks a diagnostics payload as not determined because the applicability
+/// walk is still running, the same way a missing producer does: the aggregate
+/// totals become unknown, the payload is incomplete, and the named gap says why.
+/// Per-producer counts stay, since those producers did answer.
+fn mark_applicability_walk_pending(payload: &mut Value) {
+    if !payload.is_object() || payload["status"] == "not_requested" || payload["off"] == true {
+        return;
+    }
+    for key in ["errors", "warnings", "info", "hints"] {
+        payload[key] = Value::Null;
+    }
+    payload["complete"] = Value::Bool(false);
+    if !payload["gaps"].is_array() {
+        payload["gaps"] = serde_json::json!([]);
+    }
+    payload["gaps"]
+        .as_array_mut()
+        .expect("gaps was just made an array")
+        .push(applicability_walk_gap());
 }
 
 /// Resolve the language servers an inspect should start, within the request
@@ -461,6 +498,7 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
         &[],
         &[],
         &[],
+        false,
         Some(&phase_log),
         None,
         None,
@@ -539,7 +577,10 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
 /// A blocking scoped request first has its started language servers analyze
 /// the scoped files (see `scoped_diagnostics_sweep`); scope then filters the
 /// rendered findings and adds per-file authority (named gaps for scoped files
-/// no producer has authoritatively analyzed).
+/// no producer has authoritatively analyzed). `applicability_walk_pending`
+/// marks the diagnostics result undetermined because the project's
+/// language-server applicability walk is still running (see
+/// `mark_applicability_walk_pending`).
 fn handle_inspect_payload(
     req: &RawRequest,
     ctx: &AppContext,
@@ -549,6 +590,7 @@ fn handle_inspect_payload(
     not_applicable: &[NotApplicableServer],
     expected_producers: &[ServerKey],
     indexing_gaps: &[(ServerKey, String)],
+    applicability_walk_pending: bool,
     phase_log: Option<&InspectPhaseLog>,
     request_deadline: Option<InspectRequestDeadline>,
     observed_stats: Option<&InspectRootStatSnapshot>,
@@ -826,6 +868,12 @@ fn handle_inspect_payload(
             manager.submit_category_with_callgraph(snapshot.clone(), *category, scope.clone(), None)
         };
         outcomes.insert(*category, outcome);
+    }
+    if applicability_walk_pending {
+        if let Some(JobOutcome::Fresh { payload }) = outcomes.get_mut(&InspectCategory::Diagnostics)
+        {
+            mark_applicability_walk_pending(payload);
+        }
     }
 
     if let Some(JobOutcome::Fresh { payload }) = outcomes.get_mut(&InspectCategory::DeadCode) {
@@ -1340,11 +1388,10 @@ fn run_blocking_inspect_body(
             request_deadline_terminal(next_phase(&applicability), deadline),
         );
     }
-    if reports_diagnostics {
-        wait_for_project_applicability_walk(ctx, deadline);
-        if inspect_cancellation_requested() {
-            return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
-        }
+    let applicability_wait_ran_out =
+        reports_diagnostics && wait_for_project_applicability_walk(ctx, deadline);
+    if inspect_cancellation_requested() {
+        return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
     }
     let project_root = match build_snapshot(ctx) {
         Ok(snapshot) => snapshot.project_root,
@@ -1549,6 +1596,10 @@ fn run_blocking_inspect_body(
         }
     }
     let inspect_snapshot = build_snapshot(ctx).ok();
+    // A walk that finished while the servers were settling no longer leaves
+    // diagnostics undetermined.
+    let applicability_walk_pending =
+        applicability_wait_ran_out && ctx.project_applicability_walk_running();
     let mut response = handle_inspect_payload(
         req,
         ctx,
@@ -1558,6 +1609,7 @@ fn run_blocking_inspect_body(
         &applicability.not_applicable,
         &start_outcomes.successful,
         &indexing_gaps,
+        applicability_walk_pending,
         Some(&phase_log),
         Some(deadline),
         Some(&initial_stats),
@@ -7316,6 +7368,7 @@ mod deferred_terminal_tests {
             &[],
             &[],
             &[],
+            false,
             Some(&phase_log),
             Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
             None,

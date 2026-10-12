@@ -6117,6 +6117,10 @@ fn scoped_inspect_waits_for_the_applicability_walk_and_reports_missing_producer(
     let (_temp_dir, ts, ctx, hold) = held_typescript_with_missing_gopls(40_000);
     let (waited, response, values) = scoped_inspect_against_held_walk(&ctx, &ts, hold, true);
     assert_eq!(response["success"], true, "{response:#}");
+    assert!(
+        !response.to_string().contains("applicability_pending"),
+        "a walk that finished within the wait leaves no gap: {response:#}"
+    );
     assert_eq!(
         (values.diagnostics, values.diagnostics_reason),
         (Some("producer_missing"), None),
@@ -6142,6 +6146,41 @@ fn scoped_inspect_reports_pending_with_reason_when_the_walk_outlasts_its_wait() 
     let (waited, response, values) = scoped_inspect_against_held_walk(&ctx, &ts, hold, false);
     assert!(waited, "inspect never waited for the applicability walk");
     assert_eq!(response["success"], true, "{response:#}");
+    // Which language servers apply was not decided, so the reply must not read
+    // as a determination: PARTIAL, naming the reason and retry guidance.
+    let header = response["text"]
+        .as_str()
+        .and_then(|text| text.lines().next())
+        .unwrap_or_default();
+    assert_eq!(
+        header,
+        "PARTIAL — diagnostics unknown: language-server applicability: applicability_walk_running: the walk that decides which language servers apply to this project has not finished; retry aft_inspect.",
+        "{response:#}"
+    );
+    assert_eq!(response["complete"], false, "{response:#}");
+    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
+    let diagnostics = &response["summary"]["diagnostics"];
+    assert_eq!(diagnostics["complete"], false, "{response:#}");
+    assert!(diagnostics["errors"].is_null(), "{response:#}");
+    let is_walk_gap = |gap: &Value| {
+        gap["kind"] == "applicability_pending"
+            && gap["producer"] == "language-server applicability"
+            && gap["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("applicability_walk_running"))
+    };
+    assert!(
+        diagnostics["gaps"]
+            .as_array()
+            .is_some_and(|gaps| gaps.iter().any(is_walk_gap)),
+        "{response:#}"
+    );
+    assert!(
+        response["gaps"].as_array().is_some_and(|gaps| gaps
+            .iter()
+            .any(|gap| is_walk_gap(gap) && gap["categories"] == json!(["diagnostics"]))),
+        "{response:#}"
+    );
     assert_eq!(
         (values.errors, values.diagnostics, values.diagnostics_reason),
         (None, Some("pending"), Some("applicability_walk_running")),
