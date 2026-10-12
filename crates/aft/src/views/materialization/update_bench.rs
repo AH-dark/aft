@@ -21,6 +21,9 @@
 //! - `AFT_UPDATE_BENCH_MEMO_COMPARE=1`: also cold-build the newer revision
 //!   with the resolver index's crate-wide lookups scanned instead of
 //!   memoized, and require both databases to be equal.
+//! - `AFT_UPDATE_BENCH_DISPATCH_COMPARE=1`: also cold-build the newer
+//!   revision with the method-call pass writing every site row by row, and
+//!   require the database to equal the one written by differences.
 //! - `AFT_UPDATE_BENCH_ONLY`: comma-separated case labels to run
 //!   (`switch-<first 12 hex of the target revision>` or `edit-<size>`).
 
@@ -278,6 +281,22 @@ fn bench_repository_incremental_update() {
         parity::assert_logical_parity(&memoized, &scanned);
         println!("update bench memo parity equal=true");
         for path in [scanned, memoized] {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+    }
+    if std::env::var_os("AFT_UPDATE_BENCH_DISPATCH_COMPARE").is_some() {
+        // The same cold build with the method-call pass writing every site row
+        // by row (the writer before it wrote only differences) must write the
+        // same database.
+        dispatch::WRITE_ROW_BY_ROW.with(|row_by_row| row_by_row.set(true));
+        let row_by_row = cold("new-row-by-row", &new);
+        dispatch::WRITE_ROW_BY_ROW.with(|row_by_row| row_by_row.set(false));
+        let differences = cold("new-differences", &new);
+        parity::assert_logical_parity(&differences, &row_by_row);
+        println!("update bench dispatch writer parity equal=true");
+        for path in [row_by_row, differences] {
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
             }

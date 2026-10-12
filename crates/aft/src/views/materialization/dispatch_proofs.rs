@@ -242,3 +242,301 @@ fn public_unknown_dynamic_counts_and_liveness_projection() {
         assert!(!protected.iter().any(|s| s.ends_with("::n")));
     }
 }
+
+/// Stores each source as a callgraph blob and returns the manifest naming them.
+fn manifest_of(connection: &Connection, files: &[(&str, &str)]) -> Manifest {
+    Manifest::new(files.iter().map(|(path, source)| {
+        let language = if path.ends_with(".rs") {
+            "rust"
+        } else {
+            "typescript"
+        };
+        let payload = join::CallgraphBlob::extract(source, language, "dispatch-proof")
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let key = blake3::hash(&payload).to_hex().to_string();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                params![
+                    decode_manifest_full_key(&key).unwrap(),
+                    payload,
+                    blake3::hash(&payload).as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        (
+            RelPath::new(path.as_bytes()).unwrap(),
+            ManifestEntry::Regular {
+                mode: 0o100644,
+                planes: RegularPlanes {
+                    callgraph: Some(key),
+                    semantic: None,
+                },
+                resolution_input: false,
+            },
+        )
+    }))
+    .unwrap()
+}
+
+/// Applies `base -> next` to a cold build of `base` and requires every derived
+/// table to equal a cold build of `next`. Returns the patched database.
+fn incremental_matches_cold(
+    dir: &Path,
+    base: &[(&str, &str)],
+    next: &[(&str, &str)],
+) -> (std::path::PathBuf, MaterializeStats) {
+    let blob_path = dir.join("blobs.sqlite");
+    let connection = blobs(&blob_path);
+    let base = manifest_of(&connection, base);
+    let next = manifest_of(&connection, next);
+    drop(connection);
+    let incremental = dir.join("incremental.sqlite");
+    materialize_manifest_view_database(&incremental, &blob_path, &base).unwrap();
+    let stats = apply_manifest_diff(&incremental, &base, &next, &blob_path).unwrap();
+    let cold = dir.join("cold.sqlite");
+    materialize_manifest_view_database(&cold, &blob_path, &next).unwrap();
+    parity::assert_logical_parity(&incremental, &cold);
+    (incremental, stats)
+}
+
+fn count(database: &Path, sql: &str) -> usize {
+    Connection::open(database)
+        .unwrap()
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap()
+}
+
+const INTERFACE: &str = "export interface I { m(): void; }";
+const CALLER: &str = "import { I } from './types';\nexport function caller(x: I) { x.m(); }";
+const IMPLEMENTATION: &str = "import { I } from './types';\nexport class B implements I { m() {} }";
+
+#[test]
+fn relinked_unchanged_caller_gets_method_call_status_and_edges_back() {
+    // Removing `helper` changes an answer the unchanged caller consulted, so
+    // it is re-resolved and ordinary emission rewrites its method-call site
+    // ref (status `unresolved`) and drops that ref's method-call edge. The
+    // pass must restore both.
+    let caller =
+        "import { I, helper } from './types';\nexport function caller(x: I) { helper(); x.m(); }";
+    let dir = tempfile::tempdir().unwrap();
+    let (database, stats) = incremental_matches_cold(
+        dir.path(),
+        &[
+            (
+                "types.ts",
+                &format!("{INTERFACE}\nexport function helper() {{}}"),
+            ),
+            ("caller.ts", caller),
+            ("impl.ts", IMPLEMENTATION),
+        ],
+        &[
+            ("types.ts", INTERFACE),
+            ("caller.ts", caller),
+            ("impl.ts", IMPLEMENTATION),
+        ],
+    );
+    assert!(
+        stats.dependent_files >= 1 && stats.relinked_inserted >= 1,
+        "the caller must be re-resolved and relinked: {stats:?}"
+    );
+    assert_eq!(
+        count(
+            &database,
+            "SELECT COUNT(*) FROM refs WHERE caller_file='caller.ts' AND status='resolved'
+             AND ref_id IN (SELECT ref_id FROM edges WHERE provenance='dispatch')"
+        ),
+        1
+    );
+}
+
+#[test]
+fn shifted_target_ordinals_relink_method_call_edges_of_unchanged_callers() {
+    // The caller does not depend on impl.ts, so it is not re-resolved, but its
+    // method-call edge points at a node whose ID changes with the ordinal.
+    let dir = tempfile::tempdir().unwrap();
+    let (database, stats) = incremental_matches_cold(
+        dir.path(),
+        &[
+            ("types.ts", INTERFACE),
+            ("caller.ts", CALLER),
+            ("impl.ts", IMPLEMENTATION),
+        ],
+        &[
+            ("types.ts", INTERFACE),
+            ("caller.ts", CALLER),
+            (
+                "impl.ts",
+                &format!(
+                    "{}\nexport function first() {{}}\nexport class B implements I {{ m() {{}} }}",
+                    "import { I } from './types';"
+                ),
+            ),
+        ],
+    );
+    assert_eq!(
+        stats.resolved_files, 1,
+        "only impl.ts re-resolves: {stats:?}"
+    );
+    assert_eq!(
+        count(
+            &database,
+            "SELECT COUNT(*) FROM edges WHERE provenance='dispatch' AND target_file='impl.ts'
+             AND target_node IN (SELECT id FROM nodes)"
+        ),
+        1
+    );
+}
+
+#[test]
+fn removed_file_drops_its_method_call_site_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let extra = "import { I } from './types';\nexport function g(x: I) { x.m(); }\nexport function h(y) { y.m(); }";
+    let files = [
+        ("types.ts", INTERFACE),
+        ("caller.ts", CALLER),
+        ("impl.ts", IMPLEMENTATION),
+    ];
+    let mut base = files.to_vec();
+    base.push(("extra.ts", extra));
+    let (database, _) = incremental_matches_cold(dir.path(), &base, &files);
+    assert_eq!(
+        count(
+            &database,
+            "SELECT COUNT(*) FROM view_dispatch_sites WHERE caller_file='extra.ts'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(&database, "SELECT COUNT(*) FROM view_dispatch_sites"),
+        1
+    );
+}
+
+/// Deletes the node of the function `caller` defined in `caller.ts`, then runs
+/// only the method-call pass on `database`, as if `caller.ts` had been
+/// rewritten without that node.
+fn emit_without_caller_node(
+    database: &Path,
+    blob_path: &Path,
+    manifest: &Manifest,
+    row_by_row: bool,
+) {
+    let mut connection = Connection::open(database).unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "DELETE FROM nodes WHERE file_path='caller.ts' AND scoped_name='caller'",
+            [],
+        )
+        .unwrap();
+    if row_by_row {
+        // Makes the row-by-row writer start from empty site tables and
+        // method-call edges, as in a cold build.
+        transaction
+            .execute(
+                "UPDATE meta SET v='stale' WHERE k='view_dispatch_signature'",
+                [],
+            )
+            .unwrap();
+    }
+    let blobs = Connection::open(blob_path).unwrap();
+    let reader = ManifestViewBlobReader::new(&blobs);
+    let changed = BTreeSet::from([b"caller.ts".to_vec()]);
+    dispatch::WRITE_ROW_BY_ROW.with(|cell| cell.set(row_by_row));
+    let emitted = dispatch::emit(
+        &transaction,
+        manifest,
+        &reader,
+        &dispatch::EmitScope {
+            changed_paths: Some(&changed),
+            ordinary_edge_refs: &HashSet::new(),
+        },
+    );
+    dispatch::WRITE_ROW_BY_ROW.with(|cell| cell.set(false));
+    emitted.unwrap();
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn site_whose_caller_has_no_node_gets_no_method_call_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob_path = dir.path().join("blobs.sqlite");
+    let connection = blobs(&blob_path);
+    let manifest = manifest_of(
+        &connection,
+        &[
+            ("types.ts", INTERFACE),
+            ("caller.ts", CALLER),
+            ("impl.ts", IMPLEMENTATION),
+        ],
+    );
+    drop(connection);
+    let base = dir.path().join("base.sqlite");
+    materialize_manifest_view_database(&base, &blob_path, &manifest).unwrap();
+    let from_caller =
+        "SELECT COUNT(*) FROM edges WHERE provenance='dispatch' AND ref_id LIKE 'view:caller.ts:%'";
+    assert_eq!(
+        count(&base, from_caller),
+        1,
+        "the caller starts with an edge"
+    );
+    let mut databases = Vec::new();
+    for row_by_row in [false, true] {
+        let database = dir
+            .path()
+            .join(format!("without-caller-{row_by_row}.sqlite"));
+        std::fs::copy(&base, &database).unwrap();
+        emit_without_caller_node(&database, &blob_path, &manifest, row_by_row);
+        databases.push(database);
+    }
+    parity::assert_logical_parity(&databases[0], &databases[1]);
+    assert_eq!(count(&databases[0], from_caller), 0);
+    assert_eq!(
+        count(
+            &databases[0],
+            "SELECT COUNT(*) FROM view_dispatch_sites WHERE caller_file='caller.ts'"
+        ),
+        1
+    );
+}
+
+/// A cold build written by differences must equal the row-by-row writer, for
+/// TypeScript interface and unknown receivers and for a Rust macro whose
+/// method call shares its AST ordinal with an ordinary call.
+#[test]
+fn differences_writer_matches_row_by_row_cold_builds() {
+    let fixtures: [&[(&str, &str)]; 2] = [
+        &[
+            ("types.ts", INTERFACE),
+            ("caller.ts", CALLER),
+            ("impl.ts", IMPLEMENTATION),
+            ("unknown.ts", "export function h(y) { y.m(); }"),
+        ],
+        &[(
+            "lib.rs",
+            "struct S;\nimpl S { fn m(&self) -> i32 { 1 } }\nfn helper() -> i32 { 2 }\nfn caller(s: &S) { assert_eq!(s.m(), helper()); }\n",
+        )],
+    ];
+    for (index, files) in fixtures.into_iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob_path = dir.path().join("blobs.sqlite");
+        let connection = blobs(&blob_path);
+        let manifest = manifest_of(&connection, files);
+        drop(connection);
+        let differences = dir.path().join("differences.sqlite");
+        materialize_manifest_view_database(&differences, &blob_path, &manifest).unwrap();
+        dispatch::WRITE_ROW_BY_ROW.with(|row_by_row| row_by_row.set(true));
+        let row_by_row = dir.path().join("row-by-row.sqlite");
+        let built = materialize_manifest_view_database(&row_by_row, &blob_path, &manifest);
+        dispatch::WRITE_ROW_BY_ROW.with(|row_by_row| row_by_row.set(false));
+        built.unwrap();
+        parity::assert_logical_parity(&differences, &row_by_row);
+        assert!(
+            count(&differences, "SELECT COUNT(*) FROM view_dispatch_sites") > 0,
+            "fixture {index} has method-call sites"
+        );
+    }
+}

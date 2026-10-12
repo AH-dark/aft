@@ -1085,7 +1085,19 @@ fn materialize_reading(
     // Secondary indexes remain live because updating them as rows change is cheaper
     // than rebuilding them; that maintenance cost is included in row-phase timings.
     profile.observe_empty(WritePhase::IndexMaintenance);
-    dispatch::emit(&transaction, manifest, reader)?;
+    let ordinary_edge_refs = pending_edges
+        .iter()
+        .map(|edge| edge.ref_id.clone())
+        .collect::<HashSet<_>>();
+    dispatch::emit(
+        &transaction,
+        manifest,
+        reader,
+        &dispatch::EmitScope {
+            changed_paths: changed.as_ref(),
+            ordinary_edge_refs: &ordinary_edge_refs,
+        },
+    )?;
     set_meta_ready(&transaction, true)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
@@ -1169,6 +1181,65 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
         full_key: &str,
     ) -> std::result::Result<Option<Arc<join::CallgraphBlob>>, join::ManifestJoinError> {
         self.read_decoded(full_key)
+    }
+
+    /// Reads stay on this thread, which owns the SQLite connection; decoding,
+    /// most of the cost for a whole manifest, runs on a pool bounded like the
+    /// call-graph build pool.
+    fn read_callgraph_blobs_decoded(
+        &self,
+        full_keys: &[&str],
+    ) -> std::result::Result<Vec<Option<Arc<join::CallgraphBlob>>>, join::ManifestJoinError> {
+        let mut payloads = Vec::new();
+        let mut pending = HashMap::<&str, usize>::new();
+        let mut order = Vec::with_capacity(full_keys.len());
+        for key in full_keys {
+            if let Some(blob) = self.decoded.borrow().get(*key) {
+                order.push(Some(Ok(blob.clone())));
+                continue;
+            }
+            if let Some(position) = pending.get(key) {
+                order.push(Some(Err(*position)));
+                continue;
+            }
+            let Some(payload) = self.read_payload(key)? else {
+                order.push(None);
+                break;
+            };
+            pending.insert(key, payloads.len());
+            order.push(Some(Err(payloads.len())));
+            payloads.push(payload);
+        }
+        let decode = || {
+            payloads
+                .par_iter()
+                .map(|payload| join::CallgraphBlob::from_bytes(payload).map(Arc::new))
+                .collect::<Vec<_>>()
+        };
+        let decoded = if payloads.len() > 1 {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(crate::callgraph_store::build_pool_size())
+                .thread_name(|index| format!("aft-view-decode-{index}"))
+                .build()
+                .map_or_else(|_| decode(), |pool| pool.install(decode))
+        } else {
+            decode()
+        };
+        let mut blobs = Vec::with_capacity(order.len());
+        let mut cache = self.decoded.borrow_mut();
+        for (key, entry) in full_keys.iter().zip(order) {
+            let blob = match entry {
+                Some(Ok(blob)) => blob,
+                Some(Err(position)) => decoded[position].clone()?,
+                None => {
+                    blobs.push(None);
+                    break;
+                }
+            };
+            cache.insert((*key).to_string(), blob.clone());
+            blobs.push(Some(blob));
+        }
+        Ok(blobs)
     }
 }
 

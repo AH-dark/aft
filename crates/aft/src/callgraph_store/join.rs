@@ -92,6 +92,26 @@ pub trait ManifestBlobReader {
             .map(|payload| CallgraphBlob::from_bytes(&payload).map(Arc::new))
             .transpose()
     }
+
+    /// Decoded blobs for `full_keys`, in order, stopping after the first
+    /// missing blob (its `None` is the last element) or at the first error,
+    /// exactly like reading them one by one. Readers that can verify and
+    /// decode in parallel override this.
+    fn read_callgraph_blobs_decoded(
+        &self,
+        full_keys: &[&str],
+    ) -> Result<Vec<Option<Arc<CallgraphBlob>>>, ManifestJoinError> {
+        let mut blobs = Vec::with_capacity(full_keys.len());
+        for key in full_keys {
+            let blob = self.read_callgraph_blob_decoded(key)?;
+            let missing = blob.is_none();
+            blobs.push(blob);
+            if missing {
+                break;
+            }
+        }
+        Ok(blobs)
+    }
 }
 
 /// Tree-sitter node position in canonical pre-order traversal order.
@@ -1435,12 +1455,30 @@ pub(crate) fn dispatch_type_targets(
     parses: &BTreeMap<String, &ParseBlob>,
 ) -> Result<BTreeMap<(String, String), (String, String)>, ManifestJoinError> {
     let mut stage = crate::views::materialization::profile::StageTimer::new("dispatch");
-    let loaded = manifest_payloads(manifest, blobs)?;
-    stage.finish(
-        "type_targets.load_payloads",
-        format_args!("payloads={}", loaded.len()),
-    );
-    let reader = |key: &BlobKey| loaded.get(key).cloned();
+    // Binding reads only the payloads of configuration files, so load each
+    // payload when it is first asked for rather than every payload up front.
+    let loaded = std::cell::RefCell::new(BTreeMap::<BlobKey, Arc<[u8]>>::new());
+    let read_error = std::cell::RefCell::new(None);
+    let reader = |key: &BlobKey| -> Option<Arc<[u8]>> {
+        if let Some(bytes) = loaded.borrow().get(key) {
+            return Some(bytes.clone());
+        }
+        let bytes: Arc<[u8]> = match blobs.read_callgraph_blob(key) {
+            Ok(Some(bytes)) => bytes.into(),
+            Ok(None) => {
+                read_error
+                    .borrow_mut()
+                    .get_or_insert(ManifestJoinError::MissingBlob(key.clone()));
+                return None;
+            }
+            Err(error) => {
+                read_error.borrow_mut().get_or_insert(error);
+                return None;
+            }
+        };
+        loaded.borrow_mut().insert(key.clone(), bytes.clone());
+        Some(bytes)
+    };
     let facts = Rc::new(ManifestFacts {
         manifest,
         blobs: &reader,
@@ -1540,8 +1578,15 @@ pub(crate) fn dispatch_type_targets(
     }
     stage.finish(
         "type_targets.resolve_names",
-        format_args!("names={queried} targets={}", targets.len()),
+        format_args!(
+            "names={queried} targets={} payloads_loaded={}",
+            targets.len(),
+            loaded.borrow().len()
+        ),
     );
+    if let Some(error) = read_error.borrow_mut().take() {
+        return Err(error);
+    }
     Ok(targets)
 }
 

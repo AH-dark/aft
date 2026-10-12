@@ -11793,7 +11793,7 @@ fn note_refresh_parse_for_test(project_root: &Path) {
 #[cfg(not(test))]
 fn note_refresh_parse_for_test(_project_root: &Path) {}
 
-fn build_pool_size() -> usize {
+pub(crate) fn build_pool_size() -> usize {
     std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
