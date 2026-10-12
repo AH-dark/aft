@@ -9723,7 +9723,7 @@ mod tests {
             "branch_caller"
         )
         .is_ok());
-        // Tier-2 dead code does not read main's graph for it either.
+        // aft_inspect's dead-code check must also read the worktree's own view, not main's graph.
         assert!(crate::inspect::current_view_projection_store_for_test(
             &fixture.linked,
             &fixture.borrower.config(),
