@@ -1046,3 +1046,59 @@ fn configure_rejects_malformed_lsp_paths_extra() {
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
 }
+
+/// Configure used to walk the whole project on its bind path to decide which
+/// language servers apply, so a large or busy checkout held the configure
+/// reply, and with it a route bind's deadline, for as long as the walk took.
+/// The walk now runs after the reply, on its own thread.
+#[test]
+fn configure_answers_before_the_language_server_applicability_walk() {
+    let temp_dir = tempfile::tempdir().expect("create fixture");
+    let project = temp_dir.path().join("project");
+    fs::create_dir_all(project.join("src")).expect("create project");
+    fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");
+    let signal = temp_dir.path().join("walk-started");
+    let mut aft = AftProcess::spawn_with_env(&[
+        (
+            "AFT_TEST_APPLICABILITY_WALK_DELAY_MS",
+            std::ffi::OsStr::new("10000"),
+        ),
+        ("AFT_TEST_APPLICABILITY_WALK_SIGNAL", signal.as_os_str()),
+    ]);
+
+    let started = Instant::now();
+    let configure = aft.send_with_timeout(
+        &json!({
+            "id": "cfg-applicability-walk",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+            "config": user_config(json!({
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
+            })),
+        })
+        .to_string(),
+        Duration::from_secs(30),
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "configure waited {elapsed:?} for a 10 s applicability walk"
+    );
+    // The walk still runs, after the reply.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !signal.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the applicability walk never started after configure"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}

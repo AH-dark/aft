@@ -988,7 +988,38 @@ struct ConfigureWarmState {
 struct ConfigurePhaseTiming {
     phase: &'static str,
     started_at: Instant,
-    completed: Vec<(&'static str, Duration)>,
+    /// Finished phases with their durations and the named steps inside each.
+    completed: Vec<(&'static str, Duration, Vec<(&'static str, Duration)>)>,
+    /// The named step running inside `phase`, if the phase marks steps.
+    step: Option<(&'static str, Instant)>,
+    /// Finished steps of `phase`.
+    steps: Vec<(&'static str, Duration)>,
+}
+
+impl ConfigurePhaseTiming {
+    /// Ends the running step of the current phase at `now`, if one runs.
+    fn finish_step(&mut self, now: Instant) {
+        if let Some((step, started_at)) = self.step.take() {
+            self.steps
+                .push((step, now.saturating_duration_since(started_at)));
+        }
+    }
+}
+
+/// `name=Nms`, followed by `(step=Nms,...)` when the phase marked steps.
+fn format_configure_phase(
+    phase: &str,
+    elapsed: Duration,
+    steps: impl Iterator<Item = (&'static str, Duration)>,
+) -> String {
+    let steps = steps
+        .map(|(step, elapsed)| format!("{step}={}ms", elapsed.as_millis()))
+        .collect::<Vec<_>>();
+    if steps.is_empty() {
+        format!("{phase}={}ms", elapsed.as_millis())
+    } else {
+        format!("{phase}={}ms({})", elapsed.as_millis(), steps.join(","))
+    }
 }
 
 impl Default for ConfigurePhaseTiming {
@@ -997,6 +1028,8 @@ impl Default for ConfigurePhaseTiming {
             phase: "idle",
             started_at: Instant::now(),
             completed: Vec::new(),
+            step: None,
+            steps: Vec::new(),
         }
     }
 }
@@ -3282,6 +3315,10 @@ pub struct AppContext {
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: Arc<parking_lot::Mutex<LspManager>>,
+    /// Advances with every configuration publication; a background
+    /// language-server applicability walk stores its result only while it
+    /// still matches (see `refresh_project_applicability`).
+    project_applicability_epoch: Arc<AtomicU64>,
     /// At most one diagnostics collector may outlive its caller's budget.
     /// Later edits queue their latest disk contents instead of growing a pool
     /// of threads waiting on a slow handshake or the same manager mutex.
@@ -3945,6 +3982,7 @@ impl AppContext {
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
+            project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
@@ -5747,15 +5785,27 @@ impl AppContext {
     pub(crate) fn begin_configure_ack_phase(&self, phase: &'static str) {
         let now = Instant::now();
         let mut timing = self.configure_phase_timing.lock();
+        timing.finish_step(now);
+        let steps = std::mem::take(&mut timing.steps);
         if phase == "config_resolve" {
             timing.completed.clear();
         } else if timing.phase != "idle" && timing.phase != "ack_ready" {
             let previous = timing.phase;
             let elapsed = now.saturating_duration_since(timing.started_at);
-            timing.completed.push((previous, elapsed));
+            timing.completed.push((previous, elapsed, steps));
         }
         timing.phase = phase;
         timing.started_at = now;
+    }
+
+    /// Starts a named step inside the current configure phase, ending the
+    /// previous step. The phase's entry in the timing line then lists its
+    /// steps, so a slow phase names the step that took the time.
+    pub(crate) fn begin_configure_ack_step(&self, step: &'static str) {
+        let now = Instant::now();
+        let mut timing = self.configure_phase_timing.lock();
+        timing.finish_step(now);
+        timing.step = Some((step, now));
     }
 
     pub(crate) fn configure_ack_phase_snapshot(&self) -> String {
@@ -5763,12 +5813,19 @@ impl AppContext {
         let mut parts = timing
             .completed
             .iter()
-            .map(|(phase, elapsed)| format!("{phase}={}ms", elapsed.as_millis()))
+            .map(|(phase, elapsed, steps)| {
+                format_configure_phase(phase, *elapsed, steps.iter().copied())
+            })
             .collect::<Vec<_>>();
-        parts.push(format!(
-            "{}={}ms",
+        // The running step is shown with its time so far, so a breadcrumb
+        // taken while a configure is stuck names the step it is stuck in.
+        let running_step = timing
+            .step
+            .map(|(step, started_at)| (step, started_at.elapsed()));
+        parts.push(format_configure_phase(
             timing.phase,
-            timing.started_at.elapsed().as_millis()
+            timing.started_at.elapsed(),
+            timing.steps.iter().copied().chain(running_step),
         ));
         parts.join(",")
     }
@@ -6213,17 +6270,77 @@ impl AppContext {
     }
 
     /// Atomically publish a fully-built configuration snapshot.
+    ///
+    /// Which language servers apply to the project (the diagnostics
+    /// authority behind the status bar) is recomputed on a background
+    /// thread, never here: that walks the whole project tree and then waits
+    /// for the language-server manager lock, and configure publishes on the
+    /// bind path, where a large or busy checkout made route binds miss their
+    /// deadline. Until the walk finishes, the status bar reports diagnostics
+    /// as pending for a new root, and keeps the previous result on a rebind
+    /// of the same root.
     pub fn set_config(&self, config: Config) {
+        let previous_root = self.config_unpinned().project_root.clone();
         // Configure publishes this way, and it runs inside a pinned request:
         // it must see its own publication for the rest of that request.
         let _ = self.publish_config(|_| Some(config), true);
         let config = self.config();
-        if let Some(root) = config.project_root.as_deref() {
-            if let Ok(walk) = crate::lsp::manager::walk_applicable_area(root, None, &config, None) {
-                let mut lsp = self.lsp();
-                let snapshot = lsp.classify_applicable_servers(walk, &config);
-                lsp.store_project_applicability(snapshot);
-            }
+        let root_changed = previous_root.as_deref() != config.project_root.as_deref();
+        self.refresh_project_applicability(config, root_changed);
+    }
+
+    /// Starts the background walk that records which language servers apply
+    /// to `config`'s project. Every call supersedes the walks started before
+    /// it: a superseded walk stops before walking, or discards its result.
+    fn refresh_project_applicability(&self, config: Arc<Config>, root_changed: bool) {
+        let epoch = self
+            .project_applicability_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let Some(root) = config.project_root.clone() else {
+            return;
+        };
+        let epochs = Arc::clone(&self.project_applicability_epoch);
+        let manager = Arc::clone(&self.lsp_manager);
+        let status_context = self
+            .status_emitter
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let spawned = std::thread::Builder::new()
+            .name("aft-lsp-applicability".to_string())
+            .spawn(move || {
+                let current = || epochs.load(Ordering::SeqCst) == epoch;
+                if root_changed {
+                    // The previous root's servers say nothing about this one.
+                    let mut lsp = manager.lock();
+                    if current() {
+                        lsp.clear_project_applicability();
+                    }
+                }
+                if !current() {
+                    return;
+                }
+                let Ok(walk) =
+                    crate::lsp::manager::walk_applicable_area(&root, None, &config, None)
+                else {
+                    return;
+                };
+                {
+                    let mut lsp = manager.lock();
+                    if !current() {
+                        return;
+                    }
+                    let snapshot = lsp.classify_applicable_servers(walk, &config);
+                    lsp.store_project_applicability(snapshot);
+                }
+                if let Some(ctx) = status_context.upgrade() {
+                    ctx.signal_status_changed();
+                }
+            });
+        if let Err(error) = spawned {
+            crate::slog_warn!("could not start the language-server applicability walk: {error}");
         }
     }
 
@@ -11925,6 +12042,41 @@ mod core_regressions {
         ctx.reset_filter_registry();
         ctx.install_lazy_filter_registry(stale);
         assert!(ctx.filter_registry().lookup("stale-command").is_none());
+    }
+
+    /// A phase that marks steps lists them after its total, both once it has
+    /// finished and while its last step is still running, so a configure
+    /// stuck in one step is named by the breadcrumb taken during it.
+    #[test]
+    fn configure_phase_timing_names_the_steps_of_a_phase() {
+        let ctx = context();
+        ctx.begin_configure_ack_phase("config_resolve");
+        ctx.begin_configure_ack_phase("state_commit");
+        ctx.begin_configure_ack_step("database_runtime");
+        ctx.begin_configure_ack_step("config_publish");
+
+        let running = ctx.configure_ack_phase_snapshot();
+        assert!(
+            running.starts_with("config_resolve=")
+                && running.contains(",state_commit=")
+                && running.contains("ms(database_runtime=")
+                && running.contains(",config_publish=")
+                && running.ends_with("ms)"),
+            "{running}"
+        );
+
+        ctx.begin_configure_ack_phase("index_loading_state");
+        let finished = ctx.configure_ack_phase_snapshot();
+        assert!(
+            finished.contains("ms(database_runtime=")
+                && finished.contains(",config_publish=")
+                && finished.contains("),index_loading_state="),
+            "{finished}"
+        );
+        assert!(
+            !finished.contains("index_loading_state=0ms("),
+            "steps belong to the phase that marked them: {finished}"
+        );
     }
 
     #[test]

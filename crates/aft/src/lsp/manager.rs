@@ -1329,6 +1329,12 @@ impl LspManager {
         self.project_applicability = Some(snapshot);
     }
 
+    /// Forgets the recorded applicability, so project diagnostics read as
+    /// pending until the next walk stores one.
+    pub(crate) fn clear_project_applicability(&mut self) {
+        self.project_applicability = None;
+    }
+
     /// A failed diagnostics producer differs from one still starting. Either
     /// prevents project totals, but only actual failures report producer_missing.
     pub(crate) fn project_diagnostics_authority(&self) -> (bool, Vec<serde_json::Value>) {

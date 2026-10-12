@@ -3688,6 +3688,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
     ctx.begin_configure_ack_phase("state_commit");
+    // Each step below is timed separately inside `state_commit`, so a slow
+    // commit names the step that took the time in the timing line.
+    ctx.begin_configure_ack_step("database_runtime");
     ctx.begin_database_runtime(
         canonical_cache_root.clone(),
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref()),
@@ -3697,9 +3700,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
         ctx.advance_semantic_fingerprint_generation();
     }
+    ctx.begin_configure_ack_step("lsp_search_paths");
     ctx.lsp()
         .set_search_paths(next_config.lsp_paths_extra.clone());
+    ctx.begin_configure_ack_step("config_publish");
     ctx.set_config(next_config.clone());
+    ctx.begin_configure_ack_step("hashline");
     register_hashline_for_configure(
         ctx,
         &canonical_cache_root,
@@ -3709,8 +3715,10 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         edit_slot_survives,
         &mut configure_warnings,
     );
+    ctx.begin_configure_ack_step("log_root");
     crate::logging::sync_storage_root(ctx.storage_dir());
     ctx.set_harness(harness.clone());
+    ctx.begin_configure_ack_step("backup_policy");
     {
         let mut backup = ctx.backup().lock();
         backup.set_policy(crate::backup::BackupPolicy {
@@ -3756,6 +3764,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // store switches directories at the start of its next operation, and
     // moving checkpoints saved before configure stays with that operation or
     // the deferred maintenance job, whichever takes the file lock first.
+    ctx.begin_configure_ack_step("artifact_access");
     if let Some(storage_dir) = next_config.storage_dir.clone() {
         ctx.request_checkpoint_namespace(storage_dir, harness.clone());
     }
@@ -3777,7 +3786,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // Past the commit seal: start (or join) the parent session now, so the
     // first request after this bind is already answered by it. Starting only
     // spawns its worker.
+    ctx.begin_configure_ack_step("views_parent");
     crate::views::parent::activate(ctx, &canonical_cache_root, &storage_root, &parent_semantic);
+    ctx.begin_configure_ack_step("warm_key");
     let warm_key = configure_warm_key(
         &canonical_cache_root,
         &next_config,
@@ -3804,6 +3815,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.shared_artifacts_read_only(),
     );
     let equivalent_callgraph_build = ctx.note_callgraph_build_key(callgraph_build_key);
+    ctx.begin_configure_ack_step("build_state");
     let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
     let semantic_build_in_progress = ctx.semantic_index_rx().lock().is_some();
     let semantic_build_adopted =
@@ -3819,6 +3831,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let semantic_admitted =
         crate::semantic_admission::admission(&canonical_cache_root, &next_config.index.roots)
             .admits();
+    ctx.begin_configure_ack_step("tier2_reset");
     if !equivalent_warm_config {
         ctx.reset_tier2_refresh_scheduler();
         if !semantic_build_adopted {
@@ -3846,6 +3859,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if !equivalent_warm_config || project_root_changed {
         ctx.clear_tsconfig_membership_cache();
     }
+    ctx.begin_configure_ack_step("backup_project_key");
     ctx.backup()
         .lock()
         .set_db_project_key(crate::path_identity::project_scope_key(
