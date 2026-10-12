@@ -806,6 +806,7 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     aft::runtime_drain::drain_semantic_refresh_events(runtime);
     aft::runtime_drain::drain_inspect_events(runtime);
     aft::runtime_drain::drain_watcher_events(runtime);
+    aft::runtime_drain::drain_on_demand_callgraph_build(runtime);
     aft::runtime_drain::drain_lsp_events(runtime);
     aft::runtime_drain::shutdown_idle_lsp(runtime);
     aft::logging::perf_tick(None);

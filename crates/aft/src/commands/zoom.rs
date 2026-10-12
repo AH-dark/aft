@@ -1555,7 +1555,8 @@ fn zoom_one_symbol_inner(
 /// The `callgraph` field of a `callgraph:true` zoom when the callgraph index
 /// is not ready: the analysis code plus the index status and cause. None when
 /// the index is ready. Zoom's own call lists are file-local and unaffected.
-/// Observing the index never starts a build.
+/// Observing a legacy index never starts a build; a view-served linked
+/// worktree whose graph is built on first use counts this as that use.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     use crate::feature_status::{
         callgraph_access_observation, observed_index_status, IndexEffective, IndexObservation,
@@ -1570,7 +1571,7 @@ fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
                 .pinned_view_runtime()
                 .is_some_and(|view| view.manifest.is_some()));
     let observation = if served_by_view {
-        let access = ctx.schedule_callgraph_store_warm();
+        let access = ctx.callgraph_store_for_query_without_wait();
         match &access {
             crate::context::CallgraphStoreAccess::Error(error) => {
                 IndexObservation::unavailable(error.to_string())

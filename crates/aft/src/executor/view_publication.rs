@@ -143,8 +143,23 @@ pub(crate) fn health_snapshot() -> serde_json::Value {
 }
 
 pub(super) fn running_for_context(ctx: &Arc<AppContext>) -> bool {
-    let address = Arc::as_ptr(ctx) as usize;
+    running_for(ctx)
+}
+
+/// True while a view publication for `ctx` is queued or running.
+pub(crate) fn running_for(ctx: &AppContext) -> bool {
+    let address = ctx as *const AppContext as usize;
     JOBS.lock().values().any(|job| job.context == address)
+}
+
+/// True when [`schedule`] called on this thread for `ctx` hands the work to a
+/// detached worker instead of publishing inline on the calling thread.
+pub(crate) fn detaches_for(ctx: &AppContext) -> bool {
+    CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|target| std::ptr::eq(ctx, target.ctx.as_ref()))
+    })
 }
 
 struct Lifecycle(u64);
@@ -350,6 +365,10 @@ pub(crate) fn schedule(
         .stack_size(super::EXECUTOR_WORKER_STACK_BYTES)
         .spawn(move || {
             let _cancellation = super::install_job_cancellation(token.clone());
+            // Whether the last attempt could publish without a linked
+            // worktree's derived call graph. A query may need that graph while
+            // such an attempt runs; see the follow-up after the loop.
+            let mut ran_deferred = false;
             loop {
                 if target.ctx.retire_deleted_view_root() {
                     break;
@@ -370,6 +389,7 @@ pub(crate) fn schedule(
                     token.wait_for_cancellation(wait.min(Duration::from_secs(1)));
                     continue;
                 }
+                ran_deferred = target.ctx.defer_callgraph_build();
                 let result = (|| {
                     let _permit = loop {
                         lifecycle
@@ -447,6 +467,17 @@ pub(crate) fn schedule(
                 }
             }
             drop(lifecycle);
+            // A query needed the worktree's graph while this job published
+            // without it. Start the build now that this job has left the job
+            // table; the follow-up builds, so it never schedules another.
+            if ran_deferred && target.ctx.lazy_callgraph_build_outstanding() {
+                let _scope = ActorScope::install(
+                    Arc::clone(&target.ctx),
+                    Arc::clone(&target.epoch),
+                    Arc::clone(&target.detached_writers),
+                );
+                target.ctx.schedule_lazy_callgraph_build();
+            }
         })
         .map_err(|error| error.to_string())?;
     Ok(())

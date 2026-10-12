@@ -591,6 +591,31 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     {
         return;
     }
+    // A linked worktree builds its own graph only when one of its own queries
+    // needs it. Until then the main checkout's graph answers for it while the
+    // published files match; otherwise the gap names the unbuilt graph.
+    if !super::super::read::derived_built(&view_dir, &generation) {
+        let main = store.load_manifest(&generation).ok().and_then(|manifest| {
+            super::super::read::main_checkout_callgraph(
+                &session.storage,
+                &child.root,
+                child.family(),
+                &generation,
+                &manifest,
+            )
+        });
+        *write(&child.callgraph) = match main {
+            Some((opened, _)) => {
+                child.loads.fetch_add(1, Ordering::SeqCst);
+                Plane::Ready(Arc::new(CallgraphChild {
+                    store: Arc::new(opened),
+                    generation,
+                }))
+            }
+            None => Plane::Gap(super::super::read::CALLGRAPH_NOT_BUILT.into()),
+        };
+        return;
+    }
     match super::super::read::open_published_callgraph(
         child.root.clone(),
         child.family().to_owned(),

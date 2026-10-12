@@ -236,6 +236,180 @@ pub(crate) fn open_published_callgraph(
     ReadonlyCallGraphStore::open_manifest_view(project_root, family, view_dir, generation, pin)
 }
 
+/// Why a linked worktree's own generation cannot answer call-graph queries:
+/// it was published without a derived database, which is built on first use.
+pub(crate) const CALLGRAPH_NOT_BUILT: &str =
+    "this checkout's call graph has not been built yet; the first query that needs it starts the build";
+
+/// True when `generation` has a call-graph database to read: its own derived
+/// file, or the checkout-wide `derived.sqlite` that older publications used,
+/// when that holds a ready graph. A linked worktree publishes generations
+/// with neither until a query needs its graph. Its view directory can still
+/// hold a `derived.sqlite` placeholder from a legacy import, which is not a
+/// graph. A busy legacy probe counts as no graph; it is only consulted when
+/// the generation has no file of its own.
+pub(crate) fn derived_built(view_dir: &std::path::Path, generation: &str) -> bool {
+    super::resolve_derived_path(view_dir, generation).is_ok_and(|path| path.is_file())
+        || matches!(
+            crate::callgraph_store::manifest_view_database_ready(
+                view_dir,
+                generation,
+                std::time::Instant::now(),
+            ),
+            Ok(true)
+        )
+}
+
+/// The main checkout's published call graph, opened to answer for the linked
+/// worktree at `project_root`, or `None` when it cannot answer for it.
+///
+/// It answers only when the worktree's published `manifest` has exactly the
+/// main checkout's call-graph inputs: the same paths, modes and content keys.
+/// Then main's graph is the graph a build of the worktree would produce.
+/// Derived rows hold manifest-relative paths and the reader is bound to
+/// `project_root`, so answers name the worktree's files, not main's.
+///
+/// `None` covers every case where equality is not proven: no main checkout
+/// (or `project_root` is main), a change the watcher saw in the worktree,
+/// main's view missing, unpublished or not ready, another artifact family,
+/// different files, or a probe that could not finish.
+/// The caller then builds the worktree's own graph instead of guessing.
+/// Main's generation is pinned the same way sibling seeding pins its donor, and
+/// the pin lives as long as the returned reader.
+pub(crate) fn main_checkout_callgraph(
+    storage: &std::path::Path,
+    project_root: &std::path::Path,
+    family: &str,
+    own_generation: &str,
+    manifest: &super::Manifest,
+) -> Option<(ReadonlyCallGraphStore, String)> {
+    let main_root = main_checkout_root(project_root)?;
+    if main_root == project_root
+        || checkout_diverged(project_root)
+        || crate::search_index::artifact_cache_key(&main_root) != family
+        || super::assembly::manifest_lacks_callgraph(manifest)
+    {
+        return None;
+    }
+    let view_dir = storage
+        .join("views")
+        .join(crate::path_identity::project_scope_key(&main_root));
+    let view = super::ViewStore::existing_dir(view_dir.clone())?;
+    let generation = view.current_generation_read_only().ok()??;
+    let pin = QueryPin::acquire(&view_dir, &generation).ok()?;
+    // Generations are immutable, so the verdict for this pair is cached and the
+    // main manifest is read and compared once, not on every query.
+    type Verdicts = std::collections::HashMap<(PathBuf, String, PathBuf, String), bool>;
+    static VERDICTS: std::sync::OnceLock<std::sync::Mutex<Verdicts>> = std::sync::OnceLock::new();
+    let key = (
+        project_root.to_path_buf(),
+        own_generation.to_owned(),
+        view_dir.clone(),
+        generation.clone(),
+    );
+    let verdicts = VERDICTS.get_or_init(Default::default);
+    let known = verdicts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .copied();
+    let equal = match known {
+        Some(equal) => equal,
+        None => {
+            // An unknown readiness (a busy probe) is not cached: it is not an answer.
+            let ready = crate::callgraph_store::manifest_view_database_ready(
+                &view_dir,
+                &generation,
+                std::time::Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
+            )
+            .ok()?;
+            // The derived file belongs to its owner generation; compare against the
+            // manifest it was built from, as sibling seeding does.
+            let equal = ready
+                && view
+                    .derived_owner(&generation)
+                    .and_then(|owner| view.load_manifest(&owner))
+                    .is_ok_and(|main| {
+                        super::materialization::manifest_callgraph_equivalent(manifest, &main)
+                    });
+            let mut verdicts = verdicts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if verdicts.len() >= 256 {
+                verdicts.clear();
+            }
+            verdicts.insert(key, equal);
+            equal
+        }
+    };
+    if !equal {
+        return None;
+    }
+    let store = ReadonlyCallGraphStore::open_manifest_view(
+        project_root.to_path_buf(),
+        family.to_owned(),
+        view_dir,
+        &generation,
+        Some(Arc::new(pin)),
+    )
+    .ok()?;
+    Some((store, generation))
+}
+
+/// Checkouts the file watcher saw change since this process loaded their
+/// view. A published manifest lags an edit by the watcher's quiet window, so
+/// a manifest that still equals main's does not prove the files do. Once a
+/// checkout changes, main's graph stops answering for it for the rest of the
+/// process; its next query builds its own graph instead.
+static DIVERGED_CHECKOUTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn note_checkout_diverged(project_root: &std::path::Path) {
+    DIVERGED_CHECKOUTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(project_root.to_path_buf());
+}
+
+fn checkout_diverged(project_root: &std::path::Path) -> bool {
+    DIVERGED_CHECKOUTS
+        .get()
+        .is_some_and(|roots| {
+            roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(project_root)
+        })
+}
+
+/// The main worktree of the repository `project_root` belongs to: the first
+/// entry `git worktree list` reports. Cached per root once found; a failed
+/// probe is retried on the next call rather than remembered.
+fn main_checkout_root(project_root: &std::path::Path) -> Option<PathBuf> {
+    type Roots = std::collections::HashMap<PathBuf, PathBuf>;
+    static ROOTS: std::sync::OnceLock<std::sync::Mutex<Roots>> = std::sync::OnceLock::new();
+    let roots = ROOTS.get_or_init(Default::default);
+    if let Some(main) = roots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(project_root)
+    {
+        return Some(main.clone());
+    }
+    let main = super::assembly::worker_seed::worktree_roots(project_root)?
+        .into_iter()
+        .next()?;
+    // Views are keyed by the canonical root; git may report another spelling.
+    let main = std::fs::canonicalize(&main).unwrap_or(main);
+    roots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(project_root.to_path_buf(), main.clone());
+    Some(main)
+}
+
 /// True when the checkout's current view generation (the v1 view under
 /// `<storage>/views/<scope>`) exists and was published without call graph
 /// data. Read-only: nothing is created when the view is absent.
