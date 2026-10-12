@@ -103,8 +103,10 @@ impl ActorScope {
         epoch: Arc<RwLock<()>>,
         detached_writers: Arc<AtomicUsize>,
     ) -> Self {
-        // Queries for this context now leave on-demand call-graph builds to a
-        // scoped caller instead of publishing inline (see `AppContext`).
+        // From here on, a call-graph query on `ctx` running outside a scope
+        // does not publish an on-demand build inline on its own thread; it
+        // leaves the build to a query or drain running under a scope like
+        // this one (see `AppContext::schedule_lazy_callgraph_build`).
         ctx.note_publication_scope();
         Self(CURRENT.with(|slot| {
             slot.replace(Some(Target {
@@ -470,9 +472,10 @@ pub(crate) fn schedule(
                 }
             }
             drop(lifecycle);
-            // A query needed the worktree's graph while this job published
-            // without it. Start the build now that this job has left the job
-            // table; the follow-up builds, so it never schedules another.
+            // A query needed the worktree's call graph while this job published
+            // without it. Now that this job has left the job table, schedule
+            // that build. The scheduled publication builds the graph instead of
+            // deferring it, so it does not trigger another follow-up like this.
             if ran_deferred && target.ctx.lazy_callgraph_build_outstanding() {
                 let _scope = ActorScope::install(
                     Arc::clone(&target.ctx),

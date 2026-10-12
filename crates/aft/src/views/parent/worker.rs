@@ -593,7 +593,8 @@ fn refresh_callgraph(session: &ParentSession, child: &Child) {
     }
     // A linked worktree builds its own graph only when one of its own queries
     // needs it. Until then the main checkout's graph answers for it while the
-    // published files match; otherwise the gap names the unbuilt graph.
+    // published files match; otherwise the child's call-graph plane reports
+    // that the graph has not been built yet.
     if !super::super::read::derived_built(&view_dir, &generation) {
         let main = store.load_manifest(&generation).ok().and_then(|manifest| {
             super::super::read::main_checkout_callgraph(

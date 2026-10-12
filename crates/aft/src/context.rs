@@ -7916,16 +7916,17 @@ impl AppContext {
     /// delay EOF handling until the build or wait window finishes, leaving the
     /// process alive after the client closes the pipe.
     ///
-    /// A warm is not a use of the graph: it never starts a linked worktree's
-    /// on-demand build (see `LazyCallgraph`).
+    /// Warming the store is not a use of the graph: it never starts a linked
+    /// worktree's on-demand build (see `LazyCallgraph`).
     pub(crate) fn schedule_callgraph_store_warm(&self) -> CallgraphStoreAccess {
         self.callgraph_store_for_ops_with_wait(Duration::ZERO, false)
     }
 
     /// The store for a reader that needs the graph now but must not wait for
-    /// it, such as zoom's call-graph annotations or inspect's Tier-2 scans. Unlike
-    /// a warm, this is a use of the graph and starts a linked worktree's
-    /// on-demand build when main's graph cannot answer.
+    /// it, such as zoom's call-graph annotations or inspect's dead-code and
+    /// other call-graph categories. Unlike warming the store, this counts as a
+    /// use of the graph: when main's graph cannot answer, it starts a linked
+    /// worktree's on-demand build.
     pub(crate) fn callgraph_store_for_query_without_wait(&self) -> CallgraphStoreAccess {
         self.callgraph_store_for_ops_with_wait(Duration::ZERO, true)
     }
@@ -7987,13 +7988,14 @@ impl AppContext {
     /// one that started before the demand was recorded rebuilds when it
     /// finishes.
     ///
-    /// Under a root actor or the standalone scope the publication detaches.
-    /// Outside one, `schedule` publishes inline on the calling thread. That is
-    /// its contract for tests and one-shot tools that never install a scope,
-    /// so they build here. A context that has a scope elsewhere (a daemon
-    /// root, the standalone loop) and a standalone CLI query leave the build
-    /// to the next scoped query or maintenance drain rather than hold this
-    /// thread for the whole build.
+    /// Under a root actor or the standalone scope, the publication detaches.
+    /// With no scope on this thread, `schedule` publishes inline on it; tests
+    /// and one-shot tools that never install a scope rely on that, so they
+    /// build here. If a scope was ever installed for this context on another
+    /// thread (a daemon root, the standalone loop), or this is a standalone CLI
+    /// query, this call skips the inline build and leaves it to the next
+    /// scoped query or maintenance drain, so this thread is not held for the
+    /// whole build.
     pub(crate) fn schedule_lazy_callgraph_build(&self) {
         if !self.lazy_callgraph_build_outstanding() {
             return;
