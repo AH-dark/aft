@@ -1660,3 +1660,184 @@ fn differential_incremental_matches_cold_for_adjacent_and_non_adjacent_diffs() {
         }
     }
 }
+
+fn colliding_relink_parity(last_resolves: bool, last_kind: join::BlobRefKind) {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let caller_source = "import { target } from './target'; import { stable } from './zstable'; export function caller() { target(); stable(); }";
+    let initial = manifest(
+        &conn,
+        &[
+            ("caller.ts", caller_source),
+            ("target.ts", "export function target() {}"),
+            ("zstable.ts", "export function stable() {}"),
+        ],
+    );
+    let caller = RelPath::new(b"caller.ts".to_vec()).unwrap();
+    let ManifestEntry::Regular { planes, .. } = initial.get(&caller).unwrap() else {
+        unreachable!()
+    };
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM blob_payloads WHERE full_key=?1",
+            [decode_manifest_full_key(planes.callgraph.as_deref().unwrap()).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut blob = join::CallgraphBlob::from_bytes(&payload).unwrap();
+    let join::CallgraphBlob::Parse(parse) = &mut blob else {
+        unreachable!()
+    };
+    let calls = parse
+        .refs
+        .iter()
+        .enumerate()
+        .filter(|(_, reference)| reference.kind == join::BlobRefKind::Call)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    // Force two independently resolved calls onto one stored identity, as Rust
+    // macro arguments do naturally. The final row is unchanged while target's
+    // symbol ordinal shifts; skipping that row must not change the winner.
+    parse.refs[calls[1]].ordinal = parse.refs[calls[0]].ordinal;
+    parse.refs[calls[1]].kind = last_kind;
+    if !last_resolves {
+        parse.refs[calls[1]].short_name = Some("missing".to_string());
+        parse.refs[calls[1]].full_ref = Some("missing".to_string());
+    }
+    let payload = blob.to_bytes().unwrap();
+    let key = blake3::hash(&payload);
+    conn.execute(
+        "INSERT INTO blob_payloads VALUES(?1, ?2, ?3, 1)",
+        params![
+            key.as_bytes().as_slice(),
+            payload,
+            blake3::hash(&payload).as_bytes().as_slice()
+        ],
+    )
+    .unwrap();
+    let with_caller = |manifest: Manifest| {
+        Manifest::new(manifest.entries().map(|(path, entry)| {
+            let mut entry = entry.clone();
+            if path == &caller {
+                if let ManifestEntry::Regular { planes, .. } = &mut entry {
+                    planes.callgraph = Some(key.to_hex().to_string());
+                }
+            }
+            (path.clone(), entry)
+        }))
+        .unwrap()
+    };
+    let base = with_caller(initial);
+    let next = with_caller(manifest(
+        &conn,
+        &[
+            ("caller.ts", caller_source),
+            (
+                "target.ts",
+                "export function before() {} export function target() {}",
+            ),
+            ("zstable.ts", "export function stable() {}"),
+        ],
+    ));
+    assert_eq!(base.get(&caller), next.get(&caller));
+    let seed = f.dir.path().join("seed.sqlite");
+    let patched = f.dir.path().join("patched.sqlite");
+    let cold = f.dir.path().join("cold.sqlite");
+    materialize_manifest_view_database(&seed, &f.blobs, &base).unwrap();
+    let seed_snapshot = snapshot(&seed);
+    crate::views::generation::clone_derived(&seed, &patched).unwrap();
+    let stats = apply_manifest_diff(&patched, &base, &next, &f.blobs).unwrap();
+    assert!(
+        !stats.full_resolution,
+        "must exercise the incremental writer"
+    );
+    assert_eq!(
+        stats.dependent_files, 1,
+        "unchanged caller must be relinked"
+    );
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_snapshot_parity(&snapshot(&cold), &snapshot(&patched));
+    assert_eq!(snapshot(&seed), seed_snapshot, "seed remains immutable");
+}
+
+#[test]
+fn colliding_relink_resolved_last_row_matches_cold() {
+    colliding_relink_parity(true, join::BlobRefKind::Call);
+}
+
+#[test]
+fn colliding_relink_unresolved_last_row_matches_cold() {
+    colliding_relink_parity(false, join::BlobRefKind::Call);
+}
+
+#[test]
+fn colliding_relink_mixed_reference_kinds_match_cold() {
+    colliding_relink_parity(false, join::BlobRefKind::ExportAlias);
+}
+
+#[test]
+fn macro_rust_relink_ordinal_shift_matches_cold() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let caller = "use crate::target::target; use crate::zstable::stable; fn caller() { assert_eq!(target(), stable()); }";
+    let base = manifest(
+        &conn,
+        &[
+            ("src/lib.rs", "mod caller; mod target; mod zstable;"),
+            ("src/caller.rs", caller),
+            ("src/target.rs", "pub fn target() {}"),
+            ("src/zstable.rs", "pub fn stable() {}"),
+        ],
+    );
+    let next = manifest(
+        &conn,
+        &[
+            ("src/lib.rs", "mod caller; mod target; mod zstable;"),
+            ("src/caller.rs", caller),
+            ("src/target.rs", "pub fn before() {} pub fn target() {}"),
+            ("src/zstable.rs", "pub fn stable() {}"),
+        ],
+    );
+    let parsed = join::CallgraphBlob::extract(caller, "rust", "fixture").unwrap();
+    let refs = &parsed.parse().unwrap().refs;
+    assert!(
+        refs.iter().enumerate().any(|(i, reference)| refs[..i]
+            .iter()
+            .any(|earlier| earlier.ordinal == reference.ordinal)),
+        "naturally extracted macro arguments must share an ordinal"
+    );
+    let seed = f.dir.path().join("seed.sqlite");
+    let patched = f.dir.path().join("patched.sqlite");
+    let cold = f.dir.path().join("cold.sqlite");
+    materialize_manifest_view_database(&seed, &f.blobs, &base).unwrap();
+    crate::views::generation::clone_derived(&seed, &patched).unwrap();
+    let stats = apply_manifest_diff(&patched, &base, &next, &f.blobs).unwrap();
+    assert!(
+        !stats.full_resolution,
+        "must exercise the incremental writer"
+    );
+    assert_eq!(stats.dependent_files, 1);
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_snapshot_parity(&snapshot(&cold), &snapshot(&patched));
+}
+
+#[test]
+fn colliding_relink_legacy_generation_is_rebuilt_even_without_manifest_changes() {
+    let f = fixture();
+    let (_, copy) = prepare(&f);
+    let before = snapshot(&copy);
+    let connection = Connection::open(&copy).unwrap();
+    connection.execute_batch(
+        "UPDATE meta SET v='9' WHERE k='view_materialization_version';
+         UPDATE refs SET status='unresolved', target_node=NULL, target_file=NULL, target_symbol=NULL;
+         DELETE FROM edges;",
+    ).unwrap();
+    drop(connection);
+    let stats = apply_manifest_diff(&copy, &f.base, &f.base, &f.blobs).unwrap();
+    assert!(
+        stats.full_resolution,
+        "older potentially incorrect rows must not take the no-op path"
+    );
+    assert_snapshot_parity(&before, &snapshot(&copy));
+}

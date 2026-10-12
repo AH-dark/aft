@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -100,7 +100,9 @@ pub(crate) mod parity;
 pub(crate) mod profile;
 mod resolution_facts;
 
-const MATERIALIZATION_VERSION: &str = "9";
+// Rebuild older generations rather than retaining rows produced by the
+// per-reference skip optimization when reference ordinals collide.
+const MATERIALIZATION_VERSION: &str = "10";
 
 const BASE_FINGERPRINT_MISMATCH: &str =
     "derived manifest fingerprint mismatch; cold materialization required";
@@ -924,7 +926,10 @@ fn materialize_reading(
                         && old.4 == target_symbol
                 })
             });
-            if same {
+            // Colliding ordinals share a persisted ref/edge key. Replaying only
+            // rows that differ from the base can let an earlier row overwrite a
+            // skipped later row. Replay the whole group in cold-writer order.
+            if same && !parse.colliding_ordinals.contains(&row.ref_ordinal) {
                 identical_refs += 1;
                 continue;
             }
@@ -1440,23 +1445,33 @@ struct PendingEdgeRow {
 struct EmissionParse {
     blob: Arc<join::CallgraphBlob>,
     refs_by_ordinal: HashMap<u32, usize>,
+    colliding_ordinals: HashSet<u32>,
 }
 
 impl EmissionParse {
     fn new(blob: Arc<join::CallgraphBlob>) -> Self {
+        let mut colliding_ordinals = HashSet::new();
         let refs_by_ordinal = blob
             .parse()
             .into_iter()
             .flat_map(|parse| parse.refs.iter().enumerate())
             .fold(HashMap::new(), |mut by_ordinal, (position, reference)| {
-                // Match the cold writer's original first-reference lookup when
-                // structural references share an AST ordinal.
-                by_ordinal.entry(reference.ordinal).or_insert(position);
+                // Keep the cold writer's first-reference metadata when several
+                // references share an AST ordinal (including macro arguments).
+                match by_ordinal.entry(reference.ordinal) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(position);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {
+                        colliding_ordinals.insert(reference.ordinal);
+                    }
+                }
                 by_ordinal
             });
         Self {
             blob,
             refs_by_ordinal,
+            colliding_ordinals,
         }
     }
 
