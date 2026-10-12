@@ -136,6 +136,7 @@ describe("V2 wake routing across Locations", () => {
       metadata: { kind: "bash_completion", task_ids: ["bash-second"] },
     });
     expect(sends).toEqual([
+      { command: "bash_wait_detach", params: { session_id: "session-second" } },
       {
         command: "bash_ack_completions",
         params: { session_id: "session-second", task_ids: ["bash-second"] },
@@ -177,7 +178,7 @@ describe("V2 wake routing across Locations", () => {
     );
 
     expect(secondHost.synthetic).toHaveLength(1);
-    expect(sends).toHaveLength(1);
+    expect(sends.map((send) => send.command)).toEqual(["bash_wait_detach", "bash_ack_completions"]);
     secondConsumer.dispose();
   });
 
@@ -219,13 +220,14 @@ describe("V2 wake routing across Locations", () => {
       const secondHost = recordingSession();
       const secondConsumer = second.createV2RuntimeConsumer({ session: secondHost.session });
       await runBash(secondConsumer, "session-late", "/work/second");
-      await until(() => sends.length === 2);
+      // Each delivered completion detaches the session's waits, then is acknowledged.
+      await until(() => sends.length === 4);
 
       expect(secondHost.synthetic.map((entry) => entry.metadata?.task_ids)).toEqual([
         ["bash-late-1"],
         ["bash-late-2"],
       ]);
-      expect(sends).toEqual([
+      expect(sends.filter((send) => send.command === "bash_ack_completions")).toEqual([
         {
           command: "bash_ack_completions",
           params: { session_id: "session-late", task_ids: ["bash-late-1"] },
@@ -234,6 +236,10 @@ describe("V2 wake routing across Locations", () => {
           command: "bash_ack_completions",
           params: { session_id: "session-late", task_ids: ["bash-late-2"] },
         },
+      ]);
+      expect(sends.filter((send) => send.command === "bash_wait_detach")).toEqual([
+        { command: "bash_wait_detach", params: { session_id: "session-late" } },
+        { command: "bash_wait_detach", params: { session_id: "session-late" } },
       ]);
 
       // Held completions are handed over once; a second bash call delivers nothing new.

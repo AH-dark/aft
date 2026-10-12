@@ -72,7 +72,8 @@ test("V2 routing catches a failed synthetic admission and holds it for the next 
     await execute(consumer, "bash");
     await settle();
     expect(host.attempts()).toBe(2);
-    expect(sends).toEqual(["bash_ack_completions"]);
+    // An admitted completion detaches the session's waits, then is acknowledged.
+    expect(sends).toEqual(["bash_wait_detach", "bash_ack_completions"]);
   } finally {
     consumer.dispose();
   }
@@ -102,7 +103,8 @@ test("V2 bash companions route held completions without launching bash", async (
       await execute(consumer, name);
       await settle();
       expect(synthetic).toHaveLength(1);
-      expect(sends).toEqual(["bash_ack_completions"]);
+      // An admitted completion detaches the session's waits, then is acknowledged.
+      expect(sends).toEqual(["bash_wait_detach", "bash_ack_completions"]);
     } finally {
       consumer.dispose();
     }
@@ -135,7 +137,8 @@ test("V2 routing withholds acknowledgement during a staged revert and retries af
     consumer.registerSession?.("s");
     await settle();
     expect(synthetic).toHaveLength(1);
-    expect(sends).toEqual(["bash_ack_completions"]);
+    // An admitted completion detaches the session's waits, then is acknowledged.
+    expect(sends).toEqual(["bash_wait_detach", "bash_ack_completions"]);
   } finally {
     consumer.dispose();
   }
