@@ -3359,9 +3359,15 @@ pub struct AppContext {
     /// language-server applicability walk stores its result only while it
     /// still matches (see `refresh_project_applicability`).
     project_applicability_epoch: Arc<AtomicU64>,
-    /// The epoch of the last applicability walk that has finished.
+    /// The highest `project_applicability_epoch` value whose applicability
+    /// walk has finished, however it ended. When it has caught up with
+    /// `project_applicability_epoch`, no walk for the current configuration
+    /// is still running.
     project_applicability_settled: Arc<AtomicU64>,
-    /// See `view_path_status_summary`.
+    /// The last path-status summary read from this root's view database,
+    /// with the state of the database files it was read from, so the health
+    /// rollup reopens the database only after it changed (see
+    /// `view_path_status_summary`).
     view_path_status_cache: parking_lot::Mutex<Option<PathStatusCache>>,
     /// At most one diagnostics collector may outlive its caller's budget.
     /// Later edits queue their latest disk contents instead of growing a pool
@@ -12185,9 +12191,12 @@ mod core_regressions {
         assert!(ctx.filter_registry().lookup("stale-command").is_none());
     }
 
-    /// A phase that marks steps lists them after its total, both once it has
-    /// finished and while its last step is still running, so a configure
-    /// stuck in one step is named by the breadcrumb taken during it.
+    /// In the configure timing line (`configure_ack_phase_snapshot`, used by
+    /// the slow-configure log and by pending-bind diagnostics), a phase that
+    /// marks steps is written as `phase=Nms(step=Nms,...)`. The steps are
+    /// listed once the phase has finished and also while its last step is
+    /// still running, so a snapshot taken during a stuck configure names the
+    /// step it is stuck in.
     #[test]
     fn configure_phase_timing_names_the_steps_of_a_phase() {
         let ctx = context();
