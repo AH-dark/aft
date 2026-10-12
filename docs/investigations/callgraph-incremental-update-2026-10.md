@@ -54,6 +54,107 @@ opt-in stage timing (`AFT_VIEW_PROFILE`) and an ignored measurement harness.
   further ~5–6 s. It needs persisted dependency data, which is a stored-format
   change, so it is not recommended without approval.
 
+## Outcome of steps 1 and 2 (implemented)
+
+Steps 1 and 2 were approved and built; step 3 was not.
+
+**Measurement setup.**
+- Release profile (fat LTO) on a shared Linux build server with 4 vCPUs.
+- Debug assertions on (`CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true`). As
+  noted under Method, the release library test target does not compile
+  without them.
+- The test binary was built with 8 vCPUs, because the fat-LTO link exceeded
+  the 4-vCPU job's 16 GiB.
+- Revisions: `24b2c8b6415b` and `eff918a9b26d` (HEAD~50 and HEAD when step 1
+  was measured). The edit cases are edits of `eff918a9b26d`.
+- Every case ran with `AFT_UPDATE_BENCH_PARITY=1`: every derived table of the
+  incremental result equals a cold build of the same target, row for row.
+- The host was shared with other jobs. Cold builds of the same revision
+  measured 25–49 s across the two runs, so treat differences under ~30% as
+  noise.
+
+Wall seconds:
+
+| case | unmodified (stage profile, design run) | step 1 (release) | steps 1 + 2 (release) | parity |
+|---|---:|---:|---:|---|
+| edit-1 | 181.0 | 25.1 | **12.9** | equal (both runs) |
+| edit-10 | 184.5 | 24.0 | **14.8** | equal |
+| edit-100 | 204.6 | 35.2 | **15.2** | equal |
+| switch → HEAD | 310.6 | 37.9 | **26.5** | equal |
+| switch → HEAD~50 | 305.1 | 42.5 | **27.7** | equal |
+| cold HEAD | 301.0 | 39.5–48.9 | 25.5–31.6 | — |
+
+The "unmodified" column is the design-stage baseline: the stage profile and
+the older revision pair (`fe06abac1b1e` → `99ba8bbb3dac`). Its edit cases edit
+a different file set, so compare it with the other columns only for scale.
+
+**Comparisons within one run** (same binary, same revision, cold build of
+HEAD):
+- Step 1 run, `AFT_UPDATE_BENCH_MEMO_COMPARE=1`: crate-wide lookups scanned,
+  as before step 1, took **290.9 s**; memoized took **39.5 s**. The databases
+  are equal.
+- Step 2 run, `AFT_UPDATE_BENCH_DISPATCH_COMPARE=1`: the old row-by-row
+  method-call writer took 35.0 s; the differences writer took 31.0 s. The
+  databases are equal.
+
+The cold build is therefore unchanged by both steps, not only consistent
+with the incremental path.
+
+**Remaining stages of a one-file edit after step 2** (milliseconds):
+
+| stage | ms |
+|---|---:|
+| selected join (surface replay 221 of it) | 450 |
+| method-call pass: decode every blob (2 decode threads) | 5,950 |
+| method-call pass: type names (bind 1,500, resolve 1,700; 28 payloads loaded instead of 3,212) | 3,453 |
+| method-call pass: resolve all 273,151 sites | ~900 |
+| method-call pass: write differences | 1,083 |
+| total materialization | 12,874 |
+
+For that one-file edit the differences writer:
+- kept 73,564 method-call edges and rewrote 38;
+- updated 11 site-ref statuses;
+- replaced 77 site rows and 341 unknown-receiver rows.
+
+The old writer rewrote all 273,151 sites, ~620,000 unknown-receiver rows and
+73,602 edges. Decoding every blob is now the largest edit-independent cost.
+The pool is capped at half the cores, like the call-graph build pool
+(`build_pool_size`), so on 4 vCPUs only two threads decode.
+
+Both branch switches still take the full-resolution fallback (624
+unattributed bindings) and now cost about the same as a cold build.
+
+**Tests and mutation checks.** Each check broke one guard, ran the
+materialization suite, and was restored.
+
+Step 1 (`callgraph_store::crate_scan_memo_tests`):
+- Sharing one memo across indexes reddened only
+  `a_changed_file_set_never_reuses_an_earlier_index_memo`.
+
+Step 2 (`views::materialization::dispatch_proofs`):
+- Skipping the status for refs of unchanged files reddened only
+  `relinked_unchanged_caller_gets_method_call_status_and_edges_back`.
+- Reusing an edge whose target file changed reddened
+  `shifted_target_ordinals_relink_method_call_edges_of_unchanged_callers`.
+  It also reddened the existing
+  `seeded_dispatch_incremental_equals_independent_cold_through_switches`.
+- Keeping stale site rows reddened only
+  `removed_file_drops_its_method_call_site_rows`.
+- Writing an edge for a caller with no node reddened only
+  `site_whose_caller_has_no_node_gets_no_method_call_edge`.
+- Skipping the ordinary-edge delete for rewritten site refs reddened
+  nothing. Both joins force every reference at a method-call site's ordinal
+  to unresolved, so ordinary emission never writes an edge with a site's ref
+  ID. The delete is kept so that the result equals the row-by-row writer in
+  every case.
+
+The row-by-row writer is kept, unchanged, for files in which two sites share
+an ordinal. There, only its statement order defines the result, including
+its primary-key error.
+
+**No stored-format change.** The tables, rows and meta keys are the same,
+and `MATERIALIZATION_VERSION` stays `10`.
+
 ## What was measured
 
 ### Method
@@ -521,7 +622,13 @@ needs persisted query recording and the always-safe full fallback.
     (memo prototype, with memo-versus-unmodified cold parity and per-case
     incremental-versus-cold parity);
   - `~/.local/share/cortexkit/mason-evidence/callgraph-incremental-update-2026-10/committed-harness-run3.log`
-    (the committed harness, unmodified code, one-file edit case only).
+    (the committed harness, unmodified code, one-file edit case only);
+  - `~/.local/share/cortexkit/mason-evidence/callgraph-incremental-update-2026-10/step1-release-run4.log`
+    (step 1, release, scanned versus memoized cold build and five parity
+    cases);
+  - `~/.local/share/cortexkit/mason-evidence/callgraph-incremental-update-2026-10/step2-release-run5.log`
+    (steps 1 and 2, release, row-by-row versus differences cold build and five
+    parity cases).
 
   These logs are on the measuring machine only; their key numbers are in the
   tables above.
@@ -531,4 +638,5 @@ needs persisted query recording and the always-safe full fallback.
   - opt-in stage timing: `profile::StageTimer`, used by
     `dispatch::emit`, `join::dispatch_type_targets` and the surface replay.
     It prints only when `AFT_VIEW_PROFILE` is set.
-- Not committed: the memo prototype and its per-method call counters.
+- Not committed: the design-stage memo prototype and its per-method call
+  counters. Step 1 later landed a tested implementation of the same memo.
