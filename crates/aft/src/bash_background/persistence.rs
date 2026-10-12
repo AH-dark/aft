@@ -4012,10 +4012,13 @@ mod tests {
             include_str!("../commands/bash_status.rs"),
         ];
         for source in rust_sources {
+            // Git may check Rust sources out with CRLF on Windows. The test
+            // boundary is a source-code boundary, not a line-ending contract.
+            let source = source.replace("\r\n", "\n");
             let production = source
                 .split("#[cfg(test)]\nmod tests")
                 .next()
-                .unwrap_or(source);
+                .unwrap_or(&source);
             for forbidden in [
                 "File::open(&task.paths",
                 "fs::read(&task.paths",

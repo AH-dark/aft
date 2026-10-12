@@ -269,7 +269,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     };
     if let Err((error, restore_error)) =
         append_with_rollback(&mut file_handle, append_content.as_bytes(), |file| {
-            file.set_len(original_len)
+            restore_append_length(file, original_len)
         })
     {
         let restored = restore_error.is_none();
@@ -419,6 +419,36 @@ fn append_with_rollback<W: std::io::Write>(
     writer
         .write_all(content)
         .map_err(|error| (error, restore(writer).err()))
+}
+
+fn restore_append_length(file: &std::fs::File, len: u64) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            ReOpenFile, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Append-only handles preserve atomic append but cannot truncate on
+        // Windows. Reopen the same file object for rollback, not its mutable path.
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle() as _,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let rollback = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        rollback.set_len(len)
+    }
+    #[cfg(not(windows))]
+    {
+        file.set_len(len)
+    }
 }
 
 /// Returns true if the file path contains glob characters.
@@ -1644,8 +1674,10 @@ mod append_regressions {
                 .unwrap(),
             wrote: false,
         };
-        let error = append_with_rollback(&mut writer, b"after", |writer| writer.file.set_len(6))
-            .unwrap_err();
+        let error = append_with_rollback(&mut writer, b"after", |writer| {
+            restore_append_length(&writer.file, 6)
+        })
+        .unwrap_err();
         assert!(error.1.is_none());
         assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
     }

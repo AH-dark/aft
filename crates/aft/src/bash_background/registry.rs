@@ -11955,8 +11955,10 @@ mod tests {
             let (_dir, registry, task) = approved_reap_fixture(command);
             registry.reap_child(&task);
             assert_eq!(
-                fs::read_to_string(&task.paths.exit).unwrap(),
-                expected.to_string()
+                registry
+                    .read_artifact(&task.paths.task_id, "signal-session", TaskArtifact::Exit)
+                    .unwrap(),
+                expected.to_string().into_bytes()
             );
             registry.poll_task(&task).unwrap();
             let snapshot = task.snapshot(0);
@@ -11970,7 +11972,12 @@ mod tests {
     fn approved_numeric_exit_code_is_preserved() {
         let (_dir, registry, task) = approved_reap_fixture("exit 7");
         registry.reap_child(&task);
-        assert_eq!(fs::read_to_string(&task.paths.exit).unwrap(), "7");
+        assert_eq!(
+            registry
+                .read_artifact(&task.paths.task_id, "signal-session", TaskArtifact::Exit)
+                .unwrap(),
+            b"7"
+        );
         registry.poll_task(&task).unwrap();
         assert_eq!(task.snapshot(0).exit_code, Some(7));
     }

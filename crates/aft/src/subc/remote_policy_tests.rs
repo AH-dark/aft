@@ -83,6 +83,15 @@ fn fetch(plan: &Value) -> Value {
     json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]})
 }
 
+fn native_worker_plan(root: &Path) -> Value {
+    let mut value = plan("broca-worker");
+    // Golden plans retain their Unix spellings; decoder tests need native
+    // absolute siblings without weakening rejection of relative paths.
+    value["tool_items"][0]["params"]["siblings"] =
+        json!([root.join("commons"), root.join("claustrum")]);
+    value
+}
+
 #[test]
 fn worker_reply_deadlines_track_resolved_config_only() {
     let root = tempfile::tempdir().unwrap();
@@ -652,7 +661,7 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
     // A session starter preflights its worker plan on an unscoped route. The
     // plan's params are validated and accepted there, the answer is the same
     // as a paramless fetch, and nothing is frozen without a scope.
-    let planned_fetch = fetch(&plan("broca-worker"));
+    let planned_fetch = fetch(&native_worker_plan(root.path()));
     let mut paramless_fetch = planned_fetch.clone();
     paramless_fetch.as_object_mut().unwrap().remove("params");
     let paramless = catalog(paramless_fetch, &bind, &ctx).unwrap();
@@ -1189,7 +1198,7 @@ fn malformed_routing_policy_is_refused_before_freeze_and_valid_retry_can_freeze(
         let serialized = serde_json::to_value(&error).unwrap();
         assert_eq!(serialized["detail"]["field"], format!("params.{field}"));
         assert!(lookup(&ctx, &RemoteSource::Worker(worker_key.clone())).is_none());
-        catalog(fetch(&plan("broca-worker")), &bind, &ctx).unwrap();
+        catalog(fetch(&native_worker_plan(root.path())), &bind, &ctx).unwrap();
         let frozen = lookup(&ctx, &RemoteSource::Worker(worker_key.clone())).unwrap();
         assert!(frozen.params.remote_exec.as_ref().unwrap().enabled);
         let before = serde_json::to_value(&frozen.params).unwrap();
