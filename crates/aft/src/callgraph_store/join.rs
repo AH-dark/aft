@@ -1434,7 +1434,12 @@ pub(crate) fn dispatch_type_targets(
     blobs: &impl ManifestBlobReader,
     parses: &BTreeMap<String, &ParseBlob>,
 ) -> Result<BTreeMap<(String, String), (String, String)>, ManifestJoinError> {
+    let mut stage = crate::views::materialization::profile::StageTimer::new("dispatch");
     let loaded = manifest_payloads(manifest, blobs)?;
+    stage.finish(
+        "type_targets.load_payloads",
+        format_args!("payloads={}", loaded.len()),
+    );
     let reader = |key: &BlobKey| loaded.get(key).cloned();
     let facts = Rc::new(ManifestFacts {
         manifest,
@@ -1449,6 +1454,10 @@ pub(crate) fn dispatch_type_targets(
         .iter()
         .map(|(file, parse)| Ok((file.clone(), parse.bind(file, &paths)?)))
         .collect::<Result<HashMap<_, _>, ManifestJoinError>>()?;
+    stage.finish(
+        "type_targets.bind_all",
+        format_args!("files={}", extracts.len()),
+    );
     let files = extracts
         .iter()
         .map(|(file, extract)| {
@@ -1468,7 +1477,9 @@ pub(crate) fn dispatch_type_targets(
         super::WorkspaceCratePrefixCache::default(),
         facts.clone(),
     );
+    stage.finish("type_targets.file_indexes", format_args!(""));
     let mut targets = BTreeMap::new();
+    let mut queried = 0usize;
     for (file, parse) in parses {
         if parse.language != "rust" {
             continue;
@@ -1498,6 +1509,7 @@ pub(crate) fn dispatch_type_targets(
         }
         let data = &extracts[file].data;
         for name in names {
+            queried += 1;
             let short = name.rsplit("::").next().unwrap_or(&name);
             let raw = super::RawRef {
                 ref_id: String::new(),
@@ -1526,6 +1538,10 @@ pub(crate) fn dispatch_type_targets(
             }
         }
     }
+    stage.finish(
+        "type_targets.resolve_names",
+        format_args!("names={queried} targets={}", targets.len()),
+    );
     Ok(targets)
 }
 
@@ -2141,6 +2157,7 @@ fn join_manifest_with_surfaces(
         extracts.insert(rel.to_string(), extract);
     }
     profile.finish("decode_bind_index_entries");
+    let mut replay_stage = crate::views::materialization::profile::StageTimer::new("join");
     let index = ManifestProjectIndex::from_parts(
         root,
         files,
@@ -2148,6 +2165,9 @@ fn join_manifest_with_surfaces(
         super::WorkspaceCratePrefixCache::default(),
         facts.clone(),
     );
+    replay_stage.finish("project_index_from_parts", format_args!(""));
+    let replayed_callers = std::cell::Cell::new(0usize);
+    let replayed_queries = std::cell::Cell::new(0usize);
     let mut result = JoinResult {
         rows: BTreeSet::new(),
         resolution_order: Vec::new(),
@@ -2166,15 +2186,26 @@ fn join_manifest_with_surfaces(
                 return true;
             }
             cached.get(*path).is_none_or(|old| {
+                replayed_callers.set(replayed_callers.get() + 1);
                 old.references != bindings[*path].references
-                    || old
-                        .surface_queries
-                        .iter()
-                        .any(|(query, expected)| query.answer(&index) != *expected)
+                    || old.surface_queries.iter().any(|(query, expected)| {
+                        replayed_queries.set(replayed_queries.get() + 1);
+                        query.answer(&index) != *expected
+                    })
             })
         })
         .cloned()
         .collect::<BTreeSet<_>>();
+    replay_stage.finish(
+        "surface_replay",
+        format_args!(
+            "selected={} replayed_callers={} replayed_queries={} resolved_callers={}",
+            selected.map_or(0, BTreeSet::len),
+            replayed_callers.get(),
+            replayed_queries.get(),
+            resolved_callers.len()
+        ),
+    );
     for (path, binding) in &mut bindings {
         if resolved_callers.contains(path) {
             binding.resolved_dependencies.clear();

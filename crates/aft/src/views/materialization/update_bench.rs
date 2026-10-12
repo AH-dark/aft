@@ -1,0 +1,320 @@
+//! Offline measurement of incremental call-graph updates on this repository.
+//!
+//! `bench_repository_incremental_update` clones the repository that contains
+//! this crate (`git clone --shared`, read-only on the source), publishes two
+//! revisions into private view storage to obtain real manifests and blobs, and
+//! derives synthetic edit manifests from the newer revision. It then times a
+//! cold materialization of each base and the incremental update of a clone of
+//! that base, the same `materialize(.., Some(base))` call publication makes.
+//! Run with `AFT_VIEW_PROFILE=1` to print every stage, including the method
+//! dispatch pass and the surface replay. Nothing touches live storage.
+//!
+//! Environment (all optional):
+//! - `AFT_UPDATE_BENCH_OLD` / `AFT_UPDATE_BENCH_NEW`: revisions of the branch
+//!   switch (defaults `HEAD~50` and `HEAD`), resolved in the source checkout.
+//! - `AFT_UPDATE_BENCH_EDITS`: comma-separated synthetic edit sizes
+//!   (default `1,10,100`), applied to the newer revision.
+//! - `AFT_UPDATE_BENCH_OUT`: parent directory for the scratch tree (default:
+//!   the system temporary directory).
+//! - `AFT_UPDATE_BENCH_PARITY=1`: also cold-build every target and require
+//!   every derived table to equal the incremental result.
+//! - `AFT_UPDATE_BENCH_ONLY`: comma-separated case labels to run
+//!   (`switch-<first 12 hex of the target revision>` or `edit-<size>`).
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::time::Instant;
+
+use super::*;
+use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+
+/// User plus system CPU seconds and peak resident set size for this process.
+fn usage() -> (f64, i64) {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: getrusage writes a complete rusage for RUSAGE_SELF.
+    let usage = unsafe {
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()), 0);
+        usage.assume_init()
+    };
+    let seconds =
+        |time: libc::timeval| time.tv_sec as f64 + f64::from(time.tv_usec as i32) / 1_000_000.0;
+    (
+        seconds(usage.ru_utime) + seconds(usage.ru_stime),
+        usage.ru_maxrss as i64,
+    )
+}
+
+fn git(directory: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Inserts a comment line at the middle of the file, which shifts the line of
+/// every later definition and call site, and appends one new function. This is
+/// the shape of an ordinary edit: changed positions plus a new definition.
+fn edited_source(source: &str, language: &str, index: usize) -> String {
+    let lines = source.split_inclusive('\n').collect::<Vec<_>>();
+    let middle = lines.len() / 2;
+    let mut edited = String::with_capacity(source.len() + 128);
+    for (number, line) in lines.iter().enumerate() {
+        if number == middle {
+            edited.push_str(&format!("// aft update bench edit {index}\n"));
+        }
+        edited.push_str(line);
+    }
+    if !edited.ends_with('\n') {
+        edited.push('\n');
+    }
+    if language == "rust" {
+        edited.push_str(&format!("pub fn aft_update_bench_probe_{index}() {{}}\n"));
+    } else {
+        edited.push_str(&format!(
+            "export function aftUpdateBenchProbe{index}() {{}}\n"
+        ));
+    }
+    edited
+}
+
+#[test]
+#[ignore = "offline measurement: publishes two revisions of this repository into scratch storage"]
+fn bench_repository_incremental_update() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = source.canonicalize().unwrap();
+    let old_revision = std::env::var("AFT_UPDATE_BENCH_OLD").unwrap_or_else(|_| "HEAD~50".into());
+    let new_revision = std::env::var("AFT_UPDATE_BENCH_NEW").unwrap_or_else(|_| "HEAD".into());
+    let old_sha = git(&source, &["rev-parse", &old_revision]);
+    let new_sha = git(&source, &["rev-parse", &new_revision]);
+    let edit_sizes = std::env::var("AFT_UPDATE_BENCH_EDITS")
+        .unwrap_or_else(|_| "1,10,100".into())
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<usize>().expect("edit size"))
+        .collect::<Vec<_>>();
+    let parity = std::env::var_os("AFT_UPDATE_BENCH_PARITY").is_some();
+    let only = std::env::var("AFT_UPDATE_BENCH_ONLY").ok().map(|value| {
+        value
+            .split(',')
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+    });
+    let out = tempfile::tempdir_in(
+        std::env::var_os("AFT_UPDATE_BENCH_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir),
+    )
+    .unwrap();
+    println!(
+        "update bench: source={} old={old_sha} new={new_sha} scratch={}",
+        source.display(),
+        out.path().display()
+    );
+    let checkout = out.path().join("checkout");
+    let status = std::process::Command::new("git")
+        .args(["clone", "--shared", "--quiet", "--no-checkout"])
+        .arg(&source)
+        .arg(&checkout)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git clone --shared");
+    let storage = out.path().join("storage");
+    let publish = |revision: &str| -> Manifest {
+        git(&checkout, &["checkout", "--quiet", "--force", revision]);
+        let started = Instant::now();
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.clone(),
+                project_root: checkout.clone(),
+                family: "update-bench".into(),
+                scope: "update-bench".into(),
+                desired_head: revision.into(),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        println!(
+            "published {revision} in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        report
+            .manifest
+            .expect("distinct revisions publish a manifest")
+    };
+    let old = publish(&old_sha);
+    let new = publish(&new_sha);
+    let mut store = crate::blob_store::BlobStore::open(
+        &storage,
+        "update-bench".to_string(),
+        crate::blob_store::BlobPlane::Callgraph,
+    )
+    .unwrap();
+    let blobs = store.path().to_path_buf();
+
+    // Synthetic edits of the newer revision's own source files, spread across
+    // the tree. The checkout is at the newer revision after its publication.
+    let candidates = {
+        let connection = Connection::open(&blobs).unwrap();
+        let reader = ManifestViewBlobReader::new(&connection);
+        new.entries()
+            .filter_map(|(path, entry)| {
+                let ManifestEntry::Regular {
+                    planes,
+                    resolution_input: false,
+                    ..
+                } = entry
+                else {
+                    return None;
+                };
+                let key = planes.callgraph.as_ref()?;
+                let blob = reader.read_decoded(key).ok()??;
+                let language = blob.parse()?.language.clone();
+                matches!(language.as_str(), "rust" | "typescript")
+                    .then(|| (path.clone(), entry.clone(), language))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut targets = vec![
+        (format!("switch-{}", &new_sha[..12]), &old, new.clone()),
+        (format!("switch-{}", &old_sha[..12]), &new, old.clone()),
+    ];
+    for size in edit_sizes {
+        assert!(size <= candidates.len(), "{size} edits");
+        let mut replaced = std::collections::BTreeMap::new();
+        let mut edited_paths = Vec::new();
+        for index in 0..size {
+            let (path, entry, language) =
+                &candidates[(2 * index + 1) * candidates.len() / (2 * size)];
+            let absolute = checkout.join(std::str::from_utf8(path.as_bytes()).unwrap());
+            let source = std::fs::read_to_string(&absolute).unwrap();
+            let source = edited_source(&source, language, index);
+            let key = crate::blob_store::CallgraphKey::from_bytes(
+                source.as_bytes(),
+                language.as_str(),
+                crate::views::callgraph::PRODUCER,
+            )
+            .full_key();
+            let payload =
+                join::CallgraphBlob::extract(&source, language, crate::views::callgraph::PRODUCER)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap();
+            store.put(&key, &payload).unwrap();
+            let ManifestEntry::Regular { mode, planes, .. } = entry else {
+                unreachable!("candidates are regular entries");
+            };
+            replaced.insert(
+                RelPath::new(path.as_bytes()).unwrap(),
+                ManifestEntry::Regular {
+                    mode: *mode,
+                    planes: RegularPlanes {
+                        callgraph: Some(key.to_hex()),
+                        semantic: planes.semantic.clone(),
+                    },
+                    resolution_input: false,
+                },
+            );
+            edited_paths.push(String::from_utf8_lossy(path.as_bytes()).into_owned());
+        }
+        let edited = Manifest::new(new.entries().map(|(path, entry)| {
+            (
+                path.clone(),
+                replaced.get(path).cloned().unwrap_or_else(|| entry.clone()),
+            )
+        }))
+        .unwrap();
+        println!("edit-{size} paths: {}", edited_paths.join(" "));
+        targets.push((format!("edit-{size}"), &new, edited));
+    }
+    drop(store);
+
+    let keeper = |path: &Path| {
+        let keeper = Connection::open(path).unwrap();
+        keeper.pragma_update(None, "journal_mode", "WAL").unwrap();
+        keeper
+            .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        keeper
+    };
+    let cold = |label: &str, manifest: &Manifest| -> std::path::PathBuf {
+        let path = out.path().join(format!("cold-{label}.sqlite"));
+        let _keeper = keeper(&path);
+        let (cpu_before, _) = usage();
+        let started = Instant::now();
+        materialize_manifest_view_database(&path, &blobs, manifest).unwrap();
+        let (cpu_after, max_rss_kib) = usage();
+        println!(
+            "update bench cold label={label} entries={} wall_s={:.3} cpu_s={:.3} max_rss_kib={max_rss_kib}",
+            manifest.entries().count(),
+            started.elapsed().as_secs_f64(),
+            cpu_after - cpu_before
+        );
+        path
+    };
+    let wanted = |base: &str| {
+        targets.iter().any(|(label, target_base, _)| {
+            only.as_ref().is_none_or(|only| only.contains(label))
+                && (base == "old") == std::ptr::eq(*target_base, &old)
+        })
+    };
+    let old_db = wanted("old").then(|| cold("old", &old));
+    let new_db = wanted("new").then(|| cold("new", &new));
+    for (label, base, target) in &targets {
+        if only.as_ref().is_some_and(|only| !only.contains(label)) {
+            continue;
+        }
+        let base_db = if std::ptr::eq(*base, &old) {
+            old_db.as_ref().unwrap()
+        } else {
+            new_db.as_ref().unwrap()
+        };
+        let size = manifest_diff_size(base, target);
+        let db = out.path().join(format!("incremental-{label}.sqlite"));
+        crate::views::generation::clone_derived(base_db, &db).unwrap();
+        let incremental_keeper = keeper(&db);
+        let (cpu_before, _) = usage();
+        let started = Instant::now();
+        let (stats, timings) = materialize(&db, &blobs, target, Some(base)).unwrap();
+        let wall = started.elapsed().as_secs_f64();
+        let (cpu_after, max_rss_kib) = usage();
+        println!(
+            "update bench incremental label={label} changed={} entries={} may_force_full_resolution={} product_path={} wall_s={wall:.3} cpu_s={:.3} max_rss_kib={max_rss_kib}",
+            size.changed,
+            size.entries,
+            size.may_force_full_resolution,
+            if crate::views::assembly::diff_exceeds_incremental_cutoff(size) {
+                "cold"
+            } else {
+                "incremental"
+            },
+            cpu_after - cpu_before
+        );
+        println!("update bench stats label={label} {stats:?}");
+        println!("update bench timings label={label} {timings:?}");
+        drop(incremental_keeper);
+        if parity {
+            let expected = cold(&format!("target-{label}"), target);
+            parity::assert_logical_parity(&db, &expected);
+            println!("update bench parity label={label} equal=true");
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", expected.display()));
+            }
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+    }
+}

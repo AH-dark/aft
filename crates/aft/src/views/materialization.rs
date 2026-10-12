@@ -1218,6 +1218,10 @@ fn configure_materialization_connection(connection: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests;
 
+// The measurement harness reads process CPU time through getrusage.
+#[cfg(all(test, unix))]
+mod update_bench;
+
 fn existing_changed_paths(connection: &Connection, table: &str) -> Result<BTreeSet<String>> {
     debug_assert!(matches!(table, "view_bindings" | "view_file_surfaces"));
     let mut statement = connection.prepare(&format!(

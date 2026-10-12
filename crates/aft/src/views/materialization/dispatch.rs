@@ -17,6 +17,9 @@ pub(super) fn emit(
     manifest: &Manifest,
     reader: &impl ManifestBlobReader,
 ) -> Result<()> {
+    // With `AFT_VIEW_PROFILE` set, each stage of this pass prints its wall
+    // time to stderr; without it nothing is timed or printed.
+    let mut stage = super::profile::StageTimer::new("dispatch");
     let mut decoded = BTreeMap::<String, Arc<CallgraphBlob>>::new();
     for (path, entry) in manifest.entries() {
         let ManifestEntry::Regular { planes, .. } = entry else {
@@ -36,6 +39,7 @@ pub(super) fn emit(
             })?;
         decoded.insert(path.to_string(), blob);
     }
+    stage.finish("decode_all_blobs", format_args!("files={}", decoded.len()));
     let mut resolver = Resolver::new(
         decoded
             .iter()
@@ -45,6 +49,10 @@ pub(super) fn emit(
     resolver.type_targets =
         crate::callgraph_store::join::dispatch_type_targets(manifest, reader, &resolver.files)
             .map_err(|e| CallGraphStoreError::Unavailable(e.to_string()))?;
+    stage.finish(
+        "type_targets",
+        format_args!("targets={}", resolver.type_targets.len()),
+    );
     {
         let mut query = transaction.prepare("SELECT caller_file, module_path, target_file FROM refs WHERE kind='import' AND module_path IS NOT NULL AND target_file IS NOT NULL ORDER BY caller_file, module_path, target_file")?;
         for row in query.query_map([], |r| {
@@ -58,6 +66,10 @@ pub(super) fn emit(
             resolver.import_targets.insert((caller, module), target);
         }
     }
+    stage.finish(
+        "import_targets",
+        format_args!("targets={}", resolver.import_targets.len()),
+    );
     // A content-derived signature invalidates all dispatch when a receiver hint,
     // hierarchy, method set or language membership changes, not merely callers.
     let inputs = resolver
@@ -92,21 +104,32 @@ pub(super) fn emit(
     // Even when hints did not change, ordinary ref emission may have replaced
     // receiver rows. Remove those guesses before re-emitting the ruled edges.
     let changed = old.as_deref() != Some(&signature);
+    stage.finish("signature", format_args!("changed={changed}"));
     if changed {
         transaction.execute_batch(
             "DELETE FROM view_dispatch_sites; DELETE FROM view_unknown_live;
             DELETE FROM edges WHERE provenance IN ('exact', 'dispatch', 'name_match');",
         )?;
     }
+    stage.finish("wholesale_delete", format_args!("changed={changed}"));
     let memoized = MemoizedResolver::new(&resolver);
+    let (mut sites, mut site_files, mut targets) = (0usize, 0usize, 0usize);
+    let mut resolve_time = std::time::Duration::ZERO;
     for (file, parse) in &resolver.files {
+        site_files += usize::from(!parse.dispatch.sites.is_empty());
         for site in &parse.dispatch.sites {
+            sites += 1;
             let ref_id = format!("view:{file}:{}", site.ordinal);
             transaction.execute(
                 "DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match')",
                 [&ref_id],
             )?;
+            let resolve_started = stage.enabled.then(std::time::Instant::now);
             let resolution = memoized.resolve(file, site);
+            if let Some(started) = resolve_started {
+                resolve_time += started.elapsed();
+            }
+            targets += resolution.targets.len();
             transaction.execute("UPDATE refs SET status=?2, target_node=NULL, target_file=NULL, target_symbol=NULL WHERE ref_id=?1", params![ref_id, if resolution.targets.is_empty() { "unresolved" } else { "resolved" }])?;
             if changed {
                 transaction.execute(
@@ -143,6 +166,13 @@ pub(super) fn emit(
             }
         }
     }
+    stage.finish(
+        "site_loop",
+        format_args!(
+            "sites={sites} site_files={site_files} targets={targets} resolve_ms={:.3}",
+            resolve_time.as_secs_f64() * 1000.0
+        ),
+    );
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k,v) VALUES ('view_dispatch_signature',?1)",
         [signature],
