@@ -589,8 +589,9 @@ impl Exchange<'_> {
     ) -> Result<BindingsCheck, RouteOutcome> {
         let body = json!({
             "op": BINDINGS_READ_OPERATION,
-            // The daemon derives plexus's handle connection id from the
-            // assertion it mints for this agent and the ticket's session.
+            // The daemon ignores agent_id: plexus answers the binding read
+            // with every repository's binding, whoever asks. It is still sent
+            // so a daemon from before this change keeps answering.
             "params": {"ticket": self.ticket, "agent_id": agent_id},
         });
         let bytes = self.send(&body).await.map_err(|outcome| match outcome {

@@ -7407,18 +7407,12 @@ fn spawn_gh_relay(
             .unwrap_or_default()
             .to_string();
         let params = decoded.get("params").cloned().unwrap_or_else(|| json!({}));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
         let reply = crate::gh_shim_relay::relay(
             &relay.transport,
-            &relay.cache,
             crate::gh_shim_relay::RelayCall {
                 operation: &operation,
                 params: &params,
                 first_party,
-                now,
                 route_scopes: &route_scopes,
             },
             &|line| log::info!("{line}"),
