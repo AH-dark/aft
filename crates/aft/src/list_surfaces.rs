@@ -774,7 +774,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         file: "commands/inspect.rs",
         enclosing_item: "partial_reason_from_parts",
         location_or_primitive: "commands::inspect::MAX_INSPECT_HEADER_PARTS",
-        reason: "the PARTIAL status line previews at most MAX_INSPECT_HEADER_PARTS incomplete parts and says `+N more`; every scanner reason stays in the body and the structured gaps, diagnostic overflow reasons are rendered in the body, and the cap never changes `complete`",
+        reason: "the PARTIAL status line shows every explicitly requested cause first, then previews unrequested causes up to MAX_INSPECT_HEADER_PARTS total parts and says `+N more`; every scanner reason stays in the body and the structured gaps, diagnostic overflow reasons are rendered in the body, and the cap never changes `complete`",
     },
 ];
 
