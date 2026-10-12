@@ -52,6 +52,11 @@ pub struct AccessPolicy {
     pub grants: Vec<AccessGrant>,
     /// Shell-only configured write exceptions; they do not grant access to private stores.
     pub shell_write_allow: Vec<PathBuf>,
+    /// Checkouts that live inside a private store but hold project code, not
+    /// private data: Alfonso's worker worktrees. They leave the private-store
+    /// floor and fall back to the ordinary outside-root rules, so a head can
+    /// review a worker's files. The rest of the store stays denied.
+    pub private_store_carveouts: Vec<PathBuf>,
 }
 
 impl AccessPolicy {
@@ -123,6 +128,14 @@ impl AccessPolicy {
                 }
             }
         }
+        let mut private_store_carveouts =
+            vec![home.join(".local/share/cortexkit/alfonso/worktrees")];
+        if let Some(path) = crate::environment::non_empty_os_var("XDG_DATA_HOME") {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                private_store_carveouts.push(path.join("cortexkit/alfonso/worktrees"));
+            }
+        }
         let mut read_allow = roots.clone();
         let mut managed_paths = Vec::new();
         if config.github.shim {
@@ -166,6 +179,10 @@ impl AccessPolicy {
                 .iter()
                 .map(|path| expand_home(path, home))
                 .collect(),
+            private_store_carveouts: private_store_carveouts
+                .into_iter()
+                .map(|path| policy_path(&path))
+                .collect(),
         }
     }
 
@@ -193,6 +210,10 @@ impl AccessPolicy {
             .any(|floor| floor_contains(path, floor))
             && !exceptions.iter().any(|root| path.starts_with(root))
             && !(operation == AccessOperation::Read && owned_artifact)
+            && !self
+                .private_store_carveouts
+                .iter()
+                .any(|carveout| path.starts_with(carveout))
         {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
@@ -413,6 +434,38 @@ mod tests {
     fn policy(root: &Path, store: &Path) -> AccessPolicy {
         let config = Config::default();
         AccessPolicy::from_config(&config, store, vec![policy_path(root)], &root.join("home"))
+    }
+
+    #[test]
+    fn worker_worktrees_leave_the_private_store_floor() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let store = home.join(".local/share/cortexkit/aft");
+        let worktree = home.join(".local/share/cortexkit/alfonso/worktrees/pool/bg_x/src/lib.rs");
+        let private = home.join(".local/share/cortexkit/alfonso/prompts/brief.md");
+        let project = root.path().join("project");
+        let policy = AccessPolicy::from_config(
+            &Config::default(),
+            &store,
+            vec![policy_path(&project)],
+            &home,
+        );
+        for operation in [AccessOperation::Read, AccessOperation::Write] {
+            // A worker's checkout is ordinary code outside this root: the
+            // outside rule decides, never the private-store floor.
+            assert_eq!(
+                policy.decide(operation, &policy_path(&worktree), false),
+                AccessDecision::Ask
+            );
+            for denied in [&private, &store.join("aft.db")] {
+                assert_eq!(
+                    policy.decide(operation, &policy_path(denied), false),
+                    AccessDecision::Deny(AccessDenial::Floor),
+                    "{}",
+                    denied.display()
+                );
+            }
+        }
     }
 
     #[test]
