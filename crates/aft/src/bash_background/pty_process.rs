@@ -16,11 +16,41 @@ use crate::sandbox_spawn::SpawnPlan;
 use super::persistence::{ExitMarker, TaskArtifact, TaskIoHandles, TaskPaths};
 use super::pty_runtime::{CompletionCoordinator, PtyRuntime};
 
-struct SpawnedPtyChild(Option<Box<dyn portable_pty::Child + Send + Sync>>);
+/// How long PTY setup cleanup waits for a killed child to be reaped. A
+/// SIGKILLed child normally exits within milliseconds; the bound only exists so
+/// a child that cannot finish exiting turns into a logged error instead of
+/// hanging the caller forever.
+const PTY_SETUP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A PTY child (and, during setup, the PTY master) that setup still owns. If
+/// setup fails before handing the child to its waiter thread, dropping this
+/// kills and reaps the child.
+struct SpawnedPtyChild {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+}
+
+impl SpawnedPtyChild {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self {
+            child: Some(child),
+            master: None,
+        }
+    }
+}
 
 impl Drop for SpawnedPtyChild {
     fn drop(&mut self) {
-        let Some(mut child) = self.0.take() else {
+        // Close the master before waiting on the child. On macOS a session
+        // leader's exit drains its controlling terminal: the kernel waits for
+        // pending terminal output (for example the echo of the newline and EOF
+        // that portable_pty's writer sends when it is dropped) to be read from
+        // the master. With no reader left and the master still open, the child
+        // can never finish exiting and `wait` blocks forever. Closing the
+        // master hangs up the terminal and releases that drain. Linux does not
+        // drain on exit, which is why the hang is macOS-only.
+        drop(self.master.take());
+        let Some(mut child) = self.child.take() else {
             return;
         };
         // Dropping a PTY handle is not a termination guarantee: a child can
@@ -32,12 +62,37 @@ impl Drop for SpawnedPtyChild {
             }
         }
         let _ = child.kill();
-        loop {
-            match child.wait() {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                _ => break,
+        if let Err(error) = reap_killed_child(child.as_mut(), PTY_SETUP_REAP_TIMEOUT) {
+            crate::slog_warn!("PTY setup cleanup: {error}");
+        }
+    }
+}
+
+/// Reap a child that has already been sent SIGKILL, polling instead of
+/// blocking in `wait` so a child that cannot finish exiting surfaces as an
+/// error after `timeout` rather than hanging the caller.
+fn reap_killed_child(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let pid = child.process_id();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(format!("reaping killed PTY child {pid:?} failed: {error}"));
             }
         }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "killed PTY child {pid:?} was not reaped within {}ms",
+                timeout.as_millis()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -231,19 +286,28 @@ fn try_spawn_pty(
         crate::privacy_spawn::note_session(session_id);
     }
     drop(profile_handle);
-    let mut child = SpawnedPtyChild(Some(child));
-    let child_pid = child.0.as_ref().unwrap().process_id();
-    let killer = child.0.as_ref().unwrap().clone_killer();
+    // The guard owns the master as well as the child so a setup failure closes
+    // the master before reaping the child (see `SpawnedPtyChild::drop`).
+    let mut child = SpawnedPtyChild {
+        child: Some(child),
+        master: Some(pair.master),
+    };
+    let child_pid = child.child.as_ref().unwrap().process_id();
+    let killer = child.child.as_ref().unwrap().clone_killer();
     #[cfg(test)]
     fail_pty_setup_for_test(child_pid)?;
     #[cfg(test)]
     observe_pty_setup_for_test(child_pid);
-    let reader = pair
+    let reader = child
         .master
+        .as_ref()
+        .unwrap()
         .try_clone_reader()
         .map_err(|error| format!("clone PTY reader failed: {error}"))?;
-    let writer = pair
+    let writer = child
         .master
+        .as_ref()
+        .unwrap()
         .take_writer()
         .map_err(|error| format!("take PTY writer failed: {error}"))?;
 
@@ -274,7 +338,7 @@ fn try_spawn_pty(
     )
     .map_err(|error| format!("failed to start PTY reader: {error}"))?;
     spawn_waiter(
-        child.0.take().unwrap(),
+        child.child.take().unwrap(),
         exit,
         Arc::clone(&was_killed),
         Arc::clone(&exit_observed),
@@ -283,7 +347,7 @@ fn try_spawn_pty(
     .map_err(|error| format!("failed to start PTY waiter: {error}"))?;
 
     Ok(PtyRuntime {
-        master: Some(pair.master),
+        master: child.master.take(),
         writer,
         killer,
         child_pid,
@@ -465,9 +529,9 @@ pub(crate) fn spawn_waiter(
     exit_observed: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
 ) -> io::Result<()> {
-    let mut owned_child = SpawnedPtyChild(Some(child));
+    let mut owned_child = SpawnedPtyChild::new(child);
     super::worker_thread::spawn(super::worker_thread::Worker::PtyWaiter, move || {
-        let mut child = owned_child.0.take().unwrap();
+        let mut child = owned_child.child.take().unwrap();
         let marker = loop {
             match child.wait() {
                 Ok(status) => {
@@ -613,6 +677,55 @@ mod tests {
         }
         wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(fs::read_to_string(exit_path).unwrap(), "0");
+    }
+
+    #[derive(Debug)]
+    struct NeverExitsChild;
+
+    impl ChildKiller for NeverExitsChild {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(FakeKiller)
+        }
+    }
+
+    impl Child for NeverExitsChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            panic!("setup cleanup must poll with try_wait, never block in wait");
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[test]
+    fn setup_cleanup_reap_gives_up_with_named_error_after_its_bound() {
+        let mut child = NeverExitsChild;
+        let started = Instant::now();
+        let error = reap_killed_child(&mut child, Duration::from_millis(100))
+            .expect_err("a child that never exits must not count as reaped");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "reap overran its bound: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.contains("was not reaped within 100ms"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Feed `chunks` to a fresh scanner and return how many chunks reported a
