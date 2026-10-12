@@ -940,6 +940,14 @@ pub(super) fn submit_deferred_bash(
                         if settings.wait || settings.block_to_completion || server_completion {
                             wait_window_ms
                         } else {
+                            // Shorten only the execution wait in promotion probes;
+                            // the generic foreground override also fences startup.
+                            #[cfg(any(test, feature = "test-timing-hooks"))]
+                            let wait_window_ms =
+                                std::env::var("AFT_TEST_SUBC_BASH_PROMOTION_WAIT_MS")
+                                    .ok()
+                                    .and_then(|value| value.parse::<u64>().ok())
+                                    .unwrap_or(wait_window_ms);
                             wait_window_ms.min(20_000)
                         };
                     let deadline = received_at + Duration::from_millis(wait_window_ms);
@@ -1192,7 +1200,7 @@ pub(super) fn submit_deferred_bash(
                 tokio::select! {
                     biased;
                     _ = &mut wait_task => {}
-                    _ = tokio::time::sleep_until(reply_deadline.into()), if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
+                    _ = wait_for_bash_reply_deadline(reply_deadline), if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
                         if claim.claim_for_deadline_handoff() {
                             let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session));
                             // Status-bar formatting can wait on diagnostic-cache or
@@ -1227,6 +1235,21 @@ pub(super) fn submit_deferred_bash(
             }
         }
     });
+}
+
+async fn wait_for_bash_reply_deadline(deadline: Instant) {
+    tokio::time::sleep_until(deadline.into()).await;
+    // Promotion probes require the executor job to start before racing its held
+    // result against this timer. The two-second reply assertion includes this
+    // rendezvous; calls without timing hooks keep the ordinary deadline.
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    if std::env::var_os("AFT_TEST_SUBC_BASH_PROMOTION_WAIT_MS").is_some() {
+        if let Ok(path) = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE") {
+            while !std::path::Path::new(&path).exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
 
 fn deadline_handoff_response(

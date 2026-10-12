@@ -3448,7 +3448,9 @@ fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
 #[cfg(feature = "test-timing-hooks")]
 fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
     vec![
-        set_test_foreground_wait_ms(200),
+        // Keep the production startup budget while making promotion due quickly.
+        // The generic foreground override would also refuse shell startup at 200ms.
+        set_test_env("AFT_TEST_SUBC_BASH_PROMOTION_WAIT_MS", "200"),
         // Delay the job that moves foreground bash to background after it starts,
         // beyond the foreground wait plus reply timer. The marker distinguishes
         // a running job from one merely queued behind a writer.
@@ -3465,13 +3467,29 @@ fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
 fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
     let started = probe.path().join("started");
-    run_subc_bridge_test_with_env(
+    run_subc_bridge_test_inner(
         "subc_bridge_bash_started_promotion_hands_off_before_transport_deadline",
         Duration::from_secs(45),
         || started_promotion_env(&started),
         |input| drive_started_promotion_daemon(input, false),
         |_, _, _| {},
+        true,
+        None,
+        slow_started_promotion_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
     );
+}
+
+#[cfg(feature = "test-timing-hooks")]
+fn slow_started_promotion_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.command == "bash" {
+        // Model shell setup under load, beyond the short promotion wait but
+        // within the unchanged two-second end-to-end reply assertion.
+        thread::sleep(Duration::from_millis(600));
+    }
+    bridge_dispatch(req, ctx)
 }
 
 #[cfg(feature = "test-timing-hooks")]
@@ -3479,7 +3497,7 @@ fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
 fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
     let started = probe.path().join("started");
-    run_subc_bridge_test_with_env(
+    run_subc_bridge_test_inner(
         "subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive",
         Duration::from_secs(45),
         || {
@@ -3489,6 +3507,12 @@ fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive
         },
         |input| drive_started_promotion_daemon(input, false),
         |_, _, _| {},
+        true,
+        None,
+        slow_started_promotion_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
     );
 }
 
@@ -5426,6 +5450,7 @@ async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bo
     bind_route1(&mut stream, &root1).await;
     let marker = root1.join("promote-panic-started");
     let release = root1.join("promote-panic-release");
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let sent_at = Instant::now();
     send_tool_call(
         &mut stream,
@@ -5440,14 +5465,30 @@ async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bo
     )
     .await;
     let probe = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE").expect("promotion probe");
-    wait_for_file(
-        std::path::Path::new(&probe),
-        "executor promotion start marker",
-    )
-    .await;
-    let remaining = Duration::from_secs(2).saturating_sub(sent_at.elapsed());
-    let frame = read_frame_within(&mut stream, remaining, "started promotion deadline handoff")
-        .await.expect("a started promotion must not hold its reply past the 2s test bound (25s transport budget)");
+    // Observe the reply while waiting for admission, so an early startup refusal
+    // reports its actual error rather than looking like a lost executor marker.
+    // Both the started-job marker and the original end-to-end bound are required.
+    let (_, frame) = tokio::join!(
+        wait_for_file(
+            std::path::Path::new(&probe),
+            "executor promotion start marker"
+        ),
+        async {
+            let remaining = Duration::from_secs(2).saturating_sub(sent_at.elapsed());
+            let frame = read_frame_within(&mut stream, remaining, "started promotion deadline handoff")
+                .await.expect("a started promotion must not hold its reply past the 2s test bound (25s transport budget)");
+            assert!(
+                !tool_result_is_error(&frame),
+                "bash failed before the promotion marker: {}",
+                tool_result_text(&frame),
+            );
+            assert!(
+                std::path::Path::new(&probe).exists(),
+                "the deadline handoff must exercise an already-started promotion job",
+            );
+            frame
+        },
+    );
     std::fs::write(&release, b"release").expect("release panic command");
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 116);
