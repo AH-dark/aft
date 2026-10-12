@@ -978,7 +978,8 @@ fn parse_stringified_symbol_array(raw: &str) -> Option<Vec<String>> {
 ///
 /// For code files, a string is split at top-level commas and whitespace. Separators
 /// inside a signature's parentheses, brackets, or generic arguments stay intact.
-/// Markdown/HTML headings keep the full string (headings may contain spaces).
+/// A pasted menu entry keeps only its selector before lookup. Markdown/HTML headings
+/// keep the full string (headings may contain spaces).
 fn parse_zoom_symbol_names(
     params: &serde_json::Value,
     lang: Option<LangId>,
@@ -986,9 +987,15 @@ fn parse_zoom_symbol_names(
     if let Some(arr) = params.get("symbols").and_then(|v| v.as_array()) {
         let names: Vec<String> = arr
             .iter()
-            .filter_map(|v| v.as_str().map(str::trim))
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(|name| {
+                if is_heading_zoom_language(lang) {
+                    let name = name.trim();
+                    (!name.is_empty()).then(|| name.to_string())
+                } else {
+                    normalize_zoom_symbol_entry(name)
+                }
+            })
             .collect();
         return Ok(names);
     }
@@ -1002,7 +1009,14 @@ fn parse_zoom_symbol_names(
     // the lookup fails with a not-found whose suggestions are the very names
     // the caller sent.
     if let Some(names) = parse_stringified_symbol_array(raw) {
-        return Ok(names);
+        return Ok(if is_heading_zoom_language(lang) {
+            names
+        } else {
+            names
+                .iter()
+                .filter_map(|name| normalize_zoom_symbol_entry(name))
+                .collect()
+        });
     }
 
     if is_heading_zoom_language(lang) {
@@ -1013,7 +1027,31 @@ fn parse_zoom_symbol_names(
         return Ok(vec![trimmed.to_string()]);
     }
 
-    Ok(split_zoom_symbol_string(raw))
+    Ok(split_zoom_symbol_list(raw))
+}
+
+fn split_zoom_symbol_list(raw: &str) -> Vec<String> {
+    let Some(raw) = normalize_zoom_symbol_entry(raw) else {
+        return Vec::new();
+    };
+    split_zoom_symbol_string(&raw)
+        .iter()
+        .filter_map(|name| normalize_zoom_symbol_entry(name))
+        .collect()
+}
+
+fn normalize_zoom_symbol_entry(raw: &str) -> Option<String> {
+    let entry = raw
+        .split_once(" — ")
+        .map_or(raw, |(selector, _)| selector)
+        .trim();
+    let entry = entry.strip_prefix("- ").unwrap_or(entry).trim();
+    let entry = entry
+        .strip_prefix('`')
+        .and_then(|entry| entry.strip_suffix('`'))
+        .unwrap_or(entry)
+        .trim();
+    (!entry.is_empty()).then(|| entry.to_string())
 }
 
 fn split_zoom_symbol_string(raw: &str) -> Vec<String> {
@@ -1212,7 +1250,7 @@ fn zoom_one_symbol_inner(
 
     if matches.len() > 1 {
         let suggestions = ambiguous_symbol_selectors(&matches);
-        let content = render_ambiguous_symbol_menu(symbol_name, &suggestions);
+        let content = render_ambiguous_symbol_menu(symbol_name, &matches, &suggestions);
         let candidates = matches
             .iter()
             .zip(suggestions.iter())
@@ -1562,15 +1600,29 @@ fn empty_annotations() -> serde_json::Value {
     })
 }
 
-fn render_ambiguous_symbol_menu(symbol_name: &str, suggestions: &[String]) -> String {
+fn render_ambiguous_symbol_menu(
+    symbol_name: &str,
+    matches: &[SymbolMatch],
+    suggestions: &[String],
+) -> String {
     let mut lines = vec![format!(
-        "symbol '{symbol_name}' is ambiguous ({} candidates) and cannot choose a body. {} Pick one of these qualified names for `symbol`:",
+        "symbol '{symbol_name}' is ambiguous ({} candidates) and cannot choose a body. {} Pick one of these qualified names and pass the backticked name as `symbol`:",
         suggestions.len(),
         RETRY_UNCHANGED_ZOOM_MESSAGE,
     )];
 
-    for suggestion in suggestions {
-        lines.push(format!("- {suggestion}"));
+    for (candidate, selector) in matches.iter().zip(suggestions) {
+        let signature = candidate
+            .symbol
+            .signature
+            .as_deref()
+            .filter(|signature| !signature.trim().is_empty())
+            .unwrap_or(&candidate.symbol.name);
+        let start_line = candidate.symbol.range.start_line.saturating_add(1);
+        let end_line = candidate.symbol.range.end_line.saturating_add(1);
+        lines.push(format!(
+            "- `{selector}` — {signature} (lines {start_line}-{end_line})"
+        ));
     }
 
     lines.join("\n")
@@ -2751,6 +2803,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_zoom_symbol_names_drops_context_from_a_pasted_menu_entry() {
+        let params = serde_json::json!({
+            "symbols": "- `Runtime.publish` — publish(receipt: string, rawPatch: string): string (lines 2-4)"
+        });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::TypeScript)).expect("parse");
+        assert_eq!(names, ["Runtime.publish"]);
+    }
+
+    #[test]
     fn parse_zoom_symbol_names_does_not_split_markdown_headings() {
         let params = serde_json::json!({ "symbols": "Getting Started" });
         let names = parse_zoom_symbol_names(&params, Some(LangId::Markdown)).expect("parse");
@@ -3840,7 +3901,7 @@ def local():
             content.contains(RETRY_UNCHANGED_ZOOM_MESSAGE),
             "expected ambiguous-name menu, got: {content}"
         );
-        assert!(content.contains("Pick one of these qualified names"));
+        assert!(content.contains("pass the backticked name as `symbol`"));
     }
 
     #[test]
@@ -3855,13 +3916,23 @@ def local():
         let content = ambiguous["content"].as_str().expect("ambiguity content");
         let suggestions = content
             .lines()
-            .filter_map(|line| line.strip_prefix("- "))
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("- `")?;
+                let (selector, _) = rest.split_once('`')?;
+                Some(selector)
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             suggestions,
             ["Runtime.publish", "SnapshotStore.publish"],
             "suggestions must be directly usable symbol selectors: {content}"
         );
+        assert!(content.contains(
+            "- `Runtime.publish` — publish(receipt: string, rawPatch: string): string (lines 2-4)"
+        ));
+        assert!(content.contains(
+            "- `SnapshotStore.publish` — publish(receipt: string, rawPatch: string): string (lines 8-10)"
+        ));
 
         let candidates = ambiguous["candidates"].as_array().expect("candidates");
         for ((suggestion, marker), candidate) in suggestions
@@ -3882,9 +3953,50 @@ def local():
             .unwrap();
             assert_eq!(response["success"], true, "{suggestion}: {response:?}");
             assert_ne!(response["kind"], "ambiguous_symbol", "{suggestion}");
+            assert_eq!(candidate["qualified_name"], *suggestion);
             assert_eq!(response["range"], candidate["range"]);
             assert!(response["content"].as_str().unwrap().contains(marker));
         }
+    }
+
+    #[test]
+    fn zoom_accepts_a_pasted_ambiguity_menu_line() {
+        let ctx = make_ctx();
+        let path = fixture_path("zoom_ambiguous_publish.ts");
+        let request = make_zoom_request(
+            "pasted-menu-source",
+            path.to_str().unwrap(),
+            "publish",
+            None,
+        );
+        let ambiguous = serde_json::to_value(handle_zoom(&request, &ctx)).unwrap();
+        let candidate = ambiguous["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["qualified_name"] == "Runtime.publish")
+            .unwrap();
+        let menu_line = ambiguous["content"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .find(|line| line.contains("Runtime.publish"))
+            .unwrap();
+
+        let request = serde_json::json!({
+            "id": "pasted-menu-line",
+            "command": "zoom",
+            "file": path,
+            "symbols": menu_line,
+        });
+        let response = serde_json::to_value(handle_zoom(
+            &serde_json::from_value(request).expect("zoom request"),
+            &ctx,
+        ))
+        .unwrap();
+        assert_eq!(response["success"], true, "{response:?}");
+        assert_eq!(response["range"], candidate["range"]);
+        assert!(response["content"].as_str().unwrap().contains("runtime:"));
     }
 
     #[test]
@@ -3905,7 +4017,11 @@ def local():
         let content = ambiguous["content"].as_str().expect("ambiguity content");
         let suggestions = content
             .lines()
-            .filter_map(|line| line.strip_prefix("- "))
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("- `")?;
+                let (selector, _) = rest.split_once('`')?;
+                Some(selector)
+            })
             .collect::<Vec<_>>();
         assert_eq!(suggestions, ["Runtime.publish#L2", "Runtime.publish#L3"]);
 
@@ -3926,6 +4042,7 @@ def local():
             ))
             .unwrap();
             assert_eq!(response["success"], true, "{suggestion}: {response:?}");
+            assert_eq!(candidate["qualified_name"], *suggestion);
             assert_eq!(response["range"], candidate["range"]);
             assert!(response["content"].as_str().unwrap().contains(marker));
         }
