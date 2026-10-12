@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The ranking-fenced semantic_search change only validates the caller's paths as reads with its session, so a session can search its own task output. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
