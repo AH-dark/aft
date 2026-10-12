@@ -5,7 +5,7 @@
 //! that the worker's scope has ended; idle time, a missing worktree, and row
 //! count are not evidence of that. Delete settings only for an ended scope.
 use crate::exec_remote::FrozenParams;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyKey {
@@ -66,35 +66,89 @@ pub fn lookup(
     key: &PolicyKey,
     now: u64,
 ) -> rusqlite::Result<Option<FrozenParams>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let row = catalog_params(&tx, key, CatalogParams::RemoteExec)?;
+    let policy = row
+        .map(|(rowid, json)| {
+            tx.execute(
+                "UPDATE remote_exec_policies SET last_used=?1 WHERE rowid=?2",
+                params![now as i64, rowid],
+            )?;
+            serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        })
+        .transpose()?;
+    tx.commit()?;
+    Ok(policy)
+}
+
+pub(super) enum CatalogParams {
+    RemoteExec,
+    AccessLaunch,
+}
+
+/// A new epoch of the same scope is a rebound of the same worker. Carry saved
+/// catalog inputs forward, but never grant rows or materialization markers.
+pub(super) fn catalog_params(
+    tx: &Transaction<'_>,
+    key: &PolicyKey,
+    table: CatalogParams,
+) -> rusqlite::Result<Option<(i64, String)>> {
+    let (table, extra_column) = match table {
+        CatalogParams::RemoteExec => ("remote_exec_policies", ",last_used"),
+        CatalogParams::AccessLaunch => ("access_launch_params", ""),
+    };
     let v = key.values();
-    let row: Option<(i64, String)> = conn
+    let epoch = key.epoch.to_string();
+    let identity = "project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
+        AND owner=?5 AND scope_ref=?6 AND preset=?7";
+    let exact_sql = format!("SELECT rowid,params FROM {table} WHERE {identity} AND epoch=?8");
+    let exact = || {
+        tx.query_row(
+            &exact_sql,
+            params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+    };
+    if let Some(row) = exact()? {
+        return Ok(Some(row));
+    }
+    // Epochs are canonical unsigned decimal text. Length then lexical ordering
+    // preserves the full u64 range, unlike SQLite's signed INTEGER cast.
+    let older: Option<(i64, String)> = tx
         .query_row(
-            "SELECT rowid,params FROM remote_exec_policies
-        WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
-          AND owner=?5 AND scope_ref=?6 AND preset=?7 AND epoch=?8",
-            params![
-                v[0],
-                v[1],
-                v[2],
-                v[3],
-                v[4],
-                v[5],
-                v[6],
-                key.epoch.to_string()
-            ],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            &format!(
+                "SELECT rowid,epoch FROM {table} WHERE {identity}
+            AND (length(epoch)<length(?8) OR (length(epoch)=length(?8) AND epoch<?8))
+            ORDER BY length(epoch) DESC,epoch DESC LIMIT 1"
+            ),
+            params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    row.map(|(rowid, json)| {
-        conn.execute(
-            "UPDATE remote_exec_policies SET last_used=?1 WHERE rowid=?2",
-            params![now as i64, rowid],
-        )?;
-        serde_json::from_str(&json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
-        })
-    })
-    .transpose()
+    let Some((rowid, from_epoch)) = older else {
+        return Ok(None);
+    };
+    let inserted = tx.execute(
+        &format!("INSERT OR IGNORE INTO {table}
+            (project_root,harness,session,principal,owner,scope_ref,preset,epoch,params{extra_column})
+            SELECT project_root,harness,session,principal,owner,scope_ref,preset,?1,params{extra_column}
+            FROM {table} WHERE rowid=?2"),
+        params![epoch, rowid],
+    )?;
+    if inserted == 1 {
+        log::info!(
+            "catalog params carried forward: session={} scope_ref={:.12} from_epoch={} to_epoch={} preset={} table={}",
+            key.session, key.scope_ref, from_epoch, key.epoch, key.preset, table
+        );
+    }
+    exact()
 }
 
 /// Called by scope-end handling once it is available. Ordinary route detach
@@ -161,7 +215,7 @@ mod tests {
         assert!(lookup(&conn, &key, 200).unwrap().is_none());
     }
     #[test]
-    fn exec_remote_policy_key_isolates_epoch_principal_and_sessions() {
+    fn exec_remote_policy_key_isolates_lower_epoch_principal_and_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
         let first = key(dir.path());
@@ -188,7 +242,7 @@ mod tests {
         for different in 0..7 {
             let mut other = first.clone();
             match different {
-                0 => other.epoch += 1,
+                0 => other.epoch -= 1,
                 1 => other.principal = "direct".into(),
                 2 => other.owner = "other".into(),
                 3 => other.scope_ref = "other".into(),
@@ -201,6 +255,101 @@ mod tests {
                 "key dimension {different}"
             );
         }
+    }
+
+    #[test]
+    fn exec_remote_revived_worker_carries_params_and_then_hits_exact_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let mut first = key(dir.path());
+        first.epoch = 1;
+        let frozen = FrozenParams {
+            siblings: vec!["/sibling".into()],
+            host: Some("runner".into()),
+            ..policy(true)
+        };
+        freeze(&conn, &first, &frozen, 100).unwrap();
+        let mut revived = first.clone();
+        revived.epoch = 2;
+        let carried = lookup(&conn, &revived, 200).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(carried).unwrap(),
+            serde_json::to_value(&frozen).unwrap()
+        );
+        let (json, last_used): (String, i64) = conn
+            .query_row(
+                "SELECT params,last_used FROM remote_exec_policies WHERE epoch='2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(json, serde_json::to_string(&frozen).unwrap());
+        assert_eq!(last_used, 200);
+        forget_scope(&conn, &first.owner, &first.scope_ref, first.epoch).unwrap();
+        let exact = lookup(&conn, &revived, 300).unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(exact).unwrap(),
+            serde_json::to_value(frozen).unwrap()
+        );
+        let (count, last_used): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),last_used FROM remote_exec_policies",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, last_used), (1, 300));
+    }
+
+    #[test]
+    fn exec_remote_revived_worker_uses_highest_older_epoch_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let mut first = key(dir.path());
+        first.epoch = 1;
+        freeze(&conn, &first, &policy(true), 100).unwrap();
+        let mut second = first.clone();
+        second.epoch = 2;
+        freeze(&conn, &second, &policy(false), 100).unwrap();
+        let mut third = first.clone();
+        third.epoch = 3;
+        assert!(
+            !lookup(&conn, &third, 200)
+                .unwrap()
+                .unwrap()
+                .remote_exec
+                .unwrap()
+                .enabled
+        );
+        for different in 0..8 {
+            let mut other = third.clone();
+            match different {
+                0 => other.epoch = 0,
+                1 => other.principal = "direct".into(),
+                2 => other.owner = "other".into(),
+                3 => other.scope_ref = "other".into(),
+                4 => other.harness = "other".into(),
+                5 => other.project_root = "/other".into(),
+                6 => other.preset = "head".into(),
+                _ => other.session = "two".into(),
+            }
+            assert!(
+                lookup(&conn, &other, 200).unwrap().is_none(),
+                "key dimension {different}"
+            );
+        }
+        let mut newer = first.clone();
+        newer.epoch = u64::MAX - 1;
+        freeze(&conn, &newer, &policy(true), 100).unwrap();
+        newer.epoch = u64::MAX;
+        assert!(
+            lookup(&conn, &newer, 200)
+                .unwrap()
+                .unwrap()
+                .remote_exec
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]

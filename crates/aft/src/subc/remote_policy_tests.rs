@@ -493,7 +493,7 @@ fn stamped_host_heads_keep_role_tools_and_user_remote_runner() {
 // which a Windows decode rightly rejects as not absolute.
 #[cfg(unix)]
 #[test]
-fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_session() {
+fn exec_remote_catalog_freezes_verbatim_plan_and_carries_rebound_epoch_only() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let ctx = context(root.path(), storage.path(), None);
@@ -519,8 +519,8 @@ fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_sessio
             .unwrap()
             .enabled
     );
-    // A second route under the same bind sees the policy, but another epoch
-    // or an unscoped call cannot borrow it.
+    // A rebound epoch retains the same worker's catalog inputs. Another
+    // principal or an unscoped call cannot borrow them.
     let new_epoch = identity(root.path(), "one", 8, true);
     let mut other_principal = identity(root.path(), "one", 7, true);
     if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
@@ -535,7 +535,18 @@ fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_sessio
         &RemoteSource::Worker(key(&other_principal, Some("worker")))
     )
     .is_none());
-    assert!(lookup(&ctx, &RemoteSource::Worker(key(&new_epoch, Some("worker")))).is_none());
+    let revived = lookup(&ctx, &RemoteSource::Worker(key(&new_epoch, Some("worker")))).unwrap();
+    assert_eq!(
+        serde_json::to_value(revived.params).unwrap(),
+        serde_json::to_value(
+            lookup(&ctx, &RemoteSource::Worker(key(&first, Some("worker"))))
+                .unwrap()
+                .params
+        )
+        .unwrap()
+    );
+    let old_epoch = identity(root.path(), "one", 6, true);
+    assert!(lookup(&ctx, &RemoteSource::Worker(key(&old_epoch, Some("worker")))).is_none());
     let unscoped = identity(root.path(), "one", 7, false);
     assert!(lookup(&ctx, &RemoteSource::Worker(key(&unscoped, Some("worker")))).is_none());
     assert!(lookup(&ctx, &RemoteSource::Worker(key(&first, Some("head")))).is_none());

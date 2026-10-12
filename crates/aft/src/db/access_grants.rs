@@ -201,9 +201,15 @@ pub fn launch_params(
     conn: &Connection,
     key: &PolicyKey,
 ) -> rusqlite::Result<Option<serde_json::Value>> {
-    let json: Option<String> = conn.query_row("SELECT params FROM access_launch_params WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4 AND owner=?5 AND scope_ref=?6 AND epoch=?7 AND preset=?8",
-        params![key.project_root,key.harness,key.session,key.principal,key.owner,key.scope_ref,key.epoch.to_string(),key.preset], |r| r.get(0)).optional()?;
-    json.map(|json| decode(&json)).transpose()
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let row = super::remote_exec::catalog_params(
+        &tx,
+        key,
+        super::remote_exec::CatalogParams::AccessLaunch,
+    )?;
+    let params = row.map(|(_, json)| decode(&json)).transpose()?;
+    tx.commit()?;
+    Ok(params)
 }
 
 /// Validation is completed before entering this transaction. The scope-wide
@@ -320,6 +326,93 @@ mod tests {
         conn.execute_batch("DROP TRIGGER fail_install;").unwrap();
         materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
         assert_eq!(list(&conn, &scope).unwrap(), vec![grant]);
+    }
+
+    #[test]
+    fn grants_revived_worker_carries_launch_params_but_not_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let first = scope("worker", 1);
+        let second = scope("worker", 2);
+        let head = scope("head", 1);
+        for key in [&first, &second] {
+            register_scope(&conn, key, Some(&head), &Config::default()).unwrap();
+        }
+        let bind = policy(&first, dir.path());
+        let revived = policy(&second, dir.path());
+        let grant = AccessGrant {
+            path: crate::access_policy::policy_path(&dir.path().join("outside")),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        let raw = serde_json::json!([{"path":grant.path,"mode":"read"}]);
+        materialize(&conn, &bind, &raw, &[grant.clone()]).unwrap();
+        assert_eq!(launch_params(&conn, &revived).unwrap(), Some(raw.clone()));
+        let copied: String = conn
+            .query_row(
+                "SELECT params FROM access_launch_params WHERE epoch='2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(copied, raw.to_string());
+        assert_eq!(list(&conn, &first).unwrap(), vec![grant]);
+        assert!(list(&conn, &second).unwrap().is_empty());
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM access_materialized WHERE epoch='2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(markers, 0);
+        end_scope_grants(&conn, &first).unwrap();
+        assert_eq!(launch_params(&conn, &revived).unwrap(), Some(raw));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM access_launch_params", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn grants_revived_launch_params_use_highest_older_epoch_and_isolate_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let first = scope("worker", 1);
+        let second = scope("worker", 2);
+        for key in [&first, &second] {
+            register_scope(&conn, key, None, &Config::default()).unwrap();
+        }
+        materialize(
+            &conn,
+            &policy(&first, dir.path()),
+            &serde_json::json!(["first"]),
+            &[],
+        )
+        .unwrap();
+        let newest = serde_json::json!(["second"]);
+        materialize(&conn, &policy(&second, dir.path()), &newest, &[]).unwrap();
+        let revived = policy(&scope("worker", 3), dir.path());
+        assert_eq!(launch_params(&conn, &revived).unwrap(), Some(newest));
+        for different in 0..8 {
+            let mut other = revived.clone();
+            match different {
+                0 => other.epoch = 0,
+                1 => other.principal = "direct".into(),
+                2 => other.owner = "other".into(),
+                3 => other.scope_ref = "other".into(),
+                4 => other.harness = "other".into(),
+                5 => other.project_root = "/other".into(),
+                6 => other.preset = "head".into(),
+                _ => other.session = "two".into(),
+            }
+            assert!(
+                launch_params(&conn, &other).unwrap().is_none(),
+                "key dimension {different}"
+            );
+        }
     }
 
     #[test]
