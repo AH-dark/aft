@@ -4830,9 +4830,34 @@ fn current_view_projection_store(
                 return Ok(None);
             }
         }
+        let family = crate::search_index::artifact_cache_key(project_root);
+        if !crate::views::read::derived_built(view.view_dir(), &generation) {
+            // A linked worktree builds its own graph on first use. Until then the
+            // main checkout's graph answers while the published files match it.
+            // The generation stays this checkout's, so the projection cache and
+            // the coverage checks keep using this checkout's manifest.
+            let manifest = view
+                .load_manifest(&generation)
+                .map_err(|error| error.to_string())?;
+            let Some((store, main_generation)) = crate::views::read::main_checkout_callgraph(
+                &storage,
+                project_root,
+                &family,
+                &generation,
+                &manifest,
+            ) else {
+                note_checkout_view_refusal!("projection_not_built: root={project_root:?} generation={generation}");
+                return Ok(None);
+            };
+            crate::slog_debug!(
+                "tier2 view reader uses the main checkout graph root={} generation={generation} main_generation={main_generation}",
+                project_root.display()
+            );
+            return Ok(Some((store, generation)));
+        }
         let store = crate::views::read::open_published_callgraph(
             project_root.to_path_buf(),
-            crate::search_index::artifact_cache_key(project_root),
+            family,
             view.view_dir().to_path_buf(),
             &generation,
             Some(Arc::new(pin)),
@@ -4854,6 +4879,16 @@ fn current_view_projection_store(
             None
         }
     }
+}
+
+/// The reader Tier-2 dead-code projection uses for `project_root`'s published
+/// view, for tests that compare it with an independent build.
+#[cfg(test)]
+pub(crate) fn current_view_projection_store_for_test(
+    project_root: &Path,
+    config: &crate::config::Config,
+) -> Option<(ReadonlyCallGraphStore, String)> {
+    current_view_projection_store(project_root, Path::new(""), config, &[])
 }
 
 fn build_view_callgraph_snapshot(

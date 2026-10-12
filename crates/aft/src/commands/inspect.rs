@@ -563,6 +563,7 @@ fn handle_inspect_payload(
     let tier2_enabled = InspectCategory::active()
         .iter()
         .any(|category| category.is_tier2() && snapshot.config.inspect.category_enabled(*category));
+    start_on_demand_callgraph_for_inspect(ctx, &snapshot.config);
     let routed_store = if tier2_enabled && ctx.checkout_query_runtime_active() {
         ctx.callgraph_store_for_ops()
     } else {
@@ -904,6 +905,19 @@ fn handle_inspect_payload(
     Response::success(&req.id, payload)
 }
 
+/// A linked worktree builds its call graph when a query first needs it, and
+/// the Tier-2 categories (dead code and the like) need it. Route one call-graph
+/// access so the main checkout's graph answers or that build starts; the
+/// scans themselves still read the published view.
+fn start_on_demand_callgraph_for_inspect(ctx: &AppContext, config: &crate::config::Config) {
+    let tier2_enabled = InspectCategory::active()
+        .iter()
+        .any(|category| category.is_tier2() && config.inspect.category_enabled(*category));
+    if tier2_enabled && ctx.callgraph_build_on_demand() {
+        let _ = ctx.callgraph_store_for_query_without_wait();
+    }
+}
+
 fn append_inspect_runtime_notes(payload: &mut Value, runtime_notes: &[String]) {
     if !runtime_notes.is_empty() {
         let rendered_notes = collapse_runtime_notes(runtime_notes);
@@ -1077,6 +1091,9 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         session_id: req.session_id.clone(),
         params: req.params.clone(),
     };
+    // The body below runs on a detached thread, where an on-demand call-graph
+    // build could not be started without publishing inline. Start it here.
+    start_on_demand_callgraph_for_inspect(&ctx, &snapshot.config);
     let completion_request_id = request_id.clone();
     let shutdown_log = phase_log.clone();
     let cancellation = crate::executor::current_job_cancellation()

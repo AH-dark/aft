@@ -7586,6 +7586,14 @@ fn open_view_runtime_for_configure(
     // Schedule a replacement before the warm reader rejects the old output.
     let callgraph_unready = input.callgraph
         && generation.as_deref().is_some_and(|generation| {
+            // A linked worktree publishes without a derived graph until a query
+            // needs one. Its absence is expected, and republishing would not
+            // build one.
+            if input.defer_callgraph
+                && !crate::views::read::derived_built(view.view_dir(), generation)
+            {
+                return false;
+            }
             match crate::callgraph_store::manifest_view_database_ready(
                 view.view_dir(), generation, Instant::now() + crate::db::TOOL_RETRY_BUSY_WAIT,
             ) {
@@ -7703,6 +7711,9 @@ struct ConfigureViewInput {
     family: String,
     git_common_dir: Option<PathBuf>,
     callgraph: bool,
+    /// A linked worktree that has not needed its call graph yet; see
+    /// `AppContext::defer_callgraph_build`.
+    defer_callgraph: bool,
     read_only: bool,
     semantic: SemanticBackendConfig,
     limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
@@ -7714,6 +7725,7 @@ impl ConfigureViewInput {
             family: ctx.memoized_artifact_cache_key(&job.canonical_cache_root),
             git_common_dir: ctx.git_common_dir(),
             callgraph: ctx.config().indexes.callgraph,
+            defer_callgraph: ctx.defer_callgraph_build(),
             read_only: ctx.shared_artifacts_read_only(),
             semantic: ctx.config().semantic.clone(),
             limiter: ctx.cold_build_limiter(),
@@ -9154,6 +9166,436 @@ mod tests {
             let answer = crate::commands::callers::handle_callers(&request, &borrower);
             assert!(answer.success, "{}", answer.data);
         }
+    }
+
+    /// `lib.rs` of the on-demand call-graph fixtures: one caller, one callee
+    /// and one function nothing calls, so callers, impact and dead code all
+    /// have something to report.
+    const LAZY_LIB: &str = "pub fn caller() { target(); }\npub fn target() {}\nfn unused() {}\n";
+
+    struct LazyWorktree {
+        _temp: tempfile::TempDir,
+        main: PathBuf,
+        linked: PathBuf,
+        storage: PathBuf,
+        owner: Arc<AppContext>,
+        borrower: Arc<AppContext>,
+    }
+
+    fn lazy_bind(root: &Path, storage: &Path, session: &str) -> Arc<AppContext> {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        let params = json!({
+            "project_root": root, "storage_dir": storage, "harness": "opencode",
+            "config": [user_tier(json!({ "views": { "enabled": true },
+                "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
+        });
+        let response =
+            handle_configure_for_test(&configure_request_with_session(params, session), &ctx);
+        assert!(response.success, "{}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        ctx
+    }
+
+    /// A main checkout and one linked worktree at the same commit, both bound
+    /// with views on and their configure maintenance (including the first view
+    /// publication) drained.
+    fn lazy_worktree() -> LazyWorktree {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        fs::write(main.join("lib.rs"), LAZY_LIB).unwrap();
+        assert!(git_command(&main)
+            .args(["add", "lib.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git_command(&main)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "lib",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let main = main.canonicalize().unwrap();
+        let linked = temp.path().join("linked");
+        assert!(git_command(&main)
+            .args(["worktree", "add", "--detach", "--quiet"])
+            .arg(&linked)
+            .arg("HEAD")
+            .status()
+            .unwrap()
+            .success());
+        let linked = linked.canonicalize().unwrap();
+        let storage = temp.path().join("storage");
+        let owner = lazy_bind(&main, &storage, "lazy-owner");
+        let borrower = lazy_bind(&linked, &storage, "lazy-linked");
+        assert!(!owner.callgraph_build_on_demand());
+        assert!(borrower.callgraph_build_on_demand());
+        LazyWorktree {
+            _temp: temp,
+            main,
+            linked,
+            storage,
+            owner,
+            borrower,
+        }
+    }
+
+    fn lazy_view_dir(storage: &Path, root: &Path) -> PathBuf {
+        storage
+            .join("views")
+            .join(crate::path_identity::project_scope_key(root))
+    }
+
+    /// Derived call-graph files of a view: databases and ownership references.
+    fn lazy_derived_files(view_dir: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(view_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("derived-"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn lazy_ready(access: CallgraphStoreAccess) -> Arc<crate::callgraph_store::ReadonlyCallGraphStore> {
+        match access {
+            CallgraphStoreAccess::Ready(store) => store,
+            CallgraphStoreAccess::Building => panic!("call graph reported building"),
+            CallgraphStoreAccess::Error(error) => panic!("call graph unavailable: {error}"),
+            _ => panic!("call graph not ready"),
+        }
+    }
+
+    /// An independent cold build of `root`'s current files in fresh storage,
+    /// with no main checkout or sibling to seed from.
+    fn lazy_cold_store(
+        root: &Path,
+    ) -> (
+        tempfile::TempDir,
+        crate::callgraph_store::ReadonlyCallGraphStore,
+    ) {
+        let storage = tempfile::tempdir().unwrap();
+        let family = crate::search_index::artifact_cache_key(root);
+        let scope = crate::path_identity::project_scope_key(root);
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.path().to_path_buf(),
+                project_root: root.to_path_buf(),
+                family: family.clone(),
+                scope: scope.clone(),
+                desired_head: crate::views::assembly::head_tree_fingerprint(
+                    &crate::alias::head_tree_entries(root).unwrap(),
+                ),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        let store = crate::views::read::open_published_callgraph(
+            root.to_path_buf(),
+            family,
+            lazy_view_dir(storage.path(), root),
+            report.generation.as_deref().unwrap(),
+            None,
+        )
+        .unwrap();
+        (storage, store)
+    }
+
+    /// The answers callers, impact and dead code read from a store are the
+    /// same as from an independent cold build, including the absolute paths
+    /// the dead-code projection reports under the store's checkout root.
+    fn lazy_assert_same_graph(
+        store: &crate::callgraph_store::ReadonlyCallGraphStore,
+        cold: &crate::callgraph_store::ReadonlyCallGraphStore,
+    ) {
+        assert_eq!(store.project_root(), cold.project_root());
+        assert_eq!(store.edge_snapshot().unwrap(), cold.edge_snapshot().unwrap());
+        let lib = Path::new("lib.rs");
+        assert_eq!(
+            store.callers_of(lib, "target", 3).unwrap(),
+            cold.callers_of(lib, "target", 3).unwrap()
+        );
+        assert_eq!(
+            store.impact_of(lib, "target", 3).unwrap(),
+            cold.impact_of(lib, "target", 3).unwrap()
+        );
+        let dead_code = |store: &crate::callgraph_store::ReadonlyCallGraphStore| {
+            let (_, snapshot, _, _) =
+                crate::callgraph_store::project_dead_code_snapshot_from_view(store).unwrap();
+            format!(
+                "{:?}",
+                (
+                    snapshot.files,
+                    snapshot.exported_symbols,
+                    snapshot.outbound_calls,
+                    snapshot.entry_points,
+                    snapshot.entry_point_symbols
+                )
+            )
+        };
+        let projected = dead_code(store);
+        assert!(
+            projected.contains(&cold.project_root().join("lib.rs").display().to_string()),
+            "{projected}"
+        );
+        assert_eq!(projected, dead_code(cold));
+    }
+
+    /// Wait for the publication that builds the worktree's own graph.
+    fn lazy_wait_for_own_graph(ctx: &AppContext) {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let built = ctx
+                .view_runtime_snapshot()
+                .and_then(|view| {
+                    let generation = view.generation?;
+                    Some(crate::views::read::derived_built(&view.view_dir, &generation))
+                })
+                .unwrap_or(false);
+            if built && !crate::executor::view_publication::running_for(ctx) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the on-demand call-graph build did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Edit `lib.rs` in the worktree and deliver the change through the
+    /// watcher drain, without publishing it yet.
+    fn lazy_edit_through_watcher(fixture: &LazyWorktree, contents: &str) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        *fixture.borrower.watcher_rx().lock() = Some(rx);
+        let source = fixture.linked.join("lib.rs");
+        fs::write(&source, contents).unwrap();
+        tx.send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
+            source,
+        ]))
+        .unwrap();
+        let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.borrower, 1);
+        assert_eq!(outcome.processed, 1);
+    }
+
+    #[test]
+    fn linked_worktree_answers_from_main_graph_without_building_its_own() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree();
+        let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
+        let view = crate::views::ViewStore::open(
+            &fixture.storage,
+            &crate::path_identity::project_scope_key(&fixture.linked),
+        )
+        .unwrap();
+        assert!(
+            view.current_generation().unwrap().is_some(),
+            "the worktree's view is still published at bind"
+        );
+        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
+
+        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        assert!(
+            store
+                .sqlite_path()
+                .starts_with(lazy_view_dir(&fixture.storage, &fixture.main)),
+            "answered from {:?}, not the main checkout's graph",
+            store.sqlite_path()
+        );
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
+        // Tier-2 dead code projects from the same main-checkout reader.
+        let (inspect_store, _) = crate::inspect::current_view_projection_store_for_test(
+            &fixture.linked,
+            &fixture.borrower.config(),
+        )
+        .expect("inspect reads the main checkout's graph for the worktree");
+        lazy_assert_same_graph(&inspect_store, &cold);
+        let answer = crate::commands::callers::handle_callers(
+            &RawRequest {
+                id: "lazy-callers".into(),
+                command: "callers".into(),
+                session_id: Some("lazy-linked".into()),
+                lsp_hints: None,
+                params: json!({ "file": fixture.linked.join("lib.rs"), "symbol": "target" }),
+            },
+            &fixture.borrower,
+        );
+        assert!(answer.success, "{}", answer.data);
+        assert_eq!(answer.data["total_callers"], 1, "{}", answer.data);
+
+        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
+        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 0);
+    }
+
+    #[test]
+    fn linked_worktree_edit_reports_building_then_answers_from_its_own_graph() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree();
+        lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        lazy_edit_through_watcher(
+            &fixture,
+            "pub fn caller() { target(); }\npub fn edited_caller() { target(); }\npub fn target() {}\nfn unused() {}\n",
+        );
+
+        // The edit is not published yet, but main's graph no longer answers.
+        let access = {
+            let _scope =
+                crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
+            fixture.borrower.callgraph_store_for_ops()
+        };
+        assert!(matches!(access, CallgraphStoreAccess::Building));
+        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+        lazy_wait_for_own_graph(&fixture.borrower);
+
+        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        assert!(
+            store
+                .sqlite_path()
+                .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)),
+            "answered from {:?}, not the worktree's own graph",
+            store.sqlite_path()
+        );
+        let (_cold_storage, cold) = lazy_cold_store(&fixture.linked);
+        lazy_assert_same_graph(&store, &cold);
+        assert!(crate::callgraph_store::CallGraphRead::node_for(
+            store.as_ref(),
+            Path::new("lib.rs"),
+            "edited_caller"
+        )
+        .is_ok());
+        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+    }
+
+    #[test]
+    fn linked_worktree_that_never_queries_never_builds_a_call_graph() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree();
+        let view_dir = lazy_view_dir(&fixture.storage, &fixture.linked);
+        let view = crate::views::ViewStore::open(
+            &fixture.storage,
+            &crate::path_identity::project_scope_key(&fixture.linked),
+        )
+        .unwrap();
+        let first = view.current_generation().unwrap();
+        lazy_edit_through_watcher(
+            &fixture,
+            "pub fn caller() { target(); }\npub fn target() {}\nfn unused() { caller(); }\n",
+        );
+        let mut state = fixture
+            .borrower
+            .watcher_drain_slice()
+            .lock()
+            .take()
+            .unwrap();
+        state.view_publication_due = Some(Instant::now());
+        crate::runtime_drain::publish_view_if_quiet(&fixture.borrower, &mut state);
+        assert!(state.view_publication_due.is_none());
+        let edited = view.current_generation().unwrap();
+        assert!(edited.is_some() && edited != first, "the edit is published");
+        // Rebinding the unchanged worktree neither rebuilds nor republishes.
+        let rebound = handle_configure_for_test(
+            &configure_request_with_session(
+                json!({
+                    "project_root": fixture.linked, "storage_dir": fixture.storage,
+                    "harness": "opencode",
+                    "config": [user_tier(json!({ "views": { "enabled": true },
+                        "indexes": { "trigram": false, "semantic": false, "callgraph": true } }))]
+                }),
+                "lazy-linked-again",
+            ),
+            &fixture.borrower,
+        );
+        assert!(rebound.success, "{}", rebound.data);
+        super::drain_deferred_configure_maintenance(&fixture.borrower);
+        assert_eq!(view.current_generation().unwrap(), edited);
+
+        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
+        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 0);
+        // Generation cleanup has no derived database to remove and still works.
+        view.sweep_generations().unwrap();
+        assert!(!view.manifest_path(first.as_deref().unwrap()).unwrap().exists());
+        assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn main_checkout_still_builds_its_call_graph_at_bind() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree();
+        let view_dir = lazy_view_dir(&fixture.storage, &fixture.main);
+        let generation = crate::views::ViewStore::open(
+            &fixture.storage,
+            &crate::path_identity::project_scope_key(&fixture.main),
+        )
+        .unwrap()
+        .current_generation()
+        .unwrap()
+        .unwrap();
+        assert!(
+            crate::views::read::derived_built(&view_dir, &generation),
+            "the main checkout's graph is built at bind, before any query: {:?}",
+            lazy_derived_files(&view_dir)
+        );
+        assert_eq!(fixture.owner.lazy_callgraph_builds_scheduled_for_test(), 0);
+        let store = lazy_ready(fixture.owner.callgraph_store_for_ops());
+        assert!(store.sqlite_path().starts_with(&view_dir));
+    }
+
+    #[test]
+    fn concurrent_first_queries_start_one_call_graph_build() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let fixture = lazy_worktree();
+        // A change the watcher saw means main's graph cannot answer.
+        fixture.borrower.note_checkout_changed_for_callgraph();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let queries = (0..2)
+            .map(|_| {
+                let ctx = Arc::clone(&fixture.borrower);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let _scope = crate::executor::install_standalone_scope(Arc::clone(&ctx));
+                    barrier.wait();
+                    matches!(ctx.callgraph_store_for_ops(), CallgraphStoreAccess::Building)
+                })
+            })
+            .collect::<Vec<_>>();
+        for query in queries {
+            assert!(query.join().unwrap(), "a first query must report building");
+        }
+        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+        lazy_wait_for_own_graph(&fixture.borrower);
+        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+        let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
+        assert!(store
+            .sqlite_path()
+            .starts_with(lazy_view_dir(&fixture.storage, &fixture.linked)));
     }
 
     #[test]

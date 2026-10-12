@@ -869,7 +869,7 @@ impl ViewStore {
         closure: &impl PublicationClosure,
         observer: Option<&dyn PublicationObserver>,
     ) -> Result<PreparedPublication> {
-        self.prepare_inner(request, closure, observer, None)
+        self.prepare_inner(request, closure, observer, None, false)
     }
 
     pub(super) fn prepare_with_reused_derived(
@@ -878,7 +878,19 @@ impl ViewStore {
         closure: &impl PublicationClosure,
         previous: Option<&Manifest>,
     ) -> Result<PreparedPublication> {
-        self.prepare_inner(request, closure, None, previous)
+        self.prepare_inner(request, closure, None, previous, false)
+    }
+
+    /// Prepares a generation whose derived call-graph database has not been
+    /// built: a linked worktree builds it only when a query first needs it.
+    /// The generation has no derived file, so there is nothing to make durable;
+    /// readers find the file absent and report the graph as not built.
+    pub(super) fn prepare_with_deferred_derived(
+        &self,
+        request: &PublicationRequest<'_>,
+        closure: &impl PublicationClosure,
+    ) -> Result<PreparedPublication> {
+        self.prepare_inner(request, closure, None, None, true)
     }
 
     fn prepare_inner(
@@ -887,6 +899,7 @@ impl ViewStore {
         closure: &impl PublicationClosure,
         observer: Option<&dyn PublicationObserver>,
         reused: Option<&Manifest>,
+        derived_deferred: bool,
     ) -> Result<PreparedPublication> {
         validate_generation(request.generation)?;
         if request.manifest.path_identity_version != PATH_IDENTITY_VERSION {
@@ -916,7 +929,7 @@ impl ViewStore {
         // A semantic-only fill reuses the pinned base's derived database, which
         // is already durable; syncing it again would be the closure cost the fill
         // exists to avoid.
-        if reused.is_none() {
+        if reused.is_none() && !derived_deferred {
             sync_database_with_passive_checkpoint(&request.artifacts.derived_database, observer)?;
         }
         timing.phase("derived_durability");

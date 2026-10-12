@@ -186,6 +186,20 @@ pub fn prepare_checkout(
     request: &AssemblyRequest,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
+    prepare_checkout_deferring(request, false, phase)
+}
+
+/// Like [`prepare_checkout`], but with `defer_derived` a checkout that has
+/// no derived call-graph database yet publishes its manifest without building
+/// one. Callgraph keys and blobs are still recorded, so the manifest can be
+/// compared with another checkout's and the graph can be built later from it.
+/// Once the checkout has a derived database, publication keeps it current
+/// whatever `defer_derived` says.
+pub fn prepare_checkout_deferring(
+    request: &AssemblyRequest,
+    defer_derived: bool,
+    phase: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<PreparedAssembly> {
     publication_delay_for_test();
     let readiness_deadline = Instant::now() + crate::db::STEADY_BUSY_TIMEOUT;
     let mut timing = super::profile::PublicationTiming::new(&request.project_root);
@@ -207,10 +221,16 @@ pub fn prepare_checkout(
         .as_deref()
         .map(|generation| view.load_manifest(generation))
         .transpose()?;
+    // A generation published while its derived graph was deferred has no
+    // derived file. That is no base at all, not a base that failed a check.
+    let current_derived_built = current_generation
+        .as_deref()
+        .is_some_and(|generation| super::read::derived_built(view.view_dir(), generation));
     // A byte-identical manifest can still name incompatible build output after
     // an upgrade. Never no-op, reuse, or patch a graph its reader would refuse.
     let unusable_base = match current_generation
         .as_deref()
+        .filter(|_| current_derived_built)
         .map(|generation| {
             crate::callgraph_store::manifest_view_database_ready(
                 view.view_dir(),
@@ -240,7 +260,10 @@ pub fn prepare_checkout(
         }
         Err(error) => return Err(ViewError::InvalidManifest(error.to_string())),
     };
-    let base_ready = current_generation.is_some() && unusable_base.is_none();
+    let base_ready = current_derived_built && unusable_base.is_none();
+    // Defer only while no derived file exists. A file that exists, even one
+    // an older build left unreadable, means the checkout has used its graph.
+    let defer_derived = defer_derived && request.callgraph && !current_derived_built;
     timing.phase("previous_manifest");
     let head_started = Instant::now();
     let head = head_tree_entries(&request.project_root)
@@ -591,17 +614,22 @@ pub fn prepare_checkout(
         .as_deref()
         .is_some_and(|generation| super::generation_matches_head(generation, &request.desired_head))
         && previous.as_ref() == Some(&manifest)
-        && base_ready
+        && (base_ready || defer_derived)
     {
         prepared.profile.outcome = "no_op";
-        prepared.profile.seed_source = "own";
+        prepared.profile.seed_source = if base_ready { "own" } else { "deferred" };
         prepared.profile.cold_build_reason = "none";
         prepared.report.manifest = None;
         prepared.report.blob_puts = blob_puts;
         return Ok(prepared);
     }
     prepared.profile.enter(2, phase)?;
-    let reused_derived = base_ready
+    if defer_derived {
+        prepared.profile.seed_source = "deferred";
+        prepared.profile.cold_build_reason = "none";
+    }
+    let reused_derived = !defer_derived
+        && base_ready
         && previous.as_ref().is_some_and(|base| {
             super::materialization::manifest_callgraph_equivalent(base, &manifest)
         })
@@ -618,7 +646,7 @@ pub fn prepare_checkout(
     }
     prepared.profile.io.enter(super::io::Phase::Clone);
     let derived = view.derived_path(&next_generation)?;
-    if !reused_derived {
+    if !reused_derived && !defer_derived {
         let clone_started = Instant::now();
         let mut cold_build = unusable_base;
         let base = match current_generation.as_deref() {
@@ -800,21 +828,26 @@ pub fn prepare_checkout(
     };
     prepared.profile.io.enter(super::io::Phase::Closure);
     let closure_started = Instant::now();
-    let publication = view.prepare_with_reused_derived(
-        &PublicationRequest {
-            generation: &next_generation,
-            base_generation: current_generation.as_deref(),
-            manifest: &manifest,
-            artifacts,
-            closure_requirements: ClosureRequirements::default(),
-        },
-        &closure,
-        if reused_derived {
-            previous.as_ref()
-        } else {
-            None
-        },
-    )?;
+    let publication_request = PublicationRequest {
+        generation: &next_generation,
+        base_generation: current_generation.as_deref(),
+        manifest: &manifest,
+        artifacts,
+        closure_requirements: ClosureRequirements::default(),
+    };
+    let publication = if defer_derived {
+        view.prepare_with_deferred_derived(&publication_request, &closure)?
+    } else {
+        view.prepare_with_reused_derived(
+            &publication_request,
+            &closure,
+            if reused_derived {
+                previous.as_ref()
+            } else {
+                None
+            },
+        )?
+    };
     prepared.profile.closure_ms = closure_started.elapsed().as_millis();
     prepared.profile.derived_bytes = fs::metadata(&derived)
         .map(|metadata| metadata.len())
@@ -1702,7 +1735,7 @@ mod semantic_fill_tests;
 mod cold_fallback_tests;
 
 #[path = "assembly_seed.rs"]
-mod worker_seed;
+pub(super) mod worker_seed;
 
 #[cfg(test)]
 #[path = "worker_seed_tests.rs"]

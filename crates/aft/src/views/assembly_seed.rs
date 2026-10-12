@@ -94,7 +94,8 @@ pub(super) fn sibling_checkout_seed(
     Ok(None)
 }
 
-fn worktree_roots(root: &Path) -> Option<Vec<PathBuf>> {
+/// Every worktree of the repository `root` belongs to, main worktree first.
+pub(in crate::views) fn worktree_roots(root: &Path) -> Option<Vec<PathBuf>> {
     let child = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)

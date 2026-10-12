@@ -3171,6 +3171,26 @@ struct WatcherRuntimeIdentity {
     thread_id: Option<std::thread::ThreadId>,
 }
 
+/// A linked worktree builds its call graph on first use, not when it binds.
+///
+/// Until a query needs the graph, the worktree publishes view generations
+/// without a derived call-graph database. While its published files match the
+/// main checkout's, queries read main's published graph instead. The first
+/// query that main's graph cannot answer sets `demanded`; from then on every
+/// publication builds the worktree's own graph and keeps it current.
+#[derive(Default)]
+struct LazyCallgraph {
+    /// A query needed this worktree's own graph.
+    demanded: AtomicBool,
+    /// Serializes "is a publication queued or running? if not, start one"
+    /// across query threads, so concurrent first queries start one build.
+    schedule: parking_lot::Mutex<()>,
+    /// Which source last answered a query, logged only when it changes.
+    source: parking_lot::Mutex<Option<&'static str>>,
+    #[cfg(test)]
+    builds_scheduled: AtomicUsize,
+}
+
 /// Shared application context threaded through all command handlers.
 ///
 /// Holds the language provider, backup/checkpoint stores, and configuration.
@@ -3242,6 +3262,7 @@ pub struct AppContext {
     view_runtime: RwLock<Option<ViewRuntimeState>>,
     view_publication_retry: parking_lot::Mutex<crate::executor::view_publication::PublicationRetry>,
     deleted_view_root_retired: AtomicBool,
+    lazy_callgraph: LazyCallgraph,
     #[cfg(test)]
     view_publication_attempts: AtomicUsize,
     checkout_driver: crate::views::first_load::InstalledDriver,
@@ -3956,6 +3977,7 @@ impl AppContext {
             view_runtime: RwLock::new(None),
             view_publication_retry: parking_lot::Mutex::new(Default::default()),
             deleted_view_root_retired: AtomicBool::new(false),
+            lazy_callgraph: LazyCallgraph::default(),
             #[cfg(test)]
             view_publication_attempts: AtomicUsize::new(0),
             checkout_driver: crate::views::first_load::InstalledDriver::default(),
@@ -7214,7 +7236,7 @@ impl AppContext {
             } else {
                 (BTreeMap::new(), None)
             };
-        let assembly = crate::views::assembly::prepare_checkout(
+        let assembly = crate::views::assembly::prepare_checkout_deferring(
             &crate::views::assembly::AssemblyRequest {
                 storage: snapshot.storage.clone(),
                 project_root: root,
@@ -7232,6 +7254,9 @@ impl AppContext {
                 // Nothing reads a view's call graph while the index is off.
                 callgraph: self.config().indexes.callgraph,
             },
+            // A linked worktree leaves its derived call graph unbuilt until a
+            // query needs it; see `LazyCallgraph`.
+            self.defer_callgraph_build(),
             phase,
         )
         .map_err(|error| error.to_string())?;
@@ -7869,11 +7894,14 @@ impl AppContext {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
-        self.callgraph_store_for_ops_with_wait(if active {
-            crate::views::contracts::CALLGRAPH_QUERY_WAIT
-        } else {
-            self.callgraph_build_wait_window()
-        })
+        self.callgraph_store_for_ops_with_wait(
+            if active {
+                crate::views::contracts::CALLGRAPH_QUERY_WAIT
+            } else {
+                self.callgraph_build_wait_window()
+            },
+            true,
+        )
     }
 
     /// Warm the callgraph store from the transport loop without the query-op wait.
@@ -7883,11 +7911,174 @@ impl AppContext {
     /// index initialization run on the loop that reads stdin; waiting there would
     /// delay EOF handling until the build or wait window finishes, leaving the
     /// process alive after the client closes the pipe.
+    ///
+    /// A warm is not a use of the graph: it never starts a linked worktree's
+    /// on-demand build (see `LazyCallgraph`).
     pub(crate) fn schedule_callgraph_store_warm(&self) -> CallgraphStoreAccess {
-        self.callgraph_store_for_ops_with_wait(Duration::ZERO)
+        self.callgraph_store_for_ops_with_wait(Duration::ZERO, false)
     }
 
-    fn callgraph_store_for_ops_with_wait(&self, wait: Duration) -> CallgraphStoreAccess {
+    /// The store for a reader that needs the graph now but must not wait for
+    /// it, such as zoom's call-graph annotations or inspect's Tier-2 scans. Unlike
+    /// a warm, this is a use of the graph and starts a linked worktree's
+    /// on-demand build when main's graph cannot answer.
+    pub(crate) fn callgraph_store_for_query_without_wait(&self) -> CallgraphStoreAccess {
+        self.callgraph_store_for_ops_with_wait(Duration::ZERO, true)
+    }
+
+    /// True when this root builds its call graph only on first use: a linked
+    /// worktree, as git reported it at configure, with views on. Main
+    /// checkouts keep building eagerly, and so does a root whose topology
+    /// probe failed: it is only presumed to be a worktree and has no known
+    /// main checkout whose graph could answer for it.
+    pub(crate) fn callgraph_build_on_demand(&self) -> bool {
+        let config = self.config();
+        self.is_worktree_bridge()
+            && self.git_common_dir().is_some()
+            && config.views.enabled
+            && config.indexes.callgraph
+    }
+
+    /// Whether the next view publication may leave the derived call graph
+    /// unbuilt: an on-demand root that no query has needed the graph of yet.
+    pub(crate) fn defer_callgraph_build(&self) -> bool {
+        self.callgraph_build_on_demand() && !self.lazy_callgraph.demanded.load(Ordering::Acquire)
+    }
+
+    /// The watcher saw this checkout change (an edit, commit, checkout or a
+    /// lost-event rescan). From now on the main checkout's graph no longer
+    /// answers for it, even before the change is published.
+    pub(crate) fn note_checkout_changed_for_callgraph(&self) {
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::views::read::note_checkout_diverged(&root);
+        }
+    }
+
+    /// A query needed this worktree's own graph and the current view
+    /// generation has none: a publication must still build it.
+    pub(crate) fn lazy_callgraph_build_outstanding(&self) -> bool {
+        if !self.callgraph_build_on_demand() || !self.lazy_callgraph.demanded.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let Some(view) = self.view_runtime_snapshot() else {
+            return false;
+        };
+        view.generation.as_deref().is_none_or(|generation| {
+            !crate::views::read::derived_built(&view.view_dir, generation)
+        })
+    }
+
+    /// Record that a query needs this worktree's own graph and start the
+    /// publication that builds it. Later publications build it too.
+    fn request_callgraph_build(&self) {
+        self.lazy_callgraph.demanded.store(true, Ordering::Release);
+        self.schedule_lazy_callgraph_build();
+    }
+
+    /// Start one view publication to build an outstanding on-demand graph,
+    /// through the ordinary publication scheduler and its cold-build limiter.
+    /// Does nothing while a publication for this root is queued or running:
+    /// one that started before the demand was recorded rebuilds when it
+    /// finishes. Off an actor or standalone scope `schedule` would publish
+    /// inline and hold the querying thread for the whole build, so such a
+    /// caller leaves the build to the next scoped query or maintenance drain.
+    pub(crate) fn schedule_lazy_callgraph_build(&self) {
+        if !self.lazy_callgraph_build_outstanding()
+            || !crate::executor::view_publication::detaches_for(self)
+        {
+            return;
+        }
+        let _serial = self.lazy_callgraph.schedule.lock();
+        if crate::executor::view_publication::running_for(self) {
+            return;
+        }
+        #[cfg(test)]
+        self.lazy_callgraph
+            .builds_scheduled
+            .fetch_add(1, Ordering::AcqRel);
+        let root = self.canonical_cache_root_opt().unwrap_or_default();
+        crate::slog_info!(
+            "callgraph on-demand build scheduled root={}",
+            root.display()
+        );
+        if let Err(error) = crate::executor::view_publication::schedule(
+            self,
+            BTreeSet::new(),
+            !self.shared_artifacts_read_only(),
+        ) {
+            crate::slog_warn!(
+                "callgraph on-demand build failed to schedule root={}: {}",
+                root.display(),
+                error
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lazy_callgraph_builds_scheduled_for_test(&self) -> usize {
+        self.lazy_callgraph.builds_scheduled.load(Ordering::Acquire)
+    }
+
+    /// Log which source answers this root's call-graph queries: the main
+    /// checkout's graph, the worktree's own graph, or a build in progress.
+    /// Logged when the source changes, not on every query.
+    fn note_callgraph_source(&self, source: &'static str) {
+        let mut last = self.lazy_callgraph.source.lock();
+        if *last != Some(source) {
+            *last = Some(source);
+            crate::slog_info!(
+                "callgraph queries answered by source={} root={}",
+                source,
+                self.canonical_cache_root_opt()
+                    .unwrap_or_default()
+                    .display()
+            );
+        }
+    }
+
+    /// An on-demand root whose view generation has no derived graph: answer
+    /// from the main checkout's graph while the published files match it,
+    /// otherwise report `Building` and (for a real query) start the build.
+    fn on_demand_callgraph_access(
+        &self,
+        view: &ViewRuntimeSnapshot,
+        project_root: &Path,
+        generation: &str,
+        demand: bool,
+    ) -> CallgraphStoreAccess {
+        let manifest = view.manifest.as_ref().expect("pinned manifest");
+        if crate::views::assembly::manifest_lacks_callgraph(manifest) {
+            return CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(
+                crate::views::read::CALLGRAPH_DISABLED.to_string(),
+            ));
+        }
+        // Once a query has needed the worktree's own graph, answer from it
+        // alone: main's graph never stands in for a build already under way.
+        if !self.lazy_callgraph.demanded.load(Ordering::Acquire) {
+            if let Some((store, _)) = crate::views::read::main_checkout_callgraph(
+                &view.storage,
+                project_root,
+                &view.family,
+                generation,
+                manifest,
+            ) {
+                self.note_callgraph_source("main_checkout_graph");
+                return CallgraphStoreAccess::Ready(Arc::new(store));
+            }
+        }
+        if demand {
+            self.request_callgraph_build();
+            self.note_callgraph_source("building");
+        }
+        CallgraphStoreAccess::Building
+    }
+
+    fn callgraph_store_for_ops_with_wait(
+        &self,
+        wait: Duration,
+        demand: bool,
+    ) -> CallgraphStoreAccess {
         // HOME roots and unbound roots do no heavy work at all; configure
         // also forces the callgraph off there, so check this first to keep
         // reporting them as unavailable rather than configured off.
@@ -7918,6 +8109,17 @@ impl AppContext {
             };
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
+            let on_demand = self.callgraph_build_on_demand();
+            // An on-demand root that cannot yet compare its files with the
+            // main checkout's (its view is unpublished or being refreshed)
+            // builds rather than guesses.
+            let building = || {
+                if on_demand && demand {
+                    self.request_callgraph_build();
+                    self.note_callgraph_source("building");
+                }
+                CallgraphStoreAccess::Building
+            };
             if let Some(view) = self.pinned_view_runtime() {
                 if view.manifest.is_some() {
                     let Some(project_root) = self.callgraph_project_root() else {
@@ -7931,7 +8133,7 @@ impl AppContext {
                         .values()
                         .any(|input| input.plane == "checkout")
                     {
-                        return CallgraphStoreAccess::Building;
+                        return building();
                     }
                     if !crate::views::generation_matches_head(generation, &view.head_fingerprint) {
                         crate::slog_debug!(
@@ -7939,7 +8141,16 @@ impl AppContext {
                             project_root.display(),
                             generation
                         );
-                        return CallgraphStoreAccess::Building;
+                        return building();
+                    }
+                    if on_demand && !crate::views::read::derived_built(&view.view_dir, generation)
+                    {
+                        return self.on_demand_callgraph_access(
+                            &view,
+                            &project_root,
+                            generation,
+                            demand,
+                        );
                     }
                     return match crate::views::read::open_published_callgraph(
                         project_root,
@@ -7948,7 +8159,12 @@ impl AppContext {
                         generation,
                         view.query_pin,
                     ) {
-                        Ok(store) => CallgraphStoreAccess::Ready(Arc::new(store)),
+                        Ok(store) => {
+                            if on_demand {
+                                self.note_callgraph_source("own_graph");
+                            }
+                            CallgraphStoreAccess::Ready(Arc::new(store))
+                        }
                         Err(error) => CallgraphStoreAccess::Error(error),
                     };
                 }
@@ -7964,7 +8180,7 @@ impl AppContext {
                 || (self.daemonless_query_mode()
                     && (self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some()))
             {
-                return CallgraphStoreAccess::Building;
+                return building();
             }
         }
         let operation_generation = self.configure_generation();
@@ -14083,7 +14299,7 @@ mod callgraph_store_for_ops_tests {
         tx.send(ready).expect("queue Ready event");
         *ctx.callgraph_store_rx().lock() = Some(rx);
         assert!(matches!(
-            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(60)),
+            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(60), true),
             CallgraphStoreAccess::Building
         ));
         assert!(

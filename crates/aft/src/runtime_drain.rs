@@ -3085,6 +3085,18 @@ fn semantic_ready_view_publication_paths(
     pending.filter(|paths| !paths.is_empty())
 }
 
+/// Start a linked worktree's on-demand call-graph build that a query asked
+/// for but could not start itself (it ran outside the standalone scope).
+/// Standalone mode has no root actor, so the build detaches under the same
+/// standalone scope configure maintenance uses. Cheap when nothing is owed.
+pub fn drain_on_demand_callgraph_build(ctx: &Arc<AppContext>) {
+    if !ctx.lazy_callgraph_build_outstanding() {
+        return;
+    }
+    let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
+    ctx.schedule_lazy_callgraph_build();
+}
+
 pub(crate) fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
     if !ctx.config().views.enabled
         || !matches!(state.phase, WatcherDrainPhase::Collect)
@@ -3448,6 +3460,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             state.ignore_changed_paths.clear();
             state.ignore_changed_path_count = 0;
             if ctx.config().views.enabled {
+                // Lost events: the checkout may have changed in any way.
+                ctx.note_checkout_changed_for_callgraph();
                 ctx.reset_view_publication_retry();
                 state.view_publication_paths.clear();
                 state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
@@ -3476,6 +3490,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 state.ignore_changed_paths.clear();
                 state.ignore_changed_path_count = 0;
                 if ctx.config().views.enabled {
+                    // Changed ignore rules change which files the checkout has.
+                    ctx.note_checkout_changed_for_callgraph();
                     ctx.reset_view_publication_retry();
                     state.view_publication_paths.clear();
                     state.view_publication_due =
@@ -3512,6 +3528,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 };
                 paths.retain(|path| !git_head_paths.contains(path));
                 if ctx.config().views.enabled {
+                    // An edit or a HEAD move: the main checkout's call graph no
+                    // longer answers for a linked worktree, even before the
+                    // change is published.
+                    ctx.note_checkout_changed_for_callgraph();
                     ctx.reset_view_publication_retry();
                     state.view_publication_paths.extend(paths.iter().cloned());
                     state.view_publication_due =
