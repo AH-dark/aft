@@ -901,6 +901,7 @@ pub(crate) fn detach_bash_for_module_drain(
 }
 
 fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
+    let task_line = foreground_task_line(&snapshot);
     let (output, foreground_envelope) =
         if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {
             let trailer = crate::list_surfaces::bash::envelope_trailer(envelope);
@@ -915,6 +916,7 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             // timeout diagnostics still render before the final canonical trailer.
             foreground_snapshot.output_truncated = false;
             let mut output = format_foreground_result(&foreground_snapshot);
+            push_line(&mut output, &task_line);
             // Formatting may add exit diagnostics, which are not command output lines.
             if !output.is_empty() && !output.ends_with('\n') {
                 output.push('\n');
@@ -922,7 +924,9 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             output.push_str(&trailer);
             (output, Some(envelope.clone()))
         } else {
-            (format_foreground_result(&snapshot), None)
+            let mut output = format_foreground_result(&snapshot);
+            push_line(&mut output, &task_line);
+            (output, None)
         };
     if let Some(refusal) = &snapshot.remote_refusal {
         return Response::error_with_data(
@@ -974,7 +978,49 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             .expect("foreground bash data is an object"),
         &foreground_envelope,
     );
+    if let Some(job_id) = &snapshot.remote_job_id {
+        data["remote_job_id"] = json!(job_id);
+    }
     Response::success(request_id, data)
+}
+
+/// The line naming the task (and its build-server job, for a `runon` task) at
+/// the end of a reply for a command that finished within the call, so the
+/// caller can still find the task with bash_status. It follows the bracketed
+/// diagnostics `format_foreground_result` adds, and comes before any
+/// list-envelope trailer, which must stay last.
+pub(crate) fn foreground_task_line(snapshot: &BgTaskSnapshot) -> String {
+    match &snapshot.remote_job_id {
+        Some(job_id) => format!("[task {} (job {job_id})]", snapshot.info.task_id),
+        None => format!("[task {}]", snapshot.info.task_id),
+    }
+}
+
+/// True for a line [`foreground_task_line`] writes: `[task <id>]` or
+/// `[task <id> (job <job>)]`. It is AFT's annotation, not command output, so
+/// output line counts and the repeat breaker's output hash leave it out.
+pub(crate) fn is_foreground_task_line(line: &str) -> bool {
+    let Some(inner) = line
+        .strip_prefix("[task ")
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let (id, rest) = inner.split_once(' ').unwrap_or((inner, ""));
+    !id.is_empty()
+        && (rest.is_empty()
+            || rest
+                .strip_prefix("(job ")
+                .and_then(|job| job.strip_suffix(')'))
+                .is_some_and(|job| !job.is_empty() && !job.contains(' ')))
+}
+
+/// Appends `line` to `output` on a line of its own.
+fn push_line(output: &mut String, line: &str) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(line);
 }
 
 fn background_launch_response(
@@ -1134,6 +1180,7 @@ mod tests {
             kill_reached: 0,
             hard_kill: None,
             elapsed_ms: None,
+            remote_job_id: None,
         }
     }
 
@@ -1219,6 +1266,26 @@ mod tests {
     }
 
     #[test]
+    fn inline_completion_names_its_task_and_remote_job() {
+        let local = snapshot("hello\n", false, None, BgTaskStatus::Completed, Some(0));
+        let response = foreground_result_response("local", local);
+        assert_eq!(response.data["output"], "hello\n[task bash-test]");
+        assert!(response.data.get("remote_job_id").is_none(), "{response:?}");
+
+        let mut failed = snapshot("boom", false, None, BgTaskStatus::Failed, Some(2));
+        failed.remote_job_id = Some("0192a64a-1234-7000-8000-000000000001".into());
+        let response = foreground_result_response("remote", failed);
+        assert_eq!(
+            response.data["output"],
+            "boom\n[exit code: 2]\n[task bash-test (job 0192a64a-1234-7000-8000-000000000001)]"
+        );
+        assert_eq!(
+            response.data["remote_job_id"],
+            "0192a64a-1234-7000-8000-000000000001"
+        );
+    }
+
+    #[test]
     fn decide_bash_step_returns_done_for_terminal_snapshot_even_at_deadline() {
         let snapshot = snapshot("done", false, None, BgTaskStatus::Completed, Some(0));
         let now = Instant::now();
@@ -1228,7 +1295,7 @@ mod tests {
                 assert_eq!(response.id, "req-terminal");
                 assert!(response.success);
                 assert_eq!(response.data["status"], json!("completed"));
-                assert_eq!(response.data["output"], json!("done"));
+                assert_eq!(response.data["output"], json!("done\n[task bash-test]"));
             }
             BashStep::Promote => panic!("terminal snapshot should not promote"),
             BashStep::Wait => panic!("terminal snapshot should not wait"),

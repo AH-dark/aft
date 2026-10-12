@@ -426,6 +426,10 @@ pub struct BgTaskSnapshot {
     /// set once it ends).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+    /// The build server's job ID for a remote (`runon`) task, once the
+    /// runner has accepted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -9670,6 +9674,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
     let hard_kill =
         HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
     let remote_refusal = remote::remote_refusal(&metadata);
+    let remote_job_id = remote_job_id(&metadata);
     BgTaskSnapshot {
         info: BgTaskInfo {
             task_id: metadata.task_id,
@@ -9704,7 +9709,18 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         kill_reached: 0,
         hard_kill,
         elapsed_ms: None,
+        remote_job_id,
     }
+}
+
+/// A remote task's job ID as text; `None` for a local task or a remote one
+/// the runner has not accepted yet.
+fn remote_job_id(metadata: &PersistedTask) -> Option<String> {
+    metadata
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.job_id)
+        .map(|job_id| job_id.to_string())
 }
 
 impl BgTask {
@@ -9816,6 +9832,7 @@ impl BgTask {
             },
             elapsed_ms: (!metadata.status.is_terminal())
                 .then(|| self.elapsed_for_metadata(metadata).as_millis() as u64),
+            remote_job_id: remote_job_id(metadata),
         }
     }
 

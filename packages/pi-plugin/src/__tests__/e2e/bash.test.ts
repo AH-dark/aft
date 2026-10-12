@@ -205,7 +205,8 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const result = await callBash(bash, h, { command: "echo hello" });
 
-    expect(result.output).toBe("hello\n");
+    // The line after the output names the finished task.
+    expect(result.output).toMatch(/^hello\n\[task bash-[0-9a-f]+\]$/);
     expect(result.details.exit_code).toBe(0);
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
     expect(bridgeCalls[0].params).toMatchObject({
@@ -222,7 +223,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
       compressed: false,
     });
 
-    expect(result.output).toBe("line1\nline2\nline3\n");
+    expect(result.output).toMatch(/^line1\nline2\nline3\n\[task bash-[0-9a-f]+\]$/);
     expect(result.output).not.toContain("\r");
     expect(result.details.exit_code).toBe(0);
   });
@@ -232,7 +233,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const result = await callBash(bash, h, { command: "false" });
 
-    expect(result.output).toBe("\n[exit code: 1]");
+    expect(result.output).toMatch(/^\n\[exit code: 1\]\n\[task bash-[0-9a-f]+\]$/);
     expect(result.details.exit_code).toBe(1);
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
   });
@@ -290,7 +291,9 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
 
     const result = await callBash(bash, h, { command: "pwd", workdir: subdir });
 
-    expect(result.output.trim()).toBe(await realpath(subdir));
+    const [cwd, taskLine] = result.output.trim().split("\n");
+    expect(cwd).toBe(await realpath(subdir));
+    expect(taskLine).toMatch(/^\[task bash-[0-9a-f]+\]$/);
     expect(result.details.exit_code).toBe(0);
   });
 

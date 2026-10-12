@@ -847,7 +847,11 @@ fn real_foreground_transports_attach_compressor_counts() {
         .to_string(),
     );
     assert_eq!(short["success"], true, "short foreground failed: {short:?}");
-    assert_eq!(short["output"], "alpha\nbeta\n");
+    // The output, then the line naming the finished task.
+    assert_eq!(
+        short["output"],
+        format!("alpha\nbeta\n[task {}]", short["task_id"].as_str().unwrap())
+    );
     assert!(short.get(WIRE_KEY).is_none());
     assert!(!short["output"]
         .as_str()
@@ -867,8 +871,9 @@ fn real_foreground_transports_attach_compressor_counts() {
         Some(LIST_ID),
         true,
     );
-    assert_eq!(short_subc, "alpha\nbeta\n");
-    assert_eq!(short_ndjson, "alpha\nbeta\n");
+    let short_expected = format!("alpha\nbeta\n[task {}]", short["task_id"].as_str().unwrap());
+    assert_eq!(short_subc, short_expected);
+    assert_eq!(short_ndjson, short_expected);
 
     assert!(aft.shutdown().success());
 }
@@ -965,8 +970,13 @@ fn real_gate_script_output_ends_with_verdict_then_trailer() {
     assert_eq!(reply["success"], true, "gate script failed: {reply:?}");
     assert_real_bash_envelope(&reply, "output", 283);
     let output = reply["output"].as_str().expect("gate output");
+    // The verdict is the last output line; only the line naming the task
+    // sits between it and the trailer.
     assert!(
-        output.ends_with("GATE PASSED: all phases green\nshown 10 of 283 lines (cap)"),
+        output.ends_with(&format!(
+            "GATE PASSED: all phases green\n[task {}]\nshown 10 of 283 lines (cap)",
+            reply["task_id"].as_str().unwrap()
+        )),
         "{output}"
     );
     assert!(aft.shutdown().success());
@@ -999,7 +1009,10 @@ fn real_ten_thousand_line_output_keeps_final_line_and_counts_shown_lines() {
         .count();
     assert_eq!(reply[WIRE_KEY]["shown"], numbered, "{output}");
     assert!(
-        output.ends_with(&format!("10000\nshown {numbered} of 10000 lines (cap)")),
+        output.ends_with(&format!(
+            "10000\n[task {}]\nshown {numbered} of 10000 lines (cap)",
+            reply["task_id"].as_str().unwrap()
+        )),
         "{output}"
     );
     assert!(aft.shutdown().success());

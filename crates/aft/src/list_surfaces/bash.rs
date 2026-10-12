@@ -29,7 +29,8 @@ pub const REASON_KIND: ReasonKind = ReasonKind::Selecting;
 pub const NARROW: &[&str] = &[];
 
 /// Count output lines, excluding recovery metadata, the omitted-lines marker a
-/// compressor puts where it cut, and the canonical cap trailer.
+/// compressor puts where it cut, the line naming a finished task, and the
+/// `shown N of M lines (cap)` trailer added when the output was cut.
 #[inline]
 pub fn count_output_lines(output: &str) -> usize {
     output
@@ -51,6 +52,7 @@ pub fn count_output_lines(output: &str) -> usize {
             });
             !recovery_marker
                 && !trailer
+                && !crate::commands::bash_orchestrate::is_foreground_task_line(line)
                 && !crate::compress::line_cut::is_omitted_lines_marker(line)
         })
         .count()

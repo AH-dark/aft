@@ -97,7 +97,14 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     let response = done.response_for_test();
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["exit_code"], 0, "{response:?}");
-    assert_eq!(response.data["output"], "v1-bash-proof", "{response:?}");
+    // A command that finishes within the call still names its task, so the
+    // caller can find it again with bash_status.
+    let task_id = response.data["task_id"].as_str().unwrap();
+    assert_eq!(
+        response.data["output"],
+        format!("v1-bash-proof\n[task {task_id}]"),
+        "{response:?}"
+    );
 }
 
 #[test]

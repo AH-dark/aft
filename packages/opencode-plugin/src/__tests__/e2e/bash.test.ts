@@ -201,7 +201,8 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     // Agent-visible output is bash text — NOT a JSON literal that the model
     // would have to JSON.parse before reading.
-    expect(eol(result.output)).toBe("hello\n");
+    // The line after the output names the finished task.
+    expect(eol(result.output)).toMatch(/^hello\n\[task bash-[0-9a-f]+\]$/);
     // Exit code, truncation, etc. land in metadata for the UI.
     expect(result.metadata.exit).toBe(0);
     expectNoClientPollOrPromote(bridgeCalls);
@@ -219,7 +220,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       compressed: false,
     });
 
-    expect(result.output).toBe("line1\nline2\nline3\n");
+    expect(result.output).toMatch(/^line1\nline2\nline3\n\[task bash-[0-9a-f]+\]$/);
     expect(result.output).not.toContain("\r");
     expect(result.metadata.exit).toBe(0);
   });
@@ -231,7 +232,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     // The agent must be able to detect command failure from the text itself,
     // because metadata is UI-only and not echoed back to the model.
-    expect(result.output).toBe("\n[exit code: 1]");
+    expect(result.output).toMatch(/^\n\[exit code: 1\]\n\[task bash-[0-9a-f]+\]$/);
     expect(result.metadata.exit).toBe(1);
     expectNoClientPollOrPromote(bridgeCalls);
   });
@@ -395,7 +396,9 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
 
     const result = await callPluginBash(bash, h, { command: "pwd", workdir: subdir });
 
-    expect(result.output.trim()).toBe(await realPath(subdir));
+    const [cwd, taskLine] = result.output.trim().split("\n");
+    expect(cwd).toBe(await realPath(subdir));
+    expect(taskLine).toMatch(/^\[task bash-[0-9a-f]+\]$/);
     expect(result.metadata.exit).toBe(0);
   });
 
@@ -645,7 +648,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(askInvoked).toBe(true);
     // CRLF-tolerant: PowerShell emits "allowed\r\n" on Windows. The permission
     // flow (ask invoked, command ran) is the contract — not the line ending.
-    expect(eol(result.output)).toBe("allowed\n");
+    expect(eol(result.output)).toMatch(/^allowed\n\[task bash-[0-9a-f]+\]$/);
     expect(result.metadata.exit).toBe(0);
   });
 

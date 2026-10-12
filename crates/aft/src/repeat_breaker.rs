@@ -215,8 +215,23 @@ fn hash_value(value: &impl Hash) -> u64 {
     hasher.finish()
 }
 
+/// Hash of a tool reply's text for telling identical results apart.
+///
+/// A bash command that finishes within its call ends its reply with a line
+/// naming its task (`[task bash-…]`, see `foreground_task_line`). Every call
+/// gets a new task ID, so that line is left out: otherwise two runs with the
+/// same output would never hash alike and the breaker would report the output
+/// as drifting.
 pub fn output_hash(rendered_text: &str) -> u64 {
-    hash_value(&rendered_text)
+    use crate::commands::bash_orchestrate::is_foreground_task_line;
+    if !rendered_text.split('\n').any(is_foreground_task_line) {
+        return hash_value(&rendered_text);
+    }
+    let kept: Vec<&str> = rendered_text
+        .split('\n')
+        .filter(|line| !is_foreground_task_line(line))
+        .collect();
+    hash_value(&kept.join("\n"))
 }
 
 pub fn semantic_key(tool: &str, input: &Value) -> String {
@@ -327,5 +342,22 @@ mod tests {
             start + Duration::from_secs(cadence_secs * 127),
         );
         assert_eq!(breaker.sessions.lock()[&current].calls.len(), 2);
+    }
+
+    #[test]
+    fn output_hash_ignores_the_task_line_of_a_finished_bash_call() {
+        assert_eq!(
+            output_hash("hello\n[task bash-0000000000000001]"),
+            output_hash("hello\n[task bash-0000000000000002]")
+        );
+        assert_eq!(
+            output_hash("hi\n[task bash-1 (job 0192a64a-1234-7000-8000-000000000001)]"),
+            output_hash("hi\n[task bash-2 (job 0192a64a-1234-7000-8000-000000000002)]")
+        );
+        assert_ne!(
+            output_hash("hello\n[task bash-1]"),
+            output_hash("goodbye\n[task bash-1]")
+        );
+        assert_ne!(output_hash("[task with spaces in it]"), output_hash(""));
     }
 }

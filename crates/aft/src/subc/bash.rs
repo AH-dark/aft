@@ -3953,7 +3953,14 @@ mod grant_path_tests {
                 .expect("deferred completion");
             let result = completion.result.expect("terminal bash result");
             assert!(result.response.success);
-            assert_eq!(result.text, "");
+            // No output: the reply is only the line naming the task.
+            assert_eq!(
+                result.text,
+                format!(
+                    "[task {}]",
+                    result.response.data["task_id"].as_str().unwrap()
+                )
+            );
             tokio::time::timeout(Duration::from_secs(60), poll_touch_rx.recv())
                 .await
                 .expect("poll touch deadline")
