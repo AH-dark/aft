@@ -20,9 +20,12 @@ impl FileReadCounts {
         let Some(roots) = self.roots.get() else {
             return;
         };
-        // Registered roots use comparison paths; apply the same spelling rules
-        // to reads, including Windows verbatim prefixes and dot components.
-        let path = crate::inspect::job::normalize_path(path);
+        // Registered roots are canonical comparison paths, so reads are resolved
+        // the same way: symlinked temp directories (/var on macOS) and short
+        // names (RUNNER~1 on Windows) otherwise never match. Counting is only
+        // enabled for registered fixture roots, so the extra lookup stays out
+        // of ordinary scans.
+        let path = crate::inspect::job::canonicalize_normalized(path);
         if let Ok(mut roots) = roots.lock() {
             for (root, counts) in roots.iter_mut() {
                 if path.starts_with(root) {
@@ -54,13 +57,15 @@ mod tests {
     #[test]
     fn registered_roots_count_equivalent_path_spellings_only() {
         let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("tracked");
+        // Spell reads from the canonical parent: the read paths don't exist, so
+        // they can only be compared lexically against the canonical root.
+        let base = crate::inspect::job::canonicalize_normalized(fixture.path());
+        let root = base.join("tracked");
         std::fs::create_dir(&root).unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(&root);
         let counts = FileReadCounts::new();
         counts.reset(root.clone());
-        counts.record(&fixture.path().join("spelling/../tracked/file.rs"));
-        counts.record(&fixture.path().join("untracked/file.rs"));
+        counts.record(&base.join("spelling/../tracked/file.rs"));
+        counts.record(&base.join("untracked/file.rs"));
         assert_eq!(counts.count(&root), 1);
     }
 
