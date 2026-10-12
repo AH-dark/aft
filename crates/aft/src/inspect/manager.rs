@@ -4846,7 +4846,9 @@ fn current_view_projection_store(
                 &generation,
                 &manifest,
             ) else {
-                note_checkout_view_refusal!("projection_not_built: root={project_root:?} generation={generation}");
+                note_checkout_view_refusal!(
+                    "projection_not_built: root={project_root:?} generation={generation}"
+                );
                 return Ok(None);
             };
             crate::slog_debug!(

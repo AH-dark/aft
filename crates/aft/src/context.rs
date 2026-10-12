@@ -3187,6 +3187,10 @@ struct LazyCallgraph {
     schedule: parking_lot::Mutex<()>,
     /// Which source last answered a query, logged only when it changes.
     source: parking_lot::Mutex<Option<&'static str>>,
+    /// Some thread has published for this context under a root actor or the
+    /// standalone scope, so a query outside one leaves the build to such a
+    /// caller instead of publishing inline.
+    publication_scoped: AtomicBool,
     #[cfg(test)]
     builds_scheduled: AtomicUsize,
 }
@@ -7957,16 +7961,17 @@ impl AppContext {
     /// A query needed this worktree's own graph and the current view
     /// generation has none: a publication must still build it.
     pub(crate) fn lazy_callgraph_build_outstanding(&self) -> bool {
-        if !self.callgraph_build_on_demand() || !self.lazy_callgraph.demanded.load(Ordering::Acquire)
+        if !self.callgraph_build_on_demand()
+            || !self.lazy_callgraph.demanded.load(Ordering::Acquire)
         {
             return false;
         }
         let Some(view) = self.view_runtime_snapshot() else {
             return false;
         };
-        view.generation.as_deref().is_none_or(|generation| {
-            !crate::views::read::derived_built(&view.view_dir, generation)
-        })
+        view.generation
+            .as_deref()
+            .is_none_or(|generation| !crate::views::read::derived_built(&view.view_dir, generation))
     }
 
     /// Record that a query needs this worktree's own graph and start the
@@ -7980,17 +7985,32 @@ impl AppContext {
     /// through the ordinary publication scheduler and its cold-build limiter.
     /// Does nothing while a publication for this root is queued or running:
     /// one that started before the demand was recorded rebuilds when it
-    /// finishes. Off an actor or standalone scope `schedule` would publish
-    /// inline and hold the querying thread for the whole build, so such a
-    /// caller leaves the build to the next scoped query or maintenance drain.
+    /// finishes.
+    ///
+    /// Under a root actor or the standalone scope the publication detaches.
+    /// Outside one, `schedule` publishes inline on the calling thread. That is
+    /// its contract for tests and one-shot tools that never install a scope,
+    /// so they build here. A context that has a scope elsewhere (a daemon
+    /// root, the standalone loop) and a standalone CLI query leave the build
+    /// to the next scoped query or maintenance drain rather than hold this
+    /// thread for the whole build.
     pub(crate) fn schedule_lazy_callgraph_build(&self) {
-        if !self.lazy_callgraph_build_outstanding()
-            || !crate::executor::view_publication::detaches_for(self)
+        if !self.lazy_callgraph_build_outstanding() {
+            return;
+        }
+        if !crate::executor::view_publication::detaches_for(self)
+            && (self
+                .lazy_callgraph
+                .publication_scoped
+                .load(Ordering::Acquire)
+                || self.daemonless_query_mode())
         {
             return;
         }
         let _serial = self.lazy_callgraph.schedule.lock();
-        if crate::executor::view_publication::running_for(self) {
+        if !self.lazy_callgraph_build_outstanding()
+            || crate::executor::view_publication::running_for(self)
+        {
             return;
         }
         #[cfg(test)]
@@ -8018,6 +8038,13 @@ impl AppContext {
     #[cfg(test)]
     pub(crate) fn lazy_callgraph_builds_scheduled_for_test(&self) -> usize {
         self.lazy_callgraph.builds_scheduled.load(Ordering::Acquire)
+    }
+
+    /// A root actor or the standalone scope now publishes for this context.
+    pub(crate) fn note_publication_scope(&self) {
+        self.lazy_callgraph
+            .publication_scoped
+            .store(true, Ordering::Release);
     }
 
     /// Log which source answers this root's call-graph queries: the main
@@ -8070,6 +8097,17 @@ impl AppContext {
         if demand {
             self.request_callgraph_build();
             self.note_callgraph_source("building");
+            // Outside any publication scope the build ran inline just now
+            // (tests and one-shot tools); answer from it.
+            if !self.lazy_callgraph_build_outstanding()
+                && self.view_runtime_snapshot().is_some_and(|view| {
+                    view.generation.as_deref().is_some_and(|generation| {
+                        crate::views::read::derived_built(&view.view_dir, generation)
+                    })
+                })
+            {
+                return self.callgraph_store_for_ops_with_wait(Duration::ZERO, false);
+            }
         }
         CallgraphStoreAccess::Building
     }
@@ -8143,8 +8181,7 @@ impl AppContext {
                         );
                         return building();
                     }
-                    if on_demand && !crate::views::read::derived_built(&view.view_dir, generation)
-                    {
+                    if on_demand && !crate::views::read::derived_built(&view.view_dir, generation) {
                         return self.on_demand_callgraph_access(
                             &view,
                             &project_root,
