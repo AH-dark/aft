@@ -3359,6 +3359,8 @@ pub struct AppContext {
     /// language-server applicability walk stores its result only while it
     /// still matches (see `refresh_project_applicability`).
     project_applicability_epoch: Arc<AtomicU64>,
+    /// The epoch of the last applicability walk that has finished.
+    project_applicability_settled: Arc<AtomicU64>,
     /// See `view_path_status_summary`.
     view_path_status_cache: parking_lot::Mutex<Option<PathStatusCache>>,
     /// At most one diagnostics collector may outlive its caller's budget.
@@ -4025,6 +4027,7 @@ impl AppContext {
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: Arc::new(parking_lot::Mutex::new(lsp_manager)),
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
+            project_applicability_settled: Arc::new(AtomicU64::new(0)),
             view_path_status_cache: parking_lot::Mutex::new(None),
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
@@ -6341,9 +6344,12 @@ impl AppContext {
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
         let Some(root) = config.project_root.clone() else {
+            self.project_applicability_settled
+                .fetch_max(epoch, Ordering::SeqCst);
             return;
         };
         let epochs = Arc::clone(&self.project_applicability_epoch);
+        let settled = Arc::clone(&self.project_applicability_settled);
         let manager = Arc::clone(&self.lsp_manager);
         let status_context = self
             .status_emitter
@@ -6354,6 +6360,15 @@ impl AppContext {
         let spawned = std::thread::Builder::new()
             .name("aft-lsp-applicability".to_string())
             .spawn(move || {
+                // Records that this walk is over however it ends, so a test
+                // can wait for it (see `wait_for_project_applicability`).
+                struct Settled(Arc<AtomicU64>, u64);
+                impl Drop for Settled {
+                    fn drop(&mut self) {
+                        self.0.fetch_max(self.1, Ordering::SeqCst);
+                    }
+                }
+                let _settled = Settled(settled, epoch);
                 let current = || epochs.load(Ordering::SeqCst) == epoch;
                 if root_changed {
                     // The previous root's servers say nothing about this one.
@@ -6383,7 +6398,28 @@ impl AppContext {
                 }
             });
         if let Err(error) = spawned {
+            self.project_applicability_settled
+                .fetch_max(epoch, Ordering::SeqCst);
             crate::slog_warn!("could not start the language-server applicability walk: {error}");
+        }
+    }
+
+    /// Waits, at most `timeout`, until the language-server applicability walk
+    /// started by the latest configuration publication has finished. Returns
+    /// whether it finished. For tests that read the status bar right after
+    /// configure.
+    #[doc(hidden)]
+    pub fn wait_for_project_applicability(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let latest = self.project_applicability_epoch.load(Ordering::SeqCst);
+            if self.project_applicability_settled.load(Ordering::SeqCst) >= latest {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 

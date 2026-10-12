@@ -59,6 +59,12 @@ fn configured_context(root: &Path) -> AppContext {
     let response = serde_json::to_value(handle_configure(&configure, &ctx))
         .expect("configure response serializes");
     assert_eq!(response["success"], true, "configure failed: {response:#}");
+    // Configure records which language servers apply on a background
+    // thread; the status bar reads diagnostics as pending until it has.
+    assert!(
+        ctx.wait_for_project_applicability(std::time::Duration::from_secs(30)),
+        "the language-server applicability walk did not finish"
+    );
     ctx
 }
 
