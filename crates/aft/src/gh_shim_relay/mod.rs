@@ -1,36 +1,35 @@
 //! Daemon-side relay for governed `gh` bot writes.
 //!
 //! The `gh` shim runs as an agent's child with no subc credentials, so it
-//! cannot mint an agent assertion or reach plexus itself: both require the
-//! attested `reserved:aft` principal that only this daemon holds. The shim
-//! instead sends its per-command ticket (see [`crate::gh_shim_ticket`]) and the
-//! unchanged governed request envelope to one of the management operations
-//! below. The daemon redeems the ticket to the session that spawned the
-//! command, mints an assertion for that session from prefrontal, calls plexus
-//! with it, and hands plexus's reply back unchanged.
+//! cannot reach plexus itself: that requires the attested `reserved:aft`
+//! principal that only this daemon holds. The shim instead sends its
+//! per-command ticket (see [`crate::gh_shim_ticket`]) and the unchanged
+//! governed request envelope to one of the management operations below. The
+//! daemon redeems the ticket to the session that spawned the command, calls
+//! plexus on that session's behalf, and hands plexus's reply back unchanged.
 //!
 //! The ticket is the only authority. A session or agent field in the body is
 //! never used to pick the speaker, and a missing or unknown ticket is refused
 //! before anything leaves the daemon.
 //!
-//! A bot write goes out on one of two paths:
+//! A bot write speaks for the agent named by the session's scope stamp. The
+//! session's tool route must have been bound under a daemon scope that lets
+//! providers act as the session's agent (see [`delegating_agent`]). The daemon
+//! then opens its plexus route under that same scope and sends the write with
+//! no assertion; plexus reads the agent from the stamp on that route and
+//! re-checks the scope before each write it sends. A session without such a
+//! stamp has no agent to speak as, so its bot write is refused here
+//! (`bot_write_requires_scope`) before anything leaves the daemon. The daemon
+//! never mints agent assertions.
 //!
-//! - **stamp**: the session's tool route was bound under a daemon scope that
-//!   lets providers act as the session's agent (see [`delegating_agent`]). The
-//!   daemon then opens its plexus route under that same scope and sends the
-//!   write without an assertion; plexus reads the agent from the scope stamp on
-//!   that route and re-checks the scope before each write it sends.
-//! - **assertion**: everything else. The daemon mints a signed assertion from
-//!   prefrontal and sends it with the write on an unscoped route.
-//!
-//! The stamp path needs a transport that can open a scoped route
+//! This needs a transport that can open a scoped route
 //! ([`RelayTransport::opens_scoped_routes`]). The production transport can:
 //! it opens the route with the subc client's scoped open, and never falls back
 //! to an unscoped route when that open is refused.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -38,16 +37,17 @@ use serde_json::{json, Value};
 /// Relay a governed bot write. Params: `{ticket, request_nonce, request}`.
 pub const BOT_REQUEST_OPERATION: &str = "gh_shim.bot_request";
 /// Relay plexus's repository-to-agent binding read for the shim's version
-/// check. Params: `{ticket, agent_id}`; the daemon derives plexus's handle
-/// connection id from the assertion it mints for that agent and session.
+/// check. Params: `{ticket}`; an `agent_id` the shim still sends is ignored,
+/// because the reply lists every repository's binding whichever agent asks.
 pub const BINDINGS_READ_OPERATION: &str = "gh_shim.bindings_read";
 
-pub(crate) const PREFRONTAL_MODULE_ID: &str = "prefrontal-core";
 pub(crate) const PLEXUS_MODULE_ID: &str = "plexus";
-const MINT_METHOD: &str = "agent.assertion_mint";
-/// A cached assertion is re-minted this long before its `exp`, so a token
-/// never expires between the cache check and plexus's verification.
-const TOKEN_REFRESH_MARGIN_SECS: u64 = 5 * 60;
+/// The handle connection named in `bindings.read`. Plexus uses the name only
+/// to check that the caller holds a live module grant on that connection, and
+/// answers with the same full binding list for any connection named.
+/// `reserved:aft` holds grants on every handle connection, so AFT names its
+/// own bot's connection.
+const BINDINGS_READ_CONNECTION_ID: &str = "github-handle-aft-alfonso";
 const RELAY_CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn is_relay_operation(operation: &str) -> bool {
@@ -150,7 +150,7 @@ impl RouteScopes {
     /// A ticket names a session, not a route, and a session can have more than
     /// one route bound at a time. When those routes carry different stamps, or
     /// one of them carries none, the relay cannot tell which route launched the
-    /// command, so this returns `None` and the write uses the assertion path,
+    /// command, so this returns `None` and the write is refused as unscoped,
     /// which is what an unstamped session gets.
     pub fn for_session(&self, session: &str) -> Option<&ScopeStamp> {
         let mut stamps = self
@@ -163,16 +163,9 @@ impl RouteScopes {
     }
 }
 
-/// The two outbound calls the relay makes. Production uses the daemon's own
+/// The outbound call the relay makes. Production uses the daemon's own
 /// `reserved:aft` subc connection; tests use fakes that record the bodies.
 pub trait RelayTransport: Send + Sync {
-    /// Send `body` to prefrontal-core and return the parsed JSON reply.
-    fn prefrontal(
-        &self,
-        project_root: &str,
-        session: &str,
-        body: Value,
-    ) -> impl std::future::Future<Output = Result<Value, TransportError>> + Send;
     /// Send `body` to plexus's tool provider and return the parsed JSON reply.
     /// With `scope`, the route to plexus must be opened under that scope, so
     /// plexus sees its stamp; without one the route is unscoped.
@@ -184,52 +177,9 @@ pub trait RelayTransport: Send + Sync {
         body: Value,
     ) -> impl std::future::Future<Output = Result<Value, TransportError>> + Send;
     /// Whether [`RelayTransport::plexus`] can open its route under a scope.
-    /// The stamp path is only taken when this is true: a write without an
-    /// assertion on an unscoped route would be refused by plexus.
+    /// A bot write is only sent when this is true: plexus refuses a write
+    /// without an assertion on an unscoped route.
     fn opens_scoped_routes(&self) -> bool;
-}
-
-#[derive(Clone, Debug)]
-struct CachedToken {
-    token: Value,
-    exp: u64,
-}
-
-/// Minted assertions kept in daemon memory, keyed by agent and session. The
-/// map is only touched briefly from the relay task, never from the subc frame
-/// loop.
-#[derive(Default)]
-pub struct TokenCache {
-    tokens: Mutex<HashMap<(String, String), CachedToken>>,
-}
-
-impl TokenCache {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), CachedToken>> {
-        self.tokens
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    fn fresh(&self, agent: &str, session: &str, now: u64) -> Option<Value> {
-        let mut tokens = self.lock();
-        tokens.retain(|_, cached| cached.exp > now);
-        tokens
-            .get(&(agent.to_string(), session.to_string()))
-            .filter(|cached| now.saturating_add(TOKEN_REFRESH_MARGIN_SECS) < cached.exp)
-            .map(|cached| cached.token.clone())
-    }
-
-    fn store(&self, agent: &str, session: &str, token: Value, exp: u64) {
-        self.lock().insert(
-            (agent.to_string(), session.to_string()),
-            CachedToken { token, exp },
-        );
-    }
-
-    fn drop_token(&self, agent: &str, session: &str) {
-        self.lock()
-            .remove(&(agent.to_string(), session.to_string()));
-    }
 }
 
 /// What the daemon sends back to the shim. `ok` replies carry plexus's reply
@@ -281,23 +231,21 @@ pub struct RelayCall<'a> {
     /// Whether the management route this arrived on belongs to a first-party
     /// principal. Anything else is refused even with a valid ticket.
     pub first_party: bool,
-    /// Current Unix time in seconds, for the token cache.
-    pub now: u64,
     /// Scope stamps of the daemon's bound tool routes when the request arrived.
     pub route_scopes: &'a RouteScopes,
 }
 
-/// Which path a bot write took, for the relay log line.
+/// How a call reached plexus, for the relay log line: under the session's
+/// scope stamp, or (for the binding read) on an unscoped route.
 const PATH_STAMP: &str = "stamp";
-const PATH_ASSERTION: &str = "assertion";
+const PATH_UNSCOPED: &str = "unscoped";
 
 /// Run one relay operation. `log` receives exactly one line per call carrying
 /// the redeemed session, task id, nonce, action, repository, the path the
-/// write took (`stamp` or `assertion`, `-` when refused before one was chosen)
-/// and the outcome; the ticket, the assertion and the scope never appear in it.
+/// call took (`stamp` or `unscoped`, `-` when refused before one was chosen)
+/// and the outcome; the ticket and the scope never appear in it.
 pub async fn relay<T: RelayTransport>(
     transport: &T,
-    cache: &TokenCache,
     call: RelayCall<'_>,
     log: &(dyn Fn(&str) + Send + Sync),
 ) -> RelayReply {
@@ -356,13 +304,12 @@ pub async fn relay<T: RelayTransport>(
         };
         match call.operation {
             BINDINGS_READ_OPERATION => {
-                path = PATH_ASSERTION;
-                bindings_read(transport, cache, &redeemed, params, call.now).await
+                path = PATH_UNSCOPED;
+                bindings_read(transport, &redeemed).await
             }
             _ => {
                 let stamp = call.route_scopes.for_session(&redeemed.session_id);
-                let (reply, taken) =
-                    bot_request(transport, cache, &redeemed, stamp, params, call.now).await;
+                let (reply, taken) = bot_request(transport, &redeemed, stamp, params).await;
                 path = taken;
                 reply
             }
@@ -383,94 +330,15 @@ pub async fn relay<T: RelayTransport>(
     reply
 }
 
-/// Obtain the assertion for this agent and session, minting one from
-/// prefrontal if none is cached or the cached one is near expiry.
-async fn obtain_token<T: RelayTransport>(
-    transport: &T,
-    cache: &TokenCache,
-    redeemed: &crate::gh_shim_ticket::Redeemed,
-    agent_id: &str,
-    now: u64,
-) -> Result<Value, RelayReply> {
-    let session = redeemed.session_id.as_str();
-    if let Some(token) = cache.fresh(agent_id, session, now) {
-        return Ok(token);
-    }
-    let body = json!({
-        "method": MINT_METHOD,
-        "params": {"agent_id": agent_id, "session": session},
-    });
-    let reply = transport
-        .prefrontal(&redeemed.project_root, session, body)
-        .await
-        .map_err(|error| transport_refusal("mint", error))?;
-    let Some(token) = reply
-        .get("result")
-        .and_then(|result| result.get("token"))
-        .filter(|token| token.is_object())
-        .cloned()
-    else {
-        return Err(RelayReply::refused(
-            "mint_reply_malformed",
-            "mint",
-            "prefrontal's assertion mint reply had no result.token",
-        ));
-    };
-    let exp = token
-        .get("claims")
-        .and_then(|claims| claims.get("exp"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    cache.store(agent_id, session, token.clone(), exp);
-    Ok(token)
-}
-
-/// Plexus names a GitHub handle connection after the App slug, the bot login
-/// without its `[bot]` suffix. The assertion prefrontal mints for the agent
-/// carries that login as `claims.handle`, so the connection id comes from it
-/// rather than from anything the shim sends.
-pub fn handle_connection_id(token: &Value) -> Result<String, String> {
-    let handle = token
-        .get("claims")
-        .and_then(|claims| claims.get("handle"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "the minted assertion carries no claims.handle".to_string())?;
-    let slug = handle
-        .strip_suffix("[bot]")
-        .filter(|slug| !slug.is_empty())
-        .ok_or_else(|| {
-            format!("the minted assertion's handle {handle:?} is not a GitHub App bot login (<slug>[bot])")
-        })?;
-    Ok(format!("github-handle-{slug}"))
-}
-
+/// Read plexus's repository-to-agent bindings for the shim's version check.
 async fn bindings_read<T: RelayTransport>(
     transport: &T,
-    cache: &TokenCache,
     redeemed: &crate::gh_shim_ticket::Redeemed,
-    params: &Value,
-    now: u64,
 ) -> RelayReply {
-    let Some(agent_id) = params
-        .get("agent_id")
-        .and_then(Value::as_str)
-        .filter(|agent| !agent.is_empty())
-    else {
-        return RelayReply::refused(
-            "request_malformed",
-            "request",
-            "bindings read needs an agent_id",
-        );
-    };
-    let token = match obtain_token(transport, cache, redeemed, agent_id, now).await {
-        Ok(token) => token,
-        Err(refusal) => return refusal,
-    };
-    let connection_id = match handle_connection_id(&token) {
-        Ok(connection_id) => connection_id,
-        Err(message) => return RelayReply::refused("assertion_handle_malformed", "mint", message),
-    };
-    let body = github_call(json!({"op": "bindings.read", "connection_id": connection_id}));
+    let body = github_call(json!({
+        "op": "bindings.read",
+        "connection_id": BINDINGS_READ_CONNECTION_ID,
+    }));
     match transport
         .plexus(&redeemed.project_root, &redeemed.session_id, None, body)
         .await
@@ -483,11 +351,9 @@ async fn bindings_read<T: RelayTransport>(
 /// Relay one bot write, returning plexus's reply and the path it took.
 async fn bot_request<T: RelayTransport>(
     transport: &T,
-    cache: &TokenCache,
     redeemed: &crate::gh_shim_ticket::Redeemed,
     stamp: Option<&ScopeStamp>,
     params: &Value,
-    now: u64,
 ) -> (RelayReply, &'static str) {
     let Some(nonce) = params
         .get("request_nonce")
@@ -506,8 +372,9 @@ async fn bot_request<T: RelayTransport>(
         );
     };
     // The agent is the one the shim's signed manifest binds to the target
-    // repository. It names whose bot to mint for; the session comes from the
-    // ticket alone, and plexus re-checks the agent against its own bindings.
+    // repository. It must match the agent the session's scope acts as; the
+    // session comes from the ticket alone, and plexus re-checks the agent
+    // against its own bindings.
     let Some(agent_id) = request
         .get("metadata")
         .and_then(|metadata| metadata.get("agent_id"))
@@ -525,81 +392,70 @@ async fn bot_request<T: RelayTransport>(
     };
     let session = redeemed.session_id.as_str();
 
-    // The stamp path: the session's scope lets plexus act as its agent, and
-    // the route to plexus can be opened under that scope so plexus sees it.
-    if let Some((stamp_agent, stamp)) = stamp
+    // The session's scope must let plexus act as its agent, and the route to
+    // plexus must be opened under that scope so plexus sees it. Otherwise the
+    // write has no agent to speak as, so it is refused with
+    // `bot_write_requires_scope`.
+    let Some((stamp_agent, stamp)) = stamp
         .filter(|_| transport.opens_scoped_routes())
         .and_then(|stamp| delegating_agent(stamp).map(|agent| (agent, stamp)))
-    {
-        // Plexus takes the agent from the stamp, so a request naming another
-        // agent would speak as the wrong bot. Plexus refuses the same mismatch
-        // under this code when a stamp and an assertion disagree.
-        if stamp_agent != agent_id {
-            return (
-                RelayReply::refused(
-                    "agent_identity_conflict",
-                    "scope",
-                    format!(
-                        "the session's scope acts as agent {stamp_agent}, but the request names agent {agent_id}"
-                    ),
-                ),
-                PATH_STAMP,
-            );
-        }
-        let selector = scope_selector(stamp);
-        let body = github_call(json!({
-            "op": "bot_request",
-            "request_nonce": nonce,
-            "request": request,
-        }));
-        // Every reply, refusals included (`scope_unverifiable`, `scope_ended`,
-        // `delegation_withdrawn`, `agent_identity_conflict`, with their
-        // `legs_sent`), goes back to the shim as plexus sent it. The write is
-        // never retried on the assertion path: plexus refused because of the
-        // scope, and an assertion would get the write past that decision.
-        let reply = match transport
-            .plexus(&redeemed.project_root, session, Some(&selector), body)
-            .await
-        {
-            Ok(reply) => RelayReply::relayed(reply),
-            Err(error) => transport_refusal("plexus", error),
-        };
-        return (reply, PATH_STAMP);
-    }
-
-    let token = match obtain_token(transport, cache, redeemed, agent_id, now).await {
-        Ok(token) => token,
-        Err(refusal) => return (refusal, PATH_ASSERTION),
+    else {
+        let mut refusal = RelayReply::refused(
+            "bot_write_requires_scope",
+            "scope",
+            "this session is not bound under its agent's scope, so it has no bot \
+             identity to speak as; bot comments need a scoped session. Restart the \
+             host session (it binds under its agent's scope when it starts), or ask \
+             the operator",
+        );
+        refusal.data["repository"] = request.get("repository").cloned().unwrap_or(Value::Null);
+        refusal.data["action"] = request
+            .get("action")
+            .or_else(|| request.get("verb"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        return (refusal, "-");
     };
+
+    // Plexus takes the agent from the stamp, so a request naming another
+    // agent would speak as the wrong bot. Refuse it with
+    // `agent_identity_conflict`, the code plexus uses for this mismatch.
+    if stamp_agent != agent_id {
+        return (
+            RelayReply::refused(
+                "agent_identity_conflict",
+                "scope",
+                format!(
+                    "the session's scope acts as agent {stamp_agent}, but the request names agent {agent_id}"
+                ),
+            ),
+            PATH_STAMP,
+        );
+    }
+    let selector = scope_selector(stamp);
     let body = github_call(json!({
         "op": "bot_request",
-        "assertion": token,
         "request_nonce": nonce,
         "request": request,
     }));
+    // Every reply, refusals included (`scope_unverifiable`, `scope_ended`,
+    // `delegation_withdrawn`, `agent_identity_conflict`, with their
+    // `legs_sent`), goes back to the shim as plexus sent it, and the write is
+    // never retried another way.
     let reply = match transport
-        .plexus(&redeemed.project_root, session, None, body)
+        .plexus(&redeemed.project_root, session, Some(&selector), body)
         .await
     {
-        Ok(reply) => {
-            // A refusal that names the assertion means the cached token is no
-            // longer good; the shim's retry must get a freshly minted one.
-            if facade_refusal_code(&facade_reply(&reply))
-                .is_some_and(|code| code.starts_with("assertion_"))
-            {
-                cache.drop_token(agent_id, session);
-            }
-            RelayReply::relayed(reply)
-        }
+        Ok(reply) => RelayReply::relayed(reply),
         Err(error) => transport_refusal("plexus", error),
     };
-    (reply, PATH_ASSERTION)
+    (reply, PATH_STAMP)
 }
 
 /// The body of AFT's call to plexus's `github` tool. AFT is the caller here:
 /// it is not relaying a tool call some other principal made, and the agent a
-/// write speaks for reaches plexus through the scope stamp or the minted
-/// assertion. So the request carries no `origin`, which keeps the body the
+/// write speaks for reaches plexus through the scope stamp. So the request
+/// carries no `origin`, which keeps the body the
 /// plain `{name, arguments}` shape plexus already reads.
 fn github_call(arguments: Value) -> Value {
     serde_json::to_value(subc_protocol::tool_call::ToolCallRequest {
@@ -632,16 +488,14 @@ fn transport_refusal(stage: &str, error: TransportError) -> RelayReply {
     }
 }
 
-/// The daemon's relay state: the token cache and the outbound transport.
+/// The daemon's relay state: the outbound transport.
 pub struct GhRelay {
-    pub cache: TokenCache,
     pub transport: SubcRelayTransport,
 }
 
 impl GhRelay {
     pub fn new(connection_file: PathBuf) -> Arc<Self> {
         Arc::new(Self {
-            cache: TokenCache::default(),
             transport: SubcRelayTransport::new(connection_file),
         })
     }
@@ -650,8 +504,7 @@ impl GhRelay {
 /// Route-open refusals of a scoped route that end the call at once. The subc
 /// client returns these four without retrying. Each goes back to the shim
 /// under its own code, the way plexus's own scope refusals do, and the write
-/// is never retried on the assertion path: the daemon refused because of the
-/// scope, and an assertion would get the write past that decision.
+/// is never retried another way.
 ///
 /// This is also how a scope the daemon closed stays closed. The daemon's
 /// `route.closed` notice does not say which route it closed, so the relay
@@ -793,7 +646,7 @@ struct CallFailure {
 /// With `scope`, the route is opened under that scope with the subc client's
 /// scoped open. A refused scoped open is returned as it is and never retried
 /// as an unscoped open: that would send the write without the stamp that
-/// stands in for its assertion.
+/// names its agent.
 async fn route_request(
     consumer: &subc_client_rs::SubcConsumer,
     leases: &RouteLeases,
@@ -1018,24 +871,6 @@ impl SubcRelayTransport {
 }
 
 impl RelayTransport for SubcRelayTransport {
-    async fn prefrontal(
-        &self,
-        project_root: &str,
-        session: &str,
-        body: Value,
-    ) -> Result<Value, TransportError> {
-        self.call(
-            subc_protocol::RouteTarget::ManagementSurface {
-                module_id: PREFRONTAL_MODULE_ID.to_string(),
-            },
-            project_root,
-            session,
-            None,
-            body,
-        )
-        .await
-    }
-
     async fn plexus(
         &self,
         project_root: &str,
@@ -1057,7 +892,7 @@ impl RelayTransport for SubcRelayTransport {
 
     /// True: the subc client opens a route to plexus under the session's scope
     /// (`SubcConsumer::open_route_scoped`, since subc-client-rs 0.23.2), so a
-    /// session whose scope delegates to its agent takes the stamp path.
+    /// session whose scope delegates to its agent can send bot writes.
     fn opens_scoped_routes(&self) -> bool {
         true
     }

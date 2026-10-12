@@ -8,19 +8,16 @@ use super::*;
 /// Which fake module a recorded call went to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
-    Prefrontal,
     Plexus,
 }
 
-/// Fake prefrontal and plexus. Every call's body is recorded; replies are
-/// scripted per target and default to a fresh token and a completed reply.
+/// Fake plexus. Every call's body is recorded; replies are scripted and
+/// default to a completed reply.
 /// `scoped` says whether this fake can open its plexus route under a scope.
 #[derive(Default)]
 struct FakeTransport {
     calls: Mutex<Vec<(Target, String, Value)>>,
-    prefrontal_replies: Mutex<VecDeque<Result<Value, TransportError>>>,
     plexus_replies: Mutex<VecDeque<Result<Value, TransportError>>>,
-    minted: Mutex<u64>,
     scoped: bool,
     plexus_scopes: Mutex<Vec<Option<ScopeSelector>>>,
 }
@@ -36,10 +33,6 @@ impl FakeTransport {
     /// The scope each plexus call's route was opened under, in call order.
     fn plexus_scopes(&self) -> Vec<Option<ScopeSelector>> {
         self.plexus_scopes.lock().unwrap().clone()
-    }
-
-    fn push_prefrontal(&self, reply: Result<Value, TransportError>) {
-        self.prefrontal_replies.lock().unwrap().push_back(reply);
     }
 
     fn push_plexus(&self, reply: Result<Value, TransportError>) {
@@ -58,36 +51,7 @@ impl FakeTransport {
     }
 }
 
-fn token_with_exp(serial: u64, exp: u64) -> Value {
-    json!({
-        "claims": {"agent_id": "agent-fixture", "exp": exp, "jti": format!("jti-{serial}"), "handle": "aft-alfonso[bot]"},
-        "signature_hex": format!("sig-secret-{serial}"),
-        "generation": 1,
-    })
-}
-
-const TOKEN_EXP: u64 = 1_700_014_400;
-const NOW: u64 = 1_700_000_000;
-
 impl RelayTransport for FakeTransport {
-    async fn prefrontal(
-        &self,
-        _project_root: &str,
-        session: &str,
-        body: Value,
-    ) -> Result<Value, TransportError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((Target::Prefrontal, session.to_string(), body));
-        let scripted = self.prefrontal_replies.lock().unwrap().pop_front();
-        scripted.unwrap_or_else(|| {
-            let mut minted = self.minted.lock().unwrap();
-            *minted += 1;
-            Ok(json!({"result": {"token": token_with_exp(*minted, TOKEN_EXP)}}))
-        })
-    }
-
     async fn plexus(
         &self,
         _project_root: &str,
@@ -126,29 +90,14 @@ fn envelope() -> Value {
     golden()["request"]["request"].clone()
 }
 
-fn run(
-    transport: &FakeTransport,
-    cache: &TokenCache,
-    operation: &str,
-    params: Value,
-    now: u64,
-) -> (RelayReply, Vec<String>) {
-    run_with_scopes(
-        transport,
-        cache,
-        operation,
-        params,
-        now,
-        &RouteScopes::default(),
-    )
+fn run(transport: &FakeTransport, operation: &str, params: Value) -> (RelayReply, Vec<String>) {
+    run_with_scopes(transport, operation, params, &RouteScopes::default())
 }
 
 fn run_with_scopes<T: RelayTransport>(
     transport: &T,
-    cache: &TokenCache,
     operation: &str,
     params: Value,
-    now: u64,
     route_scopes: &RouteScopes,
 ) -> (RelayReply, Vec<String>) {
     let lines = Mutex::new(Vec::new());
@@ -158,12 +107,10 @@ fn run_with_scopes<T: RelayTransport>(
         .unwrap();
     let reply = runtime.block_on(relay(
         transport,
-        cache,
         RelayCall {
             operation,
             params: &params,
             first_party: true,
-            now,
             route_scopes,
         },
         &|line| lines.lock().unwrap().push(line.to_string()),
@@ -186,19 +133,18 @@ fn fabricated_ticket_with_a_typed_head_session_is_refused_before_any_call() {
         "the head has a live ticket of its own"
     );
     let transport = FakeTransport::default();
-    let cache = TokenCache::default();
     let mut params = bot_params("0123456789abcdef0123456789abcdef", "nonce-fab");
     params["session"] = json!("ses-head");
     params["session_id"] = json!("ses-head");
     params["request"]["metadata"]["session"] = json!("ses-head");
-    let (reply, _) = run(&transport, &cache, BOT_REQUEST_OPERATION, params, NOW);
+    let (reply, _) = run(&transport, BOT_REQUEST_OPERATION, params);
     assert!(!reply.ok);
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
     assert!(transport.calls().is_empty(), "no mint and no plexus call");
 
     let mut absent = bot_params("", "nonce-absent");
     absent["session"] = json!("ses-head");
-    let (reply, _) = run(&transport, &cache, BOT_REQUEST_OPERATION, absent, NOW);
+    let (reply, _) = run(&transport, BOT_REQUEST_OPERATION, absent);
     assert_eq!(reply.data["refusal_code"], "ticket_absent");
     assert!(transport.calls().is_empty());
 }
@@ -208,23 +154,27 @@ fn fabricated_ticket_with_a_typed_head_session_is_refused_before_any_call() {
 #[test]
 fn a_real_ticket_speaks_for_its_own_session_whatever_the_body_says() {
     let worker = crate::gh_shim_ticket::ScopedTicket::issue("ses-worker", "call-w", "/p");
-    let transport = FakeTransport::default();
-    let cache = TokenCache::default();
+    let transport = FakeTransport::scoped();
     let mut params = bot_params(worker.value().unwrap(), "nonce-typed");
     params["session"] = json!("ses-head");
-    let (reply, _) = run(&transport, &cache, BOT_REQUEST_OPERATION, params, NOW);
-    assert!(reply.ok);
+    let mut scopes = scopes_for("ses-worker", Some(delegating_stamp()));
+    scopes.push("ses-head", Some(stamp(Some("agent-head"), true, true)));
+    let (reply, _) = run_with_scopes(&transport, BOT_REQUEST_OPERATION, params, &scopes);
+    assert!(reply.ok, "{:?}", reply.data);
     let calls = transport.calls();
-    assert_eq!(calls[0].0, Target::Prefrontal);
-    assert_eq!(calls[0].2["params"]["session"], "ses-worker");
+    assert_eq!(calls[0].0, Target::Plexus);
     assert_eq!(calls[0].1, "ses-worker");
+    assert_eq!(
+        transport.plexus_scopes(),
+        vec![Some(scope_selector(&delegating_stamp()))],
+        "the ticket's session's scope, not the typed head's"
+    );
 }
 
 #[test]
 fn untrusted_binds_are_refused_even_with_a_live_ticket() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-untrusted", "call-u", "/p");
     let transport = FakeTransport::default();
-    let cache = TokenCache::default();
     let params = bot_params(live.value().unwrap(), "nonce-untrusted");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -232,12 +182,10 @@ fn untrusted_binds_are_refused_even_with_a_live_ticket() {
         .unwrap();
     let reply = runtime.block_on(relay(
         &transport,
-        &cache,
         RelayCall {
             operation: BOT_REQUEST_OPERATION,
             params: &params,
             first_party: false,
-            now: NOW,
             route_scopes: &RouteScopes::default(),
         },
         &|_| {},
@@ -247,24 +195,12 @@ fn untrusted_binds_are_refused_even_with_a_live_ticket() {
 }
 
 #[test]
-fn token_lookup_purges_expired_entries_without_evicting_live_tokens() {
-    let cache = TokenCache::default();
-    cache.store("agent", "expired", json!("expired"), NOW);
-    cache.store("agent", "live", json!("live"), NOW + 1_000);
-    assert_eq!(cache.fresh("agent", "live", NOW), Some(json!("live")));
-    let tokens = cache.lock();
-    assert!(!tokens.contains_key(&("agent".into(), "expired".into())));
-    assert_eq!(tokens.len(), 1);
-}
-
-#[test]
 fn relay_log_escapes_untrusted_fields_into_one_record() {
     let transport = FakeTransport::default();
-    let cache = TokenCache::default();
     let mut params = bot_params("", "nonce\nforged record");
     params["request"]["action"] = json!("action\rforged");
     params["request"]["repository"] = json!("owner/repo\u{001b}[31m");
-    let (_, lines) = run(&transport, &cache, BOT_REQUEST_OPERATION, params, NOW);
+    let (_, lines) = run(&transport, BOT_REQUEST_OPERATION, params);
     assert_eq!(lines.len(), 1);
     assert!(!lines[0].chars().any(char::is_control), "{:?}", lines[0]);
     assert!(transport.calls().is_empty());
@@ -305,8 +241,8 @@ async fn closing_one_route_blocks_its_key_but_not_other_route_keys() {
 }
 
 /// A ticket issued to a background bash command spawned for an agent session
-/// relays as that session. The exact mint and plexus bodies are checked, and
-/// plexus's expected request and reply come from its own fixture file.
+/// relays as that session. The exact plexus body is checked, and plexus's
+/// expected request and reply come from its own fixture file.
 #[cfg(unix)]
 #[test]
 fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
@@ -361,39 +297,31 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
     };
 
     let golden = golden();
-    let transport = FakeTransport::default();
-    transport.push_prefrontal(Ok(
-        json!({"result": {"token": golden["request"]["assertion"].clone()}}),
-    ));
+    let transport = FakeTransport::scoped();
     transport.push_plexus(Ok(golden["success"].clone()));
-    let cache = TokenCache::default();
     let nonce = golden["request"]["request_nonce"].as_str().unwrap();
-    let (reply, lines) = run(
+    let (reply, lines) = run_with_scopes(
         &transport,
-        &cache,
         BOT_REQUEST_OPERATION,
         bot_params(&ticket, nonce),
-        1_700_000_000,
+        &scopes_for("ses-agent", Some(delegating_stamp())),
     );
 
     assert_eq!(reply, RelayReply::relayed(golden["success"].clone()));
     let calls = transport.calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].0, Target::Prefrontal);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, Target::Plexus);
     assert_eq!(calls[0].1, "ses-agent");
-    assert_eq!(
-        calls[0].2,
-        json!({
-            "method": "agent.assertion_mint",
-            "params": {"agent_id": "agent-fixture", "session": "ses-agent"},
-        })
-    );
-    assert_eq!(calls[1].0, Target::Plexus);
-    assert_eq!(calls[1].1, "ses-agent");
+    // The fixture request still carries an `assertion` field. AFT's write is
+    // that request with `assertion` removed and `op` set to `bot_request`.
     let mut expected_arguments = golden["request"].clone();
     expected_arguments["op"] = json!("bot_request");
+    expected_arguments
+        .as_object_mut()
+        .unwrap()
+        .remove("assertion");
     assert_eq!(
-        calls[1].2,
+        calls[0].2,
         json!({"name": "github", "arguments": expected_arguments})
     );
     assert_eq!(lines.len(), 1);
@@ -449,158 +377,23 @@ fn an_ended_commands_ticket_no_longer_redeems() {
     let transport = FakeTransport::default();
     let (reply, _) = run(
         &transport,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(&ticket, "nonce-ended"),
-        NOW,
     );
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
     assert!(transport.calls().is_empty());
 }
 
 #[test]
-fn token_is_reused_then_reminted_near_expiry_and_after_an_assertion_refusal() {
-    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-cache", "call-c", "/p");
-    let ticket = live.value().unwrap();
-    let transport = FakeTransport::default();
-    let cache = TokenCache::default();
-
-    run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(ticket, "n1"),
-        NOW,
-    );
-    run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(ticket, "n2"),
-        NOW,
-    );
-    assert_eq!(
-        transport.count(Target::Prefrontal),
-        1,
-        "second command reuses"
-    );
-    let plexus_tokens: Vec<Value> = transport
-        .calls()
-        .iter()
-        .filter(|(target, _, _)| *target == Target::Plexus)
-        .map(|(_, _, body)| body["arguments"]["assertion"].clone())
-        .collect();
-    assert_eq!(plexus_tokens[0], plexus_tokens[1]);
-
-    // Within the refresh margin of `exp` the token is minted again.
-    let near_expiry = TOKEN_EXP - TOKEN_REFRESH_MARGIN_SECS;
-    run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(ticket, "n3"),
-        near_expiry,
-    );
-    assert_eq!(
-        transport.count(Target::Prefrontal),
-        2,
-        "re-minted near expiry"
-    );
-
-    // Plexus refusing the assertion drops the cached token.
-    transport.push_plexus(Ok(json!({
-        "repo_binding_generation": 1,
-        "result": {"status": "refused", "refusal_code": "assertion_binding_generation_stale"},
-    })));
-    let (refused, _) = run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(ticket, "n4"),
-        NOW,
-    );
-    assert!(refused.ok, "plexus's refusal is relayed unchanged");
-    assert_eq!(
-        facade_refusal_code(&refused.data),
-        Some("assertion_binding_generation_stale")
-    );
-    assert_eq!(
-        transport.count(Target::Prefrontal),
-        2,
-        "the refused call reused the cached token"
-    );
-    run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(ticket, "n4"),
-        NOW,
-    );
-    assert_eq!(
-        transport.count(Target::Prefrontal),
-        3,
-        "re-minted after refusal"
-    );
-
-    // A refusal that does not name the assertion keeps the token.
-    transport.push_plexus(Ok(json!({
-        "repo_binding_generation": 1,
-        "result": {"status": "refused", "refusal_code": "repository_unbound"},
-    })));
-    run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(ticket, "n5"),
-        NOW,
-    );
-    run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(ticket, "n6"),
-        NOW,
-    );
-    assert_eq!(transport.count(Target::Prefrontal), 3);
-}
-
-#[test]
-fn mint_refusals_reach_the_shim_with_prefrontals_code_and_skip_plexus() {
-    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-worker-mint", "call-m", "/p");
-    let transport = FakeTransport::default();
-    transport.push_prefrontal(Err(TransportError::Refused {
-        code: "assertion_session_unknown".to_string(),
-        message: "session is not an agent session".to_string(),
-    }));
-    let (reply, lines) = run(
-        &transport,
-        &TokenCache::default(),
-        BOT_REQUEST_OPERATION,
-        bot_params(live.value().unwrap(), "nonce-mint"),
-        NOW,
-    );
-    assert!(!reply.ok);
-    assert_eq!(reply.data["refusal_code"], "assertion_session_unknown");
-    assert_eq!(reply.data["stage"], "mint");
-    assert_eq!(transport.count(Target::Plexus), 0);
-    assert!(
-        lines[0].ends_with("outcome=assertion_session_unknown"),
-        "{}",
-        lines[0]
-    );
-}
-
-#[test]
 fn a_sent_request_without_a_reply_is_outcome_unknown() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-unknown", "call-o", "/p");
-    let transport = FakeTransport::default();
+    let transport = FakeTransport::scoped();
     transport.push_plexus(Err(TransportError::OutcomeUnknown("timed out".to_string())));
-    let (reply, _) = run(
+    let (reply, _) = run_with_scopes(
         &transport,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(live.value().unwrap(), "nonce-unknown"),
-        NOW,
+        &scopes_for("ses-unknown", Some(delegating_stamp())),
     );
     assert_eq!(reply.data["refusal_code"], "outcome_unknown");
 }
@@ -608,13 +401,10 @@ fn a_sent_request_without_a_reply_is_outcome_unknown() {
 #[test]
 fn bindings_read_is_relayed_under_the_same_ticket_gate() {
     let transport = FakeTransport::default();
-    let cache = TokenCache::default();
     let (reply, _) = run(
         &transport,
-        &cache,
         BINDINGS_READ_OPERATION,
         json!({"ticket": "ffffffffffffffffffffffffffffffff", "agent_id": "agent-fixture"}),
-        NOW,
     );
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
     assert!(transport.calls().is_empty());
@@ -627,119 +417,48 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
     transport.push_plexus(Ok(bindings.clone()));
     let (reply, _) = run(
         &transport,
-        &cache,
         BINDINGS_READ_OPERATION,
         json!({
             "ticket": live.value().unwrap(),
             "agent_id": "agent-fixture",
-            // A connection id from the caller is ignored; the daemon derives
-            // it from the assertion it minted.
+            // A connection id from the caller is ignored; the daemon always
+            // names its own handle connection.
             "connection_id": "github-handle-someone-else",
         }),
-        NOW,
     );
     assert_eq!(reply, RelayReply::relayed(bindings));
     let calls = transport.calls();
-    assert_eq!(calls[0].0, Target::Prefrontal);
+    assert_eq!(calls.len(), 1, "a single plexus call, nothing minted");
+    assert_eq!(transport.plexus_scopes(), vec![None]);
     assert_eq!(
-        calls[0].2["params"],
-        json!({"agent_id": "agent-fixture", "session": "ses-bindings"})
-    );
-    assert_eq!(
-        calls[1].2,
+        calls[0].2,
         json!({
             "name": "github",
             "arguments": {"op": "bindings.read", "connection_id": "github-handle-aft-alfonso"},
         })
     );
-
-    // The minted token is cached, so the following bot write reuses it.
-    run(
-        &transport,
-        &cache,
-        BOT_REQUEST_OPERATION,
-        bot_params(live.value().unwrap(), "n"),
-        NOW,
-    );
-    assert_eq!(transport.count(Target::Prefrontal), 1);
 }
 
 #[test]
-fn handle_connection_id_comes_from_the_assertion_bot_login() {
-    assert_eq!(
-        handle_connection_id(&json!({"claims": {"handle": "aft-alfonso[bot]"}})),
-        Ok("github-handle-aft-alfonso".to_string())
-    );
-    for token in [
-        json!({"claims": {"handle": "aft-alfonso"}}),
-        json!({"claims": {"handle": "[bot]"}}),
-        json!({"claims": {}}),
-    ] {
-        assert!(handle_connection_id(&token).is_err(), "{token}");
-    }
-}
-
-#[test]
-fn bindings_read_fails_closed_on_a_malformed_handle_or_a_mint_refusal() {
-    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-bindings-bad", "call-bb", "/p");
-    let params = json!({"ticket": live.value().unwrap(), "agent_id": "agent-fixture"});
-
-    let transport = FakeTransport::default();
-    transport.push_prefrontal(Ok(json!({"result": {"token": {
-        "claims": {"agent_id": "agent-fixture", "exp": TOKEN_EXP, "handle": "aft-alfonso"},
-        "signature_hex": "sig-secret-x",
-        "generation": 1,
-    }}})));
-    let (reply, _) = run(
-        &transport,
-        &TokenCache::default(),
-        BINDINGS_READ_OPERATION,
-        params.clone(),
-        NOW,
-    );
-    assert!(!reply.ok);
-    assert_eq!(reply.data["refusal_code"], "assertion_handle_malformed");
-    assert_eq!(transport.count(Target::Plexus), 0);
-
-    let refused = FakeTransport::default();
-    refused.push_prefrontal(Err(TransportError::Refused {
-        code: "assertion_session_unknown".to_string(),
-        message: "not an agent session".to_string(),
-    }));
-    let (reply, _) = run(
-        &refused,
-        &TokenCache::default(),
-        BINDINGS_READ_OPERATION,
-        params,
-        NOW,
-    );
-    assert_eq!(reply.data["refusal_code"], "assertion_session_unknown");
-    assert_eq!(reply.data["stage"], "mint");
-    assert_eq!(refused.count(Target::Plexus), 0);
-}
-
-#[test]
-fn relay_log_line_carries_session_task_and_nonce_but_no_ticket_or_token() {
+fn relay_log_line_carries_session_task_and_nonce_but_no_ticket_or_scope() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-log", "call-log-7", "/p");
     let ticket = live.value().unwrap().to_string();
-    let transport = FakeTransport::default();
-    let (reply, lines) = run(
+    let transport = FakeTransport::scoped();
+    let (reply, lines) = run_with_scopes(
         &transport,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(&ticket, "nonce-log-42"),
-        NOW,
+        &scopes_for("ses-log", Some(delegating_stamp())),
     );
     assert!(reply.ok);
     assert_eq!(lines.len(), 1);
     let line = &lines[0];
     assert_eq!(
         line,
-        "gh_shim relay: op=gh_shim.bot_request session=ses-log task=call-log-7 nonce=nonce-log-42 action=issue reaction repository=org/repo path=assertion outcome=completed"
+        "gh_shim relay: op=gh_shim.bot_request session=ses-log task=call-log-7 nonce=nonce-log-42 action=issue reaction repository=org/repo path=stamp outcome=completed"
     );
     assert!(!line.contains(&ticket));
-    assert!(!line.contains("sig-secret"));
-    assert!(!line.contains("jti-"));
+    assert!(!line.contains("head-ref-1"));
 }
 
 #[test]
@@ -773,7 +492,7 @@ fn facade_reply_prefers_direct_fields_over_inner_result_content() {
 fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeStamp {
     ScopeStamp::new(
         subc_protocol::Principal::Reserved {
-            module_id: PREFRONTAL_MODULE_ID.to_string(),
+            module_id: "prefrontal-core".to_string(),
         },
         "head-ref-1",
         7,
@@ -797,23 +516,20 @@ fn scopes_for(session: &str, stamp: Option<ScopeStamp>) -> RouteScopes {
     scopes
 }
 
-/// A delegating scope on the session's route sends the write under that scope
-/// with no assertion, and prefrontal is never asked to mint one.
+/// A delegating scope on the session's route sends the write under that scope,
+/// and the body sent to plexus carries no `assertion` field.
 #[test]
-fn a_delegating_stamped_route_sends_no_assertion_and_mints_nothing() {
+fn a_delegating_stamped_route_sends_the_write_under_its_scope() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-stamp", "call-stamp", "/p");
     let transport = FakeTransport::scoped();
     let (reply, lines) = run_with_scopes(
         &transport,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(live.value().unwrap(), "nonce-stamp"),
-        NOW,
         &scopes_for("ses-stamp", Some(delegating_stamp())),
     );
 
     assert!(reply.ok, "{:?}", reply.data);
-    assert_eq!(transport.count(Target::Prefrontal), 0, "nothing was minted");
     let calls = transport.calls();
     assert_eq!(calls.len(), 1, "one plexus call per invocation");
     assert_eq!(calls[0].0, Target::Plexus);
@@ -834,7 +550,7 @@ fn a_delegating_stamped_route_sends_no_assertion_and_mints_nothing() {
         transport.plexus_scopes(),
         vec![Some(ScopeSelector {
             owner: subc_protocol::Principal::Reserved {
-                module_id: PREFRONTAL_MODULE_ID.to_string(),
+                module_id: "prefrontal-core".to_string(),
             },
             scope_ref: "head-ref-1".to_string(),
             scope_epoch: Some(7),
@@ -847,7 +563,7 @@ fn a_delegating_stamped_route_sends_no_assertion_and_mints_nothing() {
 }
 
 #[test]
-fn head_tool_and_background_routes_use_stamp_without_minting() {
+fn head_tool_and_background_routes_use_the_stamp() {
     for harness in ["opencode", "pi"] {
         let session = format!("{harness}-head");
         let ticket = crate::gh_shim_ticket::ScopedTicket::issue(&session, "head-write", "/p");
@@ -857,15 +573,11 @@ fn head_tool_and_background_routes_use_stamp_without_minting() {
         routes.push(&session, Some(delegating_stamp()));
         let (reply, _) = run_with_scopes(
             &transport,
-            &TokenCache::default(),
             BOT_REQUEST_OPERATION,
             bot_params(ticket.value().unwrap(), "head-write-nonce"),
-            NOW,
             &routes,
         );
         assert!(reply.ok, "{:?}", reply.data);
-        assert_eq!(transport.count(Target::Prefrontal), 0);
-        assert_eq!(*transport.minted.lock().unwrap(), 0);
         assert_eq!(transport.count(Target::Plexus), 1);
         assert_eq!(
             transport.plexus_scopes(),
@@ -877,74 +589,10 @@ fn head_tool_and_background_routes_use_stamp_without_minting() {
     }
 }
 
-/// A session whose route carries no stamp keeps minting and sending the
-/// assertion on an unscoped route, even when the transport could scope it.
+/// Plexus's scope refusals reach the shim exactly as plexus sent them,
+/// `legs_sent` included, and the write is never sent a second time.
 #[test]
-fn an_unstamped_route_keeps_minting_and_sending_the_assertion() {
-    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-unstamped", "call-un", "/p");
-    let transport = FakeTransport::scoped();
-    let (reply, lines) = run_with_scopes(
-        &transport,
-        &TokenCache::default(),
-        BOT_REQUEST_OPERATION,
-        bot_params(live.value().unwrap(), "nonce-unstamped"),
-        NOW,
-        &scopes_for("ses-unstamped", None),
-    );
-    assert!(reply.ok);
-    assert_eq!(transport.count(Target::Prefrontal), 1);
-    let calls = transport.calls();
-    assert_eq!(calls[1].0, Target::Plexus);
-    assert_eq!(
-        calls[1].2["arguments"]["assertion"],
-        token_with_exp(1, TOKEN_EXP)
-    );
-    assert_eq!(transport.plexus_scopes(), vec![None]);
-    assert!(lines[0].contains(" path=assertion "), "{}", lines[0]);
-}
-
-/// A stamp that does not let plexus act as its agent (not delegating, an
-/// owner the daemon does not trust with agent identity, or no agent) uses the
-/// assertion path exactly as an unstamped route does.
-#[test]
-fn a_non_delegating_stamp_uses_the_assertion_path() {
-    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-nondeleg", "call-nd", "/p");
-    for (label, non_delegating) in [
-        ("not delegating", stamp(Some("agent-fixture"), false, true)),
-        (
-            "owner not authorized",
-            stamp(Some("agent-fixture"), true, false),
-        ),
-        ("no agent", stamp(None, true, true)),
-    ] {
-        assert_eq!(delegating_agent(&non_delegating), None, "{label}");
-        let transport = FakeTransport::scoped();
-        let (reply, lines) = run_with_scopes(
-            &transport,
-            &TokenCache::default(),
-            BOT_REQUEST_OPERATION,
-            bot_params(live.value().unwrap(), "nonce-nondeleg"),
-            NOW,
-            &scopes_for("ses-nondeleg", Some(non_delegating)),
-        );
-        assert!(reply.ok, "{label}");
-        assert_eq!(transport.count(Target::Prefrontal), 1, "{label}");
-        let calls = transport.calls();
-        assert!(calls[1].2["arguments"]["assertion"].is_object(), "{label}");
-        assert_eq!(transport.plexus_scopes(), vec![None], "{label}");
-        assert!(
-            lines[0].contains(" path=assertion "),
-            "{label}: {}",
-            lines[0]
-        );
-    }
-}
-
-/// Plexus's scope refusals on the stamp path reach the shim exactly as plexus
-/// sent them, `legs_sent` included, and the write is never retried with an
-/// assertion: that retry would get past the scope decision plexus just made.
-#[test]
-fn a_stamp_path_refusal_is_relayed_verbatim_with_no_assertion_retry() {
+fn a_stamp_path_refusal_is_relayed_verbatim_with_no_retry() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-stamp-refused", "call-sr", "/p");
     for code in [
         "scope_unverifiable",
@@ -962,17 +610,13 @@ fn a_stamp_path_refusal_is_relayed_verbatim_with_no_assertion_retry() {
         });
         let transport = FakeTransport::scoped();
         transport.push_plexus(Ok(refusal.clone()));
-        let cache = TokenCache::default();
         let (reply, lines) = run_with_scopes(
             &transport,
-            &cache,
             BOT_REQUEST_OPERATION,
             bot_params(live.value().unwrap(), "nonce-stamp-refused"),
-            NOW,
             &scopes_for("ses-stamp-refused", Some(delegating_stamp())),
         );
         assert_eq!(reply, RelayReply::relayed(refusal), "{code}");
-        assert_eq!(transport.count(Target::Prefrontal), 0, "{code}: no mint");
         assert_eq!(transport.count(Target::Plexus), 1, "{code}: no second send");
         assert!(transport.calls()[0].2["arguments"]
             .get("assertion")
@@ -992,16 +636,13 @@ fn a_stamp_path_refusal_is_relayed_verbatim_with_no_assertion_retry() {
     }));
     let (reply, _) = run_with_scopes(
         &transport,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(live.value().unwrap(), "nonce-stamp-subc"),
-        NOW,
         &scopes_for("ses-stamp-refused", Some(delegating_stamp())),
     );
     assert!(!reply.ok);
     assert_eq!(reply.data["refusal_code"], "scope_ended");
     assert_eq!(reply.data["stage"], "plexus");
-    assert_eq!(transport.count(Target::Prefrontal), 0);
     assert_eq!(transport.count(Target::Plexus), 1);
 }
 
@@ -1014,10 +655,8 @@ fn a_stamp_naming_another_agent_is_refused_before_any_call() {
     let transport = FakeTransport::scoped();
     let (reply, lines) = run_with_scopes(
         &transport,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(live.value().unwrap(), "nonce-other-agent"),
-        NOW,
         &scopes_for(
             "ses-other-agent",
             Some(stamp(Some("agent-someone-else"), true, true)),
@@ -1030,11 +669,74 @@ fn a_stamp_naming_another_agent_is_refused_before_any_call() {
     assert!(lines[0].contains(" path=stamp "), "{}", lines[0]);
 }
 
-/// The production transport opens scoped routes, so a delegating stamp takes
-/// the stamp path there: with no subc connection the plexus call fails, and
-/// prefrontal is never asked for a mint. A transport that cannot open a scoped
-/// route still sends the same session down the assertion path, since plexus
-/// would refuse a write with neither a stamp nor an assertion.
+/// A session whose route carries no stamp has no agent to speak as. Its bot
+/// write is refused before anything is sent: the daemon mints no assertions.
+#[test]
+fn an_unstamped_route_is_refused_before_any_call() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-unstamped", "call-un", "/p");
+    let transport = FakeTransport::scoped();
+    let (reply, lines) = run_with_scopes(
+        &transport,
+        BOT_REQUEST_OPERATION,
+        bot_params(live.value().unwrap(), "nonce-unstamped"),
+        &scopes_for("ses-unstamped", None),
+    );
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "bot_write_requires_scope");
+    assert_eq!(reply.data["stage"], "scope");
+    assert_eq!(reply.data["repository"], envelope()["repository"]);
+    assert_eq!(reply.data["action"], envelope()["action"]);
+    assert!(
+        reply.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("Restart the host session"),
+        "{:?}",
+        reply.data
+    );
+    assert!(transport.calls().is_empty(), "nothing reached plexus");
+    assert!(lines[0].contains(" path=- "), "{}", lines[0]);
+    assert!(
+        lines[0].ends_with("outcome=bot_write_requires_scope"),
+        "{}",
+        lines[0]
+    );
+}
+
+/// A stamp that does not let plexus act as its agent (not delegating, an
+/// owner the daemon does not trust with agent identity, or no agent) is
+/// refused exactly as an unstamped route is.
+#[test]
+fn a_non_delegating_stamp_is_refused_before_any_call() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-nondeleg", "call-nd", "/p");
+    for (label, non_delegating) in [
+        ("not delegating", stamp(Some("agent-fixture"), false, true)),
+        (
+            "owner not authorized",
+            stamp(Some("agent-fixture"), true, false),
+        ),
+        ("no agent", stamp(None, true, true)),
+    ] {
+        assert_eq!(delegating_agent(&non_delegating), None, "{label}");
+        let transport = FakeTransport::scoped();
+        let (reply, _) = run_with_scopes(
+            &transport,
+            BOT_REQUEST_OPERATION,
+            bot_params(live.value().unwrap(), "nonce-nondeleg"),
+            &scopes_for("ses-nondeleg", Some(non_delegating)),
+        );
+        assert_eq!(
+            reply.data["refusal_code"], "bot_write_requires_scope",
+            "{label}"
+        );
+        assert!(transport.calls().is_empty(), "{label}");
+    }
+}
+
+/// The production transport opens scoped routes, so a write under a delegating
+/// stamp is sent to plexus. With no subc connection, that plexus call fails.
+/// A transport that cannot open a scoped route refuses the same write locally,
+/// because the scope is the only way a write names its agent.
 #[test]
 fn production_transport_takes_the_stamp_path_for_a_delegating_stamp() {
     let production = SubcRelayTransport::new(std::path::PathBuf::from(
@@ -1045,10 +747,8 @@ fn production_transport_takes_the_stamp_path_for_a_delegating_stamp() {
     let scopes = scopes_for("ses-prod", Some(delegating_stamp()));
     let (reply, lines) = run_with_scopes(
         &production,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(live.value().unwrap(), "nonce-prod"),
-        NOW,
         &scopes,
     );
     assert!(!reply.ok);
@@ -1058,17 +758,14 @@ fn production_transport_takes_the_stamp_path_for_a_delegating_stamp() {
     let unscoped = FakeTransport::default();
     let (reply, lines) = run_with_scopes(
         &unscoped,
-        &TokenCache::default(),
         BOT_REQUEST_OPERATION,
         bot_params(live.value().unwrap(), "nonce-prod-fake"),
-        NOW,
         &scopes,
     );
-    assert!(reply.ok);
-    assert_eq!(unscoped.count(Target::Prefrontal), 1);
-    assert!(unscoped.calls()[1].2["arguments"]["assertion"].is_object());
-    assert_eq!(unscoped.plexus_scopes(), vec![None]);
-    assert!(lines[0].contains(" path=assertion "), "{}", lines[0]);
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "bot_write_requires_scope");
+    assert!(unscoped.calls().is_empty());
+    assert!(lines[0].contains(" path=- "), "{}", lines[0]);
 }
 
 /// A session's stamp is used only when every route bound for it carries the
@@ -1433,12 +1130,10 @@ async fn relay_stamped(
     let lines = Mutex::new(Vec::new());
     let reply = relay(
         transport,
-        &TokenCache::default(),
         RelayCall {
             operation: BOT_REQUEST_OPERATION,
             params: &params,
             first_party: true,
-            now: NOW,
             route_scopes: &scopes,
         },
         &|line| lines.lock().unwrap().push(line.to_string()),
@@ -1628,4 +1323,13 @@ fn plexus_calls_name_no_origin() {
     );
     let call: subc_protocol::tool_call::ToolCallRequest = serde_json::from_value(body).unwrap();
     assert_eq!(call.origin, None);
+}
+
+/// The relay never asks prefrontal to mint an agent assertion: agent identity
+/// reaches plexus only through a session's scope stamp.
+#[test]
+fn the_relay_has_no_assertion_mint_call() {
+    let source = include_str!("mod.rs");
+    assert!(!source.contains("assertion_mint"));
+    assert!(!source.contains("ManagementSurface"));
 }
