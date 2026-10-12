@@ -2508,6 +2508,21 @@ export default { id: original.id, effect };
     expect(result.status).toBe(0);
   }, 150_000);
 
+  test("GA host detaches a waiting command call when a background completion arrives", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const result = await withOperatorCanary("v2-completion-detach", () =>
+      run("bun", ["test", "src/__tests__/e2e/v2-completion-detach.test.ts"], pluginRoot, {
+        env: { ...process.env, AFT_V2_HOST_BINARY: v2Binary(v2) },
+        timeoutMs: 150_000,
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-completion-detach-host-transcript]\n${transcript}`);
+    expect(transcript).toContain("1 pass");
+    expect(transcript).toContain("0 fail");
+    expect(result.status).toBe(0);
+  }, 180_000);
+
   test("GA TUI host mounts the sidebar and its status command without a keymap error", async () => {
     const { v2 } = await ensureHostInstalls();
     const packageRoot = await copyInstalledPlugin(v2, "v2-tui-keymap");
@@ -2979,6 +2994,8 @@ export default entry;
       "v2-node",
       "v2-lifecycle",
       "v2-permission-prompt",
+      "v2-synthetic-completion",
+      "v2-completion-detach",
       "v2-tui-keymap",
       "v2-theme-capture",
       "v2-tui-light-theme",

@@ -45,9 +45,11 @@ const defaults = {
   registerHostToolOverlapNotice: registerV2HostToolOverlapNotice,
   // The prompt server comes from the user-only `opencode` block of the
   // Location's config; without it AFT finds the server it runs inside.
-  toolConsumers: (context, config) => ({
+  // `getConfig` returns the Location's current config, which a live reload
+  // replaces; the wake consumer reads it when a completion arrives.
+  toolConsumers: (context, config, getConfig = () => config) => ({
     ...hoistedV2ToolConsumers(context, v2PromptChannelFor(config?.opencode)),
-    ...createV2RuntimeConsumer(context),
+    ...createV2RuntimeConsumer(context, getConfig),
   }),
   acquireBridge,
   releaseBridge,
@@ -86,7 +88,8 @@ async function bootLocation(context, location, dependencies) {
     dependencies,
   );
   const canonicalDirectory = location.project?.canonical ?? directory;
-  const consumers = dependencies.toolConsumers(context, config);
+  let liveConfig = config;
+  const consumers = dependencies.toolConsumers(context, config, () => liveConfig);
   // Only a rejected configuration keeps AFT out of a project; there is no
   // config switch that turns it off.
   const isProjectEnabled = createProjectAcceptance(directory, dependencies);
@@ -136,6 +139,7 @@ async function bootLocation(context, location, dependencies) {
     getConfig: () => toolContext.config,
     setConfig: (next) => {
       toolContext.config = next;
+      liveConfig = next;
     },
     notify,
   });

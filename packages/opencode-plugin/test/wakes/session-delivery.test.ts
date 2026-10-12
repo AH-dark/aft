@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 
+import type { AftConfig } from "../../src/config.js";
+import { __resetSyncWatchAbortForTests, isSyncWatchAborted } from "../../src/sync-watch-abort.js";
 import { createV2RuntimeConsumer } from "../../src/wakes/runtime-consumer.js";
 import {
   V2SessionDelivery,
@@ -147,7 +149,10 @@ describe("V2 session delivery", () => {
         task_ids: ["bash-1"],
       },
     });
+    // Admitted once: the session's waits are detached once and the task is
+    // acknowledged once; the duplicate push changes nothing.
     expect(sends).toEqual([
+      { command: "bash_wait_detach", params: { session_id: "session-v2" } },
       {
         command: "bash_ack_completions",
         params: { session_id: "session-v2", task_ids: ["bash-1"] },
@@ -219,5 +224,67 @@ describe("V2 session delivery", () => {
 
     expect(host.prompts).toEqual([]);
     expect(host.synthetic).toEqual([]);
+  });
+});
+
+describe("V2 completion wakes end the session's waits", () => {
+  const completion = (sessionID: string, taskID: string) => ({
+    type: "bash_completed" as const,
+    session_id: sessionID,
+    task_id: taskID,
+    status: "completed",
+    exit_code: 0,
+    command: "sleep 1",
+    output_preview: "done",
+  });
+
+  function bridge() {
+    const sends: Array<{ command: string; params: unknown }> = [];
+    return {
+      sends,
+      bridge: {
+        getCwd: () => "/work/project",
+        send: async (command: string, params: unknown) => {
+          sends.push({ command, params });
+          return { success: true, detached: command === "bash_wait_detach" };
+        },
+      },
+    };
+  }
+
+  async function deliver(config: AftConfig, sessionID: string) {
+    const host = recordingSession();
+    const consumer = createV2RuntimeConsumer({ session: host.session }, () => config);
+    consumer.registerSession?.(sessionID);
+    const pushed = bridge();
+    await consumer.bridgeOptions.onBashCompletion?.(
+      completion(sessionID, "bash-wake"),
+      pushed.bridge as never,
+    );
+    consumer.dispose();
+    return { host, sends: pushed.sends };
+  }
+
+  test("an admitted completion detaches its own session's wait and aborts its sync watch", async () => {
+    __resetSyncWatchAbortForTests();
+    const { host, sends } = await deliver({}, "session-wake");
+    expect(host.synthetic).toHaveLength(1);
+    expect(sends.filter((send) => send.command === "bash_wait_detach")).toEqual([
+      { command: "bash_wait_detach", params: { session_id: "session-wake" } },
+    ]);
+    expect(isSyncWatchAborted("session-wake")).toBe(true);
+    expect(isSyncWatchAborted("another-session")).toBe(false);
+    __resetSyncWatchAbortForTests();
+  });
+
+  test("bash.detach_on_user_message: false keeps the wait blocking", async () => {
+    __resetSyncWatchAbortForTests();
+    const { host, sends } = await deliver(
+      { bash: { detach_on_user_message: false } },
+      "session-kept",
+    );
+    expect(host.synthetic).toHaveLength(1);
+    expect(sends.map((send) => send.command)).toEqual(["bash_ack_completions"]);
+    expect(isSyncWatchAborted("session-kept")).toBe(false);
   });
 });

@@ -6,7 +6,9 @@ import type {
 } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
+import { interruptBashWaitsForChatMessage } from "../bash-wait-detach.js";
 import { formatLongRunningReminder, formatSystemReminder } from "../bg-notifications.js";
+import type { AftConfig } from "../config.js";
 import { warn } from "../logger.js";
 import { executeV2Bash } from "../tools/bash/executor.js";
 import type { V2ToolConsumers } from "../tools/definitions/v2.js";
@@ -186,20 +188,59 @@ export interface V2RuntimeConsumer extends V2ToolConsumers {
 }
 
 /**
+ * Detach the waits of the session an admitted completion wake belongs to.
+ *
+ * On OpenCode 1 a completion wake reaches the session as a synthetic message
+ * part, and `chat.message` detaches a waiting `bash({wait:true})` and aborts a
+ * sync `bash_watch` for it, so the agent can act on the result instead of
+ * sitting out the wait. OpenCode 2 admits the wake through
+ * `session.synthetic`, which does not run the session `prompt` hook where AFT
+ * makes that decision for typed messages, so the decision is made here: the
+ * same shared one, applied to the wake as a synthetic part, which detaches
+ * exactly when `bash.detach_on_user_message` is on.
+ *
+ * The wait is asked to detach on the bridge that pushed the completion: a
+ * session's background task and its waiting call run on the bridge of the
+ * Location the session belongs to.
+ */
+function detachWaitsForCompletion(
+  sessionID: string,
+  text: string,
+  bridge: AftProjectTransport,
+  config: AftConfig,
+): void {
+  const onlyThisBridge = {
+    getActiveBridgeForRoot: () => bridge,
+    activeBridges: () => [bridge],
+  } as unknown as Parameters<typeof interruptBashWaitsForChatMessage>[0];
+  interruptBashWaitsForChatMessage(onlyThisBridge, config, "", sessionID, {
+    parts: [{ type: "text", text, synthetic: true }],
+  });
+}
+
+/**
  * Creates the V2 execution consumers for one OpenCode Location. The bridge owns
  * one process-wide `onBashCompletion` callback, so it routes each notification
  * by session to the delivery object owned by that Location's Effect scope.
+ *
+ * `getConfig` returns the Location's current AFT config (a live reload
+ * replaces it); it decides whether an admitted completion detaches the
+ * session's waits.
  */
-export function createV2RuntimeConsumer(context: V2WakeHostContext): V2RuntimeConsumer {
+export function createV2RuntimeConsumer(
+  context: V2WakeHostContext,
+  getConfig: () => AftConfig = () => ({}),
+): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
   const sessions = new Set<string>();
   const route: WakeRoute = {
     completion: async (completion, bridge) => {
+      const text = formatSystemReminder([completion]);
       const admitted = await Effect.runPromise(
         delivery.completion({
           sessionID: completion.session_id,
           taskIDs: [completion.task_id],
-          text: formatSystemReminder([completion]),
+          text,
           metadata: {
             source: "aft",
             kind: "bash_completion",
@@ -208,7 +249,10 @@ export function createV2RuntimeConsumer(context: V2WakeHostContext): V2RuntimeCo
           },
         }),
       );
+      // A wake that was not admitted (a staged revert defers it) reaches the
+      // agent later, so it must not end a wait now.
       if (!admitted) return;
+      detachWaitsForCompletion(completion.session_id, text, bridge, getConfig());
 
       await bridge.send("bash_ack_completions", {
         session_id: completion.session_id,
