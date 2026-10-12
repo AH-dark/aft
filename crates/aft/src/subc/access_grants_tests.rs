@@ -251,17 +251,21 @@ fn grants_policy_reads_revocation_on_the_next_check() {
     ctx.update_config(|config| config.project_root = Some(worker.project_root.clone()));
     crate::access_policy::with_scope(Some(scope_key(&worker)), || {
         assert_eq!(
-            ctx.access_policy("check")
-                .unwrap()
-                .decide(AccessOperation::Read, &path, false),
+            ctx.access_policy("check").unwrap().decide(
+                AccessOperation::Read,
+                &crate::access_policy::policy_path(&path),
+                false
+            ),
             AccessDecision::Allow
         );
         assert!(ctx.validate_read_path("check", "worker", &path).is_ok());
         operation(json!({"path":path}), "grants.revoke", &worker, &ctx).unwrap();
         assert_eq!(
-            ctx.access_policy("check")
-                .unwrap()
-                .decide(AccessOperation::Read, &path, false),
+            ctx.access_policy("check").unwrap().decide(
+                AccessOperation::Read,
+                &crate::access_policy::policy_path(&path),
+                false
+            ),
             AccessDecision::Deny(AccessDenial::OutsideRoots)
         );
         assert!(ctx.validate_read_path("check", "worker", &path).is_err());
