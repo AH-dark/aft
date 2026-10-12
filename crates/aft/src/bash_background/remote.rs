@@ -135,6 +135,25 @@ fn draining_budget_ms(_root: &Path) -> u64 {
     DRAINING_RETRY_BUDGET_MS
 }
 
+#[cfg(unix)]
+fn draining_now_ms(_root: &Path) -> u64 {
+    #[cfg(test)]
+    if let Some(clock) = tests::draining_clock(_root) {
+        return clock.now();
+    }
+    unix_millis()
+}
+
+#[cfg(unix)]
+async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
+    #[cfg(test)]
+    if let Some(clock) = tests::draining_clock(_root) {
+        clock.sleep_until(_now, _now.saturating_add(delay)).await;
+        return;
+    }
+    tokio::time::sleep(Duration::from_millis(delay)).await;
+}
+
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
 const RUNNER_ID: &str = "ck-motor";
@@ -592,6 +611,8 @@ impl OutputSink for TaskSink {
         })
     }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
+        #[cfg(test)]
+        let clock = tests::task_draining_clock(&self.task);
         self.commit(|r| {
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
@@ -599,6 +620,8 @@ impl OutputSink for TaskSink {
             if retries_draining(r, verdict) {
                 if let Some(retry) = r.retry.as_mut() {
                     let now = unix_millis();
+                    #[cfg(test)]
+                    let now = clock.as_ref().map_or(now, |clock| clock.now());
                     retry.first_refusal_at_ms.get_or_insert(now);
                     retry.next_retry_at_ms =
                         Some(now.saturating_add(draining_delay_ms(
@@ -1257,7 +1280,7 @@ impl BgTaskRegistry {
                 let first = retry
                     .first_refusal_at_ms
                     .ok_or("draining retry start absent; command not resubmitted")?;
-                let now = unix_millis();
+                let now = draining_now_ms(root);
                 state.metadata.execution_note = Some(format!(
                     "build server is draining for maintenance; retrying (attempt {}, {} of {} used)",
                     retry.attempts.saturating_add(1), retry_duration(now.saturating_sub(first).min(budget)), retry_duration(budget)
@@ -1303,7 +1326,7 @@ impl BgTaskRegistry {
                 .min(1000);
             tokio::select! {
                 _ = task.remote_cancel_notify.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(delay)) => {},
+                _ = draining_retry_sleep(root, now, delay) => {},
             }
         }
     }

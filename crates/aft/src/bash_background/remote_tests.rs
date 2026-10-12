@@ -3504,13 +3504,117 @@ fn shorten_draining_budget(root: &Path, ms: u64) {
     draining_budgets().lock().unwrap().insert(root.into(), ms);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DrainingClockEvent {
+    Sleeping { from: u64, until: u64 },
+    Stopped,
+}
+
+pub(super) struct DrainingClock {
+    ticks: tokio::sync::watch::Sender<u64>,
+    events: tokio::sync::mpsc::UnboundedSender<DrainingClockEvent>,
+}
+
+impl DrainingClock {
+    pub(super) fn now(&self) -> u64 {
+        *self.ticks.borrow()
+    }
+
+    pub(super) async fn sleep_until(&self, from: u64, until: u64) {
+        let mut ticks = self.ticks.subscribe();
+        let _ = self
+            .events
+            .send(DrainingClockEvent::Sleeping { from, until });
+        ticks.wait_for(|now| *now >= until).await.unwrap();
+    }
+}
+
+fn draining_clocks() -> &'static Mutex<HashMap<PathBuf, Arc<DrainingClock>>> {
+    static CLOCKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<DrainingClock>>>> =
+        std::sync::OnceLock::new();
+    CLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn draining_clock(root: &Path) -> Option<Arc<DrainingClock>> {
+    draining_clocks().lock().unwrap().get(root).cloned()
+}
+
+pub(super) fn task_draining_clock(task: &BgTask) -> Option<Arc<DrainingClock>> {
+    let state = task.state.lock().unwrap();
+    draining_clock(state.metadata.project_root.as_deref()?)
+}
+
+// Remote workers have their own runtimes, so pausing the test's Tokio runtime
+// cannot control their durable timestamps or sleeps. Share one clock per root
+// across the original and replayed worker, without affecting parallel tests.
+struct PausedDrainingClock {
+    root: PathBuf,
+    clock: Arc<DrainingClock>,
+    events: tokio::sync::mpsc::UnboundedReceiver<DrainingClockEvent>,
+}
+
+impl PausedDrainingClock {
+    fn new(root: &Path) -> Self {
+        let (ticks, _) = tokio::sync::watch::channel(1_000_000);
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Arc::new(DrainingClock { ticks, events });
+        assert!(draining_clocks()
+            .lock()
+            .unwrap()
+            .insert(root.into(), clock.clone())
+            .is_none());
+        Self {
+            root: root.into(),
+            clock,
+            events: receiver,
+        }
+    }
+
+    fn now(&self) -> u64 {
+        self.clock.now()
+    }
+
+    fn advance(&self, ms: u64) {
+        self.clock.ticks.send_modify(|now| *now += ms);
+    }
+
+    async fn expect_event(&mut self, expected: DrainingClockEvent) {
+        // This is only a deadlock watchdog; the event's deadline, not elapsed
+        // wall time, proves which budget or retry delay the worker selected.
+        let event = tokio::time::timeout(Duration::from_secs(10), self.events.recv())
+            .await
+            .expect("draining worker must acknowledge its wait or stop")
+            .expect("draining clock event channel closed");
+        assert_eq!(event, expected);
+    }
+
+    async fn expect_sleep(&mut self, from: u64, until: u64) {
+        self.expect_event(DrainingClockEvent::Sleeping { from, until })
+            .await;
+    }
+}
+
+impl Drop for PausedDrainingClock {
+    fn drop(&mut self) {
+        draining_clocks().lock().unwrap().remove(&self.root);
+        // Release a worker even when an assertion failed with its clock paused.
+        self.clock.ticks.send_replace(u64::MAX);
+    }
+}
+
 fn stopped_draining_roots() -> &'static Mutex<HashSet<PathBuf>> {
     static ROOTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
     ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 pub(super) fn stop_draining_worker(root: &Path) -> bool {
-    stopped_draining_roots().lock().unwrap().remove(root)
+    let stopped = stopped_draining_roots().lock().unwrap().remove(root);
+    if stopped {
+        if let Some(clock) = draining_clock(root) {
+            let _ = clock.events.send(DrainingClockEvent::Stopped);
+        }
+    }
+    stopped
 }
 
 fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
@@ -3569,17 +3673,16 @@ async fn runon_draining_budget_caps_retry_after() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     shorten_draining_budget(dir.path(), 250);
+    let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let started = Instant::now();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
-    // The runner asks for a 60 s pause. A capped retry ends near the 250 ms
-    // budget; an uncapped one waits the full minute. The outer bound sits far
-    // between the two so a loaded runner can't fail the capped case.
-    let done = tokio::time::timeout(Duration::from_secs(20), terminal(&registry, &task))
-        .await
-        .expect("retry_after must be capped by the total budget");
+    let first = clock.now();
+    clock.expect_sleep(first, first + 250).await;
+    clock.advance(250);
+    let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed);
-    assert!(started.elapsed() >= Duration::from_millis(250));
+    let saved = read_task(&registry.task(&task).unwrap().paths.json).unwrap();
+    assert_eq!(saved.remote.unwrap().retry.unwrap().waited_ms, Some(250));
     assert_eq!(exec_runs(&daemon).len(), 1);
     let refusal = done.remote_refusal.unwrap();
     assert!(
@@ -3603,15 +3706,16 @@ async fn runon_draining_retry_after_is_honoured() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let started = Instant::now();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
-    draining_phase(&registry, &task).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let first = clock.now();
+    clock.expect_sleep(first, first + 300).await;
+    clock.advance(100);
     assert_eq!(exec_runs(&daemon).len(), 1, "must not resubmit early");
+    clock.advance(200);
     let done = terminal(&registry, &task).await;
     assert_eq!(done.exit_code, Some(0));
-    assert!(started.elapsed() >= Duration::from_millis(300));
     assert_eq!(exec_runs(&daemon).len(), 2);
 }
 
@@ -3647,21 +3751,26 @@ async fn runon_draining_kill_stops_retries() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     shorten_draining_budget(dir.path(), 1000);
+    let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
-    draining_phase(&registry, &task_id).await;
+    let first = clock.now();
+    clock.expect_sleep(first, first + 500).await;
     let killing = registry.clone();
     let killed_id = task_id.clone();
+    // With the retry clock frozen, a terminal kill proves cancellation woke
+    // the worker; the wall-clock timeout only guards against a deadlock.
     let killed = tokio::time::timeout(
-        Duration::from_millis(200),
+        Duration::from_secs(10),
         tokio::task::spawn_blocking(move || killing.kill(&killed_id, "session")),
     )
     .await
-    .expect("kill must interrupt retry sleep immediately")
+    .expect("kill must interrupt retry sleep without advancing the clock")
     .unwrap()
     .unwrap();
     assert_eq!(killed.info.status, BgTaskStatus::Killed);
-    tokio::time::sleep(Duration::from_millis(550)).await;
+    assert_eq!(clock.now(), first);
+    clock.advance(550);
     assert_eq!(
         exec_runs(&daemon).len(),
         1,
@@ -3682,6 +3791,7 @@ async fn runon_draining_restart_preserves_remaining_budget_and_request() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     shorten_draining_budget(dir.path(), 600);
+    let mut clock = PausedDrainingClock::new(dir.path());
     stopped_draining_roots()
         .lock()
         .unwrap()
@@ -3689,32 +3799,49 @@ async fn runon_draining_restart_preserves_remaining_budget_and_request() {
     let original = registry();
     let task_id = start_runon_retry(&original, dir.path(), daemon.connection.clone());
     draining_phase(&original, &task_id).await;
+    clock.expect_event(DrainingClockEvent::Stopped).await;
     let task = original.task(&task_id).unwrap();
     let saved = read_task(&task.paths.json).unwrap();
     let retry = saved.remote.as_ref().unwrap().retry.as_ref().unwrap();
     assert_eq!(retry.attempts, 1);
     let first = retry.first_refusal_at_ms.unwrap();
+    assert_eq!(first, clock.now());
+    assert_eq!(retry.next_retry_at_ms, Some(first + 10_000));
     assert!(!serde_json::to_string(&saved)
         .unwrap()
         .contains("private-value-proof"));
-    let request = restore_retry_request(&task, &retry.request_digest).unwrap();
+    let request =
+        serde_json::to_value(restore_retry_request(&task, &retry.request_digest).unwrap()).unwrap();
+    assert_eq!(request, exec_runs(&daemon)[0]);
     assert_eq!(
-        serde_json::to_value(request).unwrap()["env"]["REMOTE_REQUEST_PRIVATE_VALUE"],
+        request["env"]["REMOTE_REQUEST_PRIVATE_VALUE"],
         "private-value-proof"
     );
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    clock.advance(400);
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
-    let done = tokio::time::timeout(Duration::from_millis(400), terminal(&restarted, &task_id))
-        .await
-        .expect("restart must use remaining budget, not another full budget");
+    // The saved refusal used 400 ms of its 600 ms budget. Replaying must
+    // schedule only the remaining 200 ms, not another full 600 ms.
+    clock.expect_sleep(first + 400, first + 600).await;
+    let replayed_task = restarted.task(&task_id).unwrap();
+    assert_eq!(
+        serde_json::to_value(restore_retry_request(&replayed_task, &retry.request_digest).unwrap())
+            .unwrap(),
+        request
+    );
+    clock.advance(200);
+    let done = terminal(&restarted, &task_id).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed);
     assert_eq!(exec_runs(&daemon).len(), 1);
     let restored = read_task(&task.paths.json).unwrap();
     let retry = restored.remote.unwrap().retry.unwrap();
     assert_eq!(retry.first_refusal_at_ms, Some(first));
     assert_eq!(retry.attempts, 1);
-    assert!(retry.waited_ms.unwrap() >= 600);
+    assert_eq!(retry.waited_ms, Some(600));
+    assert_eq!(
+        retry.request_digest,
+        saved.remote.unwrap().retry.unwrap().request_digest
+    );
 }
 
 #[tokio::test]
