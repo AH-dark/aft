@@ -11510,8 +11510,32 @@ impl AppContext {
             .unwrap_or_default();
         let storage = self.storage_dir();
         let force_restrict = self.request_force_restrict(req_id);
+        let grants = if let Some(scope) = crate::access_policy::current_scope() {
+            match self.db() {
+                Some(db) => {
+                    let conn = db.lock().map_err(|_| {
+                        crate::protocol::Response::error(
+                            req_id,
+                            "grants_unavailable",
+                            "grant database lock poisoned",
+                        )
+                    })?;
+                    crate::db::access_grants::list(&conn, &scope).map_err(|error| {
+                        crate::protocol::Response::error(
+                            req_id,
+                            "grants_unavailable",
+                            error.to_string(),
+                        )
+                    })?
+                }
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         let build = move || {
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
+            policy.grants = grants;
             if force_restrict {
                 policy.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
             }

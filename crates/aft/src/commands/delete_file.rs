@@ -648,11 +648,13 @@ pub(crate) fn handle_delete_deferred_with_restriction(
         return DispatchOutcome::Immediate(handle_delete_file(req, &ctx));
     };
     let config = ctx.config();
+    let grant_scope = crate::access_policy::current_scope();
     let cancellation = crate::executor::current_job_cancellation()
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     std::thread::spawn(move || {
+        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
         let _config_pin = ctx.pin_config_to(config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));

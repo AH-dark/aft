@@ -55,6 +55,8 @@ pub(super) fn recognized_operation(op: &str) -> bool {
             | "tool.withdraw"
             | "late_results"
             | "late_results.ack"
+            | "grants.list"
+            | "grants.revoke"
     )
 }
 

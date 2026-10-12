@@ -57,6 +57,7 @@ pub(super) fn catalog(
                 },
                 "host" => value.as_str().is_some_and(|s| !s.is_empty()),
                 "remote_exec" | "siblings" if preset == "worker" => true,
+                "allow_paths" if preset == "worker" => true,
                 _ => continue,
             };
             if !valid {
@@ -71,6 +72,7 @@ pub(super) fn catalog(
     let powershell = crate::bash_background::powershell_available();
     let worker_wait_max_ms = ctx.config().bash.worker_wait_max_ms;
     let (request, catalog_preset) = tool_provider::validate_catalog_request(body)?;
+    access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
     if let Some(key) = key(identity, Some(&preset)) {
         if original.contains_key("remote_exec") || original.contains_key("siblings") {
             let policy = match crate::exec_remote::FrozenParams::decode(&original) {

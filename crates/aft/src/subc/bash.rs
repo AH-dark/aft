@@ -594,6 +594,7 @@ pub(super) fn submit_deferred_bash(
     // Leave room for writer queueing and the daemon relay under the shortest
     // supported client transport deadline (25 s). Explicit waits only extend
     // execution, never startup admission or control-file creation.
+    let grant_scope = crate::access_policy::current_scope();
     let spawn_ctx = match executor.try_actor_context(&root) {
         Some(Some(ctx)) => ctx,
         state => {
@@ -804,6 +805,7 @@ pub(super) fn submit_deferred_bash(
                     };
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
+                            let _grant_scope = crate::access_policy::scope_guard(grant_scope);
                             crate::bash_background::with_call_key(call_key, || {
                                 crate::bash_background::registry::with_ledger_spawn(
                                     ledger_key.clone(),

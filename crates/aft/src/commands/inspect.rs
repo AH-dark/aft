@@ -688,7 +688,9 @@ fn handle_inspect_payload(
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let cancellation = crate::executor::current_job_cancellation();
+        let grant_scope = crate::access_policy::current_scope();
         std::thread::spawn(move || {
+            let _grant_scope = crate::access_policy::scope_guard(grant_scope);
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
             let outcome = if use_checkout_view {
                 manager.tier2_run_with_pinned_view(snapshot, category, scope, checkout_store)
@@ -1084,7 +1086,9 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
+    let grant_scope = crate::access_policy::current_scope();
     std::thread::spawn(move || {
+        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
         let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));

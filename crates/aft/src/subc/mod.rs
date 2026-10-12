@@ -197,6 +197,7 @@ impl fmt::Display for RouteChannel {
 type PushEnvelope = (ProjectRootId, PushFrame);
 type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
+mod access_grants;
 mod bash;
 #[cfg(test)]
 mod bash_selector_tests;
@@ -3151,6 +3152,9 @@ async fn handle_bash_elicitation_reply(
 
     if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
         if routes.contains_key(&key.route) {
+            let _grant_scope = crate::access_policy::scope_guard(
+                routes.get(&key.route).map(access_grants::policy_scope_key),
+            );
             bash::submit_deferred_bash(
                 executor,
                 bash_deferred_tx,
@@ -6428,6 +6432,30 @@ async fn handle_route_bind_completion(
         probe.route_bind_ack_queued(completion.corr);
     }
     start_post_ack_database_open(executor, &completion.bind_root_id);
+    if let Some(identity) = routes
+        .get(&route_id)
+        .filter(|identity| identity.scope.is_some())
+        .cloned()
+    {
+        let _ = executor.submit_async(
+            identity.root.clone(),
+            Lane::Mutating,
+            format!("scope-bind-{}", route_id.channel),
+            Box::new(move |ctx| {
+                crate::database_open::run_staged_open(
+                    ctx,
+                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
+                    true,
+                );
+                match access_grants::register(&identity, ctx) {
+                    Ok(()) => Response::success("scope-bind", json!({})),
+                    Err(error) => {
+                        Response::error("scope-bind", "grants_unavailable", error.message)
+                    }
+                }
+            }),
+        );
+    }
     queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
     let replayed = push::replay_buffered_push_frames(
         tx,
@@ -7704,14 +7732,14 @@ async fn submit_provider_read(
     let job_operation = operation.clone();
     let request_id = format!("subc-{}-{}", route.channel, corr);
     let job_id = request_id.clone();
-    // Parameterless catalogs stay on the read lane. Scoped worker routing
-    // params are committed durably before the catalog reply is published.
-    let freeze_policy = remote_policy::key(&identity, body.get("preset").and_then(Value::as_str))
-        .is_some()
-        && body
+    // Worker catalogs can materialize persisted launch params even on a
+    // parameterless refetch. Serialize them with grant revocation before replying.
+    let freeze_policy = operation.starts_with("grants.")
+        || remote_policy::key(&identity, body.get("preset").and_then(Value::as_str)).is_some()
+        || body
             .get("params")
             .and_then(Value::as_object)
-            .is_some_and(|p| p.contains_key("remote_exec") || p.contains_key("siblings"));
+            .is_some_and(|p| p.contains_key("allow_paths"));
     let rx = submit_active_tool_call(
         executor,
         active,
@@ -7730,6 +7758,13 @@ async fn submit_provider_read(
         Box::new(move |ctx| {
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
+            } else if job_operation.starts_with("grants.") {
+                crate::database_open::run_staged_open(
+                    ctx,
+                    crate::database_open::DatabaseOpenRunner::ConfigureTail,
+                    true,
+                );
+                access_grants::operation(body, &job_operation, &identity, ctx)
             } else {
                 if freeze_policy {
                     crate::database_open::run_staged_open(
@@ -7878,7 +7913,10 @@ async fn handle_tool_call(
     if let Some(operation) =
         operation.filter(|operation| tool_provider::recognized_operation(operation))
     {
-        if matches!(operation, "role.describe" | "tool.catalog") {
+        if matches!(
+            operation,
+            "role.describe" | "tool.catalog" | "grants.list" | "grants.revoke"
+        ) {
             let body = if envelope.get("op").is_some() {
                 let mut body = envelope.clone();
                 body.as_object_mut()
@@ -8423,6 +8461,8 @@ async fn handle_tool_call(
             drain: module_drain.clone(),
         };
 
+        let _grant_scope =
+            crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
         bash::submit_deferred_bash(
             executor,
             bash_deferred_tx,
@@ -8507,6 +8547,9 @@ async fn handle_tool_call(
         phase_trace.mark_executor_submitted();
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
             let _deferred_wake_scope = completion_wake.install();
+            let _grant_scope = crate::access_policy::scope_guard(Some(
+                access_grants::policy_scope_key(&identity_for_run),
+            ));
             phase_trace.mark_job_admitted();
             // Admission for this deferred tool call: pin the config so the
             // preflight and the deferred worker share one snapshot.
@@ -8833,13 +8876,18 @@ async fn handle_tool_call(
             // Undo history and named checkpoints belong to the issuing route,
             // not to whichever harness configured this shared root last.
             let harness = identity_for_run.harness.clone();
-            crate::backup::with_request_harness(&harness, || {
-                if matches!(bind_trust, BindTrust::Untrusted) {
-                    ctx.with_force_restrict(&request_id_for_force, run)
-                } else {
-                    run()
-                }
-            })
+            crate::access_policy::with_scope(
+                Some(access_grants::policy_scope_key(&identity_for_run)),
+                || {
+                    crate::backup::with_request_harness(&harness, || {
+                        if matches!(bind_trust, BindTrust::Untrusted) {
+                            ctx.with_force_restrict(&request_id_for_force, run)
+                        } else {
+                            run()
+                        }
+                    })
+                },
+            )
         })
     });
     let rx = submit_active_tool_call(

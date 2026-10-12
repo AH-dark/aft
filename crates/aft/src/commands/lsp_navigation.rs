@@ -200,10 +200,12 @@ fn defer_lsp_navigation(
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
+    let grant_scope = crate::access_policy::current_scope();
 
     // Cold initialization and its first query run after the scheduler job returns,
     // so an LSP handshake cannot serialize unrelated work on the same root.
     std::thread::spawn(move || {
+        let _grant_scope = crate::access_policy::scope_guard(grant_scope);
         #[cfg(test)]
         let _worker = DeferredNavigationWorkerGuard::new();
         let _config_pin = ctx.pin_config_to(admitted_config);

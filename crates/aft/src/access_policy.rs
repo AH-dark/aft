@@ -6,7 +6,44 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::sandbox_profile::{SandboxDataPolicy, SandboxProfile, SandboxProfileError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+thread_local! {
+    static REQUEST_SCOPE: std::cell::RefCell<Option<crate::db::access_grants::ScopeKey>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_scope<R>(
+    scope: Option<crate::db::access_grants::ScopeKey>,
+    run: impl FnOnce() -> R,
+) -> R {
+    let _restore = scope_guard(scope);
+    run()
+}
+
+pub(crate) struct ScopeGuard(
+    Option<crate::db::access_grants::ScopeKey>,
+    std::marker::PhantomData<*const ()>,
+);
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        REQUEST_SCOPE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn scope_guard(scope: Option<crate::db::access_grants::ScopeKey>) -> ScopeGuard {
+    ScopeGuard(
+        REQUEST_SCOPE.with(|slot| slot.replace(scope)),
+        std::marker::PhantomData,
+    )
+}
+
+pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
+    REQUEST_SCOPE.with(|slot| slot.borrow().clone())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AccessOperation {
     Read,
     Write,
@@ -25,7 +62,8 @@ pub enum AccessDenial {
     OutsideRoots,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GrantKind {
     File,
     Subtree,
@@ -33,11 +71,19 @@ pub enum GrantKind {
 
 /// Canonical path capabilities supplied by the route owner. Persistence and
 /// consent cannot override denied credential paths, read_deny, or private stores.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccessGrant {
     pub path: PathBuf,
     pub kind: GrantKind,
+    #[serde(rename = "mode")]
     pub operation: AccessOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadPolicy {
+    Allow,
+    NotHeld,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +294,40 @@ impl AccessPolicy {
         self.decide(AccessOperation::Write, path, false)
     }
 
+    /// A subtree capability includes future descendants, not just the paths that
+    /// exist today. A file grant cannot cover it, and any denied descendant wins.
+    pub fn decide_capability(
+        &self,
+        operation: AccessOperation,
+        kind: GrantKind,
+        path: &Path,
+    ) -> AccessDecision {
+        if kind == GrantKind::File {
+            return self.decide(operation, path, false);
+        }
+        for floor in self.absolute_floor.iter().chain(&self.private_stores.deny) {
+            if floor_contains(floor, path)
+                && self.decide(operation, floor, false) == AccessDecision::Deny(AccessDenial::Floor)
+            {
+                return AccessDecision::Deny(AccessDenial::Floor);
+            }
+        }
+        let mut tree_policy = self.clone();
+        tree_policy
+            .grants
+            .retain(|grant| grant.kind == GrantKind::Subtree);
+        tree_policy.decide(operation, path, false)
+    }
+
+    pub fn head_policy(&self, grant: &AccessGrant) -> HeadPolicy {
+        if self.decide_capability(grant.operation, grant.kind, &grant.path) == AccessDecision::Allow
+        {
+            HeadPolicy::Allow
+        } else {
+            HeadPolicy::NotHeld
+        }
+    }
+
     /// Compile only directory write capabilities. An ask contributes nothing,
     /// and a file grant must never widen into a writable parent directory.
     pub fn compile_shell(
@@ -430,6 +510,79 @@ pub(crate) fn policy_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grants_head_policy_requires_every_descendant_and_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = policy_path(&dir.path().join("root"));
+        let mut policy = AccessPolicy::from_config(
+            &Config::default(),
+            &dir.path().join("store"),
+            vec![root.clone()],
+            &dir.path().join("home"),
+        );
+        let mut grant = AccessGrant {
+            path: root.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::Allow);
+        policy.absolute_floor.push(root.join("future-secret"));
+        assert_eq!(
+            policy.decide(AccessOperation::Read, &root, false),
+            AccessDecision::Allow
+        );
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::NotHeld);
+        grant.operation = AccessOperation::Write;
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::NotHeld);
+        policy.absolute_floor.clear();
+        policy.roots.clear();
+        policy.private_stores.read_allow.clear();
+        policy.private_stores.write_allow.clear();
+        policy.grants.push(AccessGrant {
+            operation: AccessOperation::Read,
+            ..grant.clone()
+        });
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::NotHeld);
+        grant.operation = AccessOperation::Read;
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::Allow);
+        grant.path = root.with_file_name("root-sibling");
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::NotHeld);
+    }
+
+    #[test]
+    fn grants_head_policy_does_not_delegate_a_private_store_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = policy_path(dir.path());
+        let policy = policy(&root.join("own"), &root.join("store"));
+        let grant = AccessGrant {
+            path: root,
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        assert_eq!(policy.head_policy(&grant), HeadPolicy::NotHeld);
+        assert_eq!(
+            policy.decide_capability(grant.operation, grant.kind, &grant.path),
+            AccessDecision::Deny(AccessDenial::Floor)
+        );
+    }
+
+    #[test]
+    fn grants_file_does_not_hold_a_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = policy(&dir.path().join("root"), &dir.path().join("store"));
+        let target = policy_path(&dir.path().join("outside"));
+        policy.grants.push(AccessGrant {
+            path: target.clone(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Write,
+        });
+        assert_eq!(policy.decide_tree_write(&target), AccessDecision::Allow);
+        assert_eq!(
+            policy.decide_capability(AccessOperation::Write, GrantKind::Subtree, &target),
+            AccessDecision::Ask
+        );
+    }
 
     fn policy(root: &Path, store: &Path) -> AccessPolicy {
         let config = Config::default();
