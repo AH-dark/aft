@@ -641,12 +641,27 @@ impl WatchJob {
         if snapshot.info.status.is_terminal() {
             return String::new();
         }
+        // A remote task has no AFT kill clock: say where it is on the build
+        // server instead (queued, or when the runner stops it).
+        if let Some(note) = &snapshot.remote_phase_note {
+            return remote_phase_sentence(note);
+        }
         kill_deadline_sentence(
             self.registry
                 .hard_kill_deadline(&self.task_id, &self.session),
             snapshot.info.started_at,
             self.worker,
         )
+    }
+}
+
+/// Turns `note` (from `remote_phase_note`) into a sentence: first character
+/// upper-cased, a period appended. An empty note gives an empty string.
+fn remote_phase_sentence(note: &str) -> String {
+    let mut chars = note.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
     }
 }
 

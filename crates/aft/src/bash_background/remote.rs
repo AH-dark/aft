@@ -400,6 +400,45 @@ impl RemoteProgress {
     }
 }
 
+/// Where a still-running remote task is, for bash_status and bash_watch:
+/// `queued on the runner (N s, position P)` until the runner reports that the
+/// command started, then `the runner stops it N s after it started`, because
+/// the runner enforces the timeout from start, not from queue entry.
+///
+/// It is read from the task's persisted record, so it reads the same after an
+/// AFT restart. `None` for a local task, a finished task, or a `runon` task the
+/// runner refused (whether or not it then ran locally).
+pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) -> Option<String> {
+    if metadata.is_terminal() || metadata.child_pid.is_some() {
+        return None;
+    }
+    let remote = metadata
+        .remote
+        .as_ref()
+        .filter(|remote| remote.terminal.is_none())?;
+    let phase = RemotePhase::of(remote);
+    if phase == RemotePhase::Running {
+        // The request asks the runner for this many whole seconds (see
+        // `spawn_remote`), so round up the same way.
+        return Some(match metadata.timeout_ms {
+            Some(ms) => format!(
+                "the runner stops it {} s after it started",
+                ms.div_ceil(1000)
+            ),
+            None => "running on the runner".to_string(),
+        });
+    }
+    // Counted from when AFT created the task: the job enters the queue as soon
+    // as it is submitted.
+    let queued_s = now_ms.saturating_sub(metadata.started_at) / 1000;
+    Some(match phase {
+        RemotePhase::Queued { position } => {
+            format!("queued on the runner ({queued_s} s, position {position})")
+        }
+        _ => format!("queued on the runner ({queued_s} s)"),
+    })
+}
+
 #[cfg(unix)]
 impl RemoteTask {
     fn point(&self) -> Option<ResumePoint> {

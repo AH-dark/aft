@@ -200,6 +200,13 @@ export function taskKillDeadlineText(
   // bridge stayed busy) has none to report.
   if (isTerminalTaskStatus(data.status) || typeof data.status !== "string") return "";
   if (data.status === "unknown") return "";
+  // A remote task has no AFT hard-kill deadline (`hard_kill`); report its
+  // build-server status note instead (still queued, or when the runner will
+  // stop it). Mirrors `kill_deadline_text` in crates/aft/src/commands/bash_watch.rs.
+  if (typeof data.remote_phase_note === "string" && data.remote_phase_note !== "") {
+    const note = data.remote_phase_note;
+    return `${note.charAt(0).toUpperCase()}${note.slice(1)}.`;
+  }
   const hardKill = data.hard_kill as { limit_ms?: unknown; source?: unknown } | undefined;
   if (!hardKill || typeof hardKill.limit_ms !== "number") {
     return "This task has no kill deadline.";

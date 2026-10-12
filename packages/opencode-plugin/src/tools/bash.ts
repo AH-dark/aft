@@ -902,6 +902,12 @@ async function formatBashStatusText(
   if (typeof data.live_descendants_summary === "string") {
     text += ` · ${data.live_descendants_summary}`;
   }
+  // A remote task's build-server status note: that it is still queued (and
+  // for how long), or when the runner will stop it. Without this note a
+  // queued job would show as plain "running".
+  if (typeof data.remote_phase_note === "string") {
+    text += ` · ${data.remote_phase_note}`;
+  }
   if (data.output_incomplete === true || (status === "failed" && data.status_reason)) {
     const reason =
       typeof data.status_reason === "string" && data.status_reason

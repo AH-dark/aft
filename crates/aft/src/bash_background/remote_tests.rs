@@ -3469,6 +3469,176 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Running);
 }
 
+/// bash_status for `task_id` in `ctx`, rendered as the agent sees it.
+fn rendered_status(ctx: &crate::context::AppContext, task_id: &str) -> String {
+    let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "status", "command": "bash_status", "session_id": "session",
+        "params": { "task_id": task_id },
+    }))
+    .unwrap();
+    let response = crate::commands::bash_status::handle(&request, ctx);
+    assert!(response.success, "{response:?}");
+    crate::subc_format::format_response_with_context(
+        "bash_status",
+        &response,
+        &crate::subc_format::FormatContext::default(),
+    )
+}
+
+/// A short bash_watch on `task_id` in `ctx`; returns its rendered text.
+async fn rendered_watch(ctx: Arc<crate::context::AppContext>, task_id: &str) -> String {
+    let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "watch", "command": "bash_watch", "session_id": "session",
+        "params": { "task_id": task_id, "timeout_ms": 200 },
+    }))
+    .unwrap();
+    let wake = crate::response_finalize::DeferredResponseWake::default();
+    let producer_wake = wake.clone();
+    let producer_ctx = Arc::clone(&ctx);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _wake = producer_wake.install();
+        crate::commands::bash_watch::handle_deferred(&request, producer_ctx)
+    })
+    .await
+    .unwrap();
+    let response = match outcome {
+        crate::response_finalize::DispatchOutcome::Immediate(response) => response,
+        crate::response_finalize::DispatchOutcome::Deferred(mut pending) => {
+            tokio::time::timeout(Duration::from_secs(10), wake.notified())
+                .await
+                .expect("watch answers");
+            (pending.poll)(&ctx).expect("response queued before completion wake")
+        }
+    };
+    assert!(response.success, "{response:?}");
+    response.data["output"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn remote_phase_note_says_queued_until_started_then_names_the_runner_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut metadata = PersistedTask::starting(
+        "bash-0000000000000001".into(),
+        "session".into(),
+        "cargo test".into(),
+        dir.path().into(),
+        None,
+        Some(600_500),
+        true,
+        false,
+    );
+    metadata.status = BgTaskStatus::Running;
+    metadata.started_at = 1_000_000;
+    metadata.remote = Some(RemoteTask {
+        accepted_platform: None,
+        connection_file: None,
+        explicit_runon: true,
+        harness: "runner".into(),
+        session: "session".into(),
+        requested_platform: None,
+        requested_vcpus: None,
+        requested_network: false,
+        granted_network: false,
+        accepted: false,
+        started: None,
+        job_id: None,
+        last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
+        stdout_len: 0,
+        stderr_len: 0,
+        unknown_len: 0,
+        cancel_requested: false,
+        terminal: None,
+        fallback_digest: None,
+        env_not_forwarded: None,
+        queue_position: None,
+        output_received: false,
+        retry: None,
+    });
+    let now = 1_042_900;
+    // Before acceptance there is no position to report.
+    assert_eq!(
+        remote_phase_note(&metadata, now).as_deref(),
+        Some("queued on the runner (42 s)")
+    );
+    let remote = metadata.remote.as_mut().unwrap();
+    remote.job_id = Some(id());
+    remote.queue_position = Some(7);
+    assert_eq!(
+        remote_phase_note(&metadata, now).as_deref(),
+        Some("queued on the runner (42 s, position 7)")
+    );
+    metadata.remote.as_mut().unwrap().started = Some(Started::new(3, 40_000, 1));
+    // The task's timeout_ms is 600_500 (set above); the runner takes whole
+    // seconds, so AFT asks it for 601 and the note says the same.
+    assert_eq!(
+        remote_phase_note(&metadata, now).as_deref(),
+        Some("the runner stops it 601 s after it started")
+    );
+    // A `runon` task the runner refused may fall back to a local process
+    // (here, a local child_pid is set); it then has no remote phase note.
+    let mut fallback = metadata.clone();
+    fallback.child_pid = Some(4242);
+    assert_eq!(remote_phase_note(&fallback, now), None);
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    assert_eq!(remote_phase_note(&metadata, now), None);
+}
+
+#[tokio::test]
+async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart() {
+    for started in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        // Accepted at queue position 1 and persisted; the connection file is
+        // missing, so the restarted registry keeps trying to re-attach and
+        // the task stays running with exactly the persisted stream records.
+        let (original, task_id, paths) = persist_accepted_with_snapshot(
+            dir.path(),
+            dir.path().join("missing-connection.json"),
+            "cargo test",
+        );
+        drop(original);
+        if started {
+            let mut metadata = read_task(&paths.json).unwrap();
+            metadata.remote.as_mut().unwrap().started = Some(Started::new(0, 2_000, 1));
+            write_task(&paths.json, &metadata).unwrap();
+        }
+        let ctx = Arc::new(restarted_context(dir.path()));
+        ctx.bash_background()
+            .replay_session(dir.path(), "session")
+            .unwrap();
+
+        let status = rendered_status(&ctx, &task_id);
+        let watch = rendered_watch(Arc::clone(&ctx), &task_id).await;
+        if started {
+            assert!(
+                status.starts_with(&format!(
+                    "Task {task_id}: running · the runner stops it 30 s after it started\n"
+                )),
+                "{status}"
+            );
+            assert!(
+                watch.ends_with("\nThe runner stops it 30 s after it started."),
+                "{watch}"
+            );
+        } else {
+            let header = format!("Task {task_id}: running · queued on the runner (");
+            assert!(status.starts_with(&header), "{status}");
+            assert!(
+                status.lines().next().unwrap().ends_with(" s, position 1)"),
+                "{status}"
+            );
+            let last = watch.lines().last().unwrap();
+            assert!(
+                last.starts_with("Queued on the runner (") && last.ends_with(" s, position 1)."),
+                "{watch}"
+            );
+        }
+        assert!(!watch.contains("no kill deadline"), "{watch}");
+        ctx.bash_background().detach();
+    }
+}
+
 #[tokio::test]
 async fn runon_draining_twice_then_accepts_and_discloses_wait() {
     let daemon = daemon(

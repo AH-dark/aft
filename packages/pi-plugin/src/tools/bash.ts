@@ -480,6 +480,8 @@ interface BashStatusDetails {
   live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
   live_descendants_omitted?: number;
   live_descendants_summary?: string;
+  /** Where a still-running remote task is on the build server. */
+  remote_phase_note?: string;
   waited?: BashStatusWaited;
 }
 
@@ -1810,6 +1812,11 @@ async function formatBashStatus(
   let text = `Task ${taskId}: ${details.status}${exit}${dur}`;
   if (details.live_descendants_summary) {
     text += ` · ${details.live_descendants_summary}`;
+  }
+  // A bash_watch reply (`details.waited` set) already reports the remote
+  // phase in its kill-deadline line, so skip it here to avoid printing it twice.
+  if (details.remote_phase_note && !details.waited) {
+    text += ` · ${details.remote_phase_note}`;
   }
   if (details.output_incomplete || (details.status === "failed" && details.status_reason)) {
     text += `\n[${details.status_reason || "PTY output may be incomplete"}]`;

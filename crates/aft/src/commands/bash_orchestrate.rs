@@ -1181,6 +1181,7 @@ mod tests {
             hard_kill: None,
             elapsed_ms: None,
             remote_job_id: None,
+            remote_phase_note: None,
         }
     }
 

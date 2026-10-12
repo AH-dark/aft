@@ -430,6 +430,10 @@ pub struct BgTaskSnapshot {
     /// runner has accepted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_job_id: Option<String>,
+    /// Where a still-running remote task is on the build server: queued (and
+    /// for how long), or running with the runner's stop deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_phase_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -9710,6 +9714,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         hard_kill,
         elapsed_ms: None,
         remote_job_id,
+        remote_phase_note: None,
     }
 }
 
@@ -9833,6 +9838,7 @@ impl BgTask {
             elapsed_ms: (!metadata.status.is_terminal())
                 .then(|| self.elapsed_for_metadata(metadata).as_millis() as u64),
             remote_job_id: remote_job_id(metadata),
+            remote_phase_note: remote::remote_phase_note(metadata, unix_millis()),
         }
     }
 

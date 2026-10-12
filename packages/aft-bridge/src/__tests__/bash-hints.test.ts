@@ -102,6 +102,20 @@ describe("taskKillDeadlineText", () => {
     );
   });
 
+  test("a remote task names its build-server phase instead of a missing deadline", () => {
+    const queued = { ...running(), remote_phase_note: "queued on the runner (12 s, position 3)" };
+    expect(taskKillDeadlineText(queued, "worker", defaultNowMs)).toBe(
+      "Queued on the runner (12 s, position 3).",
+    );
+    const started = {
+      ...running(),
+      remote_phase_note: "the runner stops it 600 s after it started",
+    };
+    expect(taskKillDeadlineText(started, "primary", defaultNowMs)).toBe(
+      "The runner stops it 600 s after it started.",
+    );
+  });
+
   test("matches the Rust renderer's shared deadline wording fixture", () => {
     const fixture = JSON.parse(
       fs.readFileSync(
