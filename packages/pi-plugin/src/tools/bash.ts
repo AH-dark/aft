@@ -480,7 +480,7 @@ interface BashStatusDetails {
   live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
   live_descendants_omitted?: number;
   live_descendants_summary?: string;
-  /** Where a still-running remote task is on the build server. */
+  /** Text note saying which phase a still-running remote task has reached on the build server. */
   remote_phase_note?: string;
   waited?: BashStatusWaited;
 }

@@ -313,8 +313,8 @@ async fn cancelled_wait_names_its_task_once_and_delivers_its_completion_after_re
         .observed_status(&task_id, CANCEL_SESSION, 0)
         .is_some_and(|snapshot| !snapshot.info.status.is_terminal()));
 
-    // A further bash call does not name the task again: the notice is shown
-    // once per task.
+    // A further bash call does not name the task again: a still-running task
+    // is named only once.
     route_bash(
         &executor,
         &root,
