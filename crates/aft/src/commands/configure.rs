@@ -9397,8 +9397,10 @@ mod tests {
             )
         };
         let projected = dead_code(store);
+        // `projected` is Debug-formatted, which escapes Windows backslashes, so
+        // the expected path is Debug-formatted the same way.
         assert!(
-            projected.contains(&cold.project_root().join("lib.rs").display().to_string()),
+            projected.contains(&format!("{:?}", cold.project_root().join("lib.rs"))),
             "{projected}"
         );
         assert_eq!(projected, dead_code(cold));
