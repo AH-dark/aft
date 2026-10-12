@@ -262,8 +262,11 @@ mod tests {
         let key = scope("worker", u64::MAX);
         let root = dir.path().join("root");
         let bind = policy(&key, &root);
+        // Stored grants carry the canonical policy identity (on macOS the
+        // temp dir's /var is /private/var), so build the expected grant the
+        // same way.
         let grant = AccessGrant {
-            path: dir.path().join("outside"),
+            path: crate::access_policy::policy_path(&dir.path().join("outside")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Write,
         };
@@ -305,7 +308,7 @@ mod tests {
         register_scope(&conn, &scope, None, &Config::default()).unwrap();
         let bind = policy(&scope, dir.path());
         let grant = AccessGrant {
-            path: dir.path().join("future"),
+            path: crate::access_policy::policy_path(&dir.path().join("future")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         };
