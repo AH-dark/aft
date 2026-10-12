@@ -4,7 +4,7 @@
 //! must also be old, and all writers, pins, readers and local SQLite handles must
 //! have gone. Unknown keys receive a fresh observation grace instead of treating
 //! an old payload mtime as proof that a root has not recently been bound.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, ReadDir};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,17 @@ use serde::{Deserialize, Serialize};
 use crate::context::SubcLifecycleAdmission;
 
 pub(crate) const ROOT_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// How long the caches of a deleted linked worktree are kept after its last
+/// bind. Every deleted-checkout decision reads this one constant.
 const LINKED_WORKTREE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+/// A checkout view folder (`views/<scope>`) that no family registry lists and
+/// no binding history describes was never tied to a checkout this storage
+/// knows about, typically an abandoned build. It is reclaimed once it has
+/// been observed for this long and none of its files changed for this long.
+const ORPHAN_VIEW_GRACE_MS: u64 = 60 * 60 * 1000;
+/// Caches of checkouts already past their grace that one pass processes
+/// before resuming the lexical walk.
+const DUE_FIRST_ENTRIES: usize = 64;
 const INTERVAL: Duration = Duration::from_secs(10 * 60);
 // Startup can warm many checkout views at once. Keep storage-wide V1 blob
 // marking (which must exclude pin admission) off that request-critical lane.
@@ -64,7 +74,20 @@ pub(crate) struct SweepReport {
     pub skipped_recent: usize,
     pub skipped_mount_mismatch: usize,
     pub skipped_protected: usize,
+    /// Caches kept because a fact needed to judge them could not be read.
+    pub skipped_unknown: usize,
     pub unmeasured_removed_roots: usize,
+    /// Binding records written before linked-worktree topology was recorded,
+    /// upgraded in place while their checkout still existed.
+    pub upgraded_bindings: usize,
+    /// Keys whose every binding is past its grace with caches still on disk
+    /// when the pass began.
+    pub due_keys: usize,
+    /// The share of this pass spent on keys already past their grace.
+    pub due_first: DomainReport,
+    /// The share of this pass spent on view folders with no registry member
+    /// and no binding history.
+    pub orphan_views: DomainReport,
     pub stopped_early: bool,
     pub cancelled: bool,
     pub errors: Vec<String>,
@@ -79,6 +102,7 @@ pub(crate) struct DomainReport {
     pub skipped_live: usize,
     pub skipped_mount_mismatch: usize,
     pub skipped_protected: usize,
+    pub skipped_unknown: usize,
     pub removed_roots: usize,
     pub removed_bytes: u64,
     pub unmeasured_removed_roots: usize,
@@ -92,6 +116,7 @@ impl DomainReport {
             skipped_live: report.skipped_live,
             skipped_mount_mismatch: report.skipped_mount_mismatch,
             skipped_protected: report.skipped_protected,
+            skipped_unknown: report.skipped_unknown,
             removed_roots: report.removed_roots,
             removed_bytes: report.removed_bytes,
             unmeasured_removed_roots: report.unmeasured_removed_roots,
@@ -105,6 +130,7 @@ impl DomainReport {
             skipped_live: self.skipped_live - before.skipped_live,
             skipped_mount_mismatch: self.skipped_mount_mismatch - before.skipped_mount_mismatch,
             skipped_protected: self.skipped_protected - before.skipped_protected,
+            skipped_unknown: self.skipped_unknown - before.skipped_unknown,
             removed_roots: self.removed_roots - before.removed_roots,
             removed_bytes: self.removed_bytes - before.removed_bytes,
             unmeasured_removed_roots: self.unmeasured_removed_roots
@@ -118,6 +144,7 @@ impl DomainReport {
         self.skipped_live += other.skipped_live;
         self.skipped_mount_mismatch += other.skipped_mount_mismatch;
         self.skipped_protected += other.skipped_protected;
+        self.skipped_unknown += other.skipped_unknown;
         self.removed_roots += other.removed_roots;
         self.removed_bytes += other.removed_bytes;
         self.unmeasured_removed_roots += other.unmeasured_removed_roots;
@@ -130,6 +157,9 @@ struct State {
     last_run: Option<Instant>,
     running: bool,
     report: Option<SweepReport>,
+    /// The last key the due-first lane processed, so keys that stay protected
+    /// cannot starve the ones after them.
+    due_cursor: Option<String>,
 }
 
 pub(crate) fn startup_sweeps_ready(storage: &Path) -> bool {
@@ -1044,6 +1074,7 @@ fn eligible(
     key: &str,
     history: &BTreeMap<String, Vec<Binding>>,
     now: u64,
+    unknown_grace_ms: u64,
     report: &mut SweepReport,
 ) -> io::Result<bool> {
     if let Some(records) = history.get(key) {
@@ -1077,11 +1108,55 @@ fn eligible(
         }
         Err(error) => return Err(error),
     };
-    if now.saturating_sub(first_seen) >= ROOT_GRACE_MS {
+    if now.saturating_sub(first_seen) >= unknown_grace_ms {
         return Ok(true);
     }
     report.skipped_recent += 1;
     Ok(false)
+}
+
+/// The view scopes every family registry lists, read at most once per pass
+/// and only when a pass meets a view folder with no binding history.
+#[derive(Default)]
+struct ViewMembers(Option<Result<HashSet<String>, String>>);
+
+impl ViewMembers {
+    /// `Err` when any family registry could not be read completely: a scope
+    /// that registry might list is then unknown, never absent.
+    fn contains(&mut self, storage: &Path, scope: &str) -> Result<bool, String> {
+        self.0
+            .get_or_insert_with(|| view_member_scopes(storage).map_err(|error| error.to_string()))
+            .as_ref()
+            .map(|scopes| scopes.contains(scope))
+            .map_err(Clone::clone)
+    }
+}
+
+fn view_member_scopes(storage: &Path) -> io::Result<HashSet<String>> {
+    let mut scopes = HashSet::new();
+    for entry in bounded_dirs(&storage.join("blobs/v2"), TREE_ENTRIES)? {
+        if !entry
+            .path()
+            .join(crate::views::registry::REGISTRY_FILE)
+            .exists()
+        {
+            continue;
+        }
+        let family = entry.file_name().to_string_lossy().into_owned();
+        let registry = crate::views::registry::FamilyRegistry::open_existing(storage, &family)
+            .map_err(|error| io::Error::other(format!("family registry {family}: {error}")))?
+            .ok_or_else(|| io::Error::other(format!("family registry {family} vanished")))?;
+        let members = registry
+            .members_bounded(HISTORY_ENTRIES + 1)
+            .map_err(|error| io::Error::other(format!("family registry {family}: {error}")))?;
+        if members.len() > HISTORY_ENTRIES {
+            return Err(io::Error::other(format!(
+                "family registry {family} lists more than {HISTORY_ENTRIES} views"
+            )));
+        }
+        scopes.extend(members.into_iter().map(|member| member.scope));
+    }
+    Ok(scopes)
 }
 
 fn candidate(
@@ -1093,6 +1168,47 @@ fn candidate(
     now: u64,
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
+    members: &mut ViewMembers,
+    report: &mut SweepReport,
+) -> io::Result<()> {
+    let before = DomainReport::from_report(report);
+    let mut orphan = false;
+    let result = candidate_inner(
+        storage,
+        directory,
+        key,
+        flat,
+        history,
+        now,
+        deadline,
+        cancelled,
+        members,
+        &mut orphan,
+        report,
+    );
+    if orphan {
+        let mut delta = DomainReport::from_report(report).difference(&before);
+        delta.examined += 1;
+        if result.is_err() {
+            // The caller counts a failed candidate as protected.
+            delta.skipped_protected += 1;
+        }
+        report.orphan_views.add(&delta);
+    }
+    result
+}
+
+fn candidate_inner(
+    storage: &Path,
+    directory: &Path,
+    key: &str,
+    flat: bool,
+    history: &BTreeMap<String, Vec<Binding>>,
+    now: u64,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    members: &mut ViewMembers,
+    orphan: &mut bool,
     report: &mut SweepReport,
 ) -> io::Result<()> {
     let cache = if flat {
@@ -1187,7 +1303,34 @@ fn candidate(
             return Ok(());
         }
     }
-    if !eligible(storage, key, history, now, report)? {
+    // A checkout view folder with neither binding history nor a registry
+    // member is an orphan: it gets a short observation grace instead of the
+    // week reserved for keys whose checkout might still come back. A folder a
+    // registry lists keeps the week; an unreadable registry keeps everything.
+    let mut unknown_grace_ms = ROOT_GRACE_MS;
+    if !flat
+        && directory.file_name().is_some_and(|name| name == "views")
+        && !history.contains_key(key)
+    {
+        match members.contains(storage, key) {
+            Ok(true) => {}
+            Ok(false) => {
+                *orphan = true;
+                unknown_grace_ms = ORPHAN_VIEW_GRACE_MS;
+            }
+            Err(error) => {
+                *orphan = true;
+                report.skipped_unknown += 1;
+                if report.errors.len() < 16 {
+                    report
+                        .errors
+                        .push(format!("{}: orphan check: {error}", cache.display()));
+                }
+                return Ok(());
+            }
+        }
+    }
+    if !eligible(storage, key, history, now, unknown_grace_ms, report)? {
         return Ok(());
     }
     if !history.contains_key(key)
@@ -1199,11 +1342,12 @@ fn candidate(
                 )
             }) && fs::metadata(path)
                 .and_then(|metadata| metadata.modified())
-                .is_ok_and(|mtime| {
+                // An orphan's file that cannot be dated may be changing now.
+                .map_or(*orphan, |mtime| {
                     std::time::SystemTime::now()
                         .duration_since(mtime)
                         .unwrap_or_default()
-                        < Duration::from_millis(ROOT_GRACE_MS)
+                        < Duration::from_millis(unknown_grace_ms)
                 })
         })
     {
@@ -1213,10 +1357,18 @@ fn candidate(
     // Walks run without either admission or SQLite's process-wide open gate.
     // Recheck protection and binding history under admission immediately before
     // deletion, since a configure or query may have arrived during the walks.
+    // A registration binds its root under this barrier before it creates a
+    // view folder, so an orphan that gained history here is no longer one.
     let _barrier = barrier(storage)?;
     let current_history = bindings(storage)?;
-    if !eligible(storage, key, &current_history, now, report)?
-        || crate::root_cache::live_scope_keys_for_storage(storage).contains(key)
+    if !eligible(
+        storage,
+        key,
+        &current_history,
+        now,
+        unknown_grace_ms,
+        report,
+    )? || crate::root_cache::live_scope_keys_for_storage(storage).contains(key)
         || protected(&cache)?
     {
         report.skipped_protected += 1;
@@ -1267,6 +1419,114 @@ pub(crate) fn run_pass(storage: &Path, cancelled: &dyn Fn() -> bool) -> SweepRep
     run_pass_with_clock(storage, cancelled, &Instant::now)
 }
 
+/// Keys whose every binding is missing and past its grace, in key order.
+fn due_keys(history: &BTreeMap<String, Vec<Binding>>, now: u64) -> Vec<String> {
+    history
+        .iter()
+        .filter(|(key, records)| {
+            key_valid(key)
+                // Root presence is one stat; the full test may probe volumes.
+                && records
+                    .iter()
+                    .all(|binding| matches!(binding.root.try_exists(), Ok(false)))
+                && records.iter().all(|binding| missing_and_old(binding, now))
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// Runs the full candidate checks on the checkout caches of keys that are
+/// already due, starting after the key the previous pass ended on.
+fn due_first(
+    storage: &Path,
+    domains: &[(PathBuf, bool)],
+    history: &BTreeMap<String, Vec<Binding>>,
+    deadline: Instant,
+    clock: &dyn Fn() -> Instant,
+    cancelled: &dyn Fn() -> bool,
+    members: &mut ViewMembers,
+    report: &mut SweepReport,
+) -> io::Result<()> {
+    let mut caches = Vec::new();
+    for key in due_keys(history, report.at_ms) {
+        let mut present = false;
+        for (directory, flat) in domains {
+            // Flat legacy domains keep several keys per directory; the
+            // lexical walk handles their file sets.
+            if *flat {
+                continue;
+            }
+            if fs::symlink_metadata(directory.join(&key)).is_ok_and(|metadata| metadata.is_dir()) {
+                present = true;
+                caches.push((key.clone(), directory.clone()));
+            }
+        }
+        report.due_keys += usize::from(present);
+    }
+    let cursor = states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(storage)
+        .and_then(|state| state.due_cursor.clone());
+    let start = cursor.map_or(0, |last| caches.partition_point(|(key, _)| *key <= last));
+    caches.rotate_left(start);
+    let mut last = None;
+    for (key, directory) in caches.into_iter().take(DUE_FIRST_ENTRIES) {
+        if cancelled() {
+            report.cancelled = true;
+            break;
+        }
+        if clock() >= deadline {
+            report.stopped_early = true;
+            break;
+        }
+        let before = DomainReport::from_report(report);
+        report.examined += 1;
+        if let Err(error) = candidate(
+            storage,
+            &directory,
+            &key,
+            false,
+            history,
+            report.at_ms,
+            deadline,
+            cancelled,
+            members,
+            report,
+        ) {
+            report.skipped_protected += 1;
+            if report.errors.len() < 16 {
+                report
+                    .errors
+                    .push(format!("{}: {error}", directory.join(&key).display()));
+            }
+        }
+        let delta = DomainReport::from_report(report).difference(&before);
+        report.due_first.add(&delta);
+        report
+            .domains
+            .entry(
+                directory
+                    .strip_prefix(storage)
+                    .map_err(io::Error::other)?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .or_default()
+            .add(&delta);
+        last = Some(key);
+    }
+    if let Some(last) = last {
+        states()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(storage.to_path_buf())
+            .or_default()
+            .due_cursor = Some(last);
+    }
+    Ok(())
+}
+
 fn run_pass_with_clock(
     storage: &Path,
     cancelled: &dyn Fn() -> bool,
@@ -1296,8 +1556,26 @@ fn run_pass_with_clock(
                 .or_default();
         }
         let deadline = Instant::now() + PASS_BUDGET;
+        let mut members = ViewMembers::default();
+        // Keys already past their grace go first, with at most half the
+        // budget, so their reclaim does not wait for the lexical walk to come
+        // around. That walk visits every cache in every domain and takes days
+        // at the rate new checkouts arrive.
+        due_first(
+            storage,
+            &domains,
+            &history,
+            Instant::now() + PASS_BUDGET / 2,
+            clock,
+            cancelled,
+            &mut members,
+            &mut report,
+        )?;
+        if report.cancelled {
+            return Ok(());
+        }
         let batch = next_batch(storage, &domains)?;
-        report.stopped_early = batch.entries.len() == PASS_ENTRIES;
+        report.stopped_early |= batch.entries.len() == PASS_ENTRIES;
         let mut completed = true;
         for item in batch.entries {
             let TraversalEntry {
@@ -1337,6 +1615,7 @@ fn run_pass_with_clock(
                     report.at_ms,
                     deadline,
                     cancelled,
+                    &mut members,
                     &mut report,
                 ) {
                     report.skipped_protected += 1;
@@ -1456,6 +1735,7 @@ fn collect_one_v2_family(
                 skipped_recent: swept.skipped_recent,
                 skipped_mount_mismatch: swept.skipped_mount_mismatch,
                 skipped_protected: swept.skipped_protected,
+                skipped_unknown: 0,
                 removed_roots: swept.deregistered.len(),
                 removed_bytes: swept.removed_root_bytes,
                 unmeasured_removed_roots: swept.unmeasured_removed_roots,
@@ -2155,6 +2435,18 @@ mod storage_retention_tests {
         legacy: bool,
         history_copies: bool,
     ) -> (tempfile::TempDir, PathBuf, String, PathBuf) {
+        let (temp, root, scope) = bound_checkout_fixture(linked, hours, legacy, history_copies);
+        let path = cache(temp.path(), "views", &scope);
+        fs::remove_dir_all(&root).unwrap();
+        (temp, root, scope, path)
+    }
+
+    fn bound_checkout_fixture(
+        linked: bool,
+        hours: u64,
+        legacy: bool,
+        history_copies: bool,
+    ) -> (tempfile::TempDir, PathBuf, String) {
         let temp = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
         fs::create_dir(&main).unwrap();
@@ -2238,9 +2530,7 @@ mod storage_retention_tests {
                 last_bound + 1000,
             );
         }
-        let path = cache(temp.path(), "views", &scope);
-        fs::remove_dir_all(&root).unwrap();
-        (temp, root, scope, path)
+        (temp, root, scope)
     }
 
     #[test]
@@ -2445,13 +2735,14 @@ mod storage_retention_tests {
         let mut report = SweepReport::default();
         candidate(
             &storage,
-            &storage.join("views"),
+            &storage.join("symbols"),
             key,
             false,
             &BTreeMap::new(),
             now,
             Instant::now() + Duration::from_secs(5),
             &|| false,
+            &mut ViewMembers::default(),
             &mut report,
         )
         .unwrap();
@@ -2462,7 +2753,10 @@ mod storage_retention_tests {
     fn storage_retention_unknown_observation_survives_process_restart() {
         let temp = tempfile::tempdir().unwrap();
         let key = "0123456789abcdef";
-        let view = cache(temp.path(), "views", key);
+        // A symbols cache, not a checkout view folder: view folders without
+        // history follow the hour-long orphan rule, while every other domain
+        // keeps the week-long observation grace this test exercises.
+        let view = cache(temp.path(), "symbols", key);
         // An old payload alone must not authorize deletion on first sight.
         // The synthetic clock advances a week without editing the observation
         // file or waiting a week; every observation uses a fresh OS process.
@@ -2538,6 +2832,132 @@ mod storage_retention_tests {
         assert_eq!(first.examined, PASS_ENTRIES);
         assert_eq!(second.examined, 16);
         assert!(first.stopped_early);
+    }
+
+    /// Makes an orphan view look observed, and unchanged, for over an hour.
+    fn age_orphan(storage: &Path, view: &Path, key: &str) {
+        let two_hours_ago = (crate::pins::now_ms() / 1000) as i64 - 2 * 60 * 60;
+        filetime::set_file_mtime(
+            view.join("payload.bin"),
+            filetime::FileTime::from_unix_time(two_hours_ago, 0),
+        )
+        .unwrap();
+        atomic_json(
+            &storage.join(format!("retention/unknown/{key}.json")),
+            &(crate::pins::now_ms() - ORPHAN_VIEW_GRACE_MS - 60_000),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn storage_retention_orphan_view_is_reclaimed_after_its_short_grace() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "0123456789abcdef";
+        let view = cache(temp.path(), "views", key);
+        // A folder seen for the first time may belong to a build in progress.
+        let first = run_pass(temp.path(), &|| false);
+        assert_eq!(first.removed_roots, 0, "{first:?}");
+        assert_eq!(first.orphan_views.skipped_recent, 1, "{first:?}");
+        assert!(view.exists());
+        age_orphan(temp.path(), &view, key);
+        let second = run_pass(temp.path(), &|| false);
+        assert_eq!(second.removed_roots, 1, "{second:?}");
+        assert_eq!(second.orphan_views.removed_roots, 1, "{second:?}");
+        assert!(second.orphan_views.removed_bytes > 0, "{second:?}");
+        assert!(!view.exists());
+    }
+
+    #[test]
+    fn storage_retention_orphan_view_registration_in_progress_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let scope = crate::path_identity::project_scope_key(&root);
+        let view = cache(temp.path(), "views", &scope);
+        age_orphan(temp.path(), &view, &scope);
+        // The pass judged the folder an orphan from the history it loaded at
+        // the start. A registration binds the root, under the family's
+        // artifact key, before deletion begins.
+        let (worker, release) = paused_pass(temp.path(), &view, "walk");
+        record_bind(temp.path(), &root, "fedcba9876543210").unwrap();
+        release.send(()).unwrap();
+        let report = worker.join().unwrap();
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert!(view.exists());
+    }
+
+    #[test]
+    fn storage_retention_unreadable_registry_keeps_every_orphan_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "0123456789abcdef";
+        let view = cache(temp.path(), "views", key);
+        age_orphan(temp.path(), &view, key);
+        let family = temp.path().join("blobs/v2/fedcba9876543210");
+        fs::create_dir_all(&family).unwrap();
+        fs::write(
+            family.join(crate::views::registry::REGISTRY_FILE),
+            b"not a registry database",
+        )
+        .unwrap();
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.skipped_unknown, 1, "{report:?}");
+        assert_eq!(report.orphan_views.skipped_unknown, 1, "{report:?}");
+        assert!(view.exists());
+    }
+
+    #[test]
+    fn storage_retention_registered_view_without_history_keeps_the_week() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = "0123456789abcdef";
+        let registry =
+            crate::views::registry::FamilyRegistry::open(temp.path(), "fedcba9876543210").unwrap();
+        // A missing root records no binding, so only the registry knows it.
+        drop(
+            registry
+                .register_view(scope, &temp.path().join("missing"))
+                .unwrap(),
+        );
+        let view = cache(temp.path(), "views", scope);
+        age_orphan(temp.path(), &view, scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+        assert_eq!(report.orphan_views.examined, 0, "{report:?}");
+        assert!(view.exists());
+    }
+
+    #[test]
+    fn storage_retention_due_caches_do_not_wait_for_the_lexical_walk() {
+        let (temp, root, scope) = fixture();
+        fs::remove_dir(root).unwrap();
+        // More fresh entries than one lexical batch, all ahead of the due key.
+        for number in 0..PASS_ENTRIES + 8 {
+            cache(temp.path(), "views", &format!("{number:016x}"));
+        }
+        let path = cache(temp.path(), "symbols", &scope);
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.due_keys, 1, "{report:?}");
+        assert_eq!(report.due_first.removed_roots, 1, "{report:?}");
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn storage_retention_legacy_binding_of_a_present_worktree_is_upgraded() {
+        let (temp, root, scope) = bound_checkout_fixture(true, 25, true, false);
+        let record_path = temp.path().join(format!("retention/roots/{scope}.json"));
+        let legacy: serde_json::Value = read_json(&record_path).unwrap();
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.upgraded_bindings, 1, "{report:?}");
+        let record: serde_json::Value = read_json(&record_path).unwrap();
+        assert_eq!(record["linked_worktree"], true);
+        assert_eq!(record["last_bound_ms"], legacy["last_bound_ms"]);
+        let path = cache(temp.path(), "views", &scope);
+        fs::remove_dir_all(&root).unwrap();
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(!path.exists());
     }
 
     #[test]
@@ -2677,7 +3097,14 @@ fn prune_bindings(
         {
             continue;
         }
-        let binding: Binding = read_json(&entry.path())?;
+        let record: serde_json::Value = read_json(&entry.path())?;
+        let binding: Binding = serde_json::from_value(record.clone()).map_err(io::Error::other)?;
+        if record.get("linked_worktree").is_none() && matches!(binding.root.try_exists(), Ok(true))
+        {
+            report.upgraded_bindings +=
+                usize::from(upgrade_legacy_binding(storage, &entry.path())?);
+            continue;
+        }
         if !missing_and_old(&binding, report.at_ms) {
             continue;
         }
@@ -2762,6 +3189,25 @@ fn prune_bindings(
         report.pruned_bindings += 1;
     }
     Ok(())
+}
+
+/// A record written before linked-worktree topology was recorded falls back
+/// to the week-long grace, because the topology can no longer be proven once
+/// the checkout is gone. While the checkout still exists, record the verified
+/// topology in place. The bind clock and volume identity stay as recorded.
+fn upgrade_legacy_binding(storage: &Path, path: &Path) -> io::Result<bool> {
+    let _barrier = barrier(storage)?;
+    let record: serde_json::Value = read_json(path)?;
+    if record.get("linked_worktree").is_some() {
+        return Ok(false);
+    }
+    let mut binding: Binding = serde_json::from_value(record).map_err(io::Error::other)?;
+    if !matches!(binding.root.try_exists(), Ok(true)) {
+        return Ok(false);
+    }
+    binding.linked_worktree = linked_worktree_at_bind(&binding.root);
+    atomic_json(path, &binding)?;
+    Ok(true)
 }
 
 pub(crate) fn schedule(

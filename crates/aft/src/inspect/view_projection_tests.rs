@@ -129,6 +129,21 @@ fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
 }
 
 #[test]
+fn inspect_checkout_view_lookup_never_creates_a_view_folder() {
+    let (_project, storage, job, _request) = view_projection_fixture();
+    let view_dir = storage
+        .path()
+        .join("views")
+        .join(crate::path_identity::project_scope_key(&job.project_root));
+    let _ = std::fs::remove_dir_all(&view_dir);
+    let snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
+    assert!(InspectManager::new().current_checkout_view(&snapshot, None).is_none());
+    // A folder made by a reader has no binding and no registry member; it
+    // would be left behind as an orphan once the checkout is gone.
+    assert!(!view_dir.exists(), "a projection lookup created {view_dir:?}");
+}
+
+#[test]
 fn inspect_checkout_view_refusal_diagnostics_name_compared_values() {
     let (_project, storage, job, request) = view_projection_fixture();
     let mut snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
