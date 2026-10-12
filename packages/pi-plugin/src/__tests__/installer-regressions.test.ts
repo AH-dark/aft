@@ -31,7 +31,7 @@ import {
   runGithubAutoInstall,
   _writeGithubInstalledMetaForTesting as writeGithubMeta,
 } from "../lsp-github-install.js";
-import { findGithubServerById } from "../lsp-github-table.js";
+import { detectHostPlatform, findGithubServerById } from "../lsp-github-table.js";
 import { NPM_LSP_TABLE } from "../lsp-npm-table.js";
 
 const config = { autoInstall: true, graceDays: 7, versions: {}, disabled: new Set<string>() };
@@ -157,7 +157,11 @@ describe("installer regressions", () => {
     await cacheFixture(async (root) => {
       const zls = findGithubServerById("zls");
       if (!zls) throw new Error("zls fixture missing");
-      const asset = zls.resolveAsset("linux", "x64", "1.0.0");
+      // The installer picks the asset for the machine it runs on, so the fake
+      // release must offer that machine's asset name.
+      const host = detectHostPlatform();
+      if (!host) throw new Error("unsupported test host platform");
+      const asset = zls.resolveAsset(host.platform, host.arch, "1.0.0");
       if (!asset) throw new Error("zls asset fixture missing");
       const tree = join(root, "tree");
       mkdirSync(tree);
