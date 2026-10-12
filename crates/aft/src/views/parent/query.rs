@@ -377,13 +377,34 @@ fn resolve_path(
     session: &ParentSession,
     raw: &str,
 ) -> Result<PathBuf, Response> {
-    let validated = ctx.validate_path(&req.id, Path::new(raw))?;
+    let validated = ctx.validate_read_path(&req.id, req.session(), Path::new(raw))?;
     let absolute = if validated.is_relative() {
         session.root().join(validated)
     } else {
         validated
     };
     Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+#[cfg(test)]
+#[test]
+fn artifact_read_parent_callgraph_path() {
+    crate::access_policy_tests::assert_artifact_read_policy(
+        |req, ctx| {
+            let config = ctx.config();
+            let parent = super::engine::tests::session(
+                config.project_root.as_deref().unwrap(),
+                config.storage_dir.as_deref().unwrap(),
+            );
+            drop(config);
+            match resolve_path(req, ctx, &parent, req.params["file"].as_str().unwrap()) {
+                Ok(_) => Response::success(&req.id, serde_json::json!({})),
+                Err(response) => response,
+            }
+        },
+        "callers",
+        |path| serde_json::json!({"file": path}),
+    );
 }
 
 /// A response naming why the parent could not answer from one child.

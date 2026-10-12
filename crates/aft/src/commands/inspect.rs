@@ -2714,7 +2714,7 @@ fn parse_scope(
         } else {
             project_root.join(raw_path)
         };
-        let validated = ctx.validate_path(&req.id, &candidate)?;
+        let validated = ctx.validate_read_path(&req.id, req.session(), &candidate)?;
         if !validated.exists() {
             missing.push(scope);
             continue;

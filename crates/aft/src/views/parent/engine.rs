@@ -273,7 +273,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let scope = match req.params.get("path").and_then(Value::as_str) {
-        Some(raw) => match ctx.validate_path(&req.id, Path::new(raw)) {
+        Some(raw) => match ctx.validate_read_path(&req.id, req.session(), Path::new(raw)) {
             Ok(path) => {
                 let path = if path.is_relative() {
                     session.root().join(path)
@@ -529,7 +529,7 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::*;
     use super::*;
     use crate::blob_store::v2::{ContentHash, FamilyPlane};
@@ -540,7 +540,7 @@ mod tests {
     use crate::views::snapshot::{LiveDelta, OpenGeneration};
     use crate::views::RelPath;
 
-    fn session(root: &Path, storage: &Path) -> ParentSession {
+    pub(crate) fn session(root: &Path, storage: &Path) -> ParentSession {
         ParentSession {
             root: root.to_path_buf(),
             storage: storage.to_path_buf(),
@@ -561,6 +561,23 @@ mod tests {
             pointer_interval: Duration::from_secs(1),
             backstop_interval: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn artifact_read_parent_search() {
+        crate::access_policy_tests::assert_artifact_read_policy(
+            |req, ctx| {
+                let config = ctx.config();
+                let parent = session(
+                    config.project_root.as_deref().unwrap(),
+                    config.storage_dir.as_deref().unwrap(),
+                );
+                drop(config);
+                search(req, ctx, &parent)
+            },
+            "semantic_search",
+            |path| serde_json::json!({"query": "artifact", "path": path}),
+        );
     }
 
     #[test]

@@ -704,6 +704,131 @@ fn restricted_read_allows_only_current_session_bash_artifacts() {
     assert!(aft.shutdown().success());
 }
 
+fn assert_background_artifact_search_access(command: &str) {
+    for restricted in [false, true] {
+        let mut aft = AftProcess::spawn();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let configured = aft.send(
+            &json!({
+                "id": "artifact-search-config",
+                "command": "configure",
+                "harness": "opencode",
+                "project_root": project.path(),
+                "storage_dir": storage.path(),
+                "config": user_config(json!({
+                    "restrict_to_project_root": restricted,
+                    "experimental": { "bash": { "background": true } }
+                }))
+            })
+            .to_string(),
+        );
+        assert_eq!(configured["success"], true, "{configured:?}");
+        let owner = "artifact-search-owner";
+        let spawned = aft.send(
+            &json!({
+                "id": "artifact-search-spawn",
+                "session_id": owner,
+                "command": "bash",
+                "params": { "command": "echo artifact-search-marker", "background": true }
+            })
+            .to_string(),
+        );
+        assert_eq!(spawned["success"], true, "{spawned:?}");
+        let task_id = spawned["task_id"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let completed = loop {
+            let status = status_with_session(&mut aft, task_id, owner);
+            assert_eq!(status["success"], true, "{status:?}");
+            if status["status"] == "completed" {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "task did not complete: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let output_path = Path::new(completed["output_path"].as_str().unwrap());
+        let unregistered = output_path.parent().unwrap().join("unregistered-output");
+        let private_file = storage.path().join("private-file");
+        std::fs::write(&unregistered, "artifact-search-marker").unwrap();
+        std::fs::write(&private_file, "artifact-search-marker").unwrap();
+        let path_forms = if command == "grep" { 2 } else { 1 };
+        for array_path in 0..path_forms {
+            let send = |aft: &mut AftProcess, session: &str, path: &Path| {
+                let path = if array_path == 1 {
+                    json!([path])
+                } else {
+                    json!(path)
+                };
+                aft.send(
+                    &json!({
+                        "id": "artifact-search-read",
+                        "session_id": session,
+                        "command": command,
+                        "path": path,
+                        "pattern": if command == "grep" { "artifact-search-marker" } else { "*" }
+                    })
+                    .to_string(),
+                )
+            };
+            let own = send(&mut aft, owner, output_path);
+            assert_eq!(own["success"], true, "owned {command} failed: {own:?}");
+            let results = if command == "grep" {
+                "matches"
+            } else {
+                "files"
+            };
+            assert_eq!(own[results].as_array().unwrap().len(), 1, "{own:?}");
+            let code = if restricted {
+                "path_outside_root"
+            } else {
+                "denied_floor"
+            };
+            for (session, path) in [
+                ("another-session", output_path),
+                (owner, unregistered.as_path()),
+                (owner, private_file.as_path()),
+                (owner, output_path.parent().unwrap()),
+            ] {
+                let denied = send(&mut aft, session, path);
+                assert_eq!(denied["success"], false, "{command} leaked: {denied:?}");
+                assert_eq!(denied["code"], code, "{denied:?}");
+                if !restricted {
+                    assert_eq!(
+                        denied["message"],
+                        format!(
+                            "path '{}' is denied by the access policy floor",
+                            path.display()
+                        )
+                    );
+                } else {
+                    assert_eq!(
+                        denied["message"],
+                        format!(
+                            "path '{}' is outside the project root '{}'",
+                            path.display(),
+                            std::fs::canonicalize(project.path()).unwrap().display()
+                        )
+                    );
+                }
+            }
+        }
+        assert!(aft.shutdown().success());
+    }
+}
+
+#[test]
+fn grep_reads_only_session_owned_background_artifacts() {
+    assert_background_artifact_search_access("grep");
+}
+
+#[test]
+fn glob_reads_only_session_owned_background_artifacts() {
+    assert_background_artifact_search_access("glob");
+}
+
 #[cfg(unix)]
 #[test]
 fn pty_spawn_honors_requested_terminal_dimensions() {

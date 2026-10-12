@@ -263,7 +263,7 @@ fn resolve_file_or_url(
         .map_err(|error| Response::error(&req.id, "url_fetch_failed", error.to_string()));
     }
 
-    ctx.validate_path(&req.id, Path::new(file))
+    ctx.validate_read_path(&req.id, req.session(), Path::new(file))
 }
 
 fn resolve_zoom_file(

@@ -125,7 +125,7 @@ fn navigation_requires_deferred_execution(req: &RawRequest, ctx: &AppContext) ->
     let Some(file) = req.params.get("file").and_then(serde_json::Value::as_str) else {
         return false;
     };
-    let Ok(file_path) = ctx.validate_path(&req.id, Path::new(file)) else {
+    let Ok(file_path) = ctx.validate_read_path(&req.id, req.session(), Path::new(file)) else {
         return false;
     };
     let config = ctx.config();

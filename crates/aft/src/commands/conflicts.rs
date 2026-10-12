@@ -260,7 +260,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         } else {
             path
         };
-        match ctx.validate_path(&req.id, &path) {
+        match ctx.validate_read_path(&req.id, req.session(), &path) {
             Ok(path) => path,
             Err(resp) => return resp,
         }
@@ -323,7 +323,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
 
     for file_path in &files {
         let full_path = git_toplevel.join(file_path);
-        let validated_path = match ctx.validate_path(&req.id, &full_path) {
+        let validated_path = match ctx.validate_read_path(&req.id, req.session(), &full_path) {
             Ok(path) => path,
             Err(resp) => return resp,
         };

@@ -234,7 +234,7 @@ fn validate_callgraph_path(
     ctx: &AppContext,
     file: &str,
 ) -> Result<PathBuf, Response> {
-    let file_path = ctx.validate_path(&req.id, Path::new(file))?;
+    let file_path = ctx.validate_read_path(&req.id, req.session(), Path::new(file))?;
 
     let project_root = ctx.config().project_root.clone();
     if let Some(project_root) = project_root {

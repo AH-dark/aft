@@ -54,7 +54,7 @@ fn answer_trace_to(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or(10)
         .min(100) as usize;
 
-    let file_path = match ctx.validate_path(&req.id, Path::new(file)) {
+    let file_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };

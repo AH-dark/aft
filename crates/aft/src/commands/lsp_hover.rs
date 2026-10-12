@@ -40,7 +40,7 @@ pub fn handle_lsp_hover(req: &RawRequest, ctx: &AppContext) -> Response {
         return Response::error(&req.id, "invalid_request", "lsp_hover: 'line' must be >= 1");
     }
 
-    let file_path = match ctx.validate_path(&req.id, Path::new(&params.file)) {
+    let file_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&params.file)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };

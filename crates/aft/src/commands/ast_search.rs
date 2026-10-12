@@ -116,6 +116,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let scope = match collect_ast_files(
         &req.id,
+        Some(req.session()),
         "ast_search",
         ctx,
         &project_root,

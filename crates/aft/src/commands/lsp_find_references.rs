@@ -59,7 +59,7 @@ pub fn handle_lsp_find_references(req: &RawRequest, ctx: &AppContext) -> Respons
         );
     }
 
-    let file_path = match ctx.validate_path(&req.id, Path::new(&params.file)) {
+    let file_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&params.file)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };

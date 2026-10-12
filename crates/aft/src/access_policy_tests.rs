@@ -374,3 +374,265 @@ fn access_policy_preserved_location_resolves_parent_before_dotdot() {
     assert_eq!(std::fs::read_to_string(denied).unwrap(), "protected");
     assert_eq!(std::fs::read_to_string(root.join("secret")).unwrap(), "own");
 }
+
+fn artifact_read_context() -> (tempfile::TempDir, AppContext, PathBuf) {
+    use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use crate::bash_background::BgTaskStatus;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("project");
+    let storage = directory.path().join("storage");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&storage).unwrap();
+    let config = Config {
+        project_root: Some(root.clone()),
+        storage_dir: Some(storage.clone()),
+        restrict_to_project_root: false,
+        ..Config::default()
+    };
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let paths = task_paths(&storage, "policy-session", "bash-0123456789abcdef").unwrap();
+    let mut metadata = PersistedTask::starting(
+        "bash-0123456789abcdef".into(),
+        "policy-session".into(),
+        "echo artifact".into(),
+        root.clone(),
+        Some(root),
+        None,
+        false,
+        false,
+    );
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    write_task(&paths.json, &metadata).unwrap();
+    std::fs::write(&paths.stdout, "fn artifact() {}\n").unwrap();
+    std::fs::write(&paths.stderr, "").unwrap();
+    std::fs::write(&paths.exit, "0\n").unwrap();
+    ctx.bash_background()
+        .replay_session(&storage, "policy-session")
+        .unwrap();
+    assert!(ctx
+        .bash_background()
+        .is_session_owned_artifact_path("policy-session", &paths.stdout));
+    ctx.set_harness(crate::harness::Harness::Opencode);
+    (directory, ctx, paths.stdout)
+}
+
+pub(crate) fn assert_artifact_read_policy(
+    handler: impl Fn(&RawRequest, &AppContext) -> crate::protocol::Response,
+    command: &str,
+    params: impl Fn(&Path) -> serde_json::Value,
+) {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    let owned = handler(&request(command, params(&artifact)), &ctx);
+    for code in ["denied_floor", "path_outside_root"] {
+        assert_ne!(
+            owned.data["code"], code,
+            "owner did not reach {command}: {:?}",
+            owned.data
+        );
+    }
+    if owned.data["code"] == "invalid_request" {
+        // Output artifacts have no source-language extension. Reaching the
+        // parser's extension error proves authorization passed, not parsing.
+        assert_eq!(
+            owned.data["message"],
+            "invalid request: unsupported file extension: stdout"
+        );
+    }
+    let unregistered = artifact.parent().unwrap().join("unregistered");
+    std::fs::write(&unregistered, "fn artifact() {}\n").unwrap();
+    for (session, path) in [
+        ("other-session", artifact.as_path()),
+        ("policy-session", unregistered.as_path()),
+        ("policy-session", artifact.parent().unwrap()),
+    ] {
+        let mut req = request(command, params(path));
+        req.session_id = Some(session.into());
+        let denied = handler(&req, &ctx);
+        assert!(!denied.success, "{command} leaked: {:?}", denied.data);
+        assert_eq!(
+            denied.data["code"], "denied_floor",
+            "{command}: {:?}",
+            denied.data
+        );
+        assert_eq!(
+            denied.data["message"],
+            format!(
+                "path '{}' is denied by the access policy floor",
+                path.display()
+            )
+        );
+    }
+}
+
+macro_rules! artifact_read_tool_test {
+    ($name:ident, $handler:expr, $command:literal, $params:expr) => {
+        #[test]
+        fn $name() {
+            assert_artifact_read_policy($handler, $command, $params);
+        }
+    };
+}
+
+artifact_read_tool_test!(
+    artifact_read_outline,
+    crate::commands::outline::handle_outline,
+    "outline",
+    |path| json!({"file": path})
+);
+artifact_read_tool_test!(
+    artifact_read_outline_many,
+    crate::commands::outline::handle_outline,
+    "outline",
+    |path| json!({"files": [path]})
+);
+artifact_read_tool_test!(
+    artifact_read_zoom,
+    crate::commands::zoom::handle_zoom,
+    "zoom",
+    |path| json!({"file": path, "symbol": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_ast_search,
+    crate::commands::ast_search::handle_ast_search,
+    "ast_search",
+    |path| json!({"paths": [path], "lang": "rust", "pattern": "fn $NAME() { $$$ }"})
+);
+artifact_read_tool_test!(
+    artifact_read_search,
+    crate::commands::semantic_search::handle_semantic_search,
+    "semantic_search",
+    |path| json!({"path": path, "query": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_callers,
+    crate::commands::callers::handle_callers,
+    "callers",
+    |path| json!({"file": path, "symbol": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_call_tree,
+    crate::commands::call_tree::handle_call_tree,
+    "call_tree",
+    |path| json!({"file": path, "symbol": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_impact,
+    crate::commands::impact::handle_impact,
+    "impact",
+    |path| json!({"file": path, "symbol": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_trace_to,
+    crate::commands::trace_to::handle_trace_to,
+    "trace_to",
+    |path| json!({"file": path, "symbol": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_trace_to_symbol,
+    crate::commands::trace_to_symbol::handle_trace_to_symbol,
+    "trace_to_symbol",
+    |path| json!({"file": path, "symbol": "artifact", "toSymbol": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_trace_data,
+    crate::commands::trace_data::handle_trace_data,
+    "trace_data",
+    |path| json!({"file": path, "symbol": "artifact", "expression": "value"})
+);
+artifact_read_tool_test!(
+    artifact_read_lsp_hover,
+    crate::commands::lsp_hover::handle_lsp_hover,
+    "lsp_hover",
+    |path| json!({"file": path, "line": 1, "character": 1})
+);
+artifact_read_tool_test!(
+    artifact_read_lsp_goto_definition,
+    crate::commands::lsp_goto_definition::handle_lsp_goto_definition,
+    "lsp_goto_definition",
+    |path| json!({"file": path, "line": 1, "character": 1})
+);
+artifact_read_tool_test!(
+    artifact_read_lsp_find_references,
+    crate::commands::lsp_find_references::handle_lsp_find_references,
+    "lsp_find_references",
+    |path| json!({"file": path, "line": 1, "character": 1})
+);
+artifact_read_tool_test!(
+    artifact_read_lsp_prepare_rename,
+    crate::commands::lsp_prepare_rename::handle_lsp_prepare_rename,
+    "lsp_prepare_rename",
+    |path| json!({"file": path, "line": 1, "character": 1})
+);
+artifact_read_tool_test!(
+    artifact_read_lsp_inspect,
+    crate::commands::lsp_inspect::handle_lsp_inspect,
+    "lsp_inspect",
+    |path| json!({"file": path})
+);
+artifact_read_tool_test!(
+    artifact_read_lsp_diagnostics,
+    crate::commands::lsp_diagnostics::handle_lsp_diagnostics,
+    "lsp_diagnostics",
+    |path| json!({"file": path})
+);
+artifact_read_tool_test!(
+    artifact_read_inspect,
+    crate::commands::inspect::handle_inspect,
+    "inspect",
+    |path| json!({"scope": path, "sections": ["todos"]})
+);
+artifact_read_tool_test!(
+    artifact_read_conflicts,
+    |req, ctx| crate::commands::conflicts::handle_git_conflicts(ctx, req),
+    "conflicts",
+    |path| json!({"path": path})
+);
+
+#[test]
+fn artifact_read_ast_replace_still_requires_write_access() {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    let response = crate::commands::ast_replace::handle_ast_replace(
+        &request(
+            "ast_replace",
+            json!({"paths": [artifact], "lang": "rust", "pattern": "fn $NAME() { $$$ }", "rewrite": "fn changed() {}"}),
+        ),
+        &ctx,
+    );
+    assert_eq!(response.data["code"], "denied_floor");
+    assert_eq!(
+        std::fs::read_to_string(&artifact).unwrap(),
+        "fn artifact() {}\n"
+    );
+}
+
+#[test]
+fn artifact_read_search_does_not_authorize_containing_git_store() {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    let storage = ctx.config().storage_dir.clone().unwrap();
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .arg(&storage)
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    std::fs::write(storage.join("private.rs"), "fn private_artifact() {}\n").unwrap();
+    let mut index = crate::search_index::SearchIndex::build(&storage);
+    let cache_dir = crate::search_index::resolve_cache_dir(&storage, Some(&storage));
+    assert!(index.write_to_disk(&cache_dir, None));
+    let response = crate::commands::semantic_search::handle_semantic_search(
+        &request(
+            "semantic_search",
+            json!({"path": artifact, "pattern": "artifact"}),
+        ),
+        &ctx,
+    );
+    assert_eq!(response.data["code"], "denied_floor", "{:?}", response.data);
+    assert_eq!(
+        response.data["message"],
+        format!(
+            "path '{}' is denied by the access policy floor",
+            std::fs::canonicalize(storage).unwrap().display()
+        )
+    );
+}

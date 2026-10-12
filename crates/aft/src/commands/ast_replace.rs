@@ -229,6 +229,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let scope = match collect_ast_files(
         &req.id,
+        None,
         "ast_replace",
         ctx,
         &project_root,

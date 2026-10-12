@@ -782,6 +782,26 @@ fn handle_semantic_search_with_disk_fallback(
         .map(str::trim)
         .filter(|path| !path.is_empty());
     let external_root = if let Some(requested_path) = requested_path {
+        let requested = project_root.join(crate::readonly_artifacts::expand_tilde(requested_path));
+        if let Err(response) = ctx.validate_read_path(&req.id, req.session(), &requested) {
+            // Restricted external searches already have a public refusal message
+            // naming the Git root. Keep that spelling while enforcing read policy.
+            if response.data["code"] == "path_outside_root" {
+                if let Ok(root) = ctx.resolve_external_git_root(&project_root, requested_path) {
+                    if root != project_root {
+                        return Response::error(
+                            &req.id,
+                            "path_outside_root",
+                            format!(
+                                "aft_search path is outside the configured project root while path restriction is enabled: {}",
+                                root.display()
+                            ),
+                        );
+                    }
+                }
+            }
+            return response;
+        }
         match ctx.resolve_external_git_root(&project_root, requested_path) {
             Ok(root) if root != project_root => {
                 if ctx.config().restrict_to_project_root || ctx.request_force_restrict(&req.id) {
@@ -793,6 +813,11 @@ fn handle_semantic_search_with_disk_fallback(
                             root.display()
                         ),
                     );
+                }
+                // Searching a Git root reads more than the caller's exact file.
+                // An owned task artifact must not authorize the containing store.
+                if let Err(response) = ctx.validate_read_path(&req.id, req.session(), &root) {
+                    return response;
                 }
                 Some(root)
             }
@@ -1171,6 +1196,7 @@ fn collect_pattern_list(
         None,
         split_query::BOUNDED_SCAN_MATCH_LIMIT,
         &req.id,
+        req.session(),
     )?;
     let params = GrepParams {
         include: Vec::new(),
@@ -2609,7 +2635,13 @@ fn handle_external_bounded_lexical_fallback(
     };
 
     let path_value = serde_json::Value::String(external_root.to_string_lossy().into_owned());
-    let scope = match grep_executor::resolve_grep_scope(ctx, Some(&path_value), top_k, &req.id) {
+    let scope = match grep_executor::resolve_grep_scope(
+        ctx,
+        Some(&path_value),
+        top_k,
+        &req.id,
+        req.session(),
+    ) {
         Ok(scope) => scope,
         Err(response) => return response,
     };
@@ -3487,10 +3519,12 @@ fn handle_grep_search(
     let (mut result, ranked_files, examination_note) = if let Some((ranked, note)) = ranked {
         (ranked.summary, Some(ranked.files), note)
     } else {
-        let scope = match grep_executor::resolve_grep_scope(ctx, None, fetch_limit, &req.id) {
-            Ok(scope) => scope,
-            Err(response) => return response,
-        };
+        let scope =
+            match grep_executor::resolve_grep_scope(ctx, None, fetch_limit, &req.id, req.session())
+            {
+                Ok(scope) => scope,
+                Err(response) => return response,
+            };
         let params = GrepParams {
             include: Vec::new(),
             exclude: Vec::new(),

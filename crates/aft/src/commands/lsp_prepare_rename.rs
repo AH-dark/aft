@@ -45,7 +45,7 @@ pub fn handle_lsp_prepare_rename(req: &RawRequest, ctx: &AppContext) -> Response
         );
     }
 
-    let file_path = match ctx.validate_path(&req.id, Path::new(&params.file)) {
+    let file_path = match ctx.validate_read_path(&req.id, req.session(), Path::new(&params.file)) {
         Ok(path) => path,
         Err(resp) => return resp,
     };
