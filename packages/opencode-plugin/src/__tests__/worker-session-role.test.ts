@@ -88,3 +88,27 @@ describe("caller role on every bridge request", () => {
     expect(sends[0]).not.toHaveProperty("worker_session");
   });
 });
+
+describe("host tool names on every bridge request", () => {
+  // OpenCode 2 registers AFT's bash and apply_patch as shell and patch; AFT's
+  // reply text names them only if each request says so.
+  test("an OpenCode 2 context sends its names on both bridge helpers", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, sends, toolCalls } = harness(undefined);
+    const names = { bash: "shell", apply_patch: "patch" };
+    ctx.hostToolNames = names;
+    await callBridge(ctx, runtime("ses_names_v2"), "bash", { command: "ls" });
+    await callToolCall(ctx, runtime("ses_names_v2"), "edit", { patch: "p" });
+    expect(sends[0]).toMatchObject({ session_id: "ses_names_v2", host_tool_names: names });
+    expect(toolCalls[0]?.hostToolNames).toEqual(names);
+  });
+
+  test("a context without names sends none", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, sends, toolCalls } = harness(undefined);
+    await callBridge(ctx, runtime("ses_names_v1"), "bash", { command: "ls" });
+    await callToolCall(ctx, runtime("ses_names_v1"), "edit", { patch: "p" });
+    expect(sends[0]).not.toHaveProperty("host_tool_names");
+    expect(toolCalls[0]).not.toHaveProperty("hostToolNames");
+  });
+});

@@ -354,6 +354,7 @@ fn sandbox_locking_control_never_dispatches_rewrite() {
         "cat note.txt",
         "sandbox-lock",
         None,
+        &aft::host_tool_names::HostToolNames::default(),
         &ctx,
         &AuthenticatedPrincipal::FirstParty,
     )

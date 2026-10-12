@@ -2,6 +2,8 @@ import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
 
+import { renameV2ToolReferences, v2HostToolName } from "../../v2-host-tool-names.js";
+
 const V2_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const V2_PATH_HEADER_TOOLS = new Set(["read", "write", "edit"]);
 const V2_BASH_TOOLS = new Set(["bash"]);
@@ -12,8 +14,9 @@ const V2_BASH_TOOLS = new Set(["bash"]);
  * The host's own command tool asks under `shell`, and the host rewrites a
  * legacy `bash` key in a user's permission config to `shell` when it loads
  * it. A rule for shell commands is therefore only ever stored under `shell`,
- * and a request filed under `bash` matches none of them. AFT's bash keeps its
- * name; only the action its permission requests carry is translated on V2.
+ * and a request filed under `bash` matches none of them. The shared bash
+ * definition asks under `bash`, so the action its permission requests carry
+ * is translated on V2, where the tool itself is registered as `shell`.
  */
 const V2_SHELL_PERMISSION = "shell";
 const ROOT_COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
@@ -208,12 +211,35 @@ function bareToolName(name: string): string {
  * reusing its schema node. The shared definition itself remains unchanged.
  */
 function projectArguments(name: string, definition: ToolDefinition): ToolDefinition["args"] {
-  if (!V2_PATH_HEADER_TOOLS.has(bareToolName(name)) || !("filePath" in definition.args)) {
-    return { ...definition.args };
+  const args = renameArgumentDescriptions(definition.args);
+  if (!V2_PATH_HEADER_TOOLS.has(bareToolName(name)) || !("filePath" in args)) {
+    return args;
   }
 
-  const { filePath, ...rest } = definition.args;
+  const { filePath, ...rest } = args;
   return { path: filePath, ...rest };
+}
+
+/**
+ * Copy the argument map with each argument's description naming the OpenCode
+ * 2 tool names (`shell`, `patch`). An argument whose description needs no
+ * change keeps its original schema node; one that does gets a described copy,
+ * so the shared OpenCode 1 definition is never edited.
+ */
+function renameArgumentDescriptions(args: ToolDefinition["args"]): ToolDefinition["args"] {
+  const renamed: Record<string, ToolDefinition["args"][string]> = {};
+  for (const [key, schema] of Object.entries(args)) {
+    // The shared definitions are built with zod's classic API, whose schemas
+    // carry `description` and `describe()`; the plugin type names only the core.
+    const described = schema as typeof schema & {
+      description?: string;
+      describe(description: string): typeof schema;
+    };
+    const description = described.description;
+    const next = description === undefined ? undefined : renameV2ToolReferences(description);
+    renamed[key] = next === undefined || next === description ? schema : described.describe(next);
+  }
+  return renamed;
 }
 
 function executionArguments(name: string, input: Record<string, unknown>): Record<string, unknown> {
@@ -322,22 +348,30 @@ function runtimeFor(
   };
 }
 
-/** Project one shared V1 definition into the V2 provider-tool contract. */
+/**
+ * Project one shared V1 definition into the V2 provider-tool contract.
+ *
+ * `name` is the AFT tool name. The projected tool is registered under the
+ * OpenCode 2 name (`bash` as `shell`, `apply_patch` as `patch`; see
+ * `v2-host-tool-names.ts`) with descriptions that name those tools, while
+ * permissions, the bash executor and the engine call keep using `name`.
+ */
 export function projectV2Tool(
   name: string,
   definition: ToolDefinition,
   location: V2Location,
   consumers: V2ToolConsumers = {},
 ): V2ProviderTool {
+  const hostName = v2HostToolName(name);
   const input = tool.schema.object(projectArguments(name, definition));
-  assertV2Contract(name, input);
+  assertV2Contract(hostName, input);
   const sharedOptions = (definition as ToolDefinition & { options?: Record<string, unknown> })
     .options;
   const permission = hostPermission(name);
 
   return {
-    name,
-    description: definition.description,
+    name: hostName,
+    description: renameV2ToolReferences(definition.description),
     input,
     options: {
       ...sharedOptions,

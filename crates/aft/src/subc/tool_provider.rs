@@ -4081,6 +4081,7 @@ mod route_tests {
                     standard_edit_grammar: true,
                     disabled_tools: Some(Arc::default()),
                     worker_session: false,
+                    host_tool_names: None,
                 };
                 let result = prepare_tool_call(
                     "edit",

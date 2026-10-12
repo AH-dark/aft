@@ -154,6 +154,15 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let shell_path = match crate::bash_background::resolve_shell_path(params.pty, params.shell) {
         Ok(path) => path,
+        // The only refusal here is a missing PowerShell. Rebuild its message so
+        // it names the command tool by the name this request's host gave it.
+        Err(_) if params.shell.is_powershell() => {
+            return Response::error(
+                &req.id,
+                "powershell_not_installed",
+                crate::bash_background::powershell_missing_message(req.host_tool_names().shell()),
+            )
+        }
         Err(message) => return Response::error(&req.id, "powershell_not_installed", message),
     };
     let execution_command = params.shell.command_text(&params.command);
@@ -374,6 +383,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             &params.command,
             &req.id,
             req.session_id.as_deref(),
+            &req.host_tool_names(),
             ctx,
             &principal,
         ) {

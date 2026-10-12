@@ -51,6 +51,10 @@ pub struct FormatContext {
     pub worker_session: bool,
     /// Whether the caller's tool catalog includes `bash_watch`.
     pub bash_watch_available: Option<bool>,
+    /// The caller's names for AFT's command and patch tools, from the call's
+    /// envelope; `None` when it sent none. Carried here because this context
+    /// travels with a call through every deferred path, bash included.
+    pub host_tool_names: Option<crate::host_tool_names::HostToolNames>,
 }
 
 impl Default for FormatContext {
@@ -74,6 +78,7 @@ impl Default for FormatContext {
             bash_output_mode: None,
             worker_session: false,
             bash_watch_available: None,
+            host_tool_names: None,
         }
     }
 }
@@ -101,6 +106,7 @@ impl FormatContext {
             bash_output_mode: bash_output_mode_for_call(bare_name, arguments),
             worker_session: false,
             bash_watch_available: None,
+            host_tool_names: None,
         }
     }
 }

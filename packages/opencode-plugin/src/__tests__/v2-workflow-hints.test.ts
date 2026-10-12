@@ -2,20 +2,27 @@ import { expect, spyOn, test } from "bun:test";
 import { Effect } from "effect";
 
 import * as logger from "../logger.js";
+import { aftToolNameForV2Host, renameV2ToolReferences } from "../v2-host-tool-names.js";
 import { registerV2WorkflowHints } from "../v2-workflow-hints.js";
 import { buildHintsForRegisteredTools } from "../workflow-hints.js";
 import { bootV2Runtime } from "./helpers/v2-runtime.js";
 
-test("V2 context and compaction inject byte-identical V1 workflow guidance after surface overrides", async () => {
+// The V1 guidance with its tool references renamed to OpenCode 2's `shell`
+// and `patch`; nothing else in the block differs from V1.
+test("V2 context and compaction inject the V1 workflow guidance under V2 tool names after surface overrides", async () => {
   const runtime = await bootV2Runtime({
     edit_mode: "hashline",
     disabled_tools: ["edit", "aft_inspect"],
   });
-  const expected = buildHintsForRegisteredTools(
+  const v1 = buildHintsForRegisteredTools(
     { edit_mode: "hashline" },
-    new Set(runtime.tools.keys()),
+    new Set([...runtime.tools.keys()].map(aftToolNameForV2Host)),
     false,
   );
+  if (v1 === null) throw new Error("expected a workflow hints block");
+  const expected = renameV2ToolReferences(v1);
+  expect(expected).not.toBe(v1);
+  expect(expected).toContain("`shell`");
   expect(runtime.overrides.get("edit_slot_survives")).toBe(false);
   expect(expected).not.toContain("**Hashline edit tags**");
   expect(expected).not.toContain("**AFT status bar**");

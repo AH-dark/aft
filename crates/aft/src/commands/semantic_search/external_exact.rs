@@ -1069,6 +1069,7 @@ mod tests {
             standard_edit_grammar: false,
             disabled_tools: None,
             worker_session: false,
+            host_tool_names: None,
         };
         let dispatch = |request: crate::protocol::RawRequest, app: &crate::context::AppContext| {
             assert_eq!(request.command, "semantic_search");

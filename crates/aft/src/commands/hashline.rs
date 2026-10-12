@@ -27,23 +27,28 @@ struct OwnedMvDestination {
 pub fn handle_preflight(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some((_guard, root)) = effective_binding(req, ctx) else {
         return rejection_response(
-            &req.id,
+            req,
             &HashlineRejection::parse("hashline edit is not enabled for this session"),
-            transport_kind(ctx),
+            ctx,
         );
     };
-    match hashline_preflight_from_args(&req.params, Some(&root)) {
+    let mut agent_arguments = req.params.clone();
+    if let Some(arguments) = agent_arguments.as_object_mut() {
+        // Envelope field, not an agent argument (see `RawRequest::host_tool_names`).
+        arguments.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+    }
+    match hashline_preflight_from_args(&agent_arguments, Some(&root)) {
         Ok(result) => Response::success(&req.id, result.to_json()),
-        Err(rejection) => rejection_response(&req.id, &rejection, transport_kind(ctx)),
+        Err(rejection) => rejection_response(req, &rejection, ctx),
     }
 }
 
 pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
     let Some((guard, root)) = effective_binding(req, ctx) else {
         return rejection_response(
-            &req.id,
+            req,
             &HashlineRejection::parse("hashline edit is not enabled for this session"),
-            transport_kind(ctx),
+            ctx,
         );
     };
     let preview = req
@@ -54,17 +59,19 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut agent_arguments = req.params.clone();
     if let Some(arguments) = agent_arguments.as_object_mut() {
         arguments.remove("preview");
+        // Envelope field, not an agent argument (see `RawRequest::host_tool_names`).
+        arguments.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
     }
     let patch_text = match crate::hashline::syntax::validate_raw_arguments(&agent_arguments) {
         Ok(request) => request.patch,
         Err(rejection) => {
-            return rejection_response(&req.id, &rejection, transport_kind(ctx));
+            return rejection_response(req, &rejection, ctx);
         }
     };
     let patch = match parse_hashline_patch(&patch_text) {
         Ok(patch) => patch,
         Err(rejection) => {
-            return rejection_response(&req.id, &rejection, transport_kind(ctx));
+            return rejection_response(req, &rejection, ctx);
         }
     };
 
@@ -189,7 +196,7 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             response_from_payload(&req.id, payload)
         }
-        Err(rejection) => rejection_response(&req.id, &rejection, transport_kind(ctx)),
+        Err(rejection) => rejection_response(req, &rejection, ctx),
     }
 }
 
@@ -253,11 +260,21 @@ fn transport_kind(ctx: &AppContext) -> TransportKind {
 }
 
 fn rejection_response(
-    id: &str,
+    req: &RawRequest,
     rejection: &HashlineRejection,
-    transport: TransportKind,
+    ctx: &AppContext,
 ) -> Response {
-    response_from_payload(id, render_rejection_response(rejection, transport))
+    // The steering table names the patch tool by its default name; a caller
+    // whose host registered it under another name (OpenCode 2's `patch`) gets
+    // that name. The names are the request's own, never the project's.
+    let mut rejection = rejection.clone();
+    rejection.steering = req
+        .host_tool_names()
+        .name_patch_tool_in(&rejection.steering);
+    response_from_payload(
+        &req.id,
+        render_rejection_response(&rejection, transport_kind(ctx)),
+    )
 }
 
 fn response_from_payload(id: &str, mut payload: Value) -> Response {
@@ -336,6 +353,67 @@ mod tests {
             .expect("tagged read")
             .to_string();
         (temp, root, path, ctx, tag)
+    }
+
+    #[test]
+    fn backup_refusal_names_each_callers_own_patch_tool() {
+        // One root, two callers interleaved: an OpenCode 2 session that sends
+        // its tool names on each request and a caller that sends none. Each
+        // reply names the caller's own patch tool, whatever the other did last.
+        let (_temp, _root, _path, ctx, tag) = registered_fixture("alpha\nbeta\n");
+        ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
+            enabled: false,
+            ..Default::default()
+        });
+        let patch = format!("*** Begin Patch\n[sample.txt#{tag}]\nPUT 1:\n+omega\n*** End Patch");
+        let v2 = json!({ "patch": patch, "host_tool_names": { "bash": "shell", "apply_patch": "patch" } });
+        let default = json!({ "patch": patch });
+        for (params, expected) in [
+            (
+                &v2,
+                "enable backups or use patch for this destructive change",
+            ),
+            (
+                &default,
+                "enable backups or use apply_patch for this destructive change",
+            ),
+            (
+                &v2,
+                "enable backups or use patch for this destructive change",
+            ),
+            (
+                &default,
+                "enable backups or use apply_patch for this destructive change",
+            ),
+        ] {
+            let response = handle_edit(&request("hashline_edit", params.clone()), &ctx);
+            assert!(!response.success, "{}", response.data);
+            assert_eq!(response.data["steering"], expected, "{}", response.data);
+        }
+    }
+
+    #[test]
+    fn host_tool_names_envelope_field_is_not_a_patch_argument() {
+        let (_temp, _root, path, ctx, tag) = registered_fixture("alpha\nbeta\n");
+        let patch = format!("*** Begin Patch\n[sample.txt#{tag}]\nPUT 1:\n+omega\n*** End Patch");
+        let names = json!({ "bash": "shell", "apply_patch": "patch" });
+        let preflight = handle_preflight(
+            &request(
+                "hashline_preflight",
+                json!({ "patch": patch, "host_tool_names": names }),
+            ),
+            &ctx,
+        );
+        assert!(preflight.success, "{}", preflight.data);
+        let applied = handle_edit(
+            &request(
+                "hashline_edit",
+                json!({ "patch": patch, "host_tool_names": names }),
+            ),
+            &ctx,
+        );
+        assert!(applied.success, "{}", applied.data);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "omega\nbeta\n");
     }
 
     #[test]

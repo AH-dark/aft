@@ -105,6 +105,7 @@ pub mod github_read;
 pub mod grep_executor;
 pub mod harness;
 pub mod hashline;
+pub mod host_tool_names;
 pub mod imports;
 pub mod indent;
 pub mod inspect;

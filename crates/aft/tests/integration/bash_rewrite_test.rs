@@ -398,6 +398,90 @@ fn rewrites_cat_read_and_rejects_multiple_files() {
     assert!(rewrite("cat a.txt b.txt", &ctx).is_none());
 }
 
+/// One standalone process, two sessions of one root: an OpenCode 2 session
+/// that sends its tool names (`shell`, `patch`) on each request and a session
+/// that sends none. Interleaved, each reply names the caller's own command
+/// tool; nothing either session sent changes the other's text.
+#[test]
+fn standalone_rewrite_footer_names_each_sessions_own_command_tool() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("a.txt"), "hello\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    let configured = aft.send(
+        &json!({
+            "id": "configure-host-tool-names",
+            "session_id": "opencode-2-session",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "config": user_config(json!({
+                "bash": { "rewrite": true },
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:?}"
+    );
+
+    let names = json!({ "bash": "shell", "apply_patch": "patch" });
+    for (index, (session, sent)) in [
+        ("opencode-2-session", Some(&names)),
+        ("default-session", None),
+        ("opencode-2-session", Some(&names)),
+        ("default-session", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shell = if sent.is_some() { "shell" } else { "bash" };
+        // The bridge sends a bash request with its arguments nested under
+        // `params` and the envelope fields beside it at the top level.
+        let mut request = json!({
+            "id": format!("cat-{index}"),
+            "session_id": session,
+            "command": "bash",
+            "params": {
+                "command": format!("cat {}", project.path().join("a.txt").display()),
+                "workdir": project.path(),
+                "compressed": false,
+            },
+        });
+        if let Some(sent) = sent {
+            request["host_tool_names"] = sent.clone();
+        }
+        let reply = aft.send(&request.to_string());
+        assert_eq!(reply["success"], true, "rewrite failed: {reply:?}");
+        assert!(
+            output(&reply).ends_with(&format!("Prefer `read` tool over {shell}.")),
+            "{session}: {}",
+            output(&reply)
+        );
+
+        let mut pwsh = json!({
+            "id": format!("pwsh-{index}"),
+            "session_id": session,
+            "command": "bash",
+            "params": { "command": "Write-Output hi", "shell": "powershell" },
+        });
+        if let Some(sent) = sent {
+            pwsh["host_tool_names"] = sent.clone();
+        }
+        let reply = aft.send(&pwsh.to_string());
+        if reply["code"] == "powershell_not_installed" {
+            let message = reply["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(&format!("call the {shell} tool without")),
+                "{session}: {message}"
+            );
+        }
+    }
+}
+
 #[test]
 fn rewrites_cat_append_and_echo_append() {
     let dir = tempfile::tempdir().unwrap();

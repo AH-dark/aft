@@ -23,15 +23,18 @@ import { semanticTools } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
 /**
- * Host tool names AFT removes before adding its own.
+ * AFT tools whose OpenCode 2 registration name AFT removes before adding its
+ * own (`apply_patch` is registered, and removed, as `patch`).
  *
- * `bash` is deliberately absent. Two things were observed on a real OpenCode 2
- * host rather than reasoned about: its own shell surface registers under the
- * name `shell`, so nothing the host owns is displaced by AFT taking `bash`;
- * and when a second plugin does claim `bash` first, the registry keeps the
- * later registration, because adding a tool overwrites any entry already under
- * that name. AFT's `bash` is the one the host holds either way, so a preceding
- * remove would change nothing. The load matrix keeps that observation as a row.
+ * `bash` is deliberately absent. Observed on real OpenCode 2 hosts rather than
+ * reasoned about: when two registrations claim one name, whether the host's
+ * own `shell` or another plugin's tool, the registry keeps the later one,
+ * because adding a tool overwrites any entry already under that name, and
+ * built-in plugins always register before package plugins. AFT's `bash`,
+ * registered as `shell`, is the one the host holds either way, so a preceding
+ * remove would change nothing. The real-host load matrix
+ * (test/load-matrix/load-matrix.ts, "GA host holds AFT's shell and patch")
+ * keeps that observation as a row.
  */
 const V2_BUILTIN_REPLACEMENTS = new Set(["read", "edit", "write", "apply_patch"]);
 
@@ -208,6 +211,9 @@ export function buildOpenCodeToolMap(
 /**
  * Register the shared definition inventory on V2 as direct provider tools.
  *
+ * `definitions` is keyed by AFT tool name; each tool is registered under its
+ * OpenCode 2 name (`bash` as `shell`, `apply_patch` as `patch`).
+ *
  * The transform removes only the host tools AFT replaces, does not mutate the
  * shared V1 definitions, and never calls `update`. Projection runs when the
  * host reads its tool transform, so the live runon gate is reflected without
@@ -220,12 +226,10 @@ export function registerAftTools(
   consumers: V2ToolConsumers = {},
 ): unknown {
   return context.tool.transform((editor) => {
-    const projected = Object.entries(definitions).map(([name, definition]) =>
-      projectV2Tool(name, definition, location, consumers),
-    );
-    for (const definition of projected) {
-      if (V2_BUILTIN_REPLACEMENTS.has(definition.name)) editor.remove(definition.name);
-      editor.add(definition);
+    for (const [name, definition] of Object.entries(definitions)) {
+      const projected = projectV2Tool(name, definition, location, consumers);
+      if (V2_BUILTIN_REPLACEMENTS.has(name)) editor.remove(projected.name);
+      editor.add(projected);
     }
   });
 }

@@ -62,7 +62,12 @@ import type {
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
-import { callPresetFor, PRESET_FIELD, WORKER_SESSION_FIELD } from "./transport.js";
+import {
+  callPresetFor,
+  HOST_TOOL_NAMES_FIELD,
+  PRESET_FIELD,
+  WORKER_SESSION_FIELD,
+} from "./transport.js";
 
 /** The subc pool is closing and cannot carry another request. */
 export class SubcTransportShuttingDownError extends SubcCallError {
@@ -1263,6 +1268,7 @@ class SubcTransport implements AftProjectTransport {
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
     if (options?.workerSession === true) body[WORKER_SESSION_FIELD] = true;
+    if (options?.hostToolNames) body[HOST_TOOL_NAMES_FIELD] = options.hostToolNames;
     body[PRESET_FIELD] = callPresetFor(options?.workerSession === true);
     const reply = await this.pool.routeRequest(
       this.identityFor(sessionId),
@@ -1299,9 +1305,16 @@ class SubcTransport implements AftProjectTransport {
     // The caller's role travels beside the call, like the session (which the
     // route bind carries), not inside the command's arguments: the module
     // reads it from the call body.
-    const { [WORKER_SESSION_FIELD]: workerSession, ...args } = params;
+    // The caller's tool names travel the same way: RouteBind has no field for
+    // them, and one route's host must not decide another route's wording.
+    const {
+      [WORKER_SESSION_FIELD]: workerSession,
+      [HOST_TOOL_NAMES_FIELD]: hostToolNames,
+      ...args
+    } = params;
     const body: Record<string, unknown> = { name: command, arguments: args };
     if (workerSession === true) body[WORKER_SESSION_FIELD] = true;
+    if (hostToolNames !== undefined) body[HOST_TOOL_NAMES_FIELD] = hostToolNames;
     body[PRESET_FIELD] = callPresetFor(workerSession === true);
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;

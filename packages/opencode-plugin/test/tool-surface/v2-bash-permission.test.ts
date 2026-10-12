@@ -75,7 +75,10 @@ const executionContext = {
 };
 
 describe("OpenCode 2 files AFT's bash permissions under shell", () => {
-  test("bash keeps its name and every companion keeps its name", async () => {
+  // OpenCode 2 renders its native command row only for a tool named `shell`,
+  // so AFT's bash is registered under that name there (issue #406); the
+  // companions are AFT's own tools and keep theirs.
+  test("bash registers as shell and every companion keeps its name", async () => {
     const added: V2ProviderTool[] = [];
     const removed: string[] = [];
     await Effect.runPromise(
@@ -96,14 +99,19 @@ describe("OpenCode 2 files AFT's bash permissions under shell", () => {
       ) as Effect.Effect<void>,
     );
     const names = added.map((definition) => definition.name);
-    for (const name of BASH_FAMILY) expect(names).toContain(name);
-    expect(names).not.toContain("shell");
+    for (const name of BASH_FAMILY.filter((name) => name !== "bash")) {
+      expect(names).toContain(name);
+    }
+    expect(names.filter((name) => name === "shell")).toHaveLength(1);
+    expect(names).not.toContain("bash");
+    // Registering under the host's name replaces its built-in; nothing is
+    // removed first.
     expect(removed).not.toContain("shell");
   });
 
   test("the bash tool declares the shell permission action", () => {
     const bash = projectV2Tool("bash", definitions().bash as ToolDefinition, LOCATION);
-    expect(bash.name).toBe("bash");
+    expect(bash.name).toBe("shell");
     expect(bash.options.permission).toBe("shell");
   });
 

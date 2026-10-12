@@ -221,6 +221,10 @@ pub struct ToolCallContext {
     /// bash hand-off texts are worded, and it lets a worker's `wait: true`
     /// bash call run without the default hard kill.
     pub worker_session: bool,
+    /// The caller's names for AFT's command and patch tools, from its request
+    /// envelope (see [`RawRequest::host_tool_names`]); `None` when the caller
+    /// sent none, which leaves the default names.
+    pub host_tool_names: Option<crate::host_tool_names::HostToolNames>,
 }
 
 pub(crate) fn ensure_hashline_registration(
@@ -666,6 +670,15 @@ fn raw_request_from_translated(
             json!(true),
         );
     }
+    // Likewise the caller's tool names, which only change how reply text is
+    // worded: from the envelope, never from the agent's arguments.
+    params.remove(crate::host_tool_names::HOST_TOOL_NAMES_FIELD);
+    if let Some(names) = &ctx.host_tool_names {
+        params.insert(
+            crate::host_tool_names::HOST_TOOL_NAMES_FIELD.to_string(),
+            json!(names),
+        );
+    }
     let lsp_hints = params.remove("lsp_hints").filter(|value| !value.is_null());
 
     Ok(RawRequest {
@@ -850,7 +863,32 @@ mod tests {
                 standard_edit_grammar: false,
                 disabled_tools: None,
                 worker_session: false,
+                host_tool_names: None,
             }
+        }
+
+        #[test]
+        fn host_tool_names_come_from_the_envelope_never_from_the_arguments() {
+            let mut params = serde_json::Map::new();
+            params.insert("command".into(), json!("ls"));
+            // An agent that writes the field into its arguments gets it removed.
+            params.insert(
+                crate::host_tool_names::HOST_TOOL_NAMES_FIELD.into(),
+                json!({"bash": "agent-chosen"}),
+            );
+            let plain = raw_request_from_translated("bash".into(), params.clone(), &context(false))
+                .expect("request");
+            assert!(plain.sent_host_tool_names().is_none(), "{:?}", plain.params);
+
+            let mut with_names = context(false);
+            with_names.host_tool_names = Some(crate::host_tool_names::HostToolNames {
+                bash: "shell".into(),
+                apply_patch: "patch".into(),
+            });
+            let named =
+                raw_request_from_translated("bash".into(), params, &with_names).expect("request");
+            assert_eq!(named.host_tool_names().shell(), "shell");
+            assert_eq!(named.host_tool_names().patch(), "patch");
         }
 
         #[test]

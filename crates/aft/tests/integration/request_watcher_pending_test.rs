@@ -36,6 +36,7 @@ fn call_with_drain(
             report_registration_downgrade: false,
             disabled_tools: None,
             worker_session: false,
+            host_tool_names: None,
         },
         ctx,
         &|request: RawRequest, ctx| {

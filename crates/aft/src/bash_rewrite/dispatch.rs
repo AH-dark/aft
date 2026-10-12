@@ -104,13 +104,20 @@ pub fn record_native(request_id: &str, role: ControlRole, branch_id: &str, reaso
 }
 
 pub fn dispatch(command: &str, session_id: Option<&str>, ctx: &AppContext) -> Option<Response> {
-    dispatch_for_request(command, "bash_rewrite", session_id, ctx)
+    dispatch_for_request(
+        command,
+        "bash_rewrite",
+        session_id,
+        &crate::host_tool_names::HostToolNames::default(),
+        ctx,
+    )
 }
 
 pub fn dispatch_for_request(
     command: &str,
     request_id: &str,
     session_id: Option<&str>,
+    host_tool_names: &crate::host_tool_names::HostToolNames,
     ctx: &AppContext,
 ) -> Option<Response> {
     if !ctx.config().experimental_bash_rewrite {
@@ -138,7 +145,11 @@ pub fn dispatch_for_request(
     for rule in rules {
         let decision = rule.decide(command, request_id, session_id, ctx);
         match decision {
-            crate::bash_rewrite::RewriteDecision::Accept(request) => {
+            crate::bash_rewrite::RewriteDecision::Accept(mut request) => {
+                // The footer appended to a rewritten command names the caller's
+                // own tools. Only the request carries those names and the rule
+                // decided from the command alone, so they are copied on here.
+                request.host_tool_names = host_tool_names.clone();
                 store_record(DispatchRecord {
                     request_id: request_id.to_string(),
                     route: DispatchRoute::Rewritten {

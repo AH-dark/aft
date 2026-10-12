@@ -366,12 +366,14 @@ export type {
   AftTransport,
   AftTransportOptions,
   AftTransportPool,
+  HostToolNames,
   ToolCallArguments,
   ToolCallOptions,
   ToolCallResult,
 } from "./transport.js";
 export {
   callPresetFor,
+  HOST_TOOL_NAMES_FIELD,
   observeFreshSessionStart,
   PRESET_FIELD,
   WORKER_SESSION_FIELD,

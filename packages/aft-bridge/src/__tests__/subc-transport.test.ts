@@ -667,6 +667,33 @@ describe("SubcTransport.toolCall", () => {
     });
   });
 
+  // RouteBind cannot carry the host's tool names, and routes of different
+  // hosts can share a root, so the names ride beside each call like the role.
+  test("the host's tool names travel beside each call, never in its arguments", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "ok" }));
+    const { pool } = poolWith(client);
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    const names = { bash: "shell", apply_patch: "patch" };
+
+    await bridge.toolCall("s", "edit", { patch: "p" }, { hostToolNames: names });
+    await bridge.send("bash", { session_id: "sess", command: "make", host_tool_names: names });
+    await bridge.send("bash", { session_id: "other", command: "make" });
+
+    expect(client.requests[0]?.body).toEqual({
+      name: "edit",
+      arguments: { patch: "p" },
+      host_tool_names: names,
+      preset: "head",
+    });
+    expect(client.requests[1]?.body).toEqual({
+      name: "bash",
+      arguments: { session_id: "sess", command: "make" },
+      host_tool_names: names,
+      preset: "head",
+    });
+    expect(client.requests[2]?.body).not.toHaveProperty("host_tool_names");
+  });
+
   // A route the daemon stamped with a scope refuses a tool call that names no
   // catalog preset, and a plugin route may be scoped, so every call names one:
   // `worker` for a worker session, `head` for a primary.

@@ -60,7 +60,7 @@ impl RewriteRule for GrepRule {
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
         let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
-        grep_footer_response(response, ctx, path)
+        grep_footer_response(response, request, ctx, path)
     }
 }
 
@@ -102,7 +102,7 @@ impl RewriteRule for RgRule {
     fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
         let response = crate::commands::grep::handle_grep(&tool_request("grep", request, ctx), ctx);
-        grep_footer_response(response, ctx, path)
+        grep_footer_response(response, request, ctx, path)
     }
 }
 
@@ -152,6 +152,7 @@ impl RewriteRule for FindRule {
         call_and_footer(
             crate::commands::glob::handle_glob(&tool_request("glob", request, ctx), ctx),
             "glob",
+            request,
         )
     }
 }
@@ -196,6 +197,7 @@ impl RewriteRule for CatRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request,
         )
     }
 }
@@ -245,6 +247,7 @@ impl RewriteRule for HeadRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request,
         )
     }
 }
@@ -303,6 +306,7 @@ impl RewriteRule for TailRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request,
         )
     }
 }
@@ -355,6 +359,7 @@ impl RewriteRule for CatAppendRule {
                 ctx,
             ),
             "edit",
+            request,
         )
     }
 }
@@ -400,6 +405,7 @@ impl RewriteRule for SedRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request,
         )
     }
 }
@@ -434,6 +440,7 @@ impl RewriteRule for LsRule {
         call_and_footer(
             crate::commands::read::handle_read(&tool_request("read", request, ctx), ctx),
             "read",
+            request,
         )
     }
 }
@@ -455,6 +462,7 @@ fn accept(
         branch_id,
         decision_class_id,
         params,
+        host_tool_names: crate::host_tool_names::HostToolNames::default(),
     })
 }
 
@@ -536,18 +544,31 @@ fn tool_request(tool: &str, request: &RewriteRequest, ctx: &AppContext) -> RawRe
 /// Add the normal tool footer while preserving a handler error as the final
 /// response. A handler error is not a permission to execute native bash: the
 /// request has already entered the internal handler.
-fn call_and_footer(response: Response, replacement_tool: &str) -> Response {
+fn call_and_footer(
+    response: Response,
+    replacement_tool: &str,
+    request: &RewriteRequest,
+) -> Response {
     let output = response_output(&response.data);
-    let footered = add_footer(&output, replacement_tool);
+    let footered = add_footer(&output, replacement_tool, request.host_tool_names.shell());
     apply_footer(response, footered)
 }
 
-fn grep_footer_response(response: Response, ctx: &AppContext, path: Option<&str>) -> Response {
+fn grep_footer_response(
+    response: Response,
+    request: &RewriteRequest,
+    ctx: &AppContext,
+    path: Option<&str>,
+) -> Response {
     let output = response_output(&response.data);
     let footered = if should_suppress_grep_footer(path, &grep_project_root(ctx)) {
         output
     } else {
-        add_grep_footer(&output, ctx.config().aft_search_registered)
+        add_grep_footer(
+            &output,
+            ctx.config().aft_search_registered,
+            request.host_tool_names.shell(),
+        )
     };
     apply_footer(response, footered)
 }

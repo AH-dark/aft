@@ -492,12 +492,19 @@ fn resolve_powershell_path_with(
     // The command is refused rather than handed to bash: a script written for
     // PowerShell rarely means the same thing under bash, so running it anyway
     // would be worse than a clear refusal. The message names both ways out.
-    lookup(candidate).ok_or_else(|| {
+    lookup(candidate)
+        .ok_or_else(|| powershell_missing_message(crate::host_tool_names::DEFAULT_SHELL_TOOL))
+}
+
+/// The refusal for a PowerShell command on a host without `pwsh`. `shell_tool`
+/// is the name the host registered AFT's command tool under, which is what the
+/// agent has to call again (`bash`, or `shell` on OpenCode 2).
+pub(crate) fn powershell_missing_message(shell_tool: &str) -> String {
+    format!(
         "PowerShell (pwsh) is not installed or is not on PATH, so this command was not run. \
-         Rewrite it in bash syntax and call the bash tool without `shell: \"powershell\"`, \
+         Rewrite it in bash syntax and call the {shell_tool} tool without `shell: \"powershell\"`, \
          or install PowerShell 7+: https://aka.ms/powershell"
-            .to_string()
-    })
+    )
 }
 
 /// Whether a PowerShell command could run on this host right now: the same
@@ -1469,6 +1476,10 @@ mod storage_root_tests {
         assert!(error.contains("https://aka.ms/powershell"));
         // The refusal must name the no-install fix too, not only installation.
         assert!(error.contains("bash tool without `shell: \"powershell\"`"));
+        // A host that registered the command tool under another name gets that
+        // name in the same sentence.
+        assert!(super::powershell_missing_message("shell")
+            .contains("call the shell tool without `shell: \"powershell\"`"));
     }
 
     #[test]
