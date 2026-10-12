@@ -54,6 +54,15 @@ fn catalog_request(raw: Value) -> Value {
 }
 
 #[test]
+fn grants_allow_paths_accepts_a_literal_tilde_inside_an_absolute_path() {
+    // Windows short names (C:\Users\RUNNER~1) put `~` inside absolute paths.
+    let (_dir, ctx, head, _worker) = fixture();
+    let target = head.project_root.join("SHORT~1");
+    let raw = json!([{"path":target,"mode":"read"}]);
+    remote_policy::catalog(catalog_request(raw), &head, &ctx).unwrap();
+}
+
+#[test]
 fn grants_allow_paths_preflight_fetch_revoke_restart_reclaim() {
     let (dir, ctx, head, worker) = fixture();
     let target = head.project_root.join("shared");
@@ -112,6 +121,7 @@ fn grants_allow_paths_atomic_validation_and_named_refusals() {
     let (_dir, ctx, head, worker) = fixture();
     for (bad, reason) in [
         (json!({"path":"relative","mode":"read"}), "not_absolute"),
+        (json!({"path":"~/outside","mode":"read"}), "not_absolute"),
         (json!({"path":"/tmp/../outside","mode":"read"}), "malformed"),
         (json!({"path":"/tmp/*","mode":"read"}), "malformed"),
         (json!({"path":"/tmp/outside"}), "malformed"),

@@ -294,9 +294,12 @@ pub(super) fn validate(
             Some("write") => AccessOperation::Write,
             _ => return Err(malformed()),
         };
+        // A leading `~` is never expanded: `~/x` is not absolute and is refused
+        // below. A `~` inside an absolute path is a literal name, as in Windows
+        // short names (C:\Users\RUNNER~1), so it is not malformed.
         if object.len() != 2
             || path.is_empty()
-            || path.contains(['*', '?', '[', ']', '{', '}', '~', '\0'])
+            || path.contains(['*', '?', '[', ']', '{', '}', '\0'])
             || Path::new(path)
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
