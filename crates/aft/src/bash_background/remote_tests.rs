@@ -2217,7 +2217,7 @@ async fn windows_daemon(
 ) -> crate::exec_remote::wire_tests::Daemon {
     crate::exec_remote::wire_tests::daemon_with_capabilities(
         Script::Windows { code, acknowledge },
-        &["exec-remote/v1", "exec-remote/platforms:windows"],
+        &["exec-remote/v1", "exec-remote-windows/v1"],
         1,
     )
     .await

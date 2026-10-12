@@ -5,6 +5,10 @@ use std::{path::Path, sync::Arc};
 use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer, SubscribeOptions, Subscription};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+/// Capability ck-motor advertises when it accepts Windows jobs. Capability
+/// names must have the `<name>/v<N>` shape the subc daemon validates.
+pub(crate) const WINDOWS_CAPABILITY: &str = "exec-remote-windows/v1";
+
 pub const CAPABILITY: &str = "exec-remote/v1";
 
 /// An authenticated daemon route to the catalog's sole capability provider.
@@ -66,11 +70,11 @@ impl ExecRemoteClient {
                         capabilities
                             .provides
                             .iter()
-                            .any(|capability| capability == "exec-remote/platforms:windows")
+                            .any(|capability| capability == WINDOWS_CAPABILITY)
                     })
             });
             if !advertised {
-                return Err(Error::Protocol("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing exec-remote/platforms:windows)".into()));
+                return Err(Error::Protocol(format!("runon \"windows\" is unavailable: the build server doesn't offer Windows jobs yet (missing {WINDOWS_CAPABILITY})")));
             }
         }
         self.stream("exec.run", request, StreamConsumer::new())
@@ -234,5 +238,22 @@ impl RemoteStream {
         self.consumer
             .finish_recovery(sink)
             .map(StreamProgress::Complete)
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::{CAPABILITY, WINDOWS_CAPABILITY};
+
+    /// The daemon refuses a HELLO whose manifest names a capability outside the
+    /// `<name>/v<N>` grammar, so AFT must check for names that can exist on the wire.
+    #[test]
+    fn checked_capabilities_pass_the_daemon_grammar() {
+        for capability in [CAPABILITY, WINDOWS_CAPABILITY] {
+            assert!(
+                subc_protocol::manifest::is_valid_capability_identifier(capability),
+                "{capability} is not a capability name the daemon admits"
+            );
+        }
     }
 }
