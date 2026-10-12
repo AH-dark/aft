@@ -12,16 +12,17 @@ function flakyHost() {
   return {
     attempts: () => attempts,
     session: {
-      prompt: () =>
+      get: () => Effect.succeed({}),
+      prompt: () => Effect.void,
+      synthetic: () =>
         Effect.suspend(() =>
           ++attempts === 1 ? Effect.fail(new Error("host unavailable")) : Effect.succeed({}),
         ),
-      synthetic: () => Effect.void,
     },
   };
 }
 
-test("V2 completion retries the same task after prompt admission fails", async () => {
+test("V2 completion retries the same task after synthetic admission fails", async () => {
   const host = flakyHost();
   const delivery = new V2SessionDelivery(host.session);
   const wake = { sessionID: "s", taskIDs: ["task"], text: "done" };
@@ -52,7 +53,7 @@ const completion = {
 };
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-test("V2 routing catches a failed prompt and holds it for the next session registration", async () => {
+test("V2 routing catches a failed synthetic admission and holds it for the next session registration", async () => {
   const host = flakyHost();
   const consumer = createV2RuntimeConsumer(host);
   const sends: string[] = [];
@@ -80,11 +81,12 @@ test("V2 routing catches a failed prompt and holds it for the next session regis
 test("V2 bash companions route held completions without launching bash", async () => {
   for (const name of ["bash_status", "bash_watch"]) {
     __resetV2WakeRoutesForTests();
-    const prompts: unknown[] = [];
+    const synthetic: unknown[] = [];
     const consumer = createV2RuntimeConsumer({
       session: {
-        prompt: (input) => Effect.sync(() => prompts.push(input)),
-        synthetic: () => Effect.void,
+        get: () => Effect.succeed({}),
+        prompt: () => Effect.void,
+        synthetic: (input) => Effect.sync(() => synthetic.push(input)),
       },
     });
     const sends: string[] = [];
@@ -96,13 +98,45 @@ test("V2 bash companions route held completions without launching bash", async (
     };
     try {
       await consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never);
-      expect(prompts).toEqual([]);
+      expect(synthetic).toEqual([]);
       await execute(consumer, name);
       await settle();
-      expect(prompts).toHaveLength(1);
+      expect(synthetic).toHaveLength(1);
       expect(sends).toEqual(["bash_ack_completions"]);
     } finally {
       consumer.dispose();
     }
+  }
+});
+
+test("V2 routing withholds acknowledgement during a staged revert and retries after registration", async () => {
+  let reverted = true;
+  const synthetic: unknown[] = [];
+  const consumer = createV2RuntimeConsumer({
+    session: {
+      get: () => Effect.sync(() => ({ revert: reverted ? { messageID: "boundary" } : undefined })),
+      prompt: () => Effect.void,
+      synthetic: (input) => Effect.sync(() => synthetic.push(input)),
+    },
+  });
+  const sends: string[] = [];
+  const bridge = {
+    send: async (command: string) => {
+      sends.push(command);
+      return { success: true };
+    },
+  };
+  try {
+    consumer.registerSession?.("s");
+    await consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never);
+    expect(synthetic).toEqual([]);
+    expect(sends).toEqual([]);
+    reverted = false;
+    consumer.registerSession?.("s");
+    await settle();
+    expect(synthetic).toHaveLength(1);
+    expect(sends).toEqual(["bash_ack_completions"]);
+  } finally {
+    consumer.dispose();
   }
 });

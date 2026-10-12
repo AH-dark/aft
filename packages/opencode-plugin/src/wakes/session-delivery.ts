@@ -1,10 +1,9 @@
 import { Effect, Exit } from "effect";
 
 /**
- * The `metadata.source` value on every prompt AFT admits into a session itself
- * (background-completion wakes). OpenCode 2 runs every prompt, AFT's own
- * included, through the session `prompt` hook; the hook reads this marker to
- * tell AFT's machine-written text from text an operator typed, never the text.
+ * The `metadata.source` marker for AFT-written session input. Synthetic wakes
+ * retain it, and the prompt hook recognises it on machine-originated prompts
+ * so they are not treated as text an operator typed.
  */
 export const AFT_PROMPT_SOURCE = "aft";
 
@@ -30,10 +29,12 @@ export interface V2SessionSyntheticInput {
   readonly text: string;
   readonly description?: string;
   readonly metadata?: Readonly<Record<string, unknown>>;
-  readonly resume: false;
+  readonly delivery?: "steer" | "queue";
+  readonly resume?: boolean;
 }
 
 export interface V2SessionAdmission {
+  get(input: { readonly sessionID: string }): Effect.Effect<{ readonly revert?: unknown }, unknown>;
   prompt(input: V2SessionPromptInput): Effect.Effect<unknown, unknown>;
   synthetic(input: V2SessionSyntheticInput): Effect.Effect<unknown, unknown>;
 }
@@ -53,8 +54,8 @@ export interface StatusOnlyUpdate {
 }
 
 /**
- * Admit V2 session updates through the host's native inbox. Completion text is
- * model-directed, while status records are synthetic and never resume a turn.
+ * Admit V2 session updates as synthetic input so machine-written notices are
+ * not rendered as user turns. Completions wake execution; status does not.
  */
 export class V2SessionDelivery {
   private readonly admittedCompletions = new Set<string>();
@@ -73,18 +74,29 @@ export class V2SessionDelivery {
       for (const key of reserved) this.admittedCompletions.add(key);
 
       return Effect.suspend(() =>
-        this.session.prompt({
-          sessionID: input.sessionID,
-          text: input.text,
-          delivery: "steer",
-          metadata: {
-            ...input.metadata,
-            // Set last so no caller metadata can drop the marker the prompt
-            // hook relies on to treat this wake as machine-written.
-            source: AFT_PROMPT_SOURCE,
-            task_ids: [...new Set(input.taskIDs)],
-          },
-        }),
+        this.session.get({ sessionID: input.sessionID }).pipe(
+          Effect.flatMap((session) => {
+            // A committed revert deletes synthetic input admitted after its
+            // boundary. Keep the completion unacknowledged and retryable instead.
+            if (session.revert) {
+              return Effect.fail(
+                new Error("Background bash completion deferred: session has a staged revert"),
+              );
+            }
+            return this.session.synthetic({
+              sessionID: input.sessionID,
+              text: input.text,
+              description: "Background bash completed",
+              delivery: "steer",
+              metadata: {
+                ...input.metadata,
+                // Keep the origin marker even if the caller supplies its own source.
+                source: AFT_PROMPT_SOURCE,
+                task_ids: [...new Set(input.taskIDs)],
+              },
+            });
+          }),
+        ),
       ).pipe(
         Effect.onExit((exit) =>
           Effect.sync(() => {

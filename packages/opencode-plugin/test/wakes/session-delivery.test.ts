@@ -17,6 +17,7 @@ function recordingSession() {
     synthetic,
     modelHistory,
     session: {
+      get: () => Effect.succeed({}),
       prompt: (input: V2SessionPromptInput) =>
         Effect.sync(() => {
           prompts.push(input);
@@ -33,7 +34,7 @@ function recordingSession() {
 }
 
 describe("V2 session delivery", () => {
-  test("admits one steer wake per completed task and uses the default resume behavior", async () => {
+  test("admits one synthetic steer wake per completed task and uses the default resume behavior", async () => {
     const host = recordingSession();
     const delivery = new V2SessionDelivery(host.session);
     const wake = {
@@ -47,18 +48,18 @@ describe("V2 session delivery", () => {
     await Effect.runPromise(delivery.completion(wake));
 
     expect(Date.now() - startedAt).toBeLessThan(45_000);
-    expect(host.prompts).toEqual([
+    expect(host.synthetic).toEqual([
       {
         sessionID: "session-v2",
         text: wake.text,
+        description: "Background bash completed",
         delivery: "steer",
-        // The delivery always marks its wake as AFT's own, even when the
-        // caller passes no metadata, so the prompt hook can recognise it.
+        // Keep the wake's origin even when the caller passes no metadata.
         metadata: { source: "aft", task_ids: ["bash-aborted-then-completed"] },
       },
     ]);
-    expect(host.prompts[0]).not.toHaveProperty("resume");
-    expect(host.synthetic).toEqual([]);
+    expect(host.synthetic[0]).not.toHaveProperty("resume");
+    expect(host.prompts).toEqual([]);
   });
 
   test("records status-only updates as non-resuming synthetic entries", async () => {
@@ -133,13 +134,16 @@ describe("V2 session delivery", () => {
     await consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never);
     await consumer.bridgeOptions.onBashCompletion?.(completion, bridge as never);
 
-    expect(host.prompts).toHaveLength(1);
-    expect(host.prompts[0]).toMatchObject({
+    expect(host.prompts).toEqual([]);
+    expect(host.synthetic).toHaveLength(1);
+    expect(host.synthetic[0]).toMatchObject({
       sessionID: "session-v2",
+      description: "Background bash completed",
       delivery: "steer",
       metadata: {
         source: "aft",
         kind: "bash_completion",
+        status: "completed",
         task_ids: ["bash-1"],
       },
     });

@@ -29,6 +29,7 @@ function recordingSession() {
     prompts,
     synthetic,
     session: {
+      get: () => Effect.succeed({}),
       prompt: (input: V2SessionPromptInput) =>
         Effect.sync(() => {
           prompts.push(input);
@@ -128,8 +129,9 @@ describe("V2 wake routing across Locations", () => {
     );
 
     expect(firstHost.prompts).toEqual([]);
-    expect(secondHost.prompts).toHaveLength(1);
-    expect(secondHost.prompts[0]).toMatchObject({
+    expect(secondHost.prompts).toEqual([]);
+    expect(secondHost.synthetic).toHaveLength(1);
+    expect(secondHost.synthetic[0]).toMatchObject({
       sessionID: "session-second",
       metadata: { kind: "bash_completion", task_ids: ["bash-second"] },
     });
@@ -151,7 +153,7 @@ describe("V2 wake routing across Locations", () => {
       bridge as never,
     );
     expect(firstHost.synthetic).toEqual([]);
-    expect(secondHost.synthetic).toHaveLength(1);
+    expect(secondHost.synthetic).toHaveLength(2);
 
     firstConsumer.dispose();
     secondConsumer.dispose();
@@ -174,7 +176,7 @@ describe("V2 wake routing across Locations", () => {
       bridge as never,
     );
 
-    expect(secondHost.prompts).toHaveLength(1);
+    expect(secondHost.synthetic).toHaveLength(1);
     expect(sends).toHaveLength(1);
     secondConsumer.dispose();
   });
@@ -219,7 +221,7 @@ describe("V2 wake routing across Locations", () => {
       await runBash(secondConsumer, "session-late", "/work/second");
       await until(() => sends.length === 2);
 
-      expect(secondHost.prompts.map((prompt) => prompt.metadata?.task_ids)).toEqual([
+      expect(secondHost.synthetic.map((entry) => entry.metadata?.task_ids)).toEqual([
         ["bash-late-1"],
         ["bash-late-2"],
       ]);
@@ -237,7 +239,7 @@ describe("V2 wake routing across Locations", () => {
       // Held completions are handed over once; a second bash call delivers nothing new.
       await runBash(secondConsumer, "session-late", "/work/second");
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(secondHost.prompts).toHaveLength(2);
+      expect(secondHost.synthetic).toHaveLength(2);
       secondConsumer.dispose();
     } finally {
       warn.mockRestore();

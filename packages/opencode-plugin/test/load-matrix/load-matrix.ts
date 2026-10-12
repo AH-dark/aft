@@ -2493,6 +2493,21 @@ export default { id: original.id, effect };
     expect(result.status).toBe(0);
   }, 300_000);
 
+  test("GA host admits background completions as synthetic steering input", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const result = await withOperatorCanary("v2-synthetic-completion", () =>
+      run("bun", ["test", "src/__tests__/e2e/v2-synthetic-completion.test.ts"], pluginRoot, {
+        env: { ...process.env, AFT_V2_HOST_BINARY: v2Binary(v2) },
+        timeoutMs: 120_000,
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-synthetic-completion-host-transcript]\n${transcript}`);
+    expect(transcript).toContain("1 pass");
+    expect(transcript).toContain("0 fail");
+    expect(result.status).toBe(0);
+  }, 150_000);
+
   test("GA TUI host mounts the sidebar and its status command without a keymap error", async () => {
     const { v2 } = await ensureHostInstalls();
     const packageRoot = await copyInstalledPlugin(v2, "v2-tui-keymap");
