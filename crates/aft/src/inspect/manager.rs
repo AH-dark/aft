@@ -4780,12 +4780,16 @@ fn current_view_projection_store(
                 "inspect storage unavailable".to_string()
             })?;
         let scope = crate::path_identity::project_scope_key(project_root);
-        let view = crate::views::ViewStore::open(&storage, &scope).map_err(|error| {
+        // Reading a projection never creates a view folder: a folder made here
+        // for a checkout that was never built (or was already deleted) has no
+        // binding and no registry member, and would only be left behind.
+        let view_dir = storage.join("views").join(&scope);
+        let Some(view) = crate::views::ViewStore::existing_dir(view_dir.clone()) else {
             note_checkout_view_refusal!(
-                "projection_view_open: storage={storage:?} scope={scope} error={error}"
+                "projection_unpublished: view_dir={view_dir:?} current_generation=None view=absent"
             );
-            error.to_string()
-        })?;
+            return Ok(None);
+        };
         let Some(generation) = view.current_generation().map_err(|error| {
             note_checkout_view_refusal!(
                 "projection_pointer_read: view_dir={:?} error={error}",
