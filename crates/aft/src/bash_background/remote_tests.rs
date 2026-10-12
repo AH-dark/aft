@@ -3639,6 +3639,31 @@ async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart()
     }
 }
 
+#[test]
+fn cancelled_call_notice_names_a_remote_task_and_its_job_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("missing-connection.json"),
+        "cargo test",
+    );
+    registry.note_cancelled_call(&task_id, "session");
+    assert!(read_task(&paths.json).unwrap().cancelled_call_unannounced);
+    assert!(registry
+        .take_cancelled_call_notices("other-session")
+        .is_empty());
+    assert_eq!(
+        registry.take_cancelled_call_notices("session"),
+        vec![format!(
+            "task {task_id} (job {}) from your cancelled call is still running; check it with bash_status or stop it with bash_kill",
+            id()
+        )]
+    );
+    assert!(registry.take_cancelled_call_notices("session").is_empty());
+    assert!(!read_task(&paths.json).unwrap().cancelled_call_unannounced);
+    registry.detach();
+}
+
 #[tokio::test]
 async fn runon_draining_twice_then_accepts_and_discloses_wait() {
     let daemon = daemon(

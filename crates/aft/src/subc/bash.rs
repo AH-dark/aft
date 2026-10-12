@@ -56,6 +56,13 @@ impl BashDeferredCompletion {
             .expect("bash completion result")
             .response
     }
+
+    /// The text the caller sees, or `None` for a completion that carries no
+    /// result (the call was already answered elsewhere, or cancelled).
+    #[cfg(unix)]
+    pub(super) fn text_for_test(&self) -> Option<&str> {
+        self.result.as_ref().map(|result| result.text.as_str())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -247,6 +254,12 @@ fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
             target.session_id,
             error
         );
+    } else if cancelled {
+        // The caller saw only the cancellation; name the still-running task
+        // on the session's next bash call.
+        target
+            .registry
+            .note_cancelled_call(&target.task_id, &target.session_id);
     }
     release_wait_registration(
         &target.registry,
@@ -1465,7 +1478,17 @@ async fn run_deferred_bash_wait(
                     let task_id = task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         if !run_scoped && server_completion && !registry.is_remote_task(&task_id,&session_id) { let _ = registry.kill(&task_id, &session_id); }
-                        else if !run_scoped && registry.is_remote_task(&task_id,&session_id) { let _=registry.promote(&task_id,&session_id); }
+                        else if !run_scoped {
+                            // The command keeps running as a task. Promote it so
+                            // its completion is queued for the session like any
+                            // background task's (a foreground task's completion
+                            // is otherwise marked delivered the moment it ends,
+                            // so a session that reconnects never got it), and
+                            // tell the session about it on its next bash call.
+                            if registry.promote(&task_id, &session_id).is_ok() {
+                                registry.note_cancelled_call(&task_id, &session_id);
+                            }
+                        }
                         release_wait_registration(
                             &registry,
                             &session_id,

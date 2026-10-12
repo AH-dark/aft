@@ -158,6 +158,7 @@ pub fn finalize_tool_response(
         attach_command,
         allow_bg_completions,
     );
+    append_cancelled_call_notices(text, ctx, session_id, attach_command);
     if let Some(line) = status_bar_line(ctx, publish, attach_command, session_id, counts) {
         append_trailing_line(text, &line);
     }
@@ -192,6 +193,29 @@ fn acknowledge_terminal_bash_reply(
     if let Some(task_id) = response.data.get("task_id").and_then(Value::as_str) {
         ctx.bash_background()
             .ack_terminal_result_for_session(task_id, session_id);
+    }
+}
+
+/// A bash-family reply tells the session, once, about each task whose waiting
+/// call was cancelled while the command kept running: the caller saw only the
+/// cancellation, with no task ID to check or stop.
+fn append_cancelled_call_notices(
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    command: &str,
+) {
+    if !matches!(
+        command,
+        "bash" | "powershell" | "bash_status" | "bash_watch" | "bash_kill" | "bash_write"
+    ) {
+        return;
+    }
+    for line in ctx
+        .bash_background()
+        .take_cancelled_call_notices(session_id)
+    {
+        append_trailing_line(text, &line);
     }
 }
 

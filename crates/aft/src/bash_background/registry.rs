@@ -683,6 +683,10 @@ pub(crate) struct RegistryInner {
     wait_detach_sessions: Mutex<HashMap<String, HashSet<String>>>,
     active_wait_sessions: Mutex<HashMap<String, HashSet<String>>>,
     wait_registered_tasks: Mutex<HashMap<String, HashSet<String>>>,
+    /// Per session, the tasks whose waiting call was cancelled and that the
+    /// session has not been told about yet (`cancelled_call_unannounced`), so
+    /// a bash-family reply finds them without locking every task.
+    cancelled_call_tasks: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 pub(crate) struct BgTask {
@@ -1035,6 +1039,7 @@ impl BgTaskRegistry {
                 wait_detach_sessions: Mutex::new(HashMap::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),
                 wait_registered_tasks: Mutex::new(HashMap::new()),
+                cancelled_call_tasks: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -5622,6 +5627,94 @@ impl BgTaskRegistry {
         Ok(true)
     }
 
+    /// Records that the call waiting on this still-running task was cancelled
+    /// (client cancel, transport loss, restart) while the task keeps running,
+    /// so the session's next bash-family reply names the task once (see
+    /// [`Self::take_cancelled_call_notices`]). The flag is written to the
+    /// task's record, so the notice survives an AFT restart. A task that has
+    /// already finished is left alone: its completion notice reports it.
+    pub(crate) fn note_cancelled_call(&self, task_id: &str, session_id: &str) {
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return;
+        };
+        {
+            // Declared before the lock so the aft.db write runs after it is released.
+            let mut db = DeferredDbWrites::new(self, &task);
+            let Ok(mut state) = task.lock_state() else {
+                return;
+            };
+            if state.metadata.status.is_terminal() || state.metadata.cancelled_call_unannounced {
+                return;
+            }
+            state.metadata.cancelled_call_unannounced = true;
+            if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
+                crate::slog_warn!(
+                    "cancelled-call notice for task {task_id} was not persisted: {error}"
+                );
+            }
+        }
+        self.index_cancelled_call(session_id, task_id);
+    }
+
+    fn index_cancelled_call(&self, session_id: &str, task_id: &str) {
+        if let Ok(mut tasks) = self.inner.cancelled_call_tasks.lock() {
+            tasks
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(task_id.to_string());
+        }
+    }
+
+    /// One line for each task of `session_id` whose waiting call was
+    /// cancelled while the task kept running, naming the task (and its
+    /// build-server job for a remote task) and how to check or stop it. Each
+    /// task is named once: taking a notice clears the task's flag on disk. A
+    /// task that has finished since is not named, because its completion
+    /// notice reports it.
+    pub(crate) fn take_cancelled_call_notices(&self, session_id: &str) -> Vec<String> {
+        let mut task_ids = match self.inner.cancelled_call_tasks.lock() {
+            Ok(mut tasks) => match tasks.remove(session_id) {
+                Some(task_ids) => task_ids.into_iter().collect::<Vec<_>>(),
+                None => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+        task_ids.sort();
+        let mut lines = Vec::new();
+        for task_id in task_ids {
+            let Some(task) = self.task_for_session(&task_id, session_id) else {
+                continue;
+            };
+            let mut db = DeferredDbWrites::new(self, &task);
+            let Ok(mut state) = task.lock_state() else {
+                continue;
+            };
+            if !state.metadata.cancelled_call_unannounced {
+                continue;
+            }
+            state.metadata.cancelled_call_unannounced = false;
+            if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
+                crate::slog_warn!(
+                    "cancelled-call notice for task {task_id} was not cleared on disk: {error}"
+                );
+            }
+            if state.metadata.status.is_terminal() {
+                continue;
+            }
+            let job = state
+                .metadata
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.job_id)
+                .map(|job_id| format!(" (job {job_id})"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "task {task_id}{job} from your cancelled call is still running; check it with bash_status or stop it with bash_kill"
+            ));
+        }
+        lines
+    }
+
     /// Records the worker wait limit in force, which a task reloaded after a
     /// restart is granted from the restart (see `insert_rehydrated_task`).
     pub(crate) fn set_worker_wait_window(&self, window: Duration) {
@@ -6713,6 +6806,9 @@ impl BgTaskRegistry {
             }
         }
         let suppress_replayed_running_reminder = metadata.status == BgTaskStatus::Running;
+        if metadata.cancelled_call_unannounced {
+            self.index_cancelled_call(&session_id, &task_id);
+        }
         let mode = metadata.mode.clone();
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
         let task = Arc::new(BgTask {

@@ -107,6 +107,257 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     );
 }
 
+#[cfg(unix)]
+const CANCEL_SESSION: &str = "cancelled-call-session";
+
+#[cfg(unix)]
+fn cancel_test_context(root: &ProjectRootId, storage: &Path) -> Arc<AppContext> {
+    Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.as_path().into()),
+            storage_dir: Some(storage.into()),
+            sandbox: crate::config::SandboxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ))
+}
+
+/// Sends one `bash` call through the subc route on a plugin (legacy) route.
+/// A server-owned tool provider route kills a local command when its call is
+/// cancelled; a plugin route keeps it running, which this test needs.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn route_bash(
+    executor: &Arc<Executor>,
+    root: &ProjectRootId,
+    connection_cancel: &PersistentCancelSignal,
+    bash_tx: &mpsc::Sender<bash::BashDeferredCompletion>,
+    corr: u64,
+    arguments: Value,
+) {
+    let identity = RouteIdentity(Arc::new(RouteIdentityData {
+        root: root.clone(),
+        project_root: root.as_path().into(),
+        harness: "runner".into(),
+        session: CANCEL_SESSION.into(),
+        role: tool_provider::RouteRole::Legacy,
+        trust: BindTrust::FirstParty,
+        spawn_principal: AuthenticatedPrincipal::FirstParty,
+        consumer_elicitation_capable: false,
+        disabled_tools: Arc::new(vec![]),
+        run_scope: OnceLock::new(),
+        call_mode: subc_protocol::call_mode::CallMode::Classic,
+        scope: None,
+        made_tool_call: AtomicBool::new(false),
+    }));
+    let routes = HashMap::from([(route_key(41, 1), identity)]);
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        41,
+        1,
+        corr,
+        serde_json::to_vec(&json!({"name": "bash", "arguments": arguments})).unwrap(),
+    )
+    .unwrap();
+    let (writer, _replies) = mpsc::channel(8);
+    let (touch_tx, _touch_rx) = mpsc::channel(8);
+    let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+    let deferred_tx = super::DeferredResponseSender {
+        entries: deferred_tx,
+        wake: crate::response_finalize::DeferredResponseWake::default(),
+    };
+    handle_tool_call(
+        &writer,
+        &frame,
+        None,
+        PhaseTrace::new(Instant::now()),
+        &routes,
+        &HashMap::new(),
+        &ReclaimedRoutes::default(),
+        &mut HashMap::new(),
+        executor,
+        &Arc::default(),
+        &Arc::new(PendingDeferredSetups::default()),
+        &Arc::new(Notify::new()),
+        connection_cancel,
+        bash_tx,
+        &touch_tx,
+        &Arc::new(DispatchPathMetrics::new()),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut 1,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        |request, ctx| crate::commands::bash::handle(&request, ctx),
+        &deferred_tx,
+        false,
+        1024 * 1024,
+        &drain::ModuleDrainWindow::default(),
+    )
+    .await
+    .unwrap();
+}
+
+/// The text and response data of the next bash call answered on `bash_rx`.
+#[cfg(unix)]
+async fn next_bash_reply(
+    bash_rx: &mut mpsc::Receiver<bash::BashDeferredCompletion>,
+) -> (String, Value) {
+    let done = tokio::time::timeout(Duration::from_secs(20), bash_rx.recv())
+        .await
+        .expect("bash reply within 20 s")
+        .expect("bash reply");
+    let text = done.text_for_test().expect("bash result").to_string();
+    (text, done.response_for_test().data.clone())
+}
+
+/// A `wait: true` call whose transport is lost while the command still runs
+/// answers with only the cancellation. The command keeps running as a task;
+/// across an AFT restart, the session's next bash call names it once, and its
+/// completion is delivered through the ordinary completion queue.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelled_wait_names_its_task_once_and_delivers_its_completion_after_restart() {
+    let (dir, root) = test_support::test_root("cancelled-call");
+    let storage = dir.path().join("storage");
+    let started = dir.path().join("started");
+    let release = dir.path().join("release");
+    let command = format!(
+        "touch '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; printf cancelled-call-done",
+        started.display(),
+        release.display()
+    );
+
+    let first = cancel_test_context(&root, &storage);
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(root.clone(), Arc::clone(&first)));
+    let (bash_tx, mut bash_rx) = mpsc::channel(8);
+    let connection = PersistentCancelSignal::new();
+    route_bash(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        1,
+        json!({"command": command, "wait": true, "timeout": 60_000}),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("command starts");
+    // Let the call settle into its wait before the transport goes away.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    connection.cancel();
+    let cancelled = tokio::time::timeout(Duration::from_secs(10), bash_rx.recv())
+        .await
+        .expect("cancelled call settles")
+        .expect("cancelled call completion");
+    assert!(
+        cancelled.text_for_test().is_none(),
+        "a cancelled call carries no result"
+    );
+
+    // Restart: the first registry lets go of the still-running command, and a
+    // new one reloads the session's tasks from disk.
+    first.bash_background().detach();
+    let second = cancel_test_context(&root, &storage);
+    second
+        .bash_background()
+        .replay_session(
+            &crate::bash_background::task_storage_dir(&second),
+            CANCEL_SESSION,
+        )
+        .unwrap();
+    let executor = Arc::new(Executor::new());
+    assert!(executor.register_actor(root.clone(), Arc::clone(&second)));
+    let connection = PersistentCancelSignal::new();
+
+    // The next bash call names the still-running task.
+    route_bash(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        2,
+        json!({"command": "printf next"}),
+    )
+    .await;
+    let (text, _) = next_bash_reply(&mut bash_rx).await;
+    let notice = text
+        .lines()
+        .find(|line| line.ends_with("from your cancelled call is still running; check it with bash_status or stop it with bash_kill"))
+        .unwrap_or_else(|| panic!("no cancelled-call notice in: {text}"));
+    let task_id = notice
+        .strip_prefix("task ")
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        notice,
+        format!("task {task_id} from your cancelled call is still running; check it with bash_status or stop it with bash_kill"),
+        "a local task names no job"
+    );
+    assert!(second
+        .bash_background()
+        .observed_status(&task_id, CANCEL_SESSION, 0)
+        .is_some_and(|snapshot| !snapshot.info.status.is_terminal()));
+
+    // A further bash call does not name the task again: the notice is shown
+    // once per task.
+    route_bash(
+        &executor,
+        &root,
+        &connection,
+        &bash_tx,
+        3,
+        json!({"command": "printf again"}),
+    )
+    .await;
+    let (text, _) = next_bash_reply(&mut bash_rx).await;
+    assert!(!text.contains("cancelled call"), "{text}");
+
+    // The command finishes after the restart; the session receives its
+    // completion with a later reply.
+    std::fs::write(&release, b"go").unwrap();
+    let mut delivered = None;
+    for corr in 4..200 {
+        route_bash(
+            &executor,
+            &root,
+            &connection,
+            &bash_tx,
+            corr,
+            json!({"command": "printf poll"}),
+        )
+        .await;
+        let (_, data) = next_bash_reply(&mut bash_rx).await;
+        delivered = data["bg_completions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|completion| completion["task_id"] == task_id.as_str())
+            .cloned();
+        if delivered.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let delivered = delivered.expect("the cancelled call's completion was never delivered");
+    assert_eq!(delivered["exit_code"], 0, "{delivered}");
+    second.bash_background().detach();
+}
+
 #[test]
 fn exec_remote_v1_powershell_keeps_its_only_supported_selector() {
     let mut args = serde_json::Map::new();

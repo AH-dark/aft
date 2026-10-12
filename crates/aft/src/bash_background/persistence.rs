@@ -587,6 +587,12 @@ pub struct PersistedTask {
     pub stripped_env_names: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub local_fallback_started: bool,
+    /// The call that was waiting on this task was cancelled (client cancel,
+    /// transport loss, restart) while the task kept running, and the session
+    /// has not yet been told. Its next bash-family reply names the task once
+    /// and clears this. Persisted so the notice survives an AFT restart.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancelled_call_unannounced: bool,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -662,6 +668,7 @@ impl PersistedTask {
             incomplete_output: Vec::new(),
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
+            cancelled_call_unannounced: false,
         }
     }
 
@@ -789,6 +796,7 @@ impl From<BashTaskRow> for PersistedTask {
             incomplete_output: Vec::new(),
             stripped_env_names: Vec::new(),
             local_fallback_started: false,
+            cancelled_call_unannounced: false,
         }
     }
 }
