@@ -6097,7 +6097,9 @@ fn scoped_inspect_against_held_walk(
             thread::sleep(Duration::from_millis(2));
         };
         if waited {
-            // Honest while the walk runs, even for a reader that does not wait.
+            // While the walk is still running, the status bar and the status
+            // reply (neither of which waits for the walk) must say diagnostics
+            // are pending and name the running walk as the reason.
             assert_pending_on_running_walk(ctx);
         }
         let mut hold = Some(hold);
@@ -6132,8 +6134,10 @@ fn scoped_inspect_waits_for_the_applicability_walk_and_reports_missing_producer(
 
 #[test]
 fn scoped_inspect_reports_pending_with_reason_when_the_walk_outlasts_its_wait() {
-    // 14 s budget: 9 s of work time, so the applicability wait gives up after
-    // about 4.5 s and leaves the rest for the scoped diagnostics.
+    // A 14 s inspect budget keeps 5 s back for assembling the reply, leaving
+    // 9 s of work time. The applicability wait may use half of the remaining
+    // work time, so it gives up after about 4.5 s and leaves the rest for the
+    // scoped diagnostics.
     let (_temp_dir, ts, ctx, hold) = held_typescript_with_missing_gopls(14_000);
     let (waited, response, values) = scoped_inspect_against_held_walk(&ctx, &ts, hold, false);
     assert!(waited, "inspect never waited for the applicability walk");
