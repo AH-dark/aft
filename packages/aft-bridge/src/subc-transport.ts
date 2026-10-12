@@ -2868,14 +2868,17 @@ export class SubcTransportPool implements AftTransportPool {
           { consumerIdentity: this.consumerIdentity },
         );
         if (expired) return timeout();
-        const reply = await client.request(
+        const envelope = await client.request(
           route,
           {
-            op: "session.scope_identity",
+            // Core decodes every management request as {method, params}.
+            method: "session.scope_identity",
             params: { harness: identity.harness, session: identity.session },
           },
           { timeoutMs: HOST_SCOPE_LOOKUP_TIMEOUT_MS, signal: abort.signal },
         );
+        // Core answers a management request as {result: <answer>}.
+        const reply = isRecord(envelope) ? envelope.result : undefined;
         if (isRecord(reply) && reply.answer === "no_scope") return { result: "no_scope" };
         if (
           !isRecord(reply) ||

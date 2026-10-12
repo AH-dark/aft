@@ -55,8 +55,22 @@ class HostClient implements SubcClientLike {
   async request(route: RouteHandle, body: unknown) {
     if (this.modules.get(route.channel) === "prefrontal-core") {
       this.reads.push(body);
+      // Decode like core's management surface: a body without a string `method`
+      // or with params other than {harness, session} is refused, as core does.
+      const request = body as { method?: unknown; params?: Record<string, unknown> };
+      if (typeof request?.method !== "string") {
+        throw new SubcError(
+          "route request body has no decodable method: missing field `method`",
+          "invalid_request",
+        );
+      }
+      const keys = Object.keys(request.params ?? {}).sort();
+      if (keys.join(",") !== "harness,session") {
+        throw new SubcError("session.scope_identity params: unknown field", "invalid_request");
+      }
       if (this.answer instanceof Error) throw this.answer;
-      return this.answer;
+      // Core wraps every management answer as {result: <answer>}.
+      return { result: this.answer };
     }
     this.toolBodies.push(body);
     this.toolChannels.push(route.channel);
@@ -196,7 +210,7 @@ test("OpenCode and Pi direct carriers bind scoped heads once per host session", 
       pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {}),
     ]);
     expect(client.reads).toEqual([
-      { op: "session.scope_identity", params: { harness, session: "head" } },
+      { method: "session.scope_identity", params: { harness, session: "head" } },
     ]);
     const tools = client.opens.filter((open) => open.target.module_id === "aft");
     expect(tools).toHaveLength(2);
