@@ -29,7 +29,7 @@
 //! its loop; a walk cut short reports `complete: false` rather than a number
 //! that looks exact.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -878,16 +878,22 @@ pub fn admit_new_view(registry: &FamilyRegistry) -> RegistryResult<()> {
     if reasons.is_empty() {
         return Ok(());
     }
-    let started = spawn_enforcement(registry.clone(), true);
-    let reason = format!(
-        "{}; {}",
-        reasons.join("; "),
-        if started {
-            "an eviction pass has started, register again after it"
-        } else {
-            "an eviction pass is already running, register again after it"
+    let pass = match spawn_enforcement(registry.clone(), true) {
+        Scheduled::Started => "an eviction pass has started, register again after it",
+        Scheduled::Queued => {
+            "an eviction pass is queued behind another family's disk-limits pass, \
+             register again after it"
         }
-    );
+        Scheduled::AlreadyPending => {
+            "an eviction pass is already running or queued, register again after it"
+        }
+        // A forced request is always due; this arm only keeps the match total.
+        Scheduled::NotDue => "no eviction pass is due",
+        Scheduled::Unavailable => {
+            "no eviction pass could start because its thread could not be created"
+        }
+    };
+    let reason = format!("{}; {}", reasons.join("; "), pass);
     crate::slog_warn!(
         "view admission refused family={} {}",
         registry.family(),
@@ -901,31 +907,66 @@ fn last_runs() -> &'static Mutex<BTreeMap<PathBuf, Instant>> {
     RUNS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn in_flight() -> &'static Mutex<BTreeSet<PathBuf>> {
-    static RUNNING: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
-    RUNNING.get_or_init(|| Mutex::new(BTreeSet::new()))
+/// Background enforcement in this process. At most one pass runs at a time,
+/// whatever the number of families: every pass walks view directories and
+/// family stores on disk, and passes of many families at once compete for
+/// the same disk and CPU until all of them hit their deadline. A pass that
+/// is requested while another family's pass runs waits in `queue`, and the
+/// one enforcement thread runs it next.
+#[derive(Default)]
+struct Scheduler {
+    /// Families with a pass running or waiting in `queue`, each once.
+    pending: BTreeSet<PathBuf>,
+    /// Passes waiting for the running one to finish, oldest first.
+    queue: VecDeque<FamilyRegistry>,
+    /// True while the enforcement thread exists. It drains `queue` before
+    /// it clears this under the same lock, so a queued pass is never left
+    /// without a thread to run it.
+    runner: bool,
 }
 
+fn scheduler() -> &'static Mutex<Scheduler> {
+    static SCHEDULER: OnceLock<Mutex<Scheduler>> = OnceLock::new();
+    SCHEDULER.get_or_init(|| Mutex::new(Scheduler::default()))
+}
+
+fn lock_scheduler() -> std::sync::MutexGuard<'static, Scheduler> {
+    scheduler()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Removes a family from the pending set when its pass ends, including when
+/// the pass unwinds, so its disk limits can be checked again.
 struct EnforcementFlight(PathBuf);
 
 impl Drop for EnforcementFlight {
     fn drop(&mut self) {
-        in_flight()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
+        lock_scheduler().pending.remove(&self.0);
     }
 }
 
 fn is_running(key: &Path) -> bool {
-    in_flight()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(key)
+    lock_scheduler().pending.contains(key)
+}
+
+/// What a request for a background enforcement pass did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scheduled {
+    /// The enforcement thread started with this family's pass.
+    Started,
+    /// Another family's pass is running; this one runs after it.
+    Queued,
+    /// A pass for this family is already running or queued.
+    AlreadyPending,
+    /// The interval since this family's last pass has not passed.
+    NotDue,
+    /// The enforcement thread could not be created.
+    Unavailable,
 }
 
 /// True when this process has not checked `registry`'s limits within
-/// [`ENFORCEMENT_INTERVAL`] and no check is running.
+/// [`ENFORCEMENT_INTERVAL`] and no check is running or queued.
 pub fn enforcement_due(registry: &FamilyRegistry) -> bool {
     let key = registry.path().to_path_buf();
     if is_running(&key) {
@@ -938,65 +979,128 @@ pub fn enforcement_due(registry: &FamilyRegistry) -> bool {
         .is_none_or(|last| last.elapsed() >= ENFORCEMENT_INTERVAL)
 }
 
-/// Starts one background enforcement pass for `registry` when one is due.
-/// Returns whether a pass was started.
+/// Requests one background enforcement pass for `registry` when one is due.
+/// Returns whether a pass was started or queued behind another family's.
 pub fn spawn_enforcement_if_due(registry: FamilyRegistry) -> bool {
-    spawn_enforcement(registry, false)
+    matches!(
+        spawn_enforcement(registry, false),
+        Scheduled::Started | Scheduled::Queued
+    )
 }
 
-/// Starts one background enforcement pass, unless one is already running
-/// for the family in this process. Without `force` it also waits out
-/// [`ENFORCEMENT_INTERVAL`] since the last pass.
-fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> bool {
+/// Requests one background enforcement pass, unless one is already running
+/// or queued for the family in this process. Without `force` it also waits
+/// out [`ENFORCEMENT_INTERVAL`] since the last pass. When another family's
+/// pass is running, this one is queued and runs after it on the same thread.
+fn spawn_enforcement(registry: FamilyRegistry, force: bool) -> Scheduled {
     if !force && !enforcement_due(&registry) {
-        return false;
+        return Scheduled::NotDue;
     }
     let key = registry.path().to_path_buf();
-    if !in_flight()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key.clone())
     {
-        return false;
+        let mut scheduler = lock_scheduler();
+        if !scheduler.pending.insert(key.clone()) {
+            return Scheduled::AlreadyPending;
+        }
+        if scheduler.runner {
+            scheduler.queue.push_back(registry);
+            return Scheduled::Queued;
+        }
+        scheduler.runner = true;
     }
+    let spawned = std::thread::Builder::new()
+        .name("aft-view-disk-limits".to_string())
+        .spawn(move || run_enforcement_queue(registry));
+    if let Err(error) = spawned {
+        let mut scheduler = lock_scheduler();
+        scheduler.pending.remove(&key);
+        // Passes queued while the spawn was attempted have no thread either;
+        // release them so their next request can start one.
+        for queued in std::mem::take(&mut scheduler.queue) {
+            scheduler.pending.remove(queued.path());
+        }
+        scheduler.runner = false;
+        drop(scheduler);
+        crate::slog_warn!("view disk limits thread unavailable: {error}");
+        return Scheduled::Unavailable;
+    }
+    Scheduled::Started
+}
+
+/// The body of the one enforcement thread: runs `first`, then every queued
+/// pass in order, and exits when the queue is empty.
+fn run_enforcement_queue(first: FamilyRegistry) {
+    let mut next = Some(first);
+    while let Some(registry) = next.take() {
+        // A panicking pass must not take the queued passes with it.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_enforcement_pass(&registry)
+        }));
+        if outcome.is_err() {
+            crate::slog_warn!(
+                "view disk limits check panicked family={}",
+                registry.family()
+            );
+        }
+        let mut scheduler = lock_scheduler();
+        next = scheduler.queue.pop_front();
+        if next.is_none() {
+            scheduler.runner = false;
+        }
+    }
+}
+
+#[cfg(test)]
+static ACTIVE_PASSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The most background passes that ran at once since a test last reset it.
+#[cfg(test)]
+static MOST_CONCURRENT_PASSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Milliseconds every background pass sleeps while counted as running, so
+/// that a test can make passes overlap if the scheduler would allow it.
+#[cfg(test)]
+static PASS_TEST_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn run_enforcement_pass(registry: &FamilyRegistry) {
+    // Unwinding must release the family as well as normal completion, or
+    // this family's disk limits would never run again.
+    let _flight = EnforcementFlight(registry.path().to_path_buf());
     last_runs()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key.clone(), Instant::now());
-    let spawned = std::thread::Builder::new()
-        .name("aft-view-disk-limits".to_string())
-        .spawn({
-            let key = key.clone();
-            move || {
-                // Unwinding must release the slot as well as normal completion,
-                // or this family's disk limits would never run again.
-                let _flight = EnforcementFlight(key);
-                let options = EnforceOptions {
-                    deadline: Some(Instant::now() + ENFORCEMENT_DEADLINE),
-                    observer: None,
-                };
-                match enforce(&registry, options) {
-                    Ok(report) => log_report(&registry, &report),
-                    Err(error) => crate::slog_warn!(
-                        "view disk limits check failed family={} error={}",
-                        registry.family(),
-                        error
-                    ),
-                }
+        .insert(registry.path().to_path_buf(), Instant::now());
+    #[cfg(test)]
+    let _counted = {
+        use std::sync::atomic::Ordering;
+        struct Counted;
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                ACTIVE_PASSES.fetch_sub(1, Ordering::SeqCst);
             }
-        });
-    if let Err(error) = spawned {
-        in_flight()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&key);
-        crate::slog_warn!("view disk limits thread unavailable: {error}");
-        return false;
+        }
+        let active = ACTIVE_PASSES.fetch_add(1, Ordering::SeqCst) + 1;
+        MOST_CONCURRENT_PASSES.fetch_max(active, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(
+            PASS_TEST_DELAY_MS.load(Ordering::SeqCst),
+        ));
+        Counted
+    };
+    let options = EnforceOptions {
+        deadline: Some(Instant::now() + ENFORCEMENT_DEADLINE),
+        observer: None,
+    };
+    match enforce(registry, options) {
+        Ok(report) => log_report(registry, &report),
+        Err(error) => crate::slog_warn!(
+            "view disk limits check failed family={} error={}",
+            registry.family(),
+            error
+        ),
     }
-    true
 }
 
-/// Waits until no background pass for `registry` runs in this process.
+/// Waits until no background pass for `registry` runs or waits in this
+/// process.
 #[cfg(test)]
 pub(crate) fn wait_for_background_enforcement(registry: &FamilyRegistry) {
     let started = Instant::now();
@@ -1978,12 +2082,80 @@ mod tests {
     fn enforcement_flight_is_released_when_worker_unwinds() {
         let directory = tempfile::tempdir().unwrap();
         let key = directory.path().join("registry.sqlite");
-        in_flight().lock().unwrap().insert(key.clone());
+        lock_scheduler().pending.insert(key.clone());
         let result = std::panic::catch_unwind(|| {
             let _flight = EnforcementFlight(key.clone());
             panic!("injected enforcement failure");
         });
         assert!(result.is_err());
         assert!(!is_running(&key));
+    }
+
+    /// Background passes of many families run one at a time, process-wide:
+    /// each pass walks directories on the same disk, and running them all
+    /// at once made every one of them stop at its deadline. A pass requested
+    /// while another runs is queued, not dropped, and runs afterwards.
+    #[test]
+    fn background_passes_of_many_families_run_one_at_a_time() {
+        use std::sync::atomic::Ordering;
+        struct ResetDelay;
+        impl Drop for ResetDelay {
+            fn drop(&mut self) {
+                PASS_TEST_DELAY_MS.store(0, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetDelay;
+        let storages = (0..4)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect::<Vec<_>>();
+        let registries = storages
+            .iter()
+            .enumerate()
+            .map(|(seed, storage)| {
+                let registry = FamilyRegistry::open(storage.path(), FAMILY).unwrap();
+                idle_view(&registry, "main", seed as u64, 8);
+                registry
+            })
+            .collect::<Vec<_>>();
+        // Long enough that the passes would overlap if more than one could
+        // run at a time.
+        PASS_TEST_DELAY_MS.store(150, Ordering::SeqCst);
+        MOST_CONCURRENT_PASSES.store(0, Ordering::SeqCst);
+
+        let outcomes = registries
+            .iter()
+            .map(|registry| spawn_enforcement(registry.clone(), false))
+            .collect::<Vec<_>>();
+        for registry in &registries {
+            wait_for_background_enforcement(registry);
+        }
+
+        let most = MOST_CONCURRENT_PASSES.load(Ordering::SeqCst);
+        eprintln!("most concurrent disk-limit passes: {most} outcomes={outcomes:?}");
+        assert_eq!(most, 1, "disk-limit passes ran concurrently");
+        assert!(
+            matches!(outcomes[0], Scheduled::Started | Scheduled::Queued),
+            "{outcomes:?}"
+        );
+        assert!(
+            outcomes[1..]
+                .iter()
+                .all(|outcome| *outcome == Scheduled::Queued),
+            "later families wait for the running pass: {outcomes:?}"
+        );
+        let runs = last_runs().lock().unwrap();
+        for registry in &registries {
+            assert!(
+                runs.contains_key(registry.path()),
+                "a queued pass was dropped instead of run"
+            );
+        }
+        drop(runs);
+        for registry in &registries {
+            assert!(
+                !enforcement_due(registry),
+                "a pass that ran is not due again before the interval"
+            );
+        }
     }
 }
