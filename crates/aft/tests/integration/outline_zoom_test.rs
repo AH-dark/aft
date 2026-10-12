@@ -1110,13 +1110,15 @@ class Second {
     );
     assert_eq!(resp["kind"], "ambiguous_symbol");
     let content = resp["content"].as_str().expect("zoom content");
+    // Each candidate shows a selector that can be passed back as `symbol`,
+    // followed by its signature and line range for choosing between them.
     assert!(
-        content.contains("First.execute(): string"),
-        "candidate menu should include first qualified signature: {content}"
+        content.contains("- `First.execute` — execute(): string (lines"),
+        "candidate menu should include first selector and signature: {content}"
     );
     assert!(
-        content.contains("Second.execute(): string"),
-        "candidate menu should include second qualified signature: {content}"
+        content.contains("- `Second.execute` — execute(): string (lines"),
+        "candidate menu should include second selector and signature: {content}"
     );
     assert!(
         !content.contains("firstBodyLine") && !content.contains("secondBodyLine"),
