@@ -38,21 +38,34 @@ class HostClient implements SubcClientLike {
   scopeOpenError: SubcError | undefined;
   scopeOpenGate: Promise<void> | undefined;
   toolOpenGate: Promise<void> | undefined;
+  unscopedOpenGate: Promise<void> | undefined;
+  readonly toolOpenErrors: SubcError[] = [];
   toolGate: Promise<void> | undefined;
   subscriptionChannels: number[] = [];
+  private readonly subscriptions = new Map<
+    number,
+    { finish: () => void; fail: (error: Error) => void }
+  >();
+  private readonly endedChannels = new Set<number>();
 
   async routeOpen(target: RouteTarget, identity: BindIdentity, opts?: RouteOpenOptions) {
     this.opens.push({ target, identity, opts });
     const channel = this.opens.length;
     if (target.module_id === "prefrontal-core" && this.scopeOpenError) throw this.scopeOpenError;
     if (target.module_id === "prefrontal-core") await this.scopeOpenGate;
-    if (target.module_id === "aft") await this.toolOpenGate;
+    if (target.module_id === "aft") {
+      await this.toolOpenGate;
+      if (!opts?.scope) await this.unscopedOpenGate;
+      const error = this.toolOpenErrors.shift();
+      if (error) throw error;
+    }
     if (opts?.scope && this.refusal) throw new SubcError("carrier refused", this.refusal);
     this.modules.set(channel, target.module_id);
     return { channel, epoch: 1 } as RouteHandle;
   }
 
   async request(route: RouteHandle, body: unknown) {
+    if (this.endedChannels.has(route.channel)) throw new SubcError("route gone", "unknown_channel");
     if (this.modules.get(route.channel) === "prefrontal-core") {
       this.reads.push(body);
       // Decode like core's management surface: a body without a string `method`
@@ -86,19 +99,44 @@ class HostClient implements SubcClientLike {
   subscribe(route: RouteHandle) {
     this.subscriptionChannels.push(route.channel);
     let finish!: () => void;
+    let fail!: (error: Error) => void;
+    const closed = new Promise<void>((resolve, reject) => {
+      finish = resolve;
+      fail = reject;
+    }).finally(() => this.subscriptions.delete(route.channel));
+    this.subscriptions.set(route.channel, { finish, fail });
     return {
-      closed: new Promise<void>((resolve) => {
-        finish = resolve;
-      }),
-      unsubscribe: () => finish(),
+      closed,
+      unsubscribe: finish,
     };
+  }
+
+  endRoutes(event: ControlPush) {
+    if (event.op !== "route.closed") return;
+    for (const [channel, module] of this.modules) {
+      if (
+        Array.isArray(event.body.channels)
+          ? !event.body.channels.includes(channel)
+          : event.body.module_id !== module
+      )
+        continue;
+      this.endedChannels.add(channel);
+      // A module restart sends both a control push and a GOODBYE ending the stream.
+      this.subscriptions
+        .get(channel)
+        ?.fail(
+          new SubcError("route closed by subc (GOODBYE)", "route_closed", undefined, "restart"),
+        );
+    }
   }
 
   async closeRouteChannel(route: RouteHandle) {
     this.closedRoutes.push(route.channel);
   }
 
-  close() {}
+  close() {
+    for (const sub of this.subscriptions.values()) sub.fail(new SubcError("client closed"));
+  }
 }
 
 const pools: SubcTransportPool[] = [];
@@ -183,8 +221,10 @@ function scopeLogs() {
   return lines;
 }
 
-function setup(harness = "opencode", background = false) {
+function setup(harness = "opencode", background = false, replacement?: HostClient) {
   const client = new HostClient();
+  let connected = false;
+  let current = client;
   let push!: (event: ControlPush) => void;
   const pool = new SubcTransportPool({
     connectionFile: "/fake/connection.json",
@@ -193,14 +233,161 @@ function setup(harness = "opencode", background = false) {
     consumerIdentity: null,
     connect: async (opts) => {
       push = opts.onControlPush!;
-      return client;
+      current = connected && replacement ? replacement : client;
+      connected = true;
+      return current;
     },
     routeRetrySleep: async () => {},
+    bgBackoffSleep: async () => {},
     ...(background ? { onBgEventsNudge: () => {} } : {}),
   });
   pools.push(pool);
-  return { client, pool, push: (event: ControlPush) => push(event) };
+  return {
+    client,
+    pool,
+    push: (event: ControlPush) => {
+      current.endRoutes(event);
+      push(event);
+    },
+  };
 }
+
+async function settle() {
+  for (let turn = 0; turn < 64; turn++) await Promise.resolve();
+}
+
+test("module restart reopens every head route with its cached scope through reload refusals", async () => {
+  for (const code of ["module_reloading", "module_warming", "target_unavailable"]) {
+    const { client, pool, push } = setup("opencode", true);
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    await bridge.toolCall("head", "read", {});
+    await settle();
+    const firstOpens = client.opens.length;
+    expect(client.subscriptionChannels).toHaveLength(1);
+    expect(client.reads).toHaveLength(1);
+    client.toolOpenErrors.push(
+      new SubcError("AFT restarting", code),
+      new SubcError("AFT restarting", code),
+    );
+    push({ op: "route.closed", body: { module_id: "aft", reason: "restart" } });
+    expect((await bridge.toolCall("head", "read", {})).text).toBe("ok");
+    await settle();
+    const reopened = client.opens.slice(firstOpens);
+    expect(reopened.length).toBeGreaterThanOrEqual(4);
+    expect(reopened.every((open) => open.target.module_id === "aft")).toBe(true);
+    expect(reopened.map((open) => open.opts?.scope)).toEqual(reopened.map(() => scope));
+    expect(client.subscriptionChannels).toHaveLength(2);
+    expect(client.reads).toHaveLength(1);
+    await pool.shutdown();
+  }
+});
+
+test("client reconnect reopens both head routes with the cached scope", async () => {
+  const replacement = new HostClient();
+  const { client, pool } = setup("opencode", true, replacement);
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  client.requestError = new SubcError("client closed");
+  await expect(bridge.toolCall("head", "read", {})).rejects.toThrow("client closed");
+  expect((await bridge.toolCall("head", "read", {})).text).toBe("ok");
+  await settle();
+  expect(replacement.reads).toHaveLength(0);
+  expect(replacement.opens.map((open) => open.opts?.scope)).toEqual([scope, scope]);
+  expect(replacement.subscriptionChannels).toHaveLength(1);
+});
+
+test("client reconnect waits for a fresh scope when the old lookup is cancelled", async () => {
+  const clock = retryClock();
+  const replacement = new HostClient();
+  const { client, pool } = setup("opencode", true, replacement);
+  client.answer = new Error("core starting");
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  let releaseOld!: () => void;
+  client.scopeOpenGate = new Promise<void>((resolve) => {
+    releaseOld = resolve;
+  });
+  await clock.tick(5_000);
+  let releaseNew!: () => void;
+  replacement.scopeOpenGate = new Promise<void>((resolve) => {
+    releaseNew = resolve;
+  });
+  client.requestError = new SubcError("client closed");
+  await expect(bridge.toolCall("head", "read", {})).rejects.toThrow("client closed");
+  const reconnected = bridge.toolCall("head", "read", {});
+  try {
+    await settle();
+    expect(replacement.opens.filter((open) => open.target.module_id === "aft")).toHaveLength(0);
+    expect(
+      replacement.opens.filter((open) => open.target.module_id === "prefrontal-core"),
+    ).toHaveLength(1);
+  } finally {
+    releaseOld();
+    releaseNew();
+    await reconnected;
+  }
+  await settle();
+  expect(replacement.reads).toHaveLength(1);
+  const routes = replacement.opens.filter((open) => open.target.module_id === "aft");
+  expect(routes.map((open) => open.opts?.scope)).toEqual([scope, scope]);
+  expect(replacement.subscriptionChannels).toHaveLength(1);
+});
+
+test("background reconnect adopts a scope recovered while its fallback route opens", async () => {
+  const clock = retryClock();
+  const { client, pool, push } = setup("opencode", true);
+  client.answer = new Error("core starting");
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  let release!: () => void;
+  client.unscopedOpenGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  push({ op: "route.closed", body: { module_id: "aft", reason: "restart" } });
+  await settle();
+  const fallbackChannel = client.opens.length;
+  expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
+  try {
+    client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+    await clock.tick(5_000);
+    await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+    await bridge.toolCall("head", "read", {});
+    expect(client.opens.at(-1)?.opts?.scope).toEqual(scope);
+  } finally {
+    release();
+  }
+  await settle();
+  expect(client.closedRoutes).toContain(fallbackChannel);
+  expect(client.subscriptionChannels).not.toContain(fallbackChannel);
+  expect(client.subscriptionChannels).toHaveLength(3);
+  for (const channel of client.subscriptionChannels.slice(1)) {
+    expect(client.opens[channel - 1].opts?.scope).toEqual(scope);
+  }
+});
+
+test("background scope recovery upgrades a reconnected fallback without a tool route", async () => {
+  const clock = retryClock();
+  const { client, pool, push } = setup("opencode", true);
+  client.answer = new Error("core starting");
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  push({ op: "route.closed", body: { module_id: "aft", reason: "restart" } });
+  await settle();
+  const fallbackChannel = client.subscriptionChannels.at(-1)!;
+  expect(client.opens[fallbackChannel - 1].opts?.scope).toBeUndefined();
+  client.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  await clock.tick(5_000);
+  expect(client.reads).toHaveLength(2);
+  expect(client.closedRoutes).toContain(fallbackChannel);
+  expect(client.subscriptionChannels).toHaveLength(3);
+  for (const channel of client.subscriptionChannels.slice(2)) {
+    expect(client.opens[channel - 1].opts?.scope).toEqual(scope);
+  }
+});
 
 test("OpenCode and Pi direct carriers bind scoped heads once per host session", async () => {
   for (const harness of ["opencode", "pi"]) {

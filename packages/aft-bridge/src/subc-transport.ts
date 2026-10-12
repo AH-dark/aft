@@ -674,6 +674,7 @@ class BgSubscription {
       client: SubcClientLike,
       cause: ClientDropCause,
     ) => void = () => undefined,
+    private readonly onRouteAttached: () => void = () => undefined,
   ) {
     this.loop = this.run();
   }
@@ -888,6 +889,7 @@ class BgSubscription {
         this.current = sub;
         this.attached = client;
         this.route = route;
+        this.onRouteAttached();
         stopDispatchProbe = this.startDispatchProbe(client, routeId);
         this.info("subscription-open", `subscription open channel=${routeId}`);
         if (reconnecting) {
@@ -2745,11 +2747,12 @@ export class SubcTransportPool implements AftTransportPool {
       if (
         record.identity.session === session &&
         !record.closed &&
-        entry &&
-        !entry.closed &&
-        !entry.hostScope &&
-        entry.client === this.client &&
-        (entry.handle || entry.opening)
+        ((entry &&
+          !entry.closed &&
+          !entry.hostScope &&
+          entry.client === this.client &&
+          (entry.handle || entry.opening)) ||
+          (record.bgSub?.attachedClient === this.client && record.bgSub?.attachedRoute))
       )
         return record;
     }
@@ -2783,10 +2786,10 @@ export class SubcTransportPool implements AftTransportPool {
       () => {
         state.retryTimer = undefined;
         const record = this.unscopedHostRecord(session);
-        const entry = record?.routeEntry;
-        if (this.shuttingDown || this.hostScopeCache.get(session) !== state || !record || !entry)
+        const client = record?.routeEntry?.client ?? record?.bgSub?.attachedClient;
+        if (this.shuttingDown || this.hostScopeCache.get(session) !== state || !record || !client)
           return;
-        void this.hostScope(entry.client, record.identity).catch((error) => {
+        void this.hostScope(client, record.identity).catch((error) => {
           warn(
             `subc head scope: background retry failed code=${error instanceof Error ? error.name : "Error"}`,
           );
@@ -2800,11 +2803,11 @@ export class SubcTransportPool implements AftTransportPool {
   private promoteHostScope(session: string): void {
     for (const record of this.sessions.values()) {
       const entry = record.routeEntry;
-      if (record.identity.session !== session || !entry?.handle || entry.hostScope) continue;
+      if (record.identity.session !== session) continue;
       // Retirement stops new dispatches; the existing request counter defers closure of held waits.
-      this.retireHostToolRoute(record);
+      if (entry?.handle && !entry.hostScope) this.retireHostToolRoute(record);
       const sub = record.bgSub;
-      if (!sub) continue;
+      if (!sub?.attachedRoute) continue;
       // The old subscription must finish closing before its normal attach path opens a scoped one.
       void sub.stop().then(() => {
         if (record.bgSub !== sub) return;
@@ -2939,7 +2942,7 @@ export class SubcTransportPool implements AftTransportPool {
     client: SubcClientLike,
     identity: BindIdentity,
     record: SessionRecord,
-    entry?: RouteEntry,
+    entry?: Pick<RouteEntry, "hostScope">,
   ): Promise<RouteHandle> {
     if (
       !this.hostScopes ||
@@ -2957,7 +2960,7 @@ export class SubcTransportPool implements AftTransportPool {
     client: SubcClientLike,
     identity: BindIdentity,
     record: SessionRecord,
-    entry?: RouteEntry,
+    entry?: Pick<RouteEntry, "hostScope">,
   ): Promise<RouteHandle> {
     const scope = await this.hostScope(client, identity);
     this.assertRecordLive(record);
@@ -2972,6 +2975,8 @@ export class SubcTransportPool implements AftTransportPool {
         return route;
       } catch (error) {
         if (!(error instanceof SubcError) || !error.code || isSocketDeathError(error)) throw error;
+        // A restarting provider has not rejected the scope. Keep it for the normal reopen retry.
+        if (isRouteOpenReloadWindowError(error)) throw error;
         this.assertRecordLive(record);
         if (!this.hostScopeRefusals.has(identity.session)) {
           this.hostScopeRefusals.add(identity.session);
@@ -2983,9 +2988,22 @@ export class SubcTransportPool implements AftTransportPool {
       }
     }
     this.assertRecordLive(record);
-    return client.routeOpen({ kind: "tool_provider", module_id: AFT_MODULE_ID }, identity, {
-      consumerIdentity: this.consumerIdentity,
-    });
+    const route = await client.routeOpen(
+      { kind: "tool_provider", module_id: AFT_MODULE_ID },
+      identity,
+      {
+        consumerIdentity: this.consumerIdentity,
+      },
+    );
+    // Scope recovery can finish while a fallback bind waits for the provider, including bg_events.
+    if (
+      this.hostScopeCache.get(identity.session)?.answer?.result === "scope" &&
+      !this.hostScopeRefusals.has(identity.session)
+    ) {
+      safeCloseRoute(client, route);
+      return this.openScopedHostToolRoute(client, identity, record, entry);
+    }
+    return route;
   }
 
   private invalidateHostScope(session: string): void {
@@ -3004,9 +3022,8 @@ export class SubcTransportPool implements AftTransportPool {
     const reason = routeCloseReason(push);
     if (!reason?.startsWith("scope_")) {
       for (const record of this.sessions.values()) {
-        const state = this.hostScopeCache.get(record.identity.session);
         const route = record.routeEntry?.handle;
-        if (!state || state.answer || !route) continue;
+        if (!route) continue;
         if (
           (Array.isArray(push.body.channels) && push.body.channels.includes(route.channel)) ||
           (!Array.isArray(push.body.channels) && push.body.module_id === AFT_MODULE_ID)
@@ -3082,6 +3099,7 @@ export class SubcTransportPool implements AftTransportPool {
         `nudge dropped cause=generation-provenance-unavailable-and-root-session-handler-unwired root=${currentRecord.canonicalRoot}`,
       );
     };
+    const binding: Pick<RouteEntry, "hostScope"> = {};
     let sub: BgSubscription | null = null;
     const clearDormantSubscription = (): void => {
       if (sub && record.bgSub === sub) record.bgSub = null;
@@ -3090,7 +3108,10 @@ export class SubcTransportPool implements AftTransportPool {
       identity,
       () => this.ensureClient(),
       (client, cause) => this.dropClient(client, cause),
-      (client) => this.openHostToolRoute(client, identity, record),
+      (client) => {
+        binding.hostScope = undefined;
+        return this.openHostToolRoute(client, identity, record, binding);
+      },
       onNudge,
       this.bgBackoffSleep,
       () => this.rootCanAttach(record.canonicalRoot),
@@ -3107,6 +3128,17 @@ export class SubcTransportPool implements AftTransportPool {
         this.isCurrentLiveGeneration(record.canonicalRoot, record.generation),
       (client) => this.noteClientAlive(client),
       (client, cause) => this.noteUnansweredCall(client, cause),
+      () => {
+        const state = this.hostScopeCache.get(identity.session);
+        if (state) this.scheduleHostScopeRetry(identity.session, state);
+        if (
+          state?.answer?.result === "scope" &&
+          !binding.hostScope &&
+          !this.hostScopeRefusals.has(identity.session)
+        ) {
+          this.promoteHostScope(identity.session);
+        }
+      },
     );
     record.bgSub = sub;
     if (!this.rootCanAttach(record.canonicalRoot)) {

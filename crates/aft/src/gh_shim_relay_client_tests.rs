@@ -306,6 +306,42 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
 }
 
 #[test]
+fn bot_write_requires_scope_is_an_aft_refusal_with_the_governance_exit() {
+    let refusal = json!({
+        "op": BOT_REQUEST_OPERATION,
+        "status": "error",
+        "data": {"refusal_code": "bot_write_requires_scope", "stage": "scope", "message": "unscoped route"},
+    });
+    let Reply::Refused {
+        code,
+        stage,
+        message,
+        ..
+    } = parse_reply(&serde_json::to_vec(&refusal).unwrap())
+    else {
+        panic!("not a daemon refusal");
+    };
+    let RouteOutcome::RelayRefusal { code, text } = daemon_refusal(&code, &stage, &message) else {
+        panic!("not a governance refusal");
+    };
+    assert_eq!(code, "bot_write_requires_scope");
+    assert_eq!(text, "AFT refused the bot write: this session's tool route has no agent scope, so bot writes are refused; a head session needs to bind with its core scope");
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-unscoped", "call-unscoped", "/p");
+    let harness = harness(ticket_gated(vec![refusal]));
+    let (status, upstream) = dispatch_comment(&harness, live.value(), "hello");
+    assert_eq!(status, REFUSAL_EXIT_STATUS);
+    assert!(!upstream);
+    assert_eq!(nonces(&harness).len(), 1);
+    assert_eq!(
+        super::super::seam_state(&harness.paths)
+            .last_seam_refusal
+            .unwrap()
+            .code,
+        "bot_write_requires_scope"
+    );
+}
+
+#[test]
 fn bindings_comparison_accepts_only_an_exact_match_and_shows_both_views() {
     let manifest = BTreeMap::from([
         ("cortexkit/aft".to_string(), "alfonso-aft".to_string()),

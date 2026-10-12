@@ -369,6 +369,10 @@ fn daemon_refusal(code: &str, stage: &str, message: &str) -> RouteOutcome {
             code: code.to_string(),
             text: "the AFT daemon relays bot writes only for first-party callers".to_string(),
         },
+        "bot_write_requires_scope" => RouteOutcome::RelayRefusal {
+            code: code.to_string(),
+            text: "AFT refused the bot write: this session's tool route has no agent scope, so bot writes are refused; a head session needs to bind with its core scope".to_string(),
+        },
         "relay_unavailable" => RouteOutcome::Unavailable(format!(
             "the AFT daemon could not reach {} to relay the bot write, so nothing was sent: {message}",
             if stage == "mint" { "prefrontal" } else { "plexus" }
