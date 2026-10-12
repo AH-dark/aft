@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test --timeout 120000"
+    "test": "bun test --timeout 120000",
+    "typecheck:rpc-client": "tsc --noEmit --strict --skipLibCheck --target ES2022 --module ESNext --moduleResolution Bundler --types bun,node helpers/rpc-client.ts helpers/jsonl.ts src/__tests__/rpc-client.test.ts"
   },
   "devDependencies": {
     "@copilotkit/aimock": "1.24.0",

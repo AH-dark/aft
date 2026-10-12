@@ -62,6 +62,9 @@ export function createRpcClient(child: ChildProcess): RpcClient {
   };
 
   attachJsonlReader(child.stdout, (line) => {
+    // Teardown closes stdin before stdout drains. Retire callbacks first so a
+    // buffered UI notification cannot ask a handler to reply on the closed pipe.
+    if (closed) return;
     if (line.trim().length === 0) return;
     let message: Record<string, unknown>;
     try {
