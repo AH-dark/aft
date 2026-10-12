@@ -18,6 +18,9 @@
 //!   the system temporary directory).
 //! - `AFT_UPDATE_BENCH_PARITY=1`: also cold-build every target and require
 //!   every derived table to equal the incremental result.
+//! - `AFT_UPDATE_BENCH_MEMO_COMPARE=1`: also cold-build the newer revision
+//!   with the resolver index's crate-wide lookups scanned instead of
+//!   memoized, and require both databases to be equal.
 //! - `AFT_UPDATE_BENCH_ONLY`: comma-separated case labels to run
 //!   (`switch-<first 12 hex of the target revision>` or `edit-<size>`).
 
@@ -264,6 +267,22 @@ fn bench_repository_incremental_update() {
         );
         path
     };
+    if std::env::var_os("AFT_UPDATE_BENCH_MEMO_COMPARE").is_some() {
+        // The same cold build with the resolver index's crate-wide lookups
+        // scanned on every call (the code before they were memoized) must
+        // write the same database.
+        crate::callgraph_store::SCAN_WITHOUT_CRATE_MEMO.with(|scan| scan.set(true));
+        let scanned = cold("new-scanned", &new);
+        crate::callgraph_store::SCAN_WITHOUT_CRATE_MEMO.with(|scan| scan.set(false));
+        let memoized = cold("new-memoized", &new);
+        parity::assert_logical_parity(&memoized, &scanned);
+        println!("update bench memo parity equal=true");
+        for path in [scanned, memoized] {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+    }
     let wanted = |base: &str| {
         targets.iter().any(|(label, target_base, _)| {
             only.as_ref().is_none_or(|only| only.contains(label))

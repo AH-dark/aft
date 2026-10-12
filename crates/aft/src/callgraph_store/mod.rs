@@ -3738,6 +3738,72 @@ struct ProjectIndex<'a> {
     /// its own workspace mapping.
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
     rust_crate_roots: callgraph::RustCrateRootMemo,
+    /// Crate-wide lookups derived from `files`, built on first use and never
+    /// rebuilt. Only an index with every file in memory (`lazy` is `None`)
+    /// uses it. Such an index's file set is fixed when it is constructed: a
+    /// changed file set means a new `ProjectIndex`, which starts empty.
+    crate_scans: std::cell::OnceCell<CrateScanMemo>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a measurement compare the memoized lookups with the scans on one
+    /// real corpus, in the same process.
+    pub(crate) static SCAN_WITHOUT_CRATE_MEMO: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Answers to the two Rust lookups that otherwise scan every indexed file on
+/// each call (`module_parent`, `inline_scoped_target`), precomputed from an
+/// in-memory file set. Lookups return exactly what the scans return.
+#[derive(Clone, Debug, Default)]
+struct CrateScanMemo {
+    /// Rust files in path order, with the source prefix and module segments
+    /// the inline-module lookup compares against.
+    rust_files: Vec<(String, String, Vec<String>)>,
+    /// For each declared module target, the smallest `(declaring file,
+    /// module name)` pair, which is the scan's first match after sorting.
+    module_parents: HashMap<String, (String, String)>,
+}
+
+impl CrateScanMemo {
+    fn build(files: &HashMap<String, DbFileIndex>) -> Self {
+        let mut rust_files = files
+            .iter()
+            .filter(|(_, index)| index.lang == Some(LangId::Rust))
+            .map(|(path, _)| {
+                (
+                    path.clone(),
+                    rust_src_prefix(path),
+                    rust_module_segments_for_rel(path),
+                )
+            })
+            .collect::<Vec<_>>();
+        rust_files.sort();
+        let mut module_parents = HashMap::<String, (String, String)>::new();
+        for (file, index) in files {
+            for (module, target) in &index.declared_module_targets {
+                let Some(target) = target else {
+                    continue;
+                };
+                let candidate = (file.clone(), module.clone());
+                match module_parents.entry(target.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut best) => {
+                        if candidate < *best.get() {
+                            best.insert(candidate);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(candidate);
+                    }
+                }
+            }
+        }
+        Self {
+            rust_files,
+            module_parents,
+        }
+    }
 }
 
 /// Resolution reads symbols and exports through one interface. Incremental
@@ -3779,23 +3845,10 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
-        let mut parents = self
-            .scan_paths(LazyDbFileIndexes::module_declaring_files)
-            .into_iter()
-            .filter_map(|file| {
-                let index = self.file_index(&file)?;
-                let modules = index
-                    .declared_module_targets
-                    .iter()
-                    .filter(|(_, target)| target.as_deref() == Some(target_file))
-                    .map(|(module, _)| (file.clone(), module.clone()))
-                    .collect::<Vec<_>>();
-                Some(modules)
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        parents.sort();
-        parents.into_iter().next()
+        match self.crate_scans() {
+            Some(memo) => memo.module_parents.get(target_file).cloned(),
+            None => self.module_parent_by_scan(target_file),
+        }
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
@@ -3870,6 +3923,100 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn inline_scoped_target(
+        &self,
+        caller_file: &str,
+        module_segments: &[String],
+        short_name: &str,
+    ) -> Option<(String, String)> {
+        match self.crate_scans() {
+            Some(memo) => {
+                self.inline_scoped_target_in(memo, caller_file, module_segments, short_name)
+            }
+            None => self.inline_scoped_target_by_scan(caller_file, module_segments, short_name),
+        }
+    }
+}
+
+impl ProjectIndex<'_> {
+    /// The crate-wide lookup memo, or `None` for an index that loads stored
+    /// files on demand: its file set is not all in memory, so those lookups
+    /// keep scanning.
+    fn crate_scans(&self) -> Option<&CrateScanMemo> {
+        #[cfg(test)]
+        if SCAN_WITHOUT_CRATE_MEMO.with(std::cell::Cell::get) {
+            return None;
+        }
+        if self.lazy.is_some() {
+            return None;
+        }
+        Some(
+            self.crate_scans
+                .get_or_init(|| CrateScanMemo::build(&self.files)),
+        )
+    }
+
+    /// `module_parent` by scanning every indexed file: the smallest
+    /// `(declaring file, module name)` pair whose declared target is
+    /// `target_file`.
+    fn module_parent_by_scan(&self, target_file: &str) -> Option<(String, String)> {
+        let mut parents = self
+            .scan_paths(LazyDbFileIndexes::module_declaring_files)
+            .into_iter()
+            .filter_map(|file| {
+                let index = self.file_index(&file)?;
+                let modules = index
+                    .declared_module_targets
+                    .iter()
+                    .filter(|(_, target)| target.as_deref() == Some(target_file))
+                    .map(|(module, _)| (file.clone(), module.clone()))
+                    .collect::<Vec<_>>();
+                Some(modules)
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        parents.sort();
+        parents.into_iter().next()
+    }
+
+    /// `inline_scoped_target` from the memo. Same order as the scan: the
+    /// caller's own file first, then every other Rust file in path order.
+    fn inline_scoped_target_in(
+        &self,
+        memo: &CrateScanMemo,
+        caller_file: &str,
+        module_segments: &[String],
+        short_name: &str,
+    ) -> Option<(String, String)> {
+        let src_prefix = rust_src_prefix(caller_file);
+        let check =
+            |(file_path, file_prefix, file_module_segments): &(String, String, Vec<String>)| {
+                if *file_prefix != src_prefix || !module_segments.starts_with(file_module_segments)
+                {
+                    return None;
+                }
+                let scoped_segments = &module_segments[file_module_segments.len()..];
+                if scoped_segments.is_empty() {
+                    return None;
+                }
+                let scoped_symbol = format!("{}::{short_name}", scoped_segments.join("::"));
+                self.node_for_symbol(file_path, &scoped_symbol)
+                    .map(|_| (file_path.clone(), scoped_symbol))
+            };
+        let caller = memo
+            .rust_files
+            .binary_search_by(|entry| entry.0.as_str().cmp(caller_file))
+            .ok()
+            .map(|position| &memo.rust_files[position]);
+        caller.and_then(check).or_else(|| {
+            memo.rust_files
+                .iter()
+                .filter(|entry| entry.0 != caller_file)
+                .find_map(check)
+        })
+    }
+
+    /// `inline_scoped_target` by sorting and scanning every indexed path.
+    fn inline_scoped_target_by_scan(
         &self,
         caller_file: &str,
         module_segments: &[String],
@@ -14024,6 +14171,7 @@ impl<'a> ProjectIndex<'a> {
             lazy: None,
             workspace_crate_prefixes,
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
+            crate_scans: std::cell::OnceCell::new(),
         }
     }
 
@@ -25304,6 +25452,210 @@ mod build_pool_tests {
 }
 
 #[cfg(test)]
+mod crate_scan_memo_tests {
+    //! The in-memory index answers `module_parent` and
+    //! `inline_scoped_target` from a memo built once per index. These tests
+    //! pin the memo to the scans it replaces, including their first-match
+    //! order, and show that a changed file set (a new index) never reuses an
+    //! earlier index's answers.
+    use super::*;
+
+    fn rust_file(declared: &[(&str, &str)], scoped: &[&str]) -> DbFileIndex {
+        let mut index = DbFileIndex::empty(Some(LangId::Rust));
+        for (module, target) in declared {
+            index
+                .declared_module_targets
+                .insert((*module).to_string(), Some((*target).to_string()));
+        }
+        for symbol in scoped {
+            index
+                .node_by_scoped
+                .insert((*symbol).to_string(), format!("node:{symbol}"));
+        }
+        index
+    }
+
+    fn index(files: Vec<(&str, DbFileIndex)>) -> ProjectIndex<'static> {
+        ProjectIndex::from_parts(
+            Path::new("/fixture"),
+            files
+                .into_iter()
+                .map(|(path, index)| (path.to_string(), index))
+                .collect(),
+            HashMap::new(),
+            WorkspaceCratePrefixCache::default(),
+            Rc::new(DiskFacts::new(Path::new("/fixture"))),
+        )
+    }
+
+    fn fixture_files() -> Vec<(&'static str, DbFileIndex)> {
+        // A non-Rust file whose path sorts before the Rust match; the
+        // language check must skip it.
+        let mut untyped = DbFileIndex::empty(None);
+        untyped
+            .node_by_scoped
+            .insert("deep::f".to_string(), "node:deep::f".to_string());
+        vec![
+            (
+                "crates/a/src/lib.rs",
+                rust_file(
+                    &[
+                        ("foo", "crates/a/src/foo.rs"),
+                        ("alias_foo", "crates/a/src/foo.rs"),
+                    ],
+                    &["foo::inner::helper", "bar::deep::f"],
+                ),
+            ),
+            (
+                "crates/a/src/zed.rs",
+                rust_file(&[("foo", "crates/a/src/foo.rs")], &[]),
+            ),
+            ("crates/a/src/foo.rs", rust_file(&[], &["inner::helper"])),
+            ("crates/a/src/other.rs", rust_file(&[], &[])),
+            ("crates/a/src/bar.rs", untyped),
+            (
+                "crates/b/src/lib.rs",
+                rust_file(&[], &["foo::inner::helper"]),
+            ),
+            ("crates/b/src/x.rs", rust_file(&[], &[])),
+        ]
+    }
+
+    fn segments(path: &[&str]) -> Vec<String> {
+        path.iter().map(|segment| segment.to_string()).collect()
+    }
+
+    /// Compares every memo answer with the scan over the same index and
+    /// returns the memo answers for further checks.
+    fn assert_memo_matches_scan(
+        index: &ProjectIndex<'_>,
+    ) -> Vec<(String, Option<(String, String)>)> {
+        let mut answers = Vec::new();
+        let targets = [
+            "crates/a/src/foo.rs",
+            "crates/a/src/zed.rs",
+            "crates/a/src/missing.rs",
+        ];
+        for target in targets {
+            let memo = ResolverIndex::module_parent(index, target);
+            assert_eq!(memo, index.module_parent_by_scan(target), "{target}");
+            answers.push((format!("parent {target}"), memo));
+        }
+        let mut callers = index.files.keys().cloned().collect::<Vec<_>>();
+        callers.push("crates/a/src/not_indexed.rs".to_string());
+        callers.sort();
+        let queries = [
+            (segments(&["foo", "inner"]), "helper"),
+            (segments(&["bar", "deep"]), "f"),
+            (segments(&["foo"]), "absent"),
+            (segments(&[]), "helper"),
+        ];
+        for caller in &callers {
+            for (module_segments, name) in &queries {
+                let memo =
+                    ResolverIndex::inline_scoped_target(index, caller, module_segments, name);
+                assert_eq!(
+                    memo,
+                    index.inline_scoped_target_by_scan(caller, module_segments, name),
+                    "{caller} {module_segments:?} {name}"
+                );
+                answers.push((format!("inline {caller} {module_segments:?} {name}"), memo));
+            }
+        }
+        answers
+    }
+
+    fn pair(file: &str, item: &str) -> Option<(String, String)> {
+        Some((file.to_string(), item.to_string()))
+    }
+
+    #[test]
+    fn memoized_crate_scans_answer_exactly_like_the_scans() {
+        let index = index(fixture_files());
+        assert_memo_matches_scan(&index);
+        // Several declarations of one file: the smallest (file, module) pair.
+        assert_eq!(
+            ResolverIndex::module_parent(&index, "crates/a/src/foo.rs"),
+            pair("crates/a/src/lib.rs", "alias_foo")
+        );
+        let inner = segments(&["foo", "inner"]);
+        // The caller's own file wins over an earlier path.
+        assert_eq!(
+            ResolverIndex::inline_scoped_target(&index, "crates/a/src/lib.rs", &inner, "helper"),
+            pair("crates/a/src/lib.rs", "foo::inner::helper")
+        );
+        // Otherwise the first path in order, within the caller's crate only.
+        assert_eq!(
+            ResolverIndex::inline_scoped_target(&index, "crates/a/src/other.rs", &inner, "helper"),
+            pair("crates/a/src/foo.rs", "inner::helper")
+        );
+        assert_eq!(
+            ResolverIndex::inline_scoped_target(&index, "crates/b/src/x.rs", &inner, "helper"),
+            pair("crates/b/src/lib.rs", "foo::inner::helper")
+        );
+        // A non-Rust file that sorts first is skipped.
+        assert_eq!(
+            ResolverIndex::inline_scoped_target(
+                &index,
+                "crates/a/src/other.rs",
+                &segments(&["bar", "deep"]),
+                "f"
+            ),
+            pair("crates/a/src/lib.rs", "bar::deep::f")
+        );
+    }
+
+    #[test]
+    fn a_changed_file_set_never_reuses_an_earlier_index_memo() {
+        let first = index(fixture_files());
+        let inner = segments(&["foo", "inner"]);
+        // Build the first index's memo before the file set changes.
+        let before = assert_memo_matches_scan(&first);
+        assert_eq!(
+            ResolverIndex::module_parent(&first, "crates/a/src/foo.rs"),
+            pair("crates/a/src/lib.rs", "alias_foo")
+        );
+        assert_eq!(
+            ResolverIndex::inline_scoped_target(&first, "crates/a/src/other.rs", &inner, "helper"),
+            pair("crates/a/src/foo.rs", "inner::helper")
+        );
+
+        // Remove two files and add two, the way a join rebuilds its index
+        // from the previous index's files.
+        let mut files = first.files.clone();
+        files.remove("crates/a/src/lib.rs");
+        files.remove("crates/a/src/foo.rs");
+        files.insert(
+            "crates/a/src/aaa.rs".to_string(),
+            rust_file(&[("foo", "crates/a/src/foo.rs")], &[]),
+        );
+        files.insert(
+            "crates/a/src/foo/mod.rs".to_string(),
+            rust_file(&[], &["inner::helper"]),
+        );
+        let second = ProjectIndex::from_parts(
+            Path::new("/fixture"),
+            files,
+            HashMap::new(),
+            WorkspaceCratePrefixCache::default(),
+            Rc::new(DiskFacts::new(Path::new("/fixture"))),
+        );
+        let after = assert_memo_matches_scan(&second);
+        assert_ne!(before, after, "the fixture must change some answers");
+        assert_eq!(
+            ResolverIndex::module_parent(&second, "crates/a/src/foo.rs"),
+            pair("crates/a/src/aaa.rs", "foo")
+        );
+        assert_eq!(
+            ResolverIndex::inline_scoped_target(&second, "crates/a/src/other.rs", &inner, "helper"),
+            pair("crates/a/src/foo/mod.rs", "inner::helper")
+        );
+        // The first index still answers for its own, unchanged file set.
+        assert_eq!(assert_memo_matches_scan(&first), before);
+    }
+}
+
+#[cfg(test)]
 mod reexport_resolution_tests {
     use super::*;
 
@@ -25317,6 +25669,7 @@ mod reexport_resolution_tests {
             lazy: None,
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
+            crate_scans: std::cell::OnceCell::new(),
         }
     }
 
