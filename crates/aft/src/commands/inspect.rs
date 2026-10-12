@@ -374,9 +374,9 @@ pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
 /// Configure records which language servers apply to the project on a
 /// background walk, and until it finishes the status bar reports project
 /// diagnostics as pending. A blocking inspect answers only once its analysis is
-/// current, so it waits for that walk, at most one phase wait of its request
-/// budget, and the status bar it leaves behind reads the walk's result instead
-/// of "pending".
+/// current, so it waits for that walk, for at most half of its remaining work
+/// time (capped at `INSPECT_PHASE_WAIT_CAP`), and the status bar it leaves
+/// behind reads the walk's result instead of "pending".
 ///
 /// Returns true when the walk was still running at the end of the wait. The
 /// inspect then reports diagnostics as unknown with a named gap
