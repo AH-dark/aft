@@ -103,6 +103,9 @@ impl ActorScope {
         epoch: Arc<RwLock<()>>,
         detached_writers: Arc<AtomicUsize>,
     ) -> Self {
+        // Queries for this context now leave on-demand call-graph builds to a
+        // scoped caller instead of publishing inline (see `AppContext`).
+        ctx.note_publication_scope();
         Self(CURRENT.with(|slot| {
             slot.replace(Some(Target {
                 ctx,

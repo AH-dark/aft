@@ -9271,7 +9271,9 @@ mod tests {
         names
     }
 
-    fn lazy_ready(access: CallgraphStoreAccess) -> Arc<crate::callgraph_store::ReadonlyCallGraphStore> {
+    fn lazy_ready(
+        access: CallgraphStoreAccess,
+    ) -> Arc<crate::callgraph_store::ReadonlyCallGraphStore> {
         match access {
             CallgraphStoreAccess::Ready(store) => store,
             CallgraphStoreAccess::Building => panic!("call graph reported building"),
@@ -9326,7 +9328,10 @@ mod tests {
         cold: &crate::callgraph_store::ReadonlyCallGraphStore,
     ) {
         assert_eq!(store.project_root(), cold.project_root());
-        assert_eq!(store.edge_snapshot().unwrap(), cold.edge_snapshot().unwrap());
+        assert_eq!(
+            store.edge_snapshot().unwrap(),
+            cold.edge_snapshot().unwrap()
+        );
         let lib = Path::new("lib.rs");
         assert_eq!(
             store.callers_of(lib, "target", 3).unwrap(),
@@ -9366,7 +9371,10 @@ mod tests {
                 .view_runtime_snapshot()
                 .and_then(|view| {
                     let generation = view.generation?;
-                    Some(crate::views::read::derived_built(&view.view_dir, &generation))
+                    Some(crate::views::read::derived_built(
+                        &view.view_dir,
+                        &generation,
+                    ))
                 })
                 .unwrap_or(false);
             if built && !crate::executor::view_publication::running_for(ctx) {
@@ -9444,7 +9452,10 @@ mod tests {
         assert_eq!(answer.data["total_callers"], 1, "{}", answer.data);
 
         assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 0);
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            0
+        );
     }
 
     #[test]
@@ -9461,12 +9472,14 @@ mod tests {
 
         // The edit is not published yet, but main's graph no longer answers.
         let access = {
-            let _scope =
-                crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
+            let _scope = crate::executor::install_standalone_scope(Arc::clone(&fixture.borrower));
             fixture.borrower.callgraph_store_for_ops()
         };
         assert!(matches!(access, CallgraphStoreAccess::Building));
-        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            1
+        );
         lazy_wait_for_own_graph(&fixture.borrower);
 
         let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
@@ -9485,7 +9498,10 @@ mod tests {
             "edited_caller"
         )
         .is_ok());
-        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            1
+        );
     }
 
     #[test]
@@ -9534,10 +9550,16 @@ mod tests {
         assert_eq!(view.current_generation().unwrap(), edited);
 
         assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
-        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 0);
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            0
+        );
         // Generation cleanup has no derived database to remove and still works.
         view.sweep_generations().unwrap();
-        assert!(!view.manifest_path(first.as_deref().unwrap()).unwrap().exists());
+        assert!(!view
+            .manifest_path(first.as_deref().unwrap())
+            .unwrap()
+            .exists());
         assert_eq!(lazy_derived_files(&view_dir), Vec::<String>::new());
     }
 
@@ -9582,16 +9604,25 @@ mod tests {
                 std::thread::spawn(move || {
                     let _scope = crate::executor::install_standalone_scope(Arc::clone(&ctx));
                     barrier.wait();
-                    matches!(ctx.callgraph_store_for_ops(), CallgraphStoreAccess::Building)
+                    matches!(
+                        ctx.callgraph_store_for_ops(),
+                        CallgraphStoreAccess::Building
+                    )
                 })
             })
             .collect::<Vec<_>>();
         for query in queries {
             assert!(query.join().unwrap(), "a first query must report building");
         }
-        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            1
+        );
         lazy_wait_for_own_graph(&fixture.borrower);
-        assert_eq!(fixture.borrower.lazy_callgraph_builds_scheduled_for_test(), 1);
+        assert_eq!(
+            fixture.borrower.lazy_callgraph_builds_scheduled_for_test(),
+            1
+        );
         let store = lazy_ready(fixture.borrower.callgraph_store_for_ops());
         assert!(store
             .sqlite_path()

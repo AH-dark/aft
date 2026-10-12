@@ -374,14 +374,12 @@ pub(crate) fn note_checkout_diverged(project_root: &std::path::Path) {
 }
 
 fn checkout_diverged(project_root: &std::path::Path) -> bool {
-    DIVERGED_CHECKOUTS
-        .get()
-        .is_some_and(|roots| {
-            roots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(project_root)
-        })
+    DIVERGED_CHECKOUTS.get().is_some_and(|roots| {
+        roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(project_root)
+    })
 }
 
 /// The main worktree of the repository `project_root` belongs to: the first
