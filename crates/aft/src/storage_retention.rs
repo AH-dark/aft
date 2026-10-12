@@ -1543,6 +1543,18 @@ fn run_pass_with_clock(
     cancelled: &dyn Fn() -> bool,
     clock: &dyn Fn() -> Instant,
 ) -> SweepReport {
+    run_pass_with_budget(storage, cancelled, clock, PASS_BUDGET)
+}
+
+/// One pass with an explicit time budget. Production always passes
+/// PASS_BUDGET; tests that check the entry bound pass a budget no runner can
+/// exhaust, so a slow machine cannot stop the pass by wall clock first.
+fn run_pass_with_budget(
+    storage: &Path,
+    cancelled: &dyn Fn() -> bool,
+    clock: &dyn Fn() -> Instant,
+    budget: Duration,
+) -> SweepReport {
     let mut report = SweepReport {
         at_ms: crate::pins::now_ms(),
         ..Default::default()
@@ -1566,7 +1578,7 @@ fn run_pass_with_clock(
                 )
                 .or_default();
         }
-        let deadline = Instant::now() + PASS_BUDGET;
+        let deadline = Instant::now() + budget;
         let mut members = ViewMembers::default();
         // Keys already past their grace go first, with at most half the
         // budget, so their reclaim does not wait for the lexical walk to come
@@ -1576,7 +1588,7 @@ fn run_pass_with_clock(
             storage,
             &domains,
             &history,
-            Instant::now() + PASS_BUDGET / 2,
+            Instant::now() + budget / 2,
             clock,
             cancelled,
             &mut members,
@@ -1791,7 +1803,7 @@ mod storage_retention_tests {
         )
         .unwrap();
         assert_eq!(
-            run_pass(temp.path(), &|| false).removed_roots,
+            run_pass_entry_bound(temp.path()).removed_roots,
             2,
             "removing one plane reset the shared grace for the other plane"
         );
@@ -1895,6 +1907,15 @@ mod storage_retention_tests {
         }
     }
 
+    /// A budget no test runner exhausts. Tests that count entries per pass
+    /// check the entry bound, not the runner's speed; the time bound has its
+    /// own tests with an injected clock or a zero budget.
+    const NO_TIME_BOUND: Duration = Duration::from_secs(24 * 60 * 60);
+
+    fn run_pass_entry_bound(storage: &Path) -> SweepReport {
+        run_pass_with_budget(storage, &|| false, &Instant::now, NO_TIME_BOUND)
+    }
+
     fn fixture() -> (tempfile::TempDir, PathBuf, String) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("checkout");
@@ -1970,10 +1991,10 @@ mod storage_retention_tests {
         for i in 0..130 {
             cache(temp.path(), "inspect", &format!("{i:016x}"));
         }
-        let first = run_pass(temp.path(), &|| false);
+        let first = run_pass_entry_bound(temp.path());
         assert_eq!(first.examined, PASS_ENTRIES, "{first:?}");
         states().lock().unwrap().remove(temp.path());
-        let second = run_pass(temp.path(), &|| false);
+        let second = run_pass_entry_bound(temp.path());
         assert_eq!(second.examined, PASS_ENTRIES, "{second:?}");
         assert_eq!(
             fs::read_dir(temp.path().join("retention/unknown"))
@@ -1999,7 +2020,7 @@ mod storage_retention_tests {
             }
         });
         assert_eq!(first.examined, 1, "{first:?}");
-        let second = run_pass(temp.path(), &|| false);
+        let second = run_pass_entry_bound(temp.path());
         assert_eq!(second.examined, 9, "{second:?}");
         let cursor: TraversalCursor =
             read_json(&temp.path().join("retention/cursors/roots.json")).unwrap();
@@ -2144,7 +2165,7 @@ mod storage_retention_tests {
             }
         }
         cache(temp.path(), "inspect", "0000000000000000");
-        let report = run_pass(temp.path(), &|| false);
+        let report = run_pass_entry_bound(temp.path());
         let domain = &report.domains["inspect"];
         assert_eq!(
             (
@@ -2415,7 +2436,7 @@ mod storage_retention_tests {
             .map(|domain| cache(temp.path(), domain, &scope))
             .collect::<Vec<_>>();
         fs::remove_dir(root).unwrap();
-        let report = run_pass(temp.path(), &|| false);
+        let report = run_pass_entry_bound(temp.path());
         assert_eq!(report.removed_roots, 6, "{report:?}");
         assert_eq!(report.removed_bytes, 6 * 11);
         assert!(paths.iter().all(|path| !path.exists()));
@@ -2838,11 +2859,26 @@ mod storage_retention_tests {
         for number in 0..80 {
             cache(temp.path(), "symbols", &format!("{number:016x}"));
         }
-        let first = run_pass(temp.path(), &|| false);
-        let second = run_pass(temp.path(), &|| false);
+        let first = run_pass_entry_bound(temp.path());
+        let second = run_pass_entry_bound(temp.path());
         assert_eq!(first.examined, PASS_ENTRIES);
         assert_eq!(second.examined, 16);
         assert!(first.stopped_early);
+    }
+
+    #[test]
+    fn storage_retention_time_budget_stops_the_walk_before_the_entry_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        for number in 0..80 {
+            cache(temp.path(), "symbols", &format!("{number:016x}"));
+        }
+        // An exhausted budget stops the pass before its first entry, however
+        // many entries remain, and leaves the cursor where it was.
+        let stopped = run_pass_with_budget(temp.path(), &|| false, &Instant::now, Duration::ZERO);
+        assert_eq!(stopped.examined, 0, "{stopped:?}");
+        assert!(stopped.stopped_early, "{stopped:?}");
+        let resumed = run_pass_entry_bound(temp.path());
+        assert_eq!(resumed.examined, PASS_ENTRIES, "{resumed:?}");
     }
 
     /// Makes an orphan view look observed, and unchanged, for over an hour.
@@ -2968,7 +3004,7 @@ mod storage_retention_tests {
         let path = cache(temp.path(), "symbols", &scope);
         // Expected: the due-first lane removes the due key's cache in this
         // same pass, without waiting for the batch to reach it.
-        let report = run_pass(temp.path(), &|| false);
+        let report = run_pass_entry_bound(temp.path());
         assert_eq!(report.due_keys, 1, "{report:?}");
         assert_eq!(report.due_first.removed_roots, 1, "{report:?}");
         assert_eq!(report.removed_roots, 1, "{report:?}");
