@@ -189,12 +189,15 @@ pub fn prepare_checkout(
     prepare_checkout_deferring(request, false, phase)
 }
 
-/// Like [`prepare_checkout`], but with `defer_derived` a checkout that has
-/// no derived call-graph database yet publishes its manifest without building
-/// one. Callgraph keys and blobs are still recorded, so the manifest can be
-/// compared with another checkout's and the graph can be built later from it.
-/// Once the checkout has a derived database, publication keeps it current
-/// whatever `defer_derived` says.
+/// Like [`prepare_checkout`], but with `defer_derived` the checkout publishes
+/// its manifest without building a derived call-graph database. Callgraph keys
+/// and blobs are still recorded, so the manifest can be compared with another
+/// checkout's and the graph can be built later from it. The caller decides
+/// whether to defer from whether a query has needed the graph, not from
+/// whether a derived database already exists: one an earlier process built
+/// is not a query of this one, and patching it can take minutes.
+/// An unchanged manifest whose current derived database is ready stays a
+/// no-op; any other change publishes a generation without one.
 pub fn prepare_checkout_deferring(
     request: &AssemblyRequest,
     defer_derived: bool,
@@ -261,9 +264,7 @@ pub fn prepare_checkout_deferring(
         Err(error) => return Err(ViewError::InvalidManifest(error.to_string())),
     };
     let base_ready = current_derived_built && unusable_base.is_none();
-    // Defer only while no derived file exists. A file that exists, even one
-    // an older build left unreadable, means the checkout has used its graph.
-    let defer_derived = defer_derived && request.callgraph && !current_derived_built;
+    let defer_derived = defer_derived && request.callgraph;
     timing.phase("previous_manifest");
     let head_started = Instant::now();
     let head = head_tree_entries(&request.project_root)
@@ -614,7 +615,9 @@ pub fn prepare_checkout_deferring(
         .as_deref()
         .is_some_and(|generation| super::generation_matches_head(generation, &request.desired_head))
         && previous.as_ref() == Some(&manifest)
-        && (base_ready || defer_derived)
+        // Deferring keeps a current generation that has no derived file, but
+        // still replaces one whose derived file fails the readiness check.
+        && (base_ready || (defer_derived && !current_derived_built))
     {
         prepared.profile.outcome = "no_op";
         prepared.profile.seed_source = if base_ready { "own" } else { "deferred" };
