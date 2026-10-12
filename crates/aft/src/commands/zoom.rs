@@ -3,12 +3,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::commands::outline::symbol_to_entry;
 use crate::commands::read::{handle_github_zoom, is_github_read_target};
 use crate::commands::symbol_render::{
-    build_container_outline, format_qualified_entry, might_have_container_members,
-    qualified_symbol_name, render_container_member_menu, should_return_member_menu,
-    symbol_kind_string,
+    build_container_outline, might_have_container_members, qualified_symbol_name,
+    render_container_member_menu, should_return_member_menu, symbol_kind_string,
 };
 use crate::context::AppContext;
 use crate::edit::line_col_to_byte;
@@ -493,8 +491,9 @@ fn same_file_zoom_targets(req: &RawRequest, file: &str) -> Vec<serde_json::Value
 ///
 /// Expects either `file` plus `symbol`/`symbols`, or a cross-file `targets` array,
 /// with optional `context_lines` (default 3). Resolves the symbol, extracts body +
-/// context, and walks ASTs for call annotations. For code files, a whitespace-separated
-/// top-level `symbol`/`symbols` string is split into multiple same-file lookups.
+/// context, and walks ASTs for call annotations. For code files, top-level commas and
+/// whitespace in `symbol`/`symbols` strings separate same-file lookups; nested
+/// signature text stays intact.
 pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
     super::url_output::cap_zoom_response(req, handle_zoom_inner(req, ctx))
 }
@@ -977,7 +976,8 @@ fn parse_stringified_symbol_array(raw: &str) -> Option<Vec<String>> {
 
 /// Normalize `symbol` / `symbols` into one or more lookup names.
 ///
-/// For code files, a single string containing internal whitespace is split on `\s+`.
+/// For code files, a string is split at top-level commas and whitespace. Separators
+/// inside a signature's parentheses, brackets, or generic arguments stay intact.
 /// Markdown/HTML headings keep the full string (headings may contain spaces).
 fn parse_zoom_symbol_names(
     params: &serde_json::Value,
@@ -1013,15 +1013,45 @@ fn parse_zoom_symbol_names(
         return Ok(vec![trimmed.to_string()]);
     }
 
-    if raw.split_whitespace().count() <= 1 {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Ok(Vec::new());
+    Ok(split_zoom_symbol_string(raw))
+}
+
+fn split_zoom_symbol_string(raw: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut start = None;
+    let (mut parentheses, mut brackets, mut angles) = (0usize, 0usize, 0usize);
+
+    for (index, ch) in raw.char_indices() {
+        let nested = parentheses > 0 || brackets > 0 || angles > 0;
+        if !nested && (ch == ',' || ch.is_whitespace()) {
+            if let Some(segment_start) = start.take() {
+                let name = raw[segment_start..index].trim();
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+            }
+            continue;
         }
-        return Ok(vec![trimmed.to_string()]);
+
+        start.get_or_insert(index);
+        match ch {
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            '<' => angles += 1,
+            '>' => angles = angles.saturating_sub(1),
+            _ => {}
+        }
     }
 
-    Ok(raw.split_whitespace().map(str::to_string).collect())
+    if let Some(segment_start) = start {
+        let name = raw[segment_start..].trim();
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+    }
+    names
 }
 
 fn zoom_batch_symbols(
@@ -1181,14 +1211,16 @@ fn zoom_one_symbol_inner(
     };
 
     if matches.len() > 1 {
-        let content = render_ambiguous_symbol_menu(symbol_name, &matches);
+        let suggestions = ambiguous_symbol_selectors(&matches);
+        let content = render_ambiguous_symbol_menu(symbol_name, &suggestions);
         let candidates = matches
             .iter()
-            .map(|candidate| {
+            .zip(suggestions.iter())
+            .map(|(candidate, selector)| {
                 let sym = &candidate.symbol;
                 serde_json::json!({
                     "name": sym.name.clone(),
-                    "qualified_name": qualified_symbol_name(sym),
+                    "qualified_name": selector,
                     "kind": symbol_kind_string(&sym.kind),
                     "range": sym.range.clone(),
                     "signature": sym.signature.clone(),
@@ -1530,25 +1562,44 @@ fn empty_annotations() -> serde_json::Value {
     })
 }
 
-fn render_ambiguous_symbol_menu(
-    symbol_name: &str,
-    matches: &[crate::symbols::SymbolMatch],
-) -> String {
+fn render_ambiguous_symbol_menu(symbol_name: &str, suggestions: &[String]) -> String {
     let mut lines = vec![format!(
         "symbol '{symbol_name}' is ambiguous ({} candidates) and cannot choose a body. {} Pick one of these qualified names for `symbol`:",
-        matches.len(),
+        suggestions.len(),
         RETRY_UNCHANGED_ZOOM_MESSAGE,
     )];
 
-    for candidate in matches {
-        let entry = symbol_to_entry(&candidate.symbol);
-        lines.push(format!(
-            "- {}",
-            format_qualified_entry(&entry, Some(&candidate.symbol))
-        ));
+    for suggestion in suggestions {
+        lines.push(format!("- {suggestion}"));
     }
 
     lines.join("\n")
+}
+
+fn ambiguous_symbol_selectors(matches: &[SymbolMatch]) -> Vec<String> {
+    let qualified_names = matches
+        .iter()
+        .map(|candidate| qualified_symbol_name(&candidate.symbol))
+        .collect::<Vec<_>>();
+    let mut counts = HashMap::new();
+    for name in &qualified_names {
+        *counts.entry(name.clone()).or_insert(0usize) += 1;
+    }
+
+    matches
+        .iter()
+        .zip(qualified_names)
+        .map(|(candidate, name)| {
+            if counts[name.as_str()] > 1 {
+                format!(
+                    "{name}#L{}",
+                    candidate.symbol.range.start_line.saturating_add(1)
+                )
+            } else {
+                name
+            }
+        })
+        .collect()
 }
 
 fn levenshtein_distance(s1: &str, s2: &str) -> usize {
@@ -1633,14 +1684,37 @@ fn resolve_zoom_symbol(
     query: &str,
     is_heading: bool,
 ) -> Result<Vec<SymbolMatch>, crate::error::AftError> {
-    if is_heading {
-        return resolve_heading_symbols(provider, path, query);
-    }
+    let (name, anchor_line) = split_zoom_line_anchor(query);
+    let matches = if is_heading {
+        resolve_heading_symbols(provider, path, name)?
+    } else {
+        match provider.resolve_symbol(path, name) {
+            Err(crate::error::AftError::SymbolNotFound { .. }) => Vec::new(),
+            result => result?,
+        }
+    };
+    Ok(if let Some(line) = anchor_line {
+        matches
+            .into_iter()
+            .filter(|candidate| candidate.symbol.range.start_line.saturating_add(1) == line)
+            .collect()
+    } else {
+        matches
+    })
+}
 
-    match provider.resolve_symbol(path, query) {
-        Err(crate::error::AftError::SymbolNotFound { .. }) => Ok(Vec::new()),
-        result => result,
+/// Parse the 1-based `#L<n>` suffix used to distinguish equal qualified names.
+fn split_zoom_line_anchor(query: &str) -> (&str, Option<u32>) {
+    let Some((name, line)) = query.rsplit_once("#L") else {
+        return (query, None);
+    };
+    let Ok(line) = line.parse::<u32>() else {
+        return (query, None);
+    };
+    if name.is_empty() || line == 0 {
+        return (query, None);
     }
+    (name, Some(line))
 }
 
 /// A resolved JSON node: the tree-sitter node plus the human-readable path
@@ -2654,6 +2728,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_zoom_symbol_names_splits_top_level_commas_and_whitespace() {
+        let params = serde_json::json!({ "symbols": "alpha, beta gamma, delta" });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::TypeScript)).expect("parse");
+        assert_eq!(names, vec!["alpha", "beta", "gamma", "delta"]);
+    }
+
+    #[test]
+    fn parse_zoom_symbol_names_keeps_nested_signature_text_intact() {
+        let params = serde_json::json!({
+            "symbols": "alpha, runtime.publish(receipt, rawPatch) Generic<T, U>.apply(items: [First, Second], callback: (x: T, y: U) => void)"
+        });
+        let names = parse_zoom_symbol_names(&params, Some(LangId::TypeScript)).expect("parse");
+        assert_eq!(
+            names,
+            vec![
+                "alpha",
+                "runtime.publish(receipt, rawPatch)",
+                "Generic<T, U>.apply(items: [First, Second], callback: (x: T, y: U) => void)"
+            ]
+        );
+    }
+
+    #[test]
     fn parse_zoom_symbol_names_does_not_split_markdown_headings() {
         let params = serde_json::json!({ "symbols": "Getting Started" });
         let names = parse_zoom_symbol_names(&params, Some(LangId::Markdown)).expect("parse");
@@ -2712,7 +2809,7 @@ mod tests {
         // ordinary handling rather than returning numbers-as-names.
         let params = serde_json::json!({ "symbols": "[1, 2]" });
         let names = parse_zoom_symbol_names(&params, Some(LangId::Rust)).expect("parse");
-        assert_eq!(names, vec!["[1,", "2]"]);
+        assert_eq!(names, vec!["[1, 2]"]);
     }
 
     // --- Call extraction tests ---
@@ -3744,6 +3841,94 @@ def local():
             "expected ambiguous-name menu, got: {content}"
         );
         assert!(content.contains("Pick one of these qualified names"));
+    }
+
+    #[test]
+    fn zoom_ambiguous_suggestions_round_trip_as_symbols() {
+        let ctx = make_ctx();
+        let path = fixture_path("zoom_ambiguous_publish.ts");
+        let request =
+            make_zoom_request("publish-ambiguous", path.to_str().unwrap(), "publish", None);
+
+        let ambiguous = serde_json::to_value(handle_zoom(&request, &ctx)).unwrap();
+        assert_eq!(ambiguous["kind"], "ambiguous_symbol");
+        let content = ambiguous["content"].as_str().expect("ambiguity content");
+        let suggestions = content
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            suggestions,
+            ["Runtime.publish", "SnapshotStore.publish"],
+            "suggestions must be directly usable symbol selectors: {content}"
+        );
+
+        let candidates = ambiguous["candidates"].as_array().expect("candidates");
+        for ((suggestion, marker), candidate) in suggestions
+            .iter()
+            .zip(["runtime:", "snapshot:"])
+            .zip(candidates.iter())
+        {
+            let request = serde_json::json!({
+                "id": format!("publish-{suggestion}"),
+                "command": "zoom",
+                "file": path,
+                "symbols": suggestion,
+            });
+            let response = serde_json::to_value(handle_zoom(
+                &serde_json::from_value(request).expect("zoom request"),
+                &ctx,
+            ))
+            .unwrap();
+            assert_eq!(response["success"], true, "{suggestion}: {response:?}");
+            assert_ne!(response["kind"], "ambiguous_symbol", "{suggestion}");
+            assert_eq!(response["range"], candidate["range"]);
+            assert!(response["content"].as_str().unwrap().contains(marker));
+        }
+    }
+
+    #[test]
+    fn zoom_ambiguous_suggestions_use_line_anchors_when_qualified_names_collide() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("duplicate-publish.ts");
+        std::fs::write(
+            &path,
+            "class Runtime {\n  publish(): string { return \"first\"; }\n  publish(): string { return \"second\"; }\n}\n",
+        )
+        .unwrap();
+        let ctx = make_ctx();
+        let request =
+            make_zoom_request("duplicate-publish", path.to_str().unwrap(), "publish", None);
+
+        let ambiguous = serde_json::to_value(handle_zoom(&request, &ctx)).unwrap();
+        assert_eq!(ambiguous["kind"], "ambiguous_symbol");
+        let content = ambiguous["content"].as_str().expect("ambiguity content");
+        let suggestions = content
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .collect::<Vec<_>>();
+        assert_eq!(suggestions, ["Runtime.publish#L2", "Runtime.publish#L3"]);
+
+        for ((suggestion, marker), candidate) in suggestions
+            .iter()
+            .zip(["first", "second"])
+            .zip(ambiguous["candidates"].as_array().unwrap())
+        {
+            let request = serde_json::json!({
+                "id": format!("duplicate-{suggestion}"),
+                "command": "zoom",
+                "file": path.to_str().unwrap(),
+                "symbols": suggestion,
+            });
+            let response = serde_json::to_value(handle_zoom(
+                &serde_json::from_value(request).expect("zoom request"),
+                &ctx,
+            ))
+            .unwrap();
+            assert_eq!(response["success"], true, "{suggestion}: {response:?}");
+            assert_eq!(response["range"], candidate["range"]);
+            assert!(response["content"].as_str().unwrap().contains(marker));
+        }
     }
 
     #[test]
