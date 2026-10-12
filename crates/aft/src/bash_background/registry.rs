@@ -6333,6 +6333,7 @@ impl BgTaskRegistry {
             BgTaskStatus::Killed,
             Some(SCOPE_REVOKED_REASON.into()),
         )
+        .map_err(|error| error.to_string())
     }
 
     /// Kill a running call's task because its caller withdrew the call

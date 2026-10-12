@@ -5296,6 +5296,42 @@ mod policy_tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn config_only_tool_profile_preserves_read_and_private_store_floors() {
+        let fixture = tempfile::tempdir().unwrap();
+        let project = fixture.path().join("project");
+        let storage = fixture.path().join("private-store");
+        let io = fixture
+            .path()
+            .join("tasks/session/bash-0000000000000001/io");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::create_dir_all(&io).unwrap();
+        let project = project.canonicalize().unwrap();
+        let storage = storage.canonicalize().unwrap();
+        let denied = project.join("read-denied.txt");
+        std::fs::write(&denied, "not readable by a formatter").unwrap();
+        let mut config = crate::config::Config {
+            project_root: Some(project),
+            storage_dir: Some(storage.clone()),
+            ..Default::default()
+        };
+        config.github.shim = false;
+        config.git.co_author = "off".into();
+        config.sandbox.read_deny = vec![denied.clone()];
+        let profile = build_native_profile_for_config(
+            &config,
+            &AuthenticatedPrincipal::FirstParty,
+            &io,
+            None,
+        )
+        .unwrap();
+        assert!(profile.read_deny.contains(&denied));
+        assert!(!profile.write_deny.contains(&denied));
+        assert!(profile.data_policy.deny.contains(&storage));
+    }
+
     fn context(project_root: PathBuf) -> AppContext {
         AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),

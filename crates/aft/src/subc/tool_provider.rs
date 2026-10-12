@@ -5568,6 +5568,7 @@ mod authorization_failure_tests {
             arguments: json!({"command":"printf must-not-run"}),
             format_context: crate::subc_format::FormatContext::default(),
             cancel: bash::BashWaitCancel {
+                run_scope: None,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
