@@ -1165,6 +1165,7 @@ mod tests {
         exit_code: Option<i64>,
     ) -> BgTaskSnapshot {
         BgTaskSnapshot {
+            exit_marker_unavailable: None,
             info: BgTaskInfo {
                 task_id: "bash-test".to_string(),
                 status,

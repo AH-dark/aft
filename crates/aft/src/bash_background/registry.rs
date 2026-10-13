@@ -545,6 +545,8 @@ pub struct BgTaskSnapshot {
     #[serde(flatten)]
     pub info: BgTaskInfo,
     pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_marker_unavailable: Option<String>,
     pub child_pid: Option<u32>,
     pub workdir: String,
     pub output_preview: String,
@@ -4560,6 +4562,12 @@ impl BgTaskRegistry {
         session_id: &str,
     ) -> Result<(), String> {
         #[cfg(unix)]
+        if metadata.remote.is_some() && metadata.is_terminal() {
+            remote::persist_terminal_artifacts(&paths, &mut metadata);
+            self.persist_task(&paths, &metadata)
+                .map_err(|error| error.to_string())?;
+        }
+        #[cfg(unix)]
         if metadata.remote.is_some() && !metadata.is_terminal() {
             let task_id = metadata.task_id.clone();
             self.insert_rehydrated_task(metadata, paths, true)?;
@@ -4658,6 +4666,7 @@ impl BgTaskRegistry {
                         None,
                         Some(restart_fate_unknown_reason(&metadata, &paths)),
                     );
+                    super::persistence::persist_terminal_exit(&paths, &mut metadata);
                     metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
@@ -5288,8 +5297,14 @@ impl BgTaskRegistry {
             return None;
         }
         if !metadata.is_terminal() {
-            let marker = read_exit_marker(&resolved.paths).ok()??;
-            metadata = terminal_metadata_from_marker(metadata, marker, None);
+            #[cfg(unix)]
+            let remote_proof = remote::terminal_metadata_from_proof(&mut metadata).is_some();
+            #[cfg(not(unix))]
+            let remote_proof = false;
+            if !remote_proof {
+                let marker = read_exit_marker(&resolved.paths).ok()??;
+                metadata = terminal_metadata_from_marker(metadata, marker, None);
+            }
         }
         let row = metadata.to_bash_task_row("", &resolved.paths).ok()?;
         let mut snapshot = terminal_db_row_snapshot(row, metadata.clone());
@@ -7109,6 +7124,7 @@ impl BgTaskRegistry {
                 )
             };
             metadata.mark_terminal(status, None, Some(reason));
+            super::persistence::persist_terminal_exit(&task.paths, metadata);
         });
         if let Ok(metadata) = updated {
             state.pending_terminal_override = None;
@@ -10322,6 +10338,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
             status_reason: metadata.status_reason,
         },
         exit_code: metadata.exit_code,
+        exit_marker_unavailable: metadata.exit_marker_unavailable,
         child_pid: metadata.child_pid,
         workdir: metadata.workdir.display().to_string(),
         output_preview: String::new(),
@@ -10427,6 +10444,7 @@ impl BgTask {
                 status_reason: metadata.status_reason.clone(),
             },
             exit_code: metadata.exit_code,
+            exit_marker_unavailable: metadata.exit_marker_unavailable.clone(),
             child_pid: metadata.child_pid,
             workdir: metadata.workdir.display().to_string(),
             output_preview,
@@ -11960,6 +11978,55 @@ mod tests {
         super::super::persistence::work_counts::reset();
         assert!(restarted.is_session_owned_artifact_path("session", &resolved.paths.stdout));
         assert_eq!(super::super::persistence::work_counts::get().parses, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_local_wrapper_writes_exit_and_pipeline_without_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let original = BgTaskRegistry::default();
+        let task_id = original.spawn_with_shell(
+            SpawnPlan::Unsandboxed,
+            &format!("sh -c 'while [ ! -f \"{}\" ]; do sleep 0.01; done; printf \"381 tests run: 381 passed\\n\" >&2; exit 1' | true", release.display()),
+            crate::bash_background::BashShell::Bash, PathBuf::from("/bin/bash"),
+            "session".into(),
+            dir.path().into(), HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)), dir.path().into(), 10, true, false,
+            Some(dir.path().into()),
+        ).unwrap();
+        let paths = original.task(&task_id).unwrap().paths.clone();
+        original.detach();
+        drop(original);
+        let restarted = BgTaskRegistry::default();
+        fs::write(&release, "finish").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(read_exit_marker(&paths), Ok(Some(_))) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(read_exit_marker(&paths).unwrap(), Some(ExitMarker::Code(0)));
+        assert_eq!(
+            fs::read_to_string(&paths.pipeline_status).unwrap(),
+            "1\n0\n"
+        );
+        let done = restarted
+            .status(
+                &task_id,
+                "session",
+                Some(dir.path()),
+                Some(dir.path()),
+                8192,
+            )
+            .unwrap();
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(done.info.status, BgTaskStatus::Completed);
+        assert!(done.output_preview.contains("381 tests run: 381 passed"));
     }
 
     #[test]

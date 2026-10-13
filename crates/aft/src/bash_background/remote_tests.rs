@@ -918,7 +918,7 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
     assert_eq!(fs::read(&task.paths.stderr).unwrap(), "😀".as_bytes());
     assert_eq!(
         fs::read_to_string(&task.paths.pipeline_status).unwrap(),
-        "3 0\n"
+        "3\n0\n"
     );
     assert_eq!(
         done.output_preview.lines().next(),
@@ -1377,6 +1377,134 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         2
     );
     assert!(!log.iter().any(|(_, b)| b["method"] == "exec.run"));
+}
+
+#[tokio::test]
+async fn exec_remote_bash_restart_after_terminal_proof_restores_exit_and_pipeline_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("unavailable-connection"),
+        "false | true",
+    );
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task.clone()).unwrap();
+    sink.output(0, OutputStream::Stderr, b"381 tests run: 381 passed\n")
+        .unwrap();
+    let mut record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
+    {
+        let mut state = task.state.lock().unwrap();
+        state.metadata.pipeline_segments = vec!["false".into(), "true".into()];
+        original.persist_task(&paths, &state.metadata).unwrap();
+    }
+    record.pipestatus = Some(vec![1, 0]);
+    sink.terminal(&record, &exec::grade(&record)).unwrap();
+    // The runner finished and its proof is durable, but the daemon has not
+    // published terminal status or written the local marker files yet.
+    assert_eq!(
+        read_task(&paths.json).unwrap().status,
+        BgTaskStatus::Running
+    );
+    assert!(fs::read(&paths.exit).unwrap().is_empty());
+    assert!(fs::read(&paths.pipeline_status).unwrap().is_empty());
+    let readonly = registry();
+    let (disk_status, _) = readonly
+        .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+        .unwrap();
+    assert_eq!(disk_status.info.status, BgTaskStatus::Completed);
+    assert_eq!(disk_status.exit_code, Some(0));
+    assert!(readonly.list(0).is_empty());
+    assert_eq!(
+        read_task(&paths.json).unwrap().status,
+        BgTaskStatus::Running
+    );
+    drop(sink);
+    drop(task);
+    drop(original);
+
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed);
+    assert_eq!(done.exit_code, Some(0));
+    assert_eq!(read_exit_marker(&paths).unwrap(), Some(ExitMarker::Code(0)));
+    assert_eq!(
+        fs::read_to_string(&paths.pipeline_status).unwrap(),
+        "1\n0\n"
+    );
+    assert!(done.output_preview.contains("381 tests run: 381 passed"));
+    assert!(done.output_preview.contains("segment 1 of 2"));
+    let disk = read_task(&paths.json).unwrap();
+    assert_eq!(disk.exit_code, Some(0));
+    assert_eq!(
+        disk.schema_version,
+        crate::bash_background::persistence::SCHEMA_VERSION
+    );
+    drop(restarted);
+
+    // Already-completed records from older daemons also need marker repair.
+    fs::write(&paths.exit, "").unwrap();
+    fs::write(&paths.pipeline_status, "").unwrap();
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    assert_eq!(read_exit_marker(&paths).unwrap(), Some(ExitMarker::Code(0)));
+    assert_eq!(
+        fs::read_to_string(&paths.pipeline_status).unwrap(),
+        "1\n0\n"
+    );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_restart_without_terminal_proof_names_unknown_and_removes_empty_markers() {
+    let daemon = daemon(Script::MissingTerminal, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), "false | true");
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task.clone()).unwrap();
+    sink.output(0, OutputStream::Stderr, b"381 tests run: 381 passed\n")
+        .unwrap();
+    drop(sink);
+    drop(task);
+    drop(original);
+    shorten_reattach_budget(dir.path());
+
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+    assert_eq!(done.exit_code, None);
+    assert!(done
+        .info
+        .status_reason
+        .as_deref()
+        .unwrap()
+        .contains("outcome"));
+    assert!(done.output_preview.contains("381 tests run: 381 passed"));
+    let disk = read_task(&paths.json).unwrap();
+    assert!(disk
+        .execution_note
+        .as_deref()
+        .unwrap()
+        .contains("re-attached"));
+    assert!(done.output_preview.contains("re-attached"));
+    assert!(done.exit_marker_unavailable.is_some());
+    assert!(
+        !paths.exit.exists(),
+        "an unknown outcome must not leave an empty exit marker"
+    );
+    assert!(
+        !paths.pipeline_status.exists(),
+        "missing runner proof must not leave an empty pipeline marker"
+    );
+    assert!(disk
+        .pipeline_status_unavailable
+        .as_deref()
+        .unwrap()
+        .contains("terminal"));
+    let log = daemon.log.lock().unwrap();
+    assert!(log.iter().any(|(_, body)| body["method"] == "exec.attach"));
+    assert!(!log.iter().any(|(_, body)| body["method"] == "exec.run"));
 }
 
 #[tokio::test]

@@ -529,6 +529,107 @@ fn open_task_artifact_for_remote(task: &BgTask, artifact: TaskArtifact) -> io::R
 }
 
 #[cfg(unix)]
+fn terminal_outcome(
+    verdict: Verdict,
+    error: Option<String>,
+) -> (BgTaskStatus, Option<i64>, Option<String>) {
+    match verdict {
+        Verdict::Exited { code } => (
+            if code == 0 {
+                BgTaskStatus::Completed
+            } else {
+                BgTaskStatus::Failed
+            },
+            Some(code),
+            None,
+        ),
+        Verdict::Signalled { signal } => (
+            BgTaskStatus::Failed,
+            128_i32.checked_add(signal).map(i64::from),
+            Some(format!("remote signal {signal}")),
+        ),
+        Verdict::DeadlineKilled => (
+            BgTaskStatus::TimedOut,
+            Some(124),
+            Some("remote deadline kill".into()),
+        ),
+        Verdict::Cancelled | Verdict::CancelKilled => {
+            (BgTaskStatus::Killed, None, Some("remote cancel".into()))
+        }
+        Verdict::HistoryExpired => (
+            BgTaskStatus::FateUnknown,
+            None,
+            Some("remote history_expired; prior outcome unavailable; command not rerun".into()),
+        ),
+        Verdict::RunLocally { .. } => (BgTaskStatus::Failed, None, error),
+        _ => (
+            BgTaskStatus::FateUnknown,
+            None,
+            error.or_else(|| {
+                Some("remote terminal proof reported outcome unknown; command not rerun".into())
+            }),
+        ),
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn terminal_metadata_from_proof(metadata: &mut PersistedTask) -> Option<()> {
+    let record = metadata.remote.as_ref()?.terminal.as_ref()?;
+    let verdict = exec::grade(record);
+    // A refusal to start can still trigger a draining retry or local fallback;
+    // it is not a completed run that the read-only disk fallback may settle.
+    if matches!(verdict, Verdict::RunLocally { .. }) {
+        return None;
+    }
+    let (status, code, reason) = terminal_outcome(verdict, None);
+    metadata.mark_terminal(status, code, reason);
+    Some(())
+}
+
+#[cfg(unix)]
+pub(super) fn persist_terminal_artifacts(paths: &TaskPaths, metadata: &mut PersistedTask) {
+    use super::super::persistence::{persist_terminal_exit, record_terminal_artifact};
+    persist_terminal_exit(paths, metadata);
+    let statuses = metadata
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.terminal.as_ref())
+        .and_then(|terminal| terminal.pipestatus.as_ref())
+        .filter(|statuses| !statuses.is_empty());
+    let content = statuses.map(|statuses| {
+        format!(
+            "{}\n",
+            statuses
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    });
+    metadata.pipeline_status_unavailable = match record_terminal_artifact(
+        paths,
+        TaskArtifact::PipelineStatus,
+        content.as_deref().map(str::as_bytes),
+    ) {
+        Ok(()) if content.is_some() => None,
+        Ok(()) => Some(
+            if metadata
+                .remote
+                .as_ref()
+                .is_some_and(|remote| remote.terminal.is_some())
+            {
+                "runner omitted per-segment statuses from its terminal proof".into()
+            } else {
+                "remote terminal proof unavailable; per-segment outcomes are unknown".into()
+            },
+        ),
+        Err(error) => Some(format!(
+            "remote pipeline status persistence failed: {error}"
+        )),
+    };
+}
+
+#[cfg(unix)]
 impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
         self.commit(|r| {
@@ -1691,39 +1792,7 @@ impl BgTaskRegistry {
         // as uncertain, never automatically resubmitted.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
         let unknown = matches!(&verdict, Verdict::OutcomeUnknown);
-        let (status, code, mut reason) = match verdict {
-            Verdict::Exited { code } => (
-                if code == 0 {
-                    BgTaskStatus::Completed
-                } else {
-                    BgTaskStatus::Failed
-                },
-                Some(code),
-                None,
-            ),
-            Verdict::Signalled { signal } => (
-                BgTaskStatus::Failed,
-                128_i32.checked_add(signal).map(i64::from),
-                Some(format!("remote signal {signal}")),
-            ),
-            // The runner already killed the command at its `timeout`, counted
-            // from when it started running; report it like a local timeout.
-            Verdict::DeadlineKilled => (
-                BgTaskStatus::TimedOut,
-                Some(124),
-                Some("remote deadline kill".into()),
-            ),
-            Verdict::Cancelled | Verdict::CancelKilled => {
-                (BgTaskStatus::Killed, None, Some("remote cancel".into()))
-            }
-            Verdict::HistoryExpired => (
-                BgTaskStatus::FateUnknown,
-                None,
-                Some("remote history_expired; prior outcome unavailable; command not rerun".into()),
-            ),
-            Verdict::RunLocally { .. } => (BgTaskStatus::Failed, None, error),
-            _ => (BgTaskStatus::FateUnknown, None, error),
-        };
+        let (status, code, mut reason) = terminal_outcome(verdict, error);
         {
             let mut db = DeferredDbWrites::new(self, task);
             let Ok(mut state) = task.state.lock() else {
@@ -1783,30 +1852,6 @@ impl BgTaskRegistry {
             ) {
                 state.metadata.execution_note = Some(remote_note.clone());
             }
-            if let Some(terminal) = state
-                .metadata
-                .remote
-                .as_ref()
-                .and_then(|r| r.terminal.as_ref())
-                .cloned()
-            {
-                if let Some(pipestatus) = &terminal.pipestatus {
-                    if let Some(handles) = state.io_handles.as_mut() {
-                        let _ = handles.write(
-                            TaskArtifact::PipelineStatus,
-                            format!(
-                                "{}\n",
-                                pipestatus
-                                    .iter()
-                                    .map(i32::to_string)
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            )
-                            .as_bytes(),
-                        );
-                    }
-                }
-            }
             if status == BgTaskStatus::Killed
                 && matches!(
                     state.metadata.status_reason.as_deref(),
@@ -1816,6 +1861,9 @@ impl BgTaskRegistry {
                 reason = state.metadata.status_reason.clone();
             }
             state.metadata.mark_terminal(status, code, reason.clone());
+            // Remote execution has no local shell wrapper to write markers.
+            // Publish from durable runner proof, including after registry restart.
+            persist_terminal_artifacts(&task.paths, &mut state.metadata);
             append_output_loss(&mut state.metadata);
             if let Some(reason) = reason {
                 let note = state

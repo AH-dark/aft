@@ -544,6 +544,9 @@ pub struct PersistedTask {
     /// Windows remote exit codes can exceed i32::MAX. Using i64 preserves all
     /// their bits and also stores signed local process exit codes unchanged.
     pub exit_code: Option<i64>,
+    /// Why the exit marker file is absent; an exact known code may still be in `exit_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_marker_unavailable: Option<String>,
     pub child_pid: Option<u32>,
     pub pgid: Option<i32>,
     /// `Some` records a completed Unix sample, including an empty group. `None`
@@ -652,6 +655,7 @@ impl PersistedTask {
             timeout_ms,
             default_hard_kill: false,
             exit_code: None,
+            exit_marker_unavailable: None,
             child_pid: None,
             pgid: None,
             live_descendants: None,
@@ -781,6 +785,7 @@ impl From<BashTaskRow> for PersistedTask {
             timeout_ms: row.timeout_ms.and_then(|value| u64::try_from(value).ok()),
             default_hard_kill: false,
             exit_code: row.exit_code,
+            exit_marker_unavailable: None,
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
             live_descendants: None,
@@ -2048,6 +2053,50 @@ pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
     Ok(content.parse::<i32>().ok().map(ExitMarker::Code))
 }
 
+/// Publish a terminal marker through its validated I/O directory. When proof is
+/// unavailable, remove only an empty placeholder, never an existing result.
+pub(crate) fn record_terminal_artifact(
+    paths: &TaskPaths,
+    artifact: TaskArtifact,
+    content: Option<&[u8]>,
+) -> io::Result<()> {
+    let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
+    let name = resolved.paths.artifact_name(artifact);
+    if let Some(content) = content {
+        return randomized_atomic_replace(&resolved.dirs.io, &name, content);
+    }
+    match resolved.dirs.io.open_file(&name, false) {
+        Ok(file) if file.metadata()?.len() == 0 => {
+            drop(file);
+            resolved.dirs.io.remove_file(&name)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn persist_terminal_exit(paths: &TaskPaths, metadata: &mut PersistedTask) {
+    let (content, unavailable) = match metadata.exit_code {
+        Some(code) if i32::try_from(code).is_ok() => (Some(format!("{code}\n")), None),
+        Some(code) => (None, Some(format!(
+            "exit code {code} is recorded in task metadata but exceeds the local exit marker's i32 range",
+        ))),
+        None if metadata.status == BgTaskStatus::Killed => (Some("killed\n".into()), None),
+        None => (None, Some(metadata.status_reason.clone().unwrap_or_else(||
+            "outcome unknown: no exit status was received".into()
+        ))),
+    };
+    metadata.exit_marker_unavailable = match record_terminal_artifact(
+        paths,
+        TaskArtifact::Exit,
+        content.as_deref().map(str::as_bytes),
+    ) {
+        Ok(()) => unavailable,
+        Err(error) => Some(format!("exit marker persistence failed: {error}")),
+    };
+}
+
 pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) -> io::Result<()> {
     atomic_replace(dir, name, content, false)
 }
@@ -3274,6 +3323,60 @@ mod tests {
         assert_eq!(counts.parses, 2);
         #[cfg(unix)]
         assert_eq!(counts.opens, 7);
+    }
+
+    #[test]
+    fn terminal_exit_persistence_reports_missing_proof_wide_codes_and_write_failures() {
+        for code in [None, Some(7), Some(i64::from(u32::MAX))] {
+            let dir = tempfile::tempdir().unwrap();
+            let (task, mut metadata) = counted_task(dir.path());
+            fs::write(&task.paths.exit, "").unwrap();
+            metadata.mark_terminal(
+                if code.is_some() {
+                    BgTaskStatus::Failed
+                } else {
+                    BgTaskStatus::FateUnknown
+                },
+                code,
+                Some("terminal proof lost after restart".into()),
+            );
+            persist_terminal_exit(&task.paths, &mut metadata);
+            assert_eq!(metadata.exit_code, code);
+            assert_eq!(metadata.schema_version, SCHEMA_VERSION);
+            if code == Some(7) {
+                assert_eq!(
+                    read_exit_marker(&task.paths).unwrap(),
+                    Some(ExitMarker::Code(7))
+                );
+                assert!(metadata.exit_marker_unavailable.is_none());
+            } else {
+                assert!(!task.paths.exit.exists());
+                assert!(metadata.exit_marker_unavailable.is_some());
+            }
+            write_task_at(&task, &metadata).unwrap();
+            assert_eq!(
+                read_task_at(&task).unwrap().exit_marker_unavailable,
+                metadata.exit_marker_unavailable
+            );
+            let mut old = serde_json::to_value(&metadata).unwrap();
+            old.as_object_mut()
+                .unwrap()
+                .remove("exit_marker_unavailable");
+            assert!(serde_json::from_value::<PersistedTask>(old)
+                .unwrap()
+                .exit_marker_unavailable
+                .is_none());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (task, mut metadata) = counted_task(dir.path());
+        fs::create_dir(&task.paths.exit).unwrap();
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        persist_terminal_exit(&task.paths, &mut metadata);
+        assert_eq!(metadata.exit_code, Some(0));
+        assert!(metadata
+            .exit_marker_unavailable
+            .unwrap()
+            .contains("persistence failed"));
     }
 
     #[test]
