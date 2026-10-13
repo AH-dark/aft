@@ -413,6 +413,11 @@ def verify_split_archives(
         ),
     )
     print(f"Watcher tests in integration archive: {len(watcher_in_nextest)}")
+    print(
+        "Serial-probe inventory: "
+        f"keychain={len(serial_tls_entries)}, "
+        f"backtrace={len(serial_backtrace_entries)} (excluded from hash shards)"
+    )
     print(f"Doctest cases in split inventory: {len(doc_entries)}")
     print(
         "Hash partition counts: "

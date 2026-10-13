@@ -127,21 +127,21 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertLess(warm, keychain)
         self.assertIn("extract_nextest_archive_for_prewarm", GATE_TEXT[prewarm_start:keychain])
 
-    def test_macos_backtrace_probe_runs_from_the_archive(self) -> None:
-        self.assertIn('if [[ "$(uname)" == "Darwin" ]]; then', GATE_TEXT)
+    def test_macos_backtrace_probe_runs_once_in_archive_builder_not_shards(self) -> None:
+        probe = "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
+        archive = workflow_job("unit-macos-libtest-archive")
+        shard = workflow_job("unit-macos-libtest-shard")
+
+        self.assertEqual(archive.count(probe), 1)
+        self.assertNotIn(probe, shard)
+        self.assertIn(probe, GATE_TEXT)
+        self.assertIn('"$(uname)" != "Darwin"', GATE_TEXT)
         self.assertIn(
-            "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) panic_hook_preserves_default_backtrace_behavior_and_persists",
-            GATE_TEXT,
+            "serial_backtrace_candidates",
+            PROOF_TEXT,
         )
-        expected_command = (
-            'cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \\\n'
-            "          -E 'kind(lib)' -- panic_hook_preserves_default_backtrace_behavior_and_persists"
-        )
-        self.assertIn(expected_command, GATE_TEXT)
-        self.assertIn(
-            "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet",
-            GATE_TEXT,
-        )
+        self.assertIn("serial_tests_in_unit_partitions", PROOF_TEXT)
+        self.assertIn("Serial-probe inventory:", PROOF_TEXT)
 
     def test_macos_inventory_proof_checks_source_archives_and_partitions(self) -> None:
         inventory = workflow_job("unit-macos-inventory-proof")
@@ -151,7 +151,6 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             "AFT_NEXTEST_SOURCE_INVENTORY_LIB_BIN_FILE",
             "AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE",
             "AFT_WATCHER_TEST_INVENTORY_FILE",
-            "AFT_DOCTEST_INVENTORY_FILE",
             "AFT_DOCTEST_INVENTORY_FILE",
         ):
             self.assertIn(variable, inventory)

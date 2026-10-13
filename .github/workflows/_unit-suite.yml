@@ -600,6 +600,9 @@ jobs:
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
+      - name: Run the serial backtrace probe with local debug objects
+        run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists
+
       - name: Capture lib and bin source inventory
         run: cargo nextest list --workspace --lib --bins --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-libtest-inventory.json"
 

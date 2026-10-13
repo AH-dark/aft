@@ -396,17 +396,12 @@ if phase_enabled lib; then
       cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
   fi
 
-  if phase_enabled lib-shard && [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
-    # The test re-executes current_exe. Windows needs its local PDB, while the
-    # macOS test binary can run from the same archive as the other libtests.
-    if [[ "$(uname)" == "Darwin" ]]; then
-      run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) panic_hook_preserves_default_backtrace_behavior_and_persists (serial: child backtrace)" \
-        cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
-          -E 'kind(lib)' -- panic_hook_preserves_default_backtrace_behavior_and_persists
-    else
-      run_phase "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
-        cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
-    fi
+  if phase_enabled lib-shard \
+    && [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "$(uname)" != "Darwin" ]]; then
+    # Windows needs its local PDB for the child backtrace; the macOS archive job
+    # runs this probe before upload while its linked debug objects are present.
+    run_phase "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
+      cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
   fi
 
   # When lib-shard is selected, the archive-backed command below owns the rest
