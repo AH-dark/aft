@@ -3244,6 +3244,51 @@ async fn cancel_pending_bash_ask_for_tool_call(
     Ok(())
 }
 
+/// Ends a held bash call that `tool.withdraw` settled while its permission
+/// question was pending. The question is already removed, so a later answer
+/// finds nothing to act on; the request gets the `not_started` frame recorded
+/// on its ledger row.
+#[allow(clippy::too_many_arguments)]
+async fn end_withdrawn_bash_ask(
+    tx: &WriterSender,
+    ledger_edge: &tool_provider::LedgerEdge,
+    pending: PendingBashAsk,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let withdrawn = ledger_edge.withdrawn_frame(
+        pending.route,
+        pending.tool_corr,
+        pending.tool_ver,
+        pending.tool_flags,
+    );
+    bash::handle_bash_deferred_completion(
+        tx,
+        bash::bash_withdrawn_completion(
+            pending.route,
+            pending.tool_corr,
+            pending.tool_flags,
+            pending.tool_ver,
+            pending.root,
+            pending.request_id,
+        ),
+        routes,
+        live_roots,
+        route_bash_cancels,
+        shutdown,
+        metrics,
+    )
+    .await?;
+    if let Some(frame) = withdrawn {
+        let frame = frame.map_err(SubcError::FrameBuild)?;
+        send_reliable_writer_frame(tx, metrics, frame, "withdrawn held call").await?;
+    }
+    Ok(())
+}
+
 fn remove_root_channel(
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     root: &ProjectRootId,
@@ -5152,6 +5197,23 @@ where
                         if ledger_waited && !ledger_edge.has_waiting(&frame) {
                             continue;
                         }
+                        if ledger_waited && ledger_edge.is_withdrawn(&frame) {
+                            // tool.withdraw settled this held call before its
+                            // question was filed: end it without asking.
+                            ledger_edge.finish_waiting(&frame);
+                            match ledger_edge.withdrawn_frame(route, frame.header.corr,
+                                frame.header.ver, frame.header.flags) {
+                                Some(Ok(withdrawn)) => {
+                                    if let Err(error) = send_reliable_writer_frame(&writer_tx,
+                                        &dispatch_path_metrics, withdrawn, "withdrawn held call").await {
+                                        break Err(error);
+                                    }
+                                }
+                                Some(Err(error)) => break Err(SubcError::FrameBuild(error)),
+                                None => {}
+                            }
+                            continue;
+                        }
                         if ledger_waited && ledger_edge.finish_waiting(&frame) {
                             let cancelled = match build_error_frame(frame.header.ver,
                                 route.channel, route.epoch, frame.header.corr,
@@ -5226,6 +5288,36 @@ where
                             .await
                         };
                         if let Err(error) = result {
+                            break Err(error);
+                        }
+                    }
+                    FrameType::Cancel if ledger_waited => {
+                        // Only the ledger edge sends this: tool.withdraw settled
+                        // a held call before it dispatched. Withdraw its pending
+                        // question and end its request with `not_started`.
+                        let route = route_key(frame.header.channel, frame.header.epoch);
+                        let corr = frame.header.corr;
+                        let ask = pending_bash_asks
+                            .iter()
+                            .find(|(_, ask)| ask.route == route && ask.tool_corr == corr)
+                            .map(|(key, _)| *key)
+                            .and_then(|key| pending_bash_asks.remove(&key));
+                        let Some(pending) = ask else {
+                            ledger_edge.mark_withdrawn(route, corr);
+                            continue;
+                        };
+                        if let Err(error) = end_withdrawn_bash_ask(
+                            &writer_tx,
+                            &ledger_edge,
+                            pending,
+                            &routes,
+                            &mut live_roots,
+                            &mut route_bash_cancels,
+                            &shutdown,
+                            &dispatch_path_metrics,
+                        )
+                        .await
+                        {
                             break Err(error);
                         }
                     }

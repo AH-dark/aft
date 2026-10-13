@@ -2,13 +2,26 @@
 //!
 //! All operations use the actor's existing connection. State changes and late
 //! entries share a transaction: a crash cannot publish half a settlement.
+use cortexkit_role_tool_provider::late_results::{check_since, Cursor};
+use cortexkit_role_tool_provider::withdraw::{CompletedResult, StartedOutcome, WithdrawAnswer};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use subc_protocol::FrameType;
+use subc_protocol::{ErrorBody, FrameType};
 
 pub const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 pub const SWEEP_BATCH: usize = 64;
+/// The contract's retention bounds (CONTRACT.md section 7): at most this many
+/// unacked results per custodian and this many expired entries per scope
+/// owner. AFT's custodian is always the scope's owner, so both count the same
+/// column. The oldest entries are dropped first.
+pub const UNACKED_RESULTS_MAX: usize = 1_000;
+pub const EXPIRED_ENTRIES_MAX: usize = 1_000;
+/// Most entries one `late_results` page reads, whatever `limit` asks for, so a
+/// pull never walks an unbounded log.
+pub const LATE_RESULTS_PAGE_MAX: u32 = 256;
+/// The `not_started` reason of a held call that `tool.withdraw` settled.
+pub const WITHDRAWN_REASON: &str = "withdrawn";
 
 /// One process-wide cursor identity, deliberately never persisted in aft.db.
 /// Reconnecting or binding another project must not look like a restart.
@@ -245,6 +258,28 @@ pub fn settle(
     }
     #[cfg(test)]
     run_after_ledger_read(&tx);
+    settle_row(&tx, &row, frame, outcome, reason, now)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Settles an unsettled row inside the caller's transaction. A settlement
+/// with a `reason` never ran, so its withdraw answer is already fixed by the
+/// settlement table (`withdrawn`, or `refused` for a denial, an expired ask
+/// or an ended scope). It is frozen here because the reason does not survive
+/// expiry anywhere else: expiry rewrites the recorded frame and the late
+/// entry, and an unscoped row has no late entry at all. An answer frozen by
+/// an earlier withdraw is kept.
+fn settle_row(
+    conn: &Connection,
+    row: &Row,
+    frame: &RecordedFrame,
+    outcome: &str,
+    reason: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let key = &row.key;
+    let tx = conn;
     let mut seq = None;
     let mut entry = None;
     if let Some(scope) = &row.scope {
@@ -264,10 +299,34 @@ pub fn settle(
         }
         entry = Some(value.to_string());
     }
-    tx.execute("UPDATE call_ledger SET state='Settled',frame_type=?3,frame_body=?4,outcome=?5,settled_at=?6,seq=?7,late_entry=?8 WHERE carrier=?1 AND call_key=?2 AND state=?9",
-        params![key.carrier,key.call_key,frame.type_name(),frame.body,outcome,now,seq,entry,row.state.as_str()])?;
-    tx.commit()?;
-    Ok(true)
+    let never_ran_answer = reason.map(|reason| answer_bytes(&never_ran_answer(reason)));
+    tx.execute("UPDATE call_ledger SET state='Settled',frame_type=?3,frame_body=?4,outcome=?5,settled_at=?6,seq=?7,late_entry=?8,withdraw_answer=COALESCE(withdraw_answer,?10) WHERE carrier=?1 AND call_key=?2 AND state=?9",
+        params![key.carrier,key.call_key,frame.type_name(),frame.body,outcome,now,seq,entry,row.state.as_str(),never_ran_answer])?;
+    if let Some(scope) = &row.scope {
+        enforce_retention_bounds(tx, &scope.owner)?;
+    }
+    Ok(())
+}
+
+/// The withdraw answer of a call that never ran, from its not-started reason.
+fn never_ran_answer(reason: &str) -> WithdrawAnswer {
+    use cortexkit_role_tool_provider::withdraw::{reasons, RefusalReason};
+    match reason {
+        reasons::DENIED => WithdrawAnswer::Refused {
+            reason: RefusalReason::Denied,
+        },
+        reasons::EXPIRED => WithdrawAnswer::Refused {
+            reason: RefusalReason::Expired,
+        },
+        reasons::SCOPE_ENDED => WithdrawAnswer::Refused {
+            reason: RefusalReason::ScopeEnded,
+        },
+        _ => WithdrawAnswer::Withdrawn,
+    }
+}
+
+fn answer_bytes(answer: &WithdrawAnswer) -> Vec<u8> {
+    serde_json::to_vec(&answer.encode()).expect("withdraw answers are JSON")
 }
 
 /// Expiry drops only the payload. Identity, outcome and any frozen withdrawal
@@ -348,6 +407,322 @@ pub fn ack(conn: &Connection, custodian: &str, through: u64) -> rusqlite::Result
     )?;
     tx.commit()?;
     Ok(deleted)
+}
+
+/// Drops the oldest late entries past the section 7 bounds for one custodian,
+/// deleting their rows as an ack would.
+fn enforce_retention_bounds(conn: &Connection, custodian: &str) -> rusqlite::Result<()> {
+    for (expired, max) in [(false, UNACKED_RESULTS_MAX), (true, EXPIRED_ENTRIES_MAX)] {
+        conn.execute(
+            "DELETE FROM call_ledger WHERE rowid IN (SELECT rowid FROM call_ledger
+                WHERE custodian=?1 AND late_entry IS NOT NULL
+                AND (json_extract(late_entry,'$.kind')='expired')=?2
+                ORDER BY seq DESC LIMIT -1 OFFSET ?3)",
+            params![custodian, expired, max as i64],
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_entry(entry: &str) -> rusqlite::Result<Value> {
+    let corrupt = |error: Box<dyn std::error::Error + Send + Sync>| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error)
+    };
+    let value: Value = serde_json::from_str(entry).map_err(|error| corrupt(Box::new(error)))?;
+    if !value.is_object() {
+        return Err(corrupt(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "call ledger late entry is not an object",
+        ))));
+    }
+    Ok(value)
+}
+
+/// Keeps only the outcome of a settled row whose result cannot travel in one
+/// role reply, so later replays, withdraw answers and late entries all agree
+/// that the result is gone. Returns the kept outcome.
+fn reduce_payload(conn: &Connection, row: &Row) -> rusqlite::Result<String> {
+    let outcome = row.outcome.clone().unwrap_or_else(|| "unknown".into());
+    let frame = not_retained(&row.key, &outcome);
+    let entry = row
+        .late_entry
+        .as_deref()
+        .map(|entry| -> rusqlite::Result<String> {
+            let mut value = parse_entry(entry)?;
+            let object = value.as_object_mut().expect("parse_entry returns objects");
+            if object.remove("result").is_some() {
+                object.insert("reduced".into(), json!(true));
+                object.insert("outcome".into(), json!(outcome));
+            }
+            Ok(value.to_string())
+        })
+        .transpose()?;
+    conn.execute(
+        "UPDATE call_ledger SET frame_type='Error',frame_body=?3,late_entry=?4 WHERE carrier=?1 AND call_key=?2",
+        params![row.key.carrier, row.key.call_key, frame.body, entry],
+    )?;
+    Ok(outcome)
+}
+
+/// What a `tool.withdraw` found under one `(carrier, call_key)`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Withdrawal {
+    /// No record has that key.
+    UnknownCall,
+    /// The record is under another scope than the caller's route stamp.
+    NotPermitted,
+    /// The answer frozen on the record, as reply body bytes.
+    Answer {
+        body: Vec<u8>,
+        /// The shell task to kill. Set only by the withdraw that froze
+        /// `already_started` on a running call with a linked task.
+        kill_task: Option<String>,
+        /// This withdraw settled a held call that never dispatched, so its
+        /// held request must now end with `not_started`.
+        held_withdrawn: bool,
+    },
+}
+
+/// Answers `tool.withdraw` from the record, in one conditional transaction.
+///
+/// The first withdraw computes the answer from the settlement table and
+/// stores its bytes; every later withdraw by any permitted caller returns
+/// those bytes, whatever expiry later does to the row. A held call that has
+/// not dispatched is settled `not_started` with reason `withdrawn` here, so
+/// the admission step that would dispatch it finds the row settled and stops.
+/// `max_body` bounds the answer: a `completed` answer that would not fit is
+/// reduced to its outcome, and the row with it.
+pub fn withdraw(
+    conn: &Connection,
+    key: &Key,
+    stamp: Option<&ScopeIdentity>,
+    now: i64,
+    max_body: usize,
+) -> rusqlite::Result<Withdrawal> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    reduce_expired(&tx, key, now)?;
+    // Expiry is committed even when nothing else changes, as at admission.
+    let Some(row) = get(&tx, key)? else {
+        tx.commit()?;
+        return Ok(Withdrawal::UnknownCall);
+    };
+    if row.scope.as_ref() != stamp {
+        tx.commit()?;
+        return Ok(Withdrawal::NotPermitted);
+    }
+    if let Some(body) = row.withdraw_answer {
+        tx.commit()?;
+        return Ok(Withdrawal::Answer {
+            body,
+            kill_task: None,
+            held_withdrawn: false,
+        });
+    }
+    let mut kill_task = None;
+    let mut held_withdrawn = false;
+    let answer = match row.state {
+        State::Prepared | State::Authorized => {
+            settle_row(
+                &tx,
+                &row,
+                &not_started(key, WITHDRAWN_REASON),
+                "not_started",
+                Some(WITHDRAWN_REASON),
+                now,
+            )?;
+            held_withdrawn = true;
+            WithdrawAnswer::Withdrawn
+        }
+        State::DispatchStarted => {
+            kill_task = row.task_id.clone();
+            WithdrawAnswer::AlreadyStarted {
+                outcome: StartedOutcome::Unknown,
+            }
+        }
+        State::Settled => {
+            let answer = settled_answer(&row);
+            if answer_bytes(&answer).len() > max_body {
+                WithdrawAnswer::Completed {
+                    result: CompletedResult::OutcomeOnly(reduce_payload(&tx, &row)?),
+                }
+            } else {
+                answer
+            }
+        }
+    };
+    let body = answer_bytes(&answer);
+    tx.execute(
+        "UPDATE call_ledger SET withdraw_answer=?3 WHERE carrier=?1 AND call_key=?2",
+        params![key.carrier, key.call_key, body],
+    )?;
+    tx.commit()?;
+    Ok(Withdrawal::Answer {
+        body,
+        kill_task,
+        held_withdrawn,
+    })
+}
+
+/// The settlement table's withdraw answer for a settled row. `completed` is
+/// answered only when AFT recorded the call's terminal frame; a row whose end
+/// was never observed is `already_started` with outcome `unknown`.
+fn settled_answer(row: &Row) -> WithdrawAnswer {
+    let outcome = row.outcome.as_deref().unwrap_or("unknown");
+    let Some(frame) = &row.frame else {
+        return WithdrawAnswer::AlreadyStarted {
+            outcome: StartedOutcome::Unknown,
+        };
+    };
+    let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
+    if frame.ty == FrameType::Error {
+        match body["code"].as_str() {
+            Some("not_started") => {
+                return never_ran_answer(body["detail"]["reason"].as_str().unwrap_or(""))
+            }
+            Some("result_not_retained") => {
+                return match outcome {
+                    "unknown" => WithdrawAnswer::AlreadyStarted {
+                        outcome: StartedOutcome::Unknown,
+                    },
+                    "not_started" => WithdrawAnswer::Withdrawn,
+                    outcome => WithdrawAnswer::Completed {
+                        result: CompletedResult::OutcomeOnly(outcome.into()),
+                    },
+                }
+            }
+            _ => {}
+        }
+    }
+    WithdrawAnswer::Completed {
+        result: CompletedResult::Retained(body),
+    }
+}
+
+fn head_seq(conn: &Connection, custodian: &str) -> rusqlite::Result<u64> {
+    Ok(conn
+        .query_row(
+            "SELECT last_seq FROM call_ledger_ack WHERE custodian=?1",
+            [custodian],
+            |r| r.get::<_, u64>(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Serves one `late_results` page to `custodian`, as reply body bytes, or the
+/// cursor refusal.
+///
+/// Entries come oldest first after `since`. The page stops before the entry
+/// that would push the encoded reply past `max_body` and says `more: true`;
+/// an entry that would overflow `max_body` on its own is reduced to its
+/// outcome, row included, before it is served. A due entry is expired in
+/// place first, and the section 7 bounds are applied before reading.
+pub fn late_results(
+    conn: &Connection,
+    custodian: &str,
+    incarnation: &str,
+    since: Option<&Cursor>,
+    limit: Option<u32>,
+    now: i64,
+    max_body: usize,
+) -> rusqlite::Result<Result<Vec<u8>, ErrorBody>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let head = head_seq(&tx, custodian)?;
+    if let Err(error) = check_since(incarnation, head, since) {
+        return Ok(Err(error));
+    }
+    enforce_retention_bounds(&tx, custodian)?;
+    let since_seq = since.map_or(0, |cursor| cursor.seq);
+    let cap = limit
+        .unwrap_or(LATE_RESULTS_PAGE_MAX)
+        .min(LATE_RESULTS_PAGE_MAX) as usize;
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT carrier,call_key,seq FROM call_ledger
+             WHERE custodian=?1 AND seq>?2 AND late_entry IS NOT NULL ORDER BY seq LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![custodian, since_seq, cap as i64 + 1], |r| {
+                Ok((
+                    Key {
+                        carrier: r.get(0)?,
+                        call_key: r.get(1)?,
+                    },
+                    r.get::<_, u64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    // The largest wrapper a page can have: the longest seq and `false`.
+    let overhead = serde_json::to_vec(&json!({
+        "entries": [],
+        "cursor": {"provider_incarnation": incarnation, "seq": u64::MAX},
+        "more": false,
+    }))
+    .expect("late results reply is JSON")
+    .len();
+    let mut more = rows.len() > cap;
+    let mut size = overhead;
+    let mut last = since_seq;
+    let mut entries = Vec::new();
+    for (key, seq) in rows.into_iter().take(cap) {
+        let Some(mut row) = get(&tx, &key)? else {
+            continue;
+        };
+        let due = row.settled_at.is_some_and(|at| at + RETENTION_MS <= now);
+        let entry_kind = |row: &Row| -> rusqlite::Result<Option<String>> {
+            row.late_entry
+                .as_deref()
+                .map(|entry| Ok(parse_entry(entry)?["kind"].as_str().map(str::to_owned)))
+                .transpose()
+                .map(Option::flatten)
+        };
+        if due && entry_kind(&row)?.as_deref() != Some("expired") {
+            reduce_expired(&tx, &key, now)?;
+            row = get(&tx, &key)?.expect("the row read above still exists");
+        }
+        let mut entry = parse_entry(row.late_entry.as_deref().unwrap_or("null"))?;
+        let mut len = serde_json::to_vec(&entry).expect("entry is JSON").len();
+        if overhead + len > max_body {
+            reduce_payload(&tx, &row)?;
+            row = get(&tx, &key)?.expect("the row read above still exists");
+            entry = parse_entry(row.late_entry.as_deref().unwrap_or("null"))?;
+            len = serde_json::to_vec(&entry).expect("entry is JSON").len();
+        }
+        let added = len + usize::from(!entries.is_empty());
+        if size + added > max_body {
+            more = true;
+            break;
+        }
+        size += added;
+        last = seq;
+        entries.push(entry);
+    }
+    tx.commit()?;
+    let reply = json!({
+        "entries": entries,
+        "cursor": {"provider_incarnation": incarnation, "seq": last},
+        "more": more,
+    });
+    Ok(Ok(
+        serde_json::to_vec(&reply).expect("late results reply is JSON")
+    ))
+}
+
+/// `late_results.ack {through}` for `custodian`: refuses a cursor from another
+/// incarnation or past the log, otherwise deletes every entry through it.
+pub fn ack_through(
+    conn: &Connection,
+    custodian: &str,
+    incarnation: &str,
+    through: &Cursor,
+) -> rusqlite::Result<Result<usize, ErrorBody>> {
+    let head = head_seq(conn, custodian)?;
+    if let Err(error) = check_since(incarnation, head, Some(through)) {
+        return Ok(Err(error));
+    }
+    ack(conn, custodian, through.seq).map(Ok)
 }
 
 /// Called once when a process installs its database, before admitting calls.
@@ -950,5 +1325,575 @@ mod tests {
         );
         assert_eq!(sweep(&conn, 100 + RETENTION_MS).unwrap(), 64);
         assert_eq!(sweep(&conn, 100 + RETENTION_MS).unwrap(), 2);
+    }
+
+    fn answer(found: Withdrawal) -> (Value, Option<String>, bool) {
+        match found {
+            Withdrawal::Answer {
+                body,
+                kill_task,
+                held_withdrawn,
+            } => (
+                serde_json::from_slice(&body).unwrap(),
+                kill_task,
+                held_withdrawn,
+            ),
+            other => panic!("expected an answer, got {other:?}"),
+        }
+    }
+
+    fn withdraw_bytes(
+        conn: &Connection,
+        key: &Key,
+        stamp: Option<&ScopeIdentity>,
+        now: i64,
+    ) -> Vec<u8> {
+        match withdraw(conn, key, stamp, now, usize::MAX).unwrap() {
+            Withdrawal::Answer { body, .. } => body,
+            other => panic!("expected an answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn withdraw_answers_follow_the_settlement_table_and_freeze_on_first_withdraw() {
+        let conn = database();
+        let scope = scope("owner");
+        let stamp = Some(&scope);
+        let held = Key {
+            carrier: "carrier".into(),
+            call_key: "held".into(),
+        };
+        admit(&conn, &held, "digest", stamp, State::Prepared).unwrap();
+        let (first, kill, held_withdrawn) =
+            answer(withdraw(&conn, &held, stamp, 100, usize::MAX).unwrap());
+        assert_eq!(first, json!({"answer": "withdrawn"}));
+        assert_eq!((kill, held_withdrawn), (None, true));
+        let row = get(&conn, &held).unwrap().unwrap();
+        assert_eq!(row.state, State::Settled);
+        assert_eq!(
+            row.frame.unwrap().body,
+            not_started(&held, WITHDRAWN_REASON).body
+        );
+        let entry: Value = serde_json::from_str(row.late_entry.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (entry["kind"].as_str(), entry["reason"].as_str()),
+            (Some("not_started"), Some("withdrawn"))
+        );
+        // A settled row can no longer be authorized or dispatched.
+        assert!(!transition(&conn, &held, State::Prepared, State::Authorized).unwrap());
+        assert_eq!(
+            answer(withdraw(&conn, &held, stamp, 200, usize::MAX).unwrap()),
+            (first, None, false)
+        );
+
+        // A running shell call: the first withdraw names its task to kill,
+        // later ones return the frozen bytes and kill nothing. Settlement
+        // after the freeze does not change the answer.
+        let running = Key {
+            carrier: "carrier".into(),
+            call_key: "running".into(),
+        };
+        admit(&conn, &running, "digest", stamp, State::DispatchStarted).unwrap();
+        link_task(&conn, &running, "task-1").unwrap();
+        let (first, kill, held_withdrawn) =
+            answer(withdraw(&conn, &running, stamp, 100, usize::MAX).unwrap());
+        assert_eq!(
+            first,
+            json!({"answer": "already_started", "outcome": "unknown"})
+        );
+        assert_eq!((kill.as_deref(), held_withdrawn), (Some("task-1"), false));
+        assert_eq!(
+            answer(withdraw(&conn, &running, stamp, 100, usize::MAX).unwrap()),
+            (first.clone(), None, false)
+        );
+        settle(&conn, &running, &success(), "ok", None, 150).unwrap();
+        assert_eq!(
+            answer(withdraw(&conn, &running, stamp, 200, usize::MAX).unwrap()),
+            (first, None, false)
+        );
+
+        // A non-shell call at DispatchStarted has no task: nothing is killed.
+        let read = Key {
+            carrier: "carrier".into(),
+            call_key: "read".into(),
+        };
+        admit(&conn, &read, "digest", stamp, State::DispatchStarted).unwrap();
+        assert_eq!(
+            answer(withdraw(&conn, &read, stamp, 100, usize::MAX).unwrap()).1,
+            None
+        );
+
+        // Never-run settlements.
+        for (call_key, reason, expected) in [
+            (
+                "denied",
+                "denied",
+                json!({"answer": "refused", "reason": "denied"}),
+            ),
+            (
+                "ask-expired",
+                "expired",
+                json!({"answer": "refused", "reason": "expired"}),
+            ),
+            (
+                "scope-ended",
+                "scope_ended",
+                json!({"answer": "refused", "reason": "scope_ended"}),
+            ),
+            (
+                "restart",
+                "restart_before_dispatch",
+                json!({"answer": "withdrawn"}),
+            ),
+        ] {
+            let key = Key {
+                carrier: "carrier".into(),
+                call_key: call_key.into(),
+            };
+            admit(&conn, &key, "digest", stamp, State::Prepared).unwrap();
+            settle(
+                &conn,
+                &key,
+                &not_started(&key, reason),
+                "not_started",
+                Some(reason),
+                100,
+            )
+            .unwrap();
+            // Expiry before the first withdraw loses nothing of the answer.
+            assert_eq!(
+                serde_json::from_slice::<Value>(&withdraw_bytes(
+                    &conn,
+                    &key,
+                    stamp,
+                    100 + RETENTION_MS
+                ))
+                .unwrap(),
+                expected,
+                "{call_key}"
+            );
+        }
+
+        // Started, end unobserved: already_started unknown, never completed,
+        // identically on repeat and after expiry.
+        let unknown = Key {
+            carrier: "carrier".into(),
+            call_key: "unknown".into(),
+        };
+        admit(&conn, &unknown, "digest", stamp, State::DispatchStarted).unwrap();
+        recover(&conn).unwrap();
+        let first = withdraw_bytes(&conn, &unknown, stamp, 100);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&first).unwrap(),
+            json!({"answer": "already_started", "outcome": "unknown"})
+        );
+        assert_eq!(
+            withdraw_bytes(&conn, &unknown, stamp, now_ms() + RETENTION_MS),
+            first
+        );
+
+        // Ran: completed with the recorded reply, frozen across expiry.
+        let ran = Key {
+            carrier: "carrier".into(),
+            call_key: "ran".into(),
+        };
+        admit(&conn, &ran, "digest", stamp, State::DispatchStarted).unwrap();
+        settle(&conn, &ran, &success(), "ok", None, 100).unwrap();
+        let first = withdraw_bytes(&conn, &ran, stamp, 100);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&first).unwrap(),
+            json!({"answer": "completed", "result": serde_json::from_slice::<Value>(&success().body).unwrap(), "result_retained": true})
+        );
+        assert_eq!(
+            withdraw_bytes(&conn, &ran, stamp, 100 + RETENTION_MS),
+            first
+        );
+        assert_eq!(
+            get(&conn, &ran).unwrap().unwrap().frame.unwrap().body,
+            not_retained(&ran, "ok").body
+        );
+
+        // Ran, first withdrawn after expiry: the expired form is frozen.
+        let late = Key {
+            carrier: "carrier".into(),
+            call_key: "late".into(),
+        };
+        admit(&conn, &late, "digest", stamp, State::DispatchStarted).unwrap();
+        settle(&conn, &late, &success(), "ok", None, 100).unwrap();
+        let first = withdraw_bytes(&conn, &late, stamp, 100 + RETENTION_MS);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&first).unwrap(),
+            json!({"answer": "completed", "outcome": "ok", "result_retained": false})
+        );
+        assert_eq!(
+            withdraw_bytes(&conn, &late, stamp, 200 + RETENTION_MS),
+            first
+        );
+
+        // No record, and a record under another scope: neither freezes.
+        let missing = Key {
+            carrier: "carrier".into(),
+            call_key: "missing".into(),
+        };
+        assert_eq!(
+            withdraw(&conn, &missing, stamp, 100, usize::MAX).unwrap(),
+            Withdrawal::UnknownCall
+        );
+        let elsewhere = Key {
+            carrier: "carrier".into(),
+            call_key: "elsewhere".into(),
+        };
+        admit(&conn, &elsewhere, "digest", stamp, State::Prepared).unwrap();
+        let other_scope = ScopeIdentity {
+            scope_ref: "other".into(),
+            ..scope.clone()
+        };
+        assert_eq!(
+            withdraw(&conn, &elsewhere, Some(&other_scope), 100, usize::MAX).unwrap(),
+            Withdrawal::NotPermitted
+        );
+        assert_eq!(
+            withdraw(&conn, &elsewhere, None, 100, usize::MAX).unwrap(),
+            Withdrawal::NotPermitted
+        );
+        let row = get(&conn, &elsewhere).unwrap().unwrap();
+        assert_eq!(row.state, State::Prepared);
+        assert!(row.withdraw_answer.is_none());
+    }
+
+    #[test]
+    fn a_completed_answer_too_large_for_one_frame_is_reduced_with_its_row() {
+        let conn = database();
+        let scope = scope("owner");
+        let key = key("carrier");
+        admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
+        settle(&conn, &key, &success(), "ok", None, 100).unwrap();
+        let limit = answer_bytes(&settled_answer(&get(&conn, &key).unwrap().unwrap())).len() - 1;
+        let first = match withdraw(&conn, &key, Some(&scope), 100, limit).unwrap() {
+            Withdrawal::Answer { body, .. } => body,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&first).unwrap(),
+            json!({"answer": "completed", "outcome": "ok", "result_retained": false})
+        );
+        let row = get(&conn, &key).unwrap().unwrap();
+        assert_eq!(row.frame.unwrap().body, not_retained(&key, "ok").body);
+        let entry: Value = serde_json::from_str(row.late_entry.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            (
+                entry["kind"].as_str(),
+                entry["reduced"].as_bool(),
+                entry["outcome"].as_str()
+            ),
+            (Some("result"), Some(true), Some("ok"))
+        );
+        assert!(entry.get("result").is_none());
+    }
+
+    fn page(
+        conn: &Connection,
+        custodian: &str,
+        since: Option<u64>,
+        limit: Option<u32>,
+        now: i64,
+        max_body: usize,
+    ) -> Value {
+        let since = since.map(|seq| Cursor {
+            provider_incarnation: "incarnation".into(),
+            seq,
+        });
+        serde_json::from_slice(
+            &late_results(
+                conn,
+                custodian,
+                "incarnation",
+                since.as_ref(),
+                limit,
+                now,
+                max_body,
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_settlement_yields_its_late_entry_once_and_only_to_the_owner() {
+        let conn = database();
+        let scope = scope("owner");
+        let stamp = Some(&scope);
+        let make = |call_key: &str, state| {
+            let key = Key {
+                carrier: "carrier".into(),
+                call_key: call_key.into(),
+            };
+            admit(&conn, &key, "digest", stamp, state).unwrap();
+            key
+        };
+        // Recovery also sweeps against the wall clock, so settle at it.
+        let now = now_ms();
+        let ran = make("ran", State::DispatchStarted);
+        settle(&conn, &ran, &success(), "ok", None, now).unwrap();
+        let expired = make("expired", State::DispatchStarted);
+        settle(&conn, &expired, &success(), "ok", None, now).unwrap();
+        let withdrawn = make("withdrawn", State::Prepared);
+        withdraw(&conn, &withdrawn, stamp, now, usize::MAX).unwrap();
+        for reason in ["denied", "expired"] {
+            let key = make(&format!("ask-{reason}"), State::Prepared);
+            settle(
+                &conn,
+                &key,
+                &success(),
+                "bash_denied_untrusted",
+                Some(reason),
+                now,
+            )
+            .unwrap();
+        }
+        make("restart", State::Authorized);
+        make("unobserved", State::DispatchStarted);
+        recover(&conn).unwrap();
+        // One result settled a retention period ago; everything else is fresh.
+        conn.execute(
+            "UPDATE call_ledger SET settled_at=?1 WHERE call_key='expired'",
+            [now - RETENTION_MS],
+        )
+        .unwrap();
+        let reply = page(&conn, "owner", None, None, now, usize::MAX);
+        assert_eq!(reply["more"], false);
+        let mut seen: Vec<(String, String, Option<String>, Option<bool>)> = reply["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry["custodian"], "owner");
+                assert_eq!(entry["owner"], "owner");
+                (
+                    entry["call_key"].as_str().unwrap().to_owned(),
+                    entry["kind"].as_str().unwrap().to_owned(),
+                    entry["reason"].as_str().map(str::to_owned),
+                    entry["reduced"].as_bool(),
+                )
+            })
+            .collect();
+        seen.sort();
+        let s = |value: &str| value.to_owned();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    s("ask-denied"),
+                    s("not_started"),
+                    Some(s("denied")),
+                    Some(false)
+                ),
+                (
+                    s("ask-expired"),
+                    s("not_started"),
+                    Some(s("expired")),
+                    Some(false)
+                ),
+                (s("expired"), s("expired"), None, Some(true)),
+                (s("ran"), s("result"), None, Some(false)),
+                (
+                    s("restart"),
+                    s("not_started"),
+                    Some(s("restart_before_dispatch")),
+                    Some(false)
+                ),
+                (s("unobserved"), s("result"), None, Some(true)),
+                (
+                    s("withdrawn"),
+                    s("not_started"),
+                    Some(s("withdrawn")),
+                    Some(false)
+                ),
+            ]
+        );
+        let unobserved = reply["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["call_key"] == "unobserved")
+            .unwrap();
+        assert_eq!(unobserved["outcome"], "unknown");
+        // A carrier that is not the owner is no custodian: it sees nothing.
+        assert_eq!(
+            page(&conn, "carrier", None, None, now, usize::MAX)["entries"],
+            json!([])
+        );
+        // Reading on from the cursor returns nothing again; acking drops all.
+        let cursor = reply["cursor"]["seq"].as_u64().unwrap();
+        assert_eq!(
+            page(&conn, "owner", Some(cursor), None, now, usize::MAX)["entries"],
+            json!([])
+        );
+        let through = Cursor {
+            provider_incarnation: "incarnation".into(),
+            seq: cursor,
+        };
+        assert_eq!(
+            ack_through(&conn, "owner", "incarnation", &through)
+                .unwrap()
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            page(&conn, "owner", None, None, now, usize::MAX)["entries"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn late_results_pages_stop_at_the_frame_limit_and_reduce_an_oversized_entry() {
+        let conn = database();
+        let scope = scope("owner");
+        let big = |n: usize| RecordedFrame {
+            ty: FrameType::Response,
+            body: serde_json::to_vec(
+                &json!({"isError": false, "content": [{"type": "text", "text": "x".repeat(n)}]}),
+            )
+            .unwrap(),
+        };
+        for (call_key, size) in [("a", 300), ("b", 300), ("c", 5_000)] {
+            let key = Key {
+                carrier: "carrier".into(),
+                call_key: call_key.into(),
+            };
+            admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
+            settle(&conn, &key, &big(size), "ok", None, 100).unwrap();
+        }
+        let full = page(&conn, "owner", None, None, 100, usize::MAX);
+        let encoded = |value: &Value| serde_json::to_vec(value).unwrap().len();
+        let one = page(&conn, "owner", None, Some(1), 100, usize::MAX);
+        assert_eq!(one["more"], true);
+        let limit = encoded(&one) + 100;
+        // `a` fits, `a` and `b` together do not: the page stops before `b`.
+        let first = page(&conn, "owner", None, None, 100, limit);
+        assert_eq!(first["more"], true);
+        assert_eq!(first["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(first["entries"][0]["call_key"], "a");
+        assert!(encoded(&first) <= limit);
+        let cursor = first["cursor"]["seq"].as_u64();
+        let second = page(&conn, "owner", cursor, None, 100, limit);
+        assert_eq!(second["entries"][0]["call_key"], "b");
+        assert_eq!(second["more"], true);
+        // `c` alone overflows the limit: it is served reduced, row included.
+        let third = page(
+            &conn,
+            "owner",
+            second["cursor"]["seq"].as_u64(),
+            None,
+            100,
+            limit,
+        );
+        assert_eq!(third["more"], false);
+        let entry = &third["entries"][0];
+        assert_eq!(
+            (
+                entry["call_key"].as_str(),
+                entry["kind"].as_str(),
+                entry["reduced"].as_bool(),
+                entry["outcome"].as_str()
+            ),
+            (Some("c"), Some("result"), Some(true), Some("ok"))
+        );
+        assert!(entry.get("result").is_none());
+        assert!(full["entries"][2].get("result").is_some());
+        let c = Key {
+            carrier: "carrier".into(),
+            call_key: "c".into(),
+        };
+        assert_eq!(
+            get(&conn, &c).unwrap().unwrap().frame.unwrap().body,
+            not_retained(&c, "ok").body
+        );
+    }
+
+    #[test]
+    fn late_results_refuse_foreign_and_future_cursors_and_bound_retention() {
+        let conn = database();
+        let scope = scope("owner");
+        for i in 0..UNACKED_RESULTS_MAX + 2 {
+            let key = Key {
+                carrier: "carrier".into(),
+                call_key: format!("k{i}"),
+            };
+            admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
+            settle(&conn, &key, &success(), "ok", None, 100).unwrap();
+        }
+        // The two oldest unacked results were dropped, rows included.
+        assert!(get(
+            &conn,
+            &Key {
+                carrier: "carrier".into(),
+                call_key: "k0".into()
+            }
+        )
+        .unwrap()
+        .is_none());
+        assert!(get(
+            &conn,
+            &Key {
+                carrier: "carrier".into(),
+                call_key: "k1".into()
+            }
+        )
+        .unwrap()
+        .is_none());
+        assert!(get(
+            &conn,
+            &Key {
+                carrier: "carrier".into(),
+                call_key: "k2".into()
+            }
+        )
+        .unwrap()
+        .is_some());
+        let head = (UNACKED_RESULTS_MAX + 2) as u64;
+        for (incarnation, seq) in [("another", 1), ("incarnation", head + 1)] {
+            let since = Cursor {
+                provider_incarnation: incarnation.into(),
+                seq,
+            };
+            let refused = late_results(
+                &conn,
+                "owner",
+                "incarnation",
+                Some(&since),
+                None,
+                100,
+                usize::MAX,
+            )
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(refused.code, "cursor_incarnation_changed");
+            assert_eq!(
+                ack_through(&conn, "owner", "incarnation", &since)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                "cursor_incarnation_changed"
+            );
+        }
+        let first = page(&conn, "owner", None, None, 100, usize::MAX);
+        assert_eq!(
+            first["entries"].as_array().unwrap().len(),
+            LATE_RESULTS_PAGE_MAX as usize
+        );
+        assert_eq!(first["entries"][0]["call_key"], "k2");
+        assert_eq!(first["more"], true);
+        // Entries past retention are served as expired, bounded per owner.
+        let expired = page(
+            &conn,
+            "owner",
+            None,
+            Some(1),
+            100 + RETENTION_MS,
+            usize::MAX,
+        );
+        assert_eq!(expired["entries"][0]["kind"], "expired");
     }
 }

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
     catalog::{
-        composition_digest, schema_digest, system_text_digest, CatalogAnswer, CatalogRequest,
-        CatalogTool, Reply, SystemTextAnswer,
+        composition_digest, schema_digest, session_capabilities, system_text_digest, CatalogAnswer,
+        CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
     errors,
@@ -68,6 +68,9 @@ pub(super) fn describe() -> Value {
                 "role.describe".into(),
                 "tool.catalog".into(),
                 "tool.call".into(),
+                "tool.withdraw".into(),
+                "late_results".into(),
+                "late_results.ack".into(),
             ],
             stability: "alpha".into(),
         }],
@@ -509,6 +512,13 @@ pub(super) fn catalog_for_request(
         powershell_available,
         runon,
     ));
+    // Every preset can settle a keyed call after its reply (a held shell
+    // call, or a scoped call whose end was never observed), so every catalog
+    // declares the session capability that lets a custodian pull those
+    // results.
+    answer
+        .capabilities
+        .insert(session_capabilities::LATE_RESULTS.into(), json!(true));
     if matches!(preset, CatalogPreset::Head | CatalogPreset::Worker) {
         match worker_wait_max_ms.checked_add(WORKER_REPLY_MARGIN_MS)
             .filter(|max_ms| *max_ms <= MAX_DECLARED_REPLY_MS)
@@ -836,6 +846,204 @@ struct LedgerCall {
     root: crate::path_identity::ProjectRootId,
     key: crate::db::call_ledger::Key,
     expires_at: std::time::Instant,
+    /// A `tool.withdraw` settled this held call before the frame loop filed
+    /// its question; the request is answered `not_started` when it arrives.
+    withdrawn: bool,
+}
+
+/// The role operations that read or change the call ledger.
+fn custody_operation(name: &str) -> bool {
+    matches!(name, "tool.withdraw" | "late_results" | "late_results.ack")
+}
+
+/// The largest body a role reply may carry: one subc frame. Withdraw answers
+/// and late-results pages are bounded by it, never by the tool-response limit.
+pub(super) const ROLE_REPLY_BODY_LIMIT: usize = subc_protocol::MAX_FRAME_BODY_LEN as usize;
+
+/// A custody request whose caller checks passed and that now needs the ledger.
+enum Custody {
+    Withdraw {
+        key: crate::db::call_ledger::Key,
+        /// The scope's owner named no carrier and is treated as the carrier;
+        /// finding no record of its own is then a refusal, not `unknown_call`.
+        owner_as_carrier: bool,
+    },
+    LateResults(cortexkit_role_tool_provider::late_results::LateResultsRequest),
+    Ack(cortexkit_role_tool_provider::late_results::AckRequest),
+}
+
+/// The canonical principal spelling of the route's verified caller: the same
+/// rendering the ledger keys carriers by and scope stamps name owners by.
+fn route_principal(identity: &super::RouteIdentity) -> String {
+    LedgerEdge::key(identity, "").carrier
+}
+
+fn role_scope(
+    scope: &crate::db::call_ledger::ScopeIdentity,
+) -> cortexkit_role_tool_provider::scope::ScopeIdentity {
+    cortexkit_role_tool_provider::scope::ScopeIdentity {
+        owner: scope.owner.clone(),
+        scope_ref: scope.scope_ref.clone(),
+        scope_epoch: scope.scope_epoch,
+    }
+}
+
+/// The caller checks and argument decoding of a custody request, which need
+/// no ledger access. A failure is the route error to answer with.
+fn custody_request(
+    op: &str,
+    body: &Value,
+    identity: &super::RouteIdentity,
+) -> Result<Custody, ErrorBody> {
+    use cortexkit_role_tool_provider::{
+        late_results::{AckRequest, LateResultsRequest},
+        withdraw::{parse_withdraw_request, resolve_carrier, CarrierResolution},
+    };
+    let arguments = || body.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    match op {
+        "tool.withdraw" => {
+            let request: cortexkit_role_tool_provider::call::ToolCallRequest =
+                serde_json::from_value(body.clone())
+                    .map_err(|error| errors::invalid_request("arguments", error.to_string()))?;
+            let arguments = parse_withdraw_request(&request)?;
+            let caller = route_principal(identity);
+            let stamp = identity
+                .scope
+                .as_ref()
+                .map(|scope| role_scope(&ledger_scope(scope)));
+            let (carrier, owner_as_carrier) =
+                match resolve_carrier(&caller, stamp.as_ref(), &arguments)
+                    .map_err(|problem| problem.error())?
+                {
+                    CarrierResolution::Carrier(carrier) => (carrier, false),
+                    CarrierResolution::OwnerAsCarrier(owner) => (owner, true),
+                };
+            Ok(Custody::Withdraw {
+                key: crate::db::call_ledger::Key {
+                    carrier,
+                    call_key: arguments.call_key,
+                },
+                owner_as_carrier,
+            })
+        }
+        "late_results" => serde_json::from_value::<LateResultsRequest>(arguments())
+            .map(Custody::LateResults)
+            .map_err(|error| errors::invalid_request("arguments", error.to_string())),
+        _ => serde_json::from_value::<AckRequest>(arguments())
+            .map(Custody::Ack)
+            .map_err(|error| errors::invalid_request("arguments", error.to_string())),
+    }
+}
+
+/// What a custody executor job produced: the reply body, and whether a held
+/// call was withdrawn so its request must be ended.
+struct CustodyReply {
+    body: Vec<u8>,
+    withdrawn_key: Option<crate::db::call_ledger::Key>,
+}
+
+/// Runs a custody request against the route root's ledger, on the actor's
+/// own `aft.db` connection.
+fn run_custody(
+    ctx: &crate::context::AppContext,
+    request: Custody,
+    custodian: &str,
+    stamp: Option<&crate::db::call_ledger::ScopeIdentity>,
+    request_id: &str,
+) -> Result<CustodyReply, ErrorBody> {
+    use crate::db::call_ledger::{self as ledger, Withdrawal};
+    use cortexkit_role_tool_provider::withdraw::{CallerProblem, WithdrawAnswer};
+    if let Some(refusal) = ctx.database_runtime_refusal(request_id, "bash") {
+        return Err(ErrorBody::new(
+            refusal.data["code"]
+                .as_str()
+                .unwrap_or("database_unavailable"),
+            refusal.data["message"]
+                .as_str()
+                .unwrap_or("call ledger is unavailable"),
+        )
+        .with_detail(json!({"retryable": refusal.data["retryable"]})));
+    }
+    let unavailable = |message: String| {
+        ErrorBody::new("database_unavailable", message).with_detail(json!({"retryable": false}))
+    };
+    let db = ctx
+        .db()
+        .ok_or_else(|| unavailable("call ledger is unavailable".into()))?;
+    let incarnation = ledger::provider_incarnation();
+    let now = crate::db::call_ledger::now_ms();
+    match request {
+        Custody::Withdraw {
+            key,
+            owner_as_carrier,
+        } => {
+            let found = {
+                let conn = db
+                    .lock()
+                    .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
+                ledger::withdraw(&conn, &key, stamp, now, ROLE_REPLY_BODY_LIMIT)
+                    .map_err(|error| unavailable(error.to_string()))?
+            };
+            match found {
+                Withdrawal::UnknownCall if owner_as_carrier => {
+                    Err(CallerProblem::CarrierRequired.error())
+                }
+                Withdrawal::UnknownCall => Ok(CustodyReply {
+                    body: serde_json::to_vec(&WithdrawAnswer::UnknownCall.encode())
+                        .expect("withdraw answers are JSON"),
+                    withdrawn_key: None,
+                }),
+                Withdrawal::NotPermitted => Err(CallerProblem::NotPermitted.error()),
+                Withdrawal::Answer {
+                    body,
+                    kill_task,
+                    held_withdrawn,
+                } => {
+                    // The database lock is released above: killing persists
+                    // the task's terminal state through the same connection.
+                    if let Some(task) = kill_task {
+                        if let Err(error) = ctx.bash_background().kill_withdrawn(&task) {
+                            log::warn!("withdrawn call task {task} was not killed: {error}");
+                        }
+                    }
+                    Ok(CustodyReply {
+                        body,
+                        withdrawn_key: held_withdrawn.then_some(key),
+                    })
+                }
+            }
+        }
+        Custody::LateResults(request) => {
+            let conn = db
+                .lock()
+                .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
+            ledger::late_results(
+                &conn,
+                custodian,
+                incarnation,
+                request.since.as_ref(),
+                request.limit,
+                now,
+                ROLE_REPLY_BODY_LIMIT,
+            )
+            .map_err(|error| unavailable(error.to_string()))?
+            .map(|body| CustodyReply {
+                body,
+                withdrawn_key: None,
+            })
+        }
+        Custody::Ack(request) => {
+            let conn = db
+                .lock()
+                .map_err(|_| unavailable("call ledger database mutex is poisoned".into()))?;
+            ledger::ack_through(&conn, custodian, incarnation, &request.through)
+                .map_err(|error| unavailable(error.to_string()))?
+                .map(|_| CustodyReply {
+                    body: b"{}".to_vec(),
+                    withdrawn_key: None,
+                })
+        }
+    }
 }
 
 impl LedgerEdge {
@@ -909,6 +1117,18 @@ impl LedgerEdge {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
+        if body.get("op").is_none() {
+            if let Some(op) = body
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| custody_operation(name))
+            {
+                let op = op.to_owned();
+                let body = body.clone();
+                self.custody(decoded, &op, &body, identity, executor, writer, metrics);
+                return Ok(());
+            }
+        }
         if body
             .get("op")
             .and_then(Value::as_str)
@@ -1102,6 +1322,7 @@ impl LedgerEdge {
                             root,
                             key: response_key,
                             expires_at: std::time::Instant::now() + bash_elicitation_timeout(),
+                            withdrawn: false,
                         },
                     );
                     let _ = edge.ready.send(decoded);
@@ -1263,6 +1484,174 @@ impl LedgerEdge {
             request.header.corr,
             recorded.body.clone(),
         )
+    }
+
+    /// Answers a custody request (`tool.withdraw`, `late_results`,
+    /// `late_results.ack`) on a v1 route. The caller checks run here; the
+    /// ledger read and any settlement run as one executor job on the route
+    /// root's database connection, never on the frame loop. A withdraw that
+    /// settles a held call also asks the frame loop, through the ready
+    /// channel, to end that call's request with `not_started`.
+    #[allow(clippy::too_many_arguments)]
+    fn custody(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        op: &str,
+        body: &Value,
+        identity: super::RouteIdentity,
+        executor: &std::sync::Arc<crate::executor::Executor>,
+        writer: &super::WriterSender,
+        metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+    ) {
+        use super::*;
+        let request = decoded.frame;
+        let writer = writer.clone();
+        let metrics = metrics.clone();
+        let custody = match custody_request(op, body, &identity) {
+            Ok(custody) => custody,
+            Err(error) => {
+                tokio::spawn(async move {
+                    let _ = send_provider_error(&writer, &metrics, &request, error).await;
+                });
+                return;
+            }
+        };
+        let custodian = route_principal(&identity);
+        let stamp = identity.scope.as_ref().map(ledger_scope);
+        let request_id = format!("{op}-{}-{}", request.header.channel, request.header.corr);
+        let (result_tx, result_rx) = oneshot::channel();
+        let rx = executor.submit_async(
+            identity.root.clone(),
+            Lane::Mutating,
+            request_id.clone(),
+            Box::new(move |ctx| {
+                let _ = result_tx.send(run_custody(
+                    ctx,
+                    custody,
+                    &custodian,
+                    stamp.as_ref(),
+                    &request_id,
+                ));
+                Response::success(request_id, json!({}))
+            }),
+        );
+        let edge = self.clone();
+        let op = op.to_owned();
+        tokio::spawn(async move {
+            let response = await_executor_response(rx, op.clone()).await;
+            let result = result_rx.await.unwrap_or_else(|_| {
+                Err(
+                    ErrorBody::new("executor_failure", format!("{op} did not complete"))
+                        .with_detail(response.data),
+                )
+            });
+            match result {
+                Ok(reply) => {
+                    if let Some(key) = reply.withdrawn_key {
+                        edge.end_withdrawn_held_calls(&key);
+                    }
+                    if let Ok(frame) = subc_protocol::Frame::build_with_version(
+                        request.header.ver,
+                        FrameType::Response,
+                        request.header.flags,
+                        request.header.channel,
+                        request.header.epoch,
+                        request.header.corr,
+                        reply.body,
+                    ) {
+                        let _ =
+                            send_reliable_writer_frame(&writer, &metrics, frame, "custody reply")
+                                .await;
+                    }
+                }
+                Err(error) => {
+                    let _ = send_provider_error(&writer, &metrics, &request, error).await;
+                }
+            }
+        });
+    }
+
+    /// Hands the frame loop one `Cancel`-typed frame per live request of the
+    /// withdrawn call. The frame loop removes the call's pending question
+    /// and answers the request `not_started`; a request whose question is not
+    /// filed yet is marked, and answered when the frame loop reaches it.
+    fn end_withdrawn_held_calls(&self, key: &crate::db::call_ledger::Key) {
+        let requests: Vec<_> = self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, call)| &call.key == key)
+            .map(|(request, _)| *request)
+            .collect();
+        for (route, corr) in requests {
+            match subc_protocol::Frame::build(
+                subc_protocol::FrameType::Cancel,
+                super::control_flags(),
+                route.channel,
+                route.epoch,
+                corr,
+                Vec::new(),
+            ) {
+                Ok(frame) => {
+                    let _ = self.ready.send(super::DecodedFrame {
+                        frame,
+                        phase_trace: crate::run_tool_call::PhaseTrace::new(
+                            std::time::Instant::now(),
+                        ),
+                        parsed_body: Default::default(),
+                    });
+                }
+                Err(error) => log::warn!("withdrawn call could not be ended: {error}"),
+            }
+        }
+    }
+
+    /// Marks a held request withdrawn before its question was filed. Returns
+    /// false when the request already ended.
+    pub(super) fn mark_withdrawn(&self, route: super::RouteChannel, corr: u64) -> bool {
+        match self.calls.lock().unwrap().get_mut(&(route, corr)) {
+            Some(call) => {
+                call.withdrawn = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a `tool.withdraw` settled this admitted request's call.
+    pub(super) fn is_withdrawn(&self, request: &subc_protocol::Frame) -> bool {
+        self.calls
+            .lock()
+            .unwrap()
+            .get(&(
+                super::route_key(request.header.channel, request.header.epoch),
+                request.header.corr,
+            ))
+            .is_some_and(|call| call.withdrawn)
+    }
+
+    /// The terminal frame of a held request whose call was withdrawn before
+    /// it dispatched, byte-identical to the frame recorded on its row.
+    pub(super) fn withdrawn_frame(
+        &self,
+        route: super::RouteChannel,
+        corr: u64,
+        ver: u8,
+        flags: subc_protocol::Flags,
+    ) -> Option<Result<subc_protocol::Frame, subc_protocol::FrameBuildError>> {
+        let key = self.calls.lock().unwrap().get(&(route, corr))?.key.clone();
+        let recorded =
+            crate::db::call_ledger::not_started(&key, crate::db::call_ledger::WITHDRAWN_REASON);
+        Some(subc_protocol::Frame::build_with_version(
+            ver,
+            recorded.ty,
+            flags,
+            route.channel,
+            route.epoch,
+            corr,
+            recorded.body,
+        ))
     }
 
     /// Pending admission and attached repeats do not belong to the tool's
@@ -1957,8 +2346,11 @@ mod tests {
         assert_eq!(error.detail.unwrap()["field"], "schema_pin");
     }
 
+    /// `role.describe` serves exactly the Slice B declaration: the three Slice
+    /// A ops plus `tool.withdraw`, `late_results` and `late_results.ack`, with
+    /// no module-level capabilities.
     #[test]
-    fn slice_a_declaration_matches_independent_fixture_without_normalizing_other_fields() {
+    fn slice_b_declaration_matches_independent_fixture_without_normalizing_other_fields() {
         let fixtures: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/tool_provider_conformance.json"
         ))
@@ -1966,7 +2358,7 @@ mod tests {
         let mut actual = describe();
         assert_eq!(actual["implementation_version"], env!("CARGO_PKG_VERSION"));
         actual["implementation_version"] = json!("<built-package-version>");
-        assert_eq!(actual, fixtures["slice_a"]["declaration"]);
+        assert_eq!(actual, fixtures["slice_b"]["declaration"]);
     }
 
     #[test]
@@ -3762,12 +4154,64 @@ mod route_tests {
         assert!(heavy.await.unwrap().success);
     }
 
+    /// Sends `body` through the ledger edge, the frame loop's first stop for a
+    /// request on a bound route, over a route with a real `aft.db`. `None`
+    /// means the edge left the request to the ordinary tool-call handler.
+    async fn custody_exchange(
+        body: Value,
+        role: RouteRole,
+        scope: Option<subc_protocol::scope::ScopeStamp>,
+    ) -> Option<WriterFrame> {
+        let (dir, root) = test_support::test_root("custody-ops");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let mut identity = test_support::route_identity(&root, "session");
+        let data = Arc::get_mut(&mut identity.0).unwrap();
+        data.role = role;
+        data.scope = scope;
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root, ctx));
+        let routes = HashMap::from([(route_key(41, 1), identity)]);
+        let (edge, _ready) = LedgerEdge::new();
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                41,
+                1,
+                7,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        let (writer, mut replies) = mpsc::channel(8);
+        edge.defer(
+            decoded,
+            &routes,
+            &executor,
+            &writer,
+            &Arc::new(DispatchPathMetrics::new()),
+        )
+        .ok()?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.header.corr, 7);
+        Some(reply)
+    }
+
     #[tokio::test]
-    async fn unscoped_v1_route_runs_plain_calls_and_refuses_unserved_custody_ops() {
+    async fn unscoped_v1_route_runs_plain_calls_and_serves_custody_ops() {
         // A route the daemon stamped with no scope may run plain calls, as
-        // the role contract's plain stamp expects. Withdraw and late results
-        // are not served by AFT on any route yet, so an unscoped request for
-        // them is refused as an unsupported operation without dispatching.
+        // the role contract's plain stamp expects. The custody ops are served
+        // on it too: only the carrier may withdraw there, keyed on the route's
+        // principal, and late results go to the route's principal as
+        // custodian.
         let _guard = EXCHANGE_LOCK.lock().await;
         ACTIONS.store(0, Ordering::SeqCst);
         let reply = exchange_with_scope(
@@ -3780,24 +4224,72 @@ mod route_tests {
         .await;
         assert_eq!(reply.header.ty, FrameType::Response);
         assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+        let withdraw = custody_exchange(
+            json!({"name":"tool.withdraw", "arguments":{"call_key":"key"}}),
+            RouteRole::ToolProviderV1,
+            None,
+        )
+        .await
+        .expect("v1 routes serve tool.withdraw");
+        assert_eq!(withdraw.header.ty, FrameType::Response);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&withdraw.body).unwrap(),
+            json!({"answer": "unknown_call"})
+        );
+        let page = custody_exchange(
+            json!({"name":"late_results", "arguments":{"since":null}}),
+            RouteRole::ToolProviderV1,
+            None,
+        )
+        .await
+        .expect("v1 routes serve late_results");
+        assert_eq!(page.header.ty, FrameType::Response);
+        let page: Value = serde_json::from_slice(&page.body).unwrap();
+        assert_eq!(page["entries"], json!([]));
+        assert_eq!(page["more"], false);
+        assert_eq!(
+            page["cursor"],
+            json!({"provider_incarnation": crate::db::call_ledger::provider_incarnation(), "seq": 0})
+        );
+        let malformed = custody_exchange(
+            json!({"name":"late_results.ack", "arguments":{"through":"cursor"}}),
+            RouteRole::ToolProviderV1,
+            None,
+        )
+        .await
+        .expect("v1 routes serve late_results.ack");
+        let error = error_body(&malformed);
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.detail.unwrap()["field"], "arguments");
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+    }
+
+    /// Legacy routes keep refusing the custody ops by name: the ledger edge
+    /// leaves them to the tool-call handler, which answers
+    /// `unsupported_operation` without dispatching anything.
+    #[tokio::test]
+    async fn legacy_routes_refuse_custody_ops_by_name() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
         for body in [
             json!({"name":"tool.withdraw", "arguments":{"call_key":"key"}}),
             json!({"name":"late_results", "arguments":{"since":null}}),
-            json!({"name":"late_results.ack", "arguments":{"through":"cursor"}}),
+            json!({"name":"late_results.ack", "arguments":{"through":{"provider_incarnation":"x","seq":0}}}),
         ] {
-            let reply = exchange_with_scope(
-                body.clone(),
-                RouteRole::ToolProviderV1,
-                "session",
-                vec![],
-                None,
-            )
-            .await;
-            assert_eq!(reply.header.ty, FrameType::Error, "{body}");
-            let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
-            assert_eq!(error.code, "unsupported_operation", "{body}");
+            for scope in [None, Some(stamp("head"))] {
+                assert!(
+                    custody_exchange(body.clone(), RouteRole::Legacy, scope.clone())
+                        .await
+                        .is_none(),
+                    "{body}"
+                );
+                let reply =
+                    exchange_with_scope(body.clone(), RouteRole::Legacy, "session", vec![], scope)
+                        .await;
+                assert_eq!(error_body(&reply).code, "unsupported_operation", "{body}");
+            }
         }
-        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 0);
     }
 
     fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {

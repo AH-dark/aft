@@ -2214,6 +2214,30 @@ pub(super) fn bash_module_draining_completion(
     }
 }
 
+/// Releases the waits a held bash call's permission question took, without
+/// answering the call: `tool.withdraw` settled it, and its `not_started`
+/// terminal is sent by the caller.
+pub(super) fn bash_withdrawn_completion(
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+) -> BashDeferredCompletion {
+    BashDeferredCompletion {
+        route,
+        corr,
+        flags,
+        ver,
+        root,
+        request_id,
+        result: None,
+        fatal: false,
+        settles_hold: true,
+    }
+}
+
 pub(super) fn bash_denied_untrusted_response(request_id: impl Into<String>) -> Response {
     Response::error(
         request_id.into(),

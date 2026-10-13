@@ -9,10 +9,13 @@ use cortexkit_role_tool_provider_conformance::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU16, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
@@ -27,7 +30,7 @@ use subc_transport::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Mutex as AsyncMutex,
+    sync::{mpsc, Mutex as AsyncMutex},
 };
 
 #[path = "helpers/aft_binary.rs"]
@@ -37,28 +40,181 @@ mod aft_binary;
 /// no preset, which AFT serves as `head`).
 struct Subject {
     preset: Option<&'static str>,
+    /// Stands in for the consumer's elicitation provider: the permission
+    /// questions AFT files for the runner's held calls arrive here.
+    stand_in: Arc<StandIn>,
 }
 impl Subject {
-    const HEAD: Subject = Subject { preset: None };
+    fn new(preset: Option<&'static str>) -> Self {
+        Self {
+            preset,
+            stand_in: Arc::default(),
+        }
+    }
+    fn head() -> Self {
+        Self::new(None)
+    }
+    /// The reader preset serves no shell tool, so it has no call AFT can
+    /// hold, cancel or settle later.
+    fn serves_shell(&self) -> bool {
+        self.preset != Some("reader")
+    }
 }
+
+/// The stand-in elicitation provider. AFT's question carries no call key
+/// (only the command), so a question is matched to the runner's key by the
+/// marker path the held call's command writes: the runner derives that path
+/// from the key (`marker_path(work_dir, key)` in the conformance crate).
+#[derive(Default)]
+struct StandIn {
+    /// The runner's marker directory, learned from the first `held_call`.
+    /// Questions for commands outside it go to the ordinary frame queue.
+    markers: Mutex<Option<PathBuf>>,
+    asks: Mutex<Vec<FiledAsk>>,
+}
+struct FiledAsk {
+    command: String,
+    wire: Arc<Wire>,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    answered: bool,
+}
+impl StandIn {
+    /// The command of a question this stand-in answers, if `frame` is one.
+    fn claims(&self, frame: &Frame) -> Option<String> {
+        let markers = self.markers.lock().unwrap().clone()?;
+        let body: Value = serde_json::from_slice(&frame.body).ok()?;
+        let command = body["params"]["_meta"]["aft"]["command"].as_str()?;
+        command
+            .contains(&markers.display().to_string())
+            .then(|| command.to_owned())
+    }
+    fn marker(&self, key: &str) -> Result<String, HarnessError> {
+        let markers = self
+            .markers
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| HarnessError::new("no held call was made yet"))?;
+        Ok(markers
+            .join(format!("{}.marker", key.replace('/', "_")))
+            .display()
+            .to_string())
+    }
+    /// Waits until the question for `key` has arrived, then runs `take` on it.
+    async fn wait_for<T>(
+        &self,
+        key: &str,
+        within: Duration,
+        mut take: impl FnMut(&mut FiledAsk) -> Option<T>,
+    ) -> Result<T, HarnessError> {
+        let marker = self.marker(key)?;
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if let Some(found) = self
+                .asks
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .filter(|ask| ask.command.contains(&marker))
+                .find_map(&mut take)
+            {
+                return Ok(found);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(HarnessError::new(format!(
+                    "no permission question for {key} arrived within {within:?}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 struct Process {
     child: Mutex<Child>,
-    stream: Arc<AsyncMutex<Wire>>,
+    wire: Arc<Wire>,
+    reader: tokio::task::JoinHandle<()>,
     root: PathBuf,
 }
+/// One module connection. A reader task demultiplexes the module's frames:
+/// a reply goes to the request waiting on its `(channel, corr)`, a question
+/// for a runner's held call goes to the stand-in, and everything else to one
+/// ordered queue that the exclusive [`WireGuard`] reads.
 struct Wire {
-    stream: TcpStream,
-    next_corr: u64,
-    next_channel: u16,
+    writer: AsyncMutex<tokio::net::tcp::OwnedWriteHalf>,
+    unclaimed: AsyncMutex<mpsc::UnboundedReceiver<Result<Frame, String>>>,
+    waiters: Mutex<HashMap<(u16, u64), mpsc::UnboundedSender<Frame>>>,
+    next_corr: AtomicU64,
+    next_channel: AtomicU16,
+}
+impl Wire {
+    fn corr(&self) -> u64 {
+        self.next_corr.fetch_add(1, Ordering::SeqCst)
+    }
+    async fn send(&self, frame: &Frame) -> Result<(), HarnessError> {
+        write_frame(&mut *self.writer.lock().await, frame)
+            .await
+            .map_err(harness_error)
+    }
+    /// Routes the module's frames for `(channel, corr)` to the returned
+    /// receiver until the guard drops.
+    fn expect(self: &Arc<Self>, channel: u16, corr: u64) -> Waiter {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.waiters.lock().unwrap().insert((channel, corr), tx);
+        Waiter {
+            wire: self.clone(),
+            key: (channel, corr),
+            rx,
+        }
+    }
+    /// Exclusive, ordered access to the frames no waiter or stand-in claims.
+    async fn lock(&self) -> WireGuard<'_> {
+        WireGuard {
+            wire: self,
+            unclaimed: self.unclaimed.lock().await,
+        }
+    }
+}
+struct Waiter {
+    wire: Arc<Wire>,
+    key: (u16, u64),
+    rx: mpsc::UnboundedReceiver<Frame>,
+}
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.wire.waiters.lock().unwrap().remove(&self.key);
+    }
+}
+struct WireGuard<'a> {
+    wire: &'a Wire,
+    unclaimed: tokio::sync::MutexGuard<'a, mpsc::UnboundedReceiver<Result<Frame, String>>>,
+}
+impl WireGuard<'_> {
+    fn corr(&self) -> u64 {
+        self.wire.corr()
+    }
+    async fn send(&self, frame: &Frame) -> Result<(), HarnessError> {
+        self.wire.send(frame).await
+    }
+    async fn next(&mut self) -> Result<Frame, HarnessError> {
+        tokio::time::timeout(Duration::from_secs(30), self.unclaimed.recv())
+            .await
+            .map_err(harness_error)?
+            .ok_or_else(|| HarnessError::new("module EOF"))?
+            .map_err(HarnessError::new)
+    }
 }
 #[derive(Clone)]
 struct Route {
-    wire: Arc<AsyncMutex<Wire>>,
+    wire: Arc<Wire>,
     channel: u16,
     scoped_preset: Option<&'static str>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
+        self.reader.abort();
         let child = self.child.get_mut().unwrap();
         let _ = child.kill();
         let _ = child.wait();
@@ -88,6 +244,68 @@ async fn next_frame(stream: &mut TcpStream) -> Result<Frame, HarnessError> {
         }
         return Ok(frame);
     }
+}
+/// Reads every frame the module sends after the handshake; see [`Wire`].
+fn spawn_reader(
+    mut read: tokio::net::tcp::OwnedReadHalf,
+    wire: Arc<Wire>,
+    unclaimed: mpsc::UnboundedSender<Result<Frame, String>>,
+    stand_in: Arc<StandIn>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let frame = match read_frame(&mut read).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    let _ = unclaimed.send(Err("module EOF".into()));
+                    break;
+                }
+                Err(error) => {
+                    let _ = unclaimed.send(Err(error.to_string()));
+                    break;
+                }
+            };
+            match frame.header.ty {
+                FrameType::Ping => {
+                    if let Ok(pong) =
+                        Frame::build(FrameType::Pong, flags(), 0, 0, frame.header.corr, vec![])
+                    {
+                        let _ = wire.send(&pong).await;
+                    }
+                    continue;
+                }
+                FrameType::Push => continue,
+                FrameType::Request if frame.header.channel != 0 => {
+                    if let Some(command) = stand_in.claims(&frame) {
+                        stand_in.asks.lock().unwrap().push(FiledAsk {
+                            command,
+                            wire: wire.clone(),
+                            channel: frame.header.channel,
+                            epoch: frame.header.epoch,
+                            corr: frame.header.corr,
+                            answered: false,
+                        });
+                        continue;
+                    }
+                }
+                _ => {
+                    let waiter = wire
+                        .waiters
+                        .lock()
+                        .unwrap()
+                        .get(&(frame.header.channel, frame.header.corr))
+                        .cloned();
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(frame);
+                        continue;
+                    }
+                }
+            }
+            let _ = unclaimed.send(Ok(frame));
+        }
+        // A dead module answers nothing more: end every waiting request.
+        wire.waiters.lock().unwrap().clear();
+    })
 }
 fn prepare_provider_project(root: &Path) -> Result<(), HarnessError> {
     // Construct the config location from the same components on every platform.
@@ -202,8 +420,30 @@ fn provider_project_setup_accepts_absent_and_canonical_roots() {
 impl Harness for Subject {
     type Handle = Process;
     type Route = Route;
+    /// With `test-timing-hooks` the binary blocks at the `Prepared` and
+    /// `Authorized` ledger commits when armed (see `kill_at`), and the
+    /// harness then kills the process: a fault hook followed by a real kill.
     fn declared_points(&self) -> Vec<PointDeclaration> {
-        vec![]
+        #[cfg(feature = "test-timing-hooks")]
+        {
+            use cortexkit_role_tool_provider::points;
+            [points::PREPARED, points::AUTHORIZED]
+                .into_iter()
+                .map(|point| PointDeclaration {
+                    point: KillPoint::new(point),
+                    mechanisms: vec![
+                        cortexkit_role_harness::KillMechanism::FaultHookThenProcessKill,
+                    ],
+                    note: "the call ledger is SQLite, so truncation is not meaningful: the \
+                           binary blocks right after committing the point and is then killed"
+                        .into(),
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "test-timing-hooks"))]
+        {
+            vec![]
+        }
     }
     async fn spawn(&self, root: &Path) -> Result<Process, HarnessError> {
         prepare_provider_project(root)?;
@@ -289,13 +529,20 @@ impl Harness for Subject {
         )
         .await
         .map_err(harness_error)?;
+        let (read, write) = stream.into_split();
+        let (unclaimed_tx, unclaimed_rx) = mpsc::unbounded_channel();
+        let wire = Arc::new(Wire {
+            writer: AsyncMutex::new(write),
+            unclaimed: AsyncMutex::new(unclaimed_rx),
+            waiters: Mutex::default(),
+            next_corr: AtomicU64::new(100),
+            next_channel: AtomicU16::new(1),
+        });
+        let reader = spawn_reader(read, wire.clone(), unclaimed_tx, self.stand_in.clone());
         Ok(Process {
             child: Mutex::new(guard.0.take().unwrap()),
-            stream: Arc::new(AsyncMutex::new(Wire {
-                stream,
-                next_corr: 100,
-                next_channel: 1,
-            })),
+            wire,
+            reader,
             root: root.to_path_buf(),
         })
     }
@@ -412,9 +659,9 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
     use aft::db::call_ledger::{self as ledger, Key};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let route = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     std::fs::write(root.join("project/input.txt"), "first content\n").unwrap();
@@ -427,8 +674,8 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
     assert_ne!(first.header.corr, repeat.header.corr);
     assert_eq!(first.header.ty, repeat.header.ty);
     assert_eq!(first.body, repeat.body);
-    let other = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let other = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     let repeat = other.raw(body.clone(), false).await;
@@ -491,9 +738,9 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
     // An unscoped row expires by deletion, so expiry replay is covered on a
     // scoped row below rather than confusing deletion with retained identity.
     drop(conn);
-    let process = Subject::HEAD.restart(&root).await.unwrap();
-    let route = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let process = Subject::head().restart(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&route.raw(body, false).await.body).contains("changed content"));
@@ -504,14 +751,14 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
     use aft::db::call_ledger::{self as ledger, Key};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let process = Subject::head().spawn(&root).await.unwrap();
     std::fs::write(root.join("project/input.txt"), "content\n").unwrap();
     let stamp = scoped_stamp("carrier-a", "owner-a", "same-ref");
-    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
     let body = json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"scoped"});
     let first = route.raw(body.clone(), false).await;
     assert_eq!(response_json(&first)["isError"], false);
-    let other = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let other = Subject::head().route(&process, &stamp).await.unwrap();
     let repeat = other.raw(body.clone(), false).await;
     assert_eq!(first.body, repeat.body);
     assert_eq!(first.header.ty, repeat.header.ty);
@@ -530,7 +777,7 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
             scope: None,
         },
     ] {
-        let other = Subject::HEAD
+        let other = Subject::head()
             .route(&process, &conflict_stamp)
             .await
             .unwrap();
@@ -539,13 +786,13 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
         assert_eq!(response_json(&refused)["detail"]["field"], "call_key");
     }
     let stamp_b = scoped_stamp("carrier-b", "owner-b", "same-ref");
-    let other = Subject::HEAD.route(&process, &stamp_b).await.unwrap();
+    let other = Subject::head().route(&process, &stamp_b).await.unwrap();
     assert_eq!(
         response_json(&other.raw(body.clone(), false).await)["isError"],
         false
     );
-    let trusted = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let trusted = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     let missing = json!({"name":"read","arguments":{"filePath":"missing.txt"}});
@@ -584,8 +831,8 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
     )
     .unwrap();
     drop(conn);
-    let process = Subject::HEAD.restart(&root).await.unwrap();
-    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let process = Subject::head().restart(&root).await.unwrap();
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
     let expired = route.raw(body, false).await;
     assert_eq!(expired.header.ty, FrameType::Error);
     let expired = response_json(&expired);
@@ -599,9 +846,9 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
 async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_read() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let route = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     std::fs::write(root.join("project/input.txt"), "readable\n").unwrap();
@@ -621,9 +868,9 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
     )
     .unwrap();
     drop(conn);
-    let process = Subject::HEAD.restart(&root).await.unwrap();
-    let route = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let process = Subject::head().restart(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     let marker = root.join("project/should-not-run");
@@ -663,8 +910,8 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
 async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let route = Subject::HEAD
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
         .route(&process, &scoped_stamp("carrier", "owner", "scope"))
         .await
         .unwrap();
@@ -684,7 +931,7 @@ async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
 async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let process = Subject::head().spawn(&root).await.unwrap();
     let route = bind_route_stamped_with_elicitation(
         &process,
         &root.join("project"),
@@ -721,9 +968,9 @@ async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() 
 async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let warm = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let warm = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     warm.raw(
@@ -731,7 +978,7 @@ async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
         false,
     )
     .await;
-    let route = Subject::HEAD
+    let route = Subject::head()
         .route(&process, &scoped_stamp("carrier", "owner", "scope"))
         .await
         .unwrap();
@@ -753,10 +1000,8 @@ async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
             json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":case});
         route.adapt_preset(&mut call);
         let mut wire = route.wire.lock().await;
-        let corr = wire.next_corr;
-        wire.next_corr += 1;
-        write_frame(
-            &mut wire.stream,
+        let corr = wire.corr();
+        wire.send(
             &Frame::build(
                 FrameType::Request,
                 flags(),
@@ -769,17 +1014,14 @@ async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
         )
         .await
         .unwrap();
-        let ask = next_frame(&mut wire.stream).await.unwrap();
+        let ask = wire.next().await.unwrap();
         assert_eq!(ask.header.ty, FrameType::Request, "{case}: {ask:?}");
         assert_eq!(ask.header.channel, route.channel);
         assert!(!marker.exists(), "{case}: execution must wait for a grant");
-        write_frame(
-            &mut wire.stream,
-            &Frame::build(ty, flags(), route.channel, 1, ask.header.corr, body).unwrap(),
-        )
-        .await
-        .unwrap();
-        let reply = next_frame(&mut wire.stream).await.unwrap();
+        wire.send(&Frame::build(ty, flags(), route.channel, 1, ask.header.corr, body).unwrap())
+            .await
+            .unwrap();
+        let reply = wire.next().await.unwrap();
         assert_eq!(reply.header.corr, corr, "{case}");
         assert_eq!(reply.header.ty, FrameType::Response, "{case}");
         assert_eq!(response_json(&reply)["isError"], true, "{case}");
@@ -803,13 +1045,13 @@ async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
 async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let route = Subject::HEAD
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
         .route(&process, &scoped_stamp("carrier", "owner", "scope"))
         .await
         .unwrap();
-    let warm = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let warm = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     warm.raw(
@@ -821,11 +1063,9 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     let mut body = json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"cancelled-repeat"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
-    let first = wire.next_corr;
-    let repeat = first + 1;
-    wire.next_corr += 2;
-    write_frame(
-        &mut wire.stream,
+    let first = wire.corr();
+    let repeat = wire.corr();
+    wire.send(
         &Frame::build(
             FrameType::Request,
             flags(),
@@ -838,10 +1078,9 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     )
     .await
     .unwrap();
-    let ask = next_frame(&mut wire.stream).await.unwrap();
+    let ask = wire.next().await.unwrap();
     assert_eq!(ask.header.ty, FrameType::Request);
-    write_frame(
-        &mut wire.stream,
+    wire.send(
         &Frame::build(
             FrameType::Request,
             flags(),
@@ -854,13 +1093,10 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     )
     .await
     .unwrap();
-    write_frame(
-        &mut wire.stream,
-        &Frame::build(FrameType::Cancel, flags(), route.channel, 1, repeat, vec![]).unwrap(),
-    )
-    .await
-    .unwrap();
-    let cancelled = tokio::time::timeout(Duration::from_secs(5), next_frame(&mut wire.stream))
+    wire.send(&Frame::build(FrameType::Cancel, flags(), route.channel, 1, repeat, vec![]).unwrap())
+        .await
+        .unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), wire.next())
         .await
         .expect("a cancelled attachment must receive a terminal frame")
         .unwrap();
@@ -868,8 +1104,7 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     assert_eq!(cancelled.header.ty, FrameType::Error);
     assert_eq!(response_json(&cancelled)["code"], "cancelled");
     assert!(!marker.exists());
-    write_frame(
-        &mut wire.stream,
+    wire.send(
         &Frame::build(
             FrameType::Response,
             flags(),
@@ -882,12 +1117,12 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     )
     .await
     .unwrap();
-    let completed = next_frame(&mut wire.stream).await.unwrap();
+    let completed = wire.next().await.unwrap();
     assert_eq!(completed.header.corr, first);
     assert_eq!(completed.header.ty, FrameType::Response);
     assert_eq!(response_json(&completed)["isError"], false);
     assert!(
-        tokio::time::timeout(Duration::from_millis(400), next_frame(&mut wire.stream))
+        tokio::time::timeout(Duration::from_millis(400), wire.next())
             .await
             .is_err(),
         "the cancelled repeat must not also receive the result"
@@ -902,13 +1137,13 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
 async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execution() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let route = Subject::HEAD
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
         .route(&process, &scoped_stamp("carrier", "owner", "scope"))
         .await
         .unwrap();
-    let warm = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let warm = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     warm.raw(
@@ -920,8 +1155,7 @@ async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execu
     let mut body = json!({"name":"bash","arguments":{"command":format!("printf x >> '{}'; sleep 1",marker.display())},"call_key":"held-repeat"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
-    let first = wire.next_corr;
-    wire.next_corr += 1;
+    let first = wire.corr();
     let send = |corr| {
         Frame::build(
             FrameType::Request,
@@ -933,25 +1167,23 @@ async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execu
         )
         .unwrap()
     };
-    write_frame(&mut wire.stream, &send(first)).await.unwrap();
-    let ask = next_frame(&mut wire.stream).await.unwrap();
+    wire.send(&send(first)).await.unwrap();
+    let ask = wire.next().await.unwrap();
     assert_eq!(
         ask.header.ty,
         FrameType::Request,
         "{}",
         String::from_utf8_lossy(&ask.body)
     );
-    let held = wire.next_corr;
-    wire.next_corr += 1;
-    write_frame(&mut wire.stream, &send(held)).await.unwrap();
+    let held = wire.corr();
+    wire.send(&send(held)).await.unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(150), next_frame(&mut wire.stream))
+        tokio::time::timeout(Duration::from_millis(150), wire.next())
             .await
             .is_err(),
         "a Prepared repeat must not file a second question"
     );
-    write_frame(
-        &mut wire.stream,
+    wire.send(
         &Frame::build(
             FrameType::Response,
             flags(),
@@ -971,12 +1203,11 @@ async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execu
     })
     .await
     .unwrap();
-    let running = wire.next_corr;
-    wire.next_corr += 1;
-    write_frame(&mut wire.stream, &send(running)).await.unwrap();
+    let running = wire.corr();
+    wire.send(&send(running)).await.unwrap();
     let mut replies = BTreeMap::new();
     for _ in 0..3 {
-        let frame = next_frame(&mut wire.stream).await.unwrap();
+        let frame = wire.next().await.unwrap();
         assert_eq!(frame.header.ty, FrameType::Response);
         assert_eq!(response_json(&frame)["isError"], false);
         replies.insert(frame.header.corr, frame.body);
@@ -1003,11 +1234,11 @@ async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execu
 async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let process = Subject::head().spawn(&root).await.unwrap();
     let stamp = scoped_stamp("carrier", "owner", "scope");
-    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
-    let warm = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
+    let warm = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     warm.raw(
@@ -1019,10 +1250,8 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
     let mut body = json!({"name":"bash","arguments":{"command":format!("printf x >> '{}'",marker.display())},"call_key":"cross-actor"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
-    let first = wire.next_corr;
-    wire.next_corr += 1;
-    write_frame(
-        &mut wire.stream,
+    let first = wire.corr();
+    wire.send(
         &Frame::build(
             FrameType::Request,
             flags(),
@@ -1035,7 +1264,7 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
     )
     .await
     .unwrap();
-    let ask = next_frame(&mut wire.stream).await.unwrap();
+    let ask = wire.next().await.unwrap();
     assert_eq!(ask.header.ty, FrameType::Request);
     drop(wire);
     let second_root = root.join("project2");
@@ -1065,10 +1294,8 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
     .await
     .unwrap();
     let mut wire = route.wire.lock().await;
-    let repeat = wire.next_corr;
-    wire.next_corr += 1;
-    write_frame(
-        &mut wire.stream,
+    let repeat = wire.corr();
+    wire.send(
         &Frame::build(
             FrameType::Request,
             flags(),
@@ -1081,8 +1308,7 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
     )
     .await
     .unwrap();
-    write_frame(
-        &mut wire.stream,
+    wire.send(
         &Frame::build(
             FrameType::Response,
             flags(),
@@ -1097,7 +1323,7 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
     .unwrap();
     let mut replies = BTreeMap::new();
     for _ in 0..2 {
-        let frame = next_frame(&mut wire.stream).await.unwrap();
+        let frame = wire.next().await.unwrap();
         assert_eq!(
             frame.header.ty,
             FrameType::Response,
@@ -1115,9 +1341,9 @@ async fn crash_before_dispatch(point: &str, shell: &str) {
     use aft::db::call_ledger::{self as ledger, Key, State};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let process = Subject::head().spawn(&root).await.unwrap();
     let stamp = scoped_stamp("carrier", "owner", "scope");
-    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
     let marker = root.join("project/crash-marker");
     let command = if shell == "powershell" {
         format!(
@@ -1135,7 +1361,7 @@ async fn crash_before_dispatch(point: &str, shell: &str) {
             String::from_utf8_lossy(&frame.body)
         );
     });
-    let report = Subject::HEAD
+    let report = Subject::head()
         .kill_at(process, &KillPoint::new(point), trigger)
         .await
         .unwrap();
@@ -1161,8 +1387,8 @@ async fn crash_before_dispatch(point: &str, shell: &str) {
     );
     assert!(row.task_id.is_none());
     drop(conn);
-    let process = Subject::HEAD.restart(&root).await.unwrap();
-    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let process = Subject::head().restart(&root).await.unwrap();
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
     let replay = route
         .raw(
             json!({"name":shell,"arguments":{"command":command},"call_key":"crash"}),
@@ -1214,8 +1440,8 @@ async fn s1_powershell_crash_at_prepared_restarts_not_started() {
 async fn s1_unarmed_shell_commits_both_held_states_and_replays_before_injections() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let route = Subject::HEAD
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
         .route(&process, &scoped_stamp("carrier", "owner", "scope"))
         .await
         .unwrap();
@@ -1242,11 +1468,11 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
     use aft::db::call_ledger::{self as ledger, Key, ScopeIdentity, State};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let process = Subject::head().spawn(&root).await.unwrap();
     let stamp = scoped_stamp("carrier", "owner", "scope");
-    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
-    let warm = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
+    let warm = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
         .await
         .unwrap();
     warm.raw(
@@ -1265,10 +1491,8 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
         json!({"name":"bash","arguments":{"command":command},"call_key":"recover-shell"});
     route.adapt_preset(&mut body);
     let mut wire = route.wire.lock().await;
-    let corr = wire.next_corr;
-    wire.next_corr += 1;
-    write_frame(
-        &mut wire.stream,
+    let corr = wire.corr();
+    wire.send(
         &Frame::build(
             FrameType::Request,
             flags(),
@@ -1281,10 +1505,9 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
     )
     .await
     .unwrap();
-    let ask = next_frame(&mut wire.stream).await.unwrap();
+    let ask = wire.next().await.unwrap();
     assert_eq!(ask.header.ty, FrameType::Request);
-    write_frame(
-        &mut wire.stream,
+    wire.send(
         &Frame::build(
             FrameType::Response,
             flags(),
@@ -1335,8 +1558,8 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
     )
     .unwrap();
     drop(conn);
-    let process = Subject::HEAD.restart(&root).await.unwrap();
-    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let process = Subject::head().restart(&root).await.unwrap();
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
     let response = route.raw(body, false).await;
     assert_eq!(response.header.ty, FrameType::Response);
     assert_eq!(response_json(&response)["isError"], false);
@@ -1464,11 +1687,9 @@ async fn bind_route_stamped_with_mode(
     elicitation: bool,
     mode: Option<cortexkit_role_tool_provider::CallMode>,
 ) -> Result<Route, HarnessError> {
-    let mut wire = handle.stream.lock().await;
-    let channel = wire.next_channel;
-    wire.next_channel += 1;
-    let corr = wire.next_corr;
-    wire.next_corr += 1;
+    let wire = handle.wire.clone();
+    let channel = wire.next_channel.fetch_add(1, Ordering::SeqCst);
+    let corr = wire.corr();
     let bind = ModuleControlRequest::RouteBind {
         route_channel: channel,
         epoch: 1,
@@ -1501,8 +1722,8 @@ async fn bind_route_stamped_with_mode(
         role_versions,
         call_mode: mode,
     };
-    write_frame(
-        &mut wire.stream,
+    let mut reply = wire.expect(0, corr);
+    wire.send(
         &Frame::build(
             FrameType::Request,
             flags(),
@@ -1513,9 +1734,11 @@ async fn bind_route_stamped_with_mode(
         )
         .map_err(harness_error)?,
     )
-    .await
-    .map_err(harness_error)?;
-    let ack = next_frame(&mut wire.stream).await?;
+    .await?;
+    let ack = tokio::time::timeout(Duration::from_secs(30), reply.rx.recv())
+        .await
+        .map_err(harness_error)?
+        .ok_or_else(|| HarnessError::new("module EOF"))?;
     if ack.header.ty != FrameType::Response || ack.header.corr != corr {
         return Err(HarnessError::new(format!(
             "unexpected bind frame: {:?} {}",
@@ -1529,7 +1752,7 @@ async fn bind_route_stamped_with_mode(
         return Err(HarnessError::new("no bind acknowledgement"));
     }
     Ok(Route {
-        wire: handle.stream.clone(),
+        wire,
         channel,
         scoped_preset: stamp.scope.as_ref().map(|_| "head"),
     })
@@ -1558,51 +1781,48 @@ impl Route {
         cancel: bool,
     ) -> Result<Exchange, HarnessError> {
         self.adapt_preset(&mut body);
-        let mut wire = self.wire.lock().await;
-        let corr = wire.next_corr;
-        wire.next_corr += 1;
-        write_frame(
-            &mut wire.stream,
-            &Frame::build(
-                FrameType::Request,
-                flags(),
-                self.channel,
-                1,
-                corr,
-                serde_json::to_vec(&body).unwrap(),
+        let corr = self.wire.corr();
+        // Registered before sending, so no reply can arrive unclaimed. Other
+        // requests on the same connection proceed concurrently.
+        let mut replies = self.wire.expect(self.channel, corr);
+        self.wire
+            .send(
+                &Frame::build(
+                    FrameType::Request,
+                    flags(),
+                    self.channel,
+                    1,
+                    corr,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .map_err(harness_error)?,
             )
-            .map_err(harness_error)?,
-        )
-        .await
-        .map_err(harness_error)?;
+            .await?;
         if cancel {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            write_frame(
-                &mut wire.stream,
-                &Frame::build(FrameType::Cancel, flags(), self.channel, 1, corr, vec![])
-                    .map_err(harness_error)?,
-            )
-            .await
-            .map_err(harness_error)?;
+            self.wire
+                .send(
+                    &Frame::build(FrameType::Cancel, flags(), self.channel, 1, corr, vec![])
+                        .map_err(harness_error)?,
+                )
+                .await?;
         }
         let mut exchange = Exchange::default();
         let mut terminal = false;
         loop {
-            let frame = if terminal {
-                match tokio::time::timeout(Duration::from_millis(100), next_frame(&mut wire.stream))
-                    .await
-                {
-                    Ok(frame) => frame?,
-                    Err(_) => break,
-                }
+            // Before the terminal frame, wait as long as a held call may stay
+            // held; after it, only a short quiet window for a stray second one.
+            let wait = if terminal {
+                Duration::from_millis(100)
             } else {
-                next_frame(&mut wire.stream).await?
+                Duration::from_secs(60)
             };
-            if frame.header.channel != self.channel || frame.header.corr != corr {
-                return Err(HarnessError::new(
-                    "unexpected correlation during conformance exchange",
-                ));
-            }
+            let frame = match tokio::time::timeout(wait, replies.rx.recv()).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Err(HarnessError::new("module EOF")),
+                Err(_) if terminal => break,
+                Err(elapsed) => return Err(harness_error(elapsed)),
+            };
             let observed = match frame.header.ty {
                 FrameType::Response => ObservedFrame::Response(
                     serde_json::from_slice(&frame.body).map_err(harness_error)?,
@@ -1643,14 +1863,15 @@ impl Route {
         }
     }
 
+    /// Sends `body` and reads the ordered queue of unclaimed frames until its
+    /// terminal frame, answering any permission question with `allow` when
+    /// `approve` is set and retrying while persistence is still initializing.
     async fn raw(&self, mut body: Value, approve: bool) -> Frame {
         self.adapt_preset(&mut body);
         let mut wire = self.wire.lock().await;
         for _ in 0..100 {
-            let corr = wire.next_corr;
-            wire.next_corr += 1;
-            write_frame(
-                &mut wire.stream,
+            let corr = wire.corr();
+            wire.send(
                 &Frame::build(
                     FrameType::Request,
                     flags(),
@@ -1664,10 +1885,9 @@ impl Route {
             .await
             .unwrap();
             loop {
-                let frame = next_frame(&mut wire.stream).await.unwrap();
+                let frame = wire.next().await.unwrap();
                 if frame.header.ty == FrameType::Request && approve {
-                    write_frame(
-                        &mut wire.stream,
+                    wire.send(
                         &Frame::build(
                             FrameType::Response,
                             flags(),
@@ -1714,15 +1934,30 @@ impl ToolRoute for Route {
 }
 #[async_trait]
 impl ToolProviderSubject for Subject {
+    /// A preset that serves `bash` declares the held-call, late-result,
+    /// cancellation and scope cases; `approval_execution` also needs the kill
+    /// hook, which only a `test-timing-hooks` build has. The reader serves no
+    /// shell tool, so it declares none of them and has no mode probe.
     fn capabilities(&self) -> BTreeSet<Capability> {
-        BTreeSet::from([
-            Capability::CallModes,
+        let mut declared = BTreeSet::from([
             Capability::DisableTool,
-            Capability::Cancellation,
             Capability::CallKey,
             Capability::SchemaPin,
             Capability::SystemText,
-        ])
+        ]);
+        if self.serves_shell() {
+            declared.extend([
+                Capability::CallModes,
+                Capability::Cancellation,
+                Capability::HeldCalls,
+                Capability::ScopeStamp,
+                Capability::LateResults,
+            ]);
+            if cfg!(feature = "test-timing-hooks") {
+                declared.insert(Capability::ApprovalExecution);
+            }
+        }
+        declared
     }
     fn plain_stamp(&self) -> RouteStamp {
         RouteStamp {
@@ -1730,8 +1965,20 @@ impl ToolProviderSubject for Subject {
             scope: None,
         }
     }
+    /// Three distinct reserved principals outside AFT's first-party list, so
+    /// every scoped bind is Untrusted and a keyed shell call files a question.
     fn scoped_principals(&self) -> Option<ScopedPrincipals> {
-        None
+        let scope = |scope_ref: &str| cortexkit_role_tool_provider::scope::ScopeIdentity {
+            owner: "reserved:conformance-owner".into(),
+            scope_ref: scope_ref.into(),
+            scope_epoch: 7,
+        };
+        self.serves_shell().then(|| ScopedPrincipals {
+            scope: scope("conformance-scope"),
+            carrier: "reserved:conformance-carrier".into(),
+            other_carrier: "reserved:conformance-other-carrier".into(),
+            other_scope: scope("conformance-other-scope"),
+        })
     }
     fn catalog_arguments(&self) -> Value {
         match self.preset {
@@ -1796,51 +2043,121 @@ impl ToolProviderSubject for Subject {
         Ok(route)
     }
     fn slow_call(&self) -> Option<CallSpec> {
-        Some((
-            "bash".into(),
-            json!({"command": "sleep 5", "wait": true, "timeout": 5000}),
-        ))
+        self.serves_shell().then(|| {
+            (
+                "bash".into(),
+                json!({"command": "sleep 5", "wait": true, "timeout": 5000}),
+            )
+        })
     }
     fn disabled_tool(&self) -> Option<String> {
         Some("outline".into())
     }
-    fn held_call(&self, _marker: &Path) -> Option<CallSpec> {
-        None
+    /// A keyed `bash` call that writes `marker`. On the runner's scoped
+    /// (Untrusted, elicitation-capable) routes AFT holds it behind a
+    /// permission question.
+    fn held_call(&self, marker: &Path) -> Option<CallSpec> {
+        if !self.serves_shell() {
+            return None;
+        }
+        *self.stand_in.markers.lock().unwrap() = marker.parent().map(Path::to_path_buf);
+        Some(("bash".into(), json!({"command": marker_command(marker)})))
     }
-    async fn await_held(&self, _key: &str) -> Result<(), HarnessError> {
-        Err(HarnessError::new("not declared in Slice A"))
+    async fn await_held(&self, key: &str) -> Result<(), HarnessError> {
+        self.stand_in
+            .wait_for(key, Duration::from_secs(30), |_| Some(()))
+            .await
     }
-    async fn approve(&self, _key: &str) -> Result<(), HarnessError> {
-        Err(HarnessError::new("not declared in Slice A"))
+    /// Answers `allow` to the question for `key` only, waiting at most 10 s
+    /// for it to arrive; another call's question is never answered.
+    async fn approve(&self, key: &str) -> Result<(), HarnessError> {
+        let (wire, frame) = self
+            .stand_in
+            .wait_for(key, Duration::from_secs(10), |ask| {
+                (!ask.answered).then(|| {
+                    ask.answered = true;
+                    (
+                        ask.wire.clone(),
+                        Frame::build(
+                            FrameType::Response,
+                            flags(),
+                            ask.channel,
+                            ask.epoch,
+                            ask.corr,
+                            serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+                        ),
+                    )
+                })
+            })
+            .await?;
+        wire.send(&frame.map_err(harness_error)?).await
     }
     async fn settle(&self) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 
+/// The head subject (no preset sent) against its pinned Slice B inventory.
 #[tokio::test]
 async fn slice_a_real_module_conformance_inventory() {
-    conformance_inventory(Subject::HEAD).await;
+    conformance_inventory(Subject::head()).await;
 }
 
 /// The commons suite holds for every catalog preset AFT serves: each one is a
 /// complete catalog, refuses an undefined preset, and admits its own quick
-/// call and schema pins.
+/// call and schema pins. The shell presets also pass every held-call,
+/// withdraw and late-results case, and with `test-timing-hooks` both crash
+/// cases.
 #[tokio::test]
 async fn every_catalog_preset_passes_the_conformance_suite() {
     for preset in ["head", "worker", "reader"] {
         eprintln!("preset {preset}:");
-        conformance_inventory(Subject {
-            preset: Some(preset),
-        })
-        .await;
+        conformance_inventory(Subject::new(Some(preset))).await;
     }
 }
 
+/// Runs the published suite against the real module and compares its case
+/// outcomes with the inventory pinned in the fixture for this preset and this
+/// build: `hooks` when the crash kill hook is compiled in, `no_hooks`
+/// otherwise. The runner selects cases from the declared capabilities alone,
+/// so the feature-off build must skip exactly the cases that need
+/// `approval_execution`.
+///
+/// Known runner gap: the 0.5.0 runner (and the pinned one) never sets
+/// `preset` on a call, while AFT refuses a preset-less tool call on a scoped
+/// route. The route adapter (`Route::adapt_preset`) therefore adds the
+/// subject's preset to every scoped tool call that is not a role operation.
 async fn conformance_inventory(subject: Subject) {
-    use cortexkit_role_tool_provider_conformance::CaseOutcome;
+    use cortexkit_role_tool_provider_conformance::{CaseOutcome, SuiteVerdict, CASES};
     let fixtures: Value =
         serde_json::from_str(include_str!("fixtures/tool_provider_conformance.json")).unwrap();
+    let build = if cfg!(feature = "test-timing-hooks") {
+        "hooks"
+    } else {
+        "no_hooks"
+    };
+    let inventory = &fixtures["slice_b"]["presets"][subject.preset.unwrap_or("head")][build];
+    let expected =
+        |field: &str| serde_json::from_value::<BTreeSet<String>>(inventory[field].clone()).unwrap();
+    let (expected_enabled, expected_skipped) =
+        (expected("enabled_cases"), expected("skipped_cases"));
+    // Case IDs are pinned from the conformance crate: the inventory names
+    // every case the crate runs, each exactly once.
+    let every: BTreeSet<String> = CASES.iter().map(|case| case.name.to_string()).collect();
+    assert!(expected_enabled.is_disjoint(&expected_skipped));
+    assert_eq!(
+        expected_enabled
+            .union(&expected_skipped)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        every
+    );
+    let declared: BTreeSet<String> = subject
+        .capabilities()
+        .into_iter()
+        .map(|capability| capability.name().to_string())
+        .collect();
+    assert_eq!(declared, expected("capabilities"));
     let dir = tempfile::tempdir().unwrap();
     let report =
         cortexkit_role_tool_provider_conformance::run_suite(&subject, &dir.path().join("run"))
@@ -1863,19 +2180,10 @@ async fn conformance_inventory(subject: Subject) {
                 eprintln!(
                     "FAIL {}: {}",
                     case.case,
-                    reason.chars().take(200).collect::<String>()
+                    reason.chars().take(400).collect::<String>()
                 );
             }
         }
-    }
-    let expected = |field| {
-        serde_json::from_value::<BTreeSet<String>>(fixtures["slice_a"][field].clone()).unwrap()
-    };
-    let mut expected_enabled = expected("enabled_cases");
-    let mut expected_skipped = expected("skipped_cases");
-    if subject.call_mode_probe().is_none() {
-        expected_enabled.remove("call_mode_matches_catalog");
-        expected_skipped.insert("call_mode_matches_catalog".into());
     }
     assert_eq!(enabled, expected_enabled);
     assert_eq!(skipped, expected_skipped);
@@ -1885,19 +2193,37 @@ async fn conformance_inventory(subject: Subject) {
     // the skipped ones remain undeclared.
     assert!(failed.is_empty(), "failed conformance cases: {failed:?}");
     eprintln!(
-        "v1 binds: {} passed, {} failed, {} capability skips",
+        "v1 binds ({build}): {} passed, {} failed, {} capability skips, {} kills",
         enabled.len() - failed.len(),
         failed.len(),
-        skipped.len()
+        skipped.len(),
+        report.kills.len()
     );
     assert!(
         matches!(
             report.verdict,
-            cortexkit_role_tool_provider_conformance::SuiteVerdict::ConformingForDeclaredCapabilities { .. }
+            SuiteVerdict::ConformingForDeclaredCapabilities { .. }
         ),
         "{:?}",
         report.verdict
     );
+    // A selected crash case kills the module: the verdict then rests on at
+    // least one kill that ended a real process.
+    let crashes = expected_enabled
+        .iter()
+        .filter(|case| case.starts_with("crash_"))
+        .count();
+    assert_eq!(report.kills.len(), crashes, "{:?}", report.kills);
+    if crashes > 0 {
+        assert!(
+            report
+                .kills
+                .iter()
+                .any(|kill| kill.mechanism.is_real_process_kill()),
+            "{:?}",
+            report.kills
+        );
+    }
 }
 
 #[test]
@@ -1935,6 +2261,17 @@ fn registry_manifest_lock_fixture_equalities_and_independent_declaration() {
         fixtures["slice_a"]["declaration"]["majors"][0]["ops"],
         json!(["role.describe", "tool.catalog", "tool.call"])
     );
+    assert_eq!(
+        fixtures["slice_b"]["declaration"]["majors"][0]["ops"],
+        json!([
+            "role.describe",
+            "tool.catalog",
+            "tool.call",
+            "tool.withdraw",
+            "late_results",
+            "late_results.ack"
+        ])
+    );
 }
 
 async fn catalog_reply(route: &Route, request: Value) -> Value {
@@ -1952,7 +2289,7 @@ async fn catalog_reply(route: &Route, request: Value) -> Value {
 async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let process = Subject::HEAD.spawn(&state).await.unwrap();
+    let process = Subject::head().spawn(&state).await.unwrap();
     std::fs::create_dir_all(state.join("config/cortexkit")).unwrap();
     std::fs::write(state.join("config/cortexkit/aft.jsonc"), serde_json::to_vec(&json!({"disabled_tools": [], "harnesses": {"runner": {"disabled_tools": ["aft_outline"]}, "opencode": {"disabled_tools": ["aft_search"]}}})).unwrap()).unwrap();
     let p1 = state.join("project");
@@ -2036,7 +2373,7 @@ async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
     drop(routes);
     drop(restored);
     drop(process);
-    let restarted = Subject::HEAD.restart(&state).await.unwrap();
+    let restarted = Subject::head().restart(&state).await.unwrap();
     std::fs::write(p1.join(".cortexkit/aft.jsonc"), project_config(vec![])).unwrap();
     let route = bind_route(&restarted, &p1, "runner", "restart")
         .await

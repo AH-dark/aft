@@ -97,6 +97,8 @@ const FINISHED_DELETE_MAX_ATTEMPTS: usize = 5;
 
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
+/// Status reason of a task killed because its caller withdrew the call.
+pub const WITHDRAWN_REASON: &str = "withdrawn";
 #[path = "remote.rs"]
 pub(crate) mod remote;
 #[cfg(target_os = "linux")]
@@ -5543,6 +5545,22 @@ impl BgTaskRegistry {
             session_id,
             BgTaskStatus::Killed,
             Some("scope revoked".into()),
+        )
+    }
+
+    /// Kill a running call's task because its caller withdrew the call
+    /// (`tool.withdraw`). The task is named by the call ledger row, so it is
+    /// found by id alone; its status reason is [`WITHDRAWN_REASON`].
+    pub(crate) fn kill_withdrawn(&self, task_id: &str) -> Result<BgTaskSnapshot, String> {
+        let session_id = self
+            .task(task_id)
+            .map(|task| task.session_id.clone())
+            .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        self.kill_with_status_reason(
+            task_id,
+            &session_id,
+            BgTaskStatus::Killed,
+            Some(WITHDRAWN_REASON.into()),
         )
     }
 
