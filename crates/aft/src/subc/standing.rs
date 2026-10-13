@@ -464,6 +464,102 @@ impl StandingActor {
 #[cfg(test)]
 mod startup_storage_tests {
     use super::*;
+    use std::time::Duration;
+    #[test]
+    fn standing_empty_steady_ticks_do_no_database_or_git_work() {
+        #[cfg(unix)]
+        if std::env::var_os("AFT_TEST_STANDING_GIT_LOG").is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let recorder = tempfile::tempdir().unwrap();
+            let git = which::which("git").unwrap();
+            let wrapper = recorder.path().join("git");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nprintf x >> \"$AFT_TEST_STANDING_GIT_LOG\"\nexec '{}' \"$@\"\n",
+                    git.to_string_lossy().replace('\'', "'\\''")
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::join_paths(
+                std::iter::once(recorder.path().to_path_buf())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            // AFT caches its command search path. A separate test process puts
+            // the Git logging wrapper first on PATH without changing the
+            // environment of concurrently running tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "subc::standing::startup_storage_tests::standing_empty_steady_ticks_do_no_database_or_git_work", "--nocapture"])
+                .env("PATH", path)
+                .env("AFT_TEST_RAW_PATH", "1")
+                .env("AFT_TEST_STANDING_GIT_LOG", recorder.path().join("commands"))
+                .output().unwrap();
+            eprint!("{}", String::from_utf8_lossy(&output.stdout));
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success());
+            return;
+        }
+        let git_commands = || {
+            std::env::var_os("AFT_TEST_STANDING_GIT_LOG")
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map_or(0, |meta| meta.len() as i64)
+        };
+        let storage = tempfile::tempdir().unwrap();
+        if std::env::var_os("AFT_TEST_STANDING_GIT_LOG").is_some() {
+            let before = git_commands();
+            crate::scoped_key::resolve_standing_root(storage.path().to_str().unwrap()).unwrap();
+            assert!(
+                git_commands() > before,
+                "the recorder must observe real resolver Git commands"
+            );
+        }
+        drop(crate::db::open(&storage.path().join("aft.db")).unwrap());
+        let ctx = super::super::test_support::test_ctx();
+        let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()))
+            .with_startup_storage_dir(storage.path());
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let mut startup = true;
+        let worker = StandingWorker::start(move || {
+            let before = crate::standing_roots::reconciliation_work_for_test();
+            let git_before = git_commands();
+            if startup {
+                actor.reconcile_at_startup();
+                startup = false;
+            } else {
+                actor.tick();
+            }
+            let after = crate::standing_roots::reconciliation_work_for_test();
+            ack_tx
+                .send(std::array::from_fn::<_, 7, _>(|i| {
+                    if i == 6 {
+                        git_commands() - git_before
+                    } else {
+                        after[i] - before[i]
+                    }
+                }))
+                .unwrap();
+        });
+        worker.request();
+        let startup = ack_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            startup,
+            [1, 2, 2, 1, 0, 0, 0],
+            "startup must initialize the namespace once"
+        );
+        let mut recurring = [0; 7];
+        for _ in 0..100 {
+            worker.request();
+            let tick = ack_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            for i in 0..7 {
+                recurring[i] += tick[i];
+            }
+        }
+        eprintln!("standing startup={startup:?} recurring_100_ticks={recurring:?} (logical opens, physical opens/closes, schema peeks, resolutions, IMMEDIATE, git commands)");
+        assert_eq!(recurring, [0; 7]);
+    }
+
     #[test]
     fn standing_startup_uses_explicit_storage_not_the_default_root() {
         let _env = crate::test_env::process_env_lock();

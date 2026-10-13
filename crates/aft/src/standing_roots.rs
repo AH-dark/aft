@@ -167,6 +167,7 @@ struct StandingRootsInner {
 struct StandingRootsState {
     entries: BTreeMap<String, ManagedEntry>,
     observed_first_snapshot: bool,
+    reconciled_empty: bool,
 }
 
 struct ManagedEntry {
@@ -312,7 +313,31 @@ impl StandingRoots {
             *current = Some(path.clone());
             path
         };
+        {
+            let mut state = self.inner.state.lock();
+            // Initialize aft.db in the chosen storage directory once. Removing
+            // previously configured roots must still delete their rows and stop
+            // their background builds. Only after an empty root list was applied
+            // successfully is there no database work left until roots are added.
+            if entries.is_empty() && state.entries.is_empty() && state.reconciled_empty {
+                return Ok(StandingReconcileReport {
+                    active_entries: entries,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                    replaced: Vec::new(),
+                });
+            }
+            state.reconciled_empty = false;
+        }
+        #[cfg(test)]
+        RECONCILE_DB_OPENS.with(|count| count.set(count.get() + 1));
         let mut conn = crate::db::open(&db_path)?;
+        #[cfg(test)]
+        conn.trace(Some(|sql| {
+            if sql == "BEGIN IMMEDIATE" {
+                RECONCILE_IMMEDIATE.with(|count| count.set(count.get() + 1));
+            }
+        }));
 
         let mut state = self.inner.state.lock();
         let previous_first_snapshot = state.observed_first_snapshot;
@@ -392,6 +417,7 @@ impl StandingRoots {
             }
         }
         state.observed_first_snapshot |= !entries.is_empty();
+        state.reconciled_empty = entries.is_empty();
         state.entries = next;
 
         Ok(StandingReconcileReport {
@@ -628,6 +654,22 @@ impl StandingRoots {
 #[cfg(test)]
 thread_local! {
     static ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECONCILE_DB_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECONCILE_IMMEDIATE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reconciliation_work_for_test() -> [i64; 6] {
+    use crate::db::lifecycle::{thread_counts, SqliteStore};
+    let opens = thread_counts::total_opens_on_this_thread(SqliteStore::AftDb) as i64;
+    [
+        RECONCILE_DB_OPENS.with(|count| count.get() as i64),
+        opens,
+        opens - thread_counts::open_on_this_thread(SqliteStore::AftDb),
+        crate::db::schema_peek_count_for_test() as i64,
+        ROOT_RESOLUTIONS.with(|count| count.get() as i64),
+        RECONCILE_IMMEDIATE.with(|count| count.get() as i64),
+    ]
 }
 
 fn counted_resolve_standing_root(
@@ -740,6 +782,51 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[ignore = "release reconciliation measurement"]
+    fn bench_daemon_edge_standing_reconciliation() {
+        for count in [0, 1, 18] {
+            let storage = tempdir().unwrap();
+            let projects = (0..count).map(|_| tempdir().unwrap()).collect::<Vec<_>>();
+            for project in &projects {
+                assert!(std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(project.path())
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let snapshot = config(
+                storage.path(),
+                projects
+                    .iter()
+                    .map(|project| root(project.path(), vec![IndexKind::Search]))
+                    .collect(),
+            );
+            for bound in [false, true] {
+                let roots = StandingRoots::default();
+                roots.reconcile(&snapshot).unwrap();
+                if bound {
+                    for entry in roots.entries() {
+                        roots.begin_case_a_bind(&entry.literal_path).unwrap();
+                    }
+                }
+                let before = reconciliation_work_for_test();
+                let start = std::time::Instant::now();
+                for _ in 0..100 {
+                    roots.reconcile(&snapshot).unwrap();
+                }
+                let elapsed = start.elapsed();
+                let after = reconciliation_work_for_test();
+                let work = std::array::from_fn::<_, 6, _>(|i| after[i] - before[i]);
+                eprintln!(
+                    "standing roots={count} bound={bound} ticks=100 wall_us={} work={work:?}",
+                    elapsed.as_micros()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn reconciliation_resolves_each_live_root_once() {
         let storage = tempdir().unwrap();
         let project = tempdir().unwrap();
@@ -776,6 +863,96 @@ mod tests {
             path: path.to_string_lossy().into_owned(),
             indexes,
         }
+    }
+
+    #[test]
+    fn empty_fast_path_preserves_storage_transitions_and_restart_strict_flags() {
+        let first_storage = tempdir().unwrap();
+        let second_storage = tempdir().unwrap();
+        let third_storage = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        roots
+            .reconcile(&config(first_storage.path(), vec![]))
+            .unwrap();
+        roots
+            .reconcile(&config(second_storage.path(), vec![]))
+            .unwrap();
+        assert!(!second_storage.path().join("aft.db").exists());
+        let populated = config(
+            second_storage.path(),
+            vec![root(project.path(), vec![IndexKind::Search])],
+        );
+        roots.reconcile(&populated).unwrap();
+        let admission = roots.admit_build(project.path().to_str().unwrap()).unwrap();
+        let empty = config(third_storage.path(), vec![]);
+        let removed = roots.reconcile(&empty).unwrap();
+        assert_eq!(removed.removed, vec![project.path().to_string_lossy()]);
+        assert!(admission.checkpoint());
+        let conn = crate::db::open(&second_storage.path().join("aft.db")).unwrap();
+        assert!(
+            standing_roots::get_standing_root(&conn, project.path().to_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(!third_storage.path().join("aft.db").exists());
+        let before = reconciliation_work_for_test();
+        for _ in 0..100 {
+            roots.reconcile(&empty).unwrap();
+        }
+        assert_eq!(reconciliation_work_for_test(), before);
+        let third = config(third_storage.path(), populated.index.roots);
+        roots.reconcile(&third).unwrap();
+        roots
+            .record_strict_verification(project.path().to_str().unwrap(), IndexKind::Search)
+            .unwrap();
+        let restarted = StandingRoots::default();
+        restarted
+            .reconcile(&config(third_storage.path(), vec![]))
+            .unwrap();
+        restarted.reconcile(&third).unwrap();
+        let conn = crate::db::open(&third_storage.path().join("aft.db")).unwrap();
+        assert_eq!(
+            standing_roots::needs_strict_verify(
+                &conn,
+                project.path().to_str().unwrap(),
+                IndexKind::Search
+            )
+            .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_fast_path_does_not_cache_nonempty_symlink_identity() {
+        let storage = tempdir().unwrap();
+        let targets = tempdir().unwrap();
+        std::fs::create_dir(targets.path().join("first")).unwrap();
+        std::fs::create_dir(targets.path().join("second")).unwrap();
+        let link = targets.path().join("link");
+        std::os::unix::fs::symlink(targets.path().join("first"), &link).unwrap();
+        let roots = StandingRoots::default();
+        roots.reconcile(&config(storage.path(), vec![])).unwrap();
+        let snapshot = config(storage.path(), vec![root(&link, vec![IndexKind::Search])]);
+        roots.reconcile(&snapshot).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.path().join("second"), &link).unwrap();
+        let error = roots.reconcile(&snapshot).unwrap_err();
+        assert!(error.to_string().contains("resolved-path-drift"), "{error}");
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        let recorded = standing_roots::get_standing_root(&conn, link.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded.resolved_target,
+            targets
+                .path()
+                .join("first")
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
     }
 
     #[test]

@@ -836,6 +836,36 @@ pub(super) struct LedgerEdge {
         std::collections::HashMap<crate::path_identity::ProjectRootId, std::time::Instant>,
     >,
 }
+
+#[cfg(test)]
+thread_local! {
+    // For cloned request JSON and permission arguments, count encoded bytes,
+    // not estimated heap allocations. Response-body copies count vector lengths.
+    // Include the request clone used to construct the owned ToolCallRequest.
+    static KEYED_COPY_BYTES: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+fn copy_call_json(value: &Value, kind: usize) -> Value {
+    #[cfg(test)]
+    KEYED_COPY_BYTES.with(|work| {
+        let mut bytes = work.get();
+        bytes[kind] += serde_json::to_vec(value).unwrap().len();
+        work.set(bytes);
+    });
+    #[cfg(not(test))]
+    let _ = kind;
+    value.clone()
+}
+
+fn copy_terminal_body(body: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    KEYED_COPY_BYTES.with(|work| {
+        let mut bytes = work.get();
+        bytes[2] += body.len();
+        work.set(bytes);
+    });
+    body.to_vec()
+}
 struct LedgerWait {
     admission: super::AdmissionWait,
     cancel: super::PersistentCancelSignal,
@@ -1170,7 +1200,7 @@ impl LedgerEdge {
             return Err(decoded);
         }
         let Ok(call) = serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(
-            body.clone(),
+            copy_call_json(body, 0),
         ) else {
             return Err(decoded);
         };
@@ -1191,8 +1221,8 @@ impl LedgerEdge {
         };
         let held = matches!(identity.trust, BindTrust::Untrusted)
             && matches!(call.name.as_str(), "bash" | "powershell");
-        let mut plan_args = call.arguments.clone();
         if held {
+            let mut plan_args = copy_call_json(&call.arguments, 1);
             if !identity.consumer_elicitation_capable
                 || plan_args.get("sandbox").and_then(Value::as_str) == Some("host")
             {
@@ -1906,9 +1936,9 @@ impl LedgerEdge {
                 let metrics = metrics.clone();
                 let recorded = RecordedFrame {
                     ty: outgoing.header.ty,
-                    body: outgoing.body.clone(),
+                    body: copy_terminal_body(&outgoing.body),
                 };
-                let record_for_job = recorded.clone();
+                let record_for_job = recorded;
                 let rx = executor.submit_async(
                     call.root.clone(),
                     Lane::Mutating,
@@ -4723,6 +4753,245 @@ mod ledger_terminal_tests {
     use super::*;
     use crate::db::call_ledger::Key;
     use crate::subc::{control_flags, route_key, Frame, FrameType, PersistentCancelSignal};
+
+    #[tokio::test]
+    async fn daemon_edge_permission_hold_keeps_plan_arguments_owned() {
+        use crate::db::call_ledger::{self as ledger, State};
+        use crate::subc::*;
+        let (_dir, root) = test_support::test_root("held-copy-work");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&_dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut identity = test_support::route_identity(&root, "session");
+        let inner = std::sync::Arc::get_mut(&mut identity.0).unwrap();
+        inner.role = RouteRole::ToolProviderV1;
+        inner.trust = BindTrust::Untrusted;
+        inner.consumer_elicitation_capable = true;
+        let key = LedgerEdge::key(&identity, "held-copy-key");
+        let routes = std::collections::HashMap::from([(route_key(42, 1), identity)]);
+        let arguments = json!({"command":"printf hello"});
+        let body = json!({"name":"bash", "arguments":arguments, "call_key":"held-copy-key"});
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                42,
+                1,
+                7,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(std::time::Instant::now()),
+        };
+        let (edge, mut ready) = LedgerEdge::new();
+        let (writer, _receiver) = tokio::sync::mpsc::channel(10);
+        KEYED_COPY_BYTES.with(|work| work.set([0; 3]));
+        assert!(edge
+            .defer(
+                decoded,
+                &routes,
+                &executor,
+                &writer,
+                &std::sync::Arc::new(DispatchPathMetrics::new())
+            )
+            .is_ok());
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), ready.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.body().unwrap()["arguments"], arguments);
+        let copies = KEYED_COPY_BYTES.with(std::cell::Cell::get);
+        assert_eq!(copies[1], serde_json::to_vec(&arguments).unwrap().len());
+        assert_eq!(copies[2], 0);
+        let db = ctx.db().unwrap();
+        assert_eq!(
+            ledger::get(&db.lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            State::Prepared
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_edge_keyed_calls_bound_argument_and_terminal_copies() {
+        use crate::db::call_ledger::{self as ledger, State};
+        use crate::subc::*;
+        let (_dir, root) = test_support::test_root("keyed-copy-work");
+        let ctx = test_support::test_ctx();
+        let path = _dir.path().join("aft.db");
+        ctx.set_db(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::db::open(&path).unwrap(),
+        )));
+        let executor = std::sync::Arc::new(crate::executor::Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut identity = test_support::route_identity(&root, "session");
+        std::sync::Arc::get_mut(&mut identity.0).unwrap().role = RouteRole::ToolProviderV1;
+        let key = LedgerEdge::key(&identity, "copy-key");
+        let routes = std::collections::HashMap::from([(route_key(42, 1), identity)]);
+        let (edge, mut ready) = LedgerEdge::new();
+        let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
+        let (actual, mut receiver) = tokio::sync::mpsc::channel(10);
+        let (writer, proxy) = edge.proxy(actual, executor.clone(), metrics.clone());
+        let body = json!({"name":"read", "arguments":{"filePath":"r".repeat(32768)}, "call_key":"copy-key"});
+        let decode = |body: &Value, corr| DecodedFrame {
+            parsed_body: Default::default(),
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                42,
+                1,
+                corr,
+                serde_json::to_vec(body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(std::time::Instant::now()),
+        };
+        KEYED_COPY_BYTES.with(|work| work.set([0; 3]));
+        assert!(edge
+            .defer(decode(&body, 7), &routes, &executor, &writer, &metrics)
+            .is_ok());
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), ready.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.frame.header.corr, 7);
+        let payload = serde_json::to_vec(&json!({"text":"result".repeat(32768)})).unwrap();
+        let frame = Frame::build(
+            FrameType::Response,
+            control_flags(),
+            42,
+            1,
+            7,
+            payload.clone(),
+        )
+        .unwrap();
+        send_reliable_writer_frame(&writer, &metrics, frame, "copy work test")
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.body(), payload);
+        // After the proxy forwards the response, a separate SQLite connection
+        // must see its committed ledger result. Merely scheduling that write
+        // could lose an already visible result if the process crashes first.
+        let conn = crate::db::open(&path).unwrap();
+        let row = ledger::get(&conn, &key).unwrap().unwrap();
+        assert_eq!(row.state, State::Settled);
+        use sha2::Digest;
+        let canonical = format!(
+            r#"{{"arguments":{{"filePath":"{}"}},"name":"read","schema_pin":null}}"#,
+            "r".repeat(32768)
+        );
+        let digest = format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()));
+        assert_eq!(row.digest, digest);
+        assert_eq!(row.frame.unwrap().body, payload);
+        let first = KEYED_COPY_BYTES.with(std::cell::Cell::get);
+        eprintln!(
+            "keyed first copy_bytes={first:?} response_bytes={}",
+            payload.len()
+        );
+        let mut repeat_copies = Vec::new();
+        for (label, corr, request_body) in [
+            ("replay", 8, body.clone()),
+            (
+                "conflict",
+                9,
+                json!({"name":"read", "arguments":{"filePath":"different"}, "call_key":"copy-key"}),
+            ),
+        ] {
+            KEYED_COPY_BYTES.with(|work| work.set([0; 3]));
+            assert!(edge
+                .defer(
+                    decode(&request_body, corr),
+                    &routes,
+                    &executor,
+                    &writer,
+                    &metrics
+                )
+                .is_ok());
+            let replay = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replay.header.corr, corr);
+            assert!(ready.try_recv().is_err());
+            let copies = KEYED_COPY_BYTES.with(std::cell::Cell::get);
+            eprintln!("keyed {label} copy_bytes={copies:?}");
+            repeat_copies.push((
+                label,
+                copies,
+                serde_json::to_vec(&request_body).unwrap().len(),
+            ));
+        }
+        KEYED_COPY_BYTES.with(|work| work.set([0; 3]));
+        let keyless_body = json!({"name":"read", "arguments":{"filePath":"r".repeat(32768)}});
+        assert!(edge
+            .defer(
+                decode(&keyless_body, 10),
+                &routes,
+                &executor,
+                &writer,
+                &metrics
+            )
+            .is_err());
+        let keyless = KEYED_COPY_BYTES.with(std::cell::Cell::get);
+        eprintln!("keyless copy_bytes={keyless:?}");
+        KEYED_COPY_BYTES.with(|work| work.set([0; 3]));
+        let write = json!({"name":"write", "arguments":{"filePath":"file.rs", "content":"x".repeat(32768)}, "call_key":"write-copy-key"});
+        assert!(edge
+            .defer(decode(&write, 11), &routes, &executor, &writer, &metrics)
+            .is_ok());
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        send_reliable_writer_frame(
+            &writer,
+            &metrics,
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                42,
+                1,
+                11,
+                payload.clone(),
+            )
+            .unwrap(),
+            "write copy test",
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let write_copies = KEYED_COPY_BYTES.with(std::cell::Cell::get);
+        eprintln!("keyed write copy_bytes={write_copies:?}");
+        assert_eq!(
+            first,
+            [serde_json::to_vec(&body).unwrap().len(), 0, payload.len()]
+        );
+        assert_eq!(
+            write_copies,
+            [serde_json::to_vec(&write).unwrap().len(), 0, payload.len()]
+        );
+        assert_eq!(
+            keyless,
+            [serde_json::to_vec(&keyless_body).unwrap().len(), 0, 0],
+            "keyless"
+        );
+        for (label, copies, envelope_bytes) in repeat_copies {
+            assert_eq!(copies, [envelope_bytes, 0, 0], "{label}");
+        }
+        proxy.abort();
+    }
 
     fn request() -> Frame {
         Frame::build(FrameType::Request, control_flags(), 42, 1, 7, Vec::new()).unwrap()

@@ -1460,21 +1460,51 @@ const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
 
 fn encoded_health_metrics_len(metrics: &serde_json::Map<String, Value>) -> usize {
-    serde_json::to_vec(&Value::Object(metrics.clone()))
-        .map(|encoded| encoded.len())
-        .unwrap_or(usize::MAX)
+    #[cfg(test)]
+    HEALTH_SIZE_WORK.with(|work| work.borrow_mut().0 += 1);
+    struct ByteCounter(usize);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("encoded health metrics size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = ByteCounter(0);
+    match serde_json::to_writer(&mut counter, metrics) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HEALTH_SIZE_WORK: std::cell::RefCell<(usize, usize)> = const { std::cell::RefCell::new((0, 0)) };
 }
 
 fn refresh_metrics_bytes(metrics: &mut serde_json::Map<String, Value>) -> usize {
     metrics.insert("metrics_bytes".to_string(), json!(0));
-    for _ in 0..4 {
-        let encoded_bytes = encoded_health_metrics_len(metrics);
-        if metrics.get("metrics_bytes").and_then(Value::as_u64) == Some(encoded_bytes as u64) {
-            return encoded_bytes;
-        }
-        metrics.insert("metrics_bytes".to_string(), json!(encoded_bytes));
+    let encoded_zero = encoded_health_metrics_len(metrics);
+    if encoded_zero == usize::MAX {
+        return usize::MAX;
     }
-    encoded_health_metrics_len(metrics)
+    // Only the decimal width of metrics_bytes changes after measuring zero.
+    // Solve the same fixed point without walking and copying the map again.
+    let mut encoded_bytes = encoded_zero;
+    for _ in 0..4 {
+        let next = encoded_zero - 1 + encoded_bytes.ilog10() as usize + 1;
+        if next == encoded_bytes {
+            break;
+        }
+        encoded_bytes = next;
+    }
+    metrics.insert("metrics_bytes".to_string(), json!(encoded_bytes));
+    encoded_bytes
 }
 
 fn compact_write_ledger_root_ids(metrics: &mut serde_json::Map<String, Value>) {
@@ -2724,6 +2754,171 @@ fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "release health probe sizing measurement"]
+    fn bench_daemon_edge_health_probe_sizing() {
+        let input = serde_json::json!({
+            "roots": (0..8).map(|i| serde_json::json!({"path":i,"detail":"é\\\"".repeat(2000)})).collect::<Vec<_>>(),
+            "storage_retention": (0..20).map(|i| (format!("report-{i:02}"), serde_json::json!({"detail":"r".repeat(1500)}))).collect::<serde_json::Map<_,_>>()
+        }).as_object().unwrap().clone();
+        super::HEALTH_SIZE_WORK.with(|work| *work.borrow_mut() = (0, 0));
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let mut metrics = input.clone();
+            super::budget_health_metrics(std::hint::black_box(&mut metrics));
+            std::hint::black_box(metrics);
+        }
+        eprintln!(
+            "health probes=100 wall_us={} work={:?}",
+            start.elapsed().as_micros(),
+            super::HEALTH_SIZE_WORK.with(|work| *work.borrow())
+        );
+    }
+
+    #[test]
+    fn health_self_size_uses_one_borrowed_traversal() {
+        let mut metrics = serde_json::json!({"roots":[{"path":"é\\\"","detail":"x".repeat(4096)}]})
+            .as_object()
+            .unwrap()
+            .clone();
+        super::HEALTH_SIZE_WORK.with(|work| *work.borrow_mut() = (0, 0));
+        let bytes = super::refresh_metrics_bytes(&mut metrics);
+        let work = super::HEALTH_SIZE_WORK.with(|work| *work.borrow());
+        eprintln!(
+            "health sizing: traversals={} temporary_serialized_bytes={}",
+            work.0, work.1
+        );
+        assert_eq!(bytes, serde_json::to_vec(&metrics).unwrap().len());
+        assert_eq!(
+            work,
+            (1, 0),
+            "one borrowed traversal and no serialized buffer"
+        );
+    }
+
+    fn legacy_health_budget(metrics: &mut serde_json::Map<String, serde_json::Value>) {
+        use serde_json::json;
+        let mut ledger_compacted = false;
+        loop {
+            metrics.insert("metrics_bytes".into(), json!(0));
+            let mut bytes = 0;
+            for _ in 0..4 {
+                bytes = serde_json::to_vec(&serde_json::Value::Object(metrics.clone()))
+                    .unwrap()
+                    .len();
+                if metrics["metrics_bytes"].as_u64() == Some(bytes as u64) {
+                    break;
+                }
+                metrics.insert("metrics_bytes".into(), json!(bytes));
+            }
+            if bytes <= super::HEALTH_METRICS_BUDGET_BYTES {
+                return;
+            }
+            if metrics
+                .get_mut("roots")
+                .and_then(serde_json::Value::as_array_mut)
+                .is_some_and(|roots| roots.pop().is_some())
+            {
+                let omitted = metrics
+                    .get("root_details_omitted")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                metrics.insert("root_details_omitted".into(), json!(omitted));
+                continue;
+            }
+            if !ledger_compacted {
+                super::compact_write_ledger_root_ids(metrics);
+                ledger_compacted = true;
+                continue;
+            }
+            let key = metrics
+                .get("storage_retention")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|reports| reports.keys().next_back().cloned());
+            if let Some(key) = key {
+                metrics["storage_retention"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(&key);
+                let omitted = metrics
+                    .get("storage_retention_reports_omitted")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                metrics.insert("storage_retention_reports_omitted".into(), json!(omitted));
+            } else {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn health_borrowed_budget_matches_golden_json_and_digit_boundaries() {
+        use serde_json::json;
+        let mut tiny = json!({"a":"é"}).as_object().unwrap().clone();
+        super::budget_health_metrics(&mut tiny);
+        assert_eq!(
+            serde_json::to_string(&tiny).unwrap(),
+            r#"{"a":"é","metrics_bytes":29}"#
+        );
+        for length in [
+            0, 58, 59, 60, 61, 957, 958, 959, 960, 9956, 9957, 9958, 9959, 13000,
+        ] {
+            let mut actual = json!({"fresh_liveness":"x".repeat(length)})
+                .as_object()
+                .unwrap()
+                .clone();
+            let mut expected = actual.clone();
+            legacy_health_budget(&mut expected);
+            super::budget_health_metrics(&mut actual);
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap(),
+                "length={length}"
+            );
+            assert_eq!(
+                actual["metrics_bytes"].as_u64().unwrap() as usize,
+                serde_json::to_vec(&actual).unwrap().len()
+            );
+        }
+        let mut oversized = json!({
+            "roots": (0..8).map(|i| json!({"path":i,"detail":"é\\\"".repeat(2000)})).collect::<Vec<_>>(),
+            "root_details_omitted": 2,
+            "write_ledger_top_10m": [{"root_id":format!("/very/long/{}/root", "directory/".repeat(1000)), "bytes": 123}],
+            "storage_retention": (0..20).map(|i| (format!("report-{i:02}"), json!({"detail":"r".repeat(1500)}))).collect::<serde_json::Map<_,_>>()
+        }).as_object().unwrap().clone();
+        let mut expected = oversized.clone();
+        legacy_health_budget(&mut expected);
+        super::budget_health_metrics(&mut oversized);
+        assert_eq!(
+            serde_json::to_vec(&oversized).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(oversized["write_ledger_top_10m"][0]["root_id"], "root");
+        assert!(
+            oversized["storage_retention_reports_omitted"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        let mut cached = json!({"roots":[{"detail":"r".repeat(12000)}]})
+            .as_object()
+            .unwrap()
+            .clone();
+        super::budget_health_metrics(&mut cached);
+        assert_eq!(cached["roots"].as_array().unwrap().len(), 1);
+        cached.insert("fresh_liveness".into(), json!("f".repeat(1000)));
+        let mut expected = cached.clone();
+        legacy_health_budget(&mut expected);
+        super::budget_health_metrics(&mut cached);
+        assert_eq!(
+            serde_json::to_vec(&cached).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(cached["roots"].as_array().unwrap().len(), 0);
+    }
+
     #[test]
     fn bash_deadline_reply_log_proves_actual_daemon_handoff() {
         use std::cell::RefCell;
