@@ -3180,9 +3180,10 @@ async fn real_module_project_harness_matrix_rebind_and_restart_identity() {
 async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
-    let process = Subject::HEAD.spawn(&root).await.unwrap();
-    let warm = Subject::HEAD
-        .route(&process, &Subject::HEAD.plain_stamp())
+    let subject = Subject::head();
+    let process = subject.spawn(&root).await.unwrap();
+    let warm = subject
+        .route(&process, &subject.plain_stamp())
         .await
         .unwrap();
     warm.raw(
@@ -3190,7 +3191,7 @@ async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() 
         false,
     )
     .await;
-    let route = Subject::HEAD
+    let route = subject
         .route(&process, &scoped_stamp("carrier", "owner", "scope"))
         .await
         .unwrap();

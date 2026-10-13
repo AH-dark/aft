@@ -5443,6 +5443,7 @@ mod settlement_failure_tests {
                 root,
                 key,
                 expires_at: Instant::now() + Duration::from_secs(60),
+                withdrawn: false,
             },
         );
         let metrics = Arc::new(DispatchPathMetrics::new());
@@ -5622,6 +5623,7 @@ mod authorization_failure_tests {
                 root: root.clone(),
                 key,
                 expires_at: Instant::now() + Duration::from_secs(60),
+                withdrawn: false,
             },
         );
         let reverse = ReverseCorrKey { route, corr: 100 };
