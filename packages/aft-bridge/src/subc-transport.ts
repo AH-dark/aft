@@ -356,6 +356,12 @@ const HOST_SCOPE_LOOKUP_TIMEOUT_MS = 2_000;
 const HOST_SCOPE_RETRY_FLOOR_MS = 5_000;
 const HOST_SCOPE_RETRY_CAP_MS = 300_000;
 
+function isHostScopeSyncRefusal(code: string): boolean {
+  // crates/aft/src/gh_shim_relay/mod.rs lists scope_not_synced and scope_changed as retryable.
+  // A live scope freshly reported by core can also be scope_not_live until the daemon applies it.
+  return code === "scope_not_live" || code === "scope_not_synced" || code === "scope_changed";
+}
+
 type HostScopeAnswer = { result: "scope"; scope: RouteScope } | { result: "no_scope" };
 type HostScopeResult =
   | HostScopeAnswer
@@ -365,6 +371,8 @@ type HostScopeResult =
 
 interface HostScopeState {
   answer?: HostScopeAnswer;
+  scopeBindPending?: boolean;
+  bindPending?: Promise<void>;
   pending?: Promise<RouteScope | undefined>;
   retryTimer?: ReturnType<typeof setTimeout>;
   lookupAbort?: AbortController;
@@ -2679,6 +2687,7 @@ export class SubcTransportPool implements AftTransportPool {
         if (state) this.scheduleHostScopeRetry(identity.session, state);
         if (
           state?.answer?.result === "scope" &&
+          !state.scopeBindPending &&
           !entry.hostScope &&
           !this.hostScopeRefusals.has(identity.session)
         ) {
@@ -2721,7 +2730,9 @@ export class SubcTransportPool implements AftTransportPool {
       this.hostScopeCache.set(identity.session, state);
     }
     if (state.answer) {
-      return Promise.resolve(state.answer.result === "scope" ? state.answer.scope : undefined);
+      return Promise.resolve(
+        state.answer.result === "scope" && !state.scopeBindPending ? state.answer.scope : undefined,
+      );
     }
     if (state.pending) return state.pending;
     // Backoff skips the lookup, not the bind, so an unavailable core cannot delay every root.
@@ -2780,15 +2791,21 @@ export class SubcTransportPool implements AftTransportPool {
 
   private stopUnusedHostScopeRetry(session: string): void {
     const state = this.hostScopeCache.get(session);
-    if (state && !this.unscopedHostRecord(session)) this.cancelHostScopeRetry(state);
+    if (state && !this.unscopedHostRecord(session)) {
+      if (state.retryTimer || (state.scopeBindPending && state.bindPending))
+        log(`subc head scope: session=${session} retry stopped reason=route_closed`);
+      this.cancelHostScopeRetry(state);
+      state.scopeBindPending = false;
+    }
   }
 
   private scheduleHostScopeRetry(session: string, state: HostScopeState): void {
     if (
       this.shuttingDown ||
       this.hostScopeCache.get(session) !== state ||
-      state.answer ||
+      (state.answer && !state.scopeBindPending) ||
       state.pending ||
+      state.bindPending ||
       state.retryTimer ||
       this.hostScopeRefusals.has(session) ||
       !this.unscopedHostRecord(session)
@@ -2802,7 +2819,22 @@ export class SubcTransportPool implements AftTransportPool {
         const client = record?.routeEntry?.client ?? record?.bgSub?.attachedClient;
         if (this.shuttingDown || this.hostScopeCache.get(session) !== state || !record || !client)
           return;
-        void this.hostScope(client, record.identity).catch((error) => {
+        let retry: Promise<unknown>;
+        if (state.scopeBindPending && state.answer?.result === "scope") {
+          state.bindPending = this.retryHostScopeBind(
+            client,
+            record.identity,
+            state,
+            state.answer.scope,
+          ).finally(() => {
+            state.bindPending = undefined;
+            this.scheduleHostScopeRetry(session, state);
+          });
+          retry = state.bindPending;
+        } else {
+          retry = this.hostScope(client, record.identity);
+        }
+        void retry.catch((error) => {
           warn(
             `subc head scope: background retry failed code=${error instanceof Error ? error.name : "Error"}`,
           );
@@ -2811,6 +2843,91 @@ export class SubcTransportPool implements AftTransportPool {
       Math.max(0, state.retryAt - Date.now()),
     );
     state.retryTimer.unref();
+  }
+
+  private deferHostScopeBind(session: string, state: HostScopeState, code: string): void {
+    state.scopeBindPending = true;
+    if (Date.now() >= state.retryAt) {
+      state.retryAt = Date.now() + state.retryMs;
+      state.retryMs = Math.min(state.retryMs * 2, HOST_SCOPE_RETRY_CAP_MS);
+    }
+    warn(
+      `subc head scope: session=${session} scoped bind refused code=${code}; binding unscoped; retry in=${Math.max(0, state.retryAt - Date.now())}ms`,
+    );
+    this.scheduleHostScopeRetry(session, state);
+  }
+
+  private refuseHostScopeBind(
+    session: string,
+    state: HostScopeState | undefined,
+    code: string,
+  ): void {
+    if (!this.hostScopeRefusals.has(session)) {
+      this.hostScopeRefusals.add(session);
+      warn(
+        `subc head scope: session=${session} scoped bind refused code=${code}; binding unscoped; retry stopped`,
+      );
+    }
+    if (state) {
+      state.scopeBindPending = false;
+      this.cancelHostScopeRetry(state);
+    }
+    // Remember the downgrade without misreporting it as core's no_scope answer.
+  }
+
+  private async retryHostScopeBind(
+    client: SubcClientLike,
+    identity: BindIdentity,
+    state: HostScopeState,
+    scope: RouteScope,
+  ): Promise<void> {
+    try {
+      // Validate daemon acceptance before retiring a working fallback route or its held requests.
+      const route = await client.routeOpen(
+        { kind: "tool_provider", module_id: AFT_MODULE_ID },
+        identity,
+        { consumerIdentity: this.consumerIdentity, scope },
+      );
+      safeCloseRoute(client, route);
+      if (
+        this.hostScopeCache.get(identity.session) !== state ||
+        !state.scopeBindPending ||
+        this.shuttingDown ||
+        client !== this.client ||
+        !this.unscopedHostRecord(identity.session)
+      )
+        return;
+      state.scopeBindPending = false;
+      state.retryAt = 0;
+      state.retryMs = HOST_SCOPE_RETRY_FLOOR_MS;
+      log(
+        `subc head scope: session=${identity.session} scoped bind recovered ref=${scope.ref.slice(0, 8)} epoch=${scope.scopeEpoch}`,
+      );
+      this.promoteHostScope(identity.session);
+    } catch (error) {
+      if (
+        this.hostScopeCache.get(identity.session) !== state ||
+        !state.scopeBindPending ||
+        this.shuttingDown ||
+        !this.unscopedHostRecord(identity.session)
+      )
+        return;
+      if (
+        error instanceof SubcError &&
+        error.code &&
+        !isSocketDeathError(error) &&
+        !isRouteOpenReloadWindowError(error) &&
+        !isHostScopeSyncRefusal(error.code)
+      ) {
+        this.refuseHostScopeBind(identity.session, state, error.code);
+      } else {
+        this.deferHostScopeBind(
+          identity.session,
+          state,
+          error instanceof SubcError ? (error.code ?? error.name) : "Error",
+        );
+      }
+    }
   }
 
   private promoteHostScope(session: string): void {
@@ -2991,13 +3108,12 @@ export class SubcTransportPool implements AftTransportPool {
         // A restarting provider has not rejected the scope. Keep it for the normal reopen retry.
         if (isRouteOpenReloadWindowError(error)) throw error;
         this.assertRecordLive(record);
-        if (!this.hostScopeRefusals.has(identity.session)) {
-          this.hostScopeRefusals.add(identity.session);
-          warn(`subc head scope: scoped bind refused code=${error.code}; binding unscoped`);
-        }
         const state = this.hostScopeCache.get(identity.session);
-        if (state) this.cancelHostScopeRetry(state);
-        // The refusal set remembers the downgrade without misreporting it as core's no_scope answer.
+        if (state && isHostScopeSyncRefusal(error.code)) {
+          this.deferHostScopeBind(identity.session, state, error.code);
+        } else {
+          this.refuseHostScopeBind(identity.session, state, error.code);
+        }
       }
     }
     this.assertRecordLive(record);
@@ -3011,6 +3127,7 @@ export class SubcTransportPool implements AftTransportPool {
     // Scope recovery can finish while a fallback bind waits for the provider, including bg_events.
     if (
       this.hostScopeCache.get(identity.session)?.answer?.result === "scope" &&
+      !this.hostScopeCache.get(identity.session)?.scopeBindPending &&
       !this.hostScopeRefusals.has(identity.session)
     ) {
       safeCloseRoute(client, route);
@@ -3021,7 +3138,11 @@ export class SubcTransportPool implements AftTransportPool {
 
   private invalidateHostScope(session: string): void {
     const state = this.hostScopeCache.get(session);
-    if (state) this.cancelHostScopeRetry(state);
+    if (state) {
+      if (state.scopeBindPending)
+        log(`subc head scope: session=${session} retry stopped reason=scope_route_closed`);
+      this.cancelHostScopeRetry(state);
+    }
     this.hostScopeCache.delete(session);
     this.hostScopeRefusals.delete(session);
     for (const record of this.sessions.values()) {
@@ -3146,6 +3267,7 @@ export class SubcTransportPool implements AftTransportPool {
         if (state) this.scheduleHostScopeRetry(identity.session, state);
         if (
           state?.answer?.result === "scope" &&
+          !state.scopeBindPending &&
           !binding.hostScope &&
           !this.hostScopeRefusals.has(identity.session)
         ) {
