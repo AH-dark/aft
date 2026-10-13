@@ -185,6 +185,9 @@ impl RunScope {
 
     async fn read_budget_serial(&self) -> Result<RunBudget, ErrorBody> {
         let _describe = self.describe_lock.lock().await;
+        if self.revoked() {
+            return self.cached_budget();
+        }
         if self
             .budget
             .lock()
@@ -259,11 +262,23 @@ impl RunScopes {
         }
     }
 
+    /// Pending Cingulate asks keep a run alive for scope confirmation even
+    /// when the run currently has no shell process to watch.
     pub(super) fn parked_scopes(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
-        self.scopes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values()
-            .filter(|scope| !scope.revoked() && !scope.parked_asks.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner).is_empty())
-            .map(|scope| scope.stamp.clone()).collect()
+        self.scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter(|scope| {
+                !scope.revoked()
+                    && !scope
+                        .parked_asks
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty()
+            })
+            .map(|scope| scope.stamp.clone())
+            .collect()
     }
 
     pub(super) fn bind(&self, identity: &RouteIdentity) -> Option<Arc<RunScope>> {
@@ -347,10 +362,14 @@ impl RunScopes {
         let Some(scope) = self.bind(identity) else {
             return Err(decoded);
         };
-        if !matches!(
-            name,
-            "bash" | "powershell" | "bash_watch" | "inspect" | "delete"
-        ) && !crate::commands::lsp_navigation::is_lsp_navigation_command(name)
+        // Scope-end refusal also covers short calls, so a parked consent ask
+        // cannot be retried into an execution after its run was revoked.
+        if !scope.revoked()
+            && !matches!(
+                name,
+                "bash" | "powershell" | "bash_watch" | "inspect" | "delete"
+            )
+            && !crate::commands::lsp_navigation::is_lsp_navigation_command(name)
         {
             return Err(decoded);
         }

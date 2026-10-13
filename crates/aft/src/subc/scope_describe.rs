@@ -117,7 +117,8 @@ pub(super) fn start(
             }
             tokio::select! {
                 Some(stamp) = closes.recv() => {
-                    // A route with no running stamped shell work needs no RPC.
+                    // An idle route needs no RPC; parked consent asks still
+                    // need a scope-end determination even without a process.
                     let scopes = work_scopes(executor.clone(), run_scopes.clone()).await;
                     let key = stamp_key(&stamp);
                     if scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
@@ -158,13 +159,18 @@ pub(super) fn start(
     (handle, receiver, worker)
 }
 
-async fn work_scopes(executor: Arc<Executor>, _run_scopes: Arc<super::run_scope::RunScopes>) -> Vec<ScopeStamp> {
+async fn work_scopes(
+    executor: Arc<Executor>,
+    run_scopes: Arc<super::run_scope::RunScopes>,
+) -> Vec<ScopeStamp> {
     tokio::task::spawn_blocking(move || {
-        executor
+        let mut scopes: Vec<_> = executor
             .actor_contexts()
             .into_iter()
             .flat_map(|ctx| ctx.bash_background().live_scope_stamps())
-            .collect()
+            .collect();
+        scopes.extend(run_scopes.parked_scopes());
+        scopes
     })
     .await
     .unwrap_or_default()

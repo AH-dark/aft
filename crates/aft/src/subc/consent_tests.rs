@@ -351,6 +351,115 @@ async fn wait_for(mut done: impl FnMut() -> bool) {
 }
 
 #[tokio::test]
+async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let mut f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    Arc::get_mut(&mut f.worker.0).unwrap().call_mode = subc_protocol::call_mode::CallMode::Codemode;
+    let stamp = f.worker.scope.clone().unwrap();
+    let target = f.head_root.join("shared.txt");
+    let (writer, mut controls) = mpsc::channel(8);
+    let pending = super::super::readiness::PendingControlReplies::default();
+    let control = Arc::new(super::super::readiness::DaemonControl::new(
+        writer,
+        Arc::new(DispatchPathMetrics::new()),
+        PROTOCOL_VERSION,
+        vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
+        vec![],
+        pending.clone(),
+        HELLO_CORR + 1,
+    ));
+    let scopes = Arc::new(super::super::run_scope::RunScopes::new(control.clone()));
+    scopes.bind(&f.worker).unwrap();
+    let request = |corr| DecodedFrame {
+        frame: Frame::build(
+            FrameType::Request,
+            control_flags(),
+            41,
+            1,
+            corr,
+            serde_json::to_vec(
+                &json!({"name":"read", "preset":"worker", "arguments":{"filePath":target}}),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        phase_trace: PhaseTrace::new(Instant::now()),
+        parsed_body: Default::default(),
+    };
+    let reply = |corr, status| {
+        let live = status == subc_protocol::scope::ScopeStatus::Live;
+        let body = subc_protocol::session::ModuleControlResponseToModule::ScopeDescribe {
+            status,
+            scope_epoch: Some(stamp.scope_epoch),
+            daemon_incarnation: "consent-test".into(),
+            owner_synced: true,
+            owner_configured: true,
+            scope: live.then(|| stamp.clone()),
+        };
+        Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    };
+    let (ready, mut ready_rx) = mpsc::unbounded_channel();
+    let held = f.read(&f.worker, &target, 7).await;
+    assert_eq!(code(&held), "access_pending", "{held}");
+    assert_eq!(f.asks().len(), 1);
+    assert_eq!(scopes.parked_scopes().len(), 1);
+    assert!(f.ctx.bash_background().live_scope_stamps().is_empty());
+
+    let (describes, mut ended, worker) =
+        super::super::scope_describe::start(control, f.executor.clone(), scopes.clone());
+    // Goodbye closes the consumer route, but its already-parked ask needs a
+    // daemon determination before the run can discard the remaining consent.
+    note_route_closed(route_key(41, 1));
+    describes.goodbye(stamp.clone());
+    let query = tokio::time::timeout(Duration::from_secs(2), controls.recv())
+        .await
+        .expect("parked consent work must trigger scope.describe without a shell task")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&query.body).unwrap();
+    assert_eq!(body["op"], "scope.describe");
+    assert_eq!(body["ref"], stamp.scope_ref);
+    assert!(pending.resolve(reply(
+        query.header.corr,
+        subc_protocol::scope::ScopeStatus::Ended
+    )));
+    let confirmed = tokio::time::timeout(Duration::from_secs(2), ended.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    scopes.revoke(&confirmed.stamp);
+    wait_for(|| !f.fake.calls("consent.withdraw").is_empty() && f.asks().is_empty()).await;
+    assert!(f.worker.run_scope.get().unwrap().revoked());
+    assert!(scopes.parked_scopes().is_empty());
+
+    // A retry crosses the same run admission seam as a real incoming frame.
+    // It must be refused before it can reach the tool or claim an approval.
+    assert!(scopes.defer(request(8), &f.worker, &ready).is_ok());
+    let refusal = tokio::time::timeout(Duration::from_secs(2), controls.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refusal.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&refusal.body).unwrap();
+    assert_eq!(body["code"], "run_scope_revoked");
+    assert!(
+        ready_rx.try_recv().is_err(),
+        "a revoked retry must not be dispatched"
+    );
+    assert_eq!(f.fake.calls("consent.request").len(), 1);
+    assert!(f.worker_grants().is_empty());
+    worker.abort();
+}
+
+#[tokio::test]
 async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
