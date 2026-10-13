@@ -458,6 +458,17 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 267,
+      "column": 32,
+      "token": "filePath",
+      "text": "\"arguments\": {\"filePath\": path},",
+      "location": "line 267, column 32",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
       "path": "crates/aft/src/subc/manifest.rs",
       "line": 654,
       "column": 53,
@@ -503,33 +514,33 @@
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 17231,
+      "line": 17490,
       "column": 26,
       "token": "filePath",
       "text": "\"filePath\": fixture.dir.path().join(\"module_0.rs\")",
-      "location": "line 17231, column 26",
+      "location": "line 17490, column 26",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 18467,
+      "line": 18726,
       "column": 50,
       "token": "filePath",
       "text": "br#\"{\"name\":\"read\",\"arguments\":{\"filePath\":\"README.md\"}}\"#.to_vec(),",
-      "location": "line 18467, column 50",
+      "location": "line 18726, column 50",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc/mod.rs",
-      "line": 18476,
+      "line": 18735,
       "column": 78,
       "token": "filePath",
       "text": "decoded.parsed_body.into_inner().unwrap().unwrap()[\"arguments\"][\"filePath\"],",
-      "location": "line 18476, column 78",
+      "location": "line 18735, column 78",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
