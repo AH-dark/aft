@@ -159,6 +159,47 @@ impl Jail {
         std::fs::write(other_repo.join("README.md"), "other\n").unwrap();
         git(&other_repo, &["init", "-q"]);
 
+        // A local bare remote with one commit the worker has not fetched yet,
+        // and packed refs in the main repository, as a clone would have.
+        let remote = base.join("remote.git");
+        let upstream = base.join("upstream");
+        git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                main.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                upstream.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(upstream.join("UPSTREAM.md"), "upstream\n").unwrap();
+        git(&upstream, &["add", "UPSTREAM.md"]);
+        git(&upstream, &["commit", "-q", "-m", "upstream change"]);
+        git(&upstream, &["push", "-q", "origin", "main"]);
+        git(
+            &main,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&main, &["pack-refs", "--all"]);
+
+        // Co-author attribution on, so AFT's managed Git hooks are in play.
+        std::fs::create_dir_all(xdg.join("config/cortexkit")).unwrap();
+        std::fs::write(
+            xdg.join("config/cortexkit/aft.jsonc"),
+            r#"{"git": {"co_author": "Jail Bot <jail@example.com>"}}"#,
+        )
+        .unwrap();
+
         // A tiny crate in the worktree, and operator cargo configuration
         // (outside the worktree) naming a shared target and an sccache wrapper.
         std::fs::create_dir_all(worktree.join("src")).unwrap();
@@ -168,10 +209,13 @@ impl Jail {
         )
         .unwrap();
         std::fs::write(worktree.join("src/main.rs"), "fn main() {}\n").unwrap();
-        let wrapper = base.join("bin/fake-sccache");
+        let wrapper = base.join("bin/rustc-wrapper");
         std::fs::write(
             &wrapper,
-            "#!/bin/sh\n# Stands in for sccache: records use in the sccache cache directory.\ncache=\"$HOME/Library/Caches/Mozilla.sccache\"\nmkdir -p \"$cache\" && echo used > \"$cache/marker\" || exit 97\nexec \"$@\"\n",
+            format!(
+                "#!/bin/sh\n# Stands in for a compile wrapper such as sccache: records that it ran.\necho used >> {}\nexec \"$@\"\n",
+                quote(&worktree.join("wrapper-used"))
+            ),
         )
         .unwrap();
         run(Command::new("chmod").arg("755").arg(&wrapper));
@@ -426,16 +470,48 @@ async fn worker_jail_allows_normal_worker_work_and_refuses_everything_else() {
         .await;
     assert!(committed.contains("GIT_2"), "{committed}");
     assert!(git(&jail.main, &["log", "--oneline", "work"]).contains("jailed"));
+    // AFT's managed Git hooks ran on that commit inside the jail.
+    assert!(
+        git(&jail.main, &["log", "-1", "--format=%B", "work"])
+            .contains("Co-authored-by: Jail Bot <jail@example.com>"),
+        "managed prepare-commit-msg hook did not run"
+    );
 
-    // Cargo with the operator's target-dir and sccache wrapper from
-    // ~/.cargo/config.toml (outside the worktree).
+    // gh resolves to AFT's governed shim, never to an ungoverned gh.
+    let shim = jail
+        .bash("test -n \"$AFT_GH_SHIMS_DIR\" && [ \"$(command -v gh)\" = \"$AFT_GH_SHIMS_DIR/gh\" ] && echo \"SHIM_$((1+1))\" && gh --status")
+        .await;
+    assert!(shim.contains("SHIM_2"), "{shim}");
+    assert!(
+        shim.contains("rung"),
+        "gh --status did not come from the shim: {shim}"
+    );
+
+    // The rest of a worker's Git routine: fetch from the remote, rebase onto
+    // it, stash and restore a change, and list worktrees.
+    let routine = jail
+        .bash(&format!(
+            "cd {} && git fetch -q origin && git -c user.name=w -c user.email=w@example.com rebase -q origin/main && echo stashed > stash.txt && git add stash.txt && git -c user.name=w -c user.email=w@example.com stash -q && test ! -e stash.txt && git stash pop -q && test -e stash.txt && git worktree list && echo \"ROUTINE_$((1+1))\"",
+            quote(&jail.worktree)
+        ))
+        .await;
+    assert!(routine.contains("ROUTINE_2"), "{routine}");
+    git(
+        &jail.main,
+        &["merge-base", "--is-ancestor", "origin/main", "work"],
+    );
+    assert!(git(&jail.main, &["stash", "list"]).is_empty());
+
+    // Cargo with the operator's target-dir from ~/.cargo/config.toml (outside
+    // the worktree). The rustc wrapper that file also names is bypassed in the
+    // jail: a wrapper such as sccache would compile outside the sandbox.
     let built = jail.bash(&cargo_build(&jail, "", "CARGO")).await;
     assert!(built.contains("CARGO_2"), "{built}");
     assert!(jail.base.join("shared-target/debug/jailcrate").is_file());
-    assert!(jail
-        .home
-        .join("Library/Caches/Mozilla.sccache/marker")
-        .is_file());
+    assert!(
+        !jail.worktree.join("wrapper-used").exists(),
+        "the configured rustc wrapper ran inside the jail"
+    );
 
     // The daemon environment's CARGO_TARGET_DIR is operator-set too.
     let env_target = jail.base.join("env-target");

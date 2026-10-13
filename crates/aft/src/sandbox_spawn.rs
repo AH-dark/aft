@@ -1639,6 +1639,35 @@ fn build_native_profile(
     result
 }
 
+/// Environment a jailed worker's shell gets on top of the governed child
+/// environment (gh shim on PATH, managed Git hooks, the gh-shim ticket), which
+/// already reaches the sandboxed shell through the request environment.
+///
+/// - `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` are set empty, which makes
+///   cargo ignore any `build.rustc-wrapper` from its configuration. A wrapper
+///   such as sccache hands compiles to a server that runs outside the sandbox
+///   and writes outputs wherever it is told, so it must not run for a jailed
+///   build. Jailed local builds get slower; workers build with runon.
+/// - `CARGO_HOME` and `RUSTUP_HOME`, when the daemon has them, so cargo and
+///   rustup in the shell use the homes whose caches the jail grants instead of
+///   the defaults under HOME. The rest of the daemon environment stays filtered.
+pub(crate) fn apply_worker_jail_environment(environment: &mut HashMap<String, String>) {
+    if !worker_jail_active() {
+        return;
+    }
+    for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+        environment.insert(key.to_string(), String::new());
+    }
+    #[cfg(unix)]
+    for key in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if !environment.contains_key(key) {
+            if let Some(path) = absolute_env_path(key) {
+                environment.insert(key.to_string(), path.to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
 /// What a jailed worker's shell may write outside its worktree.
 #[cfg(unix)]
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1682,7 +1711,6 @@ fn absolute_env_path(name: &str) -> Option<PathBuf> {
 ///   other worktrees' entries stay read-only, on Seatbelt and Landlock alike.
 /// - Cargo: `$CARGO_HOME/registry` and `git`, its lock files, and
 ///   `$RUSTUP_HOME/downloads` and `tmp`.
-/// - sccache's cache directory, when the configured rustc wrapper is sccache.
 /// - Build targets named by `CARGO_TARGET_DIR` in the AFT environment or by
 ///   `build.target-dir` in cargo configuration outside the worktree, unless the
 ///   target is a protected path or would contain the home or the worktree.
@@ -1746,11 +1774,6 @@ fn worker_jail_grants(
         .into_iter()
         .filter_map(absolute_env_path)
         .collect::<Vec<_>>();
-    let mut wrappers = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"]
-        .into_iter()
-        .filter_map(|name| crate::environment::non_empty_os_var(name))
-        .map(|wrapper| (wrapper.to_string_lossy().into_owned(), None))
-        .collect::<Vec<_>>();
     let mut seen = std::collections::BTreeSet::new();
     for (path, base) in configs {
         if !seen.insert(path.clone()) {
@@ -1766,19 +1789,6 @@ fn worker_jail_grants(
                 (Some(base), false) => targets.push(base.join(target)),
                 (None, false) => {}
             }
-        }
-        if let Some(wrapper) = build.rustc_wrapper {
-            wrappers.push((wrapper, base));
-        }
-    }
-
-    if wrappers
-        .iter()
-        .any(|(wrapper, base)| wrapper_is_sccache(wrapper, base.as_deref()))
-    {
-        let cache = absolute_env_path("SCCACHE_DIR").unwrap_or_else(|| sccache_default_dir(home));
-        if std::fs::create_dir_all(&cache).is_ok() {
-            grants.caches.push(cache);
         }
     }
 
@@ -1820,7 +1830,6 @@ fn linked_git_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CargoBuildSettings {
     target_dir: Option<String>,
-    rustc_wrapper: Option<String>,
 }
 
 /// The `[build]` settings of one cargo configuration file, if it exists and parses.
@@ -1842,44 +1851,7 @@ fn parse_cargo_build_settings(text: &str) -> Option<CargoBuildSettings> {
     };
     Some(CargoBuildSettings {
         target_dir: field("target-dir"),
-        rustc_wrapper: field("rustc-wrapper"),
     })
-}
-
-/// Whether a configured rustc wrapper runs sccache: it is named sccache, or it
-/// is a small script that invokes sccache (as wrappers that set the compile
-/// priority do).
-#[cfg(unix)]
-fn wrapper_is_sccache(wrapper: &str, base: Option<&Path>) -> bool {
-    let path = Path::new(wrapper);
-    if path
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().contains("sccache"))
-    {
-        return true;
-    }
-    let path = match (path.is_absolute(), base) {
-        (true, _) => path.to_path_buf(),
-        (false, Some(base)) if wrapper.contains('/') => base.join(path),
-        _ => return false,
-    };
-    std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 65_536)
-        && std::fs::read(&path).is_ok_and(|bytes| {
-            bytes
-                .windows(b"sccache".len())
-                .any(|window| window == b"sccache")
-        })
-}
-
-#[cfg(unix)]
-fn sccache_default_dir(home: &Path) -> PathBuf {
-    if cfg!(target_os = "macos") {
-        home.join("Library/Caches/Mozilla.sccache")
-    } else {
-        absolute_env_path("XDG_CACHE_HOME")
-            .unwrap_or_else(|| home.join(".cache"))
-            .join("sccache")
-    }
 }
 
 /// A configured build target may not contain the home or a project root
@@ -4033,7 +4005,6 @@ mod policy_tests {
             ),
             Some(CargoBuildSettings {
                 target_dir: Some("shared-target".into()),
-                rustc_wrapper: Some("/x/rustc-lowprio".into()),
             })
         );
         assert_eq!(parse_cargo_build_settings("[net]\noffline = true\n"), None);
@@ -4042,22 +4013,14 @@ mod policy_tests {
 
     #[cfg(unix)]
     #[test]
-    fn worker_jail_recognizes_sccache_wrappers() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("rustc-lowprio");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nexec /opt/homebrew/bin/sccache \"$@\"\n",
-        )
-        .unwrap();
-        let plain = dir.path().join("rustc-plain");
-        std::fs::write(&plain, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-        assert!(wrapper_is_sccache("sccache", None));
-        assert!(wrapper_is_sccache("/opt/homebrew/bin/sccache", None));
-        assert!(wrapper_is_sccache(script.to_str().unwrap(), None));
-        assert!(wrapper_is_sccache("./rustc-lowprio", Some(dir.path())));
-        assert!(!wrapper_is_sccache(plain.to_str().unwrap(), None));
-        assert!(!wrapper_is_sccache("rustc-lowprio", Some(dir.path())));
+    fn worker_jail_environment_disables_rustc_wrappers_only_when_jailed() {
+        let mut free = HashMap::new();
+        apply_worker_jail_environment(&mut free);
+        assert!(free.is_empty());
+        let mut jailed = HashMap::from([("RUSTC_WRAPPER".to_string(), "sccache".to_string())]);
+        with_worker_jail(true, || apply_worker_jail_environment(&mut jailed));
+        assert_eq!(jailed["RUSTC_WRAPPER"], "");
+        assert_eq!(jailed["CARGO_BUILD_RUSTC_WRAPPER"], "");
     }
 
     #[cfg(unix)]
