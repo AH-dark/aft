@@ -232,6 +232,7 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
         read_allow_listed: vec![],
         read_deny: vec![],
         socket_deny: vec![],
+        loopback_tcp_connect_deny: Vec::new(),
         cache_roots: vec![],
         temp_dir: dir.path().to_path_buf(),
     };

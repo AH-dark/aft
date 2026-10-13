@@ -102,6 +102,10 @@ async fn next_frame(stream: &mut TcpStream) -> Frame {
 
 impl Jail {
     async fn start() -> Self {
+        Self::start_with_sccache(None, None).await
+    }
+
+    async fn start_with_sccache(port: Option<u16>, uds: Option<&Path>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let home = base.join("home");
@@ -266,6 +270,15 @@ impl Jail {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        command
+            .env_remove("SCCACHE_SERVER_PORT")
+            .env_remove("SCCACHE_SERVER_UDS");
+        if let Some(port) = port {
+            command.env("SCCACHE_SERVER_PORT", port.to_string());
+        }
+        if let Some(uds) = uds {
+            command.env("SCCACHE_SERVER_UDS", uds);
+        }
         let child = command.spawn().unwrap();
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
             .await
@@ -621,4 +634,58 @@ async fn worker_jail_allows_normal_worker_work_and_refuses_everything_else() {
         );
         assert_eq!(std::fs::read(path).ok(), before, "{}", path.display());
     }
+}
+
+fn sccache_connect_script(address: &str, unix: bool) -> String {
+    let connect = if unix {
+        "s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(sys.argv[1])"
+    } else {
+        "host, port = sys.argv[1].rsplit(':', 1); s = socket.create_connection((host, int(port)), timeout=3)"
+    };
+    let python = format!(
+        "import socket,sys,errno\ntry:\n {connect}\n print('CONNECTED')\nexcept OSError as e:\n assert e.errno in (errno.EPERM, errno.EACCES), e\n print('DENIED_BY_SANDBOX')"
+    );
+    format!(
+        "python3 -B -c {} {}",
+        quote(Path::new(&python)),
+        quote(Path::new(address))
+    )
+}
+
+#[tokio::test]
+async fn worker_jail_denies_shared_sccache_tcp_but_preserves_other_loopback() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let ipv6_listener = std::net::TcpListener::bind(("::1", port)).unwrap();
+    let mut jail = Jail::start_with_sccache(Some(port), None).await;
+    for host in ["127.0.0.1", "localhost", "::1"] {
+        let script = sccache_connect_script(&format!("{host}:{port}"), false);
+        let outside = run(Command::new("/bin/bash").args(["-c", &script]));
+        assert!(outside.contains("CONNECTED"), "{host}: {outside}");
+        let reply = jail.bash(&script).await;
+        assert!(reply.contains("DENIED_BY_SANDBOX"), "{host}: {reply}");
+        assert!(!reply.contains("CONNECTED"), "{host}: {reply}");
+    }
+    drop(ipv6_listener);
+
+    // A build or test can still serve and connect to its own ephemeral loopback port.
+    let python = "import socket\ns = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()\nc = socket.create_connection(s.getsockname(), timeout=3)\ns.accept()[0].close()\nprint('OWN_LOOPBACK_CONNECTED')";
+    let reply = jail
+        .bash(&format!("python3 -B -c {}", quote(Path::new(python))))
+        .await;
+    assert!(reply.contains("OWN_LOOPBACK_CONNECTED"), "{reply}");
+}
+
+#[tokio::test]
+async fn worker_jail_denies_shared_sccache_uds() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("sccache.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let script = sccache_connect_script(path.to_str().unwrap(), true);
+    let outside = run(Command::new("/bin/bash").args(["-c", &script]));
+    assert!(outside.contains("CONNECTED"), "{outside}");
+    let mut jail = Jail::start_with_sccache(None, Some(&path)).await;
+    let reply = jail.bash(&script).await;
+    assert!(reply.contains("DENIED_BY_SANDBOX"), "{reply}");
+    assert!(!reply.contains("CONNECTED"), "{reply}");
 }

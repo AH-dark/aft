@@ -109,6 +109,12 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         ));
     }
 
+    for port in &profile.loopback_tcp_connect_deny {
+        source.push_str(&format!(
+            "(deny network-outbound (remote tcp \"localhost:{port}\"))\n"
+        ));
+    }
+
     Ok(source)
 }
 
@@ -193,6 +199,7 @@ mod tests {
             read_allow_listed: Vec::new(),
             read_deny: Vec::new(),
             socket_deny: Vec::new(),
+            loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: task_temp,
         };

@@ -10678,6 +10678,7 @@ mod tests {
                 read_allow_listed: Vec::new(),
                 read_deny: Vec::new(),
                 socket_deny: Vec::new(),
+                loopback_tcp_connect_deny: Vec::new(),
                 cache_roots: Vec::new(),
                 temp_dir: PathBuf::from("/tmp/aft-test-sandbox"),
             },

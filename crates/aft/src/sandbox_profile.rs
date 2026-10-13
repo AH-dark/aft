@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-pub const SANDBOX_PROFILE_VERSION: u32 = 4;
+pub const SANDBOX_PROFILE_VERSION: u32 = 5;
 
 /// Private stores with narrowly scoped exceptions. These exceptions apply only
 /// to these trees, never to the credential floor or user-supplied read denies.
@@ -77,6 +77,10 @@ pub struct SandboxProfile {
     pub read_allow_listed: Vec<PathBuf>,
     pub read_deny: Vec<PathBuf>,
     pub socket_deny: Vec<PathBuf>,
+    /// Shared compile servers can write outside the client's jail. Seatbelt
+    /// denies only these loopback TCP destinations, not ordinary test servers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loopback_tcp_connect_deny: Vec<u16>,
     pub cache_roots: Vec<PathBuf>,
     pub temp_dir: PathBuf,
 }
@@ -116,6 +120,7 @@ impl SandboxProfile {
             read_allow_listed: Vec::new(),
             read_deny: canonicalize_optional_paths(read_deny, "read_deny", &mut deny_paths)?,
             socket_deny: canonicalize_optional_paths(socket_deny, "socket_deny", &mut deny_paths)?,
+            loopback_tcp_connect_deny: Vec::new(),
             cache_roots: canonicalize_required_dirs(cache_roots, "cache_roots")?,
             temp_dir: canonicalize_required_dir(temp_dir, "temp_dir")?,
         })
@@ -161,6 +166,7 @@ impl SandboxProfile {
                 &mut deny_paths,
             )?,
             cache_roots: canonicalize_required_dirs(self.cache_roots, "cache_roots")?,
+            loopback_tcp_connect_deny: self.loopback_tcp_connect_deny,
             temp_dir: canonicalize_required_dir(self.temp_dir, "temp_dir")?,
         })
     }
@@ -738,7 +744,7 @@ mod tests {
             .expect_err("new launcher must reject a v1 profile");
         assert!(error
             .to_string()
-            .contains("unsupported sandbox profile version 1; expected 4"));
+            .contains("unsupported sandbox profile version 1; expected 5"));
 
         let current = SandboxProfile::build(
             vec![root.clone()],
@@ -752,12 +758,12 @@ mod tests {
         )
         .expect("current profile");
         let mut previous = current.clone();
-        previous.v = 3;
+        previous.v = 4;
         assert!(previous
             .canonicalize_for_launch()
             .unwrap_err()
             .to_string()
-            .contains("unsupported sandbox profile version 3; expected 4"));
+            .contains("unsupported sandbox profile version 4; expected 5"));
         let error = serde_json::from_value::<LegacyProfile>(
             serde_json::to_value(current).expect("serialize current profile"),
         )
@@ -780,6 +786,7 @@ mod tests {
             read_allow_listed: Vec::new(),
             read_deny: vec![root.join("missing-secret")],
             socket_deny: vec![root.join("missing.sock")],
+            loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: root.clone(),
         }

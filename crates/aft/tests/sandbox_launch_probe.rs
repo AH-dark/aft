@@ -448,7 +448,7 @@ fn v1_profile_is_a_structured_sandbox_unavailable_failure() {
     assert_eq!(output.status.code(), Some(78));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("sandbox_unavailable:"));
-    assert!(stderr.contains("unsupported sandbox profile version 1; expected 4"));
+    assert!(stderr.contains("unsupported sandbox profile version 1; expected 5"));
 }
 
 #[test]
@@ -1440,4 +1440,44 @@ fn access_policy_builtin_floor_inside_worktree_refuses_shell_launch() {
         );
     }
     assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-leak"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_support_reports_sccache_server_unblockable_on_landlock() {
+    let output = Command::new(AFT_BIN)
+        .args(["sandbox-launch", "--support"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let support: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(support["backend"], "landlock");
+    assert_eq!(
+        support["unenforced"],
+        serde_json::json!(["sccache_server_unblockable_on_landlock"])
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_jailed_launch_reports_sccache_gap_without_blocking_tcp() {
+    let mut fixture = ProbeFixture::new();
+    let mut profile: SandboxProfile =
+        serde_json::from_reader(fixture.profile.file.as_file_mut()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    profile.loopback_tcp_connect_deny = vec![4226, port];
+    fixture.profile = InheritedProfile::new(&profile);
+    let output = fixture.launch_bash(&format!(
+        "echo OK; echo connected >/dev/tcp/127.0.0.1/{port}"
+    ));
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("sccache_server_unblockable_on_landlock"),
+        "{output:?}"
+    );
 }

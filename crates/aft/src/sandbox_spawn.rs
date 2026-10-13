@@ -1603,6 +1603,21 @@ fn build_native_profile(
         profile.write_deny_nested = write_deny_nested;
         profile.read_deny.extend(shell_read_deny);
         if let Some(jail) = jail {
+            // Read server destinations from the operator's environment, never
+            // from a worker request or a file the worker can edit.
+            profile.loopback_tcp_connect_deny =
+                sccache_server_ports(std::env::var("SCCACHE_SERVER_PORT").ok().as_deref());
+            if let Some(path) = std::env::var_os("SCCACHE_SERVER_UDS").filter(|v| !v.is_empty()) {
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()
+                        .map_err(|error| format!("failed to resolve sccache socket: {error}"))?
+                        .join(path)
+                };
+                profile.socket_deny.push(path);
+            }
             profile.writable_roots.extend(jail.roots);
             profile.writable_roots.sort_unstable();
             profile.writable_roots.dedup();
@@ -1639,9 +1654,9 @@ fn build_native_profile(
     result
 }
 
-/// Environment a jailed worker's shell gets on top of the governed child
-/// environment (gh shim on PATH, managed Git hooks, the gh-shim ticket), which
-/// already reaches the sandboxed shell through the request environment.
+/// Adjust the governed child environment for a jailed worker shell. The caller
+/// has already added managed Git and GitHub command settings to the request
+/// environment.
 ///
 /// - `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` are set empty, which makes
 ///   cargo ignore any `build.rustc-wrapper` from its configuration. A wrapper
@@ -1650,11 +1665,16 @@ fn build_native_profile(
 ///   build. Jailed local builds get slower; workers build with runon.
 /// - `CARGO_HOME` and `RUSTUP_HOME`, when the daemon has them, so cargo and
 ///   rustup in the shell use the homes whose caches the jail grants instead of
-///   the defaults under HOME. The rest of the daemon environment stays filtered.
+///   the defaults under HOME. Other daemon variables are inherited only through
+///   the sandbox's base-environment allowlist.
+/// - All `SCCACHE_*` settings are removed, including server port/UDS and startup
+///   notification channels. Storage endpoints are not compile-server addresses,
+///   but are removed too so future sccache channels cannot bypass this scrub.
 pub(crate) fn apply_worker_jail_environment(environment: &mut HashMap<String, String>) {
     if !worker_jail_active() {
         return;
     }
+    environment.retain(|key, _| !key.starts_with("SCCACHE_"));
     for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
         environment.insert(key.to_string(), String::new());
     }
@@ -1666,6 +1686,17 @@ pub(crate) fn apply_worker_jail_environment(environment: &mut HashMap<String, St
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn sccache_server_ports(configured: Option<&str>) -> Vec<u16> {
+    let mut ports = vec![4226];
+    if let Some(port) = configured.and_then(|value| value.parse::<u16>().ok()) {
+        if port != 0 && port != 4226 {
+            ports.push(port);
+        }
+    }
+    ports
 }
 
 /// What a jailed worker's shell may write outside its worktree.
@@ -4013,6 +4044,47 @@ mod policy_tests {
 
     #[cfg(unix)]
     #[test]
+    fn worker_jail_sccache_ports_always_include_default_and_operator_port() {
+        assert_eq!(sccache_server_ports(None), vec![4226]);
+        assert_eq!(sccache_server_ports(Some("invalid")), vec![4226]);
+        assert_eq!(sccache_server_ports(Some("65536")), vec![4226]);
+        assert_eq!(sccache_server_ports(Some("0")), vec![4226]);
+        assert_eq!(sccache_server_ports(Some("4226")), vec![4226]);
+        assert_eq!(sccache_server_ports(Some("54226")), vec![4226, 54226]);
+    }
+
+    #[test]
+    fn worker_jail_environment_scrubs_sccache_channels_only_when_jailed() {
+        let keys = [
+            "SCCACHE_SERVER_PORT",
+            "SCCACHE_SERVER_UDS",
+            "SCCACHE_STARTUP_NOTIFY",
+            "SCCACHE_REDIS_ENDPOINT",
+            "SCCACHE_WEBDAV_ENDPOINT",
+            "SCCACHE_ENDPOINT",
+            "SCCACHE_DIRECT",
+            "SCCACHE_FUTURE_SERVER_CHANNEL",
+        ];
+        let original = keys
+            .into_iter()
+            .chain(["KEEP_ME"])
+            .map(|key| (key.to_string(), "operator-value".to_string()))
+            .collect::<HashMap<_, _>>();
+        let mut environment = original.clone();
+        with_worker_jail(false, || apply_worker_jail_environment(&mut environment));
+        assert_eq!(environment, original);
+        with_worker_jail(true, || apply_worker_jail_environment(&mut environment));
+        for key in keys {
+            assert!(
+                !environment.contains_key(key),
+                "jailed client retained {key}"
+            );
+        }
+        assert_eq!(environment["KEEP_ME"], "operator-value");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn worker_jail_environment_disables_rustc_wrappers_only_when_jailed() {
         let mut free = HashMap::new();
         apply_worker_jail_environment(&mut free);
@@ -5124,6 +5196,7 @@ mod read_allow_tests {
                 "/run/secrets".into(),
             ],
             socket_deny: Vec::new(),
+            loopback_tcp_connect_deny: Vec::new(),
             cache_roots: vec!["/home/alice/.npm".into()],
             temp_dir: temp.into(),
         };

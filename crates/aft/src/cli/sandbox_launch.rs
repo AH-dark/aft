@@ -39,7 +39,7 @@ impl SandboxLaunchError {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     fn runtime(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -68,6 +68,10 @@ impl fmt::Display for SandboxLaunchError {
 impl std::error::Error for SandboxLaunchError {}
 
 pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
+    #[cfg(windows)]
+    if args == [OsString::from("--support")] {
+        return print_support();
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = args;
@@ -359,6 +363,11 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     if !profile.socket_deny.is_empty() {
         unenforced.push("socket_deny");
     }
+    if !profile.loopback_tcp_connect_deny.is_empty() {
+        // Handling TCP connect in Landlock would deny every unlisted port;
+        // leave networking alone rather than break builds and local test servers.
+        unenforced.push("sccache_server_unblockable_on_landlock");
+    }
 
     eprint!("sandbox-launch: unenforced=[{}]", unenforced.join(","));
     if applied.partially_enforced {
@@ -410,11 +419,22 @@ fn print_support() -> Result<(), SandboxLaunchError> {
         "target_abi": landlock_backend::abi_label(landlock_backend::TARGET_ABI),
         "required_refer_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_REFER_ABI),
         "required_write_abi": landlock_backend::abi_label(landlock_backend::REQUIRED_WRITE_ABI),
-        "partially_enforced": applied.partially_enforced
+        "partially_enforced": applied.partially_enforced,
+        "unenforced": ["sccache_server_unblockable_on_landlock"]
     }))
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(windows)]
+fn print_support() -> Result<(), SandboxLaunchError> {
+    print_json(serde_json::json!({
+        "platform": "windows",
+        "supported": false,
+        "backend": null,
+        "unenforced": ["sccache_server_unblockable_without_native_sandbox"]
+    }))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn print_json(value: serde_json::Value) -> Result<(), SandboxLaunchError> {
     println!(
         "{}",
