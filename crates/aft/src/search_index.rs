@@ -3087,6 +3087,31 @@ impl SearchIndexSnapshot {
         max_files: Option<usize>,
         scan_budget: Duration,
     ) -> (GrepResult, GrepQueryPhaseTimings) {
+        self.search_grep_profiled_with_filters_and_query_and_limits_with_clock(
+            pattern,
+            query,
+            filters,
+            search_root,
+            max_results,
+            path_exclusion,
+            max_files,
+            scan_budget,
+            Instant::now,
+        )
+    }
+
+    fn search_grep_profiled_with_filters_and_query_and_limits_with_clock(
+        &self,
+        pattern: &CompiledPattern,
+        query: &RegexQuery,
+        filters: &PathFilters,
+        search_root: &Path,
+        max_results: usize,
+        path_exclusion: Option<GrepPathExclusion>,
+        max_files: Option<usize>,
+        scan_budget: Duration,
+        now: fn() -> Instant,
+    ) -> (GrepResult, GrepQueryPhaseTimings) {
         let _io_scope = crate::bounded_io::enter_if_absent(scan_budget);
         let matcher = match pattern {
             CompiledPattern::Literal(literal) => SearchMatcher::Literal(literal.clone()),
@@ -3124,7 +3149,7 @@ impl SearchIndexSnapshot {
         let engine_capped = AtomicBool::new(false);
         let stop_after = max_results.saturating_mul(2);
         let stop_scan = Arc::new(AtomicBool::new(false));
-        let deadline = GrepScanDeadline::after(scan_budget);
+        let deadline = GrepScanDeadline::after_with_clock(scan_budget, now);
         let io_budget = crate::bounded_io::current();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
@@ -3904,15 +3929,17 @@ pub(crate) struct GrepScanDeadline {
     /// `None` when the budget is too large to represent as an instant, which
     /// leaves the scan unbounded in time.
     at: Option<Instant>,
+    now: fn() -> Instant,
     reached: AtomicBool,
 }
 
 impl GrepScanDeadline {
-    pub(crate) fn after(budget: Duration) -> Self {
+    fn after_with_clock(budget: Duration, now: fn() -> Instant) -> Self {
         Self {
-            at: Instant::now().checked_add(budget).map(|at| {
+            at: now().checked_add(budget).map(|at| {
                 crate::bounded_io::current().map_or(at, |budget| at.min(budget.deadline))
             }),
+            now,
             reached: AtomicBool::new(false),
         }
     }
@@ -3922,7 +3949,7 @@ impl GrepScanDeadline {
         if self.reached.load(Ordering::Relaxed) {
             return true;
         }
-        if self.at.is_some_and(|at| Instant::now() >= at) {
+        if self.at.is_some_and(|at| (self.now)() >= at) {
             self.reached.store(true, Ordering::Relaxed);
             return true;
         }
@@ -7883,6 +7910,12 @@ thread_local! {
     /// count line-detail work or act at a chosen point inside a scan.
     static LINE_DETAILS_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+    static GREP_SCAN_CLOCK_ADVANCE: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+}
+
+#[cfg(test)]
+fn grep_scan_test_now() -> Instant {
+    Instant::now() + GREP_SCAN_CLOCK_ADVANCE.with(Cell::get)
 }
 
 /// Line number, 1-based character column and printable text of the line
@@ -10456,6 +10489,22 @@ mod tests {
         assert_ready_indexed_literal_match(r"foo\.bar");
     }
 
+    /// Resets the injected clock after a deadline test, including on panic.
+    struct GrepScanClockGuard;
+
+    impl GrepScanClockGuard {
+        fn install() -> Self {
+            GREP_SCAN_CLOCK_ADVANCE.with(|advance| advance.set(Duration::ZERO));
+            Self
+        }
+    }
+
+    impl Drop for GrepScanClockGuard {
+        fn drop(&mut self) {
+            GREP_SCAN_CLOCK_ADVANCE.with(|advance| advance.set(Duration::ZERO));
+        }
+    }
+
     /// Clears the line-details probe when a test ends, even on panic.
     struct LineDetailsProbeGuard;
 
@@ -10565,10 +10614,21 @@ mod tests {
         max_results: usize,
         budget: Duration,
     ) -> GrepResult {
+        indexed_grep_with_clock(index, root, pattern, max_results, budget, Instant::now)
+    }
+
+    fn indexed_grep_with_clock(
+        index: &SearchIndex,
+        root: &Path,
+        pattern: &CompiledPattern,
+        max_results: usize,
+        budget: Duration,
+        now: fn() -> Instant,
+    ) -> GrepResult {
         let query = decompose_grep_pattern(pattern);
         index
             .snapshot()
-            .search_grep_profiled_with_filters_and_query_and_limits(
+            .search_grep_profiled_with_filters_and_query_and_limits_with_clock(
                 pattern,
                 &query,
                 &PathFilters::default(),
@@ -10577,6 +10637,7 @@ mod tests {
                 None,
                 None,
                 budget,
+                now,
             )
             .0
     }
@@ -10729,18 +10790,26 @@ mod tests {
         fs::write(project.join("many.txt"), "needle line\n".repeat(1_000)).expect("write file");
         let index = SearchIndex::build_with_limit(&project, 8 * 1024 * 1024);
         let pattern = compile_grep_pattern("needle", true, false);
-        // The first reported line outlasts the whole budget, so the deadline
-        // has passed before the scan reaches the second line of the file.
         let budget = Duration::from_millis(100);
-        let mut slept = false;
+        let _clock = GrepScanClockGuard::install();
+        // Move the injected clock past the budget while the first line is
+        // rendered, so the next occurrence must stop the scan without sleeping.
+        let mut advanced_clock = false;
         let _probe = install_line_details_probe(move || {
-            if !slept {
-                slept = true;
-                std::thread::sleep(budget * 2);
+            if !advanced_clock {
+                advanced_clock = true;
+                GREP_SCAN_CLOCK_ADVANCE.with(|advance| advance.set(budget * 2));
             }
         });
 
-        let result = indexed_grep_with_budget(&index, &project, &pattern, 10_000, budget);
+        let result = indexed_grep_with_clock(
+            &index,
+            &project,
+            &pattern,
+            10_000,
+            budget,
+            grep_scan_test_now,
+        );
 
         assert!(result.scan_deadline_reached);
         assert!(result.engine_capped);
