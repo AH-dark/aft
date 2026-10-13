@@ -49,11 +49,15 @@ MANAGED_ORT = Path.home() / ".local/share/cortexkit/aft/onnxruntime/1.24.4"
 MANAGED_MODEL_CACHE = Path.home() / ".local/share/cortexkit/aft/semantic/models"
 
 
+PRIVATE_EXTRA_ROWS = ROOT / ".cortexkit/internal-docs/investigations/identifier-prose/prefrontal-extra-rows.json"
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", default=os.environ.get("AFT_BINARY_PATH", str(ROOT / "target/release/aft")))
     parser.add_argument("--corpus", default=str(HERE / "corpus/prefrontal.toml"))
     parser.add_argument("--fixtures", default=str(HERE / "prefrontal-search-fixtures.json"))
+    parser.add_argument("--extra-fixtures", default=str(PRIVATE_EXTRA_ROWS), help="Optional ignored local rows; their presence or absence is reported explicitly.")
     parser.add_argument("--out", default=str(HERE / ".bench/prefrontal-search/score.json"))
     parser.add_argument("--top-k", type=int, default=PAGE_SIZE, help="Results requested per query (one page, no offset).")
     parser.add_argument("--ready-timeout", type=float, default=1800.0)
@@ -99,6 +103,47 @@ def load_tasks(path: Path, repo_names: Sequence[str]) -> JsonObject:
         if not isinstance(task["ground_truth"], list) or not task["ground_truth"]:
             raise ValueError(f"task {task['id']} has no ground_truth")
     return payload
+
+
+def load_extra_rows(
+    path: Path,
+    repo_names: Sequence[str],
+    existing_tasks: Sequence[Mapping[str, Any]],
+    pinned_commit: str | None,
+) -> tuple[List[JsonObject], JsonObject]:
+    """Load optional private questions; print and return loaded or absent file status."""
+    label = display_path(path)
+    if not path.exists():
+        print(f"prefrontal_extra_rows:absent:{label}", flush=True)
+        return [], {"status": "absent", "path": label, "task_count": 0}
+    try:
+        extra = load_tasks(path, repo_names)
+    except (AttributeError, TypeError) as error:
+        raise ValueError("extra rows contain malformed tasks") from error
+    if extra.get("pinned_commit") != pinned_commit:
+        raise ValueError("extra rows pinned_commit does not match the main fixtures")
+    tasks = extra["tasks"]
+    if extra.get("task_count") != len(tasks):
+        raise ValueError("extra rows task_count does not match the task list")
+    existing_ids = {task["id"] for task in existing_tasks}
+    for task in tasks:
+        if task["id"] in existing_ids:
+            raise ValueError(f"extra task duplicates main task id {task['id']}")
+        if not isinstance(task["query"], str) or not task["query"].strip():
+            raise ValueError(f"extra task {task['id']} has no query")
+        if not isinstance(task["include_tests"], bool):
+            raise ValueError(f"extra task {task['id']} include_tests must be boolean")
+        for truth in task["ground_truth"]:
+            if not isinstance(truth, dict):
+                raise ValueError(f"extra task {task['id']} has malformed ground_truth")
+            file_path = truth.get("file_path")
+            start, end = truth.get("line_start"), truth.get("line_end")
+            if not isinstance(file_path, str) or not file_path or Path(file_path).is_absolute() or ".." in Path(file_path).parts:
+                raise ValueError(f"extra task {task['id']} needs a corpus-relative file_path")
+            if type(start) is not int or type(end) is not int or start < 1 or end < start:
+                raise ValueError(f"extra task {task['id']} has invalid line bounds")
+    print(f"prefrontal_extra_rows:loaded:{label}:tasks={len(tasks)}", flush=True)
+    return tasks, {"status": "loaded", "path": label, "task_count": len(tasks)}
 
 
 def check_ground_truth(task: Mapping[str, Any], repo_path: Path) -> None:
@@ -214,6 +259,10 @@ def run(args: argparse.Namespace) -> int:
     clone_root = validate_corpus(corpus_path, corpus, repos)
     repo_names = [str(repo["name"]) for repo in repos]
     payload = load_tasks(Path(args.fixtures).resolve(), repo_names)
+    extra_tasks, extra_status = load_extra_rows(
+        Path(args.extra_fixtures).resolve(), repo_names, payload["tasks"], payload.get("pinned_commit")
+    )
+    all_tasks = [*payload["tasks"], *extra_tasks]
     model_env = ensure_local_model_env()
 
     evaluations: List[JsonObject] = []
@@ -221,7 +270,7 @@ def run(args: argparse.Namespace) -> int:
     for repo in repos:
         name = str(repo["name"])
         repo_path = clone_root / name
-        tasks = [task for task in payload["tasks"] if task["repo"] == name]
+        tasks = [task for task in all_tasks if task["repo"] == name]
         if not tasks:
             continue
         for task in tasks:
@@ -246,6 +295,7 @@ def run(args: argparse.Namespace) -> int:
         "binary": {"path": display_path(binary), "version": binary_version(binary), "sha256": binary_sha256(binary)},
         "corpus_manifest": corpus_path.relative_to(ROOT).as_posix(),
         "fixtures": Path(args.fixtures).resolve().relative_to(ROOT).as_posix(),
+        "extra_rows": extra_status,
         "top_k": args.top_k,
         "local_model_env": model_env,
         "repo_statuses": statuses,

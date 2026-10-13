@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Adds query-only identifier-bearing prose controls 930001-930005 on the existing AFT evidence pin, including the comma-free 7972 wording, a GitHub configuration question, a TcpListener connection-loss question and two declaration-right sentences. Captures only missing query vectors and re-records the reference on the unchanged engine. Report-only corpus additions and their measurements remain in ignored local files; the runner explicitly reports whether optional local rows were loaded. No engine changes."
+}

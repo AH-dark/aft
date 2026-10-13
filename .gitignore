@@ -82,6 +82,9 @@ smoke-tests/
 .aft-windows-vm
 benchmarks/aft-search/.bench/
 
+# Local investigations can contain private corpus questions, reports and paths.
+/.cortexkit/internal-docs/
+
 # Qartez index (local code intelligence cache)
 .qartez/
 
