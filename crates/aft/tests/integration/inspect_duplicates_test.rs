@@ -299,7 +299,7 @@ fn inspect_duplicates_fragment_above_max_cost_is_not_indexed() {
 
     assert!(fragments_for(&success, "src/huge.ts")
         .iter()
-        .all(|fragment| fragment["cost"].as_u64().unwrap() <= 7_000));
+        .all(|fragment| fragment[3].as_u64().unwrap() <= 7_000));
     assert_no_groups(&success.aggregate);
 }
 

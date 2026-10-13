@@ -3633,11 +3633,10 @@ impl InspectManager {
                     cache
                         .touch_tier2_last_full_run(job.category)
                         .map_err(|error| error.to_string())?;
-                    let contributions = load_contributions(cache, job)?;
                     phases.log(job.category, &job.project_root);
                     return Ok(InspectScanSuccess {
                         scanned_files: scan_files,
-                        contributions,
+                        contributions: Vec::new(),
                         aggregate,
                     });
                 }
@@ -3739,11 +3738,10 @@ impl InspectManager {
                             cache
                                 .touch_tier2_last_full_run(job.category)
                                 .map_err(|error| error.to_string())?;
-                            let contributions = load_contributions(cache, job)?;
                             phases.log(job.category, &job.project_root);
                             return Ok(InspectScanSuccess {
                                 scanned_files: scan_files,
-                                contributions,
+                                contributions: Vec::new(),
                                 aggregate,
                             });
                         }
@@ -3918,7 +3916,8 @@ impl InspectManager {
 
         Ok(InspectScanSuccess {
             scanned_files: scan_files,
-            contributions,
+            // Contributions have already been persisted; completion only publishes the aggregate.
+            contributions: Vec::new(),
             aggregate,
         })
     }
@@ -4148,9 +4147,10 @@ impl InspectManager {
     }
 
     fn route_completion(&self, result: InspectResult) {
-        let outcome = self.completion_outcome(result.clone());
-        self.record_builder_attempt_outcome(&result.key, &outcome);
-        if let Some(waiters) = self.take_waiters(&result.key, None) {
+        let key = result.key.clone();
+        let outcome = self.completion_outcome(result);
+        self.record_builder_attempt_outcome(&key, &outcome);
+        if let Some(waiters) = self.take_waiters(&key, None) {
             Self::deliver_waiters(waiters, outcome);
         }
     }
@@ -4168,7 +4168,7 @@ impl InspectManager {
                 durations.insert(result.category, result.duration);
             }
         }
-        let outcome = match result.outcome.clone() {
+        let outcome = match result.outcome {
             Ok(success) => JobOutcome::Fresh {
                 payload: success.aggregate,
             },
@@ -5557,19 +5557,16 @@ fn load_contributions(
 }
 
 fn dead_code_contributions_need_fact_refresh(
-    cache: &(impl InspectCacheRead + ?Sized),
+    cache: &InspectCache,
     job: &InspectJob,
 ) -> Result<bool, String> {
-    let contributions = load_contributions(cache, job)?;
-    Ok(contributions
-        .iter()
-        .any(dead_code_contribution_needs_fact_refresh))
+    cache
+        .contributions_need_fact_refresh(job.category)
+        .map_err(|error| error.to_string())
 }
 
-fn dead_code_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {
-    let Ok(parsed) =
-        serde_json::from_value::<DeadCodeRefreshContribution>(contribution.contribution.clone())
-    else {
+pub(super) fn dead_code_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {
+    let Ok(parsed) = DeadCodeRefreshContribution::deserialize(&contribution.contribution) else {
         return true;
     };
 
@@ -5586,38 +5583,32 @@ fn dead_code_contribution_needs_fact_refresh(contribution: &FileContribution) ->
 }
 
 fn unused_exports_contributions_need_fact_refresh(
-    cache: &(impl InspectCacheRead + ?Sized),
+    cache: &InspectCache,
     job: &InspectJob,
 ) -> Result<bool, String> {
-    let contributions = load_contributions(cache, job)?;
-    Ok(contributions
-        .iter()
-        .any(unused_exports_contribution_needs_fact_refresh))
+    cache
+        .contributions_need_fact_refresh(job.category)
+        .map_err(|error| error.to_string())
 }
 
-/// Duplicates contributions written before v0.44 lack the `line_count` field
-/// (serde defaults it to 0), so a cached roll-up computes total_analyzed_lines
-/// as 0 and the summary renders "0.0% of 0 analyzed lines". One full rescan
-/// repopulates the counts; fresh contributions always carry line_count.
 fn duplicates_contributions_need_fact_refresh(
-    cache: &(impl InspectCacheRead + ?Sized),
+    cache: &InspectCache,
     job: &InspectJob,
 ) -> Result<bool, String> {
-    let contributions = load_contributions(cache, job)?;
-    Ok(contributions
-        .iter()
-        .any(|contribution| contribution.contribution.get("line_count").is_none()))
+    cache
+        .contributions_need_fact_refresh(job.category)
+        .map_err(|error| error.to_string())
 }
 
-fn unused_exports_contribution_needs_fact_refresh(contribution: &FileContribution) -> bool {
+pub(super) fn unused_exports_contribution_needs_fact_refresh(
+    contribution: &FileContribution,
+) -> bool {
     let top_level_oxc = contribution
         .contribution
         .get("provenance")
         .and_then(Value::as_str)
         == Some(OXC_PROVENANCE);
-    let Ok(parsed) =
-        serde_json::from_value::<UnusedExportsContribution>(contribution.contribution.clone())
-    else {
+    let Ok(parsed) = UnusedExportsContribution::deserialize(&contribution.contribution) else {
         return false;
     };
     let uses_oxc =
@@ -7142,6 +7133,7 @@ mod guard_tests {
     }
 
     include!("view_projection_tests.rs");
+    include!("completion_perf_tests.rs");
 
     fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
         let dir = tempfile::tempdir().expect("tempdir");

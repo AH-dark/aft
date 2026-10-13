@@ -182,8 +182,47 @@ impl From<serde_json::Error> for InspectCacheError {
 /// add a Tier-2 category, so unchanged contribution sets need a new roll-up.
 /// v34: Rust macro-token calls and declared-module edges change dead-code
 /// reachability and test-only verdicts for unchanged contribution sets.
-// Compact Go initializer groups participate in the incremental graph hashes.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 38;
+/// v38: compact Go initializer groups participate in the incremental graph hashes.
+/// v40: duplicate fragments use compact exact tuples; legacy rows are rescanned
+/// before roll-up, with fact-version checks served from row metadata.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 40;
+
+fn expected_facts_version(category: InspectCategory) -> i64 {
+    match category {
+        InspectCategory::Duplicates => 37,
+        InspectCategory::DeadCode => {
+            (i64::from(super::scanners::dead_code::DEAD_CODE_FACTS_FORMAT_VERSION) << 32)
+                | i64::from(super::oxc_engine::FACTS_FORMAT_VERSION)
+        }
+        InspectCategory::UnusedExports => i64::from(super::oxc_engine::FACTS_FORMAT_VERSION),
+        _ => 1,
+    }
+}
+
+fn contribution_facts_version(contribution: &FileContribution) -> i64 {
+    let current = match contribution.category {
+        InspectCategory::Duplicates => {
+            super::scanners::duplicates::contribution_is_current(&contribution.contribution)
+        }
+        InspectCategory::DeadCode => {
+            !super::manager::dead_code_contribution_needs_fact_refresh(contribution)
+        }
+        InspectCategory::UnusedExports => {
+            !super::manager::unused_exports_contribution_needs_fact_refresh(contribution)
+        }
+        _ => true,
+    };
+    if current {
+        expected_facts_version(contribution.category)
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static CONTRIBUTION_LOAD_WORK: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -877,14 +916,14 @@ impl InspectCache {
             ))?;
             tx.execute(
                 "INSERT INTO tier2_contributions \
-                 (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at, facts_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(category, project_key, file_path) DO UPDATE SET \
                  file_mtime_ns = excluded.file_mtime_ns, \
                  file_size = excluded.file_size, \
                  file_hash = excluded.file_hash, \
                  contribution = excluded.contribution, \
-                 generated_at = excluded.generated_at",
+                 generated_at = excluded.generated_at, facts_version = excluded.facts_version",
                 params![
                     contribution.category.as_str(),
                     self.project_key,
@@ -894,6 +933,7 @@ impl InspectCache {
                     hash_to_hex(contribution.freshness.content_hash),
                     blob,
                     now,
+                    contribution_facts_version(contribution),
                 ],
             )?;
         }
@@ -997,14 +1037,14 @@ impl InspectCache {
             ))?;
             tx.execute(
                 "INSERT INTO tier2_contributions \
-                 (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 (category, project_key, file_path, file_mtime_ns, file_size, file_hash, contribution, generated_at, facts_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(category, project_key, file_path) DO UPDATE SET \
                  file_mtime_ns = excluded.file_mtime_ns, \
                  file_size = excluded.file_size, \
                  file_hash = excluded.file_hash, \
                  contribution = excluded.contribution, \
-                 generated_at = excluded.generated_at",
+                 generated_at = excluded.generated_at, facts_version = excluded.facts_version",
                 params![
                     contribution.category.as_str(),
                     self.project_key,
@@ -1014,6 +1054,7 @@ impl InspectCache {
                     hash_to_hex(contribution.freshness.content_hash),
                     blob,
                     now,
+                    contribution_facts_version(&contribution),
                 ],
             )?;
         }
@@ -1177,6 +1218,11 @@ impl InspectCache {
         &self,
         category: InspectCategory,
     ) -> Result<Vec<ContributionRecord>, InspectCacheError> {
+        #[cfg(test)]
+        CONTRIBUTION_LOAD_WORK.with(|work| {
+            let (selects, rows, bytes) = work.get();
+            work.set((selects + 1, rows, bytes));
+        });
         self.refresh_read_marker()?;
         let conn = self
             .conn
@@ -1200,6 +1246,11 @@ impl InspectCache {
         let mut records = Vec::new();
         for row in rows {
             let (file_path, mtime_ns, file_size, file_hash, contribution) = row?;
+            #[cfg(test)]
+            CONTRIBUTION_LOAD_WORK.with(|work| {
+                let (selects, rows, bytes) = work.get();
+                work.set((selects, rows + 1, bytes + contribution.len()));
+            });
             let contribution: serde_json::Value = serde_json::from_slice(&contribution)?;
             let type_ref_names = type_ref_names_from_contribution(&contribution);
             records.push(ContributionRecord {
@@ -1215,6 +1266,22 @@ impl InspectCache {
             });
         }
         Ok(records)
+    }
+
+    pub(super) fn contributions_need_fact_refresh(
+        &self,
+        category: InspectCategory,
+    ) -> Result<bool, InspectCacheError> {
+        self.refresh_read_marker()?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tier2_contributions WHERE category = ?1 AND project_key = ?2 AND facts_version != ?3)",
+            params![category.as_str(), self.project_key, expected_facts_version(category)],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn delete_tier2_contribution(
@@ -2024,6 +2091,19 @@ fn initialize_schema(conn: &Connection) -> Result<(), InspectCacheError> {
             PRIMARY KEY (category, project_key)
         );",
     )?;
+    // A migrated row has no trusted format metadata. Leave it at zero so the
+    // manager rebuilds source facts rather than decoding old payloads as new ones.
+    let has_facts_version = conn
+        .prepare("PRAGMA table_info(tier2_contributions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "facts_version");
+    if !has_facts_version {
+        conn.execute_batch(
+            "ALTER TABLE tier2_contributions ADD COLUMN facts_version INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 
@@ -2496,6 +2576,80 @@ mod tests {
 
     fn collect_freshness(path: &Path) -> FileFreshness {
         crate::cache_freshness::collect(path).unwrap()
+    }
+
+    #[test]
+    fn tier2_fact_version_probes_read_metadata_without_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let path = root.join("example.rs");
+        std::fs::write(&path, "fn example() {}\n").unwrap();
+        let cache = InspectCache::open(root.join("inspect"), root.into()).unwrap();
+        let oxc = serde_json::json!({
+            "format_version": super::super::oxc_engine::FACTS_FORMAT_VERSION,
+            "content_hash": "hash", "exports": [], "imports": [], "re_exports": [], "dynamic_imports": [],
+            "same_file_value_references": [], "used_import_bindings": [],
+            "type_referenced_import_bindings": [], "value_referenced_import_bindings": []
+        });
+        for (category, payload) in [
+            (
+                InspectCategory::Duplicates,
+                serde_json::json!({"file":"example.rs", "line_count":1, "fragments":[["hash",1,20,100]]}),
+            ),
+            (
+                InspectCategory::DeadCode,
+                serde_json::json!({"facts_format_version": super::super::scanners::dead_code::DEAD_CODE_FACTS_FORMAT_VERSION, "oxc_facts":oxc}),
+            ),
+            (
+                InspectCategory::UnusedExports,
+                serde_json::json!({"file":"example.rs", "exports":[], "oxc_facts":oxc}),
+            ),
+        ] {
+            let contribution =
+                FileContribution::new(category, &path, collect_freshness(&path), payload);
+            cache
+                .store_tier2_result(
+                    JobKey::for_project_category(category),
+                    std::slice::from_ref(&path),
+                    std::slice::from_ref(&contribution),
+                    serde_json::json!({"count":0}),
+                )
+                .unwrap();
+            CONTRIBUTION_LOAD_WORK.with(|work| work.set((0, 0, 0)));
+            assert!(!cache.contributions_need_fact_refresh(category).unwrap());
+            assert_eq!(CONTRIBUTION_LOAD_WORK.with(std::cell::Cell::get), (0, 0, 0));
+            cache
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE tier2_contributions SET facts_version=0 WHERE category=?1",
+                    [category.as_str()],
+                )
+                .unwrap();
+            assert!(cache.contributions_need_fact_refresh(category).unwrap());
+            assert_eq!(CONTRIBUTION_LOAD_WORK.with(std::cell::Cell::get), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn legacy_duplicate_schema_marks_rows_for_rebuild() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE tier2_contributions (
+            category TEXT NOT NULL, project_key TEXT NOT NULL, file_path TEXT NOT NULL,
+            file_mtime_ns INTEGER NOT NULL, file_size INTEGER NOT NULL, file_hash TEXT NOT NULL,
+            contribution BLOB NOT NULL, generated_at INTEGER NOT NULL,
+            PRIMARY KEY(category,project_key,file_path));
+            INSERT INTO tier2_contributions VALUES ('duplicates','project','file.rs',0,0,'hash','{}',0);").unwrap();
+        initialize_schema(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT facts_version FROM tier2_contributions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 0);
+        assert_ne!(version, expected_facts_version(InspectCategory::Duplicates));
+        initialize_schema(&conn).unwrap();
     }
 
     #[test]
@@ -3038,7 +3192,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 38);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 40);
     }
 
     #[test]
@@ -3092,6 +3246,30 @@ mod tests {
             .load_aggregate_if_hash_matches(InspectCategory::Complexity, &current_hash)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn duplicate_cache_version_rejects_v34_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = InspectCache::open(dir.path().join("inspect"), dir.path().into()).unwrap();
+        let config = Config::default();
+        let legacy_hash = contribution_set_hash_with_version(
+            &cache.conn.lock().unwrap(),
+            InspectCategory::Duplicates,
+            &cache.project_key,
+            &cache.project_root,
+            Some(&config),
+            34,
+        )
+        .unwrap();
+        let key = JobKey::for_project_category(InspectCategory::Duplicates);
+        cache
+            .store_tier2_aggregate(key.clone(), &legacy_hash, serde_json::json!({"count":99}))
+            .unwrap();
+        assert!(cache
+            .get_aggregated_for_config(&key, &config)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

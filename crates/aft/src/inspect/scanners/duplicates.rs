@@ -510,12 +510,26 @@ fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 }
 
 fn file_scan_to_contribution(scan: &FileScan) -> FileContribution {
+    // Tuples retain the full hash and all span/cost facts without four JSON map keys
+    // and a separately allocated map node for every fragment.
+    let fragments = scan
+        .fragments
+        .iter()
+        .map(|fragment| {
+            json!([
+                fragment.hash,
+                fragment.start_line,
+                fragment.end_line,
+                fragment.cost
+            ])
+        })
+        .collect::<Vec<_>>();
     let mut contribution = json!({
         "file": scan.display_path,
         "line_count": scan.line_count,
         "expected_duplicate": scan.expected_duplicate,
-        "fragments": scan.fragments,
     });
+    contribution["fragments"] = Value::Array(fragments);
     if scan.generated {
         contribution["generated"] = json!(true);
     }
@@ -638,6 +652,17 @@ fn duplicate_contribution_ref(value: &Value) -> Option<DuplicateContributionRef<
 }
 
 fn duplicate_fragment_ref(value: &Value) -> Option<DuplicateFragmentRef<'_>> {
+    if let Some(tuple) = value.as_array() {
+        if tuple.len() != 4 {
+            return None;
+        }
+        return Some(DuplicateFragmentRef {
+            hash: tuple[0].as_str()?,
+            start_line: required_u32(&tuple[1])?,
+            end_line: required_u32(&tuple[2])?,
+            cost: required_u32(&tuple[3])?,
+        });
+    }
     let object = value.as_object()?;
     Some(DuplicateFragmentRef {
         hash: object.get("hash")?.as_str()?,
@@ -645,6 +670,12 @@ fn duplicate_fragment_ref(value: &Value) -> Option<DuplicateFragmentRef<'_>> {
         end_line: required_u32(object.get("end_line")?)?,
         cost: required_u32(object.get("cost")?)?,
     })
+}
+
+pub(in crate::inspect) fn contribution_is_current(value: &Value) -> bool {
+    value.get("line_count").is_some()
+        && duplicate_contribution_ref(value)
+            .is_some_and(|scan| scan.fragments.iter().all(Value::is_array))
 }
 
 fn optional_u32(value: Option<&Value>) -> Option<u32> {
@@ -1308,6 +1339,93 @@ mod tests {
 
     fn group_count(aggregate: &serde_json::Value) -> u64 {
         aggregate["count"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn compact_duplicate_records_bound_fragment_allocations() {
+        let scan = FileScan {
+            path: PathBuf::from("src/example.rs"),
+            display_path: "src/example.rs".into(),
+            language_skipped: None,
+            skipped_reason: None,
+            freshness: freshness(),
+            line_count: 100,
+            expected_duplicate: false,
+            generated: false,
+            fragments: (0usize..1_000)
+                .map(|index| DuplicateFragment {
+                    hash: blake3::hash(&index.to_le_bytes()).to_hex().to_string(),
+                    start_line: 1,
+                    end_line: 20,
+                    cost: 100,
+                })
+                .collect(),
+        };
+        let (_, allocations) = crate::test_allocations::count(|| file_scan_to_contribution(&scan));
+        println!("fragment serialization allocations={allocations} for 1000 fragments");
+        assert!(
+            allocations < 3_100,
+            "compact fragment serialization allocated {allocations} times"
+        );
+        let contributions = vec![file_scan_to_contribution(&scan)];
+        assert_eq!(
+            aggregate_file_scans_with_limit(&[scan], vec![], None, &[]),
+            aggregate_duplicate_contributions_with_limit(&contributions, vec![], None, &[]),
+        );
+    }
+
+    #[test]
+    fn compact_duplicate_records_preserve_groups_order_and_text() {
+        let scans = ["src/a.rs", "src/b.rs", "src/generated/c.rs"].map(|file| FileScan {
+            path: PathBuf::from(file),
+            display_path: file.into(),
+            language_skipped: None,
+            skipped_reason: None,
+            freshness: freshness(),
+            line_count: 100,
+            expected_duplicate: false,
+            generated: false,
+            fragments: vec![
+                DuplicateFragment {
+                    hash: "outer".into(),
+                    start_line: 1,
+                    end_line: 40,
+                    cost: 400,
+                },
+                DuplicateFragment {
+                    hash: "inner".into(),
+                    start_line: 10,
+                    end_line: 30,
+                    cost: 200,
+                },
+                DuplicateFragment {
+                    hash: "sibling".into(),
+                    start_line: 50,
+                    end_line: 70,
+                    cost: 200,
+                },
+            ],
+        });
+        let contributions = scans
+            .iter()
+            .map(file_scan_to_contribution)
+            .collect::<Vec<_>>();
+        for limit in [None, Some(1), Some(100)] {
+            for mirrors in [vec![], vec![["src/a.rs".into(), "src/b.rs".into()]]] {
+                let expected = aggregate_file_scans_with_limit(&scans, vec![], limit, &mirrors);
+                let actual = aggregate_duplicate_contributions_with_limit(
+                    &contributions,
+                    vec![],
+                    limit,
+                    &mirrors,
+                );
+                assert!(actual["total_groups"].as_u64().unwrap() > 0);
+                assert_eq!(
+                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&expected).unwrap()
+                );
+            }
+        }
     }
 
     fn unique_fragment_contributions(fragment_count: usize) -> Vec<FileContribution> {
