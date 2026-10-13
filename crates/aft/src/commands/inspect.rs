@@ -5721,7 +5721,9 @@ mod fresh_payload_tests {
             {"kind": "failed_producer", "producer": "rust", "root": ".",
              "reason": "rust_analyzer_capacity_exhausted: worker-policy process cap=2 reached"}
         ]}});
-        let reason = partial_summary_reason(summary.as_object().unwrap()).unwrap();
+        let reason =
+            partial_summary_reason(summary.as_object().unwrap(), &Sections::summary_only())
+                .unwrap();
         assert_eq!(reason, "diagnostics unknown: rust-analyzer @ .: cargo_check_disabled_for_worker: compile diagnostics are rust-analyzer-only for this session. Run cargo check via runon: \"linux,4c\" for compiler diagnostics.; rust-analyzer @ .: rust_analyzer_capacity_exhausted: worker-policy process cap=2 reached; retry aft_inspect.");
     }
 

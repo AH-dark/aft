@@ -7494,6 +7494,7 @@ mod project_applicability_tests {
             ServerInstanceId::next(),
             LspChildRegistry::new(),
             None,
+            false,
         )
         .unwrap();
         manager.insert_client_for_test(client);
@@ -8582,6 +8583,7 @@ mod server_exit_reap_tests {
             super::ServerInstanceId::next(),
             registry,
             None,
+            false,
         )
         .expect("spawn malformed-then-sleep stand-in")
     }

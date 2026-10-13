@@ -33,6 +33,7 @@ fn spawn(manager: &LspManager, root: &Path, script: &str) -> LspClient {
         ServerInstanceId::next(),
         manager.child_registry.clone(),
         None,
+        false,
     )
     .unwrap()
 }

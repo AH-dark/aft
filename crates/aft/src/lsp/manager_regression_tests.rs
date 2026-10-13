@@ -206,6 +206,7 @@ fn sleeping_rust_client(manager: &LspManager, root: &Path) -> LspClient {
         ServerInstanceId::next(),
         manager.child_registry.clone(),
         None,
+        false,
     )
     .unwrap()
 }

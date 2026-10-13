@@ -25,6 +25,7 @@ fn fresh_wait_releases_manager_and_requires_each_producer_version() {
                 ServerInstanceId::next(),
                 lsp.child_registry.clone(),
                 None,
+                false,
             )
             .unwrap();
             client.set_rust_analyzer_quiescent(true);

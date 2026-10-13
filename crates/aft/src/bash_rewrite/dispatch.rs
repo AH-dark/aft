@@ -215,7 +215,14 @@ mod tests {
         );
         for command in ["printf hi", "printf $(date)"] {
             crate::bash_rewrite::parser::take_parse_calls();
-            assert!(dispatch_for_request(command, "parse-once", None, &ctx).is_none());
+            assert!(dispatch_for_request(
+                command,
+                "parse-once",
+                None,
+                &crate::host_tool_names::HostToolNames::default(),
+                &ctx
+            )
+            .is_none());
             assert_eq!(
                 crate::bash_rewrite::parser::take_parse_calls(),
                 1,

@@ -7982,6 +7982,7 @@ mod idle_lsp_tests {
             crate::lsp::events::ServerInstanceId::next(),
             registry,
             None,
+            false,
         )
         .expect("spawn idle-lsp stand-in");
         let pid = client.child_pid();
