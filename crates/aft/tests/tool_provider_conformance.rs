@@ -1597,6 +1597,401 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
         2
     );
 }
+fn request_frame(channel: u16, corr: u64, body: &Value) -> Frame {
+    Frame::build(
+        FrameType::Request,
+        flags(),
+        channel,
+        1,
+        corr,
+        serde_json::to_vec(body).unwrap(),
+    )
+    .unwrap()
+}
+
+impl Waiter {
+    /// The request's terminal frame, exactly as the module sent it.
+    async fn terminal(&mut self, within: Duration) -> Frame {
+        loop {
+            let frame = tokio::time::timeout(within, self.rx.recv())
+                .await
+                .expect("the request ended in time")
+                .expect("the module is alive");
+            if matches!(
+                frame.header.ty,
+                FrameType::Response | FrameType::Error | FrameType::StreamEnd
+            ) {
+                return frame;
+            }
+        }
+    }
+}
+
+impl Route {
+    /// Sends `body` without waiting; its frames go to the returned waiter.
+    async fn start(&self, mut body: Value) -> Waiter {
+        self.adapt_preset(&mut body);
+        let corr = self.wire.corr();
+        let waiter = self.wire.expect(self.channel, corr);
+        self.wire
+            .send(&request_frame(self.channel, corr, &body))
+            .await
+            .unwrap();
+        waiter
+    }
+    /// Sends `body` and returns its terminal frame, bytes untouched.
+    async fn terminal(&self, body: Value) -> Frame {
+        self.start(body)
+            .await
+            .terminal(Duration::from_secs(30))
+            .await
+    }
+}
+
+fn withdraw_body(call_key: &str) -> Value {
+    json!({"name": "tool.withdraw", "arguments": {"call_key": call_key}})
+}
+
+async fn wait_for_file(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{} never appeared", path.display()));
+}
+
+/// The late-results page `route`'s principal is served from the start.
+async fn late_results_page(route: &Route) -> Value {
+    let page = route
+        .terminal(json!({"name": "late_results", "arguments": {"since": null}}))
+        .await;
+    assert_eq!(
+        page.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&page.body)
+    );
+    response_json(&page)
+}
+
+fn entries_for<'a>(page: &'a Value, call_key: &str) -> Vec<&'a Value> {
+    page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["call_key"] == call_key)
+        .collect()
+}
+
+#[tokio::test]
+async fn s2_withdrawn_held_request_ends_not_started_and_never_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    let warm = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        false,
+    )
+    .await;
+    let marker = root.join("project/withdrawn-marker");
+    let body =
+        json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"held"});
+    let mut held = route.start(body.clone()).await;
+    let ask = route.wire.lock().await.next().await.unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request);
+    // A repeat attaches to the same hold.
+    let mut repeat = route.start(body).await;
+    let withdrawn = route.terminal(withdraw_body("held")).await;
+    assert_eq!(withdrawn.header.ty, FrameType::Response);
+    assert_eq!(response_json(&withdrawn), json!({"answer": "withdrawn"}));
+    let ended = held.terminal(Duration::from_secs(5)).await;
+    assert_eq!(ended.header.ty, FrameType::Error);
+    assert_eq!(
+        response_json(&ended),
+        json!({"code": "not_started", "message": "call was not started",
+               "detail": {"call_key": "held", "reason": "withdrawn"}})
+    );
+    let attached = repeat.terminal(Duration::from_secs(5)).await;
+    assert_eq!(
+        (attached.header.ty, &attached.body),
+        (ended.header.ty, &ended.body)
+    );
+    // The question was withdrawn: a late "allow" finds nothing to run.
+    route
+        .wire
+        .send(
+            &Frame::build(
+                FrameType::Response,
+                flags(),
+                ask.header.channel,
+                ask.header.epoch,
+                ask.header.corr,
+                serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!marker.exists(), "the withdrawn call ran");
+    assert_eq!(
+        route.terminal(withdraw_body("held")).await.body,
+        withdrawn.body
+    );
+    // Legacy routes keep refusing the custody ops by name.
+    let legacy = bind_route_declaring(&process, &root.join("project"), "runner", "legacy", None)
+        .await
+        .unwrap();
+    for body in [
+        withdraw_body("held"),
+        json!({"name": "late_results", "arguments": {"since": null}}),
+        json!({"name": "late_results.ack", "arguments": {"through": {"provider_incarnation": "x", "seq": 0}}}),
+    ] {
+        let refused = legacy.terminal(body).await;
+        assert_eq!(refused.header.ty, FrameType::Error);
+        assert_eq!(response_json(&refused)["code"], "unsupported_operation");
+    }
+}
+
+#[tokio::test]
+async fn s2_withdraw_of_a_running_keyed_bash_kills_only_that_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
+        .await
+        .unwrap();
+    route
+        .raw(
+            json!({"name":"bash","arguments":{"command":"printf warm"}}),
+            false,
+        )
+        .await;
+    let started = |name: &str| root.join(format!("project/{name}-started"));
+    let call = |name: &str, seconds: u64| json!({"name":"bash","arguments":{"command":format!("{}; sleep {seconds}", marker_command(&started(name)))},"call_key":name});
+    let mut withdrawn = route.start(call("withdrawn", 30)).await;
+    let mut spared = route.start(call("spared", 6)).await;
+    wait_for_file(&started("withdrawn")).await;
+    wait_for_file(&started("spared")).await;
+    let first = route.terminal(withdraw_body("withdrawn")).await;
+    let second = route.terminal(withdraw_body("withdrawn")).await;
+    assert_eq!(first.header.ty, FrameType::Response);
+    assert_eq!(
+        response_json(&first),
+        json!({"answer": "already_started", "outcome": "unknown"})
+    );
+    assert_eq!(first.body, second.body);
+    withdrawn.terminal(Duration::from_secs(15)).await;
+    assert!(
+        spared.rx.try_recv().is_err(),
+        "the other running call was interrupted"
+    );
+    spared.terminal(Duration::from_secs(15)).await;
+    assert_eq!(
+        route.terminal(withdraw_body("withdrawn")).await.body,
+        first.body
+    );
+    drop(process);
+    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let mut tasks = conn
+        .prepare("SELECT json_extract(metadata,'$.call_key.key'), status, json_extract(metadata,'$.status_reason') FROM bash_tasks WHERE json_extract(metadata,'$.call_key.key') IN ('withdrawn','spared') ORDER BY 1")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    tasks.sort();
+    assert_eq!(
+        tasks,
+        vec![
+            ("spared".into(), "completed".into(), None),
+            (
+                "withdrawn".into(),
+                "killed".into(),
+                Some("withdrawn".into())
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn s2_settled_scoped_withdraw_is_identical_across_expiry_for_carrier_and_owner() {
+    use aft::db::call_ledger as ledger;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::head().spawn(&root).await.unwrap();
+    std::fs::write(root.join("project/input.txt"), "content\n").unwrap();
+    let carrier_stamp = scoped_stamp("carrier", "owner", "scope");
+    let owner_stamp = scoped_stamp("owner", "owner", "scope");
+    let carrier = Subject::head()
+        .route(&process, &carrier_stamp)
+        .await
+        .unwrap();
+    let read = json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"settled"});
+    assert_eq!(
+        response_json(&carrier.raw(read, false).await)["isError"],
+        false
+    );
+    let first = carrier.terminal(withdraw_body("settled")).await;
+    assert_eq!(first.header.ty, FrameType::Response);
+    let answer = response_json(&first);
+    assert_eq!(answer["answer"], "completed");
+    assert_eq!(answer["result_retained"], true);
+    drop(process);
+    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    conn.execute(
+        "UPDATE call_ledger SET settled_at=settled_at-?1",
+        [ledger::RETENTION_MS],
+    )
+    .unwrap();
+    drop(conn);
+    let process = Subject::head().restart(&root).await.unwrap();
+    let carrier = Subject::head()
+        .route(&process, &carrier_stamp)
+        .await
+        .unwrap();
+    let owner = Subject::head().route(&process, &owner_stamp).await.unwrap();
+    let after = carrier.terminal(withdraw_body("settled")).await;
+    let by_owner = owner
+        .terminal(json!({"name":"tool.withdraw","arguments":{"call_key":"settled","carrier":"reserved:carrier"}}))
+        .await;
+    assert_eq!(
+        (after.header.ty, &after.body),
+        (first.header.ty, &first.body)
+    );
+    assert_eq!(
+        (by_owner.header.ty, &by_owner.body),
+        (first.header.ty, &first.body)
+    );
+    // The entry is unacked and now reads `expired`.
+    let page = late_results_page(&owner).await;
+    let entries = entries_for(&page, "settled");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["kind"], "expired");
+}
+
+#[tokio::test]
+async fn s2_unobserved_scoped_row_answers_already_started_unknown() {
+    use aft::db::call_ledger::{self as ledger, Key, ScopeIdentity, State};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let stamp = scoped_stamp("carrier", "owner", "scope");
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
+    route
+        .raw(
+            json!({"name":"read","arguments":{"filePath":"missing.txt"},"call_key":"seed"}),
+            false,
+        )
+        .await;
+    drop(process);
+    // A read admitted and dispatched, whose end AFT never observed before it
+    // stopped: recovery settles it "started, end unobserved".
+    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let key = Key {
+        carrier: "reserved:carrier".into(),
+        call_key: "unobserved".into(),
+    };
+    ledger::admit(
+        &conn,
+        &key,
+        "digest",
+        Some(&ScopeIdentity {
+            owner: "reserved:owner".into(),
+            scope_ref: "scope".into(),
+            scope_epoch: 7,
+        }),
+        State::DispatchStarted,
+    )
+    .unwrap();
+    drop(conn);
+    let process = Subject::head().restart(&root).await.unwrap();
+    let route = Subject::head().route(&process, &stamp).await.unwrap();
+    let first = route.terminal(withdraw_body("unobserved")).await;
+    assert_eq!(first.header.ty, FrameType::Response);
+    assert_eq!(
+        response_json(&first),
+        json!({"answer": "already_started", "outcome": "unknown"})
+    );
+    assert_eq!(
+        route.terminal(withdraw_body("unobserved")).await.body,
+        first.body
+    );
+    let owner = Subject::head()
+        .route(&process, &scoped_stamp("owner", "owner", "scope"))
+        .await
+        .unwrap();
+    let page = late_results_page(&owner).await;
+    let entries = entries_for(&page, "unobserved");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        (
+            &entries[0]["kind"],
+            &entries[0]["reduced"],
+            &entries[0]["outcome"]
+        ),
+        (&json!("result"), &json!(true), &json!("unknown"))
+    );
+}
+
+#[tokio::test]
+async fn s2_completed_scoped_bash_reaches_only_its_owner_once_and_is_acked_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let carrier = Subject::head()
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    let marker = root.join("project/completed-marker");
+    let completed = carrier
+        .raw(
+            json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"completed"}),
+            true,
+        )
+        .await;
+    assert_eq!(response_json(&completed)["isError"], false);
+    // The approved command really ran where the held calls write.
+    assert!(marker.exists());
+    let owner = Subject::head()
+        .route(&process, &scoped_stamp("owner", "owner", "scope"))
+        .await
+        .unwrap();
+    let page = late_results_page(&owner).await;
+    let entries = entries_for(&page, "completed");
+    assert_eq!(entries.len(), 1, "{page}");
+    assert_eq!(entries[0]["kind"], "result");
+    assert_eq!(entries[0]["custodian"], "reserved:owner");
+    assert_eq!(entries[0]["result"], response_json(&completed));
+    // The carrier is not the custodian: it sees no entry.
+    assert_eq!(late_results_page(&carrier).await["entries"], json!([]));
+    for _ in 0..2 {
+        let acked = owner
+            .terminal(json!({"name":"late_results.ack","arguments":{"through": page["cursor"]}}))
+            .await;
+        assert_eq!(acked.header.ty, FrameType::Response);
+        assert_eq!(response_json(&acked), json!({}));
+        assert!(entries_for(&late_results_page(&owner).await, "completed").is_empty());
+    }
+}
+
 /// Bind a tool-provider v1 route, the way a consumer that declared
 /// `role_versions: {"tool-provider": "v1"}` on route open reaches AFT.
 async fn bind_route(
