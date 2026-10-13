@@ -103,8 +103,8 @@ jobs:
         id: pr_token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.CK_PUBLIC_BOT_APP_ID }}
+          private-key: ${{ secrets.CK_PUBLIC_BOT_PRIVATE_KEY }}
           owner: cortexkit
           repositories: aft
 
