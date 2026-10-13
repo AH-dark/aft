@@ -2794,6 +2794,46 @@ mod tests {
     }
 
     #[test]
+    fn a03_move_recovered_quote_parity() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("module.ts");
+        let dest = root.path().join("dest.ts");
+        let consumer = root.path().join("consumer.ts");
+        for input in [
+            "import { moved } from './module",
+            "import { moved } from './module\nconst text = 'next';\n",
+            "export { moved } from \"./module",
+        ] {
+            MOVE_EXHAUSTIVE_PROBE.with(|force| force.set(true));
+            let baseline = rewrite_consumer_imports(
+                input,
+                &consumer,
+                &source,
+                &dest,
+                "moved",
+                Some(LangId::TypeScript),
+                false,
+                root.path(),
+            );
+            MOVE_EXHAUSTIVE_PROBE.with(|force| force.set(false));
+            let actual = rewrite_consumer_imports(
+                input,
+                &consumer,
+                &source,
+                &dest,
+                "moved",
+                Some(LangId::TypeScript),
+                false,
+                root.path(),
+            );
+            assert_eq!(
+                actual, baseline,
+                "tree-sitter recovery must not lose a module reference in {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a03_move_filter_complete_consumers_and_fallback() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("module/index.ts");
