@@ -53,6 +53,279 @@ fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }
 
+fn copied_identity(identity: &RouteIdentity) -> RouteIdentityData {
+    RouteIdentityData {
+        root: identity.root.clone(),
+        project_root: identity.project_root.clone(),
+        harness: identity.harness.clone(),
+        session: identity.session.clone(),
+        role: identity.role,
+        trust: identity.trust,
+        spawn_principal: identity.spawn_principal.clone(),
+        consumer_elicitation_capable: identity.consumer_elicitation_capable,
+        disabled_tools: identity.disabled_tools.clone(),
+        scope: identity.scope.clone(),
+        call_mode: identity.call_mode.clone(),
+        run_scope: OnceLock::new(),
+        made_tool_call: AtomicBool::new(false),
+    }
+}
+
+fn at_epoch(identity: &RouteIdentity, epoch: u64) -> RouteIdentity {
+    let mut data = copied_identity(identity);
+    data.scope.as_mut().unwrap().scope_epoch = epoch;
+    RouteIdentity(Arc::new(data))
+}
+
+async fn first_read(ctx: Arc<AppContext>, identity: RouteIdentity, preset: &str) {
+    ctx.update_config(|config| config.project_root = Some(identity.project_root.clone()));
+    let target = identity.project_root.join("first-call.txt");
+    std::fs::write(&target, "first call").unwrap();
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(identity.root.clone(), ctx);
+    let routes = HashMap::from([(route_key(41, 1), identity)]);
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        41,
+        1,
+        7,
+        serde_json::to_vec(&json!({
+            "op":"tool.call", "name":"read", "preset":preset,
+            "arguments":{"filePath":target}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (writer, mut replies) = mpsc::channel(8);
+    let (bash_tx, _bash_rx) = mpsc::channel(8);
+    let (touch_tx, _touch_rx) = mpsc::channel(8);
+    let (entries, _deferred_rx) = mpsc::unbounded_channel();
+    handle_tool_call(
+        &writer,
+        &frame,
+        None,
+        PhaseTrace::new(Instant::now()),
+        &routes,
+        &HashMap::new(),
+        &ReclaimedRoutes::default(),
+        &mut HashMap::new(),
+        &executor,
+        &Arc::default(),
+        &Arc::new(PendingDeferredSetups::default()),
+        &Arc::new(Notify::new()),
+        &PersistentCancelSignal::new(),
+        &bash_tx,
+        &touch_tx,
+        &Arc::new(DispatchPathMetrics::new()),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut 1,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        |request, ctx| crate::commands::read::handle_read(&request, ctx),
+        &DeferredResponseSender {
+            entries,
+            wake: crate::response_finalize::DeferredResponseWake::default(),
+        },
+        false,
+        1024 * 1024,
+        &drain::ModuleDrainWindow::default(),
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .expect("first read must terminate")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
+    assert_eq!(body["structuredContent"]["success"], true, "{body}");
+}
+
+#[tokio::test]
+async fn grants_revived_launch_first_call_restores_without_catalog() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let target = head.project_root.join("shared");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    let conn = ctx.db().unwrap();
+    let conn = conn.lock().unwrap();
+    let expected = vec![AccessGrant {
+        path: policy_path(&target),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    }];
+    assert_eq!(store::list(&conn, &scope_key(&revived)).unwrap(), expected);
+    assert_eq!(store::list(&conn, &scope_key(&worker)).unwrap(), expected);
+    let markers: i64 = conn
+        .query_row("SELECT COUNT(*) FROM access_materialized", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(markers, 2, "old-epoch history must remain intact");
+}
+
+#[tokio::test]
+async fn grants_revived_launch_does_not_copy_ask_earned_grants() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    remote_policy::catalog(json!({"preset":"worker"}), &worker, &ctx).unwrap();
+    let earned = AccessGrant {
+        path: policy_path(&head.project_root.join("consented")),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Write,
+    };
+    {
+        let db = ctx.db().unwrap();
+        // Consent installs standing grants, not launch parameters.
+        store::insert(&db.lock().unwrap(), &scope_key(&worker), &earned).unwrap();
+    }
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    assert!(store::list(&conn, &scope_key(&revived)).unwrap().is_empty());
+    assert_eq!(
+        store::list(&conn, &scope_key(&worker)).unwrap(),
+        vec![earned]
+    );
+}
+
+#[test]
+fn grants_revived_launch_drops_and_logs_revoked_head_and_floor() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let held = head.project_root.join("held");
+    let revoked = worker.project_root.join("revoked");
+    let denied = head.project_root.join("denied");
+    let grant = AccessGrant {
+        path: policy_path(&revoked),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    {
+        let db = ctx.db().unwrap();
+        store::insert(&db.lock().unwrap(), &scope_key(&head), &grant).unwrap();
+    }
+    let raw = json!([
+        {"path":held,"mode":"write"},
+        {"path":revoked,"mode":"read"},
+        {"path":denied,"mode":"read"}
+    ]);
+    remote_policy::catalog(catalog_request(raw.clone()), &worker, &ctx).unwrap();
+    operation(json!({"path":revoked}), "grants.revoke", &head, &ctx).unwrap();
+    ctx.update_config(|config| config.sandbox.read_deny.push(denied.clone()));
+    register(&head, &ctx).unwrap();
+    let revived = at_epoch(&worker, 2);
+    let (result, lines) =
+        crate::logging::capture_log_lines(|| restore_launch(&revived, &ctx, "worker"));
+    result.unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for (path, reason) in [(&revoked, "head_not_held"), (&denied, "denied_floor")] {
+        assert!(
+            lines.iter().any(|line| {
+                line.contains(&format!("path={}", json!(path)))
+                    && line.contains("mode=\"read\"")
+                    && line.contains(&format!("reason=\"{reason}\""))
+            }),
+            "missing named drop for {path:?}: {lines:?}"
+        );
+    }
+    let db = ctx.db().unwrap();
+    {
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            store::list(&conn, &scope_key(&revived)).unwrap(),
+            vec![AccessGrant {
+                path: policy_path(&held),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Write,
+            }]
+        );
+        assert_eq!(store::list(&conn, &scope_key(&worker)).unwrap().len(), 3);
+        assert_eq!(
+            store::launch_params(&conn, &launch_key(&revived, "worker").unwrap()).unwrap(),
+            Some(raw)
+        );
+        store::revoke(&conn, &scope_key(&revived), &policy_path(&held)).unwrap();
+    }
+    let (result, lines) =
+        crate::logging::capture_log_lines(|| restore_launch(&revived, &ctx, "worker"));
+    result.unwrap();
+    assert!(
+        lines.is_empty(),
+        "repeat call must not revalidate: {lines:?}"
+    );
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn grants_revived_launch_isolates_ref_owner_session_and_preset() {
+    for dimension in [
+        "ref",
+        "owner",
+        "session",
+        "preset",
+        "principal",
+        "harness",
+        "root",
+    ] {
+        let (dir, ctx, head, worker) = fixture();
+        let worker = at_epoch(&worker, 1);
+        remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root.join("shared"),"mode":"read"}])),
+            &worker,
+            &ctx,
+        )
+        .unwrap();
+        let mut data = copied_identity(&at_epoch(&worker, 2));
+        let mut preset = "worker";
+        match dimension {
+            "ref" => data.scope.as_mut().unwrap().scope_ref = "other".into(),
+            "owner" => {
+                data.scope.as_mut().unwrap().owner =
+                    serde_json::from_value(json!({"kind":"direct"})).unwrap()
+            }
+            "session" => data.session = "other".into(),
+            "preset" => preset = "head",
+            "principal" => {
+                if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+                    &mut data.spawn_principal
+                {
+                    *principal_id = Some("reserved:other".into());
+                }
+            }
+            "harness" => data.harness = "other".into(),
+            _ => {
+                data.project_root = dir.path().join("other-root");
+                std::fs::create_dir(&data.project_root).unwrap();
+                data.root = ProjectRootId::from_path(&data.project_root).unwrap();
+            }
+        }
+        let other = RouteIdentity(Arc::new(data));
+        let ctx = Arc::new(ctx);
+        first_read(ctx.clone(), other.clone(), preset).await;
+        let db = ctx.db().unwrap();
+        assert!(
+            store::list(&db.lock().unwrap(), &scope_key(&other))
+                .unwrap()
+                .is_empty(),
+            "{dimension}"
+        );
+    }
+}
+
 #[test]
 fn grants_allow_paths_accepts_a_literal_tilde_inside_an_absolute_path() {
     // Windows short names (C:\Users\RUNNER~1) put `~` inside absolute paths.

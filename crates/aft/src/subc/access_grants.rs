@@ -378,15 +378,74 @@ pub(super) fn validate(
         if head.head_policy(&grant) != HeadPolicy::Allow {
             return Err(param_refused(index, path_value, "head_not_held"));
         }
-        if let Some(prior) = grants.iter_mut().find(|g| g.path == grant.path) {
-            if mode == AccessOperation::Write {
-                prior.operation = mode;
-            }
-        } else {
-            grants.push(grant);
-        }
+        merge_grant(&mut grants, grant);
     }
     Ok(grants)
+}
+
+fn merge_grant(grants: &mut Vec<AccessGrant>, grant: AccessGrant) {
+    if let Some(prior) = grants.iter_mut().find(|g| g.path == grant.path) {
+        if grant.operation == AccessOperation::Write {
+            prior.operation = grant.operation;
+        }
+    } else {
+        grants.push(grant);
+    }
+}
+
+/// Revived workers do not fetch another catalog. Recheck each saved launch entry
+/// with the catalog validator so a head's revoked capability or new deny floor
+/// cannot be delegated again. Invalid entries do not suppress valid siblings.
+pub(super) fn restore_launch(
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+    preset: &str,
+) -> Result<(), subc_protocol::ErrorBody> {
+    let Some(key) = launch_key(identity, preset) else {
+        return Ok(());
+    };
+    let db = ctx
+        .db()
+        .ok_or_else(|| refusal("grants_unavailable", "scope persistence unavailable"))?;
+    let conn = db
+        .lock()
+        .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))?;
+    register_on(&conn, identity, ctx)?;
+    let mut dropped = Vec::new();
+    store::restore_launch(&conn, &key, |conn, raw| {
+        let head = head_scope(identity)
+            .map(|scope| policy_for_scope(conn, &scope, ctx))
+            .transpose()?
+            .flatten();
+        let entries = raw.as_array().ok_or(rusqlite::Error::InvalidQuery)?;
+        let mut grants = Vec::new();
+        for entry in entries {
+            match validate(&json!([entry]), head.as_ref()) {
+                Ok(valid) => {
+                    for grant in valid {
+                        merge_grant(&mut grants, grant);
+                    }
+                }
+                Err(error) => dropped.push(format!(
+                    "launch allow_paths dropped: path={} mode={} reason={}",
+                    entry.get("path").unwrap_or(&Value::Null),
+                    entry.get("mode").unwrap_or(&Value::Null),
+                    error
+                        .detail
+                        .as_ref()
+                        .and_then(|d| d.get("reason"))
+                        .unwrap_or(&Value::Null),
+                )),
+            }
+        }
+        Ok(grants)
+    })
+    .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
+    // Report only committed drops, once per epoch, not failed installations.
+    for message in dropped {
+        crate::slog_warn!("{message}");
+    }
+    Ok(())
 }
 
 pub(super) fn catalog(

@@ -8660,6 +8660,27 @@ async fn handle_tool_call(
         return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
     }
 
+    // Restore launch capabilities before any shell, deferred or plain call can
+    // perform its permission preflight. The catalog is not refetched on revival.
+    if worker_preset && access_grants::launch_key(&identity, "worker").is_some() {
+        if let Some(ctx) = executor.actor_context(&identity.root) {
+            let identity_for_restore = identity.clone();
+            let restored = tokio::task::spawn_blocking(move || {
+                access_grants::restore_launch(&identity_for_restore, &ctx, "worker")
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(subc_protocol::ErrorBody::new(
+                    "grants_unavailable",
+                    format!("launch grant restoration failed: {error}"),
+                ))
+            });
+            if let Err(error) = restored {
+                return send_provider_error(tx, metrics, frame, error).await;
+            }
+        }
+    }
+
     if matches!(bare_name.as_str(), "bash" | "powershell") {
         // Subc answers bash on its own deferred path, not the shared tool-call
         // runner, so it captures the call for the repeat breaker here.
