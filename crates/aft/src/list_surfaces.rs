@@ -396,7 +396,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "storage_retention.rs",
-        enclosing_item: "bounded_dirs, traversal_batch, next_batch, tree_files, run_pass_with_clock, prune_bindings",
+        enclosing_item: "bounded_dirs, traversal_batch_filtered, next_batch, validate_tree, due_first, orphan_first, run_pass_with_budget, prune_bindings",
         location_or_primitive: "PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",
         reason: "internal disk-maintenance walks, not tool-result lists; bounded lexical batches persist only processed names, incomplete protection snapshots refuse deletion, and health reports examined, removed and stopped-early counts",
     },
