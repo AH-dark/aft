@@ -267,6 +267,8 @@ unit_bin_partition_command = [
     "--",
     "--skip",
     "platform_verifier_tls_client_subprocess",
+    "--skip",
+    "panic_hook_preserves_default_backtrace_behavior_and_persists",
 ]
 unit_bin_partition_output = run_command(unit_bin_partition_command, merge_stderr=False)
 unit_bin_shardable_entries = parse_nextest_list(
@@ -275,12 +277,21 @@ unit_bin_shardable_entries = parse_nextest_list(
 unit_bin_partitions = partition_nextest_entries(
     unit_bin_partition_command, {"lib", "bin"}
 )
-serial_tls_entries = [
+serial_tls_candidates = [
     entry
     for entry in unit_bin_entries
-    if entry.kind == "lib"
-    and entry.name.endswith("platform_verifier_tls_client_subprocess")
+    if entry.name.endswith("platform_verifier_tls_client_subprocess")
 ]
+serial_tls_entries = [entry for entry in serial_tls_candidates if entry.kind == "lib"]
+serial_backtrace_candidates = [
+    entry
+    for entry in unit_bin_entries
+    if entry.name.endswith("panic_hook_preserves_default_backtrace_behavior_and_persists")
+]
+serial_backtrace_entries = [
+    entry for entry in serial_backtrace_candidates if entry.kind == "lib"
+]
+serial_unit_keys = {entry.key for entry in serial_tls_entries + serial_backtrace_entries}
 
 doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "doc"]
 doc_entries: list[CargoEntry] = []
@@ -364,6 +375,12 @@ watcher_in_nextest = sorted(
 unit_partition_missing, unit_partition_duplicate, unit_partition_extra = partition_coverage_errors(
     unit_bin_shardable_entries, unit_bin_partitions
 )
+serial_tests_in_unit_partitions = sorted(
+    entry.key
+    for partition in unit_bin_partitions
+    for entry in partition
+    if entry.key in serial_unit_keys
+)
 nextest_partition_missing, nextest_partition_duplicate, nextest_partition_extra = partition_coverage_errors(
     nextest_shardable_entries, nextest_partitions
 )
@@ -406,7 +423,11 @@ if (
     or double_covered
     or extra_keys
     or watcher_in_nextest
+    or len(serial_tls_candidates) != 1
     or len(serial_tls_entries) != 1
+    or len(serial_backtrace_candidates) != 1
+    or len(serial_backtrace_entries) != 1
+    or serial_tests_in_unit_partitions
     or unit_partition_missing
     or unit_partition_duplicate
     or unit_partition_extra
@@ -433,11 +454,25 @@ if (
         print(f"  watcher leaked into nextest ({len(watcher_in_nextest)}):")
         for key in watcher_in_nextest[:20]:
             print(f"    {key}")
-    if len(serial_tls_entries) != 1:
+    if len(serial_tls_candidates) != 1 or len(serial_tls_entries) != 1:
         print(
             "  serial platform-verifier TLS test entries: "
-            f"expected 1, found {len(serial_tls_entries)}"
+            f"expected one lib target, found {len(serial_tls_candidates)} targets "
+            f"({len(serial_tls_entries)} lib entries)"
         )
+    if len(serial_backtrace_candidates) != 1 or len(serial_backtrace_entries) != 1:
+        print(
+            "  serial symbolized-backtrace test entries: "
+            f"expected one lib target, found {len(serial_backtrace_candidates)} targets "
+            f"({len(serial_backtrace_entries)} lib entries)"
+        )
+    if serial_tests_in_unit_partitions:
+        print(
+            "  serial-only tests present in lib/bin partitions "
+            f"({len(serial_tests_in_unit_partitions)}):"
+        )
+        for key in serial_tests_in_unit_partitions[:20]:
+            print(f"    {key}")
     for label, missing, duplicate, extra in (
         (
             "nextest lib/bin partitions",
