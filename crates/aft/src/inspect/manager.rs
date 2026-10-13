@@ -280,6 +280,8 @@ struct Tier2ReuseOptions {
     allow_callgraph_cold_build: bool,
     require_callgraph_snapshot: bool,
     interactive: bool,
+    // Direct result readers consume per-file facts; waiter completion only needs the aggregate.
+    return_contributions: bool,
 }
 
 impl Tier2ReuseOptions {
@@ -295,6 +297,7 @@ impl Default for Tier2ReuseOptions {
             allow_callgraph_cold_build: true,
             require_callgraph_snapshot: false,
             interactive: false,
+            return_contributions: false,
         }
     }
 }
@@ -3073,7 +3076,14 @@ impl InspectManager {
     }
 
     fn tier2_run_with_reuse_job_result(&self, job: InspectJob) -> InspectResult {
-        self.tier2_run_with_reuse_job_result_with_options(job, Tier2ReuseOptions::default(), None)
+        self.tier2_run_with_reuse_job_result_with_options(
+            job,
+            Tier2ReuseOptions {
+                return_contributions: true,
+                ..Tier2ReuseOptions::default()
+            },
+            None,
+        )
     }
 
     fn tier2_run_with_reuse_job_result_catching(
@@ -3636,7 +3646,11 @@ impl InspectManager {
                     phases.log(job.category, &job.project_root);
                     return Ok(InspectScanSuccess {
                         scanned_files: scan_files,
-                        contributions: Vec::new(),
+                        contributions: if options.return_contributions {
+                            load_contributions(cache, job)?
+                        } else {
+                            Vec::new()
+                        },
                         aggregate,
                     });
                 }
@@ -3741,7 +3755,11 @@ impl InspectManager {
                             phases.log(job.category, &job.project_root);
                             return Ok(InspectScanSuccess {
                                 scanned_files: scan_files,
-                                contributions: Vec::new(),
+                                contributions: if options.return_contributions {
+                                    load_contributions(cache, job)?
+                                } else {
+                                    Vec::new()
+                                },
                                 aggregate,
                             });
                         }
@@ -3916,8 +3934,12 @@ impl InspectManager {
 
         Ok(InspectScanSuccess {
             scanned_files: scan_files,
-            // Contributions have already been persisted; completion only publishes the aggregate.
-            contributions: Vec::new(),
+            // Facts are already persisted. Move them only to direct readers, not aggregate-only completion.
+            contributions: if options.return_contributions {
+                contributions
+            } else {
+                Vec::new()
+            },
             aggregate,
         })
     }
@@ -9115,6 +9137,7 @@ export function bannerUnused() {}
                     allow_callgraph_cold_build: true,
                     require_callgraph_snapshot: false,
                     interactive: false,
+                    return_contributions: false,
                 },
                 None,
             )

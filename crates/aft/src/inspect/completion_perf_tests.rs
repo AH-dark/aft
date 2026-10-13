@@ -197,3 +197,51 @@ fn duplicate_cache_upgrade_rebuilds_legacy_fragment_rows() {
             .all(Value::is_array)
     );
 }
+
+#[test]
+fn tier2_direct_result_returns_facts_without_reloading_rollup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let path = root.join("src/example.rs");
+    write_projection_cache_file(
+        &path,
+        "fn example() { let number = 1; println!(\"{number}\"); }\n",
+    );
+    let manager = InspectManager::new();
+    let snapshot = tier1_snapshot(&root);
+    let run = || {
+        manager
+            .tier2_run_with_reuse_result(snapshot.clone(), InspectCategory::Duplicates, None)
+            .outcome
+            .unwrap()
+    };
+    let work = || super::super::cache::CONTRIBUTION_LOAD_WORK.with(std::cell::Cell::get);
+    let reset = || super::super::cache::CONTRIBUTION_LOAD_WORK.with(|work| work.set((0, 0, 0)));
+    reset();
+    let cold = run();
+    assert_eq!(cold.contributions.len(), 1);
+    assert_eq!(work().0, 1);
+    assert_eq!(work().1, 1);
+    assert!(work().2 > 0);
+    reset();
+    let warm = run();
+    assert!(warm.contributions.is_empty());
+    assert_eq!(work(), (0, 0, 0));
+    write_projection_cache_file(
+        &path,
+        "fn example() { let number = 333; println!(\"{number}\"); }\n",
+    );
+    reset();
+    let changed = run();
+    assert_eq!(changed.contributions.len(), 1);
+    assert_eq!(work().0, 1);
+    assert_eq!(work().1, 1);
+    assert!(work().2 > 0);
+    println!(
+        "direct result facts: cold={} warm={} changed={}; changed load work={:?}",
+        cold.contributions.len(),
+        warm.contributions.len(),
+        changed.contributions.len(),
+        work()
+    );
+}
