@@ -898,7 +898,15 @@ pub(super) fn submit_deferred_bash(
                                                                 &remote_source,
                                                             ),
                                                          || {
-                                                              crate::bash_background::registry::with_scope_spawn(scope_stamp, || dispatch(raw_req, ctx))
+                                                              crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || {
+                                                                  let response = dispatch(raw_req, ctx);
+                                                                  // Registration and revocation can race across actors.
+                                                                  // Recheck after dispatch so neither ordering loses the task.
+                                                                  if let Some(scope) = &scope_stamp {
+                                                                      ctx.bash_background().kill_scope_if_revoked(scope);
+                                                                  }
+                                                                  response
+                                                              })
                                                          },
                                                         ),
                                                     )
@@ -2629,6 +2637,84 @@ mod grant_path_tests {
             None,
             None,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scope_confirmation_kills_a_task_registered_after_its_snapshot() {
+        let (_dir, root) = super::super::test_support::test_root("late-scope-registration");
+        let ctx = super::super::test_support::test_ctx();
+        let registry = ctx.bash_background().clone();
+        let scope = subc_protocol::scope::ScopeStamp::new(
+            Principal::Reserved {
+                module_id: "owner".into(),
+            },
+            "scope",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true);
+        registry.kill_scope(&scope);
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(8);
+        let (touch_tx, _touch_rx) = mpsc::channel(8);
+        submit_deferred_bash(
+            &executor,
+            &completion_tx,
+            &touch_tx,
+            &metrics,
+            running_bash_stub,
+            root.clone(),
+            root.as_path().into(),
+            "late-session".into(),
+            "late-call".into(),
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            1,
+            Flags::new(false, Priority::Interactive, false),
+            PROTOCOL_VERSION,
+            json!({"command":"sleep 2","timeout":10000,"foreground_orchestrate":true,"block_to_completion":true}),
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                run_scope: None,
+                scope: Some(scope),
+                late_results: false,
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            true,
+            super::remote_policy::RemoteSource::None,
+            Instant::now(),
+        );
+        let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = completion.response_for_test();
+        assert_eq!(response.data["status"], "killed", "{response:?}");
+        let task = response.data["task_id"].as_str().unwrap();
+        assert_eq!(
+            registry
+                .status(task, "late-session", None, None, 0)
+                .unwrap()
+                .info
+                .status_reason
+                .as_deref(),
+            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON)
+        );
     }
 
     #[cfg(unix)]

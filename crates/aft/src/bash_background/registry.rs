@@ -638,6 +638,7 @@ pub(crate) struct RegistryInner {
     retired_undelivered_completions: AtomicU64,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    revoked_scopes: Mutex<HashSet<(String, String, u64)>>,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
@@ -1032,6 +1033,7 @@ impl BgTaskRegistry {
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
                 retired_undelivered_completions: AtomicU64::new(0),
                 watchdog_tasks: Mutex::new(HashMap::new()),
+                revoked_scopes: Mutex::new(HashSet::new()),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
@@ -6885,6 +6887,17 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        // Remember the end before taking the task snapshot. A dispatch already
+        // queued on another thread may register its process after this pass.
+        self.inner
+            .revoked_scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((
+                serde_json::to_string(&scope.owner).expect("principal is JSON"),
+                scope.scope_ref.clone(),
+                scope.scope_epoch,
+            ));
         for task in self.running_tasks() {
             let matches = task
                 .lock_state()
@@ -6904,6 +6917,22 @@ impl BgTaskRegistry {
                     );
                 }
             }
+        }
+    }
+
+    pub(crate) fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        let revoked = self
+            .inner
+            .revoked_scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&(
+                serde_json::to_string(&scope.owner).expect("principal is JSON"),
+                scope.scope_ref.clone(),
+                scope.scope_epoch,
+            ));
+        if revoked {
+            self.kill_scope(scope);
         }
     }
 
