@@ -199,9 +199,9 @@ type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod access_grants;
 mod bash;
-mod consent;
 #[cfg(test)]
 mod bash_selector_tests;
+mod consent;
 mod drain;
 mod health;
 mod manifest;
@@ -8868,9 +8868,9 @@ async fn handle_tool_call(
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
             ));
-            let _ask_route = crate::access_policy::ask_route_guard(Some(
-                access_grants::ask_route(&identity_for_run),
-            ));
+            let _ask_route = crate::access_policy::ask_route_guard(Some(access_grants::ask_route(
+                &identity_for_run,
+            )));
             phase_trace.mark_job_admitted();
             // Admission for this deferred tool call: pin the config so the
             // preflight and the deferred worker share one snapshot.

@@ -71,9 +71,9 @@ pub fn new_holder() -> String {
 }
 
 fn holder_is_current(holder: &str) -> bool {
-    holder
-        .split_once(':')
-        .is_some_and(|(incarnation, _)| incarnation == crate::db::call_ledger::provider_incarnation())
+    holder.split_once(':').is_some_and(|(incarnation, _)| {
+        incarnation == crate::db::call_ledger::provider_incarnation()
+    })
 }
 
 fn decode<T: serde::de::DeserializeOwned>(json: &str) -> rusqlite::Result<T> {
@@ -298,7 +298,16 @@ mod tests {
         let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
         let ask = key("hash");
         let selector = serde_json::json!({"ref":"worker"});
-        open(&conn, &ask, "k1", &selector, &serde_json::json!({}), &grant("/a"), 1).unwrap();
+        open(
+            &conn,
+            &ask,
+            "k1",
+            &selector,
+            &serde_json::json!({}),
+            &grant("/a"),
+            1,
+        )
+        .unwrap();
         set_elicitation(&conn, &ask, "k1", "acc_1").unwrap();
         let first = new_holder();
         let second = new_holder();
@@ -312,7 +321,16 @@ mod tests {
         assert!(record.holder_is_live());
         assert_eq!(record.call_key, None);
         // A second outside path of the same call keeps the first approval.
-        open(&conn, &ask, "k2", &selector, &serde_json::json!({}), &grant("/b"), 2).unwrap();
+        open(
+            &conn,
+            &ask,
+            "k2",
+            &selector,
+            &serde_json::json!({}),
+            &grant("/b"),
+            2,
+        )
+        .unwrap();
         assert_eq!(get(&conn, &ask).unwrap().unwrap().holder, None);
         assert_eq!(
             claim(&conn, &ask, "k2", &second).unwrap(),

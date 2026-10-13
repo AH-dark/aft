@@ -115,11 +115,13 @@ pub fn parent(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<Scop
         )
         .optional()?;
     Ok(match row {
-        Some((Some(owner), Some(scope_ref), Some(epoch))) => epoch.parse().ok().map(|epoch| ScopeKey {
-            owner,
-            scope_ref,
-            epoch,
-        }),
+        Some((Some(owner), Some(scope_ref), Some(epoch))) => {
+            epoch.parse().ok().map(|epoch| ScopeKey {
+                owner,
+                scope_ref,
+                epoch,
+            })
+        }
         _ => None,
     })
 }

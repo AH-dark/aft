@@ -85,11 +85,11 @@ static TEST_TRANSPORT: LazyLock<StdMutex<Option<Arc<dyn ConsentTransport>>>> =
 
 /// Install the production transport for this process's daemon connection.
 pub(super) fn install_subc_transport(connection_file: &Path) {
-    *TRANSPORT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(
-        SharedSubcConsent(Arc::new(SubcConsentTransport::new(
-            connection_file.to_path_buf(),
-        ))),
-    ));
+    *TRANSPORT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(SharedSubcConsent(
+        Arc::new(SubcConsentTransport::new(connection_file.to_path_buf())),
+    )));
 }
 
 /// Replace the transport for consent tests; the module loop's production
@@ -302,7 +302,9 @@ impl RouteHold {
 
 impl Drop for RouteHold {
     fn drop(&mut self) {
-        let mut held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = HELD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(flags) = held.get_mut(&self.route) {
             flags.retain(|flag| !Arc::ptr_eq(flag, &self.closed));
             if flags.is_empty() {
@@ -512,9 +514,11 @@ fn prepare(
     };
     let selector = selector(stamp);
     if let Some(record) = asks::get(conn, &key)? {
-        if let (Some(call_key), Some(request), Some(pending)) =
-            (record.call_key.clone(), record.request.clone(), record.pending.clone())
-        {
+        if let (Some(call_key), Some(request), Some(pending)) = (
+            record.call_key.clone(),
+            record.request.clone(),
+            record.pending.clone(),
+        ) {
             // Re-send the ask under the call key it was first sent with, so
             // Cingulate returns the same ask rather than a second one.
             return Ok(Prep::Ask(Prepared {
@@ -624,12 +628,7 @@ fn elicitation_id(reply: &Value) -> Option<String> {
 }
 
 fn answer(call: &HeldCall, code: &str, message: String, prep_grant: &AccessGrant) -> Response {
-    Response::error_with_data(
-        &call.request_id,
-        code,
-        message,
-        json!({"ask": prep_grant}),
-    )
+    Response::error_with_data(&call.request_id, code, message, json!({"ask": prep_grant}))
 }
 
 fn pending_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
@@ -658,7 +657,12 @@ fn unavailable_answer(call: &HeldCall, grant: &AccessGrant, detail: &str) -> Res
     )
 }
 
-fn refused_answer(call: &HeldCall, grant: &AccessGrant, code: &str, note: Option<&str>) -> Response {
+fn refused_answer(
+    call: &HeldCall,
+    grant: &AccessGrant,
+    code: &str,
+    note: Option<&str>,
+) -> Response {
     let target = format!(
         "{} {}",
         operation_name(grant.operation),
@@ -720,7 +724,13 @@ fn stop_signal(call: &HeldCall, route_hold: &RouteHold) -> Option<Stop> {
     None
 }
 
-fn consent_call(call: &HeldCall, prep: &Prepared, method: &'static str, params: Value, timeout: Duration) -> ConsentCall {
+fn consent_call(
+    call: &HeldCall,
+    prep: &Prepared,
+    method: &'static str,
+    params: Value,
+    timeout: Duration,
+) -> ConsentCall {
     ConsentCall {
         scope: prep.selector.clone(),
         project_root: call.identity.project_root.clone(),
@@ -1016,7 +1026,11 @@ static REATTACHED: LazyLock<StdMutex<HashSet<(String, String, u64)>>> =
 /// ask it left open under its persisted call key, so Cingulate keeps the same
 /// ask; nothing is withdrawn. Approvals claimed by an earlier process are
 /// discarded, never reused.
-pub(super) fn reattach(ctx: &AppContext, identity: &RouteIdentity, runtime: &tokio::runtime::Handle) {
+pub(super) fn reattach(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    runtime: &tokio::runtime::Handle,
+) {
     if !access_grants::alfonso_worker(identity) {
         return;
     }
@@ -1038,7 +1052,10 @@ pub(super) fn reattach(ctx: &AppContext, identity: &RouteIdentity, runtime: &tok
         let Ok(records) = asks::for_scope(&conn, &scope) else {
             return;
         };
-        for record in records.iter().filter(|r| r.call_key.is_none() && !r.holder_is_live()) {
+        for record in records
+            .iter()
+            .filter(|r| r.call_key.is_none() && !r.holder_is_live())
+        {
             let _ = asks::discard(&conn, &record.key);
         }
         records

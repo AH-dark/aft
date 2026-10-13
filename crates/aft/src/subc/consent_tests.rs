@@ -338,7 +338,10 @@ async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
     let call_key = first["call_key"].as_str().unwrap().to_string();
     assert_eq!(f.asks().len(), 1, "the open ask is persisted");
 
-    f.fake.answer(&call_key, json!({"outcome": "allow_once", "answered_by": "head"}));
+    f.fake.answer(
+        &call_key,
+        json!({"outcome": "allow_once", "answered_by": "head"}),
+    );
     // The retry arrives under a new transport call; it re-sends the original
     // consent call key, gets the same ask, and runs once.
     let allowed = f.read(&f.worker, &target, 8).await;
@@ -348,7 +351,10 @@ async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1]["call_key"], json!(call_key));
     assert!(f.asks().is_empty(), "allow_once is used up by the run");
-    assert!(f.worker_grants().is_empty(), "allow_once installs no standing grant");
+    assert!(
+        f.worker_grants().is_empty(),
+        "allow_once installs no standing grant"
+    );
 
     // A later identical call asks again under a new consent call key.
     let again = f.read(&f.worker, &target, 9).await;
@@ -553,7 +559,8 @@ async fn consent_same_key_retry_replays_the_recorded_access_pending() {
         body: serde_json::to_vec(&held).unwrap(),
     };
     assert!(settle(&conn, &key, &recorded, "access_pending", None, 1).unwrap());
-    let Admission::Repeat(row) = admit(&conn, &key, "digest", None, State::DispatchStarted).unwrap()
+    let Admission::Repeat(row) =
+        admit(&conn, &key, "digest", None, State::DispatchStarted).unwrap()
     else {
         panic!("a same-key retry is a repeat");
     };
@@ -617,7 +624,10 @@ fn consent_settlement_treats_an_allow_without_answered_by_as_the_head() {
         settlement(&json!({"outcome": "access_head_gone"})),
         Settlement::Refused("access_head_gone".into())
     );
-    assert_eq!(settlement(&json!({"state": "pending"})), Settlement::Pending);
+    assert_eq!(
+        settlement(&json!({"state": "pending"})),
+        Settlement::Pending
+    );
 }
 
 fn jail_context(root: &Path, sandbox: bool) -> AppContext {
@@ -668,6 +678,20 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
             native.is_native_launcher() || native.refusal_code() == Some("sandbox_unavailable"),
             "{native:?}"
         );
+        if let SpawnPlan::Launcher { profile, .. } = &native {
+            // Writes are confined to the worktree: the directory holding it
+            // (and the sibling worktrees in it) is not writable.
+            let worktree = root.canonicalize().unwrap();
+            let parent = worktree.parent().unwrap();
+            assert!(profile.writable_roots.contains(&worktree), "{profile:?}");
+            assert!(
+                !profile
+                    .writable_roots
+                    .iter()
+                    .any(|writable| parent.starts_with(writable)),
+                "{profile:?}"
+            );
+        }
         for tier in [RequestedSandboxTier::Disabled, RequestedSandboxTier::Host] {
             assert_eq!(resolve(tier).refusal_code(), Some("sandbox_unavailable"));
         }

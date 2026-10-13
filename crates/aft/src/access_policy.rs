@@ -82,7 +82,9 @@ pub(crate) fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
 }
 
 pub(crate) fn current_ask_route() -> AskRoute {
-    ASK_ROUTE.with(|slot| slot.borrow().clone()).unwrap_or_default()
+    ASK_ROUTE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_default()
 }
 
 impl AccessGrant {
@@ -321,7 +323,10 @@ impl AccessPolicy {
         if self.roots.iter().any(|root| path.starts_with(root))
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
-            || self.grants.iter().any(|grant| grant.covers(operation, path))
+            || self
+                .grants
+                .iter()
+                .any(|grant| grant.covers(operation, path))
         {
             AccessDecision::Allow
         } else {
