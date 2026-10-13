@@ -647,7 +647,7 @@ fn vector(name: &str) -> Vec<u8> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/subc/fixtures/cingulate-tool-permission-v1/vectors");
     let bytes = std::fs::read(dir.join(name)).unwrap();
-    // Every vector used here must match Cingulate's own manifest.
+    // Each vector must be listed in Cingulate's SHA256SUMS with this hash.
     let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
     let expected = sums
         .lines()
@@ -729,7 +729,8 @@ fn consent_vectors_replies_decode() {
         decode_record(&decode_result(&vector("withdrawn-reply.json")).unwrap()).unwrap(),
         Settlement::Refused("access_withdrawn".into())
     );
-    // The head relay's replies embed the ask record, still open in both.
+    // The head relay's replies embed the ask record, which is still pending
+    // in both.
     for name in ["head-not-held-reply.json", "escalated-reply.json"] {
         let result = decode_result(&vector(name)).unwrap();
         assert_eq!(
@@ -770,7 +771,8 @@ fn consent_vectors_settled_allow_without_answered_by_is_the_head() {
         decode_record(&record).unwrap(),
         Settlement::Refused("access_head_gone".into())
     );
-    // Lenient shapes from before the contract was pinned are refused.
+    // Shapes outside the contract are refused: a record without a state, an
+    // id under another key, and a reply without the `result` envelope.
     assert!(decode_record(&json!({"outcome": "allow_once"})).is_err());
     assert!(decode_elicitation_id(&json!({"id": "acc_1"})).is_err());
     assert!(decode_result(br#"{"elicitation_id":"acc_1"}"#).is_err());

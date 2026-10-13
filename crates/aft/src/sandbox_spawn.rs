@@ -1639,7 +1639,7 @@ fn build_native_profile(
     result
 }
 
-/// Writes a jailed worker's shell gets beyond its worktree.
+/// What a jailed worker's shell may write outside its worktree.
 #[cfg(unix)]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct WorkerJailGrants {

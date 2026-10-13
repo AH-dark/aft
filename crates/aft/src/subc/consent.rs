@@ -621,8 +621,9 @@ fn prepare(
         }
     }
     let call_key = new_call_key();
-    // A worker-scope ask carries the head's authority; Cingulate requires it
-    // there and refuses it on every other scope kind.
+    // `head_policy` says whether the worker's head itself holds the requested
+    // access, which decides whether the head may allow it. Cingulate requires
+    // it on asks from a `worker` scope and refuses it on every other kind.
     let head = match identity.scope.as_ref().map(|stamp| stamp.kind) {
         Some(subc_protocol::scope::ScopeKind::Worker) => {
             Some(head_policy(conn, ctx, identity, grant)?)
@@ -678,9 +679,10 @@ fn head_policy_name(policy: HeadPolicy) -> &'static str {
     }
 }
 
-/// `consent.request` parameters for one `tool_permission` ask on an in-process
-/// read or write: exactly the fields Cingulate accepts (it refuses unknown
-/// ones). `command` belongs to exec asks only, which AFT does not send.
+/// `consent.request` parameters asking permission for one in-process read or
+/// write of `path`: exactly the fields Cingulate accepts, since it refuses
+/// unknown ones. Cingulate's `command` field is only for asks to run a shell
+/// command, which AFT does not send (shell file access is never asked).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn request_params(
     call_key: &str,
@@ -735,9 +737,10 @@ pub(super) fn decode_elicitation_id(result: &Value) -> Result<String, ConsentErr
 
 /// The state of the ask record `consent.await` and `consent.withdraw` return.
 /// `pending:head` and `pending:user` are still open. `settled` carries the
-/// answer and who gave it; an allow without `answered_by` counts as the head's,
-/// so it is checked against the head's authority again. `refused:<code>`
-/// (withdrawn, head gone) ends the call by that name and grants nothing.
+/// answer and who gave it; an allow without `answered_by` counts as the
+/// head's, so `finish` checks again that the head itself still holds the
+/// access. `refused:<code>` (withdrawn, head gone) grants nothing, and the held
+/// call ends with that `<code>` as its error code.
 pub(super) fn decode_record(record: &Value) -> Result<Settlement, ConsentError> {
     let field = |name: &str| record.get(name).and_then(Value::as_str);
     let state = field("state").ok_or_else(|| malformed("the record has no state"))?;
@@ -1020,10 +1023,11 @@ async fn hold(
     }
 }
 
-/// A transport failure, and Cingulate's own `access_unavailable`, keep the ask
-/// so the retried call re-sends its call key. Any other named refusal (no
-/// head, not an Alfonso scope, requester refused, unknown or foreign ask, an
-/// invalid request) ends the ask and the call by that name.
+/// A transport failure, and Cingulate's own `access_unavailable`, keep the
+/// persisted ask so the retried call re-sends its call key. Any other refusal
+/// code Cingulate sends (for example `access_no_head`, `access_not_alfonso`,
+/// `elicitation_not_found`, `elicitation_invalid_request`) discards the ask, and
+/// the held call ends with that same code.
 async fn failed(call: &HeldCall, prep: &Prepared, error: ConsentError) -> Hold {
     match error {
         ConsentError::Unavailable(detail) => {
