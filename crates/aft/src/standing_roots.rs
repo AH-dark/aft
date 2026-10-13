@@ -313,8 +313,16 @@ impl StandingRoots {
             *current = Some(path.clone());
             path
         };
-        {
-            let mut state = self.inner.state.lock();
+        #[cfg(test)]
+        let benchmark_baseline = RECONCILE_BENCH_BASELINE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let benchmark_baseline = false;
+        // Nonempty lists keep the database-open-before-state-lock path; the
+        // extra mutex check is needed only to skip recurring empty-list work.
+        if !benchmark_baseline && entries.is_empty() {
+            #[cfg(test)]
+            RECONCILE_PREOPEN_STATE_LOCKS.with(|count| count.set(count.get() + 1));
+            let state = self.inner.state.lock();
             // Initialize aft.db in the chosen storage directory once. Removing
             // previously configured roots must still delete their rows and stop
             // their background builds. Only after an empty root list was applied
@@ -327,11 +335,18 @@ impl StandingRoots {
                     replaced: Vec::new(),
                 });
             }
-            state.reconciled_empty = false;
         }
         #[cfg(test)]
         RECONCILE_DB_OPENS.with(|count| count.set(count.get() + 1));
-        let mut conn = crate::db::open(&db_path)?;
+        let mut conn = match crate::db::open(&db_path) {
+            Ok(conn) => conn,
+            Err(error) => {
+                // A failed storage switch has not initialized its database.
+                // Do not let an earlier empty snapshot suppress later retries.
+                self.inner.state.lock().reconciled_empty = false;
+                return Err(error.into());
+            }
+        };
         #[cfg(test)]
         conn.trace(Some(|sql| {
             if sql == "BEGIN IMMEDIATE" {
@@ -340,6 +355,7 @@ impl StandingRoots {
         }));
 
         let mut state = self.inner.state.lock();
+        state.reconciled_empty = false;
         let previous_first_snapshot = state.observed_first_snapshot;
         let previous = std::mem::take(&mut state.entries);
         let mut next = BTreeMap::new();
@@ -656,6 +672,10 @@ thread_local! {
     static ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECONCILE_DB_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECONCILE_IMMEDIATE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECONCILE_PREOPEN_STATE_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The release fixture compares both paths in one process on the same warmed
+    // database. Baseline mode bypasses the whole new pre-open state-lock block.
+    static RECONCILE_BENCH_BASELINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -781,6 +801,154 @@ mod tests {
     use crate::config::{IndexConfig, IndexRootConfig};
     use tempfile::tempdir;
 
+    struct ReconcileMeasurement {
+        wall_us: u128,
+        process_cpu_us: Option<u64>,
+        child_cpu_us: Option<u64>,
+        work: [i64; 6],
+        pre_open_state_locks: usize,
+    }
+
+    #[cfg(unix)]
+    fn reconciliation_cpu_us() -> (Option<u64>, Option<u64>) {
+        let read = |who| {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // getrusage initializes the caller-owned structure on success.
+            if unsafe { libc::getrusage(who, usage.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            let usage = unsafe { usage.assume_init() };
+            Some(
+                (usage.ru_utime.tv_sec as u64 + usage.ru_stime.tv_sec as u64) * 1_000_000
+                    + usage.ru_utime.tv_usec as u64
+                    + usage.ru_stime.tv_usec as u64,
+            )
+        };
+        (read(libc::RUSAGE_SELF), read(libc::RUSAGE_CHILDREN))
+    }
+
+    #[cfg(not(unix))]
+    fn reconciliation_cpu_us() -> (Option<u64>, Option<u64>) {
+        (None, None)
+    }
+
+    fn measure_reconciliation(
+        roots: &StandingRoots,
+        snapshot: &Config,
+        baseline: bool,
+        ticks: i64,
+    ) -> ReconcileMeasurement {
+        struct RestoreBaseline(bool);
+        impl Drop for RestoreBaseline {
+            fn drop(&mut self) {
+                RECONCILE_BENCH_BASELINE.with(|mode| mode.set(self.0));
+            }
+        }
+        let _restore =
+            RestoreBaseline(RECONCILE_BENCH_BASELINE.with(|mode| mode.replace(baseline)));
+        let work_before = reconciliation_work_for_test();
+        let pre_open_locks_before = RECONCILE_PREOPEN_STATE_LOCKS.with(std::cell::Cell::get);
+        let cpu_before = reconciliation_cpu_us();
+        let start = std::time::Instant::now();
+        for _ in 0..ticks {
+            roots.reconcile(std::hint::black_box(snapshot)).unwrap();
+        }
+        let wall_us = start.elapsed().as_micros();
+        let cpu_after = reconciliation_cpu_us();
+        let work_after = reconciliation_work_for_test();
+        ReconcileMeasurement {
+            wall_us,
+            process_cpu_us: cpu_after
+                .0
+                .zip(cpu_before.0)
+                .map(|(after, before)| after - before),
+            child_cpu_us: cpu_after
+                .1
+                .zip(cpu_before.1)
+                .map(|(after, before)| after - before),
+            work: std::array::from_fn(|i| work_after[i] - work_before[i]),
+            pre_open_state_locks: RECONCILE_PREOPEN_STATE_LOCKS.with(std::cell::Cell::get)
+                - pre_open_locks_before,
+        }
+    }
+
+    #[test]
+    fn nonempty_reconciliation_does_not_take_an_extra_state_lock() {
+        let storage = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let snapshot = config(
+            storage.path(),
+            vec![root(project.path(), vec![IndexKind::Search])],
+        );
+        let roots = StandingRoots::default();
+        roots.reconcile(&snapshot).unwrap();
+        let before = measure_reconciliation(&roots, &snapshot, true, 3);
+        let after = measure_reconciliation(&roots, &snapshot, false, 3);
+        eprintln!(
+            "nonempty pre-open state locks: before={} after={}",
+            before.pre_open_state_locks, after.pre_open_state_locks
+        );
+        assert_eq!(before.work, after.work);
+        assert_eq!(before.pre_open_state_locks, 0);
+        assert_eq!(after.pre_open_state_locks, 0);
+    }
+
+    #[test]
+    fn failed_storage_change_does_not_reuse_an_empty_snapshot() {
+        let storage = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        roots.reconcile(&config(storage.path(), vec![])).unwrap();
+        let blocked = storage.path().join("blocked-storage");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let nonempty = config(
+            &blocked,
+            vec![root(project.path(), vec![IndexKind::Search])],
+        );
+        let before = RECONCILE_DB_OPENS.with(std::cell::Cell::get);
+        assert!(roots.reconcile(&nonempty).is_err());
+        let retry = roots.reconcile(&config(&blocked, vec![]));
+        let opens = RECONCILE_DB_OPENS.with(std::cell::Cell::get) - before;
+        eprintln!(
+            "failed storage change: logical open attempts={opens}, empty retry refused={}",
+            retry.is_err()
+        );
+        assert_eq!(
+            opens, 2,
+            "an uninitialized storage directory must still be retried"
+        );
+        assert!(retry.is_err());
+    }
+
+    #[test]
+    fn reconciliation_benchmark_baseline_reaches_the_original_open_path() {
+        let storage = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let empty = config(storage.path(), vec![]);
+        roots.reconcile(&empty).unwrap();
+        assert_eq!(
+            measure_reconciliation(&roots, &empty, true, 3).work,
+            [3, 6, 6, 3, 0, 0]
+        );
+        assert_eq!(
+            measure_reconciliation(&roots, &empty, false, 3).work,
+            [0; 6]
+        );
+        let project = tempdir().unwrap();
+        let nonempty = config(
+            storage.path(),
+            vec![root(project.path(), vec![IndexKind::Search])],
+        );
+        roots.reconcile(&nonempty).unwrap();
+        for baseline in [true, false] {
+            assert_eq!(
+                measure_reconciliation(&roots, &nonempty, baseline, 3).work,
+                [3, 6, 6, 3, 3, 3]
+            );
+        }
+        assert!(!RECONCILE_BENCH_BASELINE.with(std::cell::Cell::get));
+    }
+
     #[test]
     #[ignore = "release reconciliation measurement"]
     fn bench_daemon_edge_standing_reconciliation() {
@@ -803,25 +971,53 @@ mod tests {
                     .collect(),
             );
             for bound in [false, true] {
-                let roots = StandingRoots::default();
-                roots.reconcile(&snapshot).unwrap();
-                if bound {
-                    for entry in roots.entries() {
-                        roots.begin_case_a_bind(&entry.literal_path).unwrap();
+                let owners = [StandingRoots::default(), StandingRoots::default()];
+                for (mode, owner) in owners.iter().enumerate() {
+                    measure_reconciliation(owner, &snapshot, mode == 0, 1);
+                    if bound {
+                        for entry in owner.entries() {
+                            owner.begin_case_a_bind(&entry.literal_path).unwrap();
+                        }
                     }
                 }
-                let before = reconciliation_work_for_test();
-                let start = std::time::Instant::now();
-                for _ in 0..100 {
-                    roots.reconcile(&snapshot).unwrap();
+                // Both owners use the same database and Git directories. Warm
+                // each path before alternating which path runs first in a pair.
+                for _ in 0..5 {
+                    for (mode, owner) in owners.iter().enumerate() {
+                        measure_reconciliation(owner, &snapshot, mode == 0, 1);
+                    }
                 }
-                let elapsed = start.elapsed();
-                let after = reconciliation_work_for_test();
-                let work = std::array::from_fn::<_, 6, _>(|i| after[i] - before[i]);
-                eprintln!(
-                    "standing roots={count} bound={bound} ticks=100 wall_us={} work={work:?}",
-                    elapsed.as_micros()
-                );
+                let mut samples = [Vec::new(), Vec::new()];
+                for round in 0..6 {
+                    for mode in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                        let sample =
+                            measure_reconciliation(&owners[mode], &snapshot, mode == 0, 100);
+                        let expected = if count == 0 && mode == 1 {
+                            [0; 6]
+                        } else {
+                            [100, 200, 200, 100, count * 100, count * 100]
+                        };
+                        assert_eq!(sample.work, expected);
+                        eprintln!("standing_pair roots={count} bound={bound} round={} mode={} ticks=100 wall_us={} process_cpu_us={:?} child_cpu_us={:?} pre_open_state_locks={} work={:?}",
+                            round + 1, if mode == 0 { "before" } else { "after" },
+                            sample.wall_us, sample.process_cpu_us, sample.child_cpu_us, sample.pre_open_state_locks, sample.work);
+                        assert_eq!(
+                            sample.pre_open_state_locks,
+                            if count == 0 && mode == 1 { 100 } else { 0 }
+                        );
+                        samples[mode].push(sample.wall_us);
+                    }
+                }
+                for (mode, mut walls) in samples.into_iter().enumerate() {
+                    eprintln!(
+                        "standing_samples roots={count} bound={bound} mode={} wall_us={walls:?}",
+                        if mode == 0 { "before" } else { "after" }
+                    );
+                    walls.sort_unstable();
+                    let median = (walls[2] + walls[3]) / 2;
+                    eprintln!("standing_summary roots={count} bound={bound} mode={} n=6 median_us={median} min_us={} max_us={}",
+                        if mode == 0 { "before" } else { "after" }, walls[0], walls[5]);
+                }
             }
         }
     }
