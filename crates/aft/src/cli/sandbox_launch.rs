@@ -368,6 +368,22 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
         // leave networking alone rather than break builds and local test servers.
         unenforced.push("sccache_server_unblockable_on_landlock");
     }
+    if profile.write_deny_nested.iter().any(|deny| {
+        deny.file_name() == Some(std::ffi::OsStr::new("config.worktree"))
+            && write_roots.iter().any(|root| paths_overlap(deny, root))
+    }) {
+        // The linked Git directory must be writable for index updates, but
+        // Landlock cannot subtract its operator-owned hooks configuration.
+        unenforced.push("worktree_git_config_mutable_on_landlock");
+    }
+    if profile.write_deny_nested.iter().any(|deny| {
+        matches!(
+            deny.file_name().and_then(|name| name.to_str()),
+            Some("commondir" | "gitdir")
+        ) && write_roots.iter().any(|root| paths_overlap(deny, root))
+    }) {
+        unenforced.push("worktree_git_binding_mutable_on_landlock");
+    }
 
     eprint!("sandbox-launch: unenforced=[{}]", unenforced.join(","));
     if applied.partially_enforced {

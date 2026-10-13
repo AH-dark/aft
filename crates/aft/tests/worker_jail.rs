@@ -1,12 +1,11 @@
-//! A stamped Alfonso worker's shell runs in the worktree jail. This drives the
-//! real `aft --subc` process from a fake daemon: a route bound with a worker
-//! scope stamp, bash calls as a worker would make them, and the real native
-//! sandbox (Seatbelt on macOS). Everything lives under one throwaway directory
-//! with its own HOME and XDG roots; the live CortexKit store is never touched.
-//!
-//! macOS only: the Linux CI runner cannot build a native sandbox profile (it
-//! has no HOME), and these checks are about what a worker on the Mac can do.
-#![cfg(target_os = "macos")]
+//! A daemon-authenticated background worker gets a native sandbox, even when
+//! ordinary sessions have sandboxing disabled. Drive the real `aft --subc`
+//! process through a fake daemon that binds such a worker route, then check its
+//! shell's allowed work and denied access. Seatbelt runs on macOS; hook and
+//! temporary-file probes also run on Linux when Landlock is available.
+//! Everything lives under one throwaway HOME and XDG layout, never the live
+//! CortexKit data store. Every daemon has a HOME, even on CI runners without one.
+#![cfg(unix)]
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -56,17 +55,23 @@ fn git(dir: &Path, args: &[&str]) -> String {
         ])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .env("HOME", dir))
 }
 
 struct Jail {
     _dir: tempfile::TempDir,
     base: PathBuf,
+    #[cfg(target_os = "macos")]
     home: PathBuf,
     main: PathBuf,
     worktree: PathBuf,
+    #[cfg(target_os = "macos")]
     other_repo: PathBuf,
     data: PathBuf,
+    #[cfg(target_os = "macos")]
     rustup: PathBuf,
     child: Child,
     stream: TcpStream,
@@ -110,7 +115,8 @@ impl Jail {
         let base = dir.path().canonicalize().unwrap();
         let home = base.join("home");
         let main = base.join("main");
-        let worktree = base.join("worktree");
+        let data = home.join(".local/share");
+        let worktree = data.join("cortexkit/alfonso/worktrees/0123456789abcdef/worker");
         let other_repo = base.join("other-repo");
         let rustup = base.join("rustup");
         let xdg = base.join("xdg");
@@ -130,12 +136,15 @@ impl Jail {
         for name in ["config", "data", "state", "cache"] {
             std::fs::create_dir_all(xdg.join(name)).unwrap();
         }
-        let data = xdg.join("data");
         std::fs::create_dir_all(data.join("cortexkit")).unwrap();
 
         // The main checkout, the worker's linked worktree and a sibling worktree.
         std::fs::write(main.join("README.md"), "main\n").unwrap();
         git(&main, &["init", "-q", "-b", "main"]);
+        // Keep automatic maintenance from adding unrelated shared-metadata
+        // writes to these commit and permission probes.
+        git(&main, &["config", "gc.auto", "0"]);
+        git(&main, &["config", "maintenance.auto", "false"]);
         git(&main, &["add", "README.md"]);
         git(&main, &["commit", "-q", "-m", "initial"]);
         git(
@@ -253,17 +262,21 @@ impl Jail {
             .current_dir(&base)
             .arg("--subc")
             .arg(&connection_path)
+            .env("SUBC_CONNECTION_FILE", &connection_path)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", xdg.join("config"))
             .env("XDG_DATA_HOME", &data)
             .env("XDG_STATE_HOME", xdg.join("state"))
             .env("XDG_CACHE_HOME", xdg.join("cache"))
+            .env("AFT_CACHE_DIR", data.join("cortexkit/aft/cache"))
             .env("RUSTUP_HOME", &rustup)
             // An operator-set shared target in the daemon's environment.
             .env("CARGO_TARGET_DIR", base.join("env-target"))
             .env_remove("SUBC_MODULE_ID")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("AFT_STORAGE_DIR")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
             .env_remove("CARGO_HOME")
             .env_remove("SCCACHE_DIR")
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
@@ -319,11 +332,14 @@ impl Jail {
         let mut jail = Self {
             _dir: dir,
             base,
+            #[cfg(target_os = "macos")]
             home,
             main,
             worktree,
+            #[cfg(target_os = "macos")]
             other_repo,
             data,
+            #[cfg(target_os = "macos")]
             rustup,
             child,
             stream,
@@ -390,15 +406,14 @@ impl Jail {
         assert_eq!(response, ModuleControlResponse::RouteBindAck {});
     }
 
-    /// Run one shell command as the worker and return the reply as text.
-    async fn bash(&mut self, command: &str) -> String {
+    async fn tool(&mut self, name: &str, arguments: Value) -> String {
         for _ in 0..200 {
             let corr = self.next_corr;
             self.next_corr += 1;
             let body = json!({
-                "name": "bash",
+                "name": name,
                 "preset": "worker",
-                "arguments": {"command": command, "timeout": 300_000},
+                "arguments": arguments,
             });
             write_frame(
                 &mut self.stream,
@@ -442,14 +457,22 @@ impl Jail {
         }
         panic!("database initialization never completed");
     }
+
+    /// Run one shell command as the worker and return the reply as text.
+    async fn bash(&mut self, command: &str) -> String {
+        self.tool("bash", json!({"command": command, "timeout": 300_000}))
+            .await
+    }
 }
 
+#[cfg(target_os = "macos")]
 fn real_rustup_home() -> PathBuf {
     std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".rustup"))
 }
 
+#[cfg(target_os = "macos")]
 fn real_cargo() -> PathBuf {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap());
     std::env::var_os("CARGO_HOME")
@@ -460,6 +483,7 @@ fn real_cargo() -> PathBuf {
 
 /// Run `cargo build --offline` from the worker shell with the throwaway
 /// CARGO_HOME (the shell's HOME default) and the real toolchain.
+#[cfg(target_os = "macos")]
 fn cargo_build(jail: &Jail, prefix: &str, marker: &str) -> String {
     format!(
         "cd {} && {prefix} RUSTUP_HOME={} {} build --offline -q && echo \"{marker}_$((1+1))\"",
@@ -469,6 +493,7 @@ fn cargo_build(jail: &Jail, prefix: &str, marker: &str) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn worker_jail_allows_normal_worker_work_and_refuses_everything_else() {
     let mut jail = Jail::start().await;
@@ -636,6 +661,7 @@ async fn worker_jail_allows_normal_worker_work_and_refuses_everything_else() {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn sccache_connect_script(address: &str, unix: bool) -> String {
     let connect = if unix {
         "s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(sys.argv[1])"
@@ -652,6 +678,7 @@ fn sccache_connect_script(address: &str, unix: bool) -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn worker_jail_denies_shared_sccache_tcp_but_preserves_other_loopback() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -676,6 +703,7 @@ async fn worker_jail_denies_shared_sccache_tcp_but_preserves_other_loopback() {
     assert!(reply.contains("OWN_LOOPBACK_CONNECTED"), "{reply}");
 }
 
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn worker_jail_denies_shared_sccache_uds() {
     let root = tempfile::tempdir().unwrap();
@@ -688,4 +716,390 @@ async fn worker_jail_denies_shared_sccache_uds() {
     let reply = jail.bash(&script).await;
     assert!(reply.contains("DENIED_BY_SANDBOX"), "{reply}");
     assert!(!reply.contains("CONNECTED"), "{reply}");
+}
+
+fn native_available() -> bool {
+    #[cfg(target_os = "linux")]
+    if !Command::new(aft_binary::aft_binary())
+        .args(["sandbox-launch", "--support"])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert_ne!(
+            std::env::var("AFT_REQUIRE_LANDLOCK").as_deref(),
+            Ok("1"),
+            "required Landlock ABI unavailable"
+        );
+        eprintln!("Landlock probe skipped: mandatory ABI unavailable");
+        return false;
+    }
+    true
+}
+
+fn executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn worker_jail_private_hook_chain_executes_read_only() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    git(&jail.main, &["config", "extensions.worktreeConfig", "true"]);
+    // First create AFT's hook scripts, then copy them under an older content
+    // key. A worktree manager can retain that older path in its hook chain
+    // even after AFT starts selecting a newer set of scripts.
+    let selected = jail.bash("git config --path core.hooksPath").await;
+    let hook_root = jail.data.join("cortexkit/aft/cache/git-hooks");
+    let managed = std::fs::read_dir(&hook_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir() && path.file_name().unwrap().len() == 32)
+        .unwrap();
+    assert!(selected.contains(managed.to_str().unwrap()), "{selected}");
+    let original = hook_root.join("0123456789abcdef0123456789abcdef");
+    std::fs::create_dir_all(&original).unwrap();
+    for entry in std::fs::read_dir(&managed).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), original.join(entry.file_name())).unwrap();
+    }
+    let hooks = jail.data.join("cortexkit/prefrontal-core/hooks/hash-1");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook_link = hooks.parent().unwrap().join("selected");
+    std::os::unix::fs::symlink(&hooks, &hook_link).unwrap();
+    let original_link = hook_root.join("original-link");
+    std::os::unix::fs::symlink(&original, &original_link).unwrap();
+    for name in ["pre-commit", "prepare-commit-msg", "post-index-change"] {
+        executable(
+            &hooks.join(name),
+            &format!(
+                "#!/bin/sh\nexec \"$(git config --path mason.originalHooksPath)/{name}\" \"$@\"\n"
+            ),
+        );
+    }
+    // The core stub execs the copied AFT hook, which returns to the common
+    // repository's native hook on its second invocation. The marker proves
+    // that whole chain ran, not merely the first wrapper.
+    executable(
+        &jail.main.join(".git/hooks/pre-commit"),
+        "#!/bin/sh\nprintf chained > hook-marker\n",
+    );
+    git(
+        &jail.worktree,
+        &[
+            "config",
+            "--worktree",
+            "core.hooksPath",
+            hook_link.to_str().unwrap(),
+        ],
+    );
+    git(
+        &jail.worktree,
+        &[
+            "config",
+            "--worktree",
+            "mason.originalHooksPath",
+            original_link.to_str().unwrap(),
+        ],
+    );
+    let direct = jail.bash(&format!(
+        "cd {} && cat {}/pre-commit > /dev/null && unset GIT_CONFIG_COUNT && git config --path core.hooksPath && git -c user.name=w -c user.email=w@example.com commit --allow-empty -m direct && echo DIRECT_HOOK_$((1+1))",
+        quote(&jail.worktree), quote(&hooks)
+    )).await;
+    eprintln!("Native direct hook output:\n{direct}");
+    assert!(direct.contains("DIRECT_HOOK_2"), "{direct}");
+    assert!(direct.contains(hook_link.to_str().unwrap()), "{direct}");
+    assert_eq!(
+        std::fs::read_to_string(jail.worktree.join("hook-marker")).unwrap(),
+        "chained"
+    );
+    std::fs::remove_file(jail.worktree.join("hook-marker")).unwrap();
+    let committed = jail.bash(&format!(
+        "cd {} && git config --path core.hooksPath && printf change > hook-change && git add hook-change && git -c user.name=w -c user.email=w@example.com commit -m chained && echo HOOK_COMMIT_$((1+1))",
+        quote(&jail.worktree)
+    )).await;
+    eprintln!("Native hook commit output:\n{committed}");
+    assert!(committed.contains("HOOK_COMMIT_2"), "{committed}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        committed.contains("worktree_git_config_mutable_on_landlock"),
+        "the writable Git configuration limitation was not reported: {committed}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        committed.contains("worktree_git_binding_mutable_on_landlock"),
+        "the writable Git binding limitation was not reported: {committed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(jail.worktree.join("hook-marker")).unwrap(),
+        "chained"
+    );
+    assert!(git(&jail.main, &["log", "-1", "--format=%B", "work"])
+        .contains("Co-authored-by: Jail Bot <jail@example.com>"));
+    #[cfg(target_os = "macos")]
+    {
+        let denied = jail
+            .bash("git config --worktree core.hooksPath /tmp/worker-selected-hooks")
+            .await;
+        assert!(denied.contains("Operation not permitted"), "{denied}");
+        assert_eq!(
+            git(
+                &jail.worktree,
+                &["config", "--worktree", "--get", "core.hooksPath"]
+            )
+            .trim(),
+            hook_link.to_str().unwrap()
+        );
+        for path in [
+            jail.worktree.join(".git"),
+            jail.main.join(".git/worktrees/worker/commondir"),
+            jail.main.join(".git/worktrees/worker/gitdir"),
+        ] {
+            let before = std::fs::read(&path).unwrap();
+            let denied = jail
+                .bash(&format!("printf redirect >> {}", quote(&path)))
+                .await;
+            assert!(denied.contains("Operation not permitted"), "{denied}");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "Git binding was writable: {denied}"
+            );
+        }
+    }
+    let sibling = hooks.parent().unwrap().join("sibling-secret");
+    std::fs::write(&sibling, "private-hook-sibling").unwrap();
+    std::fs::write(jail.data.join("cortexkit/aft/aft.db"), "private-db").unwrap();
+    for path in [
+        &sibling,
+        &jail.data.join("cortexkit/aft/aft.db"),
+        &jail.base.join("connection.json"),
+    ] {
+        let denied = jail.bash(&format!("cat {}", quote(path))).await;
+        assert!(
+            !denied.contains("private-hook-sibling") && !denied.contains("private-db"),
+            "{denied}"
+        );
+        assert!(
+            denied.contains("Operation not permitted") || denied.contains("Permission denied"),
+            "{denied}"
+        );
+    }
+    let denied = jail
+        .bash(&format!("ls {}", quote(&jail.data.join("cortexkit"))))
+        .await;
+    assert!(
+        denied.contains("Operation not permitted") || denied.contains("Permission denied"),
+        "{denied}"
+    );
+    for dir in [&hooks, &original] {
+        let path = dir.join("pre-commit");
+        let before = std::fs::read(&path).unwrap();
+        let denied = jail
+            .bash(&format!(
+                "printf tamper >> {0}; touch {1}; rm {0}; mv {0} {2}",
+                quote(&path),
+                quote(&dir.join("new-hook")),
+                quote(&dir.join("renamed-hook"))
+            ))
+            .await;
+        assert!(
+            denied.contains("Operation not permitted") || denied.contains("Permission denied"),
+            "{denied}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "hook was modified: {denied}"
+        );
+        assert!(!dir.join("new-hook").exists(), "{denied}");
+        assert!(!dir.join("renamed-hook").exists(), "{denied}");
+    }
+}
+
+// This Cargo probe is macOS-only because it uses the host's real toolchain.
+// Linux runners may install Cargo outside HOME and the system read roots, where
+// the jail correctly denies it. Hook and temporary-file probes still use Landlock.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_jail_operator_build_slot_and_container_reads() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let container = jail.worktree.parent().unwrap().to_path_buf();
+    let cargo_config = container.join(".cargo/config.toml");
+    let budget = container.join(".cargo/alfonso-test-threads");
+    let seeds = container.join(".rust-build-seeds");
+    let slots = jail.data.join("cortexkit/prefrontal-core/build-slots");
+    for path in [cargo_config.parent().unwrap(), &seeds, &slots] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(&budget, "2\n").unwrap();
+    std::fs::write(seeds.join("seed"), "build-seed").unwrap();
+    for (name, value) in [
+        (".root", "slot-root"),
+        (".cache", "slot-cache"),
+        ("limit", "2\n"),
+    ] {
+        std::fs::write(slots.join(name), value).unwrap();
+    }
+    let wrapper = slots.join("prefrontal-build-slot");
+    executable(
+        &wrapper,
+        r#"#!/usr/bin/env python3
+import fcntl, os, pathlib, sys
+base = pathlib.Path(__file__).parent
+assert (base / '.root').read_text() == 'slot-root'
+assert (base / '.cache').read_text() == 'slot-cache'
+assert (base / 'limit').read_text().strip() == '2'
+with (base / 'queue.lock').open('a') as queue, (base / '0.lock').open('a') as slot:
+    fcntl.flock(queue, fcntl.LOCK_EX)
+    fcntl.flock(slot, fcntl.LOCK_EX)
+    pathlib.Path('slot-wrapper-ran').write_text('locked')
+    fcntl.flock(queue, fcntl.LOCK_UN)
+    child = os.fork()
+    if child == 0:
+        direct = str(base / 'rustc-lowprio-direct')
+        os.execv(direct, [direct, *sys.argv[1:]])
+    _, status = os.waitpid(child, 0)
+    sys.exit(os.waitstatus_to_exitcode(status))
+"#,
+    );
+    executable(
+        &slots.join("rustc-lowprio-direct"),
+        "#!/bin/sh\nexec \"$@\"\n",
+    );
+    std::fs::write(
+        &cargo_config,
+        format!(
+            "[build]\nrustc-wrapper = {:?}\ntarget-dir = {:?}\n",
+            wrapper,
+            jail.base.join("shared-target")
+        ),
+    )
+    .unwrap();
+    let excludes = jail
+        .main
+        .join(".git/worktrees/worker/alfonso-hydration-exclude");
+    // Git names the administrative directory after the checkout's basename.
+    std::fs::write(&excludes, "hydration-excluded\n").unwrap();
+    git(
+        &jail.worktree,
+        &["config", "core.excludesFile", excludes.to_str().unwrap()],
+    );
+    std::fs::write(jail.worktree.join("hydration-excluded"), "ignored").unwrap();
+    let read = jail.bash(&format!(
+        "cat {} {} {} {} && git check-ignore hydration-excluded && git config --local --get core.excludesFile && echo CONTAINER_$((1+1))",
+        quote(&cargo_config), quote(&budget), quote(&seeds.join("seed")), quote(&excludes)
+    )).await;
+    assert!(read.contains("CONTAINER_2"), "{read}");
+    assert!(read.contains("build-seed"), "{read}");
+    let built = jail.bash(&cargo_build(&jail, "", "BUILD_SLOT")).await;
+    eprintln!("Native build-slot output:\n{built}");
+    assert!(built.contains("BUILD_SLOT_2"), "{built}");
+    assert_eq!(
+        std::fs::read_to_string(jail.worktree.join("slot-wrapper-ran")).unwrap(),
+        "locked"
+    );
+    assert!(jail.base.join("shared-target/debug/jailcrate").is_file());
+    for name in ["queue.lock", "0.lock", "1.lock", "2.lock"] {
+        let locked = jail
+            .bash(&format!(
+                "printf locked >> {} && echo SLOT_LOCK_$((1+1))",
+                quote(&slots.join(name))
+            ))
+            .await;
+        assert!(locked.contains("SLOT_LOCK_2"), "{locked}");
+    }
+    for path in [
+        &wrapper,
+        &slots.join("rustc-lowprio-direct"),
+        &slots.join(".root"),
+        &slots.join(".cache"),
+        &slots.join("limit"),
+        &cargo_config,
+        &budget,
+        &seeds.join("seed"),
+    ] {
+        let before = std::fs::read(path).unwrap();
+        let denied = jail
+            .bash(&format!("printf tamper >> {}", quote(path)))
+            .await;
+        assert!(
+            denied.contains("Operation not permitted") || denied.contains("Permission denied"),
+            "{denied}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before, "{denied}");
+    }
+    for path in [
+        slots.join("3.lock"),
+        slots.join("arbitrary"),
+        container.join("other-container-data"),
+    ] {
+        let denied = jail
+            .bash(&format!("printf tamper > {}", quote(&path)))
+            .await;
+        assert!(
+            denied.contains("Operation not permitted") || denied.contains("Permission denied"),
+            "{denied}"
+        );
+        assert!(!path.exists(), "{denied}");
+    }
+}
+
+#[tokio::test]
+async fn worker_jail_temp_and_cortexkit_scratch_match_tools() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let temp = jail.bash("printf 'TMPDIR=%s TMP=%s TEMP=%s\\n' \"$TMPDIR\" \"$TMP\" \"$TEMP\"; set -e; file=$(mktemp); dir=$(mktemp -d); test -f \"$file\"; test -d \"$dir\"; test \"${file%/*}\" = \"$TMPDIR\"; test \"${dir%/*}\" = \"$TMPDIR\"; test \"$TMP\" = \"$TMPDIR\"; test \"$TEMP\" = \"$TMPDIR\"; echo TEMP_$((1+1))").await;
+    eprintln!("Native mktemp output:\n{temp}");
+    assert!(temp.contains("TEMP_2"), "{temp}");
+    let explicit = jail.bash("file=$(mktemp ./explicit.XXXXXXXX) && test -f \"$file\" && rm \"$file\" && echo EXPLICIT_TEMP_$((1+1))").await;
+    assert!(explicit.contains("EXPLICIT_TEMP_2"), "{explicit}");
+    let outside = jail.bash("TMPDIR=/tmp mktemp").await;
+    assert!(
+        outside.contains("Operation not permitted") || outside.contains("Permission denied"),
+        "{outside}"
+    );
+    let scratch = jail.bash("mkdir -p .cortexkit/tmp .cortexkit/internal-docs && printf shell > .cortexkit/tmp/shell && printf docs > .cortexkit/internal-docs/note && cat .cortexkit/tmp/shell && echo SCRATCH_$((1+1))").await;
+    assert!(scratch.contains("SCRATCH_2"), "{scratch}");
+    let written = jail
+        .tool(
+            "write",
+            json!({"filePath": jail.worktree.join(".cortexkit/tmp/tool"), "content": "tool"}),
+        )
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(jail.worktree.join(".cortexkit/tmp/tool")).unwrap_or_default(),
+        "tool",
+        "{written}"
+    );
+    // Seatbelt protects .cortexkit/aft.jsonc and .cortexkit/aft/filters
+    // inside a writable worktree. Landlock's additive rules cannot exclude
+    // those children; its nested_write_deny warning reports that limitation.
+    #[cfg(target_os = "macos")]
+    for path in [
+        jail.worktree.join(".cortexkit/aft.jsonc"),
+        jail.worktree.join(".cortexkit/aft/filters/policy.toml"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "protected").unwrap();
+        let denied = jail
+            .bash(&format!("printf tamper >> {}", quote(&path)))
+            .await;
+        assert!(denied.contains("Operation not permitted"), "{denied}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "protected",
+            "{denied}"
+        );
+    }
 }

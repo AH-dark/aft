@@ -1535,13 +1535,84 @@ fn build_native_profile(
         let mut write_deny_nested = Vec::new();
         let mut shell_write_deny = Vec::new();
         let mut shell_read_deny = Vec::new();
+        let jailed = worker_jail_active();
+        #[cfg(target_os = "macos")]
+        if jailed {
+            install_worker_mktemp(&temp_dir)?;
+        }
         for (root, git_policy) in project_roots.iter().zip(&git_policies) {
             #[cfg(target_os = "linux")]
             write_deny_nested.push(root.join(".git"));
-            write_deny_nested.push(root.join(".cortexkit"));
+            if jailed {
+                if let Some((git_dir, _)) = &git_policy.linked {
+                    // These files bind the checkout to operator-owned Git
+                    // configuration. A shell must not redirect that binding
+                    // and turn model-written configuration into read grants.
+                    write_deny_nested.push(root.join(".git"));
+                    write_deny_nested.extend(
+                        ["config.worktree", "commondir", "gitdir"].map(|name| git_dir.join(name)),
+                    );
+                }
+                // Protect executable filters and project configuration, not
+                // scratch documents that file tools already let workers write.
+                write_deny_nested.extend([
+                    root.join(".cortexkit/aft.jsonc"),
+                    root.join(".cortexkit/aft/filters"),
+                ]);
+            } else {
+                write_deny_nested.push(root.join(".cortexkit"));
+            }
             #[cfg(target_os = "macos")]
             shell_write_deny.extend(git_policy.hooks.iter().cloned());
-            shell_read_deny.extend(git_policy.hooks.iter().cloned());
+            if jailed {
+                // Git's configured policy hooks must execute on commits. Keep
+                // them immutable even when their directory is in private data.
+                policy.private_stores.read_allow.extend(
+                    git_policy
+                        .hooks
+                        .iter()
+                        .filter(|path| path.is_dir())
+                        .cloned(),
+                );
+                policy
+                    .private_stores
+                    .read_allow
+                    .extend(git_policy.read_roots.iter().cloned());
+                for key in [
+                    "core.hooksPath",
+                    "mason.originalHooksPath",
+                    "core.excludesFile",
+                ] {
+                    if let Some(path) = configured_git_path(
+                        root,
+                        key,
+                        &mut policy.private_stores.read_metadata_allow,
+                    )? {
+                        if (key == "core.excludesFile" && path.is_file())
+                            || (key != "core.excludesFile" && path.is_dir())
+                        {
+                            policy.private_stores.read_allow.push(path.clone());
+                            if key == "core.excludesFile"
+                                && git_policy
+                                    .linked
+                                    .as_ref()
+                                    .is_some_and(|(git_dir, _)| path.starts_with(git_dir))
+                            {
+                                // core.excludesFile can be inside the linked worktree's Git
+                                // directory. Landlock cannot subtract a file from that
+                                // writable directory; report the nested exclusion
+                                // instead of refusing all Git commands.
+                                write_deny_nested.push(path);
+                            } else {
+                                shell_write_deny.push(path);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Non-worker native shells still cannot read repository hooks.
+                shell_read_deny.extend(git_policy.hooks.iter().cloned());
+            }
         }
         let storage = ctx.storage_dir();
         let mut managed_paths = Vec::new();
@@ -1584,6 +1655,19 @@ fn build_native_profile(
         let jail = worker_jail_active()
             .then(|| worker_jail_grants(&home, &project_roots, &git_policies, &policy));
         if let Some(jail) = &jail {
+            policy
+                .private_stores
+                .read_allow
+                .extend(jail.read_only.iter().cloned());
+            policy
+                .private_stores
+                .read_allow
+                .extend(jail.files.iter().filter(|path| path.exists()).cloned());
+            policy
+                .private_stores
+                .write_allow
+                .extend(jail.files.iter().filter(|path| path.exists()).cloned());
+            shell_write_deny.extend(jail.read_only.iter().cloned());
             cache_roots.extend(jail.caches.iter().cloned());
             cache_roots.sort_unstable();
             cache_roots.dedup();
@@ -1709,6 +1793,8 @@ struct WorkerJailGrants {
     roots: Vec<PathBuf>,
     /// Single lock and tracking files beside read-only configuration.
     files: Vec<PathBuf>,
+    /// Cargo configuration, .rust-build-seeds, and immutable compiler launcher files.
+    read_only: Vec<PathBuf>,
 }
 
 /// Cargo's lock and global-cache tracking files at the root of CARGO_HOME. The
@@ -1792,6 +1878,18 @@ fn worker_jail_grants(
         ),
     ];
     for root in project_roots {
+        if let Some(container) = root.parent() {
+            for path in [
+                container.join(".cargo/alfonso-test-threads"),
+                container.join(".rust-build-seeds"),
+            ] {
+                if let Ok(path) = path.canonicalize() {
+                    if !project_roots.iter().any(|root| path.starts_with(root)) {
+                        grants.read_only.push(path);
+                    }
+                }
+            }
+        }
         for ancestor in root.ancestors().skip(1) {
             for name in ["config.toml", "config"] {
                 configs.push((
@@ -1810,9 +1908,31 @@ fn worker_jail_grants(
         if !seen.insert(path.clone()) {
             continue;
         }
-        let Some(build) = cargo_build_settings(&path) else {
+        let Ok(config_path) = path.canonicalize() else {
             continue;
         };
+        if !config_path.is_file()
+            || project_roots
+                .iter()
+                .any(|root| config_path.starts_with(root))
+        {
+            continue;
+        }
+        grants.read_only.push(config_path.clone());
+        let Some(build) = cargo_build_settings(&config_path) else {
+            continue;
+        };
+        if let Some(wrapper) = build.rustc_wrapper {
+            let wrapper = PathBuf::from(wrapper);
+            let wrapper = if wrapper.is_absolute() {
+                Some(wrapper)
+            } else {
+                base.as_ref().map(|base| base.join(wrapper))
+            };
+            if let Some(wrapper) = wrapper {
+                add_build_slot_grants(&wrapper, project_roots, policy, &mut grants);
+            }
+        }
         if let Some(target) = build.target_dir {
             let target = PathBuf::from(target);
             match (&base, target.is_absolute()) {
@@ -1839,6 +1959,91 @@ fn worker_jail_grants(
     grants
 }
 
+/// Retain only the operator-configured `prefrontal-build-slot` launcher and its
+/// `rustc-lowprio-direct` companion: they take a slot lock and compile inside
+/// the sandbox rather than asking a shared server. The Cargo configuration and
+/// launcher files must be outside every model-writable worktree.
+#[cfg(unix)]
+fn add_build_slot_grants(
+    wrapper: &Path,
+    project_roots: &[PathBuf],
+    policy: &crate::access_policy::AccessPolicy,
+    grants: &mut WorkerJailGrants,
+) {
+    let Ok(wrapper) = wrapper.canonicalize() else {
+        return;
+    };
+    if wrapper.file_name() != Some(OsStr::new("prefrontal-build-slot")) || !wrapper.is_file() {
+        return;
+    }
+    let Some(dir) = wrapper.parent() else {
+        return;
+    };
+    if project_roots
+        .iter()
+        .any(|root| root.starts_with(dir) || dir.starts_with(root))
+        || !policy
+            .private_stores
+            .deny
+            .iter()
+            .any(|deny| dir.starts_with(deny) && dir != deny)
+    {
+        return;
+    }
+    let paths = [
+        wrapper.clone(),
+        dir.join("rustc-lowprio-direct"),
+        dir.join(".root"),
+        dir.join(".cache"),
+        dir.join("limit"),
+    ];
+    let Ok(paths) = paths
+        .into_iter()
+        .map(|path| path.canonicalize())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    if paths
+        .iter()
+        .any(|path| !path.is_file() || !path.starts_with(dir))
+    {
+        return;
+    }
+    let Some(limit) = std::fs::read_to_string(dir.join("limit"))
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|limit| (1..=256).contains(limit))
+    else {
+        return;
+    };
+    // Landlock's single-file grants require existing inodes. Provision only
+    // the configured queue and slot locks, never a writable directory grant.
+    // Include both endpoints so zero-based and one-based slot numbering work.
+    let locks = std::iter::once(dir.join("queue.lock"))
+        .chain((0..=limit).map(|slot| dir.join(format!("{slot}.lock"))));
+    let mut files = Vec::new();
+    for path in locks {
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+        {
+            return;
+        }
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .is_err()
+        {
+            return;
+        }
+        files.push(path);
+    }
+    grants.files.extend(files);
+    grants.read_only.extend(paths);
+}
+
 /// A linked worktree's own Git directory and its main repository's shared
 /// object, ref and log stores: what `git add` and `git commit` write. The
 /// shared `config`, hooks, `info` and other worktrees' entries are left out.
@@ -1861,6 +2066,7 @@ fn linked_git_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CargoBuildSettings {
     target_dir: Option<String>,
+    rustc_wrapper: Option<String>,
 }
 
 /// The `[build]` settings of one cargo configuration file, if it exists and parses.
@@ -1882,6 +2088,7 @@ fn parse_cargo_build_settings(text: &str) -> Option<CargoBuildSettings> {
     };
     Some(CargoBuildSettings {
         target_dir: field("target-dir"),
+        rustc_wrapper: field("rustc-wrapper"),
     })
 }
 
@@ -1977,7 +2184,6 @@ fn refuse_store_overlap(
 #[cfg(unix)]
 #[derive(Debug)]
 struct GitPolicy {
-    #[cfg(target_os = "linux")]
     read_roots: Vec<PathBuf>,
     hooks: Vec<PathBuf>,
     /// For a linked worktree: its own Git directory (`<common>/worktrees/<name>`)
@@ -1992,7 +2198,6 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(GitPolicy {
-                #[cfg(target_os = "linux")]
                 read_roots: Vec::new(),
                 hooks: vec![dot_git.join("hooks")],
                 linked: None,
@@ -2102,7 +2307,6 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
 
     let hooks = resolve_hooks_path(project_root, &common_dir)?;
     let linked = (git_dir != common_dir).then(|| (git_dir.clone(), common_dir.clone()));
-    #[cfg(target_os = "linux")]
     let read_roots = {
         let mut read_roots = vec![git_dir, common_dir];
         read_roots.sort_unstable();
@@ -2110,7 +2314,6 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         read_roots
     };
     Ok(GitPolicy {
-        #[cfg(target_os = "linux")]
         read_roots,
         hooks: vec![hooks],
         linked,
@@ -2192,6 +2395,68 @@ fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf,
         ));
     }
     canonicalize_policy_path(common_dir.join("hooks"), "Git hooks")
+}
+
+/// Resolve operator-owned Git path settings before any command-supplied
+/// environment is applied. `--path` expands Git's home-relative spelling.
+#[cfg(unix)]
+fn configured_git_path(
+    project_root: &Path,
+    key: &str,
+    metadata_allow: &mut Vec<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    if !project_root.join(".git").exists() || !crate::developer_tools::git_usable() {
+        return Ok(None);
+    }
+    let worktree_config = crate::effective_path::new_command("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["config", "--local", "--bool", "extensions.worktreeConfig"])
+        .output()
+        .map_err(|error| format!("failed to query worktree config extension: {error}"))?;
+    let worktree_config = worktree_config.status.success() && worktree_config.stdout == b"true\n";
+    // AFT injects core.hooksPath through command-scope GIT_CONFIG_* settings.
+    // Its hooks then query repository scopes to run the configured policy.
+    // Resolve those same scopes so the injected path cannot hide that policy.
+    for scope in ["--worktree", "--local", "--global", "--system"] {
+        if scope == "--worktree" && !worktree_config {
+            continue;
+        }
+        let output = crate::effective_path::new_command("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["config", scope, "--path", "--get", key])
+            .output()
+            .map_err(|error| format!("failed to query {key}: {error}"))?;
+        if output.status.code() == Some(1) && output.stdout.is_empty() {
+            continue;
+        }
+        if !output.status.success() {
+            return Err(format!(
+                "failed to query {key}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let value = String::from_utf8(output.stdout)
+            .map_err(|error| format!("{key} is not UTF-8: {error}"))?;
+        let path = PathBuf::from(value.trim());
+        if !path.as_os_str().is_empty() {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                project_root.join(path)
+            };
+            for ancestor in path.ancestors() {
+                if std::fs::symlink_metadata(ancestor)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    metadata_allow.push(ancestor.to_path_buf());
+                }
+            }
+            return canonicalize_policy_path(path, key).map(Some);
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -3004,6 +3269,34 @@ fn create_task_temp_dir(task_bundle_dir: &Path) -> Result<PathBuf, String> {
     Err("failed to allocate a fresh task temp directory after 32 attempts".to_string())
 }
 
+#[cfg(target_os = "macos")]
+fn install_worker_mktemp(temp_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = temp_dir.join(".worker-bin");
+    std::fs::create_dir(&bin)
+        .map_err(|error| format!("failed to create task temporary helpers: {error}"))?;
+    let shim = bin.join("mktemp");
+    // Apple mktemp prefers confstr(_CS_DARWIN_USER_TEMP_DIR) over TMPDIR
+    // when no template is supplied. An explicit template keeps that default
+    // operation inside the task; user-supplied templates retain their meaning.
+    std::fs::write(
+        &shim,
+        r#"#!/bin/sh
+for argument do
+    case "$argument" in
+        -*) flags=${argument#-}
+            case "$flags" in ''|*[!dqu]*) exec /usr/bin/mktemp "$@" ;; esac ;;
+        *) exec /usr/bin/mktemp "$@" ;;
+    esac
+done
+exec /usr/bin/mktemp "$@" "${TMPDIR:?}/tmp.XXXXXXXX"
+"#,
+    )
+    .map_err(|error| format!("failed to write task temporary helper: {error}"))?;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+        .map_err(|error| format!("failed to make task temporary helper executable: {error}"))
+}
+
 pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
@@ -3184,10 +3477,32 @@ fn isolated_environment_for_plan(
     }
     match plan.policy() {
         SpawnPlan::Host { environment, .. } => Some(environment.clone()),
-        SpawnPlan::Launcher { profile, .. } => Some(sandboxed_child_environment(
-            request_environment,
-            &profile.temp_dir,
-        )),
+        SpawnPlan::Launcher { profile, .. } => {
+            let mut environment =
+                sandboxed_child_environment(request_environment, &profile.temp_dir);
+            #[cfg(target_os = "macos")]
+            if profile.temp_dir.join(".worker-bin/mktemp").is_file() {
+                let mut paths = vec![profile.temp_dir.join(".worker-bin")];
+                if let Some(path) = environment.get(OsStr::new("PATH")) {
+                    paths.extend(std::env::split_paths(path));
+                }
+                if let Ok(path) = std::env::join_paths(paths) {
+                    environment.insert(OsString::from("PATH"), path);
+                }
+            }
+            // RUSTC_WRAPPER was emptied to disable out-of-sandbox compile servers.
+            // Restore only the direct launcher whose executable this profile
+            // resolved from operator config and explicitly made read-only.
+            if let Some(wrapper) = profile.data_policy.read_allow.iter().find(|path| {
+                path.file_name() == Some(OsStr::new("prefrontal-build-slot"))
+                    && profile.write_deny.contains(path)
+            }) {
+                for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+                    environment.insert(OsString::from(key), wrapper.as_os_str().to_os_string());
+                }
+            }
+            Some(environment)
+        }
         SpawnPlan::Unsandboxed | SpawnPlan::Refused { .. } => None,
         #[cfg(unix)]
         SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
@@ -3892,6 +4207,80 @@ mod tests {
 mod policy_tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn worker_build_slot_grants_are_exact_and_reject_model_writable_launchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        let store = home.join(".local/share/cortexkit");
+        let project = store.join("alfonso/worktrees/container/own");
+        let slots = store.join("operator/build-slots");
+        for path in [&project, &slots] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for name in [
+            "prefrontal-build-slot",
+            "rustc-lowprio-direct",
+            ".root",
+            ".cache",
+        ] {
+            std::fs::write(slots.join(name), "operator-owned").unwrap();
+        }
+        std::fs::write(slots.join("limit"), "2\n").unwrap();
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &crate::config::Config::default(),
+            &store.join("aft"),
+            vec![project.clone()],
+            &home,
+        );
+        let mut grants = WorkerJailGrants::default();
+        add_build_slot_grants(
+            &slots.join("prefrontal-build-slot"),
+            &[project.clone()],
+            &policy,
+            &mut grants,
+        );
+        assert_eq!(
+            grants.files,
+            ["queue.lock", "0.lock", "1.lock", "2.lock"].map(|name| slots.join(name))
+        );
+        assert_eq!(grants.read_only.len(), 5);
+        assert!(grants.roots.is_empty() && grants.caches.is_empty());
+        assert!(grants
+            .read_only
+            .iter()
+            .all(|path| path.is_file() && path.parent() == Some(slots.as_path())));
+        let mut refused = WorkerJailGrants::default();
+        add_build_slot_grants(
+            &slots.join("prefrontal-build-slot"),
+            &[slots.clone()],
+            &policy,
+            &mut refused,
+        );
+        assert_eq!(
+            refused,
+            WorkerJailGrants::default(),
+            "a model-writable launcher must never be pinned"
+        );
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(slots.join(".root")).unwrap();
+            std::fs::write(home.join("secret"), "secret").unwrap();
+            std::os::unix::fs::symlink(home.join("secret"), slots.join(".root")).unwrap();
+            add_build_slot_grants(
+                &slots.join("prefrontal-build-slot"),
+                &[project],
+                &policy,
+                &mut refused,
+            );
+            assert_eq!(
+                refused,
+                WorkerJailGrants::default(),
+                "a sibling symlink must not widen the read exception"
+            );
+        }
+    }
+
     fn context(project_root: PathBuf) -> AppContext {
         AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -4036,6 +4425,7 @@ mod policy_tests {
             ),
             Some(CargoBuildSettings {
                 target_dir: Some("shared-target".into()),
+                rustc_wrapper: Some("/x/rustc-lowprio".into()),
             })
         );
         assert_eq!(parse_cargo_build_settings("[net]\noffline = true\n"), None);
@@ -4170,13 +4560,11 @@ mod policy_tests {
             std::fs::create_dir_all(path).unwrap();
         }
         let linked = GitPolicy {
-            #[cfg(target_os = "linux")]
             read_roots: Vec::new(),
             hooks: vec![common.join("hooks")],
             linked: Some((own.clone(), common.clone())),
         };
         let main = GitPolicy {
-            #[cfg(target_os = "linux")]
             read_roots: Vec::new(),
             hooks: Vec::new(),
             linked: None,
@@ -5175,6 +5563,7 @@ mod read_allow_tests {
                     binary.clone().into(),
                 ],
                 write_allow: vec![project.clone().into(), temp.clone().into()],
+                read_metadata_allow: Vec::new(),
             },
             writable_roots: vec![project.into()],
             writable_files: Vec::new(),

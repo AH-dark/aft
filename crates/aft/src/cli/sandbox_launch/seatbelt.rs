@@ -80,13 +80,22 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
     )?;
     // Git resolves the cwd by statting each ancestor. Permit metadata on the
     // exact exception's ancestor chain, not directory contents or sibling data.
-    for allow in &profile.data_policy.read_allow {
-        for ancestor in allow.ancestors().skip(1) {
+    for allow in profile
+        .data_policy
+        .read_allow
+        .iter()
+        .chain(&profile.data_policy.read_metadata_allow)
+    {
+        for ancestor in allow.ancestors() {
             if profile
                 .data_policy
                 .deny
                 .iter()
                 .any(|deny| ancestor.starts_with(deny))
+                && !profile
+                    .read_deny
+                    .iter()
+                    .any(|deny| ancestor.starts_with(deny))
             {
                 source.push_str(&format!(
                     "(allow file-read-metadata (literal \"{}\"))\n",

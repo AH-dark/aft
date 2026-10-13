@@ -268,6 +268,7 @@ impl AccessPolicy {
                 deny: deny.into_iter().map(|path| policy_path(&path)).collect(),
                 read_allow,
                 write_allow: roots.clone(),
+                read_metadata_allow: Vec::new(),
             },
             roots,
             outside: if config.restrict_to_project_root && config.project_root.is_some() {

@@ -13,14 +13,24 @@ pub struct SandboxDataPolicy {
     pub deny: Vec<PathBuf>,
     pub read_allow: Vec<PathBuf>,
     pub write_allow: Vec<PathBuf>,
+    /// Exact symlink paths on the way to a readable configured directory.
+    /// These aliases permit metadata only; directory contents are allowed only
+    /// through the resolved `read_allow` targets, and writes stay denied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_metadata_allow: Vec<PathBuf>,
 }
 
 impl SandboxDataPolicy {
     fn canonicalize(self) -> Result<Self, SandboxProfileError> {
+        for path in &self.read_metadata_allow {
+            validate_absolute(path, "data_policy.read_metadata_allow")?;
+            validate_normalized(path, "data_policy.read_metadata_allow")?;
+        }
         Ok(Self {
             deny: canonicalize_optional_paths(self.deny, "data_policy.deny", &mut HashMap::new())?,
             read_allow: canonicalize_required_paths(self.read_allow, "data_policy.read_allow")?,
-            write_allow: canonicalize_required_dirs(self.write_allow, "data_policy.write_allow")?,
+            write_allow: canonicalize_required_paths(self.write_allow, "data_policy.write_allow")?,
+            read_metadata_allow: self.read_metadata_allow,
         })
     }
 
@@ -429,6 +439,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_store_lock_exception_stays_a_single_file_after_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().canonicalize().unwrap().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let lock = store.join("queue.lock");
+        std::fs::write(&lock, "lock").unwrap();
+        let policy = SandboxDataPolicy {
+            deny: vec![store.clone()],
+            read_allow: vec![lock.clone()],
+            write_allow: vec![lock.clone()],
+            read_metadata_allow: Vec::new(),
+        }
+        .canonicalize()
+        .unwrap();
+        let transferred: SandboxDataPolicy =
+            serde_json::from_slice(&serde_json::to_vec(&policy).unwrap()).unwrap();
+        let transferred = transferred.canonicalize().unwrap();
+        assert_eq!(transferred, policy);
+        assert!(policy
+            .validate_grants([lock.as_path()], &policy.write_allow)
+            .is_ok());
+        for path in [&store, &store.join("other.lock")] {
+            assert!(policy
+                .validate_grants([path.as_path()], &policy.write_allow)
+                .is_err());
+        }
+    }
+
+    #[test]
     fn private_store_grants_require_exact_descendant_carve_outs() {
         let base = tempfile::tempdir().unwrap();
         let store = base.path().join("cortexkit");
@@ -439,6 +478,7 @@ mod tests {
             deny: vec![store.clone()],
             read_allow: vec![own.clone(), io.clone(), hooks.clone()],
             write_allow: vec![own.clone(), io.clone()],
+            read_metadata_allow: Vec::new(),
         };
         for allowed in [&own, &io, &own.join("new-file"), &io.join("temp")] {
             policy
