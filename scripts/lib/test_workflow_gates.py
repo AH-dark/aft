@@ -19,6 +19,7 @@ WORKFLOW_TEXT = (
     Path(__file__).resolve().parents[2] / ".github/workflows/_unit-suite.yml"
 ).read_text()
 GATE_TEXT = (Path(__file__).resolve().parents[2] / "scripts/rust-test-gate.sh").read_text()
+PROOF_TEXT = (Path(__file__).resolve().parents[2] / "scripts/rust-test-inventory-proof.py").read_text()
 
 
 def workflow_job(job_id: str) -> str:
@@ -61,6 +62,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         summary = workflow_job("unit-macos")
         expected_lanes = {
             "unit-macos-nextest-archive",
+            "unit-macos-libtest-archive",
+            "unit-macos-inventory-proof",
             "unit-macos-libtest-shard",
             "unit-macos-nextest",
             "unit-macos-watcher",
@@ -75,11 +78,26 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn('if [[ "$result" != "success" ]]', summary)
 
     def test_macos_rust_buckets_and_bun_suite_run_in_parallel_lanes(self) -> None:
-        archive = workflow_job("unit-macos-nextest-archive")
-        self.assertIn("(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)", archive)
-        self.assertIn("scripts/rust-test-inventory-proof.py", archive)
+        integration_archive = workflow_job("unit-macos-nextest-archive")
+        self.assertIn("kind(test) - binary(=watcher_integration)", integration_archive)
+        self.assertIn("macos-integration-inventory.json", integration_archive)
+        self.assertIn("macos-doctest-inventory.txt", integration_archive)
+
+        libtest_archive = workflow_job("unit-macos-libtest-archive")
+        self.assertIn("(kind(lib) | kind(bin))", libtest_archive)
+        self.assertIn("macos-libtest-inventory.json", libtest_archive)
+
+        inventory = workflow_job("unit-macos-inventory-proof")
+        self.assertIn("AFT_NEXTEST_ARCHIVE_LIB_BIN_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_SOURCE_INVENTORY_LIB_BIN_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE", inventory)
+        self.assertIn("AFT_WATCHER_TEST_INVENTORY_FILE", inventory)
+        self.assertIn("scripts/rust-test-inventory-proof.py", inventory)
 
         libtest = workflow_job("unit-macos-libtest-shard")
+        self.assertIn("unit-macos-libtest-archive", libtest)
+        self.assertIn("macos-libtest-archive", libtest)
         self.assertIn("max-parallel: 3", libtest)
         self.assertIn("AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}", libtest)
         self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3", libtest)
@@ -89,6 +107,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("max-parallel: 3", integration)
         self.assertIn("AFT_GATE_PHASES: nextest", integration)
         self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3", integration)
+        self.assertIn("macos-nextest-archive", integration)
 
         watcher = workflow_job("unit-macos-watcher")
         self.assertIn("AFT_GATE_PHASES: watcher", watcher)
@@ -107,6 +126,47 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertLess(prewarm, keychain)
         self.assertLess(warm, keychain)
         self.assertIn("extract_nextest_archive_for_prewarm", GATE_TEXT[prewarm_start:keychain])
+
+    def test_macos_backtrace_probe_runs_from_the_archive(self) -> None:
+        self.assertIn('if [[ "$(uname)" == "Darwin" ]]; then', GATE_TEXT)
+        self.assertIn(
+            "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) panic_hook_preserves_default_backtrace_behavior_and_persists",
+            GATE_TEXT,
+        )
+        expected_command = (
+            'cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \\\n'
+            "          -E 'kind(lib)' -- panic_hook_preserves_default_backtrace_behavior_and_persists"
+        )
+        self.assertIn(expected_command, GATE_TEXT)
+        self.assertIn(
+            "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet",
+            GATE_TEXT,
+        )
+
+    def test_macos_inventory_proof_checks_source_archives_and_partitions(self) -> None:
+        inventory = workflow_job("unit-macos-inventory-proof")
+        for variable in (
+            "AFT_NEXTEST_ARCHIVE_LIB_BIN_FILE",
+            "AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE",
+            "AFT_NEXTEST_SOURCE_INVENTORY_LIB_BIN_FILE",
+            "AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE",
+            "AFT_WATCHER_TEST_INVENTORY_FILE",
+            "AFT_DOCTEST_INVENTORY_FILE",
+            "AFT_DOCTEST_INVENTORY_FILE",
+        ):
+            self.assertIn(variable, inventory)
+        self.assertIn("lib_bin_archive_errors = partition_coverage_errors(", PROOF_TEXT)
+        self.assertIn("integration_archive_errors = partition_coverage_errors(", PROOF_TEXT)
+        self.assertIn("or any(source_archive_errors)", PROOF_TEXT)
+        self.assertIn("or partition_errors", PROOF_TEXT)
+        self.assertIn(
+            "partition_coverage_errors(unit_bin_shardable_entries, unit_bin_partitions)",
+            PROOF_TEXT,
+        )
+        self.assertIn(
+            "partition_coverage_errors(nextest_shardable_entries, nextest_partitions)",
+            PROOF_TEXT,
+        )
 
 
 if __name__ == "__main__":
