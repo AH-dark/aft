@@ -939,6 +939,57 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
 }
 
 #[tokio::test]
+async fn exec_remote_bash_from_a_jailed_worker_is_submitted_unchanged() {
+    // A jailed worker's shell plan is a native-launcher plan. runon still
+    // snapshots and submits from AFT itself, outside the shell sandbox; the
+    // launcher plan only backs a local fallback, which this run never needs.
+    let daemon = daemon(Script::Utf8, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let temp = dir.path().join("sandbox-temp");
+    fs::create_dir_all(&temp).unwrap();
+    let profile = crate::sandbox_profile::SandboxProfile::build(
+        vec![dir.path().into()],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        temp,
+    )
+    .unwrap();
+    let registry = registry();
+    let task = crate::sandbox_spawn::with_worker_jail(true, || {
+        registry
+            .spawn_remote(
+                launch(daemon.connection.clone()),
+                SpawnPlan::launcher_for_test(profile, "/nonexistent/aft-launcher".into()),
+                "printf local-proof",
+                resolve_posix_shell(),
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().into(),
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(dir.path().into()),
+            )
+            .unwrap()
+    });
+    let done = terminal(&registry, &task).await;
+    let task = registry.task(&task).unwrap();
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), "€".as_bytes());
+    assert_eq!(
+        done.output_preview.lines().next(),
+        Some("ran remotely on ck-motor")
+    );
+    assert!(!done.output_preview.contains("local-proof"));
+}
+
+#[tokio::test]
 async fn exec_remote_bash_discloses_only_names_aft_stripped() {
     let daemon = daemon(Script::Utf8, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
