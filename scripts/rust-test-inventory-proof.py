@@ -104,7 +104,17 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         line = raw_line.rstrip("\n")
         stripped = line.strip()
         if not stripped or stripped.startswith(
-            ("Compiling ", "Checking ", "Finished `", "Blocking waiting for file lock")
+            (
+                "Compiling ",
+                "Checking ",
+                "Finished `",
+                "Blocking waiting for file lock",
+                "Updating ",
+                "Downloading ",
+                "Downloaded ",
+                "Locking ",
+                "Adding ",
+            )
         ):
             continue
 
@@ -166,6 +176,9 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
 
 def verify_cargo_list_windows_source_paths() -> None:
     output = (
+        "    Updating crates.io index\n"
+        "    Downloading serde v1.0.0\n"
+        "    Locking 1 package to latest compatible version\n"
         "Running unittests src\\lib.rs (target/debug/deps/aft-0123456789abcdef.exe)\n"
         "library_path_case: test\n"
         "Running unittests src\\main.rs (target/debug/deps/aft-0123456789abcdef.exe)\n"
