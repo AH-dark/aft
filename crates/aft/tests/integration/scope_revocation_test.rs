@@ -72,7 +72,7 @@ async fn assert_scope_kill_settled() {
 fn stamp() -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
         "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
-        "ref":"run-scope", "scope_epoch":1, "kind":"worker",
+        "ref":"run-scope", "scope_epoch":1, "kind":"ephemeral",
         "attributes":{"agent_id":"agent-a", "run_id":"run-a"},
         "owner_authorized":true,
         "expires_at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + 30000
