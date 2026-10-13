@@ -382,6 +382,13 @@ if phase_enabled lib; then
       cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
   fi
 
+  # This test re-executes current_exe and requires its PDB beside the local
+  # Cargo-built test binary; nextest's extracted archive does not carry it.
+  if phase_enabled lib-shard && [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
+    run_phase "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
+      cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
+  fi
+
   # When lib-shard is selected, the archive-backed command below owns the rest
   # of the unit inventory. Other callers keep the original whole-suite command.
   if ! phase_enabled lib-shard; then
@@ -410,7 +417,9 @@ if phase_enabled lib-shard; then
     cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
       -E 'kind(lib) | kind(bin)' \
       --partition "$AFT_NEXTEST_PARTITION" \
-      -- --skip platform_verifier_tls_client_subprocess
+      -- \
+        --skip platform_verifier_tls_client_subprocess \
+        --skip panic_hook_preserves_default_backtrace_behavior_and_persists
 fi
 
 if phase_enabled nextest && [[ "$(uname)" == "Darwin" && -z "${AFT_NEXTEST_ARCHIVE_FILE:-}" && "${AFT_GATE_NO_XPROTECT_REMEDIATION:-}" != "1" ]]; then
