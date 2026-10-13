@@ -56,6 +56,10 @@ pub(super) fn catalog(
                     _ => false,
                 },
                 "host" => value.as_str().is_some_and(|s| !s.is_empty()),
+                "mode" => {
+                    serde_json::from_value::<crate::access_policy::ApprovalMode>(value.clone())
+                        .is_ok()
+                }
                 "remote_exec" | "siblings" if preset == "worker" => true,
                 "allow_paths" if preset == "worker" => true,
                 _ => continue,
@@ -73,6 +77,34 @@ pub(super) fn catalog(
     let worker_wait_max_ms = ctx.config().bash.worker_wait_max_ms;
     let (request, catalog_preset) = tool_provider::validate_catalog_request(body)?;
     access_grants::catalog(original.get("allow_paths"), identity, ctx, &preset)?;
+    // A head preflighting a worker plan validates its override without changing
+    // its own session. The actual worker fetch persists the override on its scope.
+    if let Some(mode) = original
+        .get("mode")
+        .filter(|_| preset != "worker" || access_grants::alfonso_worker(identity))
+    {
+        access_grants::register(identity, ctx)?;
+        let db = ctx.db().ok_or_else(|| {
+            cortexkit_role_tool_provider::errors::invalid_request(
+                "params.mode",
+                "mode persistence unavailable",
+            )
+        })?;
+        let conn = db.lock().map_err(|_| {
+            cortexkit_role_tool_provider::errors::invalid_request(
+                "params.mode",
+                "mode database lock poisoned",
+            )
+        })?;
+        crate::db::access_grants::set_mode(
+            &conn,
+            &access_grants::policy_scope_key(identity),
+            serde_json::from_value(mode.clone()).expect("mode validated"),
+        )
+        .map_err(|e| {
+            cortexkit_role_tool_provider::errors::invalid_request("params.mode", e.to_string())
+        })?;
+    }
     if let Some(key) = key(identity, Some(&preset)) {
         if original.contains_key("remote_exec") || original.contains_key("siblings") {
             let policy = match crate::exec_remote::FrozenParams::decode(&original) {

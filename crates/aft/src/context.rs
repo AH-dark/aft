@@ -11999,6 +11999,7 @@ impl AppContext {
         req_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
         reject_github_address(req_id, path)?;
         let Some(PathRestrictionContext {
             raw_root,
@@ -12014,13 +12015,20 @@ impl AppContext {
             return self.validate_path(req_id, path);
         };
         let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
-        let resolved_parent = match std::fs::canonicalize(parent) {
-            Ok(resolved) => resolved,
-            Err(_) => {
-                reject_escaping_symlink(req_id, path, parent, &resolved_root, &raw_root)?;
-                resolve_with_existing_ancestors(parent)
-            }
-        };
+        let id = req_id.to_string();
+        let original = path.to_path_buf();
+        let resolved_parent = crate::bounded_io::run(parent, None, move |parent| {
+            Ok(match std::fs::canonicalize(&parent) {
+                Ok(resolved) => Ok(resolved),
+                Err(_) => {
+                    reject_escaping_symlink(&id, &original, &parent, &resolved_root, &raw_root)
+                        .map(|()| resolve_with_existing_ancestors(&parent))
+                }
+            })
+        })
+        .map_err(|error| {
+            crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+        })??;
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
         self.check_path_access(req_id, path, &resolved, None, true)?;
@@ -12047,6 +12055,7 @@ impl AppContext {
         path: &Path,
         artifact_session_id: Option<&str>,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
+        let _io = crate::bounded_io::enter_if_absent(crate::bounded_io::IO_BUDGET);
         reject_github_address(req_id, path)?;
         let Some(PathRestrictionContext {
             raw_root,
@@ -12115,7 +12124,7 @@ impl AppContext {
             .unwrap_or_default();
         let storage = self.storage_dir();
         let force_restrict = self.request_force_restrict(req_id);
-        let grants = if let Some(scope) = crate::access_policy::current_scope() {
+        let (grants, mode) = if let Some(scope) = crate::access_policy::current_scope() {
             match self.db() {
                 Some(db) => {
                     let conn = db.lock().map_err(|_| {
@@ -12125,22 +12134,32 @@ impl AppContext {
                             "grant database lock poisoned",
                         )
                     })?;
-                    crate::db::access_grants::list(&conn, &scope).map_err(|error| {
+                    let grants =
+                        crate::db::access_grants::list(&conn, &scope).map_err(|error| {
+                            crate::protocol::Response::error(
+                                req_id,
+                                "grants_unavailable",
+                                error.to_string(),
+                            )
+                        })?;
+                    let mode = crate::db::access_grants::mode(&conn, &scope).map_err(|error| {
                         crate::protocol::Response::error(
                             req_id,
                             "grants_unavailable",
                             error.to_string(),
                         )
-                    })?
+                    })?;
+                    (grants, mode)
                 }
-                None => Vec::new(),
+                None => (Vec::new(), Default::default()),
             }
         } else {
-            Vec::new()
+            (Vec::new(), Default::default())
         };
         let build = move || {
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
             policy.grants = grants;
+            policy.mode = mode;
             if force_restrict {
                 policy.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
             }
@@ -12265,20 +12284,24 @@ impl AppContext {
             }
         }
         match decision {
-            // For compatibility, treat Ask as Allow for configurations that do not
-            // restrict access to project roots, except on stamped Alfonso worker
-            // calls, which put the question to Cingulate. Restricted
-            // configurations produce Deny outside roots; protected paths are
-            // denied in every configuration.
-            AccessDecision::Allow => Ok(()),
+            AccessDecision::Allow => crate::bounded_io::probe_access(req_id, &identity),
             AccessDecision::Ask => {
                 let operation = if preserve_final {
                     AccessOperation::Write
                 } else {
                     operation
                 };
-                self.answer_ask(req_id, original, &identity, operation)
+                self.answer_ask(req_id, original, &identity, operation)?;
+                crate::bounded_io::probe_access(req_id, &identity)
             }
+            AccessDecision::Deny(AccessDenial::ReadOnly) => Err(crate::protocol::Response::error(
+                req_id,
+                "access_read_only",
+                format!(
+                    "writes outside the route's roots are denied in read-only mode: {}",
+                    original.display()
+                ),
+            )),
             AccessDecision::Deny(AccessDenial::Floor) => Err(crate::protocol::Response::error(
                 req_id,
                 "denied_floor",

@@ -56,23 +56,49 @@ impl FakeCingulate {
         state.calls.push((method.to_string(), params.clone()));
         match method {
             "consent.request" => {
-                // Cingulate refuses unknown fields and requires head_policy on
-                // worker-scope asks; these tests ask only from worker scopes.
+                // Requests from a head omit head_policy; informational cards
+                // have no permission choices and never wait for an answer.
                 let keys: Vec<_> = params.as_object().unwrap().keys().cloned().collect();
-                assert_eq!(
-                    keys,
-                    [
-                        "args_hash",
-                        "call_key",
-                        "head_policy",
-                        "kind",
-                        "operation",
-                        "paths",
-                        "pattern",
-                        "reason",
-                        "tool"
-                    ]
-                );
+                if params["kind"] == "macos_permission" {
+                    assert_eq!(
+                        params
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        ["call_key", "folder", "kind", "program", "steps"]
+                    );
+                } else if params.get("head_policy").is_some() {
+                    assert_eq!(
+                        keys,
+                        [
+                            "args_hash",
+                            "call_key",
+                            "head_policy",
+                            "kind",
+                            "operation",
+                            "paths",
+                            "pattern",
+                            "reason",
+                            "tool"
+                        ]
+                    );
+                } else {
+                    assert_eq!(
+                        keys,
+                        [
+                            "args_hash",
+                            "call_key",
+                            "kind",
+                            "operation",
+                            "paths",
+                            "pattern",
+                            "reason",
+                            "tool"
+                        ]
+                    );
+                }
                 let key = params["call_key"].as_str().unwrap().to_string();
                 let next = format!("acc_{}", state.asks.len() + 1);
                 let id = state.asks.entry(key).or_insert(next).clone();
@@ -637,13 +663,32 @@ async fn consent_user_answer_is_not_rechecked_against_the_head() {
 }
 
 #[tokio::test]
-async fn consent_stamped_head_outside_its_root_keeps_todays_allow() {
+async fn consent_stamped_head_defaults_to_ask_and_full_access_opts_out() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let target = f.dir.path().join("elsewhere.txt");
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let pending = f.read(&f.head, &target, 6).await;
+    assert_eq!(code(&pending), "access_pending", "{pending}");
+    let requests = f.fake.calls("consent.request");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].get("head_policy").is_none());
+    f.fake.answer(
+        requests[0]["call_key"].as_str().unwrap(),
+        json!({"state":"settled","outcome":"allow_once","answered_by":"user"}),
+    );
     let reply = f.read(&f.head, &target, 7).await;
     assert!(text(&reply).contains("unheld contents"), "{reply}");
-    assert!(f.fake.calls("consent.request").is_empty());
+    let count = f.fake.calls("consent.request").len();
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"full-access"}}),
+        &f.head,
+        &f.ctx,
+    )
+    .unwrap();
+    let reply = f.read(&f.head, &target, 8).await;
+    assert!(text(&reply).contains("unheld contents"), "{reply}");
+    assert_eq!(f.fake.calls("consent.request").len(), count);
 }
 
 #[tokio::test]
@@ -793,8 +838,8 @@ fn consent_routes_asks_by_stamp() {
     for (identity, asks) in [
         (&worker, true),
         (&worker_run, true),
-        (&head, false),
-        (&head_run, false),
+        (&head, true),
+        (&head_run, true),
         (&standalone, false),
         (&foreign, false),
     ] {
@@ -1123,4 +1168,84 @@ async fn consent_route_close_reaches_the_approved_rerun() {
     note_route_closed(route_key(41, 1));
     wait_for(|| RERUN_CANCELLED.load(Ordering::SeqCst)).await;
     wait_for(|| f.asks().is_empty()).await;
+}
+
+#[tokio::test]
+async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let folder = f.dir.path().join("protected");
+    let observation = |readable| crate::bounded_io::PermissionObservation {
+        folder: folder.clone(),
+        readable,
+    };
+    let db = f.ctx.db().unwrap();
+    macos_permissions(Arc::clone(&db), f.head.clone(), vec![observation(false)])
+        .await
+        .unwrap();
+    macos_permissions(Arc::clone(&db), f.worker.clone(), vec![observation(false)])
+        .await
+        .unwrap();
+    let requests = f.fake.calls("consent.request");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["kind"], "macos_permission");
+    assert_eq!(requests[0]["folder"], json!(folder));
+    assert_eq!(requests[0]["program"], "ck-aft");
+    assert!(f.fake.calls("consent.await").is_empty());
+    assert!(f.fake.calls("consent.withdraw").is_empty());
+    // A readable-again observation withdraws the existing card, even when a
+    // different scope created it: the macOS permission covers the same folder.
+    macos_permissions(Arc::clone(&db), f.worker.clone(), vec![observation(true)])
+        .await
+        .unwrap();
+    assert_eq!(f.fake.calls("consent.withdraw").len(), 1);
+    let count: u64 = db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM macos_permission_cards", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    macos_permissions(db, f.head.clone(), vec![observation(false)])
+        .await
+        .unwrap();
+    assert_eq!(
+        f.fake.calls("consent.request").len(),
+        2,
+        "a later denial creates a new card after withdrawal"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn macos_allowed_read_eperm_returns_named_denial_and_updates_one_card() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"full-access"}}),
+        &f.head,
+        &f.ctx,
+    )
+    .unwrap();
+    let folder = crate::access_policy::policy_path(&f.dir.path().join("protected"));
+    std::fs::create_dir(&folder).unwrap();
+    let target = folder.join("file.txt");
+    std::fs::write(&target, "protected bytes").unwrap();
+    let probe = crate::bounded_io::tests::deny_macos_directory(&folder);
+    for corr in [7, 8] {
+        let reply = f.read(&f.worker, &target, corr).await;
+        assert_eq!(code(&reply), "macos_permission_denied", "{reply}");
+        assert!(!text(&reply).contains("protected bytes"));
+    }
+    wait_for(|| f.fake.calls("consent.request").len() == 1).await;
+    assert_eq!(
+        f.fake.calls("consent.request")[0]["kind"],
+        "macos_permission"
+    );
+    assert!(f.fake.calls("consent.await").is_empty());
+    probe.allow();
+    let reply = f.read(&f.worker, &target, 9).await;
+    assert!(text(&reply).contains("protected bytes"), "{reply}");
+    wait_for(|| f.fake.calls("consent.withdraw").len() == 1).await;
 }

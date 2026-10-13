@@ -649,11 +649,15 @@ pub(crate) fn handle_delete_deferred_with_restriction(
     };
     let config = ctx.config();
     let grant_scope = crate::access_policy::current_scope();
+    let ask_route = crate::access_policy::current_ask_route();
+    let io_budget = crate::bounded_io::current();
     let cancellation = crate::executor::current_job_cancellation()
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     std::thread::spawn(move || {
+        let _io = crate::bounded_io::enter(io_budget);
+        let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
         let _grant_scope = crate::access_policy::scope_guard(grant_scope);
         let _config_pin = ctx.pin_config_to(config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
@@ -661,7 +665,7 @@ pub(crate) fn handle_delete_deferred_with_restriction(
         // Preserve the admitted no-backup decision even if a concurrent bind
         // changes the policy; this continuation must never acquire snapshots.
         let response = handle_delete_file_with_skip(&request, &ctx, Some(reason));
-        let _ = tx.send(response);
+        let _ = tx.send(crate::bounded_io::finish_response(response));
     });
     DispatchOutcome::Deferred(
         PendingResponse::from_receiver(

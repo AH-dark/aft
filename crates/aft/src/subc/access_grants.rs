@@ -105,7 +105,24 @@ fn register_on(
             epoch: parent.scope_epoch,
         });
     store::register_scope(conn, &scope_key(identity), parent.as_ref(), &config)
-        .map_err(|e| refusal("grants_unavailable", e.to_string()))
+        .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
+    if let Some(stamp) = identity.scope.as_ref().filter(|s| alfonso(s)) {
+        if matches!(
+            stamp.kind,
+            subc_protocol::scope::ScopeKind::Head | subc_protocol::scope::ScopeKind::Ephemeral
+        ) {
+            if let Some(agent_id) = stamp.attributes.agent_id.as_deref() {
+                store::register_agent(
+                    conn,
+                    &scope_key(identity),
+                    agent_id,
+                    stamp.kind == subc_protocol::scope::ScopeKind::Head,
+                )
+                .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn operation(
@@ -237,13 +254,11 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
     })
 }
 
-/// How an `ask` is answered on this route. Stamped Alfonso workers ask
-/// Cingulate (`Consent`). Every other route, stamped Alfonso heads and
-/// standalone routes included, treats `ask` as allow (`Lowered`). Heads stay
-/// lowered until approval modes (full-access, ask, read-only) exist; without
-/// them a head would block on every outside path with no way to opt out.
+/// Routes attested as prefrontal-core heads, workers or runs send access asks
+/// to Cingulate, the consent service, never to a plugin prompt. Other routes
+/// retain compatibility behavior: an outside-root ask is treated as allow.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
-    if alfonso_worker(identity) {
+    if identity.scope.as_ref().is_some_and(alfonso) {
         crate::access_policy::AskRoute::Consent { once: Vec::new() }
     } else {
         crate::access_policy::AskRoute::Lowered
@@ -304,6 +319,7 @@ pub(super) fn policy_for_scope(
         .map(|root| vec![policy_path(root)])
         .unwrap_or_default();
     let mut policy = AccessPolicy::from_config(&config, &ctx.storage_dir(), roots, &home);
+    policy.mode = store::mode(conn, key)?;
     policy.grants = store::list(conn, key)?;
     Ok(Some(policy))
 }

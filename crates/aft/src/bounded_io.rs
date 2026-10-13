@@ -36,16 +36,20 @@ struct Failure {
 struct ProbeError {
     kind: io::ErrorKind,
     message: String,
+    raw_os_error: Option<i32>,
 }
 impl ProbeError {
     fn from(error: &io::Error) -> Self {
         Self {
             kind: error.kind(),
             message: error.to_string(),
+            raw_os_error: error.raw_os_error(),
         }
     }
     fn error(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
+        self.raw_os_error
+            .map(io::Error::from_raw_os_error)
+            .unwrap_or_else(|| io::Error::new(self.kind, self.message.clone()))
     }
 }
 #[derive(Clone, Copy)]
@@ -63,10 +67,16 @@ pub(crate) struct Budget {
     failure: Arc<Mutex<Option<Failure>>>,
     failed: Arc<AtomicBool>,
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
+    permissions: Arc<Mutex<Vec<PermissionObservation>>>,
     #[cfg(test)]
     measurements: Arc<Measurements>,
 }
 impl Budget {
+    pub(crate) fn capped(&self, deadline: Instant) -> Self {
+        let mut budget = self.clone();
+        budget.deadline = budget.deadline.min(deadline);
+        budget
+    }
     pub(crate) fn after(duration: Duration) -> Self {
         Self {
             id: NEXT_BUDGET.fetch_add(1, Ordering::Relaxed),
@@ -74,9 +84,16 @@ impl Budget {
             failure: Arc::new(Mutex::new(None)),
             failed: Arc::new(AtomicBool::new(false)),
             directories: Arc::new(Mutex::new(HashMap::new())),
+            permissions: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             measurements: Arc::new(Measurements::default()),
         }
+    }
+    pub(crate) fn permissions(&self) -> Vec<PermissionObservation> {
+        self.permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
     #[cfg(test)]
     pub(crate) fn measurements(&self) -> (usize, usize) {
@@ -84,6 +101,135 @@ impl Budget {
             self.measurements.spawns.load(Ordering::Relaxed),
             self.measurements.round_trips.load(Ordering::Relaxed),
         )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PermissionObservation {
+    pub(crate) folder: PathBuf,
+    pub(crate) readable: bool,
+}
+
+fn observe_permission(path: &Path, result: &io::Result<Access>, macos: bool) {
+    if !macos {
+        return;
+    }
+    let readable = match result {
+        Ok(_) => true,
+        Err(error) if error.raw_os_error() == Some(1) => false,
+        _ => return,
+    };
+    if let Some(budget) = current() {
+        budget
+            .permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(PermissionObservation {
+                folder: permission_folder(path),
+                readable,
+            });
+    }
+}
+
+// macOS privacy permissions apply to the enclosing protected folder, not each
+// descendant directory.
+// This is only a display/deduplication identity; it never changes path policy.
+fn permission_folder(path: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = home {
+        for folder in [
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Pictures",
+            "Music",
+            "Movies",
+        ] {
+            let folder = home.join(folder);
+            if path.starts_with(&folder) {
+                return folder;
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
+/// The helper only probes access. The caller may mutate only after this returns.
+pub(crate) fn probe_access(req_id: &str, path: &Path) -> Result<(), Response> {
+    // A new target may have several nonexistent ancestors. Probe the nearest
+    // existing directory without creating any of those missing components.
+    let result = probe_target(path);
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut parent = path.parent();
+            while let Some(folder) = parent {
+                match probe_directory(folder, None) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        parent = folder.parent()
+                    }
+                    Err(error) => return Err(access_error(req_id, folder, error)),
+                }
+            }
+            Ok(())
+        }
+        Err(error) => Err(access_error(req_id, path, error)),
+    }
+}
+
+fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
+    let code = if cfg!(target_os = "macos") && error.raw_os_error() == Some(1) {
+        let folder = current()
+            .and_then(|budget| {
+                budget
+                    .permissions()
+                    .into_iter()
+                    .find(|p| !p.readable)
+                    .map(|p| p.folder)
+            })
+            .unwrap_or_else(|| permission_folder(path.parent().unwrap_or(path)));
+        observe_permission(&folder, &Err(io::Error::from_raw_os_error(1)), true);
+        return Response::error_with_data(req_id, "macos_permission_denied", format!("macOS denied access to {}; grant ck-aft access in System Settings → Privacy & Security, then retry", folder.display()), serde_json::json!({"folder":folder,"program":"ck-aft"}));
+    } else if error.kind() == io::ErrorKind::TimedOut {
+        "read_blocked"
+    } else {
+        "path_access_denied"
+    };
+    Response::error_with_data(
+        req_id,
+        code,
+        format!("{}: {error}", path.display()),
+        serde_json::json!({"path":path}),
+    )
+}
+
+pub(crate) fn finish_response(response: Response) -> Response {
+    if matches!(
+        response.data["code"].as_str(),
+        Some("denied_floor" | "path_outside_root" | "access_read_only")
+    ) {
+        return response;
+    }
+    if let Some(folder) = current().and_then(|budget| {
+        budget
+            .permissions()
+            .into_iter()
+            .find(|p| !p.readable)
+            .map(|p| p.folder)
+    }) {
+        return Response::error_with_data(&response.id, "macos_permission_denied", format!("macOS denied access to {}; grant ck-aft access in System Settings → Privacy & Security, then retry", folder.display()), serde_json::json!({"folder":folder,"program":"ck-aft"}));
+    }
+    let error = current().and_then(|budget| {
+        budget
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    });
+    match error {
+        Some(error) => Response::error(&response.id, error.code, error.message),
+        None => response,
     }
 }
 thread_local! {
@@ -200,16 +346,7 @@ pub(crate) fn command(
         Some(error) => Response::error(&req.id, "read_deadline_exceeded", error.to_string()),
         None => work(req, ctx),
     };
-    let budget = current().expect("command budget installed");
-    let error = budget
-        .failure
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    match error {
-        Some(error) => Response::error(&req.id, error.code, error.message),
-        None => response,
-    }
+    finish_response(response)
 }
 
 struct Limiter {
@@ -351,11 +488,18 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
             // Opening and advancing ReadDir probes consent, not just existence.
             let mut entries = std::fs::read_dir(&path)?;
             let _ = entries.next().transpose()?;
-            Ok(Access {
+            let access = Access {
                 direct: local_filesystem(&path)?,
-            })
-        })
-        .map_err(|error| ProbeError::from(&error));
+            };
+            #[cfg(all(test, unix))]
+            tests::after_directory_probe(&path);
+            Ok(access)
+        });
+        let macos = cfg!(target_os = "macos");
+        #[cfg(all(test, unix))]
+        let macos = macos || tests::macos_directory(path);
+        observe_permission(path, &result, macos);
+        let result = result.map_err(|error| ProbeError::from(&error));
         *probe.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.clone());
         probe.ready.notify_all();
         result.map_err(|error| error.error())?
@@ -427,7 +571,20 @@ fn probe_target(path: &Path) -> io::Result<()> {
             metadata
         }
     } else {
-        run(path, None, std::fs::metadata)?
+        match run(path, None, std::fs::metadata) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                if error.raw_os_error() == Some(1) {
+                    let folder = permission_folder(path);
+                    observe_permission(
+                        &folder,
+                        &Err(io::Error::from_raw_os_error(1)),
+                        cfg!(target_os = "macos"),
+                    );
+                }
+                return Err(error);
+            }
+        }
     };
     if metadata.is_dir() {
         directory(path, None)?;
@@ -574,7 +731,36 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
 pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::OpenOptionsExt;
+    static MACOS_DIRECTORIES: LazyLock<Mutex<HashMap<PathBuf, bool>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    pub(crate) struct MacosProbe(PathBuf);
+    impl MacosProbe {
+        pub(crate) fn allow(&self) {
+            MACOS_DIRECTORIES
+                .lock()
+                .unwrap()
+                .insert(self.0.clone(), true);
+        }
+    }
+    impl Drop for MacosProbe {
+        fn drop(&mut self) {
+            MACOS_DIRECTORIES.lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(crate) fn deny_macos_directory(path: &Path) -> MacosProbe {
+        let path = std::fs::canonicalize(path).unwrap();
+        MACOS_DIRECTORIES
+            .lock()
+            .unwrap()
+            .insert(path.clone(), false);
+        MacosProbe(path)
+    }
+    pub(super) fn macos_directory(path: &Path) -> bool {
+        MACOS_DIRECTORIES.lock().unwrap().contains_key(path)
+    }
     static BLOCKERS: LazyLock<Mutex<HashMap<PathBuf, (PathBuf, Arc<AtomicUsize>)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static PROBE_FINISHERS: LazyLock<Mutex<HashMap<PathBuf, std::sync::mpsc::Sender<()>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     static FIFO_REPLACEMENTS: LazyLock<
         Mutex<HashMap<PathBuf, (Arc<AtomicUsize>, std::sync::mpsc::Sender<()>)>>,
@@ -582,12 +768,14 @@ pub(crate) mod tests {
     pub(crate) struct BlockProbe {
         keys: Vec<PathBuf>,
         pub(crate) fired: Arc<AtomicUsize>,
+        pub(crate) finished: std::sync::mpsc::Receiver<()>,
     }
     impl Drop for BlockProbe {
         fn drop(&mut self) {
             let mut blockers = BLOCKERS.lock().unwrap();
             for key in &self.keys {
                 blockers.remove(key);
+                PROBE_FINISHERS.lock().unwrap().remove(key);
             }
         }
     }
@@ -598,13 +786,30 @@ pub(crate) mod tests {
         ];
         keys.dedup();
         let fired = Arc::new(AtomicUsize::new(0));
+        let (sender, finished) = std::sync::mpsc::channel();
         let mut blockers = BLOCKERS.lock().unwrap();
         for key in &keys {
             blockers.insert(key.clone(), (fifo.to_path_buf(), Arc::clone(&fired)));
+            PROBE_FINISHERS
+                .lock()
+                .unwrap()
+                .insert(key.clone(), sender.clone());
         }
-        BlockProbe { keys, fired }
+        BlockProbe {
+            keys,
+            fired,
+            finished,
+        }
+    }
+    pub(super) fn after_directory_probe(path: &Path) {
+        if let Some(sender) = PROBE_FINISHERS.lock().unwrap().remove(path) {
+            let _ = sender.send(());
+        }
     }
     pub(super) fn before_directory_probe(directory: &Path) -> io::Result<()> {
+        if MACOS_DIRECTORIES.lock().unwrap().get(directory) == Some(&false) {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
         let blocker = BLOCKERS.lock().unwrap().get(directory).cloned();
         if let Some((path, fired)) = blocker {
             fired.fetch_add(1, Ordering::Relaxed);
@@ -746,5 +951,68 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(fired.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod modes_macos_tests {
+    use super::*;
+
+    #[test]
+    fn macos_permission_observation_preserves_eperm_and_named_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = Budget::after(IO_BUDGET);
+        let _scope = enter(Some(budget.clone()));
+        let error = ProbeError::from(&io::Error::from_raw_os_error(libc::EPERM));
+        assert_eq!(error.error().raw_os_error(), Some(libc::EPERM));
+        observe_permission(dir.path(), &Err(error.error()), true);
+        let response = finish_response(Response::success("probe", serde_json::json!({})));
+        assert_eq!(response.data["code"], "macos_permission_denied");
+        assert_eq!(response.data["folder"], serde_json::json!(dir.path()));
+        assert_eq!(response.data["program"], "ck-aft");
+        assert_eq!(budget.permissions().len(), 1);
+        let non_macos = Budget::after(IO_BUDGET);
+        let _scope = enter(Some(non_macos.clone()));
+        observe_permission(dir.path(), &Err(error.error()), false);
+        assert!(non_macos.permissions().is_empty());
+    }
+
+    #[test]
+    fn macos_first_touch_timeout_never_mutates_after_probe_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("protected");
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("file.txt");
+        std::fs::write(&target, "before").unwrap();
+        let fifo = dir.path().join("answer");
+        tests::fifo(&fifo);
+        let blocker = tests::block_directory_probe(&root, &fifo);
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root);
+        config.storage_dir = Some(dir.path().join("store"));
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let request: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"write","command":"write","file":target,"content":"after"}),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let budget = Budget::after(Duration::from_millis(100));
+        let response = with_budget(Some(budget.clone()), || {
+            crate::commands::write::handle_write(&request, &ctx)
+        });
+        assert_eq!(response.data["code"], "read_blocked", "{response:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "remaining reply budget must cap the five-second I/O helper"
+        );
+        assert_eq!(blocker.fired.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        tests::release_fifo(&fifo);
+        blocker
+            .finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the released helper finishes its read-only probe");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
+        assert!(!response.success);
     }
 }

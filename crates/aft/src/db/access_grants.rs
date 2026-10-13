@@ -30,6 +30,84 @@ CREATE TABLE IF NOT EXISTS access_materialized (
 );
 "#;
 
+// Manual rollback procedure for operators downgrading from schema 18: stop AFT,
+// drop access_modes, access_scope_agents and macos_permission_cards, then set
+// schema_version to 17.
+// This discards approval modes and informational-card tracking, not path grants.
+pub(crate) const MODES_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS access_modes (
+ owner TEXT NOT NULL, scope_ref TEXT NOT NULL, epoch TEXT NOT NULL,
+ mode TEXT NOT NULL, PRIMARY KEY(owner,scope_ref,epoch)
+);
+CREATE TABLE IF NOT EXISTS access_scope_agents (
+ owner TEXT NOT NULL, scope_ref TEXT NOT NULL, epoch TEXT NOT NULL,
+ agent_id TEXT NOT NULL, kind TEXT NOT NULL,
+ PRIMARY KEY(owner,scope_ref,epoch)
+);
+CREATE TABLE IF NOT EXISTS macos_permission_cards (
+ folder TEXT NOT NULL, program TEXT NOT NULL, call_key TEXT NOT NULL,
+ selector TEXT NOT NULL, project_root TEXT NOT NULL, session TEXT NOT NULL, elicitation_id TEXT,
+ PRIMARY KEY(folder,program)
+);
+"#;
+
+/// The caller supplies only identities verified in the daemon's scope stamp.
+/// A head's code run has no parent in that stamp, so its agent id links its
+/// approval mode to the corresponding live head session.
+pub fn register_agent(
+    conn: &Connection,
+    key: &ScopeKey,
+    agent_id: &str,
+    head: bool,
+) -> rusqlite::Result<()> {
+    conn.execute("INSERT OR REPLACE INTO access_scope_agents(owner,scope_ref,epoch,agent_id,kind) VALUES (?1,?2,?3,?4,?5)", params![key.owner,key.scope_ref,key.epoch.to_string(),agent_id,if head { "head" } else { "run" }])?;
+    Ok(())
+}
+
+fn agent_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<ScopeKey>> {
+    conn.query_row("SELECT h.scope_ref,h.epoch FROM access_scope_agents r JOIN access_scope_agents h ON h.owner=r.owner AND h.agent_id=r.agent_id AND h.kind='head' JOIN access_scopes s ON s.owner=h.owner AND s.scope_ref=h.scope_ref AND s.epoch=h.epoch AND s.ended=0 WHERE r.owner=?1 AND r.scope_ref=?2 AND r.epoch=?3 AND r.kind='run' ORDER BY length(h.epoch) DESC,h.epoch DESC LIMIT 1", params![key.owner,key.scope_ref,key.epoch.to_string()], |r| {
+        let epoch: String = r.get(1)?;
+        Ok(ScopeKey {owner:key.owner.clone(),scope_ref:r.get(0)?,epoch:epoch.parse().map_err(|e| rusqlite::Error::FromSqlConversionFailure(1,rusqlite::types::Type::Text,Box::new(e)))?})
+    }).optional()
+}
+
+pub fn set_mode(
+    conn: &Connection,
+    key: &ScopeKey,
+    mode: crate::access_policy::ApprovalMode,
+) -> rusqlite::Result<()> {
+    conn.execute("INSERT INTO access_modes(owner,scope_ref,epoch,mode) SELECT ?1,?2,?3,?4 WHERE EXISTS (SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0) ON CONFLICT(owner,scope_ref,epoch) DO UPDATE SET mode=excluded.mode",
+        params![key.owner,key.scope_ref,key.epoch.to_string(),serde_json::to_string(&mode).expect("mode serializes")])?;
+    Ok(())
+}
+
+/// Unset worker modes follow the live head instead of copying its setting at
+/// launch. Bound ancestry traversal also fails closed on corrupt cyclic rows.
+pub fn mode(
+    conn: &Connection,
+    key: &ScopeKey,
+) -> rusqlite::Result<crate::access_policy::ApprovalMode> {
+    let mut scope = key.clone();
+    for _ in 0..16 {
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT mode FROM access_modes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
+                params![scope.owner, scope.scope_ref, scope.epoch.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(value) = value {
+            return decode(&value);
+        }
+        let next = parent(conn, &scope)?.or(agent_head(conn, &scope)?);
+        let Some(next) = next else {
+            return Ok(Default::default());
+        };
+        scope = next;
+    }
+    Err(rusqlite::Error::InvalidQuery)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeKey {
     pub owner: String,
@@ -208,6 +286,8 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
         "access_grants",
         "access_launch_params",
         "access_materialized",
+        "access_modes",
+        "access_scope_agents",
     ] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE owner=?1 AND scope_ref=?2 AND epoch=?3"),

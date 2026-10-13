@@ -119,6 +119,16 @@ pub enum AccessDecision {
 pub enum AccessDenial {
     Floor,
     OutsideRoots,
+    ReadOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    FullAccess,
+    #[default]
+    Ask,
+    ReadOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -148,6 +158,7 @@ pub enum HeadPolicy {
 #[derive(Debug, Clone)]
 pub struct AccessPolicy {
     pub roots: Vec<PathBuf>,
+    pub mode: ApprovalMode,
     pub outside: AccessDecision,
     pub absolute_floor: Vec<PathBuf>,
     /// Built-in protected paths only. User read_deny retains the native shell's
@@ -264,6 +275,7 @@ impl AccessPolicy {
                 .map(|path| policy_path(&path)),
         );
         Self {
+            mode: ApprovalMode::Ask,
             private_stores: SandboxDataPolicy {
                 deny: deny.into_iter().map(|path| policy_path(&path)).collect(),
                 read_allow,
@@ -323,7 +335,11 @@ impl AccessPolicy {
         {
             return AccessDecision::Deny(AccessDenial::Floor);
         }
-        if self.roots.iter().any(|root| path.starts_with(root))
+        let inside = self.roots.iter().any(|root| path.starts_with(root));
+        if self.mode == ApprovalMode::ReadOnly && operation == AccessOperation::Write && !inside {
+            return AccessDecision::Deny(AccessDenial::ReadOnly);
+        }
+        if inside
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
             || self
@@ -333,7 +349,10 @@ impl AccessPolicy {
         {
             AccessDecision::Allow
         } else {
-            self.outside
+            match (self.mode, self.outside) {
+                (ApprovalMode::FullAccess, AccessDecision::Ask) => AccessDecision::Allow,
+                _ => self.outside,
+            }
         }
     }
 
@@ -685,6 +704,7 @@ mod tests {
         let target = root.path().join("blocked");
         policy.absolute_floor.push(target.clone());
         policy.outside = AccessDecision::Allow;
+        policy.mode = ApprovalMode::FullAccess;
         policy.grants.push(AccessGrant {
             path: target.clone(),
             kind: GrantKind::Subtree,

@@ -1,7 +1,7 @@
 use super::*;
 
 fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteIdentity {
-    let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7})),"owner_authorized":true})).unwrap();
+    let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {
         root: ProjectRootId::from_path(root).unwrap(),
         project_root: root.into(),
@@ -437,4 +437,145 @@ fn grants_codemode_run_uses_agent_policy_and_revocation_without_copying() {
     store::insert(&conn, &worker_key, &grant).unwrap();
     store::end_scope_grants(&conn, &run_key).unwrap();
     assert_eq!(store::list(&conn, &worker_key).unwrap(), vec![grant]);
+}
+
+#[test]
+fn modes_new_heads_ask_instead_of_lowering_outside_access() {
+    let (_dir, _ctx, head, _worker) = fixture();
+    assert!(matches!(
+        ask_route(&head),
+        crate::access_policy::AskRoute::Consent { .. }
+    ));
+}
+
+#[test]
+fn modes_policy_mapping_keeps_floor_and_read_only_outside_write_limit() {
+    use crate::access_policy::ApprovalMode;
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("outside");
+    let secret = worker.project_root.join("secret");
+    ctx.update_config(|config| config.sandbox.read_deny.push(secret.clone()));
+    register(&worker, &ctx).unwrap();
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    for mode in [
+        ApprovalMode::Ask,
+        ApprovalMode::FullAccess,
+        ApprovalMode::ReadOnly,
+    ] {
+        store::set_mode(&conn, &scope_key(&head), mode).unwrap();
+        let policy = policy_for_scope(&conn, &scope_key(&worker), &ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.mode, mode);
+        assert_eq!(
+            policy.decide(AccessOperation::Read, &outside, false),
+            if mode == ApprovalMode::FullAccess {
+                AccessDecision::Allow
+            } else {
+                AccessDecision::Ask
+            }
+        );
+        assert_eq!(
+            policy.decide(AccessOperation::Write, &outside, false),
+            match mode {
+                ApprovalMode::FullAccess => AccessDecision::Allow,
+                ApprovalMode::Ask => AccessDecision::Ask,
+                ApprovalMode::ReadOnly => AccessDecision::Deny(AccessDenial::ReadOnly),
+            }
+        );
+        assert_eq!(
+            policy.decide(
+                AccessOperation::Write,
+                &worker.project_root.join("ok"),
+                false
+            ),
+            AccessDecision::Allow
+        );
+        for operation in [AccessOperation::Read, AccessOperation::Write] {
+            assert_eq!(
+                policy.decide(operation, &secret, false),
+                AccessDecision::Deny(AccessDenial::Floor)
+            );
+        }
+    }
+}
+
+#[test]
+fn modes_worker_inherits_live_head_until_plan_override_and_survives_restart() {
+    use crate::access_policy::ApprovalMode;
+    let (_dir, ctx, head, worker) = fixture();
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"full-access"}}),
+        &head,
+        &ctx,
+    )
+    .unwrap();
+    let head_run = identity(&head.project_root, "head-run", "ephemeral", None);
+    register(&head_run, &ctx).unwrap();
+    // The launching head validates a worker's plan before the worker starts.
+    // That validation must not apply the worker's mode to the head itself.
+    remote_policy::catalog(
+        json!({"preset":"worker","params":{"mode":"read-only"}}),
+        &head,
+        &ctx,
+    )
+    .unwrap();
+    {
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert_eq!(
+            store::mode(&conn, &scope_key(&head)).unwrap(),
+            ApprovalMode::FullAccess
+        );
+        assert_eq!(
+            store::mode(&conn, &scope_key(&head_run)).unwrap(),
+            ApprovalMode::FullAccess
+        );
+        assert_eq!(
+            store::mode(&conn, &scope_key(&worker)).unwrap(),
+            ApprovalMode::FullAccess
+        );
+    }
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"ask"}}),
+        &head,
+        &ctx,
+    )
+    .unwrap();
+    {
+        let db = ctx.db().unwrap();
+        assert_eq!(
+            store::mode(&db.lock().unwrap(), &scope_key(&worker)).unwrap(),
+            ApprovalMode::Ask
+        );
+    }
+    remote_policy::catalog(
+        json!({"preset":"worker","params":{"mode":"read-only"}}),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let storage = ctx.storage_dir();
+    drop(ctx);
+    let ctx = context(&worker.project_root, &storage);
+    remote_policy::catalog(json!({"preset":"worker"}), &worker, &ctx).unwrap();
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    assert_eq!(
+        store::mode(&conn, &scope_key(&worker)).unwrap(),
+        ApprovalMode::ReadOnly
+    );
+    let run = identity(&worker.project_root, "run", "ephemeral", Some("worker"));
+    assert_eq!(
+        store::mode(&conn, &policy_scope_key(&run)).unwrap(),
+        ApprovalMode::ReadOnly
+    );
+    drop(conn);
+    assert!(remote_policy::catalog(
+        json!({"preset":"worker","params":{"mode":"unsafe"}}),
+        &worker,
+        &ctx
+    )
+    .is_err());
 }

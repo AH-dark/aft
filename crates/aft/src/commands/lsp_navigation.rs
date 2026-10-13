@@ -201,10 +201,14 @@ fn defer_lsp_navigation(
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
     let grant_scope = crate::access_policy::current_scope();
+    let ask_route = crate::access_policy::current_ask_route();
+    let io_budget = crate::bounded_io::current().map(|budget| budget.capped(deadline));
 
     // Cold initialization and its first query run after the scheduler job returns,
     // so an LSP handshake cannot serialize unrelated work on the same root.
     std::thread::spawn(move || {
+        let _io = crate::bounded_io::enter(io_budget);
+        let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
         let _grant_scope = crate::access_policy::scope_guard(grant_scope);
         #[cfg(test)]
         let _worker = DeferredNavigationWorkerGuard::new();
@@ -219,7 +223,7 @@ fn defer_lsp_navigation(
         } else {
             handler(&request, &ctx)
         };
-        let _ = tx.send(response);
+        let _ = tx.send(crate::bounded_io::finish_response(response));
     });
 
     let mut settled = false;

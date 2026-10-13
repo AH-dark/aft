@@ -1205,7 +1205,11 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
     let grant_scope = crate::access_policy::current_scope();
+    let ask_route = crate::access_policy::current_ask_route();
+    let io_budget = crate::bounded_io::current().map(|budget| budget.capped(deadline.terminal_at));
     std::thread::spawn(move || {
+        let _io = crate::bounded_io::enter(io_budget);
+        let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
         let _grant_scope = crate::access_policy::scope_guard(grant_scope);
         let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
@@ -1245,7 +1249,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         // After the completion verdict, so a watcher backlog still marks the
         // result incomplete.
         crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
-        let _ = tx.send(response);
+        let _ = tx.send(crate::bounded_io::finish_response(response));
     });
     DispatchOutcome::Deferred(
         PendingResponse::from_receiver(

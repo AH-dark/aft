@@ -31,9 +31,11 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 17;
+pub const CURRENT_SCHEMA_VERSION: u32 = 18;
 
-const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+const MIGRATION_VERSIONS: &[u32] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+];
 
 const MIGRATION_V14: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_exec_policies (
@@ -954,6 +956,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         15 => conn.execute_batch(call_ledger::MIGRATION),
         16 => conn.execute_batch(access_grants::MIGRATION),
         17 => conn.execute_batch(access_asks::MIGRATION),
+        18 => conn.execute_batch(access_grants::MODES_MIGRATION),
         _ => Ok(()),
     }
 }

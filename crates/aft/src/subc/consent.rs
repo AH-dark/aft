@@ -386,6 +386,7 @@ pub(super) fn note_route_closed(route: RouteChannel) {
 
 /// The parts of a held call the consent flow reads.
 pub(super) struct HeldCall {
+    pub(super) reply_deadline: Instant,
     pub(super) identity: RouteIdentity,
     pub(super) tool: String,
     pub(super) arguments: Value,
@@ -431,7 +432,11 @@ where
         return Some((first.0, Some(first.1)));
     };
     let route_hold = RouteHold::new(call.route);
-    let deadline = Instant::now() + hold_budget(None);
+    let deadline = (Instant::now() + hold_budget(None)).min(
+        call.reply_deadline
+            .checked_sub(RERUN_MARGIN)
+            .unwrap_or_else(Instant::now),
+    );
     let mut holder: Option<(AskKey, String)> = None;
     loop {
         let own = holder.as_ref().map(|(_, holder)| holder.clone());
@@ -589,7 +594,7 @@ fn prepare(
     let stamp = identity
         .scope
         .as_ref()
-        .expect("only stamped workers ask Cingulate");
+        .expect("only stamped Alfonso agents ask Cingulate");
     let key = AskKey {
         scope: access_grants::scope_key(identity),
         args_hash: args_hash(identity, tool, arguments),
@@ -637,7 +642,7 @@ fn prepare(
         operation_name(grant.operation),
         &path,
         &format!(
-            "{tool} needs to {} a path outside this worker's worktree",
+            "{tool} needs to {} a path outside this route's roots",
             operation_name(grant.operation)
         ),
         &key.args_hash,
@@ -1250,3 +1255,99 @@ pub(super) fn reattach(
 #[cfg(test)]
 #[path = "consent_tests.rs"]
 mod tests;
+
+// Informational cards never hold a tool call. Serializing their updates keeps
+// concurrent probes from publishing two cards or withdrawing an unrecorded id.
+static MACOS_CARDS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(super) async fn macos_permissions(
+    db: Arc<StdMutex<crate::db::TrackedConnection>>,
+    identity: RouteIdentity,
+    observations: Vec<crate::bounded_io::PermissionObservation>,
+) -> Result<(), ConsentError> {
+    use rusqlite::{params, OptionalExtension};
+    if !matches!(
+        access_grants::ask_route(&identity),
+        AskRoute::Consent { .. }
+    ) {
+        return Ok(());
+    }
+    let Some(transport) = transport() else {
+        return Err(ConsentError::Unavailable("Cingulate is unavailable".into()));
+    };
+    let _serial = MACOS_CARDS_LOCK.lock().await;
+    let stamp = identity.scope.as_ref().expect("consent route is stamped");
+    let program = "ck-aft";
+    for observation in observations {
+        let folder = observation.folder.to_string_lossy().into_owned();
+        let row: Option<(String, String, String, String, Option<String>)> = {
+            let conn = db
+                .lock()
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+            if !observation.readable {
+                conn.execute("INSERT OR IGNORE INTO macos_permission_cards(folder,program,call_key,selector,project_root,session) VALUES (?1,?2,?3,?4,?5,?6)", params![folder,program,new_call_key(),serde_json::to_string(&selector(stamp)).expect("selector serializes"),identity.project_root.to_string_lossy(),identity.session])
+                    .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+            }
+            conn.query_row("SELECT call_key,selector,project_root,session,elicitation_id FROM macos_permission_cards WHERE folder=?1 AND program=?2", params![folder,program], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))?
+        };
+        let Some((key, scope, root, session, id)) = row else {
+            continue;
+        };
+        let scope: ScopeSelector =
+            serde_json::from_str(&scope).map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+        // If a request lost its reply, resend the call_key stored in
+        // macos_permission_cards to recover the same Cingulate elicitation id.
+        // Readable-again observations must recover that id before withdrawing.
+        let id = match id {
+            Some(id) => id,
+            None => {
+                let params = json!({"kind":"macos_permission","call_key":key,"folder":folder,"program":program,"steps":"System Settings → Privacy & Security → Files and Folders: allow ck-aft access to this folder, then retry."});
+                let result = tokio::time::timeout(
+                    UNARY_TIMEOUT,
+                    transport.call(ConsentCall {
+                        scope: scope.clone(),
+                        project_root: PathBuf::from(&root),
+                        session: session.clone(),
+                        method: "consent.request",
+                        params,
+                        timeout: UNARY_TIMEOUT,
+                    }),
+                )
+                .await
+                .map_err(|_| {
+                    ConsentError::Unavailable("macOS permission card request timed out".into())
+                })??;
+                let id = decode_elicitation_id(&result)?;
+                db.lock().map_err(|e| ConsentError::Unavailable(e.to_string()))?.execute("UPDATE macos_permission_cards SET elicitation_id=?3 WHERE folder=?1 AND program=?2", params![folder,program,id])
+                    .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+                id
+            }
+        };
+        if observation.readable {
+            tokio::time::timeout(
+                UNARY_TIMEOUT,
+                transport.call(ConsentCall {
+                    scope,
+                    project_root: root.into(),
+                    session,
+                    method: "consent.withdraw",
+                    params: json!({"elicitation_id":id}),
+                    timeout: UNARY_TIMEOUT,
+                }),
+            )
+            .await
+            .map_err(|_| {
+                ConsentError::Unavailable("macOS permission card withdrawal timed out".into())
+            })??;
+            db.lock()
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))?
+                .execute(
+                    "DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2",
+                    params![folder, program],
+                )
+                .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+        }
+    }
+    Ok(())
+}

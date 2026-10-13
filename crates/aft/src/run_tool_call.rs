@@ -552,6 +552,7 @@ pub fn run_tool_call(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
+    let _io = crate::bounded_io::enter_if_absent(Duration::from_secs(25));
     // The preflight below and the dispatched command share one config
     // snapshot, even if a live config reload publishes in between.
     let _config_pin = app_ctx.pin_config();
@@ -593,6 +594,7 @@ pub fn run_tool_call(
             } else {
                 dispatch(prepared.request, app_ctx)
             };
+            response = crate::bounded_io::finish_response(response);
             crate::response_finalize::attach_checkout_query_gaps(&mut response, app_ctx);
             crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
             if response.success && response.data.get("backup_skipped_reason").is_none() {

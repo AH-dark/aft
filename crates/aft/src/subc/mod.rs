@@ -556,12 +556,14 @@ enum DeferredSetupOutcome {
     },
     Deferred {
         pending: PendingResponse,
+        io_budget: crate::bounded_io::Budget,
         surface_downgraded: bool,
         phase_trace: PhaseTrace,
     },
 }
 
 struct PendingSubcResponse {
+    io_budget: Option<crate::bounded_io::Budget>,
     route: RouteChannel,
     corr: u64,
     flags: Flags,
@@ -8063,6 +8065,7 @@ struct PlainToolRun {
     bind_trust: BindTrust,
     request_id: String,
     ledger_key: Option<crate::db::call_ledger::Key>,
+    io_budget: crate::bounded_io::Budget,
 }
 
 impl PlainToolRun {
@@ -8075,6 +8078,7 @@ impl PlainToolRun {
         done: oneshot::Sender<ToolCallCompletion>,
     ) -> crate::executor::ExecutorJob {
         let run_spec = self.clone();
+        let runtime = tokio::runtime::Handle::current();
         Box::new(move |ctx| {
             let PlainToolRun {
                 bare_name,
@@ -8086,7 +8090,9 @@ impl PlainToolRun {
                 bind_trust,
                 request_id: request_id_for_force,
                 ledger_key,
+                io_budget,
             } = run_spec;
+            let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             phase_trace.mark_job_admitted();
             log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 let run = || {
@@ -8111,6 +8117,20 @@ impl PlainToolRun {
                         Some(&mut phase_trace),
                     ) {
                         ToolCallOutcome::Unary(result) => {
+                            if let Some(db) = ctx.db() {
+                                let mut observations = io_budget.permissions();
+                                if result.response.data["code"] != "macos_permission_denied" {
+                                    observations.retain(|observation| observation.readable);
+                                }
+                                if !observations.is_empty() {
+                                    let identity = identity_for_run.clone();
+                                    runtime.spawn(async move {
+                                        if let Err(error) = consent::macos_permissions(db, identity, observations).await {
+                                            log::warn!("macOS permission card could not be updated: {error:?}");
+                                        }
+                                    });
+                                }
+                            }
                             tool_provider::note_native_outcome(
                                 ctx,
                                 ledger_key.as_ref(),
@@ -8165,6 +8185,7 @@ async fn hold_for_consent(
     module_drain: &drain::ModuleDrainWindow,
 ) -> Option<(Response, String)> {
     let held = consent::HeldCall {
+        reply_deadline: plain_run.io_budget.deadline,
         identity: plain_run.identity.clone(),
         tool: plain_run.bare_name.clone(),
         arguments: plain_run.arguments.clone(),
@@ -8978,7 +8999,11 @@ async fn handle_tool_call(
         let ledger_key_for_setup = ledger_key.clone();
         // A stamped worker's call that asks during setup is held for consent
         // and, once approved, runs again on the plain tool-call path.
-        let consent_run = access_grants::alfonso_worker(&identity).then(|| PlainToolRun {
+        let consent_run = matches!(
+            access_grants::ask_route(&identity),
+            crate::access_policy::AskRoute::Consent { .. }
+        )
+        .then(|| PlainToolRun {
             bare_name: bare_name.clone(),
             arguments: arguments.clone(),
             format_context: format_context.clone(),
@@ -8988,11 +9013,18 @@ async fn handle_tool_call(
             bind_trust,
             request_id: request_id.clone(),
             ledger_key: ledger_key.clone(),
+            io_budget: crate::bounded_io::Budget::after(Duration::from_secs(25)),
         });
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
         let completion_wake = deferred_response_tx.wake.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let io_budget = consent_run
+            .as_ref()
+            .map(|run| run.io_budget.clone())
+            .unwrap_or_else(|| crate::bounded_io::Budget::after(Duration::from_secs(25)));
         phase_trace.mark_executor_submitted();
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
+            let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _deferred_wake_scope = completion_wake.install();
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
@@ -9004,7 +9036,7 @@ async fn handle_tool_call(
             // Admission for this deferred tool call: pin the config so the
             // preflight and the deferred worker share one snapshot.
             let _config_pin = ctx.pin_config();
-            log_ctx::with_session(Some(identity_for_run.session.clone()), || {
+            let response = log_ctx::with_session(Some(identity_for_run.session.clone()), || {
                 let run = || match prepare_tool_call(
                     &bare_name_for_run,
                     arguments,
@@ -9013,7 +9045,8 @@ async fn handle_tool_call(
                     ctx,
                     Some(&mut phase_trace),
                 ) {
-                    Err(result) => {
+                    Err(mut result) => {
+                        result.response = crate::bounded_io::finish_response(result.response);
                         tool_provider::note_native_outcome(
                             ctx,
                             ledger_key_for_setup.as_ref(),
@@ -9063,6 +9096,7 @@ async fn handle_tool_call(
                                 };
                                 let _ = setup_tx.send(DeferredSetupOutcome::Deferred {
                                     pending,
+                                    io_budget: io_budget.clone(),
                                     surface_downgraded: prepared.surface_downgraded,
                                     phase_trace,
                                 });
@@ -9072,6 +9106,7 @@ async fn handle_tool_call(
                                 )
                             }
                             DispatchOutcome::Immediate(response) => {
+                                let response = crate::bounded_io::finish_response(response);
                                 phase_trace.mark_execute_done();
                                 let finalizer = |response: &mut Response, text: &mut String| {
                                     crate::response_finalize::finalize_tool_response(
@@ -9120,7 +9155,23 @@ async fn handle_tool_call(
                         }
                     },
                 )
-            })
+            });
+            if let Some(db) = ctx.db() {
+                let mut observations = io_budget.permissions();
+                if response.data["code"] != "macos_permission_denied" {
+                    observations.retain(|observation| observation.readable);
+                }
+                if !observations.is_empty() {
+                    runtime.spawn(async move {
+                        if let Err(error) =
+                            consent::macos_permissions(db, identity_for_run, observations).await
+                        {
+                            log::warn!("macOS permission card could not be updated: {error:?}");
+                        }
+                    });
+                }
+            }
+            response
         });
         let deferred_setup_guard =
             PendingDeferredSetupGuard::new(Arc::clone(pending_deferred_setups));
@@ -9162,10 +9213,12 @@ async fn handle_tool_call(
             match setup_rx.await {
                 Ok(DeferredSetupOutcome::Deferred {
                     pending,
+                    io_budget,
                     surface_downgraded,
                     phase_trace,
                 }) => {
                     let pending = PendingSubcResponse {
+                        io_budget: Some(io_budget),
                         route,
                         corr,
                         flags,
@@ -9318,6 +9371,7 @@ async fn handle_tool_call(
         bind_trust,
         request_id: request_id.clone(),
         ledger_key,
+        io_budget: crate::bounded_io::Budget::after(Duration::from_secs(25)),
     };
     let job = plain_run.job(
         access_grants::ask_route(&identity),
@@ -9650,6 +9704,23 @@ async fn deliver_resolved_subc_response(
     let Some(ctx) = executor.actor_context(&entry.root) else {
         return Ok(());
     };
+    resolved.response = crate::bounded_io::with_budget(entry.io_budget.clone(), || {
+        crate::bounded_io::finish_response(resolved.response)
+    });
+    if let (Some(db), Some(budget)) = (ctx.db(), &entry.io_budget) {
+        let mut observations = budget.permissions();
+        if resolved.response.data["code"] != "macos_permission_denied" {
+            observations.retain(|observation| observation.readable);
+        }
+        if !observations.is_empty() {
+            let identity = identity.clone();
+            tokio::spawn(async move {
+                if let Err(error) = consent::macos_permissions(db, identity, observations).await {
+                    log::warn!("macOS permission card could not be updated: {error:?}");
+                }
+            });
+        }
+    }
     entry.phase_trace.mark_execute_done();
     let finalizer = |response: &mut Response, text: &mut String| {
         crate::response_finalize::finalize_tool_response(
@@ -10352,6 +10423,7 @@ pub(crate) mod test_support {
         };
         let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
+            io_budget: None,
             route,
             corr: 71,
             flags: Flags::new(false, Priority::Passive, false),
@@ -10689,6 +10761,7 @@ pub(crate) mod test_support {
         .with_cancellation(cancellation.clone());
         let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
+            io_budget: None,
             route: route_key(41, 1),
             corr: 7,
             flags: control_flags(),
@@ -10737,6 +10810,7 @@ pub(crate) mod test_support {
         let count = Arc::clone(&polls);
         let mut pending = PendingSubcResponses::default();
         pending.register(PendingSubcResponse {
+            io_budget: None,
             route: RouteChannel {
                 channel: 17,
                 epoch: 1,
@@ -10857,6 +10931,7 @@ pub(crate) mod test_support {
         };
         let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
+            io_budget: None,
             route: RouteChannel {
                 channel: 17,
                 epoch: 1,
@@ -11046,6 +11121,7 @@ pub(crate) mod test_support {
         started.recv_timeout(Duration::from_secs(3)).unwrap();
         let mut responses = PendingSubcResponses::default();
         responses.register(PendingSubcResponse {
+            io_budget: None,
             route,
             corr: 41,
             flags: Flags::new(false, Priority::Passive, false),
@@ -11386,6 +11462,7 @@ pub(crate) mod test_support {
             .expect("detached inspect reaches shutdown gate");
         let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
+            io_budget: None,
             route,
             corr: 42,
             flags: Flags::new(false, Priority::Passive, false),
@@ -11483,6 +11560,7 @@ pub(crate) mod test_support {
         let entry =
             |corr: u64, root: &ProjectRootId, name: &str, dir: &Path, pending: PendingResponse| {
                 PendingSubcResponse {
+                    io_budget: None,
                     ledger_key: None,
                     route,
                     corr,
@@ -18705,6 +18783,7 @@ mod terminal_lifecycle_tests {
         .with_cancellation(cancellation.clone());
         let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
+            io_budget: None,
             ledger_key: None,
             route: route_key(42, 1),
             corr: 3,
@@ -18881,6 +18960,7 @@ mod admission_mechanism_tests {
         let (_dir, root) = test_support::test_root("poll-interval-cache");
         let mut registry = PendingSubcResponses::default();
         registry.register(PendingSubcResponse {
+            io_budget: None,
             ledger_key: None,
             route: route_key(42, 1),
             corr: 3,
