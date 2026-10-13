@@ -10790,10 +10790,11 @@ mod tests {
         fs::write(project.join("many.txt"), "needle line\n".repeat(1_000)).expect("write file");
         let index = SearchIndex::build_with_limit(&project, 8 * 1024 * 1024);
         let pattern = compile_grep_pattern("needle", true, false);
-        let budget = Duration::from_millis(100);
+        let budget = Duration::from_secs(60);
         let _clock = GrepScanClockGuard::install();
-        // Move the injected clock past the budget while the first line is
-        // rendered, so the next occurrence must stop the scan without sleeping.
+        // Keep real file reads well inside the budget, even on a slow runner.
+        // Advancing the injected clock while the first line is rendered makes
+        // the next occurrence stop the scan without relying on a real sleep.
         let mut advanced_clock = false;
         let _probe = install_line_details_probe(move || {
             if !advanced_clock {
