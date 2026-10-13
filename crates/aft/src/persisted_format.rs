@@ -245,7 +245,14 @@ impl fmt::Display for UnsupportedPersistedFormat {
                 crate::reader_floor::FLOOR_SCHEMA,
                 self.store
             ),
+        }?;
+        if self.source != RefusalSource::Artifact && self.store != PersistedStore::AftDb {
+            write!(
+                f,
+                "; restart AFT after repairing the reader floor to retry this store"
+            )?;
         }
+        Ok(())
     }
 }
 
@@ -309,8 +316,8 @@ pub fn refuse(refusal: UnsupportedPersistedFormat) -> UnsupportedPersistedFormat
 
 /// Forget artifact refusals recorded for exactly `scope`, after the artifact
 /// was found readable again (for example replaced by the newer build that
-/// wrote it, or removed by the operator). Floor refusals are never cleared:
-/// the floor is never lowered while the process runs.
+/// wrote it, or removed by the operator). Floor refusals are retained until
+/// a persistence retry safely rechecks the floor file.
 pub fn clear(store: PersistedStore, scope: &Path) {
     with_registry(|entries| {
         entries.retain(|entry| {
@@ -318,6 +325,19 @@ pub fn clear(store: PersistedStore, scope: &Path) {
                 && entry.refusal.source == RefusalSource::Artifact
                 && entry.scope == scope)
         })
+    });
+}
+
+/// Replace only this root's floor evidence after a successful floor recheck.
+/// Artifact refusals still require their own format checks before clearing.
+pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersistedFormat]) {
+    with_registry(|entries| {
+        entries
+            .retain(|entry| entry.scope != root || entry.refusal.source == RefusalSource::Artifact);
+        entries.extend(refusals.iter().map(|refusal| Entry {
+            scope: root.to_path_buf(),
+            refusal: refusal.clone(),
+        }));
     });
 }
 
@@ -497,6 +517,23 @@ mod tests {
             UnsupportedPersistedFormat::from_io_error(&io),
             Some(&refusal)
         );
+    }
+
+    #[test]
+    fn floor_refusal_without_persistence_retry_requires_restart() {
+        let floor = Path::new("storage/reader-floor.json");
+        for store in PersistedStore::ALL {
+            for refusal in [
+                UnsupportedPersistedFormat::floor(store, floor, 99),
+                UnsupportedPersistedFormat::floor_unreadable(store, floor, 0),
+                UnsupportedPersistedFormat::floor_unreadable(store, floor, 99),
+            ] {
+                assert_eq!(
+                    refusal.to_string().contains("restart AFT"),
+                    store != PersistedStore::AftDb
+                );
+            }
+        }
     }
 
     #[test]
