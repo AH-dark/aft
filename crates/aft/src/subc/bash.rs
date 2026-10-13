@@ -2214,9 +2214,10 @@ pub(super) fn bash_module_draining_completion(
     }
 }
 
-/// Releases the waits a held bash call's permission question took, without
-/// answering the call: `tool.withdraw` settled it, and its `not_started`
-/// terminal is sent by the caller.
+/// Decrements the root's and the route's active bash wait counts that a held
+/// bash call took when it filed its permission question, without answering
+/// the call: `tool.withdraw` settled it, and the caller sends its
+/// `not_started` terminal frame.
 pub(super) fn bash_withdrawn_completion(
     route: RouteChannel,
     corr: u64,

@@ -999,8 +999,9 @@ fn run_custody(
                     kill_task,
                     held_withdrawn,
                 } => {
-                    // The database lock is released above: killing persists
-                    // the task's terminal state through the same connection.
+                    // The ledger lock was dropped when `found` was computed:
+                    // killing persists the task's terminal state through the
+                    // same `aft.db` connection, and would deadlock on it.
                     if let Some(task) = kill_task {
                         if let Err(error) = ctx.bash_background().kill_withdrawn(&task) {
                             log::warn!("withdrawn call task {task} was not killed: {error}");
@@ -2346,9 +2347,10 @@ mod tests {
         assert_eq!(error.detail.unwrap()["field"], "schema_pin");
     }
 
-    /// `role.describe` serves exactly the Slice B declaration: the three Slice
-    /// A ops plus `tool.withdraw`, `late_results` and `late_results.ack`, with
-    /// no module-level capabilities.
+    /// `role.describe` serves exactly the declaration pinned in the
+    /// conformance fixture: `role.describe`, `tool.catalog` and `tool.call`
+    /// plus `tool.withdraw`, `late_results` and `late_results.ack`, with no
+    /// module-level capabilities.
     #[test]
     fn slice_b_declaration_matches_independent_fixture_without_normalizing_other_fields() {
         let fixtures: Value = serde_json::from_str(include_str!(
@@ -4207,11 +4209,11 @@ mod route_tests {
 
     #[tokio::test]
     async fn unscoped_v1_route_runs_plain_calls_and_serves_custody_ops() {
-        // A route the daemon stamped with no scope may run plain calls, as
-        // the role contract's plain stamp expects. The custody ops are served
-        // on it too: only the carrier may withdraw there, keyed on the route's
-        // principal, and late results go to the route's principal as
-        // custodian.
+        // A route the daemon stamped with no scope may run plain calls; the
+        // conformance suite runs its plain cases on such a route. The custody
+        // ops are served on it too: a withdraw there looks up the record keyed
+        // on the route's own principal (the principal that raised the call),
+        // and late results go to the route's principal as custodian.
         let _guard = EXCHANGE_LOCK.lock().await;
         ACTIONS.store(0, Ordering::SeqCst);
         let reply = exchange_with_scope(

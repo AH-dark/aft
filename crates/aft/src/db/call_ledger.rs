@@ -264,12 +264,12 @@ pub fn settle(
 }
 
 /// Settles an unsettled row inside the caller's transaction. A settlement
-/// with a `reason` never ran, so its withdraw answer is already fixed by the
-/// settlement table (`withdrawn`, or `refused` for a denial, an expired ask
-/// or an ended scope). It is frozen here because the reason does not survive
-/// expiry anywhere else: expiry rewrites the recorded frame and the late
-/// entry, and an unscoped row has no late entry at all. An answer frozen by
-/// an earlier withdraw is kept.
+/// with a `reason` means the call never ran, so its `tool.withdraw` answer
+/// follows from that reason alone (see [`never_ran_answer`]: `withdrawn`, or
+/// `refused` for a denial, an expired ask or an ended scope). That answer is
+/// stored now because the reason is lost once the row expires: expiry
+/// rewrites the recorded frame and the late entry, and an unscoped row has no
+/// late entry at all. An answer already stored by an earlier withdraw is kept.
 fn settle_row(
     conn: &Connection,
     row: &Row,
@@ -409,8 +409,10 @@ pub fn ack(conn: &Connection, custodian: &str, through: u64) -> rusqlite::Result
     Ok(deleted)
 }
 
-/// Drops the oldest late entries past the section 7 bounds for one custodian,
-/// deleting their rows as an ack would.
+/// Drops one custodian's oldest late entries beyond [`UNACKED_RESULTS_MAX`]
+/// unacked results and [`EXPIRED_ENTRIES_MAX`] expired entries (the
+/// tool-provider contract's retention bounds), deleting their rows as an ack
+/// would.
 fn enforce_retention_bounds(conn: &Connection, custodian: &str) -> rusqlite::Result<()> {
     for (expired, max) in [(false, UNACKED_RESULTS_MAX), (true, EXPIRED_ENTRIES_MAX)] {
         conn.execute(
@@ -438,9 +440,10 @@ fn parse_entry(entry: &str) -> rusqlite::Result<Value> {
     Ok(value)
 }
 
-/// Keeps only the outcome of a settled row whose result cannot travel in one
-/// role reply, so later replays, withdraw answers and late entries all agree
-/// that the result is gone. Returns the kept outcome.
+/// Keeps only the outcome of a settled row whose result is too large for one
+/// reply frame (the `max_body` bound of [`withdraw`] and [`late_results`]),
+/// so later replays, withdraw answers and late entries all agree that the
+/// result is gone. Returns the kept outcome.
 fn reduce_payload(conn: &Connection, row: &Row) -> rusqlite::Result<String> {
     let outcome = row.outcome.clone().unwrap_or_else(|| "unknown".into());
     let frame = not_retained(&row.key, &outcome);
@@ -563,9 +566,10 @@ pub fn withdraw(
     })
 }
 
-/// The settlement table's withdraw answer for a settled row. `completed` is
-/// answered only when AFT recorded the call's terminal frame; a row whose end
-/// was never observed is `already_started` with outcome `unknown`.
+/// The `tool.withdraw` answer for a row that has already settled and has no
+/// stored answer yet. `completed` is answered only when AFT recorded the
+/// call's terminal frame; a row whose end was never observed is
+/// `already_started` with outcome `unknown`.
 fn settled_answer(row: &Row) -> WithdrawAnswer {
     let outcome = row.outcome.as_deref().unwrap_or("unknown");
     let Some(frame) = &row.frame else {
@@ -615,8 +619,10 @@ fn head_seq(conn: &Connection, custodian: &str) -> rusqlite::Result<u64> {
 /// Entries come oldest first after `since`. The page stops before the entry
 /// that would push the encoded reply past `max_body` and says `more: true`;
 /// an entry that would overflow `max_body` on its own is reduced to its
-/// outcome, row included, before it is served. A due entry is expired in
-/// place first, and the section 7 bounds are applied before reading.
+/// outcome, and its row with it, before it is served. An entry past the
+/// retention period is turned into an `expired` entry in place first, and the
+/// retention bounds ([`UNACKED_RESULTS_MAX`], [`EXPIRED_ENTRIES_MAX`]) are
+/// applied before reading. At most [`LATE_RESULTS_PAGE_MAX`] rows are read.
 pub fn late_results(
     conn: &Connection,
     custodian: &str,
@@ -1719,7 +1725,8 @@ mod tests {
             .find(|e| e["call_key"] == "unobserved")
             .unwrap();
         assert_eq!(unobserved["outcome"], "unknown");
-        // A carrier that is not the owner is no custodian: it sees nothing.
+        // Late entries go only to the scope's owner; a carrier that is not
+        // the owner pages an empty list.
         assert_eq!(
             page(&conn, "carrier", None, None, now, usize::MAX)["entries"],
             json!([])
@@ -1780,7 +1787,9 @@ mod tests {
         let second = page(&conn, "owner", cursor, None, 100, limit);
         assert_eq!(second["entries"][0]["call_key"], "b");
         assert_eq!(second["more"], true);
-        // `c` alone overflows the limit: it is served reduced, row included.
+        // Entry `c` exceeds the limit on its own: it is served with its
+        // `result` replaced by `outcome` (`reduced: true`), and its ledger row
+        // keeps only the outcome too.
         let third = page(
             &conn,
             "owner",

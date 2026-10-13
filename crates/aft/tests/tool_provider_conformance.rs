@@ -1662,7 +1662,8 @@ async fn wait_for_file(path: &Path) {
     .unwrap_or_else(|_| panic!("{} never appeared", path.display()));
 }
 
-/// The late-results page `route`'s principal is served from the start.
+/// Pulls `late_results` with `since: null` on `route`: every unacked entry
+/// whose custodian is the route's principal, from the oldest.
 async fn late_results_page(route: &Route) -> Value {
     let page = route
         .terminal(json!({"name": "late_results", "arguments": {"since": null}}))
@@ -1709,7 +1710,8 @@ async fn s2_withdrawn_held_request_ends_not_started_and_never_runs() {
     let mut held = route.start(body.clone()).await;
     let ask = route.wire.lock().await.next().await.unwrap();
     assert_eq!(ask.header.ty, FrameType::Request);
-    // A repeat attaches to the same hold.
+    // Resending the same keyed call while it waits on its question attaches
+    // to that call: no second question, and it ends with the same frame.
     let mut repeat = route.start(body).await;
     let withdrawn = route.terminal(withdraw_body("held")).await;
     assert_eq!(withdrawn.header.ty, FrameType::Response);
@@ -1748,7 +1750,8 @@ async fn s2_withdrawn_held_request_ends_not_started_and_never_runs() {
         route.terminal(withdraw_body("held")).await.body,
         withdrawn.body
     );
-    // Legacy routes keep refusing the custody ops by name.
+    // A route bound without the tool-provider v1 declaration still refuses
+    // tool.withdraw, late_results and late_results.ack by name.
     let legacy = bind_route_declaring(&process, &root.join("project"), "runner", "legacy", None)
         .await
         .unwrap();
@@ -1880,7 +1883,8 @@ async fn s2_settled_scoped_withdraw_is_identical_across_expiry_for_carrier_and_o
         (by_owner.header.ty, &by_owner.body),
         (first.header.ty, &first.body)
     );
-    // The entry is unacked and now reads `expired`.
+    // The call's late entry was never acked, and the forced expiry above
+    // turned it into an `expired` entry.
     let page = late_results_page(&owner).await;
     let entries = entries_for(&page, "settled");
     assert_eq!(entries.len(), 1);
@@ -1968,7 +1972,7 @@ async fn s2_completed_scoped_bash_reaches_only_its_owner_once_and_is_acked_once(
         )
         .await;
     assert_eq!(response_json(&completed)["isError"], false);
-    // The approved command really ran where the held calls write.
+    // The approved command really ran: the marker file it writes exists.
     assert!(marker.exists());
     let owner = Subject::head()
         .route(&process, &scoped_stamp("owner", "owner", "scope"))
@@ -2463,8 +2467,9 @@ impl ToolProviderSubject for Subject {
             .wait_for(key, Duration::from_secs(30), |_| Some(()))
             .await
     }
-    /// Answers `allow` to the question for `key` only, waiting at most 10 s
-    /// for it to arrive; another call's question is never answered.
+    /// Answers `allow` to the permission question filed for the held call
+    /// sent with `key`, waiting at most 10 s for it to arrive; a question from
+    /// any other call is never answered.
     async fn approve(&self, key: &str) -> Result<(), HarnessError> {
         let (wire, frame) = self
             .stand_in
@@ -2492,17 +2497,20 @@ impl ToolProviderSubject for Subject {
     }
 }
 
-/// The head subject (no preset sent) against its pinned Slice B inventory.
+/// Runs the conformance suite against the head subject (no preset sent) and
+/// checks its outcomes against the inventory pinned for `head` in
+/// `fixtures/tool_provider_conformance.json`.
 #[tokio::test]
 async fn slice_a_real_module_conformance_inventory() {
     conformance_inventory(Subject::head()).await;
 }
 
-/// The commons suite holds for every catalog preset AFT serves: each one is a
-/// complete catalog, refuses an undefined preset, and admits its own quick
-/// call and schema pins. The shell presets also pass every held-call,
-/// withdraw and late-results case, and with `test-timing-hooks` both crash
-/// cases.
+/// The published conformance suite passes for every catalog preset AFT
+/// serves (head, worker, reader): each one is a complete catalog, refuses an
+/// undefined preset, and admits its own quick call and schema pins. The shell
+/// presets also pass every held-call, withdraw and late-results case, and,
+/// when built with `test-timing-hooks`, the two crash cases that need its
+/// kill hook.
 #[tokio::test]
 async fn every_catalog_preset_passes_the_conformance_suite() {
     for preset in ["head", "worker", "reader"] {
@@ -2518,10 +2526,12 @@ async fn every_catalog_preset_passes_the_conformance_suite() {
 /// so the feature-off build must skip exactly the cases that need
 /// `approval_execution`.
 ///
-/// Known runner gap: the 0.5.0 runner (and the pinned one) never sets
-/// `preset` on a call, while AFT refuses a preset-less tool call on a scoped
-/// route. The route adapter (`Route::adapt_preset`) therefore adds the
-/// subject's preset to every scoped tool call that is not a role operation.
+/// Known gap in the conformance runner (the
+/// `cortexkit-role-tool-provider-conformance` dev-dependency, from 0.5.0 up
+/// to the pinned version): it never sets `preset` on a tool call, while AFT
+/// refuses a preset-less tool call on a scoped route. The route adapter
+/// (`Route::adapt_preset`) therefore adds the subject's preset to every
+/// scoped tool call that is not a role operation.
 async fn conformance_inventory(subject: Subject) {
     use cortexkit_role_tool_provider_conformance::{CaseOutcome, SuiteVerdict, CASES};
     let fixtures: Value =
