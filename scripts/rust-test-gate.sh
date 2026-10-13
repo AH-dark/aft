@@ -367,6 +367,20 @@ else
   }
 fi
 
+if phase_enabled lib-shard \
+  && [[ "$(uname)" == "Darwin" \
+    && -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" \
+    && -n "${AFT_NEXTEST_EXTRACT_TO:-}" ]]; then
+  # The isolated keychain probe runs before the libtest partition. Extract and
+  # prewarm its fresh archive binaries first so Gatekeeper does not interrupt
+  # a timed test with its first-execution assessment.
+  mkdir -p "$AFT_NEXTEST_EXTRACT_TO"
+  run_phase "extract nextest archive for macOS libtest prewarming" \
+    extract_nextest_archive_for_prewarm
+  run_phase "warm macOS extracted libtest binaries" \
+    ./scripts/warm-macos-nextest-archive.sh
+fi
+
 if phase_enabled lib; then
   # The platform-verifier TLS test spawns a subprocess whose keychain trust
   # evaluation is unbounded on Macs with third-party root CAs (NordVPN: ~10s

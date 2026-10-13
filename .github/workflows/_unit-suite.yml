@@ -492,25 +492,20 @@ jobs:
   # ---------------------------------------------------------------------------
   # Rust + plugin tests on macOS
   #
-  # Warm-cache runs spent 7.5-9.2 minutes in the Rust gate and only 0.7-1.3
-  # minutes in the explicit debug build. Its 1,683-test nextest slice alone ran
-  # for 4.8-5.0 minutes, so it uses the same exact-inventory archive sharding as
-  # Linux. Extracted binaries are signed and prewarmed before timed execution;
-  # the keychain probe stays isolated, unit targets use per-test nextest
-  # timeouts, and the watcher remains serialized on libtest.
+  # These lanes test macOS-specific behavior: FSEvents watcher delivery,
+  # /var-to-/private/var canonicalization, broken-symlink fallback,
+  # bash_background SIGTERM handling, and Apple Silicon compilation. Linux
+  # cannot exercise these paths.
   #
-  # Catches macOS-specific code paths: FSEvents watcher behavior (different
-  # coalescing latency from inotify), /var vs /private/var symlink
-  # canonicalization, broken-symlink-chain fallback, bash_background SIGTERM
-  # behavior, and Apple Silicon-specific Rust compilation. The build-darwin-*
-  # jobs in release.yml only run `cargo build` — this is the only place we
-  # actually execute tests on macOS in CI.
+  # To stay within the job limit, the archive is split into three hash
+  # partitions each for lib/bin unit tests and non-watcher integration tests.
+  # Watcher tests stay serial; conformance and Bun tests use their own lane.
   # ---------------------------------------------------------------------------
   unit-macos-nextest-archive:
     name: Cargo test archive (macOS)
     runs-on: macos-26
-    # A cold macOS build of the crate and its test binaries takes about 15
-    # minutes on these runners, leaving 25 minutes no room for the archive.
+    # A cold build of every Rust test binary and its archive needs room beyond
+    # the warm-cache path, so keep this job's limit separate from test shards.
     timeout-minutes: 40
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -542,13 +537,15 @@ jobs:
           cache-bin: false
           cache-on-failure: true
 
-      - name: Build nextest archive (macOS integration suite)
-        run: cargo nextest archive --workspace -E 'kind(test) - binary(=watcher_integration)' --archive-file "$MACOS_NEXTEST_ARCHIVE"
+      - name: Build nextest archive (macOS Rust suite)
+        run: cargo nextest archive --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$MACOS_NEXTEST_ARCHIVE"
         env:
           MACOS_NEXTEST_ARCHIVE: ${{ runner.temp }}/macos-nextest.tar.zst
 
       - name: Prove split Rust test inventory is exact
         run: python3 scripts/rust-test-inventory-proof.py
+        env:
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/macos-nextest.tar.zst
 
       - name: Report nextest archive size
         run: |
@@ -566,105 +563,35 @@ jobs:
 
   unit-macos:
     name: Unit tests (macOS)
-    runs-on: macos-26
-    # Measured 2026-10-08: build ~15 min, lib suite ~5 min, watcher suite
-    # compile and run ~4 min, then conformance. 25 minutes cancelled the job
-    # mid-watcher three runs in a row while every test that ran passed.
-    timeout-minutes: 40
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
-      CARGO_INCREMENTAL: "0"
+    if: always()
+    needs:
+      - unit-macos-nextest-archive
+      - unit-macos-libtest-shard
+      - unit-macos-nextest
+      - unit-macos-watcher
+      - unit-macos-conformance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-nextest (direct, installer-action-independent)
+      - name: Require every macOS unit lane
+        if: always()
         shell: bash
+        env:
+          ARCHIVE_RESULT: ${{ needs.unit-macos-nextest-archive.result }}
+          LIBTEST_RESULT: ${{ needs.unit-macos-libtest-shard.result }}
+          INTEGRATION_RESULT: ${{ needs.unit-macos-nextest.result }}
+          WATCHER_RESULT: ${{ needs.unit-macos-watcher.result }}
+          CONFORMANCE_BUN_RESULT: ${{ needs.unit-macos-conformance.result }}
         run: |
           set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
-
-      - uses: mozilla-actions/sccache-action@v0.0.11
-
-      # cache-bin: false is what makes rust-cache safe on macOS. The failure
-      # that previously banned it here (release runs 25839773442 and
-      # 25840332625) was the cached ~/.cargo/bin shim overwriting the
-      # just-installed cargo shim, which then misread its argv as
-      # rustup-init. Excluding the bin directory keeps the dependency
-      # artifacts (the multi-minute win) without touching the shims.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: unit-macos
-          cache-bin: false
-          cache-on-failure: true
-
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "24"
-
-      - name: Install workspace deps
-        run: bun install --frozen-lockfile
-
-      # Fail fast: cheapest checks first (see the Linux job).
-      - name: Bun lint
-        run: bun run lint
-
-      - name: Build aft-bridge dist (workspace consumers depend on it)
-        run: bun run --cwd packages/aft-bridge build
-
-      - name: Build pi-plugin dist (Pi RPC tests need it)
-        run: bun run --cwd packages/pi-plugin build
-
-      - name: Bun typecheck
-        run: bun run typecheck
-
-      - name: Cargo build (debug — needed by plugin e2e tests)
-        run: cargo build -p agent-file-tools
-
-      - name: Rust test gate (unit and integration on nextest, watcher isolated)
-        run: ./scripts/rust-test-gate.sh
-        env:
-          AFT_TEST_DIAG: "1"
-          # See the Linux job: full core count on otherwise-idle CI runners.
-          NEXTEST_TEST_THREADS: "num-cpus"
-          # Archive shards own the integration inventory. These phases preserve
-          # the isolated keychain probe and serialized watcher behavior.
-          AFT_GATE_PHASES: lib,watcher,conformance
-          AFT_UNIT_TEST_RUNNER: nextest
-          # The storm tests exercise no macOS-specific paths; the dedicated
-          # unit-linux-storm job is the release-storm arbiter.
-          AFT_GATE_SKIP_RELEASE_STORM: "1"
-
-      # cortexkit/subconscious is public, so the default job-scoped token can
-      # read its pinned release assets, including on fork pull requests.
-      - name: Fetch pinned subc-core
-        id: subc_core
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          path="$(./scripts/fetch-subc-core.sh)"
-          echo "path=$path" >> "$GITHUB_OUTPUT"
-
-      - name: Bun test (all packages)
-        run: bun run test:unit
-        env:
-          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-          AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
-          SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
-          SUBC_CORE_WIRE_VERSION: "2"
+          for lane in ARCHIVE LIBTEST INTEGRATION WATCHER CONFORMANCE_BUN; do
+            result_var="${lane}_RESULT"
+            result="${!result_var}"
+            if [[ "$result" != "success" ]]; then
+              echo "macOS unit lane $lane concluded $result" >&2
+              exit 1
+            fi
+          done
 
   unit-macos-nextest:
     name: Cargo integration shard ${{ matrix.shard }}/3 (macOS)
@@ -673,6 +600,7 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         shard: [1, 2, 3]
     steps:
@@ -741,6 +669,196 @@ jobs:
             /cores/core.*
           if-no-files-found: warn
           retention-days: 3
+
+  unit-macos-libtest-shard:
+    name: Cargo libtest shard ${{ matrix.shard }}/3 (macOS)
+    needs: unit-macos-nextest-archive
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-macos
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Install cargo-nextest (direct, installer-action-independent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
+          "$HOME/.cargo/bin/cargo-nextest" --version
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-nextest-archive
+          path: ${{ runner.temp }}
+
+      - name: Rust libtest shard (nextest archive)
+        run: |
+          set -o pipefail
+          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/macos-libtest-shard-${{ matrix.shard }}.log"
+        shell: bash
+        env:
+          AFT_TEST_DIAG: "1"
+          AFT_UNIT_TEST_RUNNER: nextest
+          AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
+          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/macos-nextest.tar.zst
+          AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
+          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
+          NEXTEST_TEST_THREADS: "num-cpus"
+
+      - name: Upload macOS libtest shard output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-libtest-shard-${{ matrix.shard }}-log
+          path: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log
+          if-no-files-found: warn
+
+  unit-macos-watcher:
+    name: Cargo watcher tests (macOS)
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-macos
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Install cargo-nextest (direct, installer-action-independent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
+          "$HOME/.cargo/bin/cargo-nextest" --version
+
+      - name: Rust watcher gate (macOS)
+        # Keep FSEvents tests serial because they share fixtures and exercise
+        # the platform watcher backend that the other shards exclude.
+        run: |
+          set -o pipefail
+          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/macos-watcher.log"
+        shell: bash
+        env:
+          AFT_TEST_DIAG: "1"
+          AFT_GATE_PHASES: watcher
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+      - name: Upload macOS watcher output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-watcher-log
+          path: ${{ runner.temp }}/macos-watcher.log
+          if-no-files-found: warn
+
+  unit-macos-conformance:
+    name: Cargo conformance + Bun tests (macOS)
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-macos
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Install cargo-nextest (direct, installer-action-independent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
+          "$HOME/.cargo/bin/cargo-nextest" --version
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Bun lint
+        run: bun run lint
+
+      - name: Build aft-bridge dist (workspace consumers depend on it)
+        run: bun run --cwd packages/aft-bridge build
+
+      - name: Build pi-plugin dist (Pi RPC tests need it)
+        run: bun run --cwd packages/pi-plugin build
+
+      - name: Bun typecheck
+        run: bun run typecheck
+
+      - name: Cargo build (debug — needed by plugin tests)
+        run: cargo build -p agent-file-tools
+
+      - name: Rust conformance gate (macOS)
+        run: ./scripts/rust-test-gate.sh
+        env:
+          AFT_TEST_DIAG: "1"
+          AFT_GATE_PHASES: conformance
+          AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+      - name: Fetch pinned subc-core
+        id: subc_core
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          path="$(./scripts/fetch-subc-core.sh)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Bun test (all packages)
+        run: bun run test:unit
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
+          SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
+          SUBC_CORE_WIRE_VERSION: "2"
 
   # ---------------------------------------------------------------------------
   # Rust unit and integration tests on Windows
