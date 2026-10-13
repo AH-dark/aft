@@ -608,6 +608,37 @@ async fn consent_same_key_retry_replays_the_recorded_access_pending() {
     assert_eq!(code(&replayed), "access_pending");
 }
 
+#[tokio::test]
+async fn access_pending_wire_matches_golden_vector() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let outside = f.head_root.join("shared.txt");
+    assert!(!outside.starts_with(&f.worker.project_root));
+    let mut replies = f.send_read(&f.worker, &outside, 7).await;
+    let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .expect("the call ends with one terminal frame")
+        .expect("writer stays open");
+    let wire = String::from_utf8(reply.body.clone()).unwrap();
+    let body: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["isError"], true);
+    assert_eq!(code(&body), "access_pending");
+    assert!(body.get("errorCode").is_none());
+    assert!(body["structuredContent"].get("elicitation_id").is_none());
+
+    // Normalize only the transport request id and temp root; every other wire byte stays fixed.
+    let request_id = body["structuredContent"]["id"].as_str().unwrap();
+    let wire = wire
+        .replace(request_id, "${REQUEST_ID}")
+        .replace(&f.head_root.display().to_string(), "${HEAD_ROOT}");
+    assert_eq!(
+        wire.as_bytes(),
+        include_bytes!("../../../../test-vectors/access-pending-v1/worker-read-outside.json")
+    );
+}
+
 #[test]
 fn consent_routes_asks_by_stamp() {
     let dir = tempfile::tempdir().unwrap();
