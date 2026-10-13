@@ -16,7 +16,8 @@ use crate::edit;
 use crate::error::AftError;
 use crate::inspect::job::is_test_file;
 use crate::parser::{
-    detect_language, node_range_with_decorators, node_text, FileParser, LangId, TreeSitterProvider,
+    detect_language, node_range_with_decorators, node_text, FileParser, LangId, ParsedFile,
+    RustModule, TreeSitterProvider,
 };
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::{Range, Symbol};
@@ -27,6 +28,11 @@ const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const OUTLINE_FILE_WALK_CAP: usize = 200;
 const OUTLINE_FILE_COLLECTION_CAP: usize = 10_000;
 const TYPE_MEMBER_PREVIEW_CAP: usize = 3;
+
+#[cfg(test)]
+thread_local! {
+    static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// A single entry in the outline tree.
 ///
@@ -238,23 +244,38 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let symbols = match ctx.provider().list_symbols(&path) {
+    let symbols = match crate::parser::list_symbols_shared(ctx.provider(), &path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
         }
     };
 
-    let mut parser = FileParser::new();
-    let entries = match outline_structure_entries(
-        &path,
-        &symbols,
-        &mut parser,
-        ctx,
-        &req.id,
-        req.session(),
-        false,
-    ) {
+    let mut parser = ctx
+        .provider()
+        .as_any()
+        .downcast_ref::<TreeSitterProvider>()
+        .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()))
+        .unwrap_or_else(FileParser::new);
+    let structure = if detect_language(&path) == Some(LangId::Rust)
+        && ctx.provider().as_any().is::<TreeSitterProvider>()
+    {
+        parser
+            .extract_rust_outline(&path)
+            .map(|(symbols, modules)| rust_modules_outline(&modules, &symbols, &[], &[]))
+    } else {
+        outline_structure_entries(
+            &path,
+            &symbols,
+            &mut parser,
+            ctx,
+            &req.id,
+            req.session(),
+            false,
+            None,
+        )
+    };
+    let entries = match structure {
         Ok(entries) => entries,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
@@ -723,6 +744,7 @@ fn outline_structure_entries(
     req_id: &str,
     session_id: &str,
     collapse_tests: bool,
+    parsed: Option<&ParsedFile>,
 ) -> Result<Vec<OutlineEntry>, AftError> {
     let Some(lang) = detect_language(path).filter(|lang| {
         matches!(
@@ -737,11 +759,20 @@ fn outline_structure_entries(
     }) else {
         return Ok(build_outline_tree(symbols));
     };
-    let source =
-        crate::bounded_io::read_to_string(path).map_err(|error| AftError::FileNotFound {
+    if !collapse_tests && lang != LangId::Rust {
+        return Ok(build_outline_tree(symbols));
+    }
+    let captured;
+    let (source, tree) = if let Some(parsed) = parsed {
+        (parsed.source.as_ref(), &parsed.tree)
+    } else {
+        let source = crate::parser::read_source(path).map_err(|error| AftError::FileNotFound {
             path: format!("{}: {error}", path.display()),
         })?;
-    let (tree, _) = parser.parse_cloned(path)?;
+        let (tree, _) = parser.parse_cloned(path)?;
+        captured = (source, tree);
+        (captured.0.as_str(), &captured.1)
+    };
     if collapse_tests && tree.root_node().has_error() {
         return Err(AftError::ParseError {
             message: format!("syntax errors in {}", path.display()),
@@ -893,35 +924,31 @@ fn rust_module_outline(
     tests: &[TestSummary],
     scope: &[String],
 ) -> Vec<OutlineEntry> {
-    fn immediate_modules<'a>(
-        node: tree_sitter::Node<'a>,
-        modules: &mut Vec<tree_sitter::Node<'a>>,
-    ) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() == "mod_item" {
-                modules.push(child);
-            } else {
-                immediate_modules(child, modules);
-            }
-        }
-    }
-    let mut modules = Vec::new();
-    immediate_modules(root, &mut modules);
+    rust_modules_outline(
+        &crate::parser::rust_modules(root, source),
+        symbols,
+        tests,
+        scope,
+    )
+}
+
+fn rust_modules_outline(
+    modules: &[RustModule],
+    symbols: &[Symbol],
+    tests: &[TestSummary],
+    scope: &[String],
+) -> Vec<OutlineEntry> {
     let modules = modules
-        .into_iter()
-        .filter(|node| {
-            !tests.iter().any(|test| {
-                range_contains(
-                    &test.range,
-                    &node_range_with_decorators(node, source, LangId::Rust),
-                )
-            })
+        .iter()
+        .filter(|module| {
+            !tests
+                .iter()
+                .any(|test| range_contains(&test.range, &module.range))
         })
         .collect::<Vec<_>>();
     let ranges = modules
         .iter()
-        .map(|node| node_range_with_decorators(node, source, LangId::Rust))
+        .map(|module| module.range.clone())
         .collect::<Vec<_>>();
     let local = symbols
         .iter()
@@ -941,11 +968,7 @@ fn rust_module_outline(
         .collect::<Vec<_>>();
     let mut entries = build_outline_tree(&local);
     for (module, range) in modules.into_iter().zip(ranges) {
-        let name = module
-            .child_by_field_name("name")
-            .map(|name| node_text(source, &name))
-            .unwrap_or("module")
-            .to_string();
+        let name = module.name.clone();
         let mut module_scope = scope.to_vec();
         module_scope.push(name.clone());
         let module_symbols = symbols
@@ -953,14 +976,8 @@ fn rust_module_outline(
             .filter(|symbol| range_contains(&range, &symbol.range))
             .cloned()
             .collect::<Vec<_>>();
-        let members = module
-            .child_by_field_name("body")
-            .map(|body| rust_module_outline(body, source, &module_symbols, tests, &module_scope))
-            .unwrap_or_default();
-        let mut cursor = module.walk();
-        let exported = module
-            .named_children(&mut cursor)
-            .any(|child| child.kind() == "visibility_modifier");
+        let members = rust_modules_outline(&module.children, &module_symbols, tests, &module_scope);
+        let exported = module.exported;
         let entry = OutlineEntry {
             name: name.clone(),
             kind: "module".into(),
@@ -1666,6 +1683,26 @@ fn plan_outline_file_rows(
     file_entries: &[OutlineFileEntry],
     max_bytes: usize,
 ) -> Vec<OutlineTableRow> {
+    plan_outline_file_rows_with_length(
+        roots,
+        directory_nodes,
+        file_entries,
+        max_bytes,
+        files_table_rendered_len,
+    )
+}
+
+fn plan_outline_file_rows_with_length(
+    roots: &[usize],
+    directory_nodes: &[OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
+    max_bytes: usize,
+    mut rendered_len: impl FnMut(
+        &[OutlineTableRow],
+        &[OutlineDirectoryNode],
+        &[OutlineFileEntry],
+    ) -> usize,
+) -> Vec<OutlineTableRow> {
     // A depth-first alphabetical list lets a large crate consume the whole
     // response before later siblings appear. Start with every direct entry,
     // then prefer cheap same-level expansions so the budget reveals breadth
@@ -1731,9 +1768,7 @@ fn plan_outline_file_rows(
             };
             let mut candidate_rows = rows.clone();
             candidate_rows.splice(position..=position, replacement);
-            if format_files_table(&candidate_rows, directory_nodes, file_entries, max_bytes).len()
-                <= max_bytes
-            {
+            if rendered_len(&candidate_rows, directory_nodes, file_entries) <= max_bytes {
                 rows = candidate_rows;
             } else {
                 level_fully_expanded = false;
@@ -1801,8 +1836,7 @@ fn populate_rendered_file_symbols(
             if metadata.len() > MAX_OUTLINE_FILE_BYTES {
                 0
             } else {
-                ctx.provider()
-                    .list_symbols(&path)
+                crate::parser::list_symbols_shared(ctx.provider(), &path)
                     .map(|symbols| symbols.len())
                     .unwrap_or(0)
             }
@@ -1836,10 +1870,7 @@ fn cached_symbol_count(
     let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
     let size = metadata.len();
     let symbol_cache = ctx.symbol_cache();
-    let cache = symbol_cache.read().ok()?;
-    cache
-        .symbol_count_if_metadata_matches(path, mtime, size)
-        .or_else(|| cache.get(path, mtime).map(|symbols| symbols.len()))
+    crate::parser::cached_symbol_count_shared(&symbol_cache, path, mtime, size)
 }
 
 fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileContentStats> {
@@ -1974,6 +2005,31 @@ fn format_files_table(
     file_entries: &[OutlineFileEntry],
     _max_bytes: usize,
 ) -> OutlineTable {
+    #[cfg(test)]
+    TABLE_RENDERS.with(|count| count.set(count.get() + 1));
+    let (path_width, language_width, middle_width) =
+        files_table_widths(rows, directory_nodes, file_entries);
+    let mut output = String::new();
+    for row in rows {
+        let (path, middle, lines) =
+            files_table_fields(row, directory_nodes, file_entries, language_width);
+        output.push_str(&format!(
+            "{path:<path_width$}  {middle:<middle_width$} {lines:>7} lines\n",
+            lines = lines.as_deref().unwrap_or("unknown"),
+        ));
+    }
+    let rendered_len = output.len() + files_table_trailer_len(rows, directory_nodes);
+    OutlineTable {
+        table: output,
+        rendered_len,
+    }
+}
+
+fn files_table_widths(
+    rows: &[OutlineTableRow],
+    directory_nodes: &[OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
+) -> (usize, usize, usize) {
     let path_width = rows
         .iter()
         .map(|row| match row {
@@ -2004,39 +2060,71 @@ fn format_files_table(
         .unwrap_or(0)
         .max(file_middle_width);
 
-    let mut output = String::new();
-    for row in rows {
-        let (path, middle, lines) = match row {
-            OutlineTableRow::File(file_id) => {
-                let entry = &file_entries[*file_id];
-                (
-                    entry.path.clone(),
-                    format!(
-                        "{:<language_width$} {:>5} syms",
-                        entry.language,
-                        entry.symbols.unwrap_or(0)
-                    ),
-                    entry
-                        .lines
-                        .map(|lines| lines.to_string())
-                        .or_else(|| (entry.language == "binary").then(|| "-".to_string())),
-                )
-            }
-            OutlineTableRow::Rollup(node_id) => {
-                let node = &directory_nodes[*node_id];
-                (
-                    format!("{}/", node.path.trim_end_matches('/')),
-                    directory_rollup_summary(&node.stats),
-                    (node.stats.unknown_lines == 0).then(|| node.stats.lines.to_string()),
-                )
-            }
-        };
-        output.push_str(&format!(
-            "{path:<path_width$}  {middle:<middle_width$} {lines:>7} lines\n",
-            lines = lines.as_deref().unwrap_or("unknown"),
-        ));
-    }
+    (path_width, language_width, middle_width)
+}
 
+fn files_table_fields(
+    row: &OutlineTableRow,
+    directory_nodes: &[OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
+    language_width: usize,
+) -> (String, String, Option<String>) {
+    match row {
+        OutlineTableRow::File(file_id) => {
+            let entry = &file_entries[*file_id];
+            (
+                entry.path.clone(),
+                format!(
+                    "{:<language_width$} {:>5} syms",
+                    entry.language,
+                    entry.symbols.unwrap_or(0)
+                ),
+                entry
+                    .lines
+                    .map(|lines| lines.to_string())
+                    .or_else(|| (entry.language == "binary").then(|| "-".to_string())),
+            )
+        }
+        OutlineTableRow::Rollup(node_id) => {
+            let node = &directory_nodes[*node_id];
+            (
+                format!("{}/", node.path.trim_end_matches('/')),
+                directory_rollup_summary(&node.stats),
+                (node.stats.unknown_lines == 0).then(|| node.stats.lines.to_string()),
+            )
+        }
+    }
+}
+
+/// Rust string formatting pads by character count, but the output budget counts
+/// bytes. Keep both quantities so Unicode paths make the same budget decisions.
+fn files_table_rendered_len(
+    rows: &[OutlineTableRow],
+    directory_nodes: &[OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
+) -> usize {
+    let (path_width, language_width, middle_width) =
+        files_table_widths(rows, directory_nodes, file_entries);
+    let mut bytes = files_table_trailer_len(rows, directory_nodes);
+    for row in rows {
+        let (path, middle, lines) =
+            files_table_fields(row, directory_nodes, file_entries, language_width);
+        let lines = lines.as_deref().unwrap_or("unknown");
+        bytes += path.len()
+            + path_width.saturating_sub(path.chars().count())
+            + middle.len()
+            + middle_width.saturating_sub(middle.chars().count())
+            + lines.len()
+            + 7usize.saturating_sub(lines.chars().count())
+            + 10;
+    }
+    bytes
+}
+
+fn files_table_trailer_len(
+    rows: &[OutlineTableRow],
+    directory_nodes: &[OutlineDirectoryNode],
+) -> usize {
     let shown = rows
         .iter()
         .filter(|row| matches!(row, OutlineTableRow::File(_)))
@@ -2052,7 +2140,7 @@ fn format_files_table(
         }
     }
 
-    let rendered_len = if budget_rollups_present {
+    if budget_rollups_present {
         let envelope = crate::list_envelope::ListEnvelope::new(
             shown,
             crate::list_envelope::Total::Exact(shown + budget_rollup_files),
@@ -2061,14 +2149,9 @@ fn format_files_table(
             &["path"],
         );
         let trailer_len = crate::list_surfaces::outline::outline_trailer_byte_len(&envelope);
-        output.len() + 2 + trailer_len
+        2 + trailer_len
     } else {
-        output.len()
-    };
-
-    OutlineTable {
-        table: output,
-        rendered_len,
+        0
     }
 }
 
@@ -2108,7 +2191,9 @@ fn outline_many_files(
         .provider()
         .as_any()
         .downcast_ref::<TreeSitterProvider>()
-        .map(|provider| FileParser::with_symbol_cache(provider.symbol_cache()));
+        .map(|provider| {
+            FileParser::with_symbol_cache(provider.symbol_cache()).with_source_capture()
+        });
     let mut fallback_parser = FileParser::new();
 
     for (file, path) in files.iter().zip(paths) {
@@ -2126,9 +2211,20 @@ fn outline_many_files(
             continue;
         }
 
-        let symbols = match batch_parser.as_mut() {
-            Some(parser) => parser.extract_symbols(&path),
-            None => ctx.provider().list_symbols(&path),
+        let parsed = match batch_parser.as_mut() {
+            Some(parser) => match parser.parse_snapshot(&path) {
+                Ok(parsed) => Some(parsed),
+                Err(error) => {
+                    parser.evict_parse_tree(&path);
+                    skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)));
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let symbols = match (batch_parser.as_mut(), parsed.as_ref()) {
+            (Some(parser), Some(parsed)) => parser.extract_symbols_from_snapshot(&path, parsed),
+            _ => crate::parser::list_symbols_shared(ctx.provider(), &path),
         };
         match symbols {
             Ok(symbols) => {
@@ -2140,16 +2236,28 @@ fn outline_many_files(
                     req_id,
                     session_id,
                     true,
+                    parsed.as_ref(),
                 );
                 match structure {
                     Ok(mut entries) => {
                         if detect_language(&path) == Some(LangId::Rust) {
-                            let parser = batch_parser.as_mut().unwrap_or(&mut fallback_parser);
-                            if let (Ok(source), Ok((tree, _))) = (
-                                crate::bounded_io::read_to_string(&path),
-                                parser.parse(&path),
-                            ) {
-                                add_trait_member_previews(tree.root_node(), &source, &mut entries);
+                            if let Some(parsed) = &parsed {
+                                add_trait_member_previews(
+                                    parsed.tree.root_node(),
+                                    &parsed.source,
+                                    &mut entries,
+                                );
+                            } else {
+                                let parser = &mut fallback_parser;
+                                if let (Ok(source), Ok((tree, _))) =
+                                    (crate::parser::read_source(&path), parser.parse(&path))
+                                {
+                                    add_trait_member_previews(
+                                        tree.root_node(),
+                                        &source,
+                                        &mut entries,
+                                    );
+                                }
                             }
                         }
                         file_outlines.push(FileOutline {
@@ -2946,6 +3054,545 @@ pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
 mod tests {
     use super::*;
     use crate::symbols::SymbolKind;
+
+    fn navigation_fixture() -> (tempfile::TempDir, Vec<PathBuf>, AppContext) {
+        let temp = tempfile::tempdir().unwrap();
+        let sources = [
+            ("a.ts", "export function alpha() {}\nfunction beta() {}\n"),
+            ("b.tsx", "export function alpha() {}\nfunction beta() {}\n"),
+            ("c.js", "export function alpha() {}\nfunction beta() {}\n"),
+            ("d.py", "def alpha(): pass\ndef beta(): pass\n"),
+            ("e.go", "package main\nfunc alpha() {}\nfunc beta() {}\n"),
+            (
+                "f.rs",
+                "pub mod nested {\n    pub fn alpha() {}\n}\n#[test]\nfn beta() {}\n",
+            ),
+            ("g.cpp", "void alpha() {}\nvoid beta() {}\n"),
+        ];
+        let files = sources
+            .iter()
+            .map(|(name, source)| {
+                let path = temp.path().join(name);
+                std::fs::write(&path, source).unwrap();
+                path
+            })
+            .collect();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        (temp, files, ctx)
+    }
+
+    fn navigation_counts(
+        request: &RawRequest,
+        ctx: &AppContext,
+    ) -> (serde_json::Value, usize, usize) {
+        use crate::parser::work_counters::{tree_parses, SOURCE_READS};
+        let reads = SOURCE_READS.with(|count| count.get());
+        let parses = tree_parses();
+        let response = serde_json::to_value(handle_outline(request, ctx)).unwrap();
+        (
+            response,
+            SOURCE_READS.with(|count| count.get()) - reads,
+            tree_parses() - parses,
+        )
+    }
+
+    #[test]
+    fn single_outline_cache_hit_does_no_source_work() {
+        let (_temp, files, ctx) = navigation_fixture();
+        let mut counts = Vec::new();
+        for path in files {
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"single-work", "command":"outline", "file":path}),
+            )
+            .unwrap();
+            let (cold, reads, parses) = navigation_counts(&request, &ctx);
+            counts.push((reads, parses));
+            let (warm, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!(warm, cold);
+            counts.push((reads, parses));
+        }
+        assert_eq!(counts, [(1, 1), (0, 0)].repeat(7));
+    }
+
+    #[test]
+    fn multi_outline_shares_one_source_snapshot() {
+        let (_temp, files, ctx) = navigation_fixture();
+        let mut counts = Vec::new();
+        for path in &files {
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"multi-work", "command":"outline", "files":[path]}),
+            )
+            .unwrap();
+            let (cold, reads, parses) = navigation_counts(&request, &ctx);
+            counts.push((reads, parses));
+            let (warm, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!(warm, cold);
+            counts.push((reads, parses));
+        }
+        assert_eq!(counts, vec![(1, 1); 14]);
+        let batch_ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"mixed-work", "command":"outline", "files":files}),
+        )
+        .unwrap();
+        let (cold, reads, parses) = navigation_counts(&request, &batch_ctx);
+        assert_eq!((reads, parses), (7, 7));
+        let (warm, reads, parses) = navigation_counts(&request, &batch_ctx);
+        assert_eq!((reads, parses), (7, 7));
+        assert_eq!(warm, cold);
+    }
+
+    #[test]
+    fn rust_disk_and_manual_tables_hydrate_layout_once() {
+        let (temp, files, ctx) = navigation_fixture();
+        let path = &files[5];
+        let provider = ctx
+            .provider()
+            .as_any()
+            .downcast_ref::<TreeSitterProvider>()
+            .unwrap();
+        let symbols = ctx.provider().list_symbols(path).unwrap();
+        let cache = provider.symbol_cache();
+        let storage = tempfile::tempdir().unwrap();
+        cache
+            .write()
+            .unwrap()
+            .set_project_root(temp.path().to_path_buf());
+        crate::symbol_cache_disk::write_to_disk(&cache.read().unwrap(), storage.path(), "layout")
+            .unwrap();
+        for disk in [true, false] {
+            let mut loaded = crate::parser::SymbolCache::new();
+            if disk {
+                assert_eq!(
+                    loaded.load_from_disk(storage.path(), "layout", temp.path()),
+                    1
+                );
+            } else {
+                let meta = std::fs::metadata(path).unwrap();
+                loaded.insert(
+                    path.clone(),
+                    meta.modified().unwrap(),
+                    meta.len(),
+                    blake3::hash(&std::fs::read(path).unwrap()),
+                    symbols.clone(),
+                );
+            }
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::with_symbol_cache(Arc::new(
+                    std::sync::RwLock::new(loaded),
+                ))),
+                crate::config::Config::default(),
+            );
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"layout", "command":"outline", "file":path}),
+            )
+            .unwrap();
+            let (first, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (1, 1), "disk={disk}");
+            let (warm, reads, parses) = navigation_counts(&request, &ctx);
+            assert_eq!((reads, parses), (0, 0), "disk={disk}");
+            assert_eq!(warm, first);
+        }
+    }
+
+    #[test]
+    fn rust_outline_layout_tracks_symbol_freshness_and_invalidation() {
+        let (_temp, files, ctx) = navigation_fixture();
+        let path = &files[5];
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"fresh", "command":"outline", "file":path}),
+        )
+        .unwrap();
+        let (first, _, _) = navigation_counts(&request, &ctx);
+        assert!(first["text"].as_str().unwrap().contains("pub mod nested"));
+        std::fs::write(
+            path,
+            "pub mod replacement { pub fn alpha() {} }\nfn beta() {}\n",
+        )
+        .unwrap();
+        let (changed, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (1, 1));
+        assert!(changed["text"]
+            .as_str()
+            .unwrap()
+            .contains("pub mod replacement"));
+        assert!(!changed["text"].as_str().unwrap().contains("nested"));
+        let (warm, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (0, 0));
+        assert_eq!(warm, changed);
+        ctx.provider()
+            .as_any()
+            .downcast_ref::<TreeSitterProvider>()
+            .unwrap()
+            .symbol_cache()
+            .write()
+            .unwrap()
+            .invalidate(path);
+        let (invalidated, reads, parses) = navigation_counts(&request, &ctx);
+        assert_eq!((reads, parses), (1, 1));
+        assert_eq!(invalidated, changed);
+    }
+
+    #[test]
+    fn outline_snapshot_does_not_change_extracted_symbols_or_ranges() {
+        let (_temp, files, ctx) = navigation_fixture();
+        for path in files {
+            let mut parser = FileParser::new();
+            let parsed = parser.parse_snapshot(&path).unwrap();
+            let reference =
+                crate::parser::extract_symbols_from_tree(&parsed.source, &parsed.tree, parsed.lang)
+                    .unwrap();
+            assert_eq!(
+                parser
+                    .extract_symbols_from_snapshot(&path, &parsed)
+                    .unwrap()
+                    .as_ref(),
+                &reference
+            );
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"symbols", "command":"outline", "file":path}),
+            )
+            .unwrap();
+            assert!(handle_outline(&request, &ctx).success);
+            assert_eq!(ctx.provider().list_symbols(&path).unwrap(), reference);
+        }
+    }
+
+    #[test]
+    fn zoom_navigation_output_goldens() {
+        type Leaf<'a> = ([usize; 4], &'a str, &'a [&'a str], &'a [&'a str]);
+        let ts: [Leaf<'_>; 2] = [
+            (
+                [1, 1, 1, 27],
+                "export function alpha() {}",
+                &[],
+                &["function beta() {}"],
+            ),
+            (
+                [2, 1, 2, 19],
+                "function beta() {}",
+                &["export function alpha() {}"],
+                &[],
+            ),
+        ];
+        let cases: [[Leaf<'_>; 2]; 7] = [
+            ts,
+            ts,
+            ts,
+            [
+                (
+                    [1, 1, 1, 18],
+                    "def alpha(): pass",
+                    &[],
+                    &["def beta(): pass"],
+                ),
+                (
+                    [2, 1, 2, 17],
+                    "def beta(): pass",
+                    &["def alpha(): pass"],
+                    &[],
+                ),
+            ],
+            [
+                (
+                    [2, 1, 2, 16],
+                    "func alpha() {}",
+                    &["package main"],
+                    &["func beta() {}"],
+                ),
+                (
+                    [3, 1, 3, 15],
+                    "func beta() {}",
+                    &["package main", "func alpha() {}"],
+                    &[],
+                ),
+            ],
+            [
+                (
+                    [2, 5, 2, 22],
+                    "    pub fn alpha() {}",
+                    &["pub mod nested {"],
+                    &["}", "#[test]", "fn beta() {}"],
+                ),
+                (
+                    [4, 1, 5, 13],
+                    "#[test]\nfn beta() {}",
+                    &["pub mod nested {", "    pub fn alpha() {}", "}"],
+                    &[],
+                ),
+            ],
+            [
+                ([1, 1, 1, 16], "void alpha() {}", &[], &["void beta() {}"]),
+                ([2, 1, 2, 15], "void beta() {}", &["void alpha() {}"], &[]),
+            ],
+        ];
+        let (_temp, files, ctx) = navigation_fixture();
+        for (path, leaves) in files.iter().zip(cases) {
+            let symbols = ["alpha", "beta"].into_iter().zip(leaves).map(|(name, (range, content, before, after))| serde_json::json!({
+                "name":name, "response":{
+                    "id":"zoom-golden", "success":true, "name":name, "kind":"function",
+                    "range":{"start_line":range[0], "start_col":range[1], "end_line":range[2], "end_col":range[3]},
+                    "content":content, "context_before":before, "context_after":after,
+                    "annotations":{"calls_out":[], "called_by":[]}
+                }
+            })).collect::<Vec<_>>();
+            let expected = serde_json::json!({"id":"zoom-golden", "success":true, "complete":true, "symbols":symbols});
+            let request = serde_json::from_value(serde_json::json!({"id":"zoom-golden", "command":"zoom", "file":path, "symbols":["alpha","beta"], "context_lines":3})).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    serde_json::to_value(super::super::zoom::handle_zoom(&request, &ctx)).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_output_goldens() {
+        let (_temp, files, ctx) = navigation_fixture();
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"golden", "command":"outline", "files":files}),
+        )
+        .unwrap();
+        let response = serde_json::to_value(handle_outline(&request, &ctx)).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"id":"golden","success":true,"text":concat!(
+            "a.ts\n  E fn   alpha 1:1\n  - fn   beta 2:2\n",
+            "b.tsx\n  E fn   alpha 1:1\n  - fn   beta 2:2\n",
+            "c.js\n  E fn   alpha 1:1\n  - fn   beta 2:2\n",
+            "d.py\n  - fn   alpha 1:1\n  - fn   beta 2:2\n",
+            "e.go\n  - fn   alpha 2:2\n  - fn   beta 3:3\n",
+            "f.rs\n  E modu nested 1:3\n    E fn   alpha 2:2\n  tests: 1 items (lines 4-5)\n",
+            "g.cpp\n  - fn   alpha 1:1\n  - fn   beta 2:2\n"),
+            "complete":true,"output_truncated":false,"files_shown":7,"structure_footer":"","skipped_files":[]})
+        );
+        let bodies = [
+            "  E function alpha() {} 1:1\n  function beta() {} 2:2\n",
+            "  E function alpha() {} 1:1\n  function beta() {} 2:2\n",
+            "  E function alpha() {} 1:1\n  function beta() {} 2:2\n",
+            "  def alpha(): pass 1:1\n  def beta(): pass 2:2\n",
+            "  func alpha() {} 2:2\n  func beta() {} 3:3\n",
+            "  pub mod nested 1:3\n    .pub fn alpha() {} 2:2\n  fn beta() {} 4:5\n",
+            "  void alpha() {} 1:1\n  void beta() {} 2:2\n",
+        ];
+        for (path, body) in files.iter().zip(bodies) {
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"golden", "command":"outline", "file":path}),
+            )
+            .unwrap();
+            let expected = serde_json::json!({"id":"golden", "success":true, "complete":true,
+                "text":format!("{}\n{body}", path.file_name().unwrap().to_str().unwrap())});
+            assert_eq!(
+                serde_json::to_value(handle_outline(&request, &ctx)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    fn planner_fixture() -> (Vec<OutlineDirectoryNode>, Vec<OutlineFileEntry>) {
+        let files = (0..10_000)
+            .map(|i| OutlineFileEntry {
+                path: format!("root/d{:03}/f{i:05}.ts", i / 100),
+                language: "typescript".into(),
+                symbols: Some(i % 150),
+                lines: Some(i + 1),
+                absolute_path: PathBuf::new(),
+                data_doc: false,
+            })
+            .collect::<Vec<_>>();
+        let mut nodes = vec![OutlineDirectoryNode {
+            path: "root".into(),
+            depth: 0,
+            direct_files: vec![],
+            children: (1..=100).collect(),
+            stats: OutlineDirectoryStats::default(),
+        }];
+        for i in 0..100 {
+            nodes.push(OutlineDirectoryNode {
+                path: format!("root/d{i:03}"),
+                depth: 1,
+                direct_files: (i * 100..(i + 1) * 100).collect(),
+                children: vec![],
+                stats: OutlineDirectoryStats {
+                    files: 100,
+                    code_files: 100,
+                    lines: 1000,
+                    code_lines: 1000,
+                    ..Default::default()
+                },
+            });
+        }
+        (nodes, files)
+    }
+
+    #[test]
+    fn files_planner_materializes_only_the_final_table() {
+        let (nodes, files) = planner_fixture();
+        let before = TABLE_RENDERS.with(|count| count.get());
+        let rows = plan_outline_file_rows(&[0], &nodes, &files, 30 * 1024);
+        assert!(!format_files_table(&rows, &nodes, &files, 30 * 1024).is_empty());
+        assert_eq!(TABLE_RENDERS.with(|count| count.get()) - before, 1);
+    }
+
+    #[test]
+    fn files_mode_cold_counts_do_not_copy_symbol_tables() {
+        let (_temp, paths, ctx) = navigation_fixture();
+        let mut entries = paths
+            .iter()
+            .map(|path| OutlineFileEntry {
+                path: path_to_slash(path),
+                language: "code".into(),
+                symbols: None,
+                lines: Some(2),
+                absolute_path: path.clone(),
+                data_doc: false,
+            })
+            .collect::<Vec<_>>();
+        let rows = (0..entries.len())
+            .map(OutlineTableRow::File)
+            .collect::<Vec<_>>();
+        let before = crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get());
+        populate_rendered_file_symbols(&rows, &mut entries, &ctx);
+        assert!(entries.iter().all(|entry| entry.symbols == Some(2)));
+        assert_eq!(
+            crate::parser::work_counters::OWNED_SYMBOL_COPIES.with(|count| count.get()) - before,
+            0
+        );
+    }
+
+    #[test]
+    fn files_planner_lengths_and_acceptance_match_rendering() {
+        let (mut nodes, mut files) = planner_fixture();
+        nodes[1].path = "root/界/🦀".repeat(30);
+        nodes[2].stats.data_doc_files = 100;
+        nodes[2].stats.code_files = 0;
+        nodes[3].stats.unknown_lines = 1;
+        files[0].path = "界/🦀/e\u{301}.ts".into();
+        files[0].language = "🦀lang".into();
+        files[0].symbols = Some(123456789);
+        files[0].lines = Some(123456789);
+        files[1].lines = None;
+        files[1].language = "binary".into();
+        for budget in [
+            0,
+            1,
+            999,
+            1000,
+            1001,
+            10_000,
+            30 * 1024,
+            30 * 1024 + 1,
+            usize::MAX,
+        ] {
+            let mut candidates = 0;
+            let measured = plan_outline_file_rows_with_length(
+                &[0, 3],
+                &nodes,
+                &files,
+                budget,
+                |rows, nodes, files| {
+                    candidates += 1;
+                    let bytes = files_table_rendered_len(rows, nodes, files);
+                    let rendered = format_files_table(rows, nodes, files, budget).len();
+                    assert_eq!(bytes, rendered);
+                    for boundary in [rendered.saturating_sub(1), rendered, rendered + 1] {
+                        assert_eq!(bytes <= boundary, rendered <= boundary);
+                    }
+                    bytes
+                },
+            );
+            let reference = plan_outline_file_rows_with_length(
+                &[0, 3],
+                &nodes,
+                &files,
+                budget,
+                |rows, nodes, files| format_files_table(rows, nodes, files, budget).len(),
+            );
+            assert!(candidates > 0);
+            assert_eq!(measured, reference);
+            assert_eq!(
+                format_files_table(&measured, &nodes, &files, budget),
+                format_files_table(&reference, &nodes, &files, budget)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode files planner performance probe"]
+    fn files_planner_perf_probe() {
+        let (nodes, files) = planner_fixture();
+        let mut times = Vec::new();
+        for _ in 0..21 {
+            let start = std::time::Instant::now();
+            let rows = plan_outline_file_rows(&[0], &nodes, &files, 30 * 1024);
+            std::hint::black_box(format_files_table(&rows, &nodes, &files, 30 * 1024));
+            times.push(start.elapsed().as_micros());
+        }
+        times.sort();
+        println!(
+            "PLANNER PERF entries=10000 p50_us={} p95_us={}",
+            times[10], times[19]
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release-mode navigation performance probe"]
+    fn navigation_perf_probe() {
+        use std::time::Instant;
+        for lines in [1_000, 10_000] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = "// padding\n".repeat(lines - 2)
+                + "export function alpha() {}\nfunction beta() {}\n";
+            let files = (0..200)
+                .map(|i| {
+                    let path = temp.path().join(format!("f{i:03}.ts"));
+                    std::fs::write(&path, &source).unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"perf", "command":"outline", "files":files}),
+            )
+            .unwrap();
+            for cold in [true, false] {
+                let mut timings = Vec::new();
+                let mut ctx = AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::config::Config::default(),
+                );
+                if !cold {
+                    handle_outline(&request, &ctx);
+                }
+                for _ in 0..11 {
+                    if cold {
+                        ctx = AppContext::new(
+                            Box::new(TreeSitterProvider::new()),
+                            crate::config::Config::default(),
+                        );
+                    }
+                    let start = Instant::now();
+                    let (response, reads, parses) = navigation_counts(&request, &ctx);
+                    timings.push(start.elapsed().as_micros());
+                    assert_eq!(response["files_shown"], 200);
+                    if timings.len() == 1 {
+                        println!("lines={lines} cold={cold} reads={reads} parses={parses}");
+                    }
+                }
+                timings.sort();
+                println!(
+                    "NAV PERF lines={lines} cold={cold} p50_us={} p95_us={}",
+                    timings[5], timings[10]
+                );
+            }
+        }
+    }
 
     fn summary_regression_text() -> String {
         let temp = tempfile::tempdir().unwrap();

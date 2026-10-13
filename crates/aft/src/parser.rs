@@ -1004,6 +1004,8 @@ pub(crate) mod work_counters {
         /// Copies of a cached symbol list handed out by `FileParser`.
         pub(crate) static CACHED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
         pub(crate) static FILE_PARSE_READS: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static SOURCE_READS: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static OWNED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn tree_parses() -> usize {
@@ -1013,6 +1015,12 @@ pub(crate) mod work_counters {
     pub(crate) fn grammar_loads() -> usize {
         GRAMMAR_LOADS.with(Cell::get)
     }
+}
+
+pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
+    crate::bounded_io::read_to_string(path)
 }
 
 /// Parse source with a parser retained by the current worker thread.
@@ -1053,6 +1061,63 @@ struct CachedTree {
     size: u64,
     content_hash: blake3::Hash,
     tree: Tree,
+    source: Option<Arc<str>>,
+}
+
+/// Outline-only module containers; these never enter the extracted symbol table.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RustModule {
+    pub(crate) name: String,
+    pub(crate) range: Range,
+    pub(crate) exported: bool,
+    pub(crate) children: Vec<RustModule>,
+}
+
+pub(crate) fn rust_modules(root: Node<'_>, source: &str) -> Vec<RustModule> {
+    fn immediate_modules<'a>(node: Node<'a>, modules: &mut Vec<Node<'a>>) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() == "mod_item" {
+                modules.push(child);
+            } else {
+                immediate_modules(child, modules);
+            }
+        }
+    }
+    let mut modules = Vec::new();
+    immediate_modules(root, &mut modules);
+    modules
+        .into_iter()
+        .map(|module| {
+            let mut cursor = module.walk();
+            let exported = module
+                .named_children(&mut cursor)
+                .any(|child| child.kind() == "visibility_modifier");
+            RustModule {
+                name: module
+                    .child_by_field_name("name")
+                    .map(|name| node_text(source, &name))
+                    .unwrap_or("module")
+                    .to_string(),
+                range: node_range_with_decorators(&module, source, LangId::Rust),
+                exported,
+                children: module
+                    .child_by_field_name("body")
+                    .map(|body| rust_modules(body, source))
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// A request-local source and tree captured together, for read-only consumers.
+pub(crate) struct ParsedFile {
+    pub(crate) source: Arc<str>,
+    pub(crate) tree: Tree,
+    pub(crate) lang: LangId,
+    mtime: SystemTime,
+    size: u64,
+    content_hash: blake3::Hash,
 }
 
 /// Cached symbol extraction result: mtime at extraction time + symbols.
@@ -1065,6 +1130,7 @@ struct CachedSymbols {
     /// reference-count bump, and copy the symbols only after the lock is
     /// released and only if the entry turns out to be fresh.
     symbols: Arc<Vec<Symbol>>,
+    modules: Option<Arc<Vec<RustModule>>>,
 }
 
 fn content_hash_for_source(source: &str) -> blake3::Hash {
@@ -1222,6 +1288,7 @@ impl DecodedSymbolCache {
                     size: entry.size,
                     content_hash: entry.content_hash,
                     symbols: Arc::new(entry.symbols),
+                    modules: None,
                 },
             );
             outcome.loaded += 1;
@@ -1310,7 +1377,7 @@ impl SymbolCache {
         content_hash: blake3::Hash,
         symbols: Vec<Symbol>,
     ) -> bool {
-        self.insert_shared(path, mtime, size, content_hash, Arc::new(symbols))
+        self.insert_shared(path, mtime, size, content_hash, Arc::new(symbols), None)
     }
 
     fn insert_shared(
@@ -1320,15 +1387,35 @@ impl SymbolCache {
         size: u64,
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
+        modules: Option<Arc<Vec<RustModule>>>,
     ) -> bool {
+        let modules = modules.or_else(|| {
+            self.entries
+                .get(&path)
+                .filter(|entry| {
+                    entry.mtime == mtime
+                        && entry.size == size
+                        && entry.content_hash == content_hash
+                        && entry.symbols == symbols
+                })
+                .and_then(|entry| entry.modules.clone())
+        });
         let entry = CachedSymbols {
             mtime,
             size,
             content_hash,
             symbols,
+            modules,
         };
-        if self.entries.get(&path) == Some(&entry) {
-            return false;
+        if let Some(cached) = self.entries.get_mut(&path) {
+            if cached.mtime == entry.mtime
+                && cached.size == entry.size
+                && cached.content_hash == entry.content_hash
+                && cached.symbols == entry.symbols
+            {
+                cached.modules = entry.modules;
+                return false;
+            }
         }
         self.entries.insert(path, entry);
         self.mutation_revision = self.mutation_revision.wrapping_add(1);
@@ -1354,8 +1441,13 @@ impl SymbolCache {
     /// Return cached symbols when the source file is still fresh.
     pub fn get(&self, path: &Path, mtime: SystemTime) -> Option<Vec<Symbol>> {
         self.entries.get(path).and_then(|cached| {
-            cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime)
-                .then(|| cached.symbols.as_ref().clone())
+            cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime).then(
+                || {
+                    #[cfg(test)]
+                    work_counters::OWNED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
+                    cached.symbols.as_ref().clone()
+                },
+            )
         })
     }
 
@@ -1511,11 +1603,27 @@ impl SymbolCache {
                 .count("symbols", 0);
         }
         let entry_bytes = self.entries.iter().fold(0u64, |bytes, (path, cached)| {
+            fn module_bytes(modules: &[RustModule]) -> u64 {
+                modules
+                    .iter()
+                    .map(|module| {
+                        std::mem::size_of::<RustModule>() as u64
+                            + module.name.len() as u64
+                            + module_bytes(&module.children)
+                    })
+                    .sum()
+            }
             bytes
                 .saturating_add(std::mem::size_of::<PathBuf>() as u64)
                 .saturating_add(crate::memory::path_bytes(path))
                 .saturating_add(std::mem::size_of::<CachedSymbols>() as u64)
                 .saturating_add(symbols_estimated_bytes(&cached.symbols))
+                .saturating_add(
+                    cached
+                        .modules
+                        .as_deref()
+                        .map_or(0, |modules| module_bytes(modules)),
+                )
         });
         let project_root_bytes = self
             .project_root
@@ -1563,12 +1671,36 @@ impl SymbolCache {
     }
 }
 
+pub(crate) fn cached_symbol_count_shared(
+    cache: &SharedSymbolCache,
+    path: &Path,
+    mtime: SystemTime,
+    size: u64,
+) -> Option<usize> {
+    let cached = cache.read().ok()?.entries.get(path)?.clone();
+    if cached.mtime == mtime && cached.size == size {
+        return Some(cached.symbols.len());
+    }
+    if !cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime) {
+        return None;
+    }
+    // Hashing runs without a guard. A replacement during that I/O must not
+    // turn the old table into a fresh count for the newly installed entry.
+    let current = cache.read().ok()?;
+    current
+        .entries
+        .get(path)
+        .filter(|entry| Arc::ptr_eq(&entry.symbols, &cached.symbols))
+        .map(|_| cached.symbols.len())
+}
+
 /// Core parsing engine. Handles language detection, parse tree caching,
 /// symbol table caching, and query pattern execution via tree-sitter.
 pub struct FileParser {
     cache: HashMap<PathBuf, CachedTree>,
     symbol_cache: SharedSymbolCache,
     symbol_cache_generation: Option<u64>,
+    capture_source: bool,
 }
 
 impl FileParser {
@@ -1591,7 +1723,15 @@ impl FileParser {
             cache: HashMap::new(),
             symbol_cache,
             symbol_cache_generation,
+            capture_source: false,
         }
+    }
+
+    /// Outline batches retain source only until the matching tree is evicted;
+    /// other parser consumers do not need a second resident copy of each file.
+    pub(crate) fn with_source_capture(mut self) -> Self {
+        self.capture_source = true;
+        self
     }
 
     /// Parses `source` with this thread's retained parser for `lang` and
@@ -1663,10 +1803,9 @@ impl FileParser {
             work_counters::FILE_PARSE_READS.with(|count| count.set(count.get() + 1));
             #[cfg(test)]
             work_counters::TREE_SOURCE_READS.with(|count| count.set(count.get() + 1));
-            let source =
-                crate::bounded_io::read_to_string(path).map_err(|e| AftError::FileNotFound {
-                    path: format!("{}: {}", path.display(), e),
-                })?;
+            let source = read_source(path).map_err(|e| AftError::FileNotFound {
+                path: format!("{}: {}", path.display(), e),
+            })?;
 
             let tree = Self::parse_source(path, &source, lang)?;
 
@@ -1677,6 +1816,7 @@ impl FileParser {
                     size: source.len() as u64,
                     content_hash: content_hash_for_source(&source),
                     tree,
+                    source: self.capture_source.then(|| Arc::from(source)),
                 },
             );
         }
@@ -1694,6 +1834,110 @@ impl FileParser {
     pub fn parse_cloned(&mut self, path: &Path) -> Result<(Tree, LangId), AftError> {
         let (tree, lang) = self.parse(path)?;
         Ok((tree.clone(), lang))
+    }
+
+    pub(crate) fn parse_snapshot(&mut self, path: &Path) -> Result<ParsedFile, AftError> {
+        self.capture_source = true;
+        if self
+            .cache
+            .get(path)
+            .is_some_and(|cached| cached.source.is_none())
+        {
+            self.evict_parse_tree(path);
+        }
+        let (_, lang) = self.parse(path)?;
+        let cached = &self.cache[path];
+        Ok(ParsedFile {
+            source: Arc::clone(cached.source.as_ref().expect("source capture enabled")),
+            tree: cached.tree.clone(),
+            lang,
+            mtime: cached.mtime,
+            size: cached.size,
+            content_hash: cached.content_hash,
+        })
+    }
+
+    /// Reuse a validated request snapshot rather than reopening its source.
+    pub(crate) fn extract_symbols_from_snapshot(
+        &mut self,
+        path: &Path,
+        parsed: &ParsedFile,
+    ) -> Result<Arc<Vec<Symbol>>, AftError> {
+        let cached = self
+            .symbol_cache
+            .read()
+            .map_err(|_| AftError::ParseError {
+                message: "symbol cache lock poisoned".into(),
+            })?
+            .entries
+            .get(path)
+            .cloned();
+        let symbols = match cached {
+            Some(cached)
+                if cached.size == parsed.size
+                    && cached.content_hash == parsed.content_hash
+                    && (cached.mtime == parsed.mtime
+                        || parsed.content_hash != cache_freshness::zero_hash()) =>
+            {
+                cached.symbols
+            }
+            _ => Arc::new(extract_symbols_from_tree(
+                &parsed.source,
+                &parsed.tree,
+                parsed.lang,
+            )?),
+        };
+        let modules = (parsed.lang == LangId::Rust)
+            .then(|| Arc::new(rust_modules(parsed.tree.root_node(), &parsed.source)));
+        let mut cache = self
+            .symbol_cache
+            .write()
+            .map_err(|_| AftError::ParseError {
+                message: "symbol cache lock poisoned".into(),
+            })?;
+        if self
+            .symbol_cache_generation
+            .is_none_or(|generation| cache.generation == generation)
+        {
+            cache.insert_shared(
+                path.to_path_buf(),
+                parsed.mtime,
+                parsed.size,
+                parsed.content_hash,
+                Arc::clone(&symbols),
+                modules,
+            );
+        }
+        Ok(symbols)
+    }
+
+    /// Module layout shares the symbol entry's freshness and invalidation lifetime.
+    /// Disk-loaded or manually inserted tables have no module layout: their first
+    /// outline reads and parses once, then later fresh hits do neither.
+    pub(crate) fn extract_rust_outline(
+        &mut self,
+        path: &Path,
+    ) -> Result<(Arc<Vec<Symbol>>, Arc<Vec<RustModule>>), AftError> {
+        let symbols = self.extract_symbols_shared(path)?;
+        let modules = self
+            .symbol_cache
+            .read()
+            .map_err(|_| AftError::ParseError {
+                message: "symbol cache lock poisoned".into(),
+            })?
+            .entries
+            .get(path)
+            .filter(|entry| Arc::ptr_eq(&entry.symbols, &symbols))
+            .and_then(|entry| entry.modules.clone());
+        if let Some(modules) = modules {
+            return Ok((symbols, modules));
+        }
+        let parsed = self.parse_snapshot(path)?;
+        let symbols = self.extract_symbols_from_snapshot(path, &parsed)?;
+        Ok((
+            symbols,
+            Arc::new(rust_modules(parsed.tree.root_node(), &parsed.source)),
+        ))
     }
 
     /// Like [`FileParser::parse`] but reuses caller-provided file contents and
@@ -1746,6 +1990,7 @@ impl FileParser {
                     size,
                     content_hash,
                     tree,
+                    source: self.capture_source.then(|| Arc::from(source)),
                 },
             );
         }
@@ -1774,6 +2019,10 @@ impl FileParser {
             work_counters::CACHED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
         }
         let _ = hit;
+        #[cfg(test)]
+        if Arc::strong_count(&symbols) > 1 {
+            work_counters::OWNED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
+        }
         Ok((Arc::unwrap_or_clone(symbols), changed))
     }
 
@@ -1848,20 +2097,22 @@ impl FileParser {
             }
         }
 
-        let source =
-            crate::bounded_io::read_to_string(path).map_err(|e| AftError::FileNotFound {
-                path: format!("{}: {}", path.display(), e),
-            })?;
+        let source = read_source(path).map_err(|e| AftError::FileNotFound {
+            path: format!("{}: {}", path.display(), e),
+        })?;
         let size = source.len() as u64;
         let content_hash = content_hash_for_source(&source);
 
-        let symbols = Arc::new({
+        let (symbols, modules) = {
             // Reuse the source we just read instead of letting parse() read the
             // same file a second time.
             let (tree, lang) =
                 self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
-            extract_symbols_from_tree(&source, tree, lang)?
-        });
+            (
+                Arc::new(extract_symbols_from_tree(&source, tree, lang)?),
+                (lang == LangId::Rust).then(|| Arc::new(rust_modules(tree.root_node(), &source))),
+            )
+        };
 
         let mut symbol_cache = self
             .symbol_cache
@@ -1877,6 +2128,7 @@ impl FileParser {
                     size,
                     content_hash,
                     Arc::clone(&symbols),
+                    modules,
                 )
         } else {
             symbol_cache.insert_shared(
@@ -1885,6 +2137,7 @@ impl FileParser {
                 size,
                 content_hash,
                 Arc::clone(&symbols),
+                modules,
             )
         };
 
@@ -8901,6 +9154,64 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    #[test]
+    fn only_snapshot_consumers_retain_source_with_the_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("layout.rs");
+        std::fs::write(&path, "pub mod api { pub fn run() {} }\n").unwrap();
+        let mut parser = FileParser::new();
+        parser.extract_symbols_shared(&path).unwrap();
+        assert!(parser.cache[&path].source.is_none());
+        assert!(parser.symbol_cache.read().unwrap().entries[&path]
+            .modules
+            .is_some());
+        parser.evict_parse_tree(&path);
+        let captured = parser.parse_snapshot(&path).unwrap();
+        assert_eq!(
+            captured.source.as_ref(),
+            "pub mod api { pub fn run() {} }\n"
+        );
+        assert!(parser.cache[&path].source.is_some());
+        parser.evict_parse_tree(&path);
+        assert_eq!(parser.parse_tree_cache_len(), 0);
+    }
+
+    #[test]
+    fn cached_symbol_count_hashing_releases_cache_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("counts.ts");
+        std::fs::write(&path, "export function alpha() {}\n").unwrap();
+        let mut parser = super::FileParser::new();
+        parser.extract_symbols_shared(&path).unwrap();
+        let cache = parser.symbol_cache();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta.modified().unwrap() + std::time::Duration::from_secs(2);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(mtime)).unwrap();
+        let arrived = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let released = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let (cache, path, arrived, released) = (
+                cache.clone(),
+                path.clone(),
+                arrived.clone(),
+                released.clone(),
+            );
+            std::thread::spawn(move || {
+                super::FRESHNESS_TEST_BARRIERS
+                    .with(|slot| *slot.borrow_mut() = Some((arrived, released)));
+                super::cached_symbol_count_shared(&cache, &path, mtime, meta.len())
+            })
+        };
+        arrived.wait();
+        let writer_progress = cache.try_write().is_ok();
+        released.wait();
+        assert_eq!(worker.join().unwrap(), Some(1));
+        assert!(
+            writer_progress,
+            "fallback hashing retained the shared cache read lock"
+        );
+    }
+
     use super::*;
     use crate::language::LanguageProvider;
     use crate::symbol_cache_disk;
