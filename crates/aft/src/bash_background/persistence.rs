@@ -2977,6 +2977,101 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    // Freeze the scope-blind version-7 task shape rather than deserializing
+    // through PersistedTask, whose new scope field would hide rollback behavior.
+    // Serde's unknown-field handling lets that reader ignore the added stamp.
+    #[derive(Serialize, Deserialize)]
+    struct ScopeBlindV7Task {
+        schema_version: u32,
+        harness: Option<String>,
+        task_id: String,
+        session_id: String,
+        command: String,
+        #[serde(default)]
+        pipeline_segments: Vec<String>,
+        pipeline_status_unavailable: Option<String>,
+        #[serde(default)]
+        mode: BgMode,
+        workdir: PathBuf,
+        project_root: Option<PathBuf>,
+        status: BgTaskStatus,
+        started_at: u64,
+        finished_at: Option<u64>,
+        duration_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+        #[serde(default)]
+        default_hard_kill: bool,
+        exit_code: Option<i64>,
+        child_pid: Option<u32>,
+        pgid: Option<i32>,
+        live_descendants: Option<Vec<LiveDescendant>>,
+        #[serde(default)]
+        live_descendants_omitted: usize,
+        completion_delivered: bool,
+        #[serde(default = "default_notify_on_completion")]
+        notify_on_completion: bool,
+        #[serde(default = "default_compressed")]
+        compressed: bool,
+        pty_rows: Option<u16>,
+        pty_cols: Option<u16>,
+        #[serde(default)]
+        scanner_report: Vec<PermissionAsk>,
+        #[serde(default)]
+        sandbox_native: bool,
+        sandbox_temp_dir: Option<PathBuf>,
+        status_reason: Option<String>,
+        #[serde(default)]
+        output_incomplete: bool,
+        call_key: Option<crate::bash_background::TaskCallKey>,
+        remote: Option<crate::bash_background::registry::remote::RemoteTask>,
+        execution_note: Option<String>,
+        #[serde(default)]
+        incomplete_output: Vec<(u64, u64)>,
+        #[serde(default)]
+        stripped_env_names: Vec<String>,
+        #[serde(default)]
+        local_fallback_started: bool,
+        #[serde(default)]
+        cancelled_call_unannounced: bool,
+    }
+
+    fn read_scope_blind_v7(bytes: &[u8]) -> Result<ScopeBlindV7Task, String> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let version = value["schema_version"].as_u64().ok_or("missing version")?;
+        if !(2..=7).contains(&version) {
+            return Err(format!(
+                "unsupported background task schema_version {version}"
+            ));
+        }
+        let task: ScopeBlindV7Task = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        validate_task_id(&task.task_id).map_err(|e| e.to_string())?;
+        Ok(task)
+    }
+
+    #[test]
+    fn stamped_v7_is_readable_by_scope_blind_v7_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let (resolved, mut task) = counted_task(directory.path());
+        task.scope = Some(subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Direct,
+            "scope",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        ));
+        write_task_at(&resolved, &task).unwrap();
+        let bytes = std::fs::read(&resolved.paths.json).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(written["schema_version"], 7);
+        assert_eq!(written["scope"]["ref"], "scope");
+        let old = read_scope_blind_v7(&bytes).expect("scope-blind reader accepts stamped v7");
+        assert_eq!(old.task_id, task.task_id);
+        assert_eq!(old.session_id, task.session_id);
+        assert_eq!(old.command, task.command);
+        assert_eq!(old.status, task.status);
+        assert!(serde_json::to_value(old).unwrap().get("scope").is_none());
+        assert_eq!(read_task_at(&resolved).unwrap().scope, task.scope);
+    }
+
     #[test]
     fn scope_stamp_task_versions_and_unstamped_v7_are_compatible() {
         let directory = tempfile::tempdir().unwrap();
