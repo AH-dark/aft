@@ -22,6 +22,7 @@ import {
   resolveSubcConnectionFilePath,
 } from "./config-error.js";
 import {
+  asCanonicalRootPath,
   type CanonicalRootPath,
   type ConcretePoolId,
   getLifecycleRegistry,
@@ -122,7 +123,7 @@ function satisfyLifecycleDemand(wrapper: RevivableTransportPool, projectRoot: st
   if (activePool.isShutdown() || !(activePool instanceof SubcTransportPool)) return;
   // The outer wrapper's synchronous getBridge is the explicit demand boundary.
   // Register the concrete root before the wrapper creates and returns its facade.
-  activePool.getBridge(projectRoot);
+  activePool.getBridgeForCanonicalRoot(asCanonicalRootPath(projectRoot));
 }
 
 /**
@@ -172,8 +173,8 @@ export async function createAftTransportPool(
   });
   if (reapingEnabled) {
     const owner = wrapper;
-    const getBridge = owner.getBridge.bind(owner);
-    owner.getBridge = (projectRoot) => {
+    const getBridge = owner.getBridgeForCanonicalRoot.bind(owner);
+    owner.getBridgeForCanonicalRoot = (projectRoot) => {
       satisfyLifecycleDemand(owner, projectRoot);
       return getBridge(projectRoot);
     };

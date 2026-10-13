@@ -157,7 +157,6 @@ describe("hoisted tool adapters", () => {
 
   test("hashline edit pins one session across preflight, preview, and apply", async () => {
     const root = await tempRoot();
-    let editCalls = 0;
     let sessionReads = 0;
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((command) => {
@@ -171,15 +170,12 @@ describe("hoisted tool adapters", () => {
         };
       }
       expect(command).toBe("edit");
-      editCalls += 1;
-      return editCalls === 1
-        ? { success: true, preview: true, text: "Preview ready." }
-        : {
-            success: true,
-            filePath: "src.ts",
-            text: "1 of 1 files applied",
-            metadata: { diff: "Index: src.ts\n", files: [] },
-          };
+      return {
+        success: true,
+        filePath: "src.ts",
+        text: "1 of 1 files applied",
+        metadata: { diff: "Index: src.ts\n", files: [] },
+      };
     });
     registerHoistedTools(
       api,
@@ -229,13 +225,14 @@ describe("hoisted tool adapters", () => {
       extCtx,
     )) as { content: Array<{ text: string }> };
 
+    // Apply verifies tagged addresses against current bytes before writing, without a separate validation-only preview.
+    // Preflight and apply must share the session that owns the tagged read snapshots.
     expect(calls.map((call) => [call.params.name, call.params.preview === true])).toEqual([
       ["hashline_preflight", false],
-      ["edit", true],
       ["edit", false],
     ]);
+    // Removing the redundant preview does not permit either remaining request to change sessions.
     expect(calls.map((call) => call.params.session_id)).toEqual([
-      "hashline-session",
       "hashline-session",
       "hashline-session",
     ]);

@@ -986,14 +986,7 @@ describe("Hoisted tool execute handlers", () => {
           };
         }
         expect(command).toBe("edit");
-        if (options?.preview) {
-          return {
-            success: true,
-            preview: true,
-            text: "Preview ready.",
-            metadata: { diff: previewDiff },
-          };
-        }
+        expect(options?.preview).not.toBe(true);
         return {
           success: true,
           filePath: "src.ts",
@@ -1006,9 +999,10 @@ describe("Hoisted tool execute handlers", () => {
 
     const result = await tools.edit.execute({ patch }, sdkCtx);
 
+    // Preflight identifies paths for permission checks; apply verifies tagged addresses against current bytes before writing.
+    // A separate validation-only preview repeats that work without contributing an approval diff.
     expect(calls.map((call) => [call.command, call.options?.preview === true])).toEqual([
       ["hashline_preflight", false],
-      ["edit", true],
       ["edit", false],
     ]);
     expect(askCalls.find((call) => call.permission === "edit")?.patterns).toContain("src.ts");

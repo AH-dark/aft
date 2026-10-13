@@ -786,10 +786,6 @@ export function registerHoistedTools(
             },
           );
         }
-        const preview = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx, {
-          preview: true,
-        });
-        if (preview.success === false) throw toolErrorFromResponse("edit", preview);
         const response = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx);
         if (response.success === false) throw toolErrorFromResponse("edit", response);
         return buildMutationResult(response);

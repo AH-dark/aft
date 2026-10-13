@@ -795,9 +795,6 @@ function createHashlineEditTool(ctx: PluginContext): ToolDefinition {
       });
       if (denial) return permissionDeniedResponse(denial);
 
-      const preview = await callToolCall(ctx, context, "edit", rawArgs, { preview: true });
-      if (preview.success === false) throw toolErrorFromResponse("edit", preview);
-
       const data = await callToolCall(ctx, context, "edit", rawArgs);
       if (data.success === false) throw toolErrorFromResponse("edit", data);
       const firstPath =

@@ -1502,7 +1502,11 @@ fn insert_common_mutation_flags(out: &mut Map<String, Value>, ctx: TranslateCont
         "diagnostics".to_string(),
         Value::Bool(ctx.diagnostics_on_edit),
     );
-    out.insert("include_diff_content".to_string(), Value::Bool(true));
+    // Approval previews consume the patch, while only final host UI rendering needs full texts.
+    out.insert(
+        "include_diff_content".to_string(),
+        Value::Bool(!ctx.preview),
+    );
     out.insert("preview".to_string(), Value::Bool(ctx.preview));
 }
 
@@ -2978,6 +2982,100 @@ mod tests {
                     assert_same_path(actual, expected, &format!("tool {tool}"))
                 }
                 other => panic!("tool {tool}: unexpected expectation {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn preview_diff_content_work_bound_preserves_patches_and_final_texts() {
+        let project = Path::new("/project");
+        let mutations = [
+            (
+                "write",
+                serde_json::json!({"path":"a.ts","content":"after"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":"a.ts","edits":[{"oldString":"before","newString":"after"}]}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":"a.ts","appendContent":"after"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":"a.ts","symbol":"value","content":"after"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":"a.ts","oldString":"before","newString":"after"}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":"*.ts","edits":[{"oldString":"before","newString":"after"}]}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path":"a.ts","edits":[{"startLine":1,"endLine":1,"content":"after"}]}),
+            ),
+        ];
+        let fixtures = [
+            (
+                "before\r\nrepeat\r\nrepeat".to_string(),
+                "after\r\nrepeat\r\nrepeat".to_string(),
+            ),
+            (String::new(), "created\n".to_string()),
+            ("deleted\n".to_string(), String::new()),
+            ("a".repeat(512 * 1024), "b".repeat(512 * 1024)),
+            ("a".repeat(512 * 1024 + 1), "b".repeat(512 * 1024 + 1)),
+            (
+                "same\n".repeat(5001),
+                format!("after\n{}", "same\n".repeat(5000)),
+            ),
+        ];
+        for (name, arguments) in mutations {
+            let translate = |preview| {
+                subc_translate_with_context(
+                    name,
+                    &arguments,
+                    project,
+                    TranslateContext {
+                        preview,
+                        ..TranslateContext::default()
+                    },
+                )
+                .unwrap()
+            };
+            let preview = Value::Object(translate(true).args);
+            let apply = Value::Object(translate(false).args);
+            for (before, after) in &fixtures {
+                let mut result = serde_json::json!({"success":true});
+                crate::edit::attach_preview_diff(&mut result, &preview, "a.ts", before, after);
+                assert!(
+                    result["diff"].get("before").is_none(),
+                    "preview must ship zero unused full texts"
+                );
+                assert!(result["diff"].get("after").is_none());
+                let mut original = serde_json::json!({"success":true});
+                crate::edit::attach_preview_diff(&mut original, &apply, "a.ts", before, after);
+                assert_eq!(result["preview_diff"], original["preview_diff"]);
+                assert_eq!(result["metadata"], original["metadata"]);
+                assert_eq!(result["diff"]["additions"], original["diff"]["additions"]);
+                assert_eq!(result["diff"]["deletions"], original["diff"]["deletions"]);
+                let saved = serde_json::to_vec(&original).unwrap().len() as isize
+                    - serde_json::to_vec(&result).unwrap().len() as isize;
+                if before.len().max(after.len()) <= 512 * 1024 {
+                    assert_eq!(original["diff"]["before"], *before);
+                    assert_eq!(original["diff"]["after"], *after);
+                    assert!(saved > 0);
+                } else {
+                    assert_eq!(original["diff"]["truncated"], true);
+                }
+                println!(
+                    "{name}: before={} after={} preview_bytes_saved={saved}",
+                    before.len(),
+                    after.len()
+                );
             }
         }
     }

@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 
 import { error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
+import { asCanonicalRootPath, type CanonicalRootPath } from "./lifecycle-registry.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import type {
@@ -226,11 +227,14 @@ export class BridgePool implements AftTransportPool {
    * isolated by `session_id` on the Rust side.
    */
   getBridge(projectRoot: string): BinaryBridge {
+    return this.getBridgeForCanonicalRoot(asCanonicalRootPath(normalizeKey(projectRoot)));
+  }
+
+  getBridgeForCanonicalRoot(key: CanonicalRootPath): BinaryBridge {
     if (this.shutdownCalled) {
       this.shutdownCalled = false;
       this.startCleanupTimer();
     }
-    const key = normalizeKey(projectRoot);
 
     // `$HOME`-rooted spawns are no longer refused here. The Rust
     // `handle_configure` auto-disables heavy subsystems (search_index,

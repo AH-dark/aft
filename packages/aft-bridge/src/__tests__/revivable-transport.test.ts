@@ -88,9 +88,8 @@ describe("RevivableTransportPool", () => {
           "revived",
         );
       }
-      // One outer lookup and one concrete-pool lookup per operation, not a
-      // third canonicalization just to refresh the already-known facade.
-      expect(realpaths.mock.calls.length).toBe(200);
+      // Resolve the project directory once per request; the underlying pool still checks that it exists.
+      expect(realpaths.mock.calls.length).toBe(100);
       realpaths.mockClear();
       for (let i = 0; i < 100; i++) {
         expect((await transport.send("status", { session_id: "hot" })).text).toBe("revived");

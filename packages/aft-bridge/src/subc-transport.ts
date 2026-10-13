@@ -1406,6 +1406,8 @@ export class SubcTransportPool implements AftTransportPool {
   private routeReopenRetryMs: number | null = null;
   /** Per-session records keyed by the opaque identity key. */
   private readonly sessions = new Map<IdentityKey, SessionRecord>();
+  /** Keep global insertion order so a session using several roots selects the same first live route. */
+  private readonly sessionIndex = new Map<string, Set<SessionRecord>>();
   // Pending host creation events are bounded. Forgetting one only makes that
   // session unknown (retained), never falsely eligible for eviction.
   private readonly observedStarts = new Set<IdentityKey>();
@@ -1745,7 +1747,10 @@ export class SubcTransportPool implements AftTransportPool {
    * always has a registered root and captured generation.
    */
   getBridge(projectRoot: string): SubcTransport {
-    const root = this.canonicalRoot(projectRoot);
+    return this.getBridgeForCanonicalRoot(this.canonicalRoot(projectRoot));
+  }
+
+  getBridgeForCanonicalRoot(root: CanonicalRootPath): SubcTransport {
     if (this.shuttingDown && this.lifecycleEnabled()) {
       throw new SubcTransportShuttingDownError();
     }
@@ -1863,6 +1868,12 @@ export class SubcTransportPool implements AftTransportPool {
       pendingDetach: false,
     };
     this.sessions.set(key, record);
+    let records = this.sessionIndex.get(identity.session);
+    if (!records) {
+      records = new Set<SessionRecord>();
+      this.sessionIndex.set(identity.session, records);
+    }
+    records.add(record);
     let keys = this.rootIndex.get(root);
     if (!keys) {
       keys = new Set<IdentityKey>();
@@ -2085,6 +2096,9 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private removeIndexMembership(record: SessionRecord): void {
+    const records = this.sessionIndex.get(record.identity.session);
+    records?.delete(record);
+    if (records?.size === 0) this.sessionIndex.delete(record.identity.session);
     const keys = this.rootIndex.get(record.canonicalRoot);
     if (!keys) return;
     keys.delete(record.identityKey);
@@ -2766,7 +2780,7 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private unscopedHostRecord(session: string): SessionRecord | undefined {
-    for (const record of this.sessions.values()) {
+    for (const record of this.sessionIndex.get(session) ?? []) {
       const entry = record.routeEntry;
       if (
         record.identity.session === session &&
@@ -3522,6 +3536,7 @@ export class SubcTransportPool implements AftTransportPool {
       if (owner) detached.push(owner);
     }
     this.rootIndex.clear();
+    this.sessionIndex.clear();
     this.transports.clear();
 
     const client = this.client;
@@ -3548,9 +3563,7 @@ export class SubcTransportPool implements AftTransportPool {
       session: session && session.length > 0 ? session : DEFAULT_SESSION_ID,
     };
     const owner = this.detachSession(identityKey(identity), "session_closed");
-    if (
-      ![...this.sessions.values()].some((record) => record.identity.session === identity.session)
-    ) {
+    if (!this.sessionIndex.has(identity.session)) {
       const state = this.hostScopeCache.get(identity.session);
       if (state) this.cancelHostScopeRetry(state);
       this.hostScopeCache.delete(identity.session);

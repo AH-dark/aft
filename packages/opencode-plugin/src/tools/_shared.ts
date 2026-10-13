@@ -27,6 +27,7 @@ import type {
 } from "@cortexkit/aft-bridge";
 import {
   adaptToolError,
+  asCanonicalRootPath,
   canonicalizeProjectRoot,
   decodeFileUrl,
   HOST_TOOL_NAMES_FIELD,
@@ -219,17 +220,8 @@ export async function resolvePathArg(
   return resolvePathFromProjectRoot(await resolveProjectRoot(ctx, runtime), target);
 }
 
-/**
- * Get the BinaryBridge for the runtime's project root.
- *
- * Prefer `callBridge()` unless you need to send multiple requests yourself.
- *
- * This is synchronous and uses only the cached session directory. If the
- * cache is cold, it falls back to `runtime.directory` — `callBridge()`
- * eagerly warms the cache before calling this so the cache is hot for
- * subsequent calls in the same session.
- */
-export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectTransport {
+/** Resolve a root for this request and refuse disabled or missing projects before transport work. */
+function checkedProjectRoot(ctx: PluginContext, runtime: ToolRuntime): string {
   const projectRoot = projectRootFor(runtime);
   if (ctx.isProjectEnabled?.(projectRoot) === false) {
     throw new Error(`AFT disabled by config for ${projectRoot}`);
@@ -240,7 +232,18 @@ export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectT
   if (!existsSync(projectRoot)) {
     throw new Error(`project directory no longer exists: ${projectRoot} (stale restored session?)`);
   }
-  return ctx.pool.getBridge(projectRoot);
+  return projectRoot;
+}
+
+/**
+ * Get the BinaryBridge for the runtime's project root.
+ *
+ * Prefer `callBridge()` unless you need to send multiple requests yourself.
+ * This synchronous helper uses only the cached session directory;
+ * `callBridge()` warms that cache before resolving the request's root.
+ */
+export function bridgeFor(ctx: PluginContext, runtime: ToolRuntime): AftProjectTransport {
+  return ctx.pool.getBridge(checkedProjectRoot(ctx, runtime));
 }
 
 /**
@@ -311,11 +314,11 @@ export async function callBridge(
   markBridgeStart();
   let response: Awaited<ReturnType<AftProjectTransport["send"]>>;
   try {
-    response = await bridgeFor(ctx, runtime).send(
-      command,
-      merged,
-      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
-    );
+    const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
+    const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
+    response = ctx.pool.sendForCanonicalRoot
+      ? await ctx.pool.sendForCanonicalRoot(root, command, merged, opts)
+      : await ctx.pool.getBridge(root).send(command, merged, opts);
   } catch (error) {
     // The break-glass gate must receive the original transport failure. In
     // particular, do not append recovery text before gate-off callers rethrow it.
@@ -367,12 +370,11 @@ export async function callToolCall(
   markBridgeStart();
   let response: Awaited<ReturnType<AftProjectTransport["toolCall"]>>;
   try {
-    response = await bridgeFor(ctx, runtime).toolCall(
-      runtime.sessionID,
-      name,
-      rawArgs,
-      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
-    );
+    const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
+    const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
+    response = ctx.pool.toolCallForCanonicalRoot
+      ? await ctx.pool.toolCallForCanonicalRoot(root, runtime.sessionID, name, rawArgs, opts)
+      : await ctx.pool.getBridge(root).toolCall(runtime.sessionID, name, rawArgs, opts);
   } catch (error) {
     throw adaptToolError(name, error);
   } finally {

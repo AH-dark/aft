@@ -1,4 +1,5 @@
 import type { BridgeRequestOptions, StatusSnapshot } from "./bridge.js";
+import type { CanonicalRootPath } from "./lifecycle-registry.js";
 import type { BridgeToolCallRuntime } from "./pool.js";
 
 export type ToolCallArguments = Record<string, unknown>;
@@ -101,6 +102,22 @@ export interface AftTransportPool {
   /** Host-observed creation, never resume/reload. Optional for older pool implementations. */
   observeSessionStart?(projectRoot: string, session: string): void;
   getBridge(projectRoot: string): AftProjectTransport;
+  /** Reuse a root already canonicalized for this request; raw paths need getBridge's symlink resolution. */
+  getBridgeForCanonicalRoot?(projectRoot: CanonicalRootPath): AftProjectTransport;
+  /** Dispatch with a root resolved by the host for this request, not a cached raw-path identity. */
+  sendForCanonicalRoot?(
+    projectRoot: CanonicalRootPath,
+    command: string,
+    params?: Record<string, unknown>,
+    options?: AftTransportOptions,
+  ): Promise<Record<string, unknown>>;
+  toolCallForCanonicalRoot?(
+    projectRoot: CanonicalRootPath,
+    sessionId: string | undefined,
+    name: string,
+    rawArgs?: ToolCallArguments,
+    options?: ToolCallOptions,
+  ): Promise<ToolCallResult>;
   getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null;
   /**
    * All currently-live project transports, for session-scoped signals (e.g.

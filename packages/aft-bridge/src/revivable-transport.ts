@@ -1,4 +1,5 @@
 import { warn } from "./active-logger.js";
+import { asCanonicalRootPath, type CanonicalRootPath } from "./lifecycle-registry.js";
 import { canonicalizeProjectRoot } from "./project-identity.js";
 import type { BgNudgeRef } from "./subc-transport.js";
 import type {
@@ -50,7 +51,12 @@ export class RevivableTransportPool implements AftTransportPool {
   }
 
   getBridge(projectRoot: string): RevivableProjectTransport {
-    const key = canonicalizeProjectRoot(projectRoot);
+    return this.getBridgeForCanonicalRoot(
+      asCanonicalRootPath(canonicalizeProjectRoot(projectRoot)),
+    );
+  }
+
+  getBridgeForCanonicalRoot(key: CanonicalRootPath): RevivableProjectTransport {
     let transport = this.transports.get(key);
     if (!transport) {
       transport = new RevivableProjectTransport(this, key);
@@ -98,7 +104,13 @@ export class RevivableTransportPool implements AftTransportPool {
     rawArgs: ToolCallArguments = {},
     options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
-    return this.getBridge(projectRoot).toolCall(runtime.sessionID, name, rawArgs, options);
+    return this.toolCallForCanonicalRoot(
+      asCanonicalRootPath(canonicalizeProjectRoot(projectRoot)),
+      runtime.sessionID,
+      name,
+      rawArgs,
+      options,
+    );
   }
 
   setConfigureOverride(key: string, value: unknown): void {
@@ -277,8 +289,23 @@ export class RevivableTransportPool implements AftTransportPool {
     params?: Record<string, unknown>,
     options?: Parameters<AftProjectTransport["send"]>[2],
   ): Promise<Record<string, unknown>> {
+    return this.sendForCanonicalRoot(
+      asCanonicalRootPath(canonicalizeProjectRoot(projectRoot)),
+      command,
+      params,
+      options,
+    );
+  }
+
+  async sendForCanonicalRoot(
+    projectRoot: CanonicalRootPath,
+    command: string,
+    params?: Record<string, unknown>,
+    options?: Parameters<AftProjectTransport["send"]>[2],
+  ): Promise<Record<string, unknown>> {
+    this.getBridgeForCanonicalRoot(projectRoot);
     const pool = await this.ensureActivePool();
-    const bridge = pool.getBridge(projectRoot);
+    const bridge = pool.getBridgeForCanonicalRoot?.(projectRoot) ?? pool.getBridge(projectRoot);
     this.transports.get(projectRoot)?.refreshStatusSubscription(bridge);
     return bridge.send(command, params, options);
   }
@@ -290,8 +317,25 @@ export class RevivableTransportPool implements AftTransportPool {
     rawArgs?: ToolCallArguments,
     options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
+    return this.toolCallForCanonicalRoot(
+      asCanonicalRootPath(canonicalizeProjectRoot(projectRoot)),
+      sessionId,
+      name,
+      rawArgs,
+      options,
+    );
+  }
+
+  async toolCallForCanonicalRoot(
+    projectRoot: CanonicalRootPath,
+    sessionId: string | undefined,
+    name: string,
+    rawArgs?: ToolCallArguments,
+    options?: ToolCallOptions,
+  ): Promise<ToolCallResult> {
+    this.getBridgeForCanonicalRoot(projectRoot);
     const pool = await this.ensureActivePool();
-    const bridge = pool.getBridge(projectRoot);
+    const bridge = pool.getBridgeForCanonicalRoot?.(projectRoot) ?? pool.getBridge(projectRoot);
     this.transports.get(projectRoot)?.refreshStatusSubscription(bridge);
     return bridge.toolCall(sessionId, name, rawArgs, options);
   }

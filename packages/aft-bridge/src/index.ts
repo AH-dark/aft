@@ -83,7 +83,6 @@ export type {
   ConfigureWarningsContext,
   StatusSnapshot,
 } from "./bridge.js";
-// --- transport ---
 export {
   BinaryBridge,
   BridgeTransportTimeoutError,
@@ -214,6 +213,8 @@ export * from "./feature-config.js";
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
 export { stripJsoncSymbols } from "./jsonc.js";
+// --- transport ---
+export { asCanonicalRootPath, type CanonicalRootPath } from "./lifecycle-registry.js";
 // --- per-Location process-global transport ownership ---
 export type {
   AcquireBridgeDependencies,
