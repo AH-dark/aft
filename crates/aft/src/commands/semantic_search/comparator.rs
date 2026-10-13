@@ -111,6 +111,18 @@ pub struct RankedTuple {
 /// single hit in source. The demotion never crosses kinds: a data file with a
 /// verbatim hit still ranks above a source file with only a token window.
 pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Ordering {
+    // For prose, an identifier hit ranked first by both lexical and semantic
+    // relevance can precede declaration ownership and mention counts. Without
+    // that agreement, sparse names and explicit declaration requests retain
+    // the ordinary score-free exact order.
+    match b
+        .evidence
+        .prose_lane_agreement
+        .cmp(&a.evidence.prose_lane_agreement)
+    {
+        Ordering::Equal => {}
+        ord => return ord,
+    }
     // (1) Definition hit: true > false
     let a_def = a.evidence.kind == EvidenceKind::Definition;
     let b_def = b.evidence.kind == EvidenceKind::Definition;

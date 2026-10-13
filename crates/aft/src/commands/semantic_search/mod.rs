@@ -4161,6 +4161,41 @@ fn definition_identifier_tokens(query: &str) -> Vec<&str> {
         .collect()
 }
 
+fn identifier_has_code_reference(
+    path: &Path,
+    identifier: &str,
+    parser: &mut crate::parser::FileParser,
+) -> bool {
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok((tree, _)) = parser.parse(path) else {
+        return false;
+    };
+    source.match_indices(identifier).any(|(start, _)| {
+        let end = start + identifier.len();
+        let Some(node) = tree.root_node().descendant_for_byte_range(start, end) else {
+            return false;
+        };
+        if node.start_byte() != start
+            || node.end_byte() != end
+            || !(node.kind() == "identifier"
+                || node.kind().ends_with("_identifier")
+                || node.kind() == "constant")
+        {
+            return false;
+        }
+        let mut ancestor = Some(node);
+        while let Some(node) = ancestor {
+            if node.is_error() || node.is_missing() {
+                return false;
+            }
+            ancestor = node.parent();
+        }
+        true
+    })
+}
+
 fn path_scope_contains(path_scope: &HashSet<PathBuf>, path: &Path) -> bool {
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     path_scope.contains(&path)
@@ -4367,7 +4402,40 @@ fn run_engine_ranking(
         };
     if plan.shape == SearchShape::NaturalLanguage && plan.query_facts.has_identifier_token {
         let lane = exact_lane::ExactLane::with_memo(ctx.search_exact_memo());
+        let mut reference_parser = crate::parser::FileParser::new();
+        let declaration_request = query.split_whitespace().any(|word| {
+            matches!(
+                word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "defined" | "definition" | "declaration"
+            )
+        });
+        let agreed_path = (!declaration_request && plan.query_facts.embedded_span.is_none())
+            .then(|| lexical.canonical_order().first())
+            .flatten()
+            .filter(|lexical| {
+                semantic_results
+                    .iter()
+                    .max_by(|a, b| a.score.total_cmp(&b.score))
+                    .is_some_and(|semantic| semantic.file == lexical.result.path)
+            })
+            .map(|candidate| &candidate.result.path);
         for fact in crate::search_b2::router::identifier_shaped_tokens(query) {
+            // Capitalized camel-case words can name products, not code in this
+            // project. Keep real external code references (including imported
+            // types and qualified enum variants), but do not give occurrences
+            // confined to prose, comments or strings exact priority.
+            let undeclared_word = plan.query_facts.embedded_span.is_none()
+                && fact
+                    .bytes()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase())
+                && fact.bytes().all(|ch| ch.is_ascii_alphanumeric())
+                && !exact_candidates.iter().any(|candidate| {
+                    candidate.evidence.kind == EvidenceKind::Definition
+                        && definition_matches_identifier_token(candidate, &fact)
+                });
             let mut fact_inputs = vec![(fact.clone(), true)];
             fact_inputs.extend(
                 extensions
@@ -4400,7 +4468,22 @@ fn run_engine_ranking(
                 fact_candidates.retain(|candidate| candidate.evidence.kind == EvidenceKind::E1);
                 for candidate in &mut fact_candidates {
                     candidate.evidence.exact_form = exact_form;
+                    candidate.evidence.prose_lane_agreement =
+                        agreed_path.is_some_and(|path| *path == candidate.path);
                 }
+                let has_code_reference = undeclared_word
+                    && fact_candidates.iter().any(|candidate| {
+                        identifier_has_code_reference(
+                            &candidate.path,
+                            &fact_input,
+                            &mut reference_parser,
+                        )
+                    });
+                fact_candidates.retain(|candidate| {
+                    !undeclared_word
+                        || has_code_reference
+                        || candidate.evidence.prose_lane_agreement
+                });
                 exact_candidates.extend(fact_candidates);
             }
         }
@@ -11526,6 +11609,167 @@ mod tests {
             eprintln!("mock separator={separator:?}, watchdog hits={hits:#?}");
             assert_eq!(hits[0].kind, expected_kind, "{hits:#?}");
             assert!(hits.iter().any(|hit| hit.name == "kill_expired_task"));
+        }
+    }
+
+    fn rank_prose_identifier_fixture(
+        query: &str,
+        files: &[(&str, &str)],
+        semantic_file: &str,
+    ) -> Vec<HybridResult> {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        for (name, source) in files {
+            std::fs::write(root.join(name), source).unwrap();
+        }
+        let ctx = test_context(&root);
+        install_ready_search_index(&ctx, &root);
+        let semantic = SemanticResult {
+            file: root.join(semantic_file),
+            name: "answer".into(),
+            qualified_name: None,
+            kind: SymbolKind::Function,
+            start_line: 1,
+            end_line: 1,
+            exported: false,
+            snippet: String::new(),
+            score: 0.9,
+            rank_score: 0.9,
+            cap_protected: false,
+            source: "semantic",
+        };
+        let extensions = crate::search_b2::install_defaults();
+        let raw = extensions::RawQuery::new(query);
+        let (shape, facts) = extensions.classify(&raw);
+        assert_eq!(shape, SearchShape::NaturalLanguage);
+        let mut plan = extensions.plan(
+            &shape,
+            &facts,
+            &extensions::Readiness::new(true, true, true),
+        );
+        plan.exact_input = Some(crate::search_b2::router::exact_input(&raw, shape, &facts));
+        run_engine_ranking(
+            "prose-identifier-fixture",
+            &ctx,
+            &root,
+            query,
+            query,
+            false,
+            vec![semantic],
+            paging::parse_public_page_request(&serde_json::json!({"topK": 50})).unwrap(),
+            extensions,
+            &plan,
+            None,
+            None,
+        )
+        .unwrap()
+        .results
+    }
+
+    #[test]
+    fn prose_identifier_lane_agreement_beats_definition_and_repeated_mentions() {
+        let ranked = rank_prose_identifier_fixture(
+            "harness daemon socket thread run_subc_mode_for_test drops result asserts unexplained",
+            &[
+                ("answer.rs", "// harness daemon socket thread drops result asserts\nfn detach() { run_subc_mode_for_test(); }\n"),
+                ("definition.rs", "pub fn run_subc_mode_for_test() {}\n"),
+                ("mentions.rs", "// run_subc_mode_for_test run_subc_mode_for_test run_subc_mode_for_test\n"),
+            ],
+            "answer.rs",
+        );
+        assert!(ranked[0].file.ends_with("answer.rs"), "{ranked:?}");
+    }
+
+    #[test]
+    fn prose_identifier_product_word_does_not_make_a_lockfile_exact() {
+        let ranked = rank_prose_identifier_fixture(
+            "how is structured GitHub resource reading enabled by user configuration",
+            &[
+                (
+                    "answer.rs",
+                    "// structured GitHub resource reading enabled user configuration\nfn read_config() {}\n",
+                ),
+                (
+                    "Cargo.lock",
+                    "# https://GitHub.example/ https://GitHub.example/ https://GitHub.example/\n",
+                ),
+                (
+                    "unrelated.rs",
+                    "// GitHub GitHub GitHub GitHub GitHub\nfn unrelated() {}\n",
+                ),
+            ],
+            "answer.rs",
+        );
+        assert!(ranked[0].file.ends_with("answer.rs"), "{ranked:?}");
+        assert!(ranked
+            .iter()
+            .filter(|result| result.file.ends_with("Cargo.lock"))
+            .all(|result| !result.exact));
+    }
+
+    #[test]
+    fn prose_identifier_declaration_request_still_puts_the_definition_first() {
+        let ranked = rank_prose_identifier_fixture(
+            "where is worker_mode defined for the daemon handshake",
+            &[
+                ("definition.rs", "pub fn worker_mode() {}\n"),
+                (
+                    "caller.rs",
+                    "// daemon handshake\nfn run() { worker_mode(); }\n",
+                ),
+            ],
+            "caller.rs",
+        );
+        assert!(ranked[0].file.ends_with("definition.rs"), "{ranked:?}");
+        assert!(ranked[0].exact);
+    }
+
+    #[test]
+    fn prose_identifier_qualified_external_code_names_keep_exact_recovery() {
+        let ranked = rank_prose_identifier_fixture(
+            "daemon socket ConnectionReset ConnectionAborted Windows terminated EOF",
+            &[
+                (
+                    "answer.rs",
+                    "fn lost() { let kind = std::io::ErrorKind::ConnectionReset; }\n",
+                ),
+                (
+                    "other.rs",
+                    "// daemon socket Windows terminated EOF\nfn other() {}\n",
+                ),
+            ],
+            "other.rs",
+        );
+        assert!(ranked[0].file.ends_with("answer.rs"), "{ranked:?}");
+        assert!(ranked[0].exact);
+    }
+
+    #[test]
+    fn prose_identifier_code_reference_excludes_comments_strings_and_prefixes() {
+        let project = tempfile::tempdir().unwrap();
+        let mut parser = crate::parser::FileParser::new();
+        for (index, source, expected) in [
+            (
+                0,
+                "fn f() { let kind = std::io::ErrorKind::ConnectionReset; }",
+                true,
+            ),
+            (1, "use sdk::ConnectionReset;", true),
+            (2, "// io::ErrorKind::ConnectionReset\nfn f() {}", false),
+            (
+                3,
+                "fn f() { let text = \"io::ErrorKind::ConnectionReset\"; }",
+                false,
+            ),
+            (4, "fn f() { let kind = sdk::ConnectionResetExtra; }", false),
+        ] {
+            let path = project.path().join(format!("case_{index}.rs"));
+            std::fs::write(&path, source).unwrap();
+            assert_eq!(
+                identifier_has_code_reference(&path, "ConnectionReset", &mut parser),
+                expected,
+                "{source}"
+            );
         }
     }
 

@@ -369,8 +369,17 @@ fn has_code_syntax_outside_spans(analysis: &Analysis<'_>) -> bool {
         }
         if matches!(
             character,
-            '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '=' | '!' | ';' | ',' | '|' | '&'
+            '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '=' | '!' | '|' | '&'
         ) {
+            return true;
+        }
+        // Spaced commas and semicolons separate prose clauses. Tight or final
+        // punctuation still reads as code (`a,b`, `x;y`, `return value;`).
+        if matches!(character, ',' | ';')
+            && !characters
+                .peek()
+                .is_some_and(|(_, next)| next.is_whitespace())
+        {
             return true;
         }
         if character == '\\' && characters.peek().is_some() {
@@ -438,5 +447,26 @@ mod tests {
         ] {
             assert!(!is_hyphenated_literal(query), "{query:?}");
         }
+    }
+}
+#[test]
+fn prose_punctuation_with_identifier_words_keeps_the_sentence_shape() {
+    for query in [
+        "a fake daemon TcpListener, then the socket closes",
+        "run_subc_mode_for_test attaches; then the daemon drops the socket",
+        "skips synthetic, custom; and system messages",
+    ] {
+        assert_eq!(
+            classify(&RawQuery::new(query)).0,
+            SearchShape::NaturalLanguage,
+            "{query}"
+        );
+    }
+    for query in ["a,b", "x;y", "return value;", "resolveRoot,"] {
+        assert_eq!(
+            classify(&RawQuery::new(query)).0,
+            SearchShape::CodeLiteral,
+            "{query}"
+        );
     }
 }

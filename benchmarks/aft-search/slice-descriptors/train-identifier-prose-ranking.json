@@ -1,0 +1,32 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "wrong_lane_nl",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/mod.rs::prose_identifier_lane_agreement_beats_definition_and_repeated_mentions",
+    "crates/aft/src/commands/semantic_search/mod.rs::prose_identifier_product_word_does_not_make_a_lockfile_exact",
+    "crates/aft/src/commands/semantic_search/mod.rs::prose_identifier_declaration_request_still_puts_the_definition_first",
+    "crates/aft/src/commands/semantic_search/mod.rs::prose_identifier_qualified_external_code_names_keep_exact_recovery",
+    "crates/aft/src/commands/semantic_search/mod.rs::prose_identifier_code_reference_excludes_comments_strings_and_prefixes",
+    "crates/aft/tests/engine_exact_test.rs::nl_identifier_facts_join_exact_retrieval_without_rerouting_the_shape",
+    "crates/aft/src/search_b2/router.rs::prose_punctuation_with_identifier_words_keeps_the_sentence_shape"
+  ],
+  "slices": [
+    "prose-identifier-lane-agreement",
+    "undeclared-product-word-relevance",
+    "spaced-prose-punctuation"
+  ],
+  "unreachable_split_rows": [
+    {
+      "episode_id": "followup-census:910001",
+      "predicate": "split_rank1_required",
+      "reason": "Unreachable by any pattern design: the query alone never ranks the answer (commands/ast_search.rs) in its first ten results, and the pattern ast_grep_search is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
+    },
+    {
+      "episode_id": "followup-census:910002",
+      "predicate": "split_rank1_required",
+      "reason": "Unreachable by any pattern design: the query alone ranks the answer (bash_background/registry.rs) 10th, and the pattern subagent_type is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
+    }
+  ],
+  "note": "On the harness-only identifier-prose reference, independently agreed lexical/semantic leaders can precede identifier declaration/mention order in prose. Capitalized camel-case words confined to prose, comments or strings are scored as context rather than manufactured exact requests; declarations and syntax-verified external code references preserve exact retrieval. Quoted and explicit declaration requests remain protected. Sparse identifier recovery is retained without tuned lexical bonuses. Spaced commas and semicolons then route as prose. Ranking-fenced files change; acceptance requires strictly higher wrong_lane_nl MRR@10 and no per-row regressions in either recall family or real-query replay. Additional local report-only rows and their measurements are not part of the public gate schema or committed corpus data."
+}

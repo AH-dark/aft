@@ -50,6 +50,12 @@ pub struct EvidenceDescriptor {
     /// definition kind such a file sorts first. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub receiver_in_path: bool,
+    /// In prose, this identifier hit ranks first in both the lexical word-match
+    /// order and the semantic similarity order. That independent agreement is
+    /// stronger context evidence than declaration ownership or mention counts.
+    /// Ordinary exact requests never set this flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prose_lane_agreement: bool,
 }
 
 impl EvidenceDescriptor {
@@ -67,6 +73,7 @@ impl EvidenceDescriptor {
             generated,
             data_file: false,
             receiver_in_path: false,
+            prose_lane_agreement: false,
         }
     }
 
@@ -83,6 +90,7 @@ impl EvidenceDescriptor {
             generated,
             data_file: false,
             receiver_in_path: false,
+            prose_lane_agreement: false,
         }
     }
 
@@ -99,6 +107,7 @@ impl EvidenceDescriptor {
             generated,
             data_file: false,
             receiver_in_path: false,
+            prose_lane_agreement: false,
         }
     }
 
@@ -122,6 +131,7 @@ impl EvidenceDescriptor {
             generated,
             data_file: false,
             receiver_in_path: false,
+            prose_lane_agreement: false,
         }
     }
 
@@ -138,6 +148,7 @@ impl EvidenceDescriptor {
             generated,
             data_file: false,
             receiver_in_path: false,
+            prose_lane_agreement: false,
         }
     }
 
