@@ -794,13 +794,19 @@ fn answer(call: &HeldCall, code: &str, message: String, prep_grant: &AccessGrant
 }
 
 fn pending_answer(call: &HeldCall, grant: &AccessGrant) -> Response {
+    let recipient = if access_grants::alfonso_worker(&call.identity) {
+        "your head"
+    } else {
+        "the user"
+    };
     answer(
         call,
         "access_pending",
         format!(
-            "Waiting for permission to {} {}. The request has gone to your head. End your turn now; you will be resumed with the answer, and then you should run this same call again.",
+            "Waiting for permission to {} {}. The request has gone to {}. End your turn now; you will be resumed with the answer, and then you should run this same call again.",
             operation_name(grant.operation),
-            grant.path.display()
+            grant.path.display(),
+            recipient
         ),
         grant,
     )

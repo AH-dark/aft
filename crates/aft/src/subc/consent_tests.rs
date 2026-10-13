@@ -1579,3 +1579,23 @@ async fn macos_blocked_or_refused_card_does_not_block_or_replace_tool_denial() {
     wait_for(|| count() == 0).await;
     assert_eq!(code(&reply), "macos_permission_denied");
 }
+
+#[tokio::test]
+async fn consent_pending_messages_pin_worker_and_head_recipients() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(300)));
+    let target = crate::access_policy::policy_path(&f.dir.path().join("elsewhere.txt"));
+    let worker = f.read(&f.worker, &target, 71).await;
+    assert_eq!(code(&worker), "access_pending", "{worker}");
+    assert_eq!(worker["structuredContent"]["message"], format!(
+        "Waiting for permission to read {}. The request has gone to your head. End your turn now; you will be resumed with the answer, and then you should run this same call again.",
+        target.display()
+    ));
+    let head = f.read(&f.head, &target, 72).await;
+    assert_eq!(code(&head), "access_pending", "{head}");
+    assert_eq!(head["structuredContent"]["message"], format!(
+        "Waiting for permission to read {}. The request has gone to the user. End your turn now; you will be resumed with the answer, and then you should run this same call again.",
+        target.display()
+    ));
+}
