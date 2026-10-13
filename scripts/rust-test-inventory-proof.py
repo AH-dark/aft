@@ -130,8 +130,10 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
             suite = suite_name_from_artifact(artifact_path)
             kind = "test"
             if source.startswith("unittests "):
-                unit_source = source.removeprefix("unittests ")
-                kind = "lib" if unit_source == "src/lib.rs" else "bin"
+                # Cargo preserves native separators in test source labels on Windows.
+                unit_source = source.removeprefix("unittests ").replace("\\", "/")
+                is_library = unit_source == "src/lib.rs" or unit_source.endswith("/src/lib.rs")
+                kind = "lib" if is_library else "bin"
                 source = unit_source
             current_kind = kind
             current_suite = suite
@@ -156,6 +158,29 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
         raise RuntimeError(f"unrecognized cargo list line: {line}")
 
     return entries
+
+
+def verify_cargo_list_windows_source_paths() -> None:
+    output = (
+        "Running unittests src\\lib.rs (target/debug/deps/aft-0123456789abcdef.exe)\n"
+        "library_path_case: test\n"
+        "Running unittests src\\main.rs (target/debug/deps/aft-0123456789abcdef.exe)\n"
+        "binary_path_case: test\n"
+    )
+    entries = parse_cargo_list(output)
+    actual = {(entry.kind, entry.suite, entry.name) for entry in entries}
+    expected = {
+        ("lib", "aft", "library_path_case"),
+        ("bin", "aft", "binary_path_case"),
+    }
+    if actual != expected:
+        raise RuntimeError(
+            "Cargo test-list target classification failed for Windows source paths: "
+            f"expected {sorted(expected)}, got {sorted(actual)}"
+        )
+
+
+verify_cargo_list_windows_source_paths()
 
 
 def parse_nextest_list(
