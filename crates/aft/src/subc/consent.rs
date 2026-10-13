@@ -27,8 +27,8 @@ use subc_protocol::scope::ScopeSelector;
 
 pub(super) const CINGULATE_MODULE_ID: &str = "cingulate";
 
-/// Cingulate refusals that end an ask by name. Each ends the held call with
-/// the same code, and none grants anything.
+/// Cingulate refusals that end an ask by name. The held call ends with the
+/// refusal's own code (for example `access_no_head`), and none grants anything.
 const TERMINAL_REFUSALS: &[&str] = &[
     "access_no_head",
     "access_head_gone",
@@ -211,8 +211,9 @@ impl SubcConsentTransport {
             route_retry_deadline: call.timeout,
             ..CallOptions::default()
         };
-        // A refused scoped open is never retried unscoped: Cingulate must see
-        // the asker's stamp to know who asks and who answers.
+        // A refused scoped open is never retried unscoped: the daemon stamps
+        // the asking route's scope onto Cingulate's route, and Cingulate reads
+        // the asker and its head from that stamp.
         let route = match consumer
             .open_route_scoped(
                 RouteTarget::ManagementSurface {
@@ -1026,9 +1027,10 @@ pub(super) async fn withdraw_parked(parked: Vec<ParkedAsk>) {
 static REATTACHED: LazyLock<StdMutex<HashSet<(String, String, u64)>>> =
     LazyLock::new(|| StdMutex::new(HashSet::new()));
 
-/// On the first bind of a stamped worker scope in this process, re-send every
-/// ask it left open under its persisted call key, so Cingulate keeps the same
-/// ask; nothing is withdrawn. Approvals claimed by an earlier process are
+/// The first time this process binds a route for a stamped Alfonso worker
+/// scope (see `access_grants::alfonso_worker`), re-send every ask that scope
+/// left open under its persisted call key, so Cingulate keeps the same ask;
+/// nothing is withdrawn. Approvals claimed by an earlier process are
 /// discarded, never reused.
 pub(super) fn reattach(
     ctx: &AppContext,

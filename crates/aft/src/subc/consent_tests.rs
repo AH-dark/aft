@@ -4,7 +4,8 @@ use crate::sandbox_spawn::{
     resolve_sandbox_spawn, with_worker_jail, RequestedSandboxTier, SandboxTaskKind, SpawnPlan,
 };
 
-/// Consent tests share the process-wide test transport and hold budget.
+/// Serializes the consent tests: they share the process-wide test transport
+/// and the test override for how long a call is held for an answer.
 static CONSENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Default)]
@@ -397,7 +398,8 @@ async fn consent_floor_path_is_denied_without_asking() {
     std::fs::write(&secret, "credential").unwrap();
     f.ctx
         .update_config(|config| config.sandbox.read_deny.push(secret.clone()));
-    // A standing grant cannot widen the floor either.
+    // A standing grant on the worker's scope cannot override the read_deny
+    // floor: the path stays denied even when a grant covers it.
     {
         let db = f.ctx.db().unwrap();
         crate::db::access_grants::insert(

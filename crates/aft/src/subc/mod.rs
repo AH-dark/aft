@@ -7948,10 +7948,6 @@ async fn submit_provider_read(
     Ok(())
 }
 
-/// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
-/// the sync command core → wrap the structured Response in a CallToolResult
-/// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
-/// serialized into ONE text block; `isError` carries `success == false`.
 /// Everything one plain (non-deferred) tool-call run needs, kept so a call
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
@@ -8121,6 +8117,10 @@ async fn hold_for_consent(
     }
 }
 
+/// Route-channel tool call: `{name, arguments}` → executor lane → dispatch to
+/// the sync command core → wrap the structured Response in a CallToolResult
+/// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
+/// serialized into ONE text block; `isError` carries `success == false`.
 async fn handle_tool_call(
     tx: &WriterSender,
     frame: &Frame,
@@ -9236,9 +9236,10 @@ async fn handle_tool_call(
                 None,
             ),
         };
-        // A stamped worker's call that needs permission for an outside path is
-        // held here while Cingulate asks its head, then runs again or ends
-        // with a named refusal.
+        // A call from a stamped Alfonso worker (see `access_grants::ask_route`)
+        // that needs permission for a path outside its worktree is held here
+        // while Cingulate asks the worker's head agent, then runs again or
+        // ends with a named refusal.
         let (response, text, phase_trace) = if consent::requested_ask(&response).is_some() {
             match hold_for_consent(
                 &plain_run,

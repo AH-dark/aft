@@ -222,10 +222,10 @@ pub(super) fn head_scope(identity: &RouteIdentity) -> Option<ScopeKey> {
     }
 }
 
-/// Whether this route's calls are a stamped Alfonso worker's: a `worker`
-/// scope, or a codemode run whose scope names a parent. Only heads start runs
-/// today and their runs carry no parent, so a parented run is a worker's run,
-/// judged as that worker.
+/// Whether this route's calls are a stamped Alfonso worker's: a `Worker`
+/// scope, or an `Ephemeral` (codemode run) scope that names a parent. Heads'
+/// runs carry no parent, so a parented run is a worker's run and is judged as
+/// that worker.
 pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
     identity.scope.as_ref().is_some_and(|stamp| {
         alfonso(stamp)
@@ -238,10 +238,10 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 }
 
 /// How an `ask` is answered on this route. Stamped Alfonso workers ask
-/// Cingulate. Stamped Alfonso heads keep today's lowering to allow until the
-/// approval modes (full-access, ask, read-only) exist; without them a head
-/// would block on every outside path with no way to opt out. Standalone
-/// routes keep today's behaviour as well.
+/// Cingulate (`Consent`). Every other route, stamped Alfonso heads and
+/// standalone routes included, treats `ask` as allow (`Lowered`). Heads stay
+/// lowered until approval modes (full-access, ask, read-only) exist; without
+/// them a head would block on every outside path with no way to opt out.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
     if alfonso_worker(identity) {
         crate::access_policy::AskRoute::Consent { once: Vec::new() }

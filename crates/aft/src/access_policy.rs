@@ -45,9 +45,11 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
 /// Who answers an `ask` decision for the call running on this thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AskRoute {
-    /// `ask` is lowered to allow, the behaviour before consent existed.
-    /// Standalone calls and stamped Alfonso heads use it until approval modes
-    /// arrive; restricted configurations already turn outside paths into deny.
+    /// `ask` is treated as allow. Standalone calls and stamped Alfonso heads
+    /// use this route: standalone calls have no Cingulate to ask, and a head
+    /// has no full-access setting yet to opt out of blocking on every outside
+    /// path. Restricted configurations turn outside paths into deny, so they
+    /// never reach an `ask`.
     #[default]
     Lowered,
     /// A stamped Alfonso worker: an `ask` refuses with `access_ask_required`

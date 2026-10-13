@@ -12151,7 +12151,7 @@ impl AppContext {
     }
 
     /// Resolve an `ask` decision for the call on this thread. A lowered route
-    /// allows, as before consent existed. A consent route allows only what an
+    /// treats the ask as allow. A consent route allows only what an
     /// `allow_once` answer approved for this dispatch; anything else refuses
     /// with the internal ask code, carrying the capability to request.
     fn answer_ask(
