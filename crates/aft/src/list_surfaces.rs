@@ -450,9 +450,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "agent_child_env.rs",
-        enclosing_item: "refresh_legacy_git_hooks",
+        enclosing_item: "refresh_legacy_git_hooks_until",
         location_or_primitive: "legacy hook directory and file byte take",
-        reason: "internal cache-maintenance enumeration and input-byte safety bounds, not an agent-visible list; the refresh logs examined and rewritten counts plus whether its scan was bounded",
+        reason: "internal cache-maintenance enumeration and input-byte safety bounds, not an agent-visible list; the iterator caps new verification work, preserves verified progress on a bounded scan, and logs examined and rewritten counts plus whether its scan was bounded",
     },
     // The views-on semantic gap note names its first few missing files in the
     // response text; every missing file is listed in the JSON `semantic_gap`

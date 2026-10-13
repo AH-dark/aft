@@ -1154,6 +1154,100 @@ fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {
 
 const LEGACY_HOOK_DIRECTORY_SCAN_LIMIT: usize = 256;
 const LEGACY_HOOK_MAX_BYTES: u64 = 64 * 1024;
+const LEGACY_HOOK_STATE_FILE: &str = ".legacy-refresh.json";
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct LegacyHookState {
+    version: u32,
+    dispatcher_key: String,
+    directories: HashMap<String, LegacyDirectoryState>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct LegacyDirectoryState {
+    stamp: Option<String>,
+    // Keep per-hook progress only while a directory is incomplete. Completed
+    // directories need just one digest of their metadata, not their contents.
+    hooks: HashMap<String, String>,
+}
+
+fn read_legacy_hook_state(root: &Path) -> LegacyHookState {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let state = (|| {
+        let mut file = options.open(root.join(LEGACY_HOOK_STATE_FILE)).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        serde_json::from_slice::<LegacyHookState>(&bytes).ok()
+    })();
+    state
+        .filter(|state| state.version == 1 && state.dispatcher_key == managed_git_hook_set().key)
+        .unwrap_or_else(|| LegacyHookState {
+            version: 1,
+            dispatcher_key: managed_git_hook_set().key.clone(),
+            directories: HashMap::new(),
+        })
+}
+
+fn legacy_path_stamp(path: &Path) -> Result<String, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok("missing".into()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect old AFT hook {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    let modified = metadata.modified().map_err(|error| {
+        format!(
+            "failed to inspect old AFT hook timestamp {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(&metadata.len().to_le_bytes());
+    hash.update(format!("{modified:?}").as_bytes());
+    hash.update(&[
+        u8::from(metadata.is_file()),
+        u8::from(metadata.is_dir()),
+        u8::from(metadata.file_type().is_symlink()),
+    ]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Inode and ctime also invalidate same-size replacements and writes
+        // whose mtime was restored by the writer.
+        hash.update(&metadata.dev().to_le_bytes());
+        hash.update(&metadata.ino().to_le_bytes());
+        hash.update(&metadata.ctime().to_le_bytes());
+        hash.update(&metadata.ctime_nsec().to_le_bytes());
+        hash.update(&metadata.mode().to_le_bytes());
+    }
+    Ok(hash.finalize().to_hex().to_string())
+}
+
+fn legacy_directory_stamps(directory: &Path) -> Result<(String, Vec<String>), String> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(legacy_path_stamp(directory)?.as_bytes());
+    let mut stamps = Vec::with_capacity(MANAGED_GIT_HOOK_NAMES.len());
+    for (name, _) in &managed_git_hook_set().hooks {
+        let stamp = legacy_path_stamp(&directory.join(name))?;
+        hash.update(stamp.as_bytes());
+        stamps.push(stamp);
+    }
+    Ok((hash.finalize().to_hex().to_string(), stamps))
+}
 const MANAGED_HOOK_HEADER: &[u8] = b"#!/bin/sh\n# AFT selects this hook through the agent child's environment. It does not alter\n# the repository or the user's Git configuration.\n";
 
 #[derive(Debug, Default)]
@@ -1162,15 +1256,22 @@ struct LegacyHookRefresh {
     hooks_examined: usize,
     rewritten: usize,
     bounded: bool,
+    verification_time: Duration,
 }
 
 /// Upgrade only recognizable AFT dispatchers in old content-keyed directories.
 /// Their paths can outlive a version in a worktree manager's recorded hook chain;
 /// leaving stale scripts there would make a current dispatcher reenter old code.
 fn refresh_legacy_git_hooks(root: &Path, budget: Duration) -> Result<LegacyHookRefresh, String> {
+    refresh_legacy_git_hooks_until(root, |report| report.verification_time >= budget)
+}
+
+fn refresh_legacy_git_hooks_until(
+    root: &Path,
+    mut expired: impl FnMut(&LegacyHookRefresh) -> bool,
+) -> Result<LegacyHookRefresh, String> {
     use std::io::Read;
 
-    let deadline = Instant::now() + budget;
     let entries = fs::read_dir(root).map_err(|error| {
         format!(
             "failed to scan AFT Git hooks cache {}: {error}",
@@ -1178,75 +1279,133 @@ fn refresh_legacy_git_hooks(root: &Path, budget: Duration) -> Result<LegacyHookR
         )
     })?;
     let mut report = LegacyHookRefresh::default();
+    let mut state = read_legacy_hook_state(root);
+    let mut state_changed = false;
     let mut keyed_directories = 0usize;
-    // Enumeration is bounded by the deadline, and the refresh work by the
-    // number of hook-set directories. Unrelated cache entries (lock files,
-    // staging leftovers) never count toward the directory limit, and only a
-    // hook-set directory that was actually left unvisited marks the refresh
-    // as bounded: a complete scan is never a reason to refuse a launch.
-    for entry in entries {
-        if Instant::now() >= deadline {
-            report.bounded = true;
-            break;
-        }
-        report.entries_examined += 1;
-        let entry =
-            entry.map_err(|error| format!("failed to read AFT hooks cache entry: {error}"))?;
-        let name = entry.file_name();
-        let keyed = name.to_str().is_some_and(|name| {
-            name.len() == GIT_HOOK_SET_KEY_LEN && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-        });
-        if !keyed || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        if keyed_directories == LEGACY_HOOK_DIRECTORY_SCAN_LIMIT {
-            report.bounded = true;
-            break;
-        }
-        keyed_directories += 1;
-        for (hook_name, contents) in &managed_git_hook_set().hooks {
-            if Instant::now() >= deadline {
+    let mut seen = HashSet::new();
+    // Cap unverified directories inside the iterator, before reading hooks.
+    // Charge the time budget only for verifying new or changed directories;
+    // listing and statting known-good directories cannot justify a refusal.
+    let refreshed = (|| -> Result<(), String> {
+        for entry in entries {
+            report.entries_examined += 1;
+            let entry =
+                entry.map_err(|error| format!("failed to read AFT hooks cache entry: {error}"))?;
+            let name = entry.file_name();
+            let keyed = name.to_str().is_some_and(|name| {
+                name.len() == GIT_HOOK_SET_KEY_LEN
+                    && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if !keyed || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = name.to_str().unwrap().to_owned();
+            seen.insert(name.clone());
+            let directory = entry.path();
+            let (directory_stamp, mut hook_stamps) = legacy_directory_stamps(&directory)?;
+            if state
+                .directories
+                .get(&name)
+                .is_some_and(|record| record.stamp.as_ref() == Some(&directory_stamp))
+            {
+                continue;
+            }
+            if keyed_directories == LEGACY_HOOK_DIRECTORY_SCAN_LIMIT || expired(&report) {
                 report.bounded = true;
                 break;
             }
-            let hook = entry.path().join(hook_name);
-            let Ok(metadata) = fs::symlink_metadata(&hook) else {
-                continue;
-            };
-            if !metadata.is_file() {
-                continue;
-            }
-            report.hooks_examined += 1;
-            let mut options = fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
+            keyed_directories += 1;
+            let previous_time = report.verification_time;
+            let started = Instant::now();
+            let record = state.directories.entry(name).or_default();
+            record.stamp = None;
+            state_changed = true;
+            for ((hook_name, contents), stamp) in
+                managed_git_hook_set().hooks.iter().zip(&mut hook_stamps)
             {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW);
-            }
-            let Ok(file) = options.open(&hook) else {
-                continue;
-            };
-            let mut existing = Vec::new();
-            file.take(LEGACY_HOOK_MAX_BYTES)
-                .read_to_end(&mut existing)
-                .map_err(|error| {
-                    format!("failed to read old AFT hook {}: {error}", hook.display())
+                if record.hooks.get(*hook_name) == Some(stamp) {
+                    continue;
+                }
+                report.verification_time = previous_time + started.elapsed();
+                if expired(&report) {
+                    report.bounded = true;
+                    break;
+                }
+                let hook = directory.join(hook_name);
+                if stamp == "missing" {
+                    record.hooks.insert((*hook_name).into(), stamp.clone());
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(&hook).map_err(|error| {
+                    format!("failed to inspect old AFT hook {}: {error}", hook.display())
                 })?;
-            if !existing.starts_with(MANAGED_HOOK_HEADER) || existing == contents.as_bytes() {
-                continue;
+                if !metadata.is_file() {
+                    record.hooks.insert((*hook_name).into(), stamp.clone());
+                    continue;
+                }
+                let mut options = fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                let file = options.open(&hook).map_err(|error| {
+                    format!("failed to open old AFT hook {}: {error}", hook.display())
+                })?;
+                let mut existing = Vec::new();
+                file.take(LEGACY_HOOK_MAX_BYTES)
+                    .read_to_end(&mut existing)
+                    .map_err(|error| {
+                        format!("failed to read old AFT hook {}: {error}", hook.display())
+                    })?;
+                report.hooks_examined += 1;
+                if legacy_path_stamp(&hook)? != *stamp {
+                    return Err(format!(
+                        "old AFT hook changed during verification: {}",
+                        hook.display()
+                    ));
+                }
+                if existing.starts_with(MANAGED_HOOK_HEADER) && existing != contents.as_bytes() {
+                    replace_legacy_hook(&hook, contents.as_bytes(), metadata.permissions())?;
+                    *stamp = legacy_path_stamp(&hook)?;
+                    report.rewritten += 1;
+                    crate::slog_info!(
+                        "[agent_child_env] upgraded legacy AFT Git hook {}",
+                        hook.display()
+                    );
+                }
+                record.hooks.insert((*hook_name).into(), stamp.clone());
             }
-            replace_legacy_hook(&hook, contents.as_bytes(), metadata.permissions())?;
-            report.rewritten += 1;
-            crate::slog_info!(
-                "[agent_child_env] upgraded legacy AFT Git hook {}",
-                hook.display()
-            );
+            report.verification_time = previous_time + started.elapsed();
+            if report.bounded {
+                break;
+            }
+            let (final_stamp, final_hook_stamps) = legacy_directory_stamps(&directory)?;
+            if final_hook_stamps != hook_stamps {
+                return Err(format!(
+                    "old AFT hooks changed during verification: {}",
+                    directory.display()
+                ));
+            }
+            record.stamp = Some(final_stamp);
+            record.hooks.clear();
         }
-        if report.bounded {
-            break;
-        }
+        Ok(())
+    })();
+    if refreshed.is_ok() && !report.bounded {
+        let previous = state.directories.len();
+        state.directories.retain(|name, _| seen.contains(name));
+        state_changed |= previous != state.directories.len();
     }
+    // Save verified hook stamps even after a budget or I/O failure, so the next
+    // launch resumes unfinished directories without rereading verified hooks.
+    // The maintenance lock covers the read/modify/atomic-rename transaction.
+    if state_changed {
+        let bytes = serde_json::to_vec(&state).map_err(|error| error.to_string())?;
+        install_managed_file(&root.join(LEGACY_HOOK_STATE_FILE), &bytes, false)?;
+    }
+    refreshed?;
     // This refresh runs before every child launch with co-authorship on, so
     // a refresh that changed nothing is routine and logged at debug level.
     if report.rewritten > 0 || report.bounded {
@@ -2799,13 +2958,19 @@ mod tests {
             fs::read_dir(&hooks_dir).unwrap().count(),
             MANAGED_GIT_HOOK_NAMES.len()
         );
-        let siblings = fs::read_dir(hooks_dir.parent().unwrap())
+        let mut siblings = fs::read_dir(hooks_dir.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
+        siblings.sort();
+        let mut expected = vec![
+            OsString::from(".maintenance.lock"),
+            OsString::from(LEGACY_HOOK_STATE_FILE),
+            OsString::from(&managed_git_hook_set().key),
+        ];
+        expected.sort();
         assert_eq!(
-            siblings.len(),
-            2,
+            siblings, expected,
             "staging directories were left behind: {siblings:?}"
         );
     }
@@ -3218,24 +3383,214 @@ mod tests {
         create_hook_set_directories(temp.path(), LEGACY_HOOK_DIRECTORY_SCAN_LIMIT + 1);
         let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
         assert!(report.bounded);
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        assert!(
+            !report.bounded,
+            "the iterator cap must preserve completed directories"
+        );
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::ZERO).unwrap();
+        assert!(
+            !report.bounded,
+            "recorded directories must not count against the iterator cap"
+        );
     }
 
     #[test]
     fn legacy_refresh_obeys_its_deadline() {
         let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("foreign"), "not a hook").unwrap();
+        create_hook_set_directories(temp.path(), 1);
         let report = refresh_legacy_git_hooks(temp.path(), Duration::ZERO).unwrap();
-        assert_eq!(report.entries_examined, 0);
+        assert_eq!(report.entries_examined, 1);
         assert!(report.bounded);
     }
 
+    #[cfg(unix)]
+    fn populated_legacy_hook_cache(root: &Path, count: usize) {
+        create_hook_set_directories(root, count);
+        for index in 0..count {
+            let directory = root.join(format!("{index:0width$x}", width = GIT_HOOK_SET_KEY_LEN));
+            for name in MANAGED_GIT_HOOK_NAMES {
+                write_executable(&directory.join(name), &legacy_dispatcher(name));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_refresh_records_upgrades_and_known_sets_read_zero_hook_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        populated_legacy_hook_cache(temp.path(), 7);
+        let managed = temp.path().join(&managed_git_hook_set().key);
+        ensure_managed_git_hooks(&managed).unwrap();
+        for index in 0..7 {
+            let directory = temp
+                .path()
+                .join(format!("{index:0width$x}", width = GIT_HOOK_SET_KEY_LEN));
+            for (name, contents) in &managed_git_hook_set().hooks {
+                assert_eq!(fs::read(directory.join(name)).unwrap(), contents.as_bytes());
+            }
+        }
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            report.hooks_examined, 0,
+            "known hook sets must not reread contents"
+        );
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::ZERO).unwrap();
+        assert!(
+            !report.bounded,
+            "known-good stats may exceed the time budget"
+        );
+        ensure_managed_git_hooks(&managed).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_refresh_expired_budget_persists_progress_and_next_launch_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        populated_legacy_hook_cache(temp.path(), 3);
+        let first =
+            refresh_legacy_git_hooks_until(temp.path(), |report| report.hooks_examined >= 5)
+                .unwrap();
+        assert!(first.bounded);
+        assert_eq!(first.hooks_examined, 5);
+        assert_eq!(first.rewritten, 5);
+        let second = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        assert!(!second.bounded);
+        assert_eq!(
+            second.hooks_examined,
+            3 * MANAGED_GIT_HOOK_NAMES.len() - 5,
+            "verified progress must survive a bounded launch"
+        );
+        assert_eq!(second.rewritten, 3 * MANAGED_GIT_HOOK_NAMES.len() - 5);
+        ensure_managed_git_hooks(&temp.path().join(&managed_git_hook_set().key)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_refresh_changed_recorded_hook_is_reexamined_and_upgraded() {
+        let temp = tempfile::tempdir().unwrap();
+        populated_legacy_hook_cache(temp.path(), 2);
+        refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        let path = temp
+            .path()
+            .join(format!("{:0width$x}", 0, width = GIT_HOOK_SET_KEY_LEN))
+            .join("pre-commit");
+        write_executable(&path, &legacy_dispatcher("pre-commit"));
+        let report = refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        assert_eq!(report.rewritten, 1);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            managed_git_hook_contents("pre-commit").as_bytes()
+        );
+        assert_eq!(
+            report.hooks_examined,
+            MANAGED_GIT_HOOK_NAMES.len(),
+            "only the changed directory should be reread"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_refresh_state_is_private_and_invalid_state_is_reverified() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        populated_legacy_hook_cache(temp.path(), 1);
+        refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30)).unwrap();
+        let state_path = temp.path().join(LEGACY_HOOK_STATE_FILE);
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state["dispatcher_key"] = serde_json::json!("obsolete dispatcher");
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30))
+                .unwrap()
+                .hooks_examined,
+            MANAGED_GIT_HOOK_NAMES.len()
+        );
+        fs::write(&state_path, "{interrupted state").unwrap();
+        assert_eq!(
+            refresh_legacy_git_hooks(temp.path(), Duration::from_secs(30))
+                .unwrap()
+                .hooks_examined,
+            MANAGED_GIT_HOOK_NAMES.len()
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn incomplete_legacy_refresh_refuses_to_launch_with_unvisited_dispatchers() {
         let temp = tempfile::tempdir().unwrap();
         create_hook_set_directories(temp.path(), LEGACY_HOOK_DIRECTORY_SCAN_LIMIT + 1);
-        let error =
-            ensure_managed_git_hooks(&temp.path().join(&managed_git_hook_set().key)).unwrap_err();
-        assert!(error.contains("refresh was bounded"), "{error}");
+        let entered = temp.path().join("old-resolver-entered");
+        for index in 0..=LEGACY_HOOK_DIRECTORY_SCAN_LIMIT {
+            let path = temp
+                .path()
+                .join(format!("{index:0width$x}", width = GIT_HOOK_SET_KEY_LEN))
+                .join("pre-commit");
+            write_executable(
+                &path,
+                &format!(
+                    "{}printf entered > '{}'\n{}",
+                    std::str::from_utf8(MANAGED_HOOK_HEADER).unwrap(),
+                    entered.display(),
+                    legacy_dispatcher("pre-commit")
+                ),
+            );
+        }
+        let result = ensure_managed_git_hooks(&temp.path().join(&managed_git_hook_set().key));
+        let unvisited = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("pre-commit"))
+            .find(|path| fs::read_to_string(path).is_ok_and(|body| body.contains("printf entered")))
+            .expect("the bounded scan must leave an old resolver unvisited");
+        // A child may run only after ensure_managed_git_hooks succeeds. Execute
+        // an unvisited hook on success: its marker detects an unsafe launch
+        // without waiting for the old resolver to get stuck in a hook chain.
+        if result.is_ok() {
+            assert!(Command::new("sh")
+                .arg(unvisited)
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert!(
+            !entered.exists(),
+            "a launched child entered an unvisited old resolver"
+        );
+        let error = result.unwrap_err();
+        let report_entries = error
+            .split("after ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap();
+        assert_eq!(error, format!("AFT Git hooks refresh was bounded after {report_entries} cache entries; retry refresh or remove unused AFT hook cache directories in {}", temp.path().display()));
+        // The second launch skips recorded directories and upgrades the rest.
+        ensure_managed_git_hooks(&temp.path().join(&managed_git_hook_set().key)).unwrap();
+    }
+
+    #[test]
+    fn managed_hook_set_verification_read_only_cost() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(&managed_git_hook_set().key);
+        ensure_managed_git_hooks(&directory).unwrap();
+        let expected = &managed_git_hook_set().hooks;
+        let iterations = 100;
+        let started = Instant::now();
+        for _ in 0..iterations {
+            quarantine_foreign_hook_entries(&directory, expected).unwrap();
+            for (name, contents) in expected {
+                write_hook_if_changed(&directory.join(name), contents.as_bytes()).unwrap();
+            }
+        }
+        let elapsed = started.elapsed();
+        eprintln!("managed-set read-only verification: {iterations} iterations, {} hooks, {} content reads per iteration, {:.3} ms total, {:.3} ms/launch", expected.len(), expected.len() * 2, elapsed.as_secs_f64() * 1000.0, elapsed.as_secs_f64() * 1000.0 / f64::from(iterations));
     }
 
     #[cfg(unix)]
