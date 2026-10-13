@@ -514,6 +514,10 @@ if phase_enabled watcher; then
 fi
 
 if phase_enabled conformance; then
+  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill" \
+    cargo test -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill
+  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation" \
+    cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
     cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
   # Keep promotion failure, deadline handoff, and elicitation TTL coverage in

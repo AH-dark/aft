@@ -4,6 +4,12 @@
 use super::*;
 use std::path::Path;
 
+async fn open_scope_daemon_session(input: FakeDaemonInput) -> FakeDaemonSession {
+    open_fake_daemon_session_with_ops(input, &[subc_protocol::scope::SCOPE_DESCRIBE_OP])
+        .await
+        .0
+}
+
 static OBSERVED_TASK: OnceLock<Mutex<Option<(aft::bash_background::BgTaskRegistry, String)>>> =
     OnceLock::new();
 
@@ -56,7 +62,7 @@ async fn assert_scope_kill_settled() {
             assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
             assert_eq!(
                 snapshot.info.status_reason.as_deref(),
-                Some("scope revoked")
+                Some("scope_revoked")
             );
             assert!(
                 aft::commands::bash_orchestrate::format_foreground_result(&snapshot)
@@ -179,7 +185,7 @@ fn call_modes_refuse_flow_writes_and_unknown_but_serve_read_and_classic() {
         Duration::from_secs(30),
         |input| async move {
             use subc_protocol::call_mode::CallMode;
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             std::fs::write(daemon.root1.join("mode.txt"), "mode-read-ok").unwrap();
             let mut flow = stamp();
             flow.attributes.flow_id = Some("mode-flow".into());
@@ -270,7 +276,7 @@ fn codemode_bash_refuses_missing_bind_deadline() {
         "missing run deadline",
         Duration::from_secs(30),
         |input| async move {
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             let scope = stamp().with_expires_at_ms(None);
             bind_mode(
                 &mut daemon.stream,
@@ -315,7 +321,7 @@ fn codemode_bash_clamps_requested_timeout_to_bind_deadline() {
         "run deadline clamp",
         Duration::from_secs(30),
         |input| async move {
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             let mut scope = stamp();
             scope.expires_at_ms = Some(
                 std::time::SystemTime::now()
@@ -469,11 +475,36 @@ enum CloseCase {
     NewEpoch,
     NotLive,
     NotSynced,
+    #[cfg(feature = "test-timing-hooks")]
     SlowResync,
     Error,
     Timeout,
     Duplicate,
     NonRun,
+}
+
+#[cfg(unix)]
+async fn assert_hold_or_retry(stream: &mut tokio::net::TcpStream, pid: u32, reason: &str) {
+    #[cfg(feature = "test-timing-hooks")]
+    let retry = describe(stream).await;
+    #[cfg(not(feature = "test-timing-hooks"))]
+    assert!(
+        read_frame_within(stream, Duration::from_millis(300), reason)
+            .await
+            .is_none(),
+        "production retries must wait for the regular poll"
+    );
+    assert!(alive(pid), "{reason} must hold work");
+    assert_run_not_killing();
+    #[cfg(feature = "test-timing-hooks")]
+    answer(
+        stream,
+        &retry,
+        subc_protocol::scope::ScopeStatus::Ended,
+        true,
+        Some(1),
+    )
+    .await;
 }
 
 #[cfg(unix)]
@@ -483,7 +514,13 @@ fn close_case(name: &'static str, case: CloseCase) {
         Duration::from_secs(30),
         move |input| async move {
             use subc_protocol::scope::ScopeStatus;
-            let mut daemon = open_fake_daemon_session(input).await;
+            // The bridge fixture serializes environment changes; production
+            // builds ignore these knobs and retain their 10 s / 60 s bounds.
+            #[cfg(feature = "test-timing-hooks")]
+            let _poll = set_test_env("AFT_TEST_SCOPE_POLL_MS", "500");
+            #[cfg(feature = "test-timing-hooks")]
+            let _timeout = set_test_env("AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS", "1000");
+            let mut daemon = open_scope_daemon_session(input).await;
             let run = !matches!(case, CloseCase::NonRun);
             bind(&mut daemon.stream, &daemon.root1, 1, run).await;
             if matches!(case, CloseCase::Duplicate) {
@@ -528,18 +565,8 @@ fn close_case(name: &'static str, case: CloseCase) {
                 1
             };
             send_route_goodbye(&mut daemon.stream, first_close, 200).await;
-            if matches!(case, CloseCase::NonRun) {
-                // A non-run route still neither describes its scope nor kills its
-                // foreground task merely because its carrier closed the route.
-                assert!(read_frame_within(
-                    &mut daemon.stream,
-                    Duration::from_millis(300),
-                    "non-run close"
-                )
-                .await
-                .is_none());
-                assert!(alive(pid));
-            } else {
+            {
+                // Scope end governs classic and codemode tasks alike.
                 let request = describe(&mut daemon.stream).await;
                 assert!(alive(pid), "route close alone must not kill");
                 if matches!(case, CloseCase::Duplicate) {
@@ -565,18 +592,9 @@ fn close_case(name: &'static str, case: CloseCase) {
                             None,
                         )
                         .await;
-                        let retry = describe(&mut daemon.stream).await;
-                        assert!(alive(pid), "not-synced must hold work");
-                        assert_run_not_killing();
-                        answer(
-                            &mut daemon.stream,
-                            &retry,
-                            ScopeStatus::Ended,
-                            true,
-                            Some(1),
-                        )
-                        .await;
+                        assert_hold_or_retry(&mut daemon.stream, pid, "not-synced").await;
                     }
+                    #[cfg(feature = "test-timing-hooks")]
                     CloseCase::SlowResync => {
                         let mut request = request;
                         for attempt in 0..3 {
@@ -629,30 +647,18 @@ fn close_case(name: &'static str, case: CloseCase) {
                             .unwrap(),
                         )
                         .await;
-                        let retry = describe(&mut daemon.stream).await;
-                        assert!(alive(pid), "describe error must hold work");
-                        assert_run_not_killing();
-                        answer(
-                            &mut daemon.stream,
-                            &retry,
-                            ScopeStatus::Ended,
-                            true,
-                            Some(1),
-                        )
-                        .await;
+                        assert_hold_or_retry(&mut daemon.stream, pid, "describe error").await;
                     }
                     CloseCase::Timeout => {
-                        let retry = describe(&mut daemon.stream).await;
-                        assert!(alive(pid), "describe timeout must hold work");
-                        assert_run_not_killing();
-                        answer(
+                        #[cfg(not(feature = "test-timing-hooks"))]
+                        assert!(read_frame_within(
                             &mut daemon.stream,
-                            &retry,
-                            ScopeStatus::Ended,
-                            true,
-                            Some(1),
+                            Duration::from_secs(11),
+                            "production describe timeout"
                         )
-                        .await;
+                        .await
+                        .is_none());
+                        assert_hold_or_retry(&mut daemon.stream, pid, "describe timeout").await;
                     }
                     CloseCase::NewEpoch => {
                         answer(
@@ -662,7 +668,16 @@ fn close_case(name: &'static str, case: CloseCase) {
                             true,
                             Some(2),
                         )
+                        .await;
+                        assert!(read_frame_within(
+                            &mut daemon.stream,
+                            Duration::from_millis(300),
+                            "live epoch move"
+                        )
                         .await
+                        .is_none());
+                        assert!(alive(pid), "a live epoch move must not kill");
+                        assert_run_not_killing();
                     }
                     CloseCase::NotLive => {
                         answer(
@@ -685,8 +700,16 @@ fn close_case(name: &'static str, case: CloseCase) {
                         .await
                     }
                 }
-                wait_dead(pid).await;
-                assert_scope_kill_settled().await;
+                let should_kill = !matches!(case, CloseCase::NewEpoch)
+                    && (cfg!(feature = "test-timing-hooks")
+                        || !matches!(
+                            case,
+                            CloseCase::NotSynced | CloseCase::Error | CloseCase::Timeout
+                        ));
+                if should_kill {
+                    wait_dead(pid).await;
+                    assert_scope_kill_settled().await;
+                }
                 if matches!(case, CloseCase::Duplicate) {
                     assert!(
                         read_frame_within(
@@ -714,7 +737,7 @@ fn scope_revocation_ended_kills_grandchild_group() {
 }
 #[cfg(unix)]
 #[test]
-fn scope_revocation_live_new_epoch_kills_group() {
+fn scope_revocation_live_new_epoch_holds_group() {
     close_case("scope-new-epoch", CloseCase::NewEpoch);
 }
 #[cfg(unix)]
@@ -744,7 +767,7 @@ fn scope_revocation_duplicate_closes_share_describe() {
 }
 #[cfg(unix)]
 #[test]
-fn scope_revocation_non_run_route_close_is_unchanged() {
+fn scope_revocation_classic_route_ended_kills_group() {
     close_case("scope-non-run-close", CloseCase::NonRun);
 }
 
@@ -754,7 +777,7 @@ fn scope_revocation_run_background_refused_before_spawn() {
         "run-background-refused",
         Duration::from_secs(15),
         |input| async move {
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             bind(&mut daemon.stream, &daemon.root1, 1, true).await;
             let marker = daemon.root1.join("must-not-exist");
             for (corr, option) in [(100, "background"), (101, "pty")] {
@@ -782,7 +805,7 @@ fn scope_revocation_unreadable_run_record_refused_before_spawn() {
         "run-record-refused",
         Duration::from_secs(15),
         |input| async move {
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             bind(&mut daemon.stream, &daemon.root1, 1, true).await;
             let marker = daemon.root1.join("must-not-exist");
             call(
@@ -826,7 +849,7 @@ fn scope_revocation_codemode_watch_not_served() {
         "run-watch-background",
         Duration::from_secs(15),
         |input| async move {
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             bind(&mut daemon.stream, &daemon.root1, 1, true).await;
             send_frame(&mut daemon.stream, Frame::build(FrameType::Request, control_flags(), 1, 1, 100,
             serde_json::to_vec(&json!({"name":"bash_watch", "preset":"worker", "arguments":{"taskId":"absent", "background":true}})).unwrap()).unwrap()).await;
@@ -850,10 +873,23 @@ fn scope_revocation_non_run_background_is_unchanged() {
         "non-run-background",
         Duration::from_secs(15),
         |input| async move {
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             bind(&mut daemon.stream, &daemon.root1, 1, false).await;
             let marker = daemon.root1.join("background-ran");
-            call(&mut daemon.stream, 1, 100, json!({"command":format!("sleep 0.05; printf done > '{}'", marker.display()),"background":true})).await;
+            #[cfg(windows)]
+            let command = format!(
+                "Start-Sleep -Milliseconds 50; Set-Content -LiteralPath '{}' -Value done",
+                marker.display().to_string().replace('\'', "''")
+            );
+            #[cfg(not(windows))]
+            let command = format!("sleep 0.05; printf done > '{}'", marker.display());
+            call(
+                &mut daemon.stream,
+                1,
+                100,
+                json!({"command":command,"background":true}),
+            )
+            .await;
             let response = read_frame_timeout(&mut daemon.stream, "normal background launch").await;
             assert_eq!(response.header.ty, FrameType::Response);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -877,7 +913,7 @@ fn scope_revocation_record_timeout_refuses_without_blocking_frames() {
         "run-record-timeout",
         Duration::from_secs(15),
         |input| async move {
-            let mut daemon = open_fake_daemon_session(input).await;
+            let mut daemon = open_scope_daemon_session(input).await;
             bind(&mut daemon.stream, &daemon.root1, 1, true).await;
             let marker = daemon.root1.join("must-not-exist");
             call(
@@ -913,7 +949,7 @@ fn scope_revocation_record_timeout_refuses_without_blocking_frames() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "test-timing-hooks"))]
 #[test]
 fn scope_revocation_three_inconclusive_then_ended_kills_group() {
     close_case("scope-slow-owner-resync", CloseCase::SlowResync);

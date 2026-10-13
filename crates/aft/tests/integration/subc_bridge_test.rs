@@ -4022,6 +4022,13 @@ fn hello_tool_names(hello: &ModuleHelloBody) -> Vec<String> {
 pub(super) async fn open_fake_daemon_session_with_hello(
     input: FakeDaemonInput,
 ) -> (FakeDaemonSession, ModuleHelloBody) {
+    open_fake_daemon_session_with_ops(input, &[]).await
+}
+
+pub(super) async fn open_fake_daemon_session_with_ops(
+    input: FakeDaemonInput,
+    advertised_ops: &[&str],
+) -> (FakeDaemonSession, ModuleHelloBody) {
     let FakeDaemonInput {
         listener,
         key,
@@ -4065,7 +4072,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
             hello.header.corr,
             serde_json::to_vec(&ModuleHelloAckBody {
                 negotiated_ver: PROTOCOL_VERSION,
-                subc_ops: Vec::new(),
+                subc_ops: advertised_ops.iter().map(|op| (*op).into()).collect(),
                 subc_capabilities: Vec::new(),
                 storage: None,
                 machine_id: None,

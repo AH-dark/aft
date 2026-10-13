@@ -57,6 +57,9 @@ fn stamp(owner: &str, epoch: u64) -> subc_protocol::scope::ScopeStamp {
     .with_owner_authorized(true)
 }
 fn sleep_command(seconds: u64) -> String {
+    #[cfg(windows)]
+    return format!("Start-Sleep -Seconds {seconds}");
+    #[cfg(not(windows))]
     format!("sleep {seconds}")
 }
 impl Daemon {
@@ -408,8 +411,17 @@ fn gated_shell(root: &Path, key: Option<&str>) -> Value {
         .display()
         .to_string()
         .replace('\\', "/");
-    call["arguments"]["command"] =
-        json!(format!("while [ ! -f '{release}' ]; do sleep 0.05; done"));
+    #[cfg(windows)]
+    let command = format!(
+        "while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 50 }}",
+        release.replace('\'', "''")
+    );
+    #[cfg(not(windows))]
+    let command = format!(
+        "while [ ! -f '{}' ]; do sleep 0.05; done",
+        release.replace('\'', "'\\''")
+    );
+    call["arguments"]["command"] = json!(command);
     call
 }
 
@@ -580,7 +592,8 @@ async fn goodbye_ended_kills_exact_owner_and_refuses_prepared_call() {
     daemon
         .bind(4, 1, "owner-a", Some(stamp("owner-a", 1)), false)
         .await;
-    // Reconnect to the original session for task-status ownership checks.
+    // Rebind channel 1 to session-1: bash_status only exposes tasks
+    // started in the caller's session.
     daemon
         .bind(1, 2, "direct", Some(stamp("owner-a", 1)), false)
         .await;
@@ -674,9 +687,9 @@ async fn nondefinitive_answers_retry_without_killing_and_detached_result_is_once
     assert_eq!(page["entries"].as_array().unwrap().len(), 1);
     assert_eq!(page["entries"][0]["call_key"], "natural");
     assert_eq!(page["entries"][0]["kind"], "result");
-    // This carrier is not first-party, so its wire result omits structured
-    // status. Empty command output renders only the task marker; the task
-    // record independently proves the actual exit status.
+    // The module named "carrier" is not in AFT's trusted consumer list,
+    // so its wire result omits structured status. Empty command output
+    // renders only the task marker; the persisted task record proves the exit.
     let completed = task_metadata(&root)
         .into_iter()
         .find(|(_, record)| record["task_id"] == task["task_id"])
