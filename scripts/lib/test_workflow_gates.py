@@ -80,11 +80,13 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
     def test_macos_rust_buckets_and_bun_suite_run_in_parallel_lanes(self) -> None:
         integration_archive = workflow_job("unit-macos-nextest-archive")
         self.assertIn("kind(test) - binary(=watcher_integration)", integration_archive)
+        self.assertIn('SCCACHE_IDLE_TIMEOUT: "0"', integration_archive)
         self.assertIn("macos-integration-inventory.json", integration_archive)
         self.assertIn("macos-doctest-inventory.txt", integration_archive)
 
         libtest_archive = workflow_job("unit-macos-libtest-archive")
         self.assertIn("(kind(lib) | kind(bin))", libtest_archive)
+        self.assertIn('SCCACHE_IDLE_TIMEOUT: "0"', libtest_archive)
         self.assertIn("macos-libtest-inventory.json", libtest_archive)
 
         inventory = workflow_job("unit-macos-inventory-proof")
