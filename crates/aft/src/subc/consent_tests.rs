@@ -527,7 +527,9 @@ async fn consent_cancel_and_route_close_withdraw_but_a_transport_drop_keeps_the_
     let _replies = f.send_read(&f.worker, &target, 9).await;
     wait_for(|| fake.calls("consent.request").len() == 3).await;
     let call_key = fake.calls("consent.request")[2]["call_key"].clone();
+    // Connection teardown cancels the connection first, then drops its calls.
     f.connection_cancel.cancel();
+    cancel_all_active_tool_calls(&f.active, &f.executor, "connection teardown");
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(fake.calls("consent.withdraw").len(), 2);
     assert_eq!(f.asks().len(), 1);
