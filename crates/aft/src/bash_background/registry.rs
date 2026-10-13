@@ -4784,14 +4784,12 @@ impl BgTaskRegistry {
         drain: bool,
     ) -> Vec<PatternMatch> {
         const CHUNK: u64 = 64 * 1024;
-        // Catch up on bursts using the freshly validated per-pass handle, but
-        // yield after a bounded amount of I/O so other tasks can be scanned.
-        // Terminal scans still drain fully before routing an exit fallback.
-        const LIVE_BUDGET: usize = 1024 * 1024;
+        // Charge reads even when another scanner advances the cursor, so a
+        // contended running scan still yields after one chunk.
         let mut bytes_read = 0;
         let mut matches = Vec::new();
         loop {
-            if !drain && bytes_read >= LIVE_BUDGET {
+            if !drain && bytes_read >= CHUNK as usize {
                 break;
             }
             let cursor = match self.inner.watch_registry.lock() {
@@ -4852,32 +4850,45 @@ impl BgTaskRegistry {
             .flatten();
         let drain = !task.is_running();
         let mut matches = Vec::new();
-        match mode {
-            BgMode::Pipes => {
-                let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
-                    return;
-                };
-                matches.extend(self.scan_watch_file(
-                    &task.task_id,
-                    &format!("{}:stdout", task.task_id),
-                    stdout,
-                    drain,
-                ));
-                matches.extend(self.scan_watch_file(
-                    &task.task_id,
-                    &format!("{}:stderr", task.task_id),
-                    stderr,
-                    drain,
-                ));
+        // Catch up using the same fresh handles in bounded stdout/stderr rounds.
+        // The chunk order matters: a once watch can match either stream, so a
+        // later stdout chunk must not overtake stderr's first chunk. Terminal
+        // drains keep their existing stdout-before-stderr ordering.
+        let rounds = if drain { 1 } else { 16 };
+        for _ in 0..rounds {
+            let before = self.watch_stream_cursors(&task.task_id);
+            match mode {
+                BgMode::Pipes => {
+                    let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
+                        return;
+                    };
+                    matches.extend(self.scan_watch_file(
+                        &task.task_id,
+                        &format!("{}:stdout", task.task_id),
+                        stdout,
+                        drain,
+                    ));
+                    matches.extend(self.scan_watch_file(
+                        &task.task_id,
+                        &format!("{}:stderr", task.task_id),
+                        stderr,
+                        drain,
+                    ));
+                }
+                BgMode::Pty => {
+                    let Some(pty) = pty.as_mut() else { return };
+                    matches.extend(self.scan_watch_file(
+                        &task.task_id,
+                        &format!("{}:pty", task.task_id),
+                        pty,
+                        drain,
+                    ));
+                }
             }
-            BgMode::Pty => {
-                let Some(pty) = pty.as_mut() else { return };
-                matches.extend(self.scan_watch_file(
-                    &task.task_id,
-                    &format!("{}:pty", task.task_id),
-                    pty,
-                    drain,
-                ));
+            if self.active_watch_count(&task.task_id) == 0
+                || self.watch_stream_cursors(&task.task_id) == before
+            {
+                break;
             }
         }
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
@@ -17066,6 +17077,30 @@ mod tests {
             work.artifact_opens, 2,
             "fresh validation is shared by all chunks in this pass"
         );
+    }
+
+    #[test]
+    fn a02_running_watch_preserves_stream_chunk_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, _db, frames) = registry_with_db_and_frames(dir.path());
+        let task = lifecycle_running_fixture(&registry, &dir);
+        registry
+            .register_watch(
+                task.task_id.clone(),
+                WatchPattern::Substring("WINNER".into()),
+                true,
+            )
+            .unwrap();
+        fs::write(&task.paths.stdout, "x".repeat(64 * 1024) + "WINNER stdout").unwrap();
+        fs::write(&task.paths.stderr, "WINNER stderr").unwrap();
+        registry.scan_task_watch_output(&task);
+        let hits = pattern_match_frames(&frames);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].match_offset, 0,
+            "stderr's first chunk must win before stdout's second chunk for a once watch"
+        );
+        assert!(hits[0].context.contains("stderr"));
     }
 
     #[test]
