@@ -934,9 +934,9 @@ fn materialize_reading(
                         && old.4 == target_symbol
                 })
             });
-            // Colliding ordinals share a persisted ref/edge key. Replaying only
-            // rows that differ from the base can let an earlier row overwrite a
-            // skipped later row. Replay the whole group in cold-writer order.
+            // Several parse facts can share one AST position. Replay their rows
+            // in a fresh database's insertion order, even though their reference
+            // keys differ, to preserve the fresh builder's metadata selection.
             if same && !parse.colliding_ordinals.contains(&row.ref_ordinal) {
                 identical_refs += 1;
                 continue;

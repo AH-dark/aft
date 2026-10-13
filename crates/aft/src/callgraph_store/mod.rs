@@ -25461,6 +25461,75 @@ edition = "2021"
             .is_some_and(|rows| rows.iter().any(|row| row["symbol"] == symbol))
     }
 
+    fn fixture_root_symbols<'a>(
+        snapshot: &'a CallgraphSnapshot,
+        root: &Path,
+        file: &str,
+    ) -> Option<&'a BTreeSet<String>> {
+        let key = crate::inspect::job::canonicalize_normalized(&root.join(file));
+        snapshot.entry_point_symbols.get(&key)
+    }
+
+    fn fixture_target_is(root: &Path, target: &str, file: &str, symbol: &str) -> bool {
+        let target = target
+            .split(crate::inspect::job::DISPATCHED_CALLEE_SEPARATOR)
+            .next()
+            .unwrap_or(target);
+        let Some(actual_file) = target.strip_suffix(&format!("::{symbol}")) else {
+            return false;
+        };
+        let actual = Path::new(actual_file);
+        let actual = if actual.is_absolute() {
+            actual.to_path_buf()
+        } else {
+            root.join(actual)
+        };
+        crate::inspect::job::canonicalize_normalized(&actual)
+            == crate::inspect::job::canonicalize_normalized(&root.join(file))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_path_comparisons_accept_aliases_but_reject_wrong_leaf_or_symbol() {
+        let temp = tempdir().unwrap();
+        let physical = temp.path().join("physical");
+        fs::create_dir(&physical).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let file = write_file(&physical, "entry.ts", "export const Public = 1;\n");
+        let wrong = write_file(&physical, "wrong.ts", "export const Public = 1;\n");
+        let snapshot = CallgraphSnapshot {
+            entry_point_symbols: [(
+                crate::inspect::job::canonicalize_normalized(&file),
+                ["Public".to_string()].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        assert!(fixture_root_symbols(&snapshot, &alias, "entry.ts")
+            .unwrap()
+            .contains("Public"));
+        assert!(fixture_target_is(
+            &alias,
+            &format!("{}::Public", file.display()),
+            "entry.ts",
+            "Public"
+        ));
+        assert!(!fixture_target_is(
+            &alias,
+            &format!("{}::Public", wrong.display()),
+            "entry.ts",
+            "Public"
+        ));
+        assert!(!fixture_target_is(
+            &alias,
+            &format!("{}::Other", file.display()),
+            "entry.ts",
+            "Public"
+        ));
+    }
+
     fn go_fixture_store(root: &Path, files: &[PathBuf]) -> (CallGraphStore, CallgraphSnapshot) {
         let store = CallGraphStore::open(root.join(".store"), root.to_path_buf()).unwrap();
         store.cold_build(files).unwrap();
@@ -25539,7 +25608,8 @@ edition = "2021"
     fn callgraph_view_macro_and_go_initializer_equal_cold_legacy() {
         for language in [LangId::Go, LangId::Rust] {
             let dir = tempdir().unwrap();
-            let root = dir.path();
+            let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
+            let root = resolved_root.as_path();
             let (files, manifest) = if language == LangId::Go {
                 let manifest = write_file(root, "go.mod", "module example.com/app\n");
                 let main = write_file(root, "main.go", "package main\nimport (\n \"net/http\"\n c \"example.com/app/cmd\"\n)\nvar Boot = Register()\nfunc Register() int { return 1 }\nfunc main() { _ = http.HandlerFunc(c.F) }\n");
@@ -25554,6 +25624,10 @@ edition = "2021"
             let mut inputs = files;
             inputs.push(manifest);
             let view = callgraph_fixture_view(root, &inputs);
+            assert_eq!(
+                legacy.files, view.files,
+                "legacy/view snapshots must retain the same file path forms"
+            );
             let owner = if language == LangId::Go {
                 "Command"
             } else {
@@ -25567,9 +25641,7 @@ edition = "2021"
             for snapshot in [&legacy, &view] {
                 if language == LangId::Go {
                     assert!(
-                        snapshot
-                            .entry_point_symbols
-                            .get(&root.join("main.go"))
+                        fixture_root_symbols(snapshot, root, "main.go")
                             .is_some_and(|roots| roots.contains("Boot")),
                         "package main initializer Boot must be a liveness root"
                     );
@@ -25578,7 +25650,7 @@ edition = "2021"
                             .outbound_calls
                             .iter()
                             .any(|call| call.provenance == "value_ref"
-                                && call.target.ends_with("cmd/f.go::F")),
+                                && fixture_target_is(root, &call.target, "cmd/f.go", "F")),
                         "Go view must resolve callback paths through go.mod: {:?}",
                         snapshot.outbound_calls
                     );
@@ -25644,22 +25716,24 @@ edition = "2021"
     #[test]
     fn callgraph_non_go_exported_variable_retains_view_root_flag() {
         let dir = tempdir().unwrap();
-        let root = dir.path();
+        let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let root = resolved_root.as_path();
         let file = write_file(root, "entry.ts", "export const Public = 1;\n");
         let rust = write_file(
             root,
             "entry.rs",
             "pub struct Widget;\nimpl Widget { pub fn Method(&self) {} }\n",
         );
+        let (_, legacy) = go_fixture_store(root, &[file.clone(), rust.clone()]);
         let snapshot = callgraph_fixture_view(root, &[file, rust]);
-        assert!(snapshot
-            .entry_point_symbols
-            .get(&root.join("entry.ts"))
+        assert_eq!(
+            legacy.files, snapshot.files,
+            "legacy/view snapshots must retain the same file path forms"
+        );
+        assert!(fixture_root_symbols(&snapshot, root, "entry.ts")
             .is_some_and(|roots| roots.contains("Public")));
         assert!(
-            snapshot
-                .entry_point_symbols
-                .get(&root.join("entry.rs"))
+            fixture_root_symbols(&snapshot, root, "entry.rs")
                 .is_some_and(|roots| roots.contains("Widget::Method")),
             "non-Go exported methods retain their existing view root flag"
         );
@@ -25763,7 +25837,8 @@ edition = "2021"
     #[test]
     fn callgraph_rust_nested_use_tree_aliases_match_legacy_and_view() {
         let dir = tempdir().unwrap();
-        let root = dir.path();
+        let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let root = resolved_root.as_path();
         write_rust_manifest(root, "nested-alias-bin");
         let main = write_file(root, "src/main.rs", "mod flags;\nuse crate::flags::{complete::{bash::generate as direct_bash}, doc::{help::{generate as direct_help}}};\nfn main() { flags::generate_complete_bash(); flags::generate_help(); flags::generate_version(); direct_bash(); direct_help(); }\n");
         let flags = write_file(root, "src/flags.rs", "mod complete;\nmod doc;\npub(crate) use crate::flags::{complete::{bash::generate as generate_complete_bash}, doc::{help::{generate as generate_help}, version::{generate as generate_version}}};\n");
@@ -25800,11 +25875,20 @@ edition = "2021"
         let mut inputs = files;
         inputs.push(root.join("Cargo.toml"));
         let view = callgraph_fixture_view(root, &inputs);
+        assert_eq!(
+            legacy.files, view.files,
+            "legacy/view snapshots must retain the same file path forms"
+        );
         assert!(
             view.outbound_calls
                 .iter()
                 .any(|call| call.caller_symbol == "main"
-                    && call.target.ends_with("complete/bash.rs::generate")),
+                    && fixture_target_is(
+                        root,
+                        &call.target,
+                        "src/flags/complete/bash.rs",
+                        "generate"
+                    )),
             "nested alias view trace: {:?}",
             view.outbound_calls
         );
@@ -25961,7 +26045,8 @@ edition = "2021"
     #[test]
     fn callgraph_rust_nested_aliases_custom_bin_root_match_legacy_and_view() {
         let dir = tempdir().unwrap();
-        let root = dir.path();
+        let resolved_root = crate::inspect::job::canonicalize_normalized(dir.path());
+        let root = resolved_root.as_path();
         let manifest = write_file(root, "Cargo.toml", "[package]\nname='custom-layout'\nversion='0.1.0'\nedition='2021'\n[[bin]]\nname='rg'\npath='crates/core/main.rs'\n");
         let main = write_file(root, "crates/core/main.rs", "mod flags;\nfn main() { generate(); special(); }\nfn generate() { flags::generate_complete_bash(); flags::generate_complete_fish(); flags::generate_complete_powershell(); flags::generate_complete_zsh(); flags::generate_man_page(); }\nfn special() { flags::generate_help_short(); flags::generate_help_long(); flags::generate_version_short(); flags::generate_version_long(); flags::generate_version_pcre2(); }\n");
         let flags = write_file(root, "crates/core/flags/mod.rs", "pub(crate) use crate::flags::{\n complete::{bash::generate as generate_complete_bash, fish::generate as generate_complete_fish, powershell::generate as generate_complete_powershell, zsh::generate as generate_complete_zsh},\n doc::{help::{generate_long as generate_help_long, generate_short as generate_help_short}, man::generate as generate_man_page, version::{generate_long as generate_version_long, generate_pcre2 as generate_version_pcre2, generate_short as generate_version_short}},\n};\nmod complete;\nmod doc;\nmod parse;\n");
@@ -26080,12 +26165,16 @@ edition = "2021"
         let mut inputs = files;
         inputs.push(manifest);
         let view = callgraph_fixture_view(root, &inputs);
+        assert_eq!(
+            legacy.files, view.files,
+            "legacy/view snapshots must retain the same file path forms"
+        );
         for (alias, file, symbol, caller) in targets {
             assert!(
                 view.outbound_calls
                     .iter()
                     .any(|call| call.caller_symbol == caller
-                        && call.target.ends_with(&format!("{file}::{symbol}"))),
+                        && fixture_target_is(root, &call.target, file, symbol)),
                 "view custom-root alias {alias} must land on the real leaf"
             );
         }
@@ -26151,9 +26240,7 @@ edition = "2021"
                     && call.caller_symbol == "Less" && call.provenance == "go_package_initializer"),
                     "fabricating Less -> package-init creates a dispatch-root key for an unrelated plain function");
                     assert!(
-                        !snapshot
-                            .entry_point_symbols
-                            .get(&root.join(method_file))
+                        !fixture_root_symbols(snapshot, root, method_file)
                             .is_some_and(|roots| roots.contains("Less")
                                 || roots.contains(&format!("{go_type}::Unused"))),
                         "exported Go method names are not unconditional projection roots"
