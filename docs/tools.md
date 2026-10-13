@@ -264,7 +264,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | `compressed` | boolean | Opt in/out of output compression for this call (default true; requires compression flag) |
 | `pty` | boolean | Run in a real PTY for interactive programs. Implies `background: true`. |
 | `ptyRows` / `ptyCols` | number | PTY dimensions (max 60 rows / 140 cols). Soft-ignored on non-PTY calls. |
-| `runon` | string | Run the whole line on the remote Linux build server (`"linux"`). Offered only where remote runs are configured; see below. |
+| `runon` | string | Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options). |
 
 Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` for local bash children from `../.cargo/alfonso-test-threads` (one decimal integer plus newline), defaulting to 4 when the file is missing, invalid, or above 256; valid values through 256 are preserved. Existing inherited or per-call values take precedence, and shell command prefixes still override them; head sessions and unscoped plugin worker flags receive no defaults, and exec-remote requests never carry these variables.
 
@@ -287,20 +287,20 @@ briefly then hard-kills at 2s. `background: true` skips polling entirely.
 Returns combined stdout/stderr plus `exit_code`, `duration_ms`, truncation status, and an
 `output_path` when large output spills to disk.
 
-**Running on the remote build server (`runon`)** — `runon: "linux"` sends the whole command
+**Running on a remote build server (`runon`)** — `runon: "linux"` sends the whole command
 line, exactly as written (pipes, lists, environment prefixes and all), to the remote Linux
 build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v1`). `runon:
 "linux,4c"` requests exactly four vCPUs; the runner refuses counts it cannot serve before the
 command starts. Without a count, the job gets 2 vCPUs. Add `,net` for outbound internet:
 `linux,net`, `linux,4c,net` and `linux,net,4c` are accepted; remote jobs are offline by default. A plan's
-`default_demand` may include these
-options too. Duplicate options, unknown tokens and non-Linux platforms are refused by name
-before dispatch. It runs there under `bash -c` in the same working directory, with the same timeout
-and the same environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips
-before any off-host request (the reply names them). New plans require `runon` to send a line
-away. Deployed worker plans with an enabled `commands` prefix list retain their existing
-automatic routing: every literal command must match an allowed prefix, and unsupported syntax
-stays local.
+`default_demand` may include these options too. `runon: "windows"` sends the command to a Windows
+build machine and runs it in Git Bash; it does not accept vCPU or network options. Duplicate
+options, unknown tokens and unsupported platforms are refused by name before dispatch. It runs
+there under `bash -c` in the same working directory, with the same timeout and the same
+environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips before any
+off-host request (the reply names them). New plans require `runon` to send a line away. Deployed
+worker plans with an enabled `commands` prefix list retain their existing automatic routing: every
+literal command must match an allowed prefix, and unsupported syntax stays local.
 Explicit whole-line `runon` also requires the user-only live safety switch
 `bash.runon_enabled: true` (default false); projects cannot enable it. Turning that switch off
 hides and refuses `runon` without disabling legacy prefix routing.

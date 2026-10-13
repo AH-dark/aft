@@ -3541,8 +3541,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "5be3adb939784ab01da7fb2e418127a78d385e979fc9e831e159fd3b176f938d",
-      "catalog_digest": "5be3adb939784ab01da7fb2e418127a78d385e979fc9e831e159fd3b176f938d",
+      "generation": "2d83a4e96e00854c1456232c15c4e29c5b9d8ec760c65f2d4b4427ef9b805be6",
+      "catalog_digest": "2d83a4e96e00854c1456232c15c4e29c5b9d8ec760c65f2d4b4427ef9b805be6",
       "tools": [
         {
           "name": "status",
@@ -3636,7 +3636,7 @@
               },
               "runon": {
                 "type": "string",
-                "description": "Run on the remote Linux build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default)."
+                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
               }
             },
             "required": [
@@ -4800,8 +4800,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "c629169a6704f679f764e735fe2eb01dce9871870fd81e851edf61c6306b9bb4",
-      "catalog_digest": "c629169a6704f679f764e735fe2eb01dce9871870fd81e851edf61c6306b9bb4",
+      "generation": "ce7cde40779e4da162ac3c023907ca4cee3ff2c0d2e5f8c3f1f2d9942bc093a2",
+      "catalog_digest": "ce7cde40779e4da162ac3c023907ca4cee3ff2c0d2e5f8c3f1f2d9942bc093a2",
       "tools": [
         {
           "name": "status",
@@ -4895,7 +4895,7 @@
               },
               "runon": {
                 "type": "string",
-                "description": "Run on the remote Linux build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default)."
+                "description": "Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add \",net\" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options)."
               }
             },
             "required": [

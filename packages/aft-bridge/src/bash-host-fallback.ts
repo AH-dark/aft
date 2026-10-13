@@ -18,7 +18,7 @@ export const BASH_HOST_FALLBACK_REFUSAL =
  * the rest. Shared by the OpenCode and Pi tools and the module catalog.
  */
 export const BASH_RUNON_DESCRIPTION =
-  'Run on the remote Linux build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default).';
+  'Run on a remote build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default). `windows` runs the command in Git Bash on a Windows build machine (no vCPU or network options).';
 
 /** Guidance served only beside an available remote-run parameter. */
 export const BASH_RUNON_GUIDANCE =
