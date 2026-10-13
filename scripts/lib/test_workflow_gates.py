@@ -115,6 +115,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("AFT_GATE_PHASES: watcher", watcher)
 
         conformance = workflow_job("unit-macos-conformance")
+        self.assertIn("unit-macos-nextest-archive", conformance)
+        self.assertIn("unit-macos-libtest-archive", conformance)
         self.assertIn("AFT_GATE_PHASES: conformance", conformance)
         self.assertIn("bun run test:unit", conformance)
 
@@ -172,6 +174,14 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             "partition_coverage_errors(nextest_shardable_entries, nextest_partitions)",
             PROOF_TEXT,
         )
+
+    def test_macos_conformance_waits_until_archives_finish(self) -> None:
+        conformance = workflow_job("unit-macos-conformance")
+        dependencies = conformance.split("    steps:", 1)[0]
+
+        self.assertIn("needs:", dependencies)
+        self.assertIn("unit-macos-nextest-archive", dependencies)
+        self.assertIn("unit-macos-libtest-archive", dependencies)
 
 
 if __name__ == "__main__":

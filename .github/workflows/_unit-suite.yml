@@ -910,6 +910,11 @@ jobs:
 
   unit-macos-conformance:
     name: Cargo conformance + Bun tests (macOS)
+    # Let the large archive compiles finish before running Bun's short
+    # event-loop deadline tests alongside the Cargo workload.
+    needs:
+      - unit-macos-nextest-archive
+      - unit-macos-libtest-archive
     runs-on: macos-26
     timeout-minutes: 30
     env:
