@@ -1,5 +1,5 @@
 use super::*;
-use crate::access_policy::GrantKind;
+
 use crate::sandbox_spawn::{
     resolve_sandbox_spawn, with_worker_jail, RequestedSandboxTier, SandboxTaskKind, SpawnPlan,
 };
@@ -56,18 +56,36 @@ impl FakeCingulate {
         state.calls.push((method.to_string(), params.clone()));
         match method {
             "consent.request" => {
+                // Cingulate refuses unknown fields and requires head_policy on
+                // worker-scope asks; these tests ask only from worker scopes.
+                let keys: Vec<_> = params.as_object().unwrap().keys().cloned().collect();
+                assert_eq!(
+                    keys,
+                    [
+                        "args_hash",
+                        "call_key",
+                        "head_policy",
+                        "kind",
+                        "operation",
+                        "paths",
+                        "pattern",
+                        "reason",
+                        "tool"
+                    ]
+                );
                 let key = params["call_key"].as_str().unwrap().to_string();
                 let next = format!("acc_{}", state.asks.len() + 1);
                 let id = state.asks.entry(key).or_insert(next).clone();
-                let mut reply = state.answers.get(&id).cloned().unwrap_or(json!({}));
-                reply["elicitation_id"] = json!(id);
-                Ok(Some(reply))
+                Ok(Some(json!({"elicitation_id": id})))
             }
             "consent.await" => {
-                let id = params["elicitationId"].as_str().unwrap();
+                let id = params["elicitation_id"].as_str().unwrap();
+                assert!(params["timeout_ms"].as_u64().unwrap() <= 120_000);
                 Ok(state.answers.get(id).cloned())
             }
-            _ => Ok(Some(json!({"ok": true}))),
+            _ => Ok(Some(
+                json!({"state": "refused:access_withdrawn", "outcome": "access_withdrawn", "code": "access_withdrawn"}),
+            )),
         }
     }
 }
@@ -78,19 +96,23 @@ impl ConsentTransport for SharedFake {
     fn call(&self, call: ConsentCall) -> ConsentFuture {
         let fake = Arc::clone(&self.0);
         Box::pin(async move {
-            let wait = Duration::from_millis(call.params["wait_ms"].as_u64().unwrap_or(0));
+            // Go through the real envelope encoder and decoder on both sides.
+            let sent: Value = serde_json::from_slice(&encode(call.method, &call.params)?).unwrap();
+            let params = sent["params"].clone();
+            let wait = Duration::from_millis(params["timeout_ms"].as_u64().unwrap_or(0));
             let end = Instant::now() + wait.min(call.timeout);
-            loop {
-                if let Some(reply) = fake.reply(call.method, &call.params)? {
-                    return Ok(reply);
+            let result = loop {
+                if let Some(reply) = fake.reply(call.method, &params)? {
+                    break reply;
                 }
                 // An open ask long-polls until it settles or the wait ends.
                 fake.state.lock().unwrap().calls.pop();
                 if Instant::now() >= end {
-                    return Ok(json!({"state": "pending"}));
+                    break json!({"state": "pending:head"});
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            };
+            decode_result(&serde_json::to_vec(&json!({ "result": result })).unwrap())
         })
     }
 }
@@ -218,6 +240,16 @@ impl Fixture {
         path: &Path,
         corr: u64,
     ) -> mpsc::Receiver<WriterFrame> {
+        self.send_with(identity, path, corr, read_dispatch).await
+    }
+
+    async fn send_with(
+        &self,
+        identity: &RouteIdentity,
+        path: &Path,
+        corr: u64,
+        dispatch: DispatchFn,
+    ) -> mpsc::Receiver<WriterFrame> {
         if self.executor.actor_context(&identity.root).is_none() {
             self.executor
                 .register_actor(identity.root.clone(), Arc::clone(&self.ctx));
@@ -269,7 +301,7 @@ impl Fixture {
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
-            read_dispatch,
+            dispatch,
             &deferred_tx,
             false,
             1024 * 1024,
@@ -341,7 +373,7 @@ async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
 
     f.fake.answer(
         &call_key,
-        json!({"outcome": "allow_once", "answered_by": "head"}),
+        json!({"state": "settled", "outcome": "allow_once", "answered_by": "head"}),
     );
     // The retry arrives under a new transport call; it re-sends the original
     // consent call key, gets the same ask, and runs once.
@@ -378,7 +410,10 @@ async fn consent_answer_within_the_budget_runs_the_held_call() {
         .as_str()
         .unwrap()
         .to_string();
-    f.fake.answer(&call_key, json!({"outcome": "allow_scope"}));
+    f.fake.answer(
+        &call_key,
+        json!({"state": "settled", "outcome": "allow_scope"}),
+    );
     let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
         .await
         .unwrap()
@@ -465,7 +500,7 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
     }
     f.fake.answer(
         request["call_key"].as_str().unwrap(),
-        json!({"outcome": "allow_scope", "answered_by": "head"}),
+        json!({"state": "settled", "outcome": "allow_scope", "answered_by": "head"}),
     );
     let declined = f.read(&f.worker, &target, 8).await;
     assert_eq!(code(&declined), "access_declined", "{declined}");
@@ -486,7 +521,7 @@ async fn consent_user_answer_is_not_rechecked_against_the_head() {
     assert_eq!(request["head_policy"], "not_held");
     f.fake.answer(
         request["call_key"].as_str().unwrap(),
-        json!({"outcome": "allow_once", "answered_by": "user"}),
+        json!({"state": "settled", "outcome": "allow_once", "answered_by": "user"}),
     );
     let allowed = f.read(&f.worker, &target, 8).await;
     assert!(text(&allowed).contains("unheld contents"), "{allowed}");
@@ -608,30 +643,157 @@ fn consent_hold_budget_is_capped_at_100_seconds() {
     );
 }
 
+fn vector(name: &str) -> Vec<u8> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/subc/fixtures/cingulate-tool-permission-v1/vectors");
+    let bytes = std::fs::read(dir.join(name)).unwrap();
+    // Every vector used here must match Cingulate's own manifest.
+    let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap();
+    let expected = sums
+        .lines()
+        .find_map(|line| {
+            let (hash, file) = line.split_once("  ")?;
+            (file == name).then_some(hash)
+        })
+        .unwrap_or_else(|| panic!("{name} is not in SHA256SUMS"));
+    use sha2::Digest;
+    let actual: String = sha2::Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(actual, expected, "{name} differs from Cingulate's manifest");
+    bytes
+}
+
+fn vector_json(name: &str) -> Value {
+    serde_json::from_slice(&vector(name)).unwrap()
+}
+
 #[test]
-fn consent_settlement_treats_an_allow_without_answered_by_as_the_head() {
+fn consent_vectors_requests_encode_byte_for_byte() {
+    let open = request_params(
+        "call-1",
+        "read",
+        "read",
+        "/tmp/file",
+        "Inspect file",
+        "hash",
+        "/tmp/file",
+        Some("not_held"),
+    );
+    for name in ["worker-open-request.json", "replay-request.json"] {
+        assert_eq!(
+            encode("consent.request", &open).unwrap(),
+            vector(name),
+            "{name}"
+        );
+    }
+    for (name, id) in [
+        ("await-pending-request.json", "acc_2"),
+        ("await-settled-request.json", "acc_1"),
+    ] {
+        assert_eq!(
+            encode(
+                "consent.await",
+                &json!({"elicitation_id": id, "timeout_ms": 0})
+            )
+            .unwrap(),
+            vector(name),
+            "{name}"
+        );
+    }
     assert_eq!(
-        settlement(&json!({"outcome": "allow_once"})),
-        Settlement::Allow {
-            scope: false,
-            by_user: false
-        }
+        encode("consent.withdraw", &json!({"elicitation_id": "acc_2"})).unwrap(),
+        vector("withdrawn-request.json")
+    );
+}
+
+#[test]
+fn consent_vectors_replies_decode() {
+    for name in ["worker-open-reply.json", "replay-reply.json"] {
+        let result = decode_result(&vector(name)).unwrap();
+        assert_eq!(decode_elicitation_id(&result).unwrap(), "acc_1", "{name}");
+    }
+    assert_eq!(
+        decode_record(&decode_result(&vector("await-pending-reply.json")).unwrap()).unwrap(),
+        Settlement::Pending
     );
     assert_eq!(
-        settlement(&json!({"outcome": "allow_scope", "answered_by": "user"})),
+        decode_record(&decode_result(&vector("await-settled-reply.json")).unwrap()).unwrap(),
         Settlement::Allow {
             scope: true,
             by_user: true
         }
     );
     assert_eq!(
-        settlement(&json!({"outcome": "access_head_gone"})),
+        decode_record(&decode_result(&vector("withdrawn-reply.json")).unwrap()).unwrap(),
+        Settlement::Refused("access_withdrawn".into())
+    );
+    // The head relay's replies embed the ask record, still open in both.
+    for name in ["head-not-held-reply.json", "escalated-reply.json"] {
+        let result = decode_result(&vector(name)).unwrap();
+        assert_eq!(
+            decode_record(&result["elicitation"]).unwrap(),
+            Settlement::Pending,
+            "{name}"
+        );
+    }
+    // The requests these replies answer are the head relay's, not AFT's.
+    for name in ["head-not-held-request.json", "escalated-request.json"] {
+        assert_eq!(vector_json(name)["method"], "consent.answer", "{name}");
+    }
+}
+
+#[test]
+fn consent_vectors_settled_allow_without_answered_by_is_the_head() {
+    let mut record = decode_result(&vector("await-settled-reply.json")).unwrap();
+    record.as_object_mut().unwrap().remove("answered_by");
+    record["outcome"] = json!("allow_once");
+    assert_eq!(
+        decode_record(&record).unwrap(),
+        Settlement::Allow {
+            scope: false,
+            by_user: false
+        }
+    );
+    record["outcome"] = json!("deny");
+    record["note"] = json!("not this one");
+    assert_eq!(
+        decode_record(&record).unwrap(),
+        Settlement::Deny {
+            note: Some("not this one".into())
+        }
+    );
+    record["state"] = json!("refused:access_head_gone");
+    record["outcome"] = json!("access_head_gone");
+    assert_eq!(
+        decode_record(&record).unwrap(),
         Settlement::Refused("access_head_gone".into())
     );
-    assert_eq!(
-        settlement(&json!({"state": "pending"})),
-        Settlement::Pending
-    );
+    // Lenient shapes from before the contract was pinned are refused.
+    assert!(decode_record(&json!({"outcome": "allow_once"})).is_err());
+    assert!(decode_elicitation_id(&json!({"id": "acc_1"})).is_err());
+    assert!(decode_result(br#"{"elicitation_id":"acc_1"}"#).is_err());
+}
+
+#[test]
+fn consent_vectors_bind_stamps_route_asks_under_the_worker_stamp() {
+    let stamps = vector_json("bind-stamps.json");
+    let worker: subc_protocol::scope::ScopeStamp =
+        serde_json::from_value(stamps["worker"]["scope"].clone()).unwrap();
+    let head: subc_protocol::scope::ScopeStamp =
+        serde_json::from_value(stamps["head"]["scope"].clone()).unwrap();
+    assert_eq!(stamps["worker"]["principal"], "reserved:aft");
+    let dir = tempfile::tempdir().unwrap();
+    let worker_identity = identity(dir.path(), Some(worker.clone()));
+    let head_identity = identity(dir.path(), Some(head));
+    assert!(access_grants::alfonso_worker(&worker_identity));
+    assert!(!access_grants::alfonso_worker(&head_identity));
+    // Asks go out under the asking worker's own stamp.
+    let sent = selector(&worker);
+    assert_eq!(sent.scope_ref, "worker");
+    assert_eq!(sent.scope_epoch, Some(3));
+    assert_eq!(sent.owner, worker.owner);
 }
 
 fn jail_context(root: &Path, sandbox: bool) -> AppContext {
@@ -722,4 +884,70 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
         );
     });
     assert!(!crate::sandbox_spawn::worker_jail_active());
+}
+
+static RERUN_STARTED: AtomicBool = AtomicBool::new(false);
+static RERUN_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Reads normally, except that an approved rerun (one carrying `allow_once`
+/// approvals) waits until its job is cancelled, and records whether it was.
+fn blocking_rerun_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    if let AskRoute::Consent { once } = crate::access_policy::current_ask_route() {
+        if !once.is_empty() {
+            RERUN_STARTED.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !crate::executor::current_job_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            RERUN_CANCELLED.store(crate::executor::current_job_cancelled(), Ordering::SeqCst);
+            return Response::error(&request.id, "request_cancelled", "rerun stopped");
+        }
+    }
+    read_dispatch(request, ctx)
+}
+
+async fn start_blocked_rerun(f: &Fixture, corr: u64) -> mpsc::Receiver<WriterFrame> {
+    RERUN_STARTED.store(false, Ordering::SeqCst);
+    RERUN_CANCELLED.store(false, Ordering::SeqCst);
+    set_hold_budget_for_test(Some(Duration::from_secs(8)));
+    let replies = f
+        .send_with(
+            &f.worker,
+            &f.head_root.join("shared.txt"),
+            corr,
+            blocking_rerun_dispatch,
+        )
+        .await;
+    let fake = Arc::clone(&f.fake);
+    wait_for(|| !fake.calls("consent.request").is_empty()).await;
+    let call_key = fake.calls("consent.request")[0]["call_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    f.fake.answer(
+        &call_key,
+        json!({"state": "settled", "outcome": "allow_once", "answered_by": "head"}),
+    );
+    wait_for(|| RERUN_STARTED.load(Ordering::SeqCst)).await;
+    replies
+}
+
+#[tokio::test]
+async fn consent_cancel_reaches_the_approved_rerun() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let _replies = start_blocked_rerun(&f, 7).await;
+    // The rerun is the call's active job: a Cancel for the call stops it.
+    assert!(cancel_active_tool_call(&f.active, &f.executor, route_key(41, 1), 7, "test").is_some());
+    wait_for(|| RERUN_CANCELLED.load(Ordering::SeqCst)).await;
+}
+
+#[tokio::test]
+async fn consent_route_close_reaches_the_approved_rerun() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let _replies = start_blocked_rerun(&f, 7).await;
+    note_route_closed(route_key(41, 1));
+    wait_for(|| RERUN_CANCELLED.load(Ordering::SeqCst)).await;
+    wait_for(|| f.asks().is_empty()).await;
 }

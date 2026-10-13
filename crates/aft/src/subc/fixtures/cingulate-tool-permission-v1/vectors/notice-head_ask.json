@@ -1,0 +1,1 @@
+{"asker":{"scope_epoch":3,"scope_ref":"worker"},"elicitation_id":"acc_1","fields":{"answers":["deny","escalate"],"head_policy":"not_held","operation":"read","paths":["/tmp/file"],"reason":"Inspect file","tool":"read"},"head":{"scope_epoch":7,"scope_ref":"head"},"purpose":"head_ask"}

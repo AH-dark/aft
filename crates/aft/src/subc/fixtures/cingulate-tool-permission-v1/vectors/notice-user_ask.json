@@ -1,0 +1,1 @@
+{"asker":{"scope_epoch":7,"scope_ref":"head"},"elicitation_id":"acc_2","fields":{"answers":["allow_once","allow_scope","deny"],"command":"pwd","operation":"exec","paths":[],"reason":"Inspect directory","tool":"bash"},"purpose":"user_ask"}

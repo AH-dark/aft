@@ -1,0 +1,1 @@
+{"method":"consent.request","params":{"args_hash":"hash","call_key":"call-1","head_policy":"not_held","kind":"tool_permission","operation":"read","paths":["/tmp/file"],"pattern":"/tmp/file","reason":"Inspect file","tool":"read"}}

@@ -884,6 +884,43 @@ fn submit_active_tool_call(
     rx
 }
 
+/// Run a tracked call's job again (after a consent answer) as that call's
+/// active job, so a Cancel or teardown that targets the call cancels this run.
+/// When the call stopped being tracked in the meantime (it was cancelled), the
+/// new job is cancelled at once.
+#[allow(clippy::too_many_arguments)]
+fn resubmit_active_tool_call(
+    executor: &Executor,
+    active: &ActiveToolCalls,
+    route: RouteChannel,
+    corr: u64,
+    root_id: ProjectRootId,
+    lane: Lane,
+    request_id: String,
+    tool: &str,
+    job: crate::executor::ExecutorJob,
+) -> oneshot::Receiver<Response> {
+    let (rx, cancellation) =
+        executor.submit_tool_call_cancellable_async(root_id.clone(), lane, request_id, tool, job);
+    let registered = {
+        let mut calls = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match calls.get_mut(&(route, corr)) {
+            Some(call) if !call.answering => {
+                call.cancellation = cancellation.clone();
+                call.root_id = root_id.clone();
+                true
+            }
+            _ => false,
+        }
+    };
+    if !registered {
+        executor.cancel_job(&root_id, &cancellation);
+    }
+    rx
+}
+
 /// Claims the right to answer a tracked call from its response task. Returns
 /// false when the call is no longer tracked (a Cancel or route teardown already
 /// ended it) or another path already claimed it. The entry stays in the map
@@ -8077,10 +8114,15 @@ async fn hold_for_consent(
     let rerun = |ask_route| {
         let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
         let job = plain_run.job(ask_route, PhaseTrace::new(Instant::now()), done_tx);
-        let rx = executor.submit_async(
+        let rx = resubmit_active_tool_call(
+            executor,
+            active_tool_calls,
+            route,
+            corr,
             plain_run.identity.root.clone(),
             lane,
             plain_run.request_id.clone(),
+            &plain_run.bare_name,
             job,
         );
         let request_id = plain_run.request_id.clone();

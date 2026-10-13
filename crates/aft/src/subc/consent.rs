@@ -12,14 +12,22 @@
 //! `access_pending`, and the persisted ask (see [`crate::db::access_asks`]) lets
 //! the retried call pick up the same Cingulate ask by its original call key.
 //!
-//! Wire shape, as AFT sends it: a management route to the `cingulate` module,
-//! opened under the asking route's own scope (so Cingulate reads the asker and
-//! its head from the daemon's stamp), carrying `{"method": <name>, "params":
-//! {...}}`. `consent.request` returns the ask's `elicitation_id` and, when it
-//! has already settled, its outcome. `consent.await {elicitationId, wait_ms}`
-//! long-polls; `consent.withdraw {elicitationId}` withdraws.
+//! Wire contract (Cingulate's requester contract, `tool_permission` asks): a
+//! management-surface route to the `cingulate` module, opened by AFT's own
+//! principal (`reserved:aft`) under the asking route's scope stamp. Cingulate
+//! takes the asker and its head only from that stamp. Each request is
+//! `{"method", "params"}` and each reply `{"result"}`; refusals arrive as
+//! module error frames carrying a code and message.
+//! - `consent.request {kind, call_key, tool, operation, paths, reason,
+//!   args_hash, pattern, head_policy?}` returns `{elicitation_id}`; repeating a
+//!   call key returns the same id. `head_policy` is sent on worker-scope asks
+//!   only, and unknown fields are refused.
+//! - `consent.await {elicitation_id, timeout_ms}` returns the ask's record once
+//!   it leaves its pending states or the timeout (at most 120 s) passes.
+//! - `consent.withdraw {elicitation_id}` settles a pending ask as
+//!   `access_withdrawn` and returns the record.
 use super::*;
-use crate::access_policy::{AccessGrant, AccessOperation, AskRoute, HeadPolicy};
+use crate::access_policy::{AccessGrant, AccessOperation, AskRoute, GrantKind, HeadPolicy};
 use crate::db::access_asks::{self as asks, AskKey};
 use std::future::Future;
 use std::pin::Pin;
@@ -27,15 +35,10 @@ use subc_protocol::scope::ScopeSelector;
 
 pub(super) const CINGULATE_MODULE_ID: &str = "cingulate";
 
-/// Cingulate refusals that end an ask by name. The held call ends with the
-/// refusal's own code (for example `access_no_head`), and none grants anything.
-const TERMINAL_REFUSALS: &[&str] = &[
-    "access_no_head",
-    "access_head_gone",
-    "access_not_placed",
-    "access_withdrawn",
-    "access_declined",
-];
+/// Cingulate refuses an envelope larger than this many bytes.
+const MAX_ENVELOPE_BYTES: usize = 1_310_720;
+/// Cingulate holds one `consent.await` for at most this long.
+const MAX_AWAIT: Duration = Duration::from_millis(120_000);
 
 /// Clients give a call without a declared reply budget at least this long
 /// (the shortest supported transport deadline).
@@ -237,15 +240,13 @@ impl SubcConsentTransport {
                 return Err(ConsentError::Unavailable(error.to_string()));
             }
         };
-        let body = serde_json::to_vec(&json!({"method": call.method, "params": call.params}))
-            .map_err(|error| ConsentError::Unavailable(error.to_string()))?;
+        let body = encode(call.method, &call.params)?;
         let options = CallOptions {
             timeout: call.timeout,
             ..CallOptions::default()
         };
         match consumer.request(&route, body, options).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|_| ConsentError::Unavailable("cingulate's reply was not JSON".into())),
+            Ok(bytes) => decode_result(&bytes),
             Err(CallError::Module(body)) => Err(ConsentError::Refused {
                 code: body.code,
                 message: body.message,
@@ -255,6 +256,56 @@ impl SubcConsentTransport {
                 Err(ConsentError::Unavailable(error.to_string()))
             }
         }
+    }
+}
+
+/// Copy of `value` whose object keys are in sorted order at every level. The
+/// crate builds JSON with insertion-ordered maps, and Cingulate's contract
+/// vectors are written with sorted keys.
+fn sorted_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), sorted_keys(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The request envelope for one consent method: `{"method", "params"}`, compact,
+/// with sorted keys. Cingulate refuses envelopes over its size cap, so an
+/// oversized one is refused here by the same name instead of being sent.
+pub(super) fn encode(method: &str, params: &Value) -> Result<Vec<u8>, ConsentError> {
+    let body = serde_json::to_vec(&sorted_keys(&json!({"method": method, "params": params})))
+        .map_err(|error| ConsentError::Unavailable(error.to_string()))?;
+    if body.len() > MAX_ENVELOPE_BYTES {
+        return Err(ConsentError::Refused {
+            code: "elicitation_request_too_large".into(),
+            message: format!("consent envelope exceeds {MAX_ENVELOPE_BYTES} bytes"),
+        });
+    }
+    Ok(body)
+}
+
+/// The `result` of a reply envelope `{"result": ...}`. Refusals never arrive
+/// here: Cingulate sends them as module error frames.
+pub(super) fn decode_result(bytes: &[u8]) -> Result<Value, ConsentError> {
+    let envelope: Value = serde_json::from_slice(bytes)
+        .map_err(|_| ConsentError::Unavailable("cingulate's reply was not JSON".into()))?;
+    match envelope {
+        Value::Object(mut object) if object.len() == 1 && object.contains_key("result") => {
+            Ok(object.remove("result").expect("result is present"))
+        }
+        _ => Err(ConsentError::Unavailable(
+            "cingulate's reply is not a {result} envelope".into(),
+        )),
     }
 }
 
@@ -391,7 +442,34 @@ where
                 holder: claimed,
             } => {
                 holder = Some((ask, claimed));
-                let (response, text) = rerun(AskRoute::Consent { once }).await;
+                let running = rerun(AskRoute::Consent { once });
+                tokio::pin!(running);
+                let (response, text) = loop {
+                    tokio::select! {
+                        done = &mut running => break done,
+                        _ = tokio::time::sleep(SIGNAL_POLL) => {
+                            // The consumer closed the route while the approved
+                            // run was in flight: stop the run (it is the call's
+                            // active job) and drop what was approved for it.
+                            if route_hold.closed() {
+                                cancel_active_tool_call(
+                                    &call.active,
+                                    &call.executor,
+                                    call.route,
+                                    call.corr,
+                                    "route closed during an approved rerun",
+                                );
+                                if let Some((ask, _)) = holder.take() {
+                                    let _ = with_db(&call, move |conn, _| {
+                                        asks::discard(conn, &ask).map(|_| ())
+                                    })
+                                    .await;
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                };
                 match requested_ask(&response) {
                     Some(next) => grant = next,
                     None => {
@@ -438,7 +516,6 @@ struct Prepared {
     key: AskKey,
     call_key: String,
     request: Value,
-    elicitation_id: Option<String>,
     selector: ScopeSelector,
     grant: AccessGrant,
 }
@@ -530,7 +607,6 @@ fn prepare(
                 key,
                 call_key,
                 request,
-                elicitation_id: record.elicitation_id,
                 selector,
                 grant: pending,
             }));
@@ -545,27 +621,28 @@ fn prepare(
         }
     }
     let call_key = new_call_key();
-    let mut request = json!({
-        "kind": "tool_permission",
-        "call_key": call_key,
-        "tool": tool,
-        "operation": operation_name(grant.operation),
-        "paths": [grant.path],
-        "reason": format!(
-            "{} needs to {} a path outside this worker's worktree",
-            tool.chars().take(64).collect::<String>(),
+    // A worker-scope ask carries the head's authority; Cingulate requires it
+    // there and refuses it on every other scope kind.
+    let head = match identity.scope.as_ref().map(|stamp| stamp.kind) {
+        Some(subc_protocol::scope::ScopeKind::Worker) => {
+            Some(head_policy(conn, ctx, identity, grant)?)
+        }
+        _ => None,
+    };
+    let path = grant.path.to_string_lossy();
+    let request = request_params(
+        &call_key,
+        tool,
+        operation_name(grant.operation),
+        &path,
+        &format!(
+            "{tool} needs to {} a path outside this worker's worktree",
             operation_name(grant.operation)
         ),
-        "args_hash": key.args_hash,
-        "pattern": grant,
-    });
-    if identity
-        .scope
-        .as_ref()
-        .is_some_and(|stamp| stamp.kind != subc_protocol::scope::ScopeKind::Head)
-    {
-        request["head_policy"] = json!(head_policy(conn, ctx, identity, grant)?);
-    }
+        &key.args_hash,
+        &pattern(grant),
+        head.map(head_policy_name),
+    );
     asks::open(
         conn,
         &key,
@@ -579,57 +656,123 @@ fn prepare(
         key,
         call_key,
         request,
-        elicitation_id: None,
         selector,
         grant: grant.clone(),
     }))
 }
 
+/// The display pattern Cingulate shows for the capability an answer grants:
+/// the path itself, or `<path>/**` for a whole directory tree.
+fn pattern(grant: &AccessGrant) -> String {
+    let path = grant.path.to_string_lossy();
+    match grant.kind {
+        GrantKind::File => path.into_owned(),
+        GrantKind::Subtree => format!("{}/**", path.trim_end_matches('/')),
+    }
+}
+
+fn head_policy_name(policy: HeadPolicy) -> &'static str {
+    match policy {
+        HeadPolicy::Allow => "allow",
+        HeadPolicy::NotHeld => "not_held",
+    }
+}
+
+/// `consent.request` parameters for one `tool_permission` ask on an in-process
+/// read or write: exactly the fields Cingulate accepts (it refuses unknown
+/// ones). `command` belongs to exec asks only, which AFT does not send.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn request_params(
+    call_key: &str,
+    tool: &str,
+    operation: &str,
+    path: &str,
+    reason: &str,
+    args_hash: &str,
+    pattern: &str,
+    head_policy: Option<&str>,
+) -> Value {
+    let mut params = json!({
+        "args_hash": args_hash,
+        "call_key": call_key,
+        "kind": "tool_permission",
+        "operation": operation,
+        "paths": [path],
+        "pattern": pattern,
+        "reason": reason,
+        "tool": tool,
+    });
+    if let Some(policy) = head_policy {
+        params["head_policy"] = json!(policy);
+    }
+    sorted_keys(&params)
+}
+
 /// Cingulate's answer as AFT applies it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Settlement {
+pub(super) enum Settlement {
     Pending,
     Allow { scope: bool, by_user: bool },
     Deny { note: Option<String> },
     Refused(String),
 }
 
-fn settlement(reply: &Value) -> Settlement {
-    let outcome = reply
-        .get("outcome")
-        .or_else(|| reply.get("answer"))
-        .and_then(Value::as_str);
-    // A settled allow with no `answered_by` is treated as the head's answer,
-    // so it is checked against the head's authority again.
-    let by_user = reply.get("answered_by").and_then(Value::as_str) == Some("user");
-    let note = reply
-        .get("note")
-        .and_then(Value::as_str)
-        .map(|note| note.chars().take(160).collect());
-    match outcome {
-        Some("allow_once") => Settlement::Allow {
-            scope: false,
-            by_user,
-        },
-        Some("allow_scope") => Settlement::Allow {
-            scope: true,
-            by_user,
-        },
-        Some("deny") => Settlement::Deny { note },
-        Some(code) if code.starts_with("access_") => Settlement::Refused(code.to_string()),
-        _ => match reply.get("state").and_then(Value::as_str) {
-            Some("withdrawn") => Settlement::Refused("access_withdrawn".into()),
-            _ => Settlement::Pending,
-        },
-    }
+fn malformed(what: &str) -> ConsentError {
+    ConsentError::Unavailable(format!("cingulate's reply is not understood: {what}"))
 }
 
-fn elicitation_id(reply: &Value) -> Option<String> {
-    ["elicitation_id", "elicitationId", "id"]
-        .iter()
-        .find_map(|key| reply.get(*key).and_then(Value::as_str))
-        .filter(|id| !id.is_empty())
+/// The id in a `consent.request` result `{"elicitation_id": "acc_..."}`.
+pub(super) fn decode_elicitation_id(result: &Value) -> Result<String, ConsentError> {
+    result
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("elicitation_id"))
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("acc_"))
         .map(str::to_string)
+        .ok_or_else(|| malformed("consent.request did not return an acc_ elicitation_id"))
+}
+
+/// The state of the ask record `consent.await` and `consent.withdraw` return.
+/// `pending:head` and `pending:user` are still open. `settled` carries the
+/// answer and who gave it; an allow without `answered_by` counts as the head's,
+/// so it is checked against the head's authority again. `refused:<code>`
+/// (withdrawn, head gone) ends the call by that name and grants nothing.
+pub(super) fn decode_record(record: &Value) -> Result<Settlement, ConsentError> {
+    let field = |name: &str| record.get(name).and_then(Value::as_str);
+    let state = field("state").ok_or_else(|| malformed("the record has no state"))?;
+    match state {
+        "pending:head" | "pending:user" => Ok(Settlement::Pending),
+        "settled" => {
+            let by_user = match record.get("answered_by") {
+                None | Some(Value::Null) => false,
+                Some(Value::String(by)) if by == "head" => false,
+                Some(Value::String(by)) if by == "user" => true,
+                Some(_) => return Err(malformed("answered_by is neither head nor user")),
+            };
+            match field("outcome") {
+                Some("allow_once") => Ok(Settlement::Allow {
+                    scope: false,
+                    by_user,
+                }),
+                Some("allow_scope") => Ok(Settlement::Allow {
+                    scope: true,
+                    by_user,
+                }),
+                Some("deny") => Ok(Settlement::Deny {
+                    note: field("note").map(str::to_string),
+                }),
+                _ => Err(malformed("a settled record has no known outcome")),
+            }
+        }
+        refused if refused.starts_with("refused:") => {
+            let code = field("outcome")
+                .filter(|outcome| outcome.starts_with("access_"))
+                .unwrap_or(&refused["refused:".len()..]);
+            Ok(Settlement::Refused(code.to_string()))
+        }
+        _ => Err(malformed("the record's state is unknown")),
+    }
 }
 
 fn answer(call: &HeldCall, code: &str, message: String, prep_grant: &AccessGrant) -> Response {
@@ -685,7 +828,10 @@ fn refused_answer(
             format!("Outside access denied: the request for permission to {target} could not be placed.")
         }
         "access_withdrawn" => format!("The request for permission to {target} was withdrawn."),
-        _ => format!("Outside access denied ({code}) for {target}."),
+        _ => match note {
+            Some(detail) => format!("Outside access denied ({code}) for {target}: {detail}"),
+            None => format!("Outside access denied ({code}) for {target}."),
+        },
     };
     answer(call, code, message, grant)
 }
@@ -753,7 +899,7 @@ async fn withdraw(call: &HeldCall, prep: &Prepared, elicitation: &str) {
                 call,
                 prep,
                 "consent.withdraw",
-                json!({"elicitationId": elicitation}),
+                json!({"elicitation_id": elicitation}),
                 UNARY_TIMEOUT,
             ))
             .await
@@ -814,16 +960,9 @@ async fn hold(
             UNARY_TIMEOUT,
         ))
         .await;
-    let reply = match reply {
-        Ok(reply) => reply,
+    let elicitation = match reply.and_then(|reply| decode_elicitation_id(&reply)) {
+        Ok(elicitation) => elicitation,
         Err(error) => return failed(call, &prep, error).await,
-    };
-    let Some(elicitation) = elicitation_id(&reply).or(prep.elicitation_id.clone()) else {
-        return Hold::Answer(unavailable_answer(
-            call,
-            &prep.grant,
-            "cingulate returned no elicitation id",
-        ));
     };
     {
         let key = prep.key.clone();
@@ -834,22 +973,22 @@ async fn hold(
         })
         .await;
     }
-    let mut settled = settlement(&reply);
+    // Await at least once, even with no budget left, so an ask that already
+    // settled (a retry after the answer) is applied rather than parked.
+    let mut first = true;
     loop {
-        if settled != Settlement::Pending {
-            return finish(call, &prep, settled).await;
-        }
         let now = Instant::now();
-        if now >= deadline {
+        if now >= deadline && !first {
             park(call, &prep, &elicitation);
             return Hold::Answer(pending_answer(call, &prep.grant));
         }
-        let wait = deadline - now;
+        first = false;
+        let wait = deadline.saturating_duration_since(now).min(MAX_AWAIT);
         let awaited = transport.call(consent_call(
             call,
             &prep,
             "consent.await",
-            json!({"elicitationId": elicitation, "wait_ms": wait.as_millis() as u64}),
+            json!({"elicitation_id": elicitation, "timeout_ms": wait.as_millis() as u64}),
             wait + UNARY_TIMEOUT,
         ));
         tokio::pin!(awaited);
@@ -873,31 +1012,29 @@ async fn hold(
                 }
             }
         };
-        match reply {
-            None => {}
-            Some(Ok(reply)) => settled = settlement(&reply),
+        match reply.map(|reply| reply.and_then(|record| decode_record(&record))) {
+            None | Some(Ok(Settlement::Pending)) => {}
+            Some(Ok(settled)) => return finish(call, &prep, settled).await,
             Some(Err(error)) => return failed(call, &prep, error).await,
         }
     }
 }
 
-/// A transport failure keeps the ask for the retry; a named refusal ends it.
+/// A transport failure, and Cingulate's own `access_unavailable`, keep the ask
+/// so the retried call re-sends its call key. Any other named refusal (no
+/// head, not an Alfonso scope, requester refused, unknown or foreign ask, an
+/// invalid request) ends the ask and the call by that name.
 async fn failed(call: &HeldCall, prep: &Prepared, error: ConsentError) -> Hold {
     match error {
         ConsentError::Unavailable(detail) => {
             Hold::Answer(unavailable_answer(call, &prep.grant, &detail))
         }
+        ConsentError::Refused { code, message } if code == "access_unavailable" => {
+            Hold::Answer(unavailable_answer(call, &prep.grant, &message))
+        }
         ConsentError::Refused { code, message } => {
-            if TERMINAL_REFUSALS.contains(&code.as_str()) {
-                discard(call, prep).await;
-                Hold::Answer(refused_answer(call, &prep.grant, &code, None))
-            } else {
-                Hold::Answer(unavailable_answer(
-                    call,
-                    &prep.grant,
-                    &format!("{code}: {message}"),
-                ))
-            }
+            discard(call, prep).await;
+            Hold::Answer(refused_answer(call, &prep.grant, &code, Some(&message)))
         }
     }
 }
@@ -990,7 +1127,7 @@ fn park(call: &HeldCall, prep: &Prepared, elicitation: &str) {
             call,
             prep,
             "consent.withdraw",
-            json!({"elicitationId": elicitation}),
+            json!({"elicitation_id": elicitation}),
             UNARY_TIMEOUT,
         ),
         key: prep.key.clone(),
@@ -1090,7 +1227,7 @@ pub(super) fn reattach(
         runtime.spawn(async move {
             match transport.call(call).await {
                 Ok(reply) => {
-                    if let Some(id) = elicitation_id(&reply) {
+                    if let Ok(id) = decode_elicitation_id(&reply) {
                         let key = record.key.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             if let Ok(conn) = db.lock() {

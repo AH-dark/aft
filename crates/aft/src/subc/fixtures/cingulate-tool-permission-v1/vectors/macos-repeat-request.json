@@ -1,0 +1,1 @@
+{"method":"consent.request","params":{"folder":"/protected","kind":"macos_permission","program":"Terminal","steps":"Open System Settings, Privacy & Security, Files and Folders"}}

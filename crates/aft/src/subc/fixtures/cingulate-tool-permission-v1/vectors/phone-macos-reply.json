@@ -1,0 +1,1 @@
+{"result":{"asker":{"agent_id":"agent","scope_epoch":7,"scope_ref":"head"},"createdAtMs":1000,"elicitationId":"acc_3","folder":"/protected","kind":"macos_permission","options":[],"program":"Terminal","requesterLabel":"reserved:aft","state":"pending:user","steps":"Open System Settings, Privacy & Security, Files and Folders"}}

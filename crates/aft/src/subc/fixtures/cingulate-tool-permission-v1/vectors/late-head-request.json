@@ -1,0 +1,1 @@
+{"method":"consent.answer","params":{"answer":"deny","answered_by":{"agent_id":"agent","scope_epoch":7,"scope_ref":"head"},"elicitation_id":"acc_1"}}
