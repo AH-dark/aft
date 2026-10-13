@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The ranking-fenced search_index change only lets a test inject the clock that bounds an indexed grep scan; production still reads Instant::now. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
