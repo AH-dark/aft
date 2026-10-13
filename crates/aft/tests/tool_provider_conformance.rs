@@ -3201,10 +3201,8 @@ async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() 
         let mut call = json!({"name":"bash", "arguments":{"command":marker_command(&marker)}, "call_key":call_key});
         route.adapt_preset(&mut call);
         let mut wire = route.wire.lock().await;
-        let corr = wire.next_corr;
-        wire.next_corr += 1;
-        write_frame(
-            &mut wire.stream,
+        let corr = wire.corr();
+        wire.send(
             &Frame::build(
                 FrameType::Request,
                 flags(),
@@ -3217,14 +3215,13 @@ async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() 
         )
         .await
         .unwrap();
-        let ask = next_frame(&mut wire.stream).await.unwrap();
+        let ask = wire.next().await.unwrap();
         assert_eq!(ask.header.ty, FrameType::Request);
         assert!(!marker.exists());
         let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
         conn.execute_batch(&format!("CREATE TRIGGER refuse_authorization_{index} BEFORE UPDATE ON call_ledger WHEN NEW.call_key='{call_key}' AND NEW.state='{state}' BEGIN SELECT RAISE(ABORT, 'authorization storage fixture failure'); END;")).unwrap();
         for _ in 0..2 {
-            write_frame(
-                &mut wire.stream,
+            wire.send(
                 &Frame::build(
                     FrameType::Response,
                     flags(),
@@ -3238,7 +3235,7 @@ async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() 
             .await
             .unwrap();
         }
-        let reply = tokio::time::timeout(Duration::from_secs(1), next_frame(&mut wire.stream))
+        let reply = tokio::time::timeout(Duration::from_secs(1), wire.next())
             .await
             .expect("durable authorization failure must answer before prompt expiry")
             .unwrap();
@@ -3256,8 +3253,7 @@ async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() 
             .query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
             .unwrap();
         assert_eq!(executions, 0);
-        write_frame(
-            &mut wire.stream,
+        wire.send(
             &Frame::build(
                 FrameType::Response,
                 flags(),
@@ -3271,7 +3267,7 @@ async fn s1_keyed_authorization_storage_failure_answers_once_and_never_spawns() 
         .await
         .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(60), next_frame(&mut wire.stream))
+            tokio::time::timeout(Duration::from_millis(60), wire.next())
                 .await
                 .is_err(),
             "late/duplicate allows must not emit another original terminal"
