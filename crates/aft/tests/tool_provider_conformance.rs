@@ -355,6 +355,10 @@ fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, Harn
             "AFT_TEST_CALL_LEDGER_CONTROL",
             root.join("ledger-control.json"),
         )
+        .env(
+            "AFT_TEST_LEDGER_ADMISSION_GATE",
+            root.join("admission-gate"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1764,6 +1768,71 @@ async fn s2_withdrawn_held_request_ends_not_started_and_never_runs() {
         assert_eq!(refused.header.ty, FrameType::Error);
         assert_eq!(response_json(&refused)["code"], "unsupported_operation");
     }
+}
+
+/// A withdraw that settles a held call after its admission committed but
+/// before the frame loop filed its question. The admission gate orders it:
+/// hold the request between admission and question filing, withdraw, then
+/// release. The request must end `not_started` without a question being filed
+/// and without its command running.
+#[cfg(feature = "test-timing-hooks")]
+#[tokio::test]
+async fn s2_withdraw_before_the_question_is_filed_ends_the_request_not_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::head().spawn(&root).await.unwrap();
+    let route = Subject::head()
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    let warm = Subject::head()
+        .route(&process, &Subject::head().plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        false,
+    )
+    .await;
+    let gate = root.join("admission-gate");
+    let held_signal = root.join("admission-gate.held");
+    std::fs::write(&gate, b"hold").unwrap();
+    let marker = root.join("project/unfiled-marker");
+    let mut held = route
+        .start(json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"unfiled"}))
+        .await;
+    // Admission committed `Prepared`; the request has not reached the frame loop.
+    wait_for_file(&held_signal).await;
+    let withdrawn = route.terminal(withdraw_body("unfiled")).await;
+    assert_eq!(withdrawn.header.ty, FrameType::Response);
+    assert_eq!(response_json(&withdrawn), json!({"answer": "withdrawn"}));
+    std::fs::remove_file(&gate).unwrap();
+    let ended = held.terminal(Duration::from_secs(10)).await;
+    assert_eq!(
+        ended.header.ty,
+        FrameType::Error,
+        "{}",
+        String::from_utf8_lossy(&ended.body)
+    );
+    assert_eq!(
+        response_json(&ended),
+        json!({"code": "not_started", "message": "call was not started",
+               "detail": {"call_key": "unfiled", "reason": "withdrawn"}})
+    );
+    // No permission question was ever filed for it, and it never ran.
+    let mut wire = route.wire.lock().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), wire.next())
+            .await
+            .is_err(),
+        "a question was filed for the withdrawn call"
+    );
+    drop(wire);
+    assert!(!marker.exists(), "the withdrawn call ran");
+    assert_eq!(
+        route.terminal(withdraw_body("unfiled")).await.body,
+        withdrawn.body
+    );
 }
 
 #[tokio::test]

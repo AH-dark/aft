@@ -851,6 +851,34 @@ struct LedgerCall {
     withdrawn: bool,
 }
 
+/// Test-only gate between a keyed call's durable admission and the frame
+/// loop seeing its request (which, for a held shell call, files the
+/// permission question). Lets a real-process test withdraw the call in that
+/// window. With `AFT_TEST_LEDGER_ADMISSION_GATE` naming a path and a file at
+/// that path, the admission writes `<path>.held` and waits, at most 60 s,
+/// until the file is removed. Compiled only with `test-timing-hooks`.
+#[cfg(feature = "test-timing-hooks")]
+async fn admission_gate() {
+    let Some(gate) = std::env::var_os("AFT_TEST_LEDGER_ADMISSION_GATE") else {
+        return;
+    };
+    let gate = std::path::PathBuf::from(gate);
+    if !gate.exists() {
+        return;
+    }
+    let mut held = gate.clone().into_os_string();
+    held.push(".held");
+    if std::fs::write(&held, b"held").is_err() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while gate.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+#[cfg(not(feature = "test-timing-hooks"))]
+async fn admission_gate() {}
+
 /// The role operations that read or change the call ledger.
 fn custody_operation(name: &str) -> bool {
     matches!(name, "tool.withdraw" | "late_results" | "late_results.ack")
@@ -1299,9 +1327,24 @@ impl LedgerEdge {
             let result = result_rx.await.unwrap_or(Err(response));
             match result {
                 Ok(Admission::New) => {
-                    let waiting = edge.waiting.lock().unwrap();
-                    if !waiting.contains_key(&(route, decoded.frame.header.corr)) {
-                        drop(waiting);
+                    let admitted = {
+                        let waiting = edge.waiting.lock().unwrap();
+                        let admitted = waiting.contains_key(&(route, decoded.frame.header.corr));
+                        if admitted {
+                            edge.calls.lock().unwrap().insert(
+                                (route, decoded.frame.header.corr),
+                                LedgerCall {
+                                    root: root.clone(),
+                                    key: response_key.clone(),
+                                    expires_at: std::time::Instant::now()
+                                        + bash_elicitation_timeout(),
+                                    withdrawn: false,
+                                },
+                            );
+                        }
+                        admitted
+                    };
+                    if !admitted {
                         // Drain answered before admission completed. No tool was
                         // dispatched, so leave a durable not-started result for repeats.
                         drop(repeat_executor.submit_async(root, Lane::Mutating, "ledger-drained-admission".into(), Box::new(move |ctx| {
@@ -1317,15 +1360,11 @@ impl LedgerEdge {
                         })));
                         return;
                     }
-                    edge.calls.lock().unwrap().insert(
-                        (route, decoded.frame.header.corr),
-                        LedgerCall {
-                            root,
-                            key: response_key,
-                            expires_at: std::time::Instant::now() + bash_elicitation_timeout(),
-                            withdrawn: false,
-                        },
-                    );
+                    // Without `test-timing-hooks` the gate is an empty async fn:
+                    // it completes on its first poll and never yields, so the
+                    // admission check above and the send stay one step on the
+                    // frame loop's single-threaded runtime.
+                    admission_gate().await;
                     let _ = edge.ready.send(decoded);
                 }
                 Ok(Admission::Repeat(row)) if row.state != State::Settled => {
