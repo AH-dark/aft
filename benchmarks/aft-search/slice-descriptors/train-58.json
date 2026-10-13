@@ -1,1 +1,10 @@
-train-57.json
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "phrase_present_not_surfaced",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/tests/integration/aft_search_contract_test.rs",
+    "crates/aft/tests/engine_search_extensions_test.rs"
+  ],
+  "slices": ["A-integration", "B2-prerequisite"]
+}
