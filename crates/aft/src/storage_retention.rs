@@ -3600,11 +3600,9 @@ mod storage_retention_tests {
             .unwrap();
             let path = cache(temp.path(), "views", &key);
             for file in 0..FILES {
-                // Sparse payloads model a large store without allocating gigabytes.
-                fs::File::create(path.join(format!("payload-{file}.bin")))
-                    .unwrap()
-                    .set_len(8 * 1024 * 1024)
-                    .unwrap();
+                // File count exercises traversal cost; small payloads also work
+                // on filesystems that allocate the full length of an extended file.
+                fs::write(path.join(format!("payload-{file}.bin")), b"rebuildable").unwrap();
             }
             let measurements = measurements.clone();
             let walks = walks.clone();
@@ -3613,8 +3611,6 @@ mod storage_retention_tests {
                 Arc::new(move |step| {
                     if step == "measure-file" {
                         measurements.fetch_add(1, Ordering::Relaxed);
-                        // Model metadata I/O latency, not synthetic CPU load.
-                        std::thread::sleep(Duration::from_micros(200));
                     } else if step == "walk" {
                         walks.fetch_add(1, Ordering::Relaxed);
                     }
@@ -3633,25 +3629,40 @@ mod storage_retention_tests {
         let orphan_key = "ffffffffffffffff";
         let orphan = cache(temp.path(), "views", orphan_key);
         age_orphan(temp.path(), &orphan, orphan_key);
-        let started = Instant::now();
-        let report = run_pass_with_budget(
-            temp.path(),
-            &|| false,
-            &Instant::now,
-            Duration::from_secs(2),
-        );
+        let run_bounded_pass = || {
+            let clock_start = Instant::now();
+            let clock_calls = AtomicUsize::new(0);
+            let clock = || {
+                if clock_calls.fetch_add(1, Ordering::Relaxed) < MIN_REMOVED {
+                    clock_start
+                } else {
+                    // Prioritized due candidates stop at half the pass budget. After
+                    // MIN_REMOVED checks, jump past that cutoff but stay before
+                    // the unbound-view stage's three-quarter cutoff and the
+                    // full-budget cutoff of the general directory traversal.
+                    clock_start + NO_TIME_BOUND * 5 / 8
+                }
+            };
+            // Inner safety walks still use wall time. Their generous guard is
+            // independent of the logical clock that bounds the candidate count.
+            run_pass_with_budget(temp.path(), &|| false, &clock, NO_TIME_BOUND)
+        };
+        let report = run_bounded_pass();
         let remaining = (0..ROOTS)
             .filter(|number| temp.path().join(format!("views/{number:016x}")).exists())
             .count();
-        eprintln!("retention fixture roots={ROOTS} files_per_root={FILES} logical_bytes_per_root={} budget_ms=2000 elapsed_ms={} measured_files={} walks={} cursor_commits={} due_removed={} remaining={} orphan_examined={} errors={:?}", FILES * 8 * 1024 * 1024, started.elapsed().as_millis(), measurements.load(Ordering::Relaxed), walks.load(Ordering::Relaxed), cursor_commits.load(Ordering::Relaxed), report.due_first.removed_roots, remaining, report.orphan_views.examined, report.errors);
-        eprintln!("retention fixture timings_ms={:?}", report.timings_ms);
-        assert!(
-            report.due_first.removed_roots >= MIN_REMOVED,
+        eprintln!("retention fixture roots={ROOTS} files_per_root={FILES} logical_due_quota={MIN_REMOVED} measured_files={} walks={} cursor_commits={} due_removed={} remaining={} orphan_examined={} errors={:?}", measurements.load(Ordering::Relaxed), walks.load(Ordering::Relaxed), cursor_commits.load(Ordering::Relaxed), report.due_first.removed_roots, remaining, report.orphan_views.examined, report.errors);
+        assert_eq!(
+            report.due_first.removed_roots, MIN_REMOVED,
             "due backlog did not drain: {report:?}"
         );
-        assert!(remaining <= ROOTS - MIN_REMOVED, "backlog did not shrink");
-        assert!(
-            report.orphan_views.examined > 0,
+        assert_eq!(
+            remaining,
+            ROOTS - MIN_REMOVED - PASS_ENTRIES,
+            "backlog did not shrink"
+        );
+        assert_eq!(
+            report.orphan_views.examined, 1,
             "orphan lane starved: {report:?}"
         );
         assert_eq!(
@@ -3659,16 +3670,12 @@ mod storage_retention_tests {
             0,
             "due roots were byte-measured"
         );
-        assert!(
-            cursor_commits.load(Ordering::Relaxed) <= 2,
+        assert_eq!(
+            cursor_commits.load(Ordering::Relaxed),
+            2,
             "cursor was synced per entry"
         );
-        let second = run_pass_with_budget(
-            temp.path(),
-            &|| false,
-            &Instant::now,
-            Duration::from_secs(2),
-        );
+        let second = run_bounded_pass();
         let second_remaining = (0..ROOTS)
             .filter(|number| temp.path().join(format!("views/{number:016x}")).exists())
             .count();
@@ -3676,13 +3683,24 @@ mod storage_retention_tests {
             "retention second pass due_removed={} remaining={second_remaining}",
             second.due_first.removed_roots
         );
-        assert!(
-            second.due_first.removed_roots >= MIN_REMOVED,
+        assert_eq!(
+            second.due_first.removed_roots, MIN_REMOVED,
             "second pass stalled: {second:?}"
         );
-        assert!(
-            second_remaining <= remaining - MIN_REMOVED,
+        assert_eq!(
+            second_remaining,
+            remaining - MIN_REMOVED - PASS_ENTRIES,
             "second pass did not shrink backlog"
+        );
+        assert_eq!(
+            measurements.load(Ordering::Relaxed),
+            0,
+            "second pass byte-measured due roots"
+        );
+        assert_eq!(
+            cursor_commits.load(Ordering::Relaxed),
+            4,
+            "second pass did not commit each batch once"
         );
     }
 
