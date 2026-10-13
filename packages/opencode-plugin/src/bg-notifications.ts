@@ -69,6 +69,7 @@ export interface BgLongRunningReminder {
 }
 
 type SessionBgState = {
+  heldWorkerCompletions?: boolean;
   outstandingTaskIds: Set<string>;
   pendingCompletions: BgCompletion[];
   pendingLongRunning: BgLongRunningReminder[];
@@ -410,6 +411,27 @@ export function unmarkExplicitControl(sessionID: string | undefined, taskId: str
   stateFor(sessionID).explicitControlTasks.delete(taskId);
 }
 
+/** Keep a silent worker completion for its next tool result, not a new turn. */
+export function holdBgCompletion(
+  sessionID: string,
+  completion: BgCompletion,
+  stopped = false,
+): void {
+  const state = stateFor(sessionID);
+  if (!stopped && state.consumedTaskIds.has(completion.task_id)) return;
+  state.heldWorkerCompletions = true;
+  state.explicitControlTasks.delete(completion.task_id);
+  state.outstandingTaskIds.delete(completion.task_id);
+  if (!state.pendingCompletions.some((pending) => pending.task_id === completion.task_id)) {
+    state.pendingCompletions.push(completion);
+  }
+}
+
+export function hasHeldBgCompletions(sessionID: string): boolean {
+  const state = stateFor(sessionID);
+  return state.heldWorkerCompletions === true && state.pendingCompletions.length > 0;
+}
+
 function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntry): void {
   const normalized: PatternMatchEntry = entry.reason
     ? entry
@@ -581,6 +603,7 @@ export async function appendInTurnBgCompletions(
     reminder_chars: reminder.length,
   });
   state.pendingCompletions = [];
+  state.heldWorkerCompletions = false;
   for (const completion of deliveredCompletions) {
     state.wakeDeferredTaskIds.delete(completion.task_id);
   }

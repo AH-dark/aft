@@ -34,6 +34,12 @@ import { resolveBashConfig } from "../config.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
+import {
+  allowV2WatchWake,
+  awaitV2ExecutionSettlement,
+  trackV2Watch,
+  v2SubagentStopped,
+} from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
 import { bashCompanionRegistered } from "./bash.js";
 
@@ -162,6 +168,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
           if (code === "too_many_watches") throw new Error(`invalid_request: ${message}`);
           throw new Error(`${code}: ${message}`);
         }
+        await trackV2Watch(ctx, context, taskId, registered.watch_id);
         const metadata = (context as { metadata?: (data: Record<string, unknown>) => void })
           .metadata;
         metadata?.({ taskId, registered: true, watchId: registered.watch_id });
@@ -190,6 +197,10 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         effectiveWaitMs,
         role,
       );
+      if (isSubagent && context.abort.aborted)
+        await awaitV2ExecutionSettlement(ctx.client, context.sessionID);
+      const stopped = isSubagent && v2SubagentStopped(ctx.client, context.sessionID);
+      if (stopped && data.waited?.reason === "user_message") data.waited.reason = "aborted";
       const waited = data.waited;
       // User-message abort: the sync wait was interrupted because the user
       // sent a message. Auto-register the equivalent async watch so the
@@ -245,6 +256,7 @@ async function convertToAsyncWatchOnAbort(
   // No pattern: the auto-reminder system already handles exit notifications
   // for background tasks, so no explicit watch registration is needed.
   if (!waitFor) {
+    allowV2WatchWake(ctx.client, context.sessionID, taskId);
     return (
       interrupted +
       interruptedWatchTail(
@@ -274,6 +286,7 @@ async function convertToAsyncWatchOnAbort(
         reminderFallback
       );
     }
+    await trackV2Watch(ctx, context, taskId, registered.watch_id);
     return (
       interrupted +
       `The wait has been converted to an async watch (${registered.watch_id}). ` +
@@ -475,6 +488,11 @@ export async function waitForBashStatus(
       }
       busySince = undefined;
       lastData = data;
+      // A cancelled worker tool cannot deliver its inline result. Leave a
+      // racing completion unacknowledged for the worker's next resumed turn.
+      if (role === "worker" && abortSignal?.aborted) {
+        return withWaited(data, waited("aborted"));
+      }
       const terminal = isTerminalStatus(data.status);
       if (waitFor) {
         const scan = await readNewTaskOutput(data, spillCursor);

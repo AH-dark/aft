@@ -68,6 +68,7 @@ export interface V2BashExecution {
 }
 
 export interface V2ToolConsumers {
+  onToolAbort?: (sessionID: string) => void;
   /** A resumed session can discover pending wakes without starting another shell. */
   registerSession?: (sessionID: string | undefined) => void;
   /** Maps legacy tool permission requests to the V2 session permission service. */
@@ -381,23 +382,31 @@ export function projectV2Tool(
     execute: (rawInput, context) =>
       Effect.tryPromise({
         try: async (signal) => {
-          if (name === "bash_status" || name === "bash_watch") {
-            consumers.registerSession?.(context.sessionID);
+          const onAbort = () => {
+            if (context.sessionID) consumers.onToolAbort?.(context.sessionID);
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          try {
+            if (name === "bash_status" || name === "bash_watch") {
+              consumers.registerSession?.(context.sessionID);
+            }
+            const runtime = runtimeFor(name, location, context, signal, consumers);
+            const input = executionArguments(name, rawInput);
+            const result =
+              consumers.executeBash && V2_BASH_TOOLS.has(name)
+                ? await consumers.executeBash({
+                    name: name as "bash" | "aft_bash",
+                    input,
+                    context: runtime,
+                    definition,
+                  })
+                : await definition.execute(input, runtime as never);
+            const refusal = failureEnvelopeMessage(result);
+            if (refusal) throw new Error(refusal);
+            return resultContent(result);
+          } finally {
+            signal.removeEventListener("abort", onAbort);
           }
-          const runtime = runtimeFor(name, location, context, signal, consumers);
-          const input = executionArguments(name, rawInput);
-          const result =
-            consumers.executeBash && V2_BASH_TOOLS.has(name)
-              ? await consumers.executeBash({
-                  name: name as "bash" | "aft_bash",
-                  input,
-                  context: runtime,
-                  definition,
-                })
-              : await definition.execute(input, runtime as never);
-          const refusal = failureEnvelopeMessage(result);
-          if (refusal) throw new Error(refusal);
-          return resultContent(result);
         },
         catch: failure,
       }),

@@ -7,11 +7,23 @@ import type {
 import { Effect } from "effect";
 
 import { interruptBashWaitsForChatMessage } from "../bash-wait-detach.js";
-import { formatLongRunningReminder, formatSystemReminder } from "../bg-notifications.js";
+import {
+  formatLongRunningReminder,
+  formatSystemReminder,
+  holdBgCompletion,
+} from "../bg-notifications.js";
 import type { AftConfig } from "../config.js";
 import { warn } from "../logger.js";
+import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import { executeV2Bash } from "../tools/bash/executor.js";
 import type { V2ToolConsumers } from "../tools/definitions/v2.js";
+import {
+  awaitV2ExecutionSettlement,
+  forgetV2Watch,
+  noteV2ToolAbort,
+  v2SubagentStopped,
+  v2WatchWakeAllowed,
+} from "../v2-session-lifecycle.js";
 import { type V2SessionAdmission, V2SessionDelivery } from "./session-delivery.js";
 
 export interface V2WakeHostContext {
@@ -235,6 +247,21 @@ export function createV2RuntimeConsumer(
   const sessions = new Set<string>();
   const route: WakeRoute = {
     completion: async (completion, bridge) => {
+      if (await resolveIsSubagent(context, completion.session_id)) {
+        await awaitV2ExecutionSettlement(context, completion.session_id);
+      }
+      if (
+        (await resolveIsSubagent(context, completion.session_id)) &&
+        !v2WatchWakeAllowed(context, completion.session_id, completion.task_id)
+      ) {
+        holdBgCompletion(
+          completion.session_id,
+          completion,
+          v2SubagentStopped(context, completion.session_id),
+        );
+        forgetV2Watch(context, completion.session_id, completion.task_id);
+        return;
+      }
       const text = formatSystemReminder([completion]);
       const admitted = await Effect.runPromise(
         delivery.completion({
@@ -258,6 +285,7 @@ export function createV2RuntimeConsumer(
         session_id: completion.session_id,
         task_ids: [completion.task_id],
       });
+      forgetV2Watch(context, completion.session_id, completion.task_id);
     },
     longRunning: (reminder) =>
       Effect.runPromise(
@@ -285,6 +313,7 @@ export function createV2RuntimeConsumer(
   return {
     bridgeOptions: sharedBridgeOptions,
     registerSession,
+    onToolAbort: (sessionID) => noteV2ToolAbort(context, sessionID),
     executeBash: (execution) => {
       registerSession(execution.context.sessionID);
       return executeV2Bash(execution);

@@ -1,10 +1,11 @@
 import type { SessionContext, SessionDomain } from "@opencode/plugin/effect/session";
 import type { ToolDomain } from "@opencode/plugin/effect/tool";
 import { Effect, Schema } from "effect";
-
+import { appendInTurnBgCompletions, hasHeldBgCompletions } from "./bg-notifications.js";
 import { prepareOpenCodeArguments } from "./normalize-schemas.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { rememberReadModel } from "./shared/read-vision.js";
+import type { PluginContext } from "./types.js";
 import {
   aftToolNameForV2Host,
   renameV2ToolReferences,
@@ -71,7 +72,7 @@ function restoreShellDescription(
  */
 export function registerV2ToolHooks(
   context: unknown,
-  runtime: { hashlineEffective?: boolean },
+  runtime: { hashlineEffective?: boolean; pool?: PluginContext["pool"] },
   registeredTools: ReadonlySet<string>,
   bashDescription?: string,
 ) {
@@ -80,6 +81,34 @@ export function registerV2ToolHooks(
     bashDescription === undefined ? undefined : renameV2ToolReferences(bashDescription);
   return Effect.gen(function* () {
     if (typeof host.tool?.hook === "function") {
+      yield* host.tool.hook("execute.after", (event) =>
+        Effect.promise(async () => {
+          if (
+            !runtime.pool ||
+            event.status !== "completed" ||
+            !hasHeldBgCompletions(event.sessionID)
+          )
+            return;
+          const content = event.result.content;
+          const output = { output: "" };
+          await appendInTurnBgCompletions(
+            {
+              ctx: runtime as PluginContext,
+              directory: (context as { location: { directory: string } }).location.directory,
+              sessionID: event.sessionID,
+            },
+            output,
+          );
+          if (!output.output) return;
+          event.result = {
+            ...event.result,
+            content:
+              typeof content === "string"
+                ? content + output.output
+                : [...(content ?? []), { type: "text", text: output.output }],
+          };
+        }),
+      );
       yield* host.tool.hook("execute.before", (event) =>
         Effect.try({
           try: () => {

@@ -24,6 +24,7 @@ import {
 } from "../v2-host-tool-names.js";
 import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
 import { registerV2ToolHooks } from "../v2-tool-hooks.js";
+import { registerV2SessionLifecycle } from "../v2-session-lifecycle.js";
 import { registerV2WorkflowHints } from "../v2-workflow-hints.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import { buildHintsForRegisteredTools } from "../workflow-hints.js";
@@ -232,6 +233,7 @@ export function makeServerEffect(overrides = {}) {
       );
       const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
+      yield* registerV2SessionLifecycle(context);
       // OpenCode 2 has no chat.message hook; its session prompt hook is where a
       // new message detaches a waiting bash, as chat.message does on OpenCode 1.
       // The config is read through the tool context so live reloads apply.

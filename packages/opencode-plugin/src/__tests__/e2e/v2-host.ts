@@ -8,10 +8,11 @@
  * service. AFT is loaded from this package's `dist/` (run `bun run build`
  * first) with the `aft` binary in AFT_BINARY_PATH, default target/debug/aft.
  */
+
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { OpenCode } from "@opencode/client";
+import { OpenCode, type V2Event } from "@opencode/client";
 
 export const pluginRoot = resolve(import.meta.dir, "../../..");
 const repoRoot = resolve(pluginRoot, "../..");
@@ -52,7 +53,12 @@ export async function until(label: string, predicate: () => Promise<boolean>, ms
  * call (when the tool is offered); anything else gets a plain reply. Every
  * request is recorded, and so is the command of every call it issues.
  */
-function startModel(script: ModelScript, requests: ModelRequest[], issued: string[]) {
+function startModel(
+  script: ModelScript,
+  requests: ModelRequest[],
+  issued: string[],
+  errors: V2HostOptions["modelErrors"],
+) {
   let call = 0;
   return Bun.serve({
     hostname: "127.0.0.1",
@@ -70,6 +76,12 @@ function startModel(script: ModelScript, requests: ModelRequest[], issued: strin
           choices: [{ index: 0, delta, finish_reason: finish }],
         })}\n\n`;
       const last = body.messages.at(-1);
+      const error = last?.role === "user" ? errors?.[messageText(last.content).trim()] : undefined;
+      if (error)
+        return Response.json(
+          { error: { message: error.message, type: error.code, code: error.code } },
+          { status: error.status },
+        );
       const step = last?.role === "user" ? script[messageText(last.content).trim()] : undefined;
       if (step && body.tools?.some((tool) => tool.function.name === step.name)) {
         call += 1;
@@ -132,6 +144,7 @@ export interface V2HostOptions {
   files?: Record<string, string>;
   /** User-tier AFT config, written under the host's own XDG_CONFIG_HOME. */
   userAftConfig?: Record<string, unknown>;
+  modelErrors?: Record<string, { status: number; code: string; message: string }>;
 }
 
 export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
@@ -175,7 +188,10 @@ export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
 
   const requests: ModelRequest[] = [];
   const issued: string[] = [];
-  const model = startModel(options.script, requests, issued);
+  const model = startModel(options.script, requests, issued, options.modelErrors);
+  const eventAbort = new AbortController();
+  const events: V2Event[] = [];
+
   // An explicit service port plus throwaway HOME/XDG roots and database keep
   // the host off the operator's managed OpenCode service.
   const portProbe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
@@ -244,6 +260,7 @@ export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
       setTimeout(() => child.kill("SIGKILL"), 2000).unref();
     });
     model.stop(true);
+    eventAbort.abort();
     await rm(root, { recursive: true, force: true });
   };
 
@@ -272,6 +289,17 @@ export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
       response.json(),
     )) as { version: string };
     const client = OpenCode.make({ baseUrl: `http://127.0.0.1:${port}`, headers });
+    const subscription = client.event
+      .subscribe({ signal: eventAbort.signal })
+      [Symbol.asyncIterator]();
+    const first = subscription.next();
+    void (async () => {
+      let next = await first;
+      while (!next.done) {
+        events.push(next.value);
+        next = await subscription.next();
+      }
+    })().catch(() => {});
     await client.location.get({ location: { directory: project } });
     return {
       client,
@@ -279,6 +307,8 @@ export async function bootV2Host(hostBinary: string, options: V2HostOptions) {
       requests,
       issued,
       version: info.version,
+      events,
+
       logs: () => logs,
       stop,
       async newSession(title: string) {
