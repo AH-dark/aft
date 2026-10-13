@@ -33,8 +33,18 @@ fn rust_worker_logged_manager(log: &std::path::Path) -> LspManager {
     manager
 }
 
+pub(crate) fn rust_worker_policy_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    // These fixtures share the daemon-wide worker counter even when Rust's
+    // test runner executes different modules concurrently.
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn rust_worker_config_disables_all_compilation_and_head_config_is_unchanged() {
+    let _guard = rust_worker_policy_test_guard();
     let (temp, file, _) = rust_fixture_files();
     let log = temp.path().join("initialization.jsonl");
     let mut manager = rust_worker_logged_manager(&log);
@@ -88,24 +98,9 @@ fn rust_worker_config_disables_all_compilation_and_head_config_is_unchanged() {
     assert_eq!(rows[1]["procMacro.enable"], false);
 }
 
-#[cfg(unix)]
-fn shutdown_fixture_config() -> Config {
-    // Shutdown budgets apply to every language server. Use uncapped custom
-    // servers so this six-process cleanup test does not bypass the Rust cap.
-    let mut config = Config::default();
-    config.disabled_lsp.insert("rust".into());
-    config.lsp_servers.push(UserServerDef {
-        id: "shutdown-fixture".into(),
-        extensions: vec!["rs".into()],
-        binary: fake_server_path().display().to_string(),
-        root_markers: vec!["Cargo.toml".into()],
-        ..Default::default()
-    });
-    config
-}
-
 #[test]
 fn rust_worker_shared_root_restarts_head_analyzer_and_never_reenables_cargo() {
+    let _guard = rust_worker_policy_test_guard();
     let (temp, file, other) = rust_fixture_files();
     let log = temp.path().join("initialization.jsonl");
     let mut manager = rust_worker_logged_manager(&log);
@@ -140,11 +135,15 @@ fn rust_worker_shared_root_restarts_head_analyzer_and_never_reenables_cargo() {
 
 #[test]
 fn rust_worker_cap_refuses_n_plus_one_without_spawn() {
+    let _guard = rust_worker_policy_test_guard();
     let fixtures = (0..3).map(|_| rust_fixture_files()).collect::<Vec<_>>();
     let mut managers = fixtures
         .iter()
         .map(|(temp, _, _)| rust_worker_logged_manager(&temp.path().join("initialization.jsonl")))
         .collect::<Vec<_>>();
+    for manager in &mut managers {
+        manager.disable_rust_cargo_for_worker();
+    }
     let config = Config::default();
     for index in 0..2 {
         assert_eq!(
@@ -173,15 +172,67 @@ fn rust_worker_cap_refuses_n_plus_one_without_spawn() {
         0,
         "capacity refusal must happen before spawning"
     );
+}
+
+#[test]
+fn rust_worker_cap_admits_next_request_after_slot_release_without_restart() {
+    let _guard = rust_worker_policy_test_guard();
+    let fixtures = (0..3).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let mut managers = fixtures
+        .iter()
+        .map(|(temp, _, _)| {
+            let mut manager = rust_worker_logged_manager(&temp.path().join("initialization.jsonl"));
+            manager.disable_rust_cargo_for_worker();
+            manager
+        })
+        .collect::<Vec<_>>();
+    let config = Config::default();
+    for index in 0..2 {
+        assert_eq!(
+            managers[index]
+                .ensure_server_for_file(&fixtures[index].1, &config)
+                .len(),
+            1
+        );
+    }
+    let refused = managers[2].ensure_server_for_file_detailed(&fixtures[2].1, &config);
+    assert!(refused.successful.is_empty());
+    assert!(refused.attempts[0]
+        .result
+        .failure_reason()
+        .contains("rust_analyzer_capacity_exhausted"));
     drop(managers.remove(0));
-    managers[1].clear_failed_spawns();
     assert_eq!(
         managers[1]
             .ensure_server_for_file(&fixtures[2].1, &config)
             .len(),
         1,
-        "dropping an analyzer must release its slot"
+        "the very next request must start after slot release without clearing failures or restarting"
     );
+}
+
+#[test]
+fn rust_worker_cap_never_counts_or_refuses_head_analyzers() {
+    let _guard = rust_worker_policy_test_guard();
+    let fixtures = (0..4).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let mut managers = fixtures
+        .iter()
+        .map(|(temp, _, _)| rust_worker_logged_manager(&temp.path().join("initialization.jsonl")))
+        .collect::<Vec<_>>();
+    for index in [1, 2] {
+        managers[index].disable_rust_cargo_for_worker();
+    }
+    // A primary-session analyzer starts before the workers; another starts
+    // after both worker slots are full. Neither may consume or need a slot.
+    for index in 0..4 {
+        assert_eq!(
+            managers[index]
+                .ensure_server_for_file(&fixtures[index].1, &Config::default())
+                .len(),
+            1,
+            "head analyzers must not consume or be refused worker capacity (start {index})"
+        );
+    }
 }
 
 #[test]
@@ -686,7 +737,6 @@ fn test_manager_shutdown_all() {
 #[cfg(unix)]
 #[test]
 fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() {
-    let config = shutdown_fixture_config();
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
     let registry = LspChildRegistry::new();
     let mut managers = Vec::new();
@@ -695,7 +745,7 @@ fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() 
         manager.set_child_registry(registry.clone());
         manager.override_binary(ServerKind::Rust, fake_server_path());
         manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
-        manager.ensure_server_for_file(main_rs, &config);
+        manager.ensure_server_for_file_default(main_rs);
         managers.push(manager);
     }
     let pids = registry.pids();
@@ -730,7 +780,6 @@ fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() 
 #[cfg(unix)]
 #[test]
 fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
-    let config = shutdown_fixture_config();
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
     let registry = LspChildRegistry::new();
     let mut manager = LspManager::new();
@@ -739,7 +788,7 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
     manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
 
     for (_, main_rs, _) in &fixtures {
-        manager.ensure_server_for_file(main_rs, &config);
+        manager.ensure_server_for_file_default(main_rs);
     }
     let pids = registry.pids();
     assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");
@@ -777,7 +826,6 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
 #[cfg(unix)]
 #[test]
 fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_with_delayed_exit() {
-    let config = shutdown_fixture_config();
     use aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET;
 
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
@@ -789,7 +837,7 @@ fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_with_dela
     manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SIGTERM", "1");
     manager.set_extra_env("AFT_FAKE_LSP_EXIT_DELAY_MS", "30000");
     for (_, main_rs, _) in &fixtures {
-        manager.ensure_server_for_file(main_rs, &config);
+        manager.ensure_server_for_file_default(main_rs);
     }
     let pids = registry.pids();
     assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");

@@ -431,11 +431,6 @@ pub(crate) fn run_diagnostics_category(
                 .cargo_disabled_producers
                 .insert((server_id(key), key.root.clone()));
         }
-        if !collection.cargo_disabled_producers.is_empty() {
-            collection
-                .producer_notes
-                .insert("Run cargo check via runon: \"linux,4c\" for compiler diagnostics.".into());
-        }
     }
     collection
         .uncertified_compiler_reports

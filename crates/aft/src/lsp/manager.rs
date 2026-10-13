@@ -954,6 +954,7 @@ const TRANSIENT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 /// environment changing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureDurability {
+    Capacity,
     /// Only a change to the environment fixes it: a binary that is missing or
     /// cannot be executed, a server that exited naming a configuration error
     /// AFT recognises, or a server AFT's own checks refused. Replayed until
@@ -1126,6 +1127,10 @@ impl LspManager {
         }
         let now = self.retry_clock.now();
         let retry_at = match durability {
+            // Capacity changes when another root releases a slot, not when a
+            // broken executable recovers. Recheck on the next request instead
+            // of hiding an available slot behind the normal startup backoff.
+            FailureDurability::Capacity => return result,
             FailureDurability::Permanent => {
                 self.transient_backoff.remove(key);
                 None
@@ -6282,6 +6287,7 @@ impl PreparedSpawn {
             self.event_tx,
             self.child_registry,
             Some(&self.reclaim_root),
+            worker,
         ) {
             Ok(client) => client,
             Err(err) => {
@@ -6299,7 +6305,6 @@ impl PreparedSpawn {
             }
         };
         client.runtime_note = self.runtime_note;
-        client.rust_cargo_disabled_for_worker = worker;
         client.completed_rust_check = completed_rust_check;
         // A worker can arrive while spawn runs without the manager lock.
         // Apply its policy before initialize; finish also rejects an unsafe
@@ -6309,8 +6314,15 @@ impl PreparedSpawn {
                 .rust_worker_policy
                 .load(std::sync::atomic::Ordering::Acquire)
         {
+            if let Err(error) = client.enable_rust_worker_policy() {
+                return Err(SpawnFailure::NotStarted {
+                    exit_log_line: format!(
+                        "worker analyzer admission refused before initialize: {error}"
+                    ),
+                    error: error.into(),
+                });
+            }
             disable_rust_cargo_options(&mut self.initialization_options);
-            client.rust_cargo_disabled_for_worker = true;
             client.completed_rust_check = None;
         }
         let initialize = match initialize_timeout {
@@ -7209,6 +7221,13 @@ fn prepare_failure(error: LspError) -> StartFailure {
 /// I/O error may not recur.
 fn process_start_durability(error: &LspError) -> FailureDurability {
     match error {
+        LspError::Io(io)
+            if io.get_ref().is_some_and(|cause| {
+                cause.is::<super::client::RustAnalyzerCapacityExhausted>()
+            }) =>
+        {
+            FailureDurability::Capacity
+        }
         LspError::NotFound(_) => FailureDurability::Permanent,
         LspError::Io(io)
             if matches!(

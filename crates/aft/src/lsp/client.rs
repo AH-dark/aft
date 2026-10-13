@@ -39,9 +39,25 @@ const CAUSE_STDERR_LINE_BYTES: usize = 200;
 /// Longest command line quoted in exit reports.
 const COMMAND_DISPLAY_BYTES: usize = 512;
 
-// An analyzer indexes a whole Cargo workspace and owns its own thread pools
-// and caches. Limit processes across root managers, not just within one root.
-const RUST_ANALYZER_PROCESS_CAP: usize = 2;
+// Delegated sessions can fan out across many worktrees, each with independent
+// analyzer thread pools and caches. Bound that fan-out without withholding
+// diagnostics from primary or standalone sessions on other repositories.
+const RUST_ANALYZER_WORKER_PROCESS_CAP: usize = 2;
+
+#[derive(Debug)]
+pub(crate) struct RustAnalyzerCapacityExhausted {
+    cap: usize,
+}
+
+impl std::fmt::Display for RustAnalyzerCapacityExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,
+            "rust_analyzer_capacity_exhausted: daemon-wide worker-policy rust-analyzer process cap={} reached; retry after another worker analyzer stops",
+            self.cap)
+    }
+}
+
+impl std::error::Error for RustAnalyzerCapacityExhausted {}
 
 struct RustAnalyzerCapacity {
     active: Mutex<usize>,
@@ -56,10 +72,7 @@ impl RustAnalyzerCapacity {
         if *active >= self.cap {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!(
-                    "rust_analyzer_capacity_exhausted: daemon-wide rust-analyzer process cap={} reached; retry after another analyzer stops",
-                    self.cap
-                ),
+                RustAnalyzerCapacityExhausted { cap: self.cap },
             ));
         }
         *active += 1;
@@ -78,7 +91,7 @@ fn rust_analyzer_capacity() -> &'static Arc<RustAnalyzerCapacity> {
     CAPACITY.get_or_init(|| {
         Arc::new(RustAnalyzerCapacity {
             active: Mutex::new(0),
-            cap: RUST_ANALYZER_PROCESS_CAP,
+            cap: RUST_ANALYZER_WORKER_PROCESS_CAP,
         })
     })
 }
@@ -840,6 +853,7 @@ impl LspClient {
             event_tx,
             child_registry,
             None,
+            false,
         )
     }
 
@@ -853,6 +867,7 @@ impl LspClient {
         event_tx: Sender<LspEvent>,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
+        worker_policy: bool,
     ) -> io::Result<Self> {
         Self::spawn_with_capacity(
             kind,
@@ -863,6 +878,7 @@ impl LspClient {
             event_tx,
             child_registry,
             reclaim_root,
+            worker_policy,
             rust_analyzer_capacity(),
         )
     }
@@ -876,11 +892,11 @@ impl LspClient {
         event_tx: Sender<LspEvent>,
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
+        worker_policy: bool,
         capacity: &Arc<RustAnalyzerCapacity>,
     ) -> io::Result<Self> {
-        let rust_analyzer_permit = (kind == ServerKind::Rust)
-            .then(|| capacity.acquire())
-            .transpose()?;
+        let worker_policy = kind == ServerKind::Rust && worker_policy;
+        let rust_analyzer_permit = worker_policy.then(|| capacity.acquire()).transpose()?;
         #[cfg(windows)]
         let is_batch_file = crate::windows_command::is_batch_file(binary);
         #[cfg(windows)]
@@ -1105,7 +1121,7 @@ impl LspClient {
         child_registry.mark_client_live(child_pid);
         Ok(Self {
             _rust_analyzer_permit: rust_analyzer_permit,
-            rust_cargo_disabled_for_worker: false,
+            rust_cargo_disabled_for_worker: worker_policy,
             runtime_note: None,
             kind,
             root,
@@ -1144,6 +1160,17 @@ impl LspClient {
             #[cfg(test)]
             suppress_kill_on_drop: false,
         })
+    }
+
+    pub(crate) fn enable_rust_worker_policy(&mut self) -> io::Result<()> {
+        if self.kind == ServerKind::Rust && !self.rust_cargo_disabled_for_worker {
+            // A worker can arrive after a primary session spawned the child
+            // but before initialize. Count that conversion before sending the
+            // worker configuration; refusal drops the still-uninitialized child.
+            self._rust_analyzer_permit = Some(rust_analyzer_capacity().acquire()?);
+            self.rust_cargo_disabled_for_worker = true;
+        }
+        Ok(())
     }
 
     /// Send the initialize request and wait for response. Transition to Ready.

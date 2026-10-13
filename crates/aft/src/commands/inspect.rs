@@ -1996,7 +1996,13 @@ pub(crate) fn partial_terminal_reason(payload: &Map<String, Value>) -> Option<St
     partial_reason_from_parts(&incomplete_result_parts(payload))
 }
 
-fn incomplete_result_parts(payload: &Map<String, Value>) -> Vec<(bool, String)> {
+struct InspectIncompleteReason {
+    diagnostic: bool,
+    text: String,
+    retryable: bool,
+}
+
+fn incomplete_result_parts(payload: &Map<String, Value>) -> Vec<InspectIncompleteReason> {
     let mut parts = payload
         .get("summary")
         .and_then(Value::as_object)
@@ -2020,15 +2026,26 @@ fn incomplete_result_parts(payload: &Map<String, Value>) -> Vec<(bool, String)> 
         };
         let reason = gap["reason"].as_str().unwrap_or("analysis did not finish");
         let reason = format!("{label}: {}", compact_inspect_reason(reason));
-        if !parts.iter().any(|(_, existing)| existing == &reason) {
-            parts.push((false, reason));
+        if !parts.iter().any(|existing| existing.text == reason) {
+            parts.push(InspectIncompleteReason {
+                diagnostic: false,
+                text: reason,
+                retryable: true,
+            });
         }
     }
     if parts.is_empty() && payload.get("complete").and_then(Value::as_bool) == Some(false) {
-        parts.push((false, "analysis incomplete: no complete report".to_string()));
+        parts.push(InspectIncompleteReason {
+            diagnostic: false,
+            text: "analysis incomplete: no complete report".to_string(),
+            retryable: true,
+        });
     }
-    parts.sort_by_key(|(diagnostic, reason)| {
-        (*diagnostic, if *diagnostic { 0 } else { reason.len() })
+    parts.sort_by_key(|part| {
+        (
+            part.diagnostic,
+            if part.diagnostic { 0 } else { part.text.len() },
+        )
     });
     parts
 }
@@ -2066,17 +2083,21 @@ fn set_inspect_completion(payload: &mut Map<String, Value>) {
             .and_then(Value::as_object)
             .map(incomplete_summary_parts)
             .unwrap_or_default();
-        for (diagnostic, reason) in incomplete_result_parts(payload)
+        for part in incomplete_result_parts(payload)
             .into_iter()
             .skip(MAX_INSPECT_HEADER_PARTS)
         {
-            if diagnostic && !text.contains(&reason) {
-                text.push_str(&format!("\nIncomplete diagnostics: {reason}"));
+            if part.diagnostic && !text.contains(&part.text) {
+                text.push_str(&format!("\nIncomplete diagnostics: {}", part.text));
             }
         }
-        for (_, reason) in incomplete_result_parts(payload) {
-            if !summary_parts.iter().any(|(_, part)| part == &reason) && !text.contains(&reason) {
-                text.push_str(&format!("\nIncomplete analysis: {reason}"));
+        for part in incomplete_result_parts(payload) {
+            if !summary_parts
+                .iter()
+                .any(|existing| existing.text == part.text)
+                && !text.contains(&part.text)
+            {
+                text.push_str(&format!("\nIncomplete analysis: {}", part.text));
             }
         }
         payload.insert("text".to_string(), Value::String(text));
@@ -2172,7 +2193,7 @@ fn incomplete_category_gaps(category: InspectCategory, value: &Value) -> Vec<Val
 
 /// Short scanner explanations precede verbose diagnostic producer explanations.
 /// Diagnostic causes retain first-seen order, including their scoped roots.
-fn incomplete_summary_parts(summary: &Map<String, Value>) -> Vec<(bool, String)> {
+fn incomplete_summary_parts(summary: &Map<String, Value>) -> Vec<InspectIncompleteReason> {
     let mut groups = Vec::<(String, Vec<String>)>::new();
     for (category, value) in summary {
         if category == "diagnostics" || !category_is_incomplete(value) {
@@ -2209,14 +2230,18 @@ fn incomplete_summary_parts(summary: &Map<String, Value>) -> Vec<(bool, String)>
     }
     let mut parts = groups
         .into_iter()
-        .map(|(reason, labels)| (false, format!("{} {reason}", labels.join(", "))))
+        .map(|(reason, labels)| InspectIncompleteReason {
+            diagnostic: false,
+            text: format!("{} {reason}", labels.join(", ")),
+            retryable: true,
+        })
         .collect::<Vec<_>>();
-    parts.sort_by_key(|(_, reason)| reason.len());
+    parts.sort_by_key(|part| part.text.len());
     if let Some(causes) = summary
         .get("diagnostics")
         .and_then(diagnostics_unknown_causes)
     {
-        parts.extend(causes.into_iter().map(|cause| (true, cause)));
+        parts.extend(causes);
     }
     parts
 }
@@ -2226,7 +2251,7 @@ fn partial_summary_reason(summary: &Map<String, Value>) -> Option<String> {
     partial_reason_from_parts(&parts)
 }
 
-fn partial_reason_from_parts(parts: &[(bool, String)]) -> Option<String> {
+fn partial_reason_from_parts(parts: &[InspectIncompleteReason]) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
@@ -2235,22 +2260,28 @@ fn partial_reason_from_parts(parts: &[(bool, String)]) -> Option<String> {
     let mut shown = parts
         .iter()
         .take(MAX_INSPECT_HEADER_PARTS)
-        .map(|(diagnostic, reason)| {
-            if *diagnostic && !diagnostic_label_shown {
+        .map(|part| {
+            if part.diagnostic && !diagnostic_label_shown {
                 diagnostic_label_shown = true;
-                format!("diagnostics unknown: {reason}")
+                format!("diagnostics unknown: {}", part.text)
             } else {
-                reason.clone()
+                part.text.clone()
             }
         })
         .collect::<Vec<_>>();
     if parts.len() > shown.len() {
         shown.push(format!("+{} more", parts.len() - shown.len()));
     }
-    Some(format!("{}; retry aft_inspect.", shown.join("; ")))
+    // Retrying can fill an unfinished report, but cannot enable compiler
+    // checks forbidden by the session policy. Keep advice for other gaps.
+    Some(if parts.iter().any(|part| part.retryable) {
+        format!("{}; retry aft_inspect.", shown.join("; "))
+    } else {
+        shown.join("; ")
+    })
 }
 
-fn diagnostics_unknown_causes(diagnostics: &Value) -> Option<Vec<String>> {
+fn diagnostics_unknown_causes(diagnostics: &Value) -> Option<Vec<InspectIncompleteReason>> {
     if diagnostics.get("complete").and_then(Value::as_bool) != Some(false) {
         return None;
     }
@@ -2259,7 +2290,15 @@ fn diagnostics_unknown_causes(diagnostics: &Value) -> Option<Vec<String>> {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let mut causes = Vec::<(String, String, String, usize)>::new();
+    struct Cause<'a> {
+        producer: &'a str,
+        root: &'a str,
+        reason: &'a str,
+        files: usize,
+        retryable: bool,
+        suggestion: Option<&'a str>,
+    }
+    let mut causes = Vec::<Cause<'_>>::new();
     // Producer gaps are the primary explanation; uncovered files add counts
     // to that explanation rather than restating it with slightly different words.
     for uncovered in [false, true] {
@@ -2277,6 +2316,8 @@ fn diagnostics_unknown_causes(diagnostics: &Value) -> Option<Vec<String>> {
             let reason = cause["reason"]
                 .as_str()
                 .unwrap_or("no authoritative report");
+            let retryable =
+                cause["reason_code"].as_str() != Some("cargo_check_disabled_for_worker");
             let files = if uncovered {
                 1
             } else {
@@ -2285,50 +2326,71 @@ fn diagnostics_unknown_causes(diagnostics: &Value) -> Option<Vec<String>> {
                     .map_or(0, Vec::len)
             };
             if let Some(existing) = causes.iter_mut().find(|entry| {
-                entry.0 == producer && (entry.1 == root || entry.1.is_empty() || root.is_empty())
+                entry.producer == producer
+                    && entry.retryable == retryable
+                    && (entry.root == root || entry.root.is_empty() || root.is_empty())
             }) {
-                existing.3 += files;
-                if existing.1.is_empty() {
-                    existing.1 = root.to_string();
+                existing.files += files;
+                if existing.root.is_empty() {
+                    existing.root = root;
                 }
             } else {
-                causes.push((
-                    producer.to_string(),
-                    root.to_string(),
-                    reason.to_string(),
+                causes.push(Cause {
+                    producer,
+                    root,
+                    reason,
                     files,
-                ));
+                    retryable,
+                    suggestion: cause["suggestion"].as_str(),
+                });
             }
         }
     }
     let mut explanations = causes
         .into_iter()
-        .map(|(producer, root, reason, files)| {
-            let producer = if producer == "rust" {
+        .map(|cause| {
+            let producer = if cause.producer == "rust" {
                 "rust-analyzer"
             } else {
-                &producer
+                cause.producer
             };
-            let reason = reason.strip_prefix("still checking: ").unwrap_or(&reason);
+            let reason = cause
+                .reason
+                .strip_prefix("still checking: ")
+                .unwrap_or(cause.reason);
             let reason = reason
                 .strip_prefix(&format!("{producer}: "))
                 .unwrap_or(reason);
             let reason = compact_inspect_reason(reason);
-            let root = if root.is_empty() {
+            let root = if cause.root.is_empty() {
                 String::new()
             } else {
-                format!(" @ {root}")
+                format!(" @ {}", cause.root)
             };
-            let count = match files {
+            let count = match cause.files {
                 0 => String::new(),
                 1 => " (1 file)".to_string(),
                 n => format!(" ({n} files)"),
             };
-            compact_inspect_reason(&format!("{producer}{root}: {reason}{count}"))
+            let mut text = compact_inspect_reason(&format!("{producer}{root}: {reason}{count}"));
+            if !cause.retryable {
+                if let Some(suggestion) = cause.suggestion {
+                    text = format!("{}. {suggestion}", text.trim_end_matches('.'));
+                }
+            }
+            InspectIncompleteReason {
+                diagnostic: true,
+                text,
+                retryable: cause.retryable,
+            }
         })
         .collect::<Vec<_>>();
     if explanations.is_empty() {
-        explanations.push("no authoritative report".to_string());
+        explanations.push(InspectIncompleteReason {
+            diagnostic: true,
+            text: "no authoritative report".to_string(),
+            retryable: true,
+        });
     }
     Some(explanations)
 }
@@ -3399,12 +3461,12 @@ fn render_incomplete_categories(
 ) {
     // Most diagnostic reasons live only in the header. Overflow must remain
     // visible in the body, even for non-file producer failures.
-    for (_, reason) in incomplete_summary_parts(summary)
+    for part in incomplete_summary_parts(summary)
         .into_iter()
         .skip(MAX_INSPECT_HEADER_PARTS)
-        .filter(|(diagnostic, _)| *diagnostic)
+        .filter(|part| part.diagnostic)
     {
-        lines.push(format!("Incomplete diagnostics: {reason}"));
+        lines.push(format!("Incomplete diagnostics: {}", part.text));
     }
     for (category, value) in summary {
         if value.get("complete").and_then(Value::as_bool) != Some(false) {
@@ -5595,6 +5657,20 @@ mod fresh_payload_tests {
     use super::*;
     use crate::config::Config;
     use crate::parser::SymbolCache;
+
+    #[test]
+    fn worker_cargo_policy_keeps_other_same_root_gaps_retryable() {
+        let summary = serde_json::json!({"diagnostics": {"complete": false, "gaps": [
+            {"kind": "cargo_check_disabled_for_worker", "reason_code": "cargo_check_disabled_for_worker",
+             "producer": "rust", "root": ".",
+             "reason": "cargo_check_disabled_for_worker: compile diagnostics are rust-analyzer-only for this session",
+             "suggestion": "Run cargo check via runon: \"linux,4c\" for compiler diagnostics."},
+            {"kind": "failed_producer", "producer": "rust", "root": ".",
+             "reason": "rust_analyzer_capacity_exhausted: worker-policy process cap=2 reached"}
+        ]}});
+        let reason = partial_summary_reason(summary.as_object().unwrap()).unwrap();
+        assert_eq!(reason, "diagnostics unknown: rust-analyzer @ .: cargo_check_disabled_for_worker: compile diagnostics are rust-analyzer-only for this session. Run cargo check via runon: \"linux,4c\" for compiler diagnostics.; rust-analyzer @ .: rust_analyzer_capacity_exhausted: worker-policy process cap=2 reached; retry aft_inspect.");
+    }
 
     #[test]
     fn disabled_inspect_categories_render_off_and_never_partial() {
