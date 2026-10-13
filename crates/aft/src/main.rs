@@ -1249,6 +1249,9 @@ fn dispatch_config_probe_for_test(ctx: &AppContext) {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    if req.worker_session() {
+        ctx.lsp().disable_rust_cargo_for_worker();
+    }
     if ctx.claim_database_runtime_retry(&req.command) {
         ctx.retry_database_runtime();
     }
@@ -1586,6 +1589,9 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
 }
 
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
+    if req.worker_session() {
+        ctx.lsp().disable_rust_cargo_for_worker();
+    }
     // The request is admitted here: pin the published config so every handler
     // below, and every worker thread a deferred handler starts, uses this
     // snapshot even if a live config reload publishes while it runs.

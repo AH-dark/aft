@@ -23,6 +23,167 @@ fn fake_server_path() -> PathBuf {
     crate::test_helpers::fake_lsp::fake_server_binary()
 }
 
+fn rust_worker_logged_manager(log: &std::path::Path) -> LspManager {
+    let mut manager = LspManager::new();
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+    manager.set_extra_env(
+        "AFT_FAKE_LSP_INITIALIZATION_LOG",
+        &log.display().to_string(),
+    );
+    manager
+}
+
+#[test]
+fn rust_worker_config_disables_all_compilation_and_head_config_is_unchanged() {
+    let (temp, file, _) = rust_fixture_files();
+    let log = temp.path().join("initialization.jsonl");
+    let mut manager = rust_worker_logged_manager(&log);
+    let config = Config::default();
+    assert_eq!(manager.ensure_server_for_file(&file, &config).len(), 1);
+    manager.shutdown_all();
+    manager.disable_rust_cargo_for_worker();
+    let mut worker_config = config.clone();
+    worker_config.lsp_servers.push(UserServerDef {
+        id: "rust".into(),
+        initialization_options: Some(json!({
+            "checkOnSave": true,
+            "cargo": {"buildScripts": {"enable": true}},
+            "procMacro": {"enable": true},
+            "cargo.buildScripts.enable": true,
+            "procMacro.enable": true,
+        })),
+        ..Default::default()
+    });
+    assert_eq!(
+        manager.ensure_server_for_file(&file, &worker_config).len(),
+        1
+    );
+    let rows: Vec<Value> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        json!({
+            "checkOnSave": false,
+            "cargo": {"targetDir": true, "extraArgs": ["--locked"], "metadataExtraArgs": ["--locked"]}
+        }),
+        "head options must stay byte-for-value compatible"
+    );
+    for pointer in [
+        "/checkOnSave",
+        "/cargo/buildScripts/enable",
+        "/procMacro/enable",
+    ] {
+        assert_eq!(
+            rows[1].pointer(pointer),
+            Some(&json!(false)),
+            "worker must disable {pointer}"
+        );
+    }
+    assert_eq!(rows[1]["cargo"]["metadataExtraArgs"], json!(["--locked"]));
+    assert_eq!(rows[1]["cargo.buildScripts.enable"], false);
+    assert_eq!(rows[1]["procMacro.enable"], false);
+}
+
+#[cfg(unix)]
+fn shutdown_fixture_config() -> Config {
+    // Shutdown budgets apply to every language server. Use uncapped custom
+    // servers so this six-process cleanup test does not bypass the Rust cap.
+    let mut config = Config::default();
+    config.disabled_lsp.insert("rust".into());
+    config.lsp_servers.push(UserServerDef {
+        id: "shutdown-fixture".into(),
+        extensions: vec!["rs".into()],
+        binary: fake_server_path().display().to_string(),
+        root_markers: vec!["Cargo.toml".into()],
+        ..Default::default()
+    });
+    config
+}
+
+#[test]
+fn rust_worker_shared_root_restarts_head_analyzer_and_never_reenables_cargo() {
+    let (temp, file, other) = rust_fixture_files();
+    let log = temp.path().join("initialization.jsonl");
+    let mut manager = rust_worker_logged_manager(&log);
+    let config = Config::default();
+    assert_eq!(manager.ensure_server_for_file(&file, &config).len(), 1);
+    manager.disable_rust_cargo_for_worker();
+    assert_eq!(
+        manager.server_count(),
+        0,
+        "worker admission must retire the head's analyzer"
+    );
+    assert_eq!(manager.ensure_server_for_file(&file, &config).len(), 1);
+    // Simulate a primary session reading another file after a delegated
+    // session arrived. Both share the root's analyzer, so the primary read
+    // must not turn compilation back on for the delegated session.
+    assert_eq!(manager.ensure_server_for_file(&other, &config).len(), 1);
+    manager.disable_rust_cargo_for_worker();
+    assert_eq!(manager.server_count(), 1, "worker admission is idempotent");
+    let rows: Vec<Value> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the head and worker must share one replacement"
+    );
+    assert_eq!(rows[1]["cargo"]["buildScripts"]["enable"], false);
+    assert_eq!(rows[1]["procMacro"]["enable"], false);
+}
+
+#[test]
+fn rust_worker_cap_refuses_n_plus_one_without_spawn() {
+    let fixtures = (0..3).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let mut managers = fixtures
+        .iter()
+        .map(|(temp, _, _)| rust_worker_logged_manager(&temp.path().join("initialization.jsonl")))
+        .collect::<Vec<_>>();
+    let config = Config::default();
+    for index in 0..2 {
+        assert_eq!(
+            managers[index]
+                .ensure_server_for_file(&fixtures[index].1, &config)
+                .len(),
+            1
+        );
+    }
+    let pid_dir = fixtures[2].0.path().join("pids");
+    fs::create_dir(&pid_dir).unwrap();
+    managers[2].set_extra_env("AFT_FAKE_LSP_PID_DIR", &pid_dir.display().to_string());
+    let result = managers[2].ensure_server_for_file_detailed(&fixtures[2].1, &config);
+    assert!(
+        result.successful.is_empty(),
+        "the third analyzer must not be admitted"
+    );
+    let failure = result.attempts[0].result.failure_reason();
+    assert!(
+        failure.contains("rust_analyzer_capacity_exhausted"),
+        "{failure}"
+    );
+    assert!(failure.contains("cap=2"), "{failure}");
+    assert_eq!(
+        fs::read_dir(&pid_dir).unwrap().count(),
+        0,
+        "capacity refusal must happen before spawning"
+    );
+    drop(managers.remove(0));
+    managers[1].clear_failed_spawns();
+    assert_eq!(
+        managers[1]
+            .ensure_server_for_file(&fixtures[2].1, &config)
+            .len(),
+        1,
+        "dropping an analyzer must release its slot"
+    );
+}
+
 #[test]
 fn lsp_child_environment_disables_optional_git_locks_unless_configured() {
     use aft::lsp::client::LspClient;
@@ -525,6 +686,7 @@ fn test_manager_shutdown_all() {
 #[cfg(unix)]
 #[test]
 fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() {
+    let config = shutdown_fixture_config();
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
     let registry = LspChildRegistry::new();
     let mut managers = Vec::new();
@@ -533,7 +695,7 @@ fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() 
         manager.set_child_registry(registry.clone());
         manager.override_binary(ServerKind::Rust, fake_server_path());
         manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
-        manager.ensure_server_for_file_default(main_rs);
+        manager.ensure_server_for_file(main_rs, &config);
         managers.push(manager);
     }
     let pids = registry.pids();
@@ -568,6 +730,7 @@ fn shutdown_taken_clients_shares_deadline_across_roots_and_reaps_every_server() 
 #[cfg(unix)]
 #[test]
 fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
+    let config = shutdown_fixture_config();
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
     let registry = LspChildRegistry::new();
     let mut manager = LspManager::new();
@@ -576,7 +739,7 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
     manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
 
     for (_, main_rs, _) in &fixtures {
-        manager.ensure_server_for_file_default(main_rs);
+        manager.ensure_server_for_file(main_rs, &config);
     }
     let pids = registry.pids();
     assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");
@@ -614,6 +777,7 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
 #[cfg(unix)]
 #[test]
 fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_with_delayed_exit() {
+    let config = shutdown_fixture_config();
     use aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET;
 
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
@@ -625,7 +789,7 @@ fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_with_dela
     manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SIGTERM", "1");
     manager.set_extra_env("AFT_FAKE_LSP_EXIT_DELAY_MS", "30000");
     for (_, main_rs, _) in &fixtures {
-        manager.ensure_server_for_file_default(main_rs);
+        manager.ensure_server_for_file(main_rs, &config);
     }
     let pids = registry.pids();
     assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");

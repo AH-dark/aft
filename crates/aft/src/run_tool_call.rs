@@ -343,6 +343,9 @@ pub(crate) fn prepare_tool_call(
             phase_trace,
         ));
     }
+    if ctx.worker_session {
+        app_ctx.lsp().disable_rust_cargo_for_worker();
+    }
     let sanitized_args = strip_agent_preview_arg_owned(args);
     let binding_root = app_ctx
         .canonical_cache_root_opt()

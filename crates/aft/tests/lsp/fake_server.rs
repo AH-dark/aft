@@ -658,6 +658,11 @@ pub(crate) fn main() -> io::Result<()> {
         match message {
             ServerMessage::Request { id, method, params } => match method.as_str() {
                 "initialize" => {
+                    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_INITIALIZATION_LOG") {
+                        use std::io::Write;
+                        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+                        writeln!(log, "{}", params.as_ref().unwrap()["initializationOptions"]).unwrap();
+                    }
                     if std::env::var("AFT_FAKE_LSP_INIT_NO_REPLY").ok().as_deref() == Some("1")
                         || std::env::var_os("AFT_FAKE_LSP_INIT_NO_REPLY_ONCE").is_some_and(|path| {
                             std::fs::OpenOptions::new()

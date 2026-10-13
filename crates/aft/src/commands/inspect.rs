@@ -354,6 +354,9 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
+    if req.worker_session() {
+        ctx.lsp().disable_rust_cargo_for_worker();
+    }
     handle_inspect_payload(
         req,
         ctx,
@@ -507,6 +510,9 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
 }
 
 pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response {
+    if req.worker_session() {
+        ctx.lsp().disable_rust_cargo_for_worker();
+    }
     let phase_log = InspectPhaseLog::for_request(req.id.clone());
     let deadline = InspectRequestDeadline::from_config(&ctx.config());
     let snapshot = match inspect_preflight(req, ctx) {
@@ -1116,6 +1122,9 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     ctx: Arc<AppContext>,
     force_restrict: bool,
 ) -> DispatchOutcome {
+    if req.worker_session() {
+        ctx.lsp().disable_rust_cargo_for_worker();
+    }
     let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());

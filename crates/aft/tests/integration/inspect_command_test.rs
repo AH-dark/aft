@@ -4273,6 +4273,69 @@ fn single_crate_fixture(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (temp_dir, root, lib)
 }
 
+#[cfg(unix)]
+#[test]
+fn rust_worker_inspect_is_partial_and_never_invokes_cargo_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, root, _) = single_crate_fixture("worker-inspect");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let log = temp.path().join("cargo-invocations");
+    let cargo = bin.join("cargo");
+    let real_cargo = which::which("cargo").unwrap();
+    fs::write(&cargo, format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = check ]; then exit 1; fi\nexec '{}' \"$@\"\n",
+        log.display(), real_cargo.display()
+    )).unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let ctx = configured_context(&root);
+    let mut config = (*ctx.config()).clone();
+    config.inspect.diagnostics_timeout_ms = 10_000;
+    ctx.set_config(config);
+    {
+        let mut lsp = ctx.lsp();
+        lsp.override_binary(ServerKind::Rust, fake_server_path());
+        lsp.set_extra_env("PATH", path.to_str().unwrap());
+        // Pin the same recorder for the explicit check as well as PATH lookup;
+        // inherited toolchain discovery must not bypass the fake Cargo.
+        lsp.set_extra_env("CARGO", cargo.to_str().unwrap());
+    }
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "worker-inspect", "command": "inspect", "scope": "src/lib.rs",
+            "sections": "diagnostics", "worker_session": true,
+        }),
+    );
+    assert!(
+        !log.exists(),
+        "worker inspect must never invoke Cargo: {:?}",
+        fs::read_to_string(&log)
+    );
+    assert_eq!(response["inspect_terminal"], "partial", "{response:#}");
+    assert_eq!(response["complete"], false);
+    let text = response["text"].as_str().unwrap();
+    eprintln!("worker inspect wording: {text}");
+    assert!(text.starts_with("PARTIAL —"), "{text}");
+    assert!(text.contains("cargo_check_disabled_for_worker: compile diagnostics are rust-analyzer-only for this session"), "{text}");
+    assert!(
+        text.contains("Run cargo check via runon: \"linux,4c\" for compiler diagnostics."),
+        "{text}"
+    );
+    assert!(
+        response["summary"]["diagnostics"]["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["reason_code"] == "cargo_check_disabled_for_worker"),
+        "{response:#}"
+    );
+}
+
 fn scoped_diagnostics_inspect(ctx: &AppContext, id: &str, scope: &str) -> Value {
     inspect_tool_call(
         ctx,

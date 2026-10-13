@@ -772,6 +772,7 @@ pub struct LspShutdownAllOutcome {
 }
 
 pub struct LspManager {
+    rust_cargo_disabled_for_worker: Arc<std::sync::atomic::AtomicBool>,
     quiesced: std::sync::atomic::AtomicBool,
     /// Active server instances, keyed by (ServerKind, workspace_root).
     clients: HashMap<ServerKey, LspClient>,
@@ -1027,6 +1028,7 @@ impl LspManager {
     pub fn new() -> Self {
         let (event_tx, event_rx) = unbounded();
         Self {
+            rust_cargo_disabled_for_worker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quiesced: std::sync::atomic::AtomicBool::new(false),
             clients: HashMap::new(),
             inspect_rust_checks: HashMap::new(),
@@ -1066,6 +1068,46 @@ impl LspManager {
     #[doc(hidden)]
     pub fn set_retry_clock(&mut self, clock: RetryClock) {
         self.retry_clock = clock;
+    }
+
+    /// A root's analyzer is shared by sessions. Once a worker uses the root,
+    /// keep Cargo disabled until the manager is destroyed: a later head request
+    /// must not re-enable compilation underneath an attached worker.
+    pub fn disable_rust_cargo_for_worker(&mut self) {
+        if self
+            .rust_cargo_disabled_for_worker
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let keys: Vec<_> = self
+            .clients
+            .keys()
+            .filter(|key| key.kind == ServerKind::Rust)
+            .cloned()
+            .collect();
+        for key in keys {
+            // Drop kills the old process group, including any check it started
+            // before the worker arrived. The next request starts a safe instance.
+            self.clients.remove(&key);
+            self.server_binaries.remove(&key);
+            self.documents.remove(&key);
+            self.diagnostics.clear_server_instance(&key);
+        }
+        self.inspect_rust_checks.clear();
+        self.failed_spawns
+            .retain(|key, _| key.kind != ServerKind::Rust);
+        self.transient_backoff
+            .retain(|key, _| key.kind != ServerKind::Rust);
+    }
+
+    pub(crate) fn rust_worker_policy(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.rust_cargo_disabled_for_worker.clone()
+    }
+
+    pub(crate) fn rust_cargo_disabled_for_worker(&self) -> bool {
+        self.rust_cargo_disabled_for_worker
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Remember a failed start of `key` and return the result to report for
@@ -1537,6 +1579,19 @@ impl LspManager {
             .get(key)
             .map(|reservation| reservation.clients_generation);
         match result {
+            Ok(client)
+                if self.rust_cargo_disabled_for_worker()
+                    && key.kind == ServerKind::Rust
+                    && !client.rust_cargo_disabled_for_worker =>
+            {
+                outcomes.failures.push(ApplicableServerFailure {
+                    server_key: key.clone(),
+                    result: ServerAttemptResult::SpawnFailed {
+                        binary: candidate.definition.binary.clone(),
+                        reason: RUST_WORKER_POLICY_CHANGED.into(),
+                    },
+                });
+            }
             // A start through another path (an edit's diagnostics, say) won
             // the race; keep that client and let this one's drop stop its
             // process.
@@ -1694,6 +1749,16 @@ impl LspManager {
             .get(key)
             .map(|reservation| reservation.clients_generation);
         let outcome = match result {
+            Ok(client)
+                if self.rust_cargo_disabled_for_worker()
+                    && key.kind == ServerKind::Rust
+                    && !client.rust_cargo_disabled_for_worker =>
+            {
+                Some(ServerAttemptResult::SpawnFailed {
+                    binary: def.binary.clone(),
+                    reason: RUST_WORKER_POLICY_CHANGED.into(),
+                })
+            }
             // Another path started the same server meanwhile; keep that
             // client and let this one's drop stop its process.
             Ok(_) if self.clients.contains_key(key) => {
@@ -2918,6 +2983,9 @@ impl LspManager {
         &self,
         deadline: Instant,
     ) -> HashMap<ServerKey, super::completed_rust_check::SavedCheck> {
+        if self.rust_cargo_disabled_for_worker() {
+            return HashMap::new();
+        }
         let mut saved: HashMap<_, _> = self
             .clients
             .iter()
@@ -2950,6 +3018,9 @@ impl LspManager {
         ServerKey,
         Arc<parking_lot::Mutex<super::completed_rust_check::CompletedRustCheck>>,
     )> {
+        if self.rust_cargo_disabled_for_worker() {
+            return Vec::new();
+        }
         for key in producers {
             if self.inspect_rust_checks.contains_key(key) {
                 continue;
@@ -5405,6 +5476,7 @@ impl LspManager {
             .unwrap_or_else(|| root.to_path_buf());
 
         Ok(PreparedSpawn {
+            rust_worker_policy: self.rust_worker_policy(),
             kind: def.kind.clone(),
             binary_name: def.binary.clone(),
             root: root.to_path_buf(),
@@ -5695,6 +5767,33 @@ fn biome_unavailable_reason(reason: &str) -> String {
 }
 
 const ASTRO_TSDK_UNAVAILABLE: &str = "astro-ls requires a project TypeScript install; none found";
+
+const RUST_WORKER_POLICY_CHANGED: &str = "rust_analyzer_worker_policy_changed: a worker disabled Cargo while the analyzer was starting; retry to start an analyzer-only instance";
+
+fn disable_rust_cargo_options(options: &mut Option<serde_json::Value>) {
+    // procMacro.enable implies build-script compilation even when the build
+    // script flag is false. Override both, and checks, after user options.
+    let mut disabled = serde_json::json!({
+        "checkOnSave": false,
+        "cargo": {"buildScripts": {"enable": false}},
+        "procMacro": {"enable": false},
+    });
+    if let Some(configured) = options.take() {
+        let mut merged = configured;
+        merge_json_override(&mut merged, disabled);
+        // rust-analyzer also accepts dotted initialization keys. A user's
+        // flat spelling must not take precedence over the nested safety flags.
+        if let Some(object) = merged.as_object_mut() {
+            for key in ["cargo.buildScripts.enable", "procMacro.enable"] {
+                if object.contains_key(key) {
+                    object.insert(key.into(), serde_json::Value::Bool(false));
+                }
+            }
+        }
+        disabled = merged;
+    }
+    *options = Some(disabled);
+}
 
 fn initialization_options_for_spawn(
     def: &ServerDef,
@@ -6070,6 +6169,7 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// Everything needed to spawn and initialize one language server, gathered
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
+    rust_worker_policy: Arc<std::sync::atomic::AtomicBool>,
     kind: ServerKind,
     /// The installable binary name, used in failure reasons.
     binary_name: String,
@@ -6135,37 +6235,44 @@ impl PreparedSpawn {
 
     /// Start the process and run the `initialize` handshake. Touches no
     /// manager state, so it runs without the manager lock.
-    fn run(self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
+    fn run(mut self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
         let initialize_timeout = initialize_timeout.or_else(|| self.test_initialize_timeout());
+        let worker = self.kind == ServerKind::Rust
+            && self
+                .rust_worker_policy
+                .load(std::sync::atomic::Ordering::Acquire);
+        if worker {
+            disable_rust_cargo_options(&mut self.initialization_options);
+        }
         // Loose Rust roots have no Cargo check to certify; keep their analyzer
         // diagnostics instead of replacing an indexing gap with a Cargo failure.
-        let completed_rust_check = (self.kind == ServerKind::Rust
-            && self.root.join("Cargo.toml").is_file())
-        .then(|| {
-            let runtime = super::completed_rust_check::Runtime {
-                binary: self.binary.clone(),
-                args: self.args.clone(),
-                env: self.env.clone(),
-                options: self.initialization_options.clone(),
-                launch_env: None,
-                #[cfg(test)]
-                validation_delay: Duration::ZERO,
-            };
-            super::completed_rust_check::CompletedRustCheck::new(
-                &self.root,
-                &self.reclaim_root,
-                &self.storage_root,
-                runtime.clone(),
-            )
-            .or_else(|| {
-                super::completed_rust_check::CompletedRustCheck::in_memory(
-                    &self.root,
-                    &self.reclaim_root,
-                    runtime,
-                )
-            })
-        })
-        .flatten();
+        let completed_rust_check =
+            (self.kind == ServerKind::Rust && !worker && self.root.join("Cargo.toml").is_file())
+                .then(|| {
+                    let runtime = super::completed_rust_check::Runtime {
+                        binary: self.binary.clone(),
+                        args: self.args.clone(),
+                        env: self.env.clone(),
+                        options: self.initialization_options.clone(),
+                        launch_env: None,
+                        #[cfg(test)]
+                        validation_delay: Duration::ZERO,
+                    };
+                    super::completed_rust_check::CompletedRustCheck::new(
+                        &self.root,
+                        &self.reclaim_root,
+                        &self.storage_root,
+                        runtime.clone(),
+                    )
+                    .or_else(|| {
+                        super::completed_rust_check::CompletedRustCheck::in_memory(
+                            &self.root,
+                            &self.reclaim_root,
+                            runtime,
+                        )
+                    })
+                })
+                .flatten();
         let mut client = match LspClient::spawn_with_reclaim_root(
             self.kind.clone(),
             self.root.clone(),
@@ -6192,7 +6299,20 @@ impl PreparedSpawn {
             }
         };
         client.runtime_note = self.runtime_note;
+        client.rust_cargo_disabled_for_worker = worker;
         client.completed_rust_check = completed_rust_check;
+        // A worker can arrive while spawn runs without the manager lock.
+        // Apply its policy before initialize; finish also rejects an unsafe
+        // instance if the policy changed after initialization was sent.
+        if self.kind == ServerKind::Rust
+            && self
+                .rust_worker_policy
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            disable_rust_cargo_options(&mut self.initialization_options);
+            client.rust_cargo_disabled_for_worker = true;
+            client.completed_rust_check = None;
+        }
         let initialize = match initialize_timeout {
             Some(timeout) => {
                 client.initialize_with_timeout(&self.root, self.initialization_options, timeout)

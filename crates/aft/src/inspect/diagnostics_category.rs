@@ -55,9 +55,11 @@ pub(crate) fn start_inspect_rust_checks(
     producers: &[ServerKey],
     deadline: Instant,
 ) -> Vec<InspectRustCheck> {
+    let worker_policy = ctx.lsp().rust_worker_policy();
     let work = ctx.lsp().inspect_rust_check_work(producers);
     work.into_iter()
         .map(|(key, check)| {
+            let worker_policy = worker_policy.clone();
             let (sender, outcome) = std::sync::mpsc::sync_channel(1);
             let cancellation = crate::executor::current_job_cancellation();
             // A thread that cannot start drops the sender, which the
@@ -70,8 +72,9 @@ pub(crate) fn start_inspect_rust_checks(
                         None => (Err(EXPLICIT_CHECK_RUNNING_REASON.to_string()), Vec::new()),
                         Some(mut check) => {
                             let result = check.run_for_inspect(deadline, || {
-                                crate::executor::current_job_cancellation()
-                                    .is_some_and(|token| token.cancel_requested_before_commit())
+                                worker_policy.load(std::sync::atomic::Ordering::Acquire)
+                                    || crate::executor::current_job_cancellation()
+                                        .is_some_and(|token| token.cancel_requested_before_commit())
                             });
                             let reports = if result.is_err() {
                                 check.reports.values().flatten().cloned().collect()
@@ -140,6 +143,7 @@ impl CoverageCause {
 
 #[derive(Default)]
 struct DiagnosticsCollection {
+    cargo_disabled_producers: BTreeSet<(String, PathBuf)>,
     // Completed Cargo output can remain useful even when its input fingerprint
     // cannot be certified. Keep these rows separate from stale native publishes.
     uncertified_compiler_reports: Vec<CollectedDiagnostic>,
@@ -412,6 +416,27 @@ pub(crate) fn run_diagnostics_category(
         collection.checking_producers.insert(producer.clone());
         collection.checking_reasons.insert(producer, reason);
     }
+    if ctx.lsp().rust_cargo_disabled_for_worker() {
+        let scope_producers = scoped
+            .as_ref()
+            .map(|(_, keys)| keys.clone())
+            .unwrap_or_else(|| scope_producer_keys(snapshot, scope));
+        for key in expected_producers
+            .iter()
+            .chain(producer_failures.iter().map(|failure| &failure.server_key))
+            .chain(scope_producers.iter())
+            .filter(|key| key.kind == ServerKind::Rust)
+        {
+            collection
+                .cargo_disabled_producers
+                .insert((server_id(key), key.root.clone()));
+        }
+        if !collection.cargo_disabled_producers.is_empty() {
+            collection
+                .producer_notes
+                .insert("Run cargo check via runon: \"linux,4c\" for compiler diagnostics.".into());
+        }
+    }
     collection
         .uncertified_compiler_reports
         .extend(
@@ -468,6 +493,7 @@ pub(crate) fn run_diagnostics_category(
     if collection.is_reportable()
         || !collection.indexing_gaps.is_empty()
         || !collection.checking_producers.is_empty()
+        || !collection.cargo_disabled_producers.is_empty()
     {
         JobOutcome::Fresh {
             payload: collection.into_payload(snapshot),
@@ -1054,24 +1080,36 @@ impl DiagnosticsCollection {
         failures.sort_by(|(left, _), (right, _)| {
             (left.kind.id_str(), &left.root).cmp(&(right.kind.id_str(), &right.root))
         });
-        let mut gaps: Vec<Value> = failures
-            .into_iter()
-            .map(|(server, reason)| {
-                let mut gap = serde_json::json!({
-                    "kind": "failed_producer",
-                    "producer": server_id(server),
-                    "root": display_root(snapshot, &server.root),
-                    "reason": reason,
-                });
-                if let Some(files) = self.producer_failure_files.get(server) {
-                    gap["affected_files"] = serde_json::json!(files
-                        .iter()
-                        .map(|file| display_path(snapshot, file))
-                        .collect::<Vec<_>>());
-                }
-                gap
+        let mut gaps: Vec<Value> = self.cargo_disabled_producers.iter().map(|(producer, root)| {
+            serde_json::json!({
+                "kind": "cargo_check_disabled_for_worker",
+                "reason_code": "cargo_check_disabled_for_worker",
+                "producer": producer,
+                "root": display_root(snapshot, root),
+                "reason": "cargo_check_disabled_for_worker: compile diagnostics are rust-analyzer-only for this session",
+                "suggestion": "Run cargo check via runon: \"linux,4c\" for compiler diagnostics.",
             })
-            .collect();
+        }).collect();
+        gaps.extend(
+            failures
+                .into_iter()
+                .map(|(server, reason)| {
+                    let mut gap = serde_json::json!({
+                        "kind": "failed_producer",
+                        "producer": server_id(server),
+                        "root": display_root(snapshot, &server.root),
+                        "reason": reason,
+                    });
+                    if let Some(files) = self.producer_failure_files.get(server) {
+                        gap["affected_files"] = serde_json::json!(files
+                            .iter()
+                            .map(|file| display_path(snapshot, file))
+                            .collect::<Vec<_>>());
+                    }
+                    gap
+                })
+                .collect::<Vec<_>>(),
+        );
         // A failure recorded only under its server id (not under a server
         // key) has no workspace root; it still becomes a gap row, without
         // a root.

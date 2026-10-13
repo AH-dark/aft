@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -38,6 +38,50 @@ const EXIT_LOG_STDERR_BYTES: usize = 2 * 1024;
 const CAUSE_STDERR_LINE_BYTES: usize = 200;
 /// Longest command line quoted in exit reports.
 const COMMAND_DISPLAY_BYTES: usize = 512;
+
+// An analyzer indexes a whole Cargo workspace and owns its own thread pools
+// and caches. Limit processes across root managers, not just within one root.
+const RUST_ANALYZER_PROCESS_CAP: usize = 2;
+
+struct RustAnalyzerCapacity {
+    active: Mutex<usize>,
+    cap: usize,
+}
+
+struct RustAnalyzerPermit(Arc<RustAnalyzerCapacity>);
+
+impl RustAnalyzerCapacity {
+    fn acquire(self: &Arc<Self>) -> io::Result<RustAnalyzerPermit> {
+        let mut active = self.active.lock().unwrap();
+        if *active >= self.cap {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "rust_analyzer_capacity_exhausted: daemon-wide rust-analyzer process cap={} reached; retry after another analyzer stops",
+                    self.cap
+                ),
+            ));
+        }
+        *active += 1;
+        Ok(RustAnalyzerPermit(self.clone()))
+    }
+}
+
+impl Drop for RustAnalyzerPermit {
+    fn drop(&mut self) {
+        *self.0.active.lock().unwrap() -= 1;
+    }
+}
+
+fn rust_analyzer_capacity() -> &'static Arc<RustAnalyzerCapacity> {
+    static CAPACITY: OnceLock<Arc<RustAnalyzerCapacity>> = OnceLock::new();
+    CAPACITY.get_or_init(|| {
+        Arc::new(RustAnalyzerCapacity {
+            active: Mutex::new(0),
+            cap: RUST_ANALYZER_PROCESS_CAP,
+        })
+    })
+}
 
 /// rust-analyzer starts a `cargo check` of the whole workspace each time it
 /// becomes quiescent after loading the workspace; 1.98 announces it about
@@ -656,10 +700,13 @@ pub(crate) struct RustWorkspaceState {
 /// A client connected to one language server process.
 pub struct LspClient {
     pub(crate) runtime_note: Option<String>,
+    pub(crate) rust_cargo_disabled_for_worker: bool,
     kind: ServerKind,
     root: PathBuf,
     state: ServerState,
     child: Child,
+    // Held until the child exits or Drop kills/reaps it, including failed handshakes.
+    _rust_analyzer_permit: Option<RustAnalyzerPermit>,
     /// Child PID captured at spawn time. Used by Drop to untrack the
     /// PID from the shared registry; we capture once rather than reading
     /// `child.id()` later because Drop ordering with the Child can race.
@@ -807,6 +854,33 @@ impl LspClient {
         child_registry: LspChildRegistry,
         reclaim_root: Option<&Path>,
     ) -> io::Result<Self> {
+        Self::spawn_with_capacity(
+            kind,
+            root,
+            binary,
+            args,
+            env,
+            event_tx,
+            child_registry,
+            reclaim_root,
+            rust_analyzer_capacity(),
+        )
+    }
+
+    fn spawn_with_capacity(
+        kind: ServerKind,
+        root: PathBuf,
+        binary: &Path,
+        args: &[String],
+        env: &HashMap<String, String>,
+        event_tx: Sender<LspEvent>,
+        child_registry: LspChildRegistry,
+        reclaim_root: Option<&Path>,
+        capacity: &Arc<RustAnalyzerCapacity>,
+    ) -> io::Result<Self> {
+        let rust_analyzer_permit = (kind == ServerKind::Rust)
+            .then(|| capacity.acquire())
+            .transpose()?;
         #[cfg(windows)]
         let is_batch_file = crate::windows_command::is_batch_file(binary);
         #[cfg(windows)]
@@ -1030,6 +1104,8 @@ impl LspClient {
         let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
         child_registry.mark_client_live(child_pid);
         Ok(Self {
+            _rust_analyzer_permit: rust_analyzer_permit,
+            rust_cargo_disabled_for_worker: false,
             runtime_note: None,
             kind,
             root,
@@ -1786,6 +1862,14 @@ impl LspClient {
     }
 
     fn shutdown_with_request_timeout(&mut self, request_timeout: Duration) -> Result<(), LspError> {
+        let result = self.shutdown_child(request_timeout);
+        if self.child.try_wait().ok().flatten().is_some() {
+            self._rust_analyzer_permit.take();
+        }
+        result
+    }
+
+    fn shutdown_child(&mut self, request_timeout: Duration) -> Result<(), LspError> {
         if self.state == ServerState::Exited {
             self.child_registry.untrack(self.child_pid);
             return Ok(());
@@ -1839,11 +1923,15 @@ impl LspClient {
     }
 
     pub fn child_exited(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_some()
+        self.child_exit_status().is_some()
     }
 
     pub fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        let status = self.child.try_wait().ok().flatten();
+        if status.is_some() {
+            self._rust_analyzer_permit.take();
+        }
+        status
     }
 
     pub(crate) fn child_pid(&self) -> u32 {
@@ -1866,7 +1954,7 @@ impl LspClient {
     pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
+            if let Some(status) = self.child_exit_status() {
                 return Some(status);
             }
             if Instant::now() >= deadline {

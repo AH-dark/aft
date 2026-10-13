@@ -8848,6 +8848,13 @@ async fn handle_tool_call(
         return Ok(());
     }
 
+    // Catalog role controls tool behavior, but a stamped worker must never
+    // enable Cargo indirectly by selecting a head catalog on its route.
+    if access_grants::alfonso_worker(&identity) {
+        if let Some(ctx) = executor.actor_context(&identity.root) {
+            ctx.lsp().disable_rust_cargo_for_worker();
+        }
+    }
     let lane = command_lane(&bare_name);
     let tool_call_context = ToolCallContext {
         project_root: identity.project_root.clone(),
