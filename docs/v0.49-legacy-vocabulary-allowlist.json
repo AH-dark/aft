@@ -2811,6 +2811,17 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/tests/worker_jail.rs",
+      "line": 1133,
+      "column": 21,
+      "token": "filePath",
+      "text": "json!({\"filePath\": jail.worktree.join(\".cortexkit/tmp/tool\"), \"content\": \"tool\"}),",
+      "location": "line 1133, column 21",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "docs/design/opencode-v2-plugin-playbook.md",
       "line": 75,
       "column": 15,
