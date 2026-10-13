@@ -1006,6 +1006,7 @@ pub(crate) mod work_counters {
         pub(crate) static FILE_PARSE_READS: Cell<usize> = const { Cell::new(0) };
         pub(crate) static SOURCE_READS: Cell<usize> = const { Cell::new(0) };
         pub(crate) static OWNED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static RUST_MODULE_SCANS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn tree_parses() -> usize {
@@ -1021,6 +1022,11 @@ pub(crate) fn read_source(path: &Path) -> std::io::Result<String> {
     #[cfg(test)]
     work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
     crate::bounded_io::read_to_string(path)
+}
+
+/// Keep the completed read's allocation; an Arc<str> conversion copies its bytes.
+fn captured_source(source: String) -> Arc<String> {
+    Arc::new(source)
 }
 
 /// Parse source with a parser retained by the current worker thread.
@@ -1061,7 +1067,7 @@ struct CachedTree {
     size: u64,
     content_hash: blake3::Hash,
     tree: Tree,
-    source: Option<Arc<str>>,
+    source: Option<Arc<String>>,
 }
 
 /// Outline-only module containers; these never enter the extracted symbol table.
@@ -1074,6 +1080,8 @@ pub(crate) struct RustModule {
 }
 
 pub(crate) fn rust_modules(root: Node<'_>, source: &str) -> Vec<RustModule> {
+    #[cfg(test)]
+    work_counters::RUST_MODULE_SCANS.with(|count| count.set(count.get() + 1));
     fn immediate_modules<'a>(node: Node<'a>, modules: &mut Vec<Node<'a>>) {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
@@ -1112,9 +1120,10 @@ pub(crate) fn rust_modules(root: Node<'_>, source: &str) -> Vec<RustModule> {
 
 /// A request-local source and tree captured together, for read-only consumers.
 pub(crate) struct ParsedFile {
-    pub(crate) source: Arc<str>,
+    pub(crate) source: Arc<String>,
     pub(crate) tree: Tree,
     pub(crate) lang: LangId,
+    pub(crate) modules: Option<Arc<Vec<RustModule>>>,
     mtime: SystemTime,
     size: u64,
     content_hash: blake3::Hash,
@@ -1816,7 +1825,7 @@ impl FileParser {
                     size: source.len() as u64,
                     content_hash: content_hash_for_source(&source),
                     tree,
-                    source: self.capture_source.then(|| Arc::from(source)),
+                    source: self.capture_source.then(|| captured_source(source)),
                 },
             );
         }
@@ -1847,10 +1856,19 @@ impl FileParser {
         }
         let (_, lang) = self.parse(path)?;
         let cached = &self.cache[path];
+        // Cache insertion and outline rendering need the same module layout.
+        // Derive it with the source snapshot instead of walking its tree twice.
+        let modules = (lang == LangId::Rust).then(|| {
+            Arc::new(rust_modules(
+                cached.tree.root_node(),
+                cached.source.as_deref().expect("source capture enabled"),
+            ))
+        });
         Ok(ParsedFile {
             source: Arc::clone(cached.source.as_ref().expect("source capture enabled")),
             tree: cached.tree.clone(),
             lang,
+            modules,
             mtime: cached.mtime,
             size: cached.size,
             content_hash: cached.content_hash,
@@ -1887,8 +1905,7 @@ impl FileParser {
                 parsed.lang,
             )?),
         };
-        let modules = (parsed.lang == LangId::Rust)
-            .then(|| Arc::new(rust_modules(parsed.tree.root_node(), &parsed.source)));
+        let modules = parsed.modules.clone();
         let mut cache = self
             .symbol_cache
             .write()
@@ -1936,7 +1953,7 @@ impl FileParser {
         let symbols = self.extract_symbols_from_snapshot(path, &parsed)?;
         Ok((
             symbols,
-            Arc::new(rust_modules(parsed.tree.root_node(), &parsed.source)),
+            parsed.modules.expect("Rust outline requires Rust source"),
         ))
     }
 
@@ -1990,7 +2007,9 @@ impl FileParser {
                     size,
                     content_hash,
                     tree,
-                    source: self.capture_source.then(|| Arc::from(source)),
+                    source: self
+                        .capture_source
+                        .then(|| captured_source(source.to_owned())),
                 },
             );
         }
@@ -9154,6 +9173,19 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    #[test]
+    fn captured_source_keeps_the_owned_read_buffer() {
+        let source = "// padding\n".repeat(10_000);
+        let pointer = source.as_bytes().as_ptr();
+        let captured = captured_source(source);
+        assert_eq!(
+            captured.as_bytes().as_ptr(),
+            pointer,
+            "capturing a completed read must not copy its bytes"
+        );
+        assert_eq!(captured.len(), 110_000);
+    }
+
     #[test]
     fn only_snapshot_consumers_retain_source_with_the_tree() {
         let temp = tempfile::tempdir().unwrap();

@@ -764,7 +764,7 @@ fn outline_structure_entries(
     }
     let captured;
     let (source, tree) = if let Some(parsed) = parsed {
-        (parsed.source.as_ref(), &parsed.tree)
+        (parsed.source.as_str(), &parsed.tree)
     } else {
         let source = crate::parser::read_source(path).map_err(|error| AftError::FileNotFound {
             path: format!("{}: {error}", path.display()),
@@ -860,7 +860,11 @@ fn outline_structure_entries(
     summaries.extend(standalone);
     summaries.sort_by_key(|summary| (summary.range.start_line, summary.range.start_col));
     let mut entries = if lang == LangId::Rust {
-        rust_module_outline(tree.root_node(), &source, &product_symbols, &summaries, &[])
+        if let Some(modules) = parsed.and_then(|parsed| parsed.modules.as_deref()) {
+            rust_modules_outline(modules, &product_symbols, &summaries, &[])
+        } else {
+            rust_module_outline(tree.root_node(), &source, &product_symbols, &summaries, &[])
+        }
     } else {
         build_outline_tree(&product_symbols)
     };
@@ -3240,6 +3244,26 @@ mod tests {
     }
 
     #[test]
+    fn rust_batch_derives_module_layout_once() {
+        let (_temp, files, ctx) = navigation_fixture();
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"layout-work", "command":"outline", "files":[files[5]]}),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let before = crate::parser::work_counters::RUST_MODULE_SCANS.with(|count| count.get());
+            let response = handle_outline(&request, &ctx);
+            assert!(response.success);
+            let scans =
+                crate::parser::work_counters::RUST_MODULE_SCANS.with(|count| count.get()) - before;
+            assert_eq!(
+                scans, 2,
+                "one scan of the file root and one of its nested module"
+            );
+        }
+    }
+
+    #[test]
     fn outline_snapshot_does_not_change_extracted_symbols_or_ranges() {
         let (_temp, files, ctx) = navigation_fixture();
         for path in files {
@@ -3592,6 +3616,104 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The same harness can be appended to the older outline implementation.
+    /// Comparing separately compiled revisions avoids a reference path that
+    /// accidentally includes the optimization it is supposed to measure.
+    #[test]
+    #[ignore = "manual paired-revision release-mode outline performance probe"]
+    fn navigation_paired_revision_perf_probe() {
+        use crate::parser::work_counters::tree_parses;
+        let lines = std::env::var("AFT_OUTLINE_BENCH_LINES")
+            .unwrap_or_else(|_| "1000".into())
+            .parse::<usize>()
+            .unwrap();
+        let language = std::env::var("AFT_OUTLINE_BENCH_LANGUAGE").unwrap_or_else(|_| "ts".into());
+        assert!(matches!(language.as_str(), "ts" | "rs"));
+        let mode = std::env::var("AFT_OUTLINE_BENCH_MODE").unwrap_or_else(|_| "multi".into());
+        assert!(matches!(mode.as_str(), "single" | "multi"));
+        let warm = std::env::var("AFT_OUTLINE_BENCH_CACHE").is_ok_and(|value| value == "warm");
+        let before =
+            std::env::var("AFT_OUTLINE_BENCH_REVISION").is_ok_and(|value| value == "before");
+        let temporary = tempfile::tempdir().unwrap();
+        let fixture = std::env::var_os("AFT_OUTLINE_BENCH_FIXTURE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temporary.path().to_path_buf());
+        let source = "// padding\n".repeat(lines - 2)
+            + if language == "ts" {
+                "export function alpha() {}\nfunction beta() {}\n"
+            } else {
+                "pub fn alpha() {}\nfn beta() {}\n"
+            };
+        let files = (0..200)
+            .map(|i| fixture.join(format!("f{i:03}.{language}")))
+            .collect::<Vec<_>>();
+        if std::env::var_os("AFT_OUTLINE_BENCH_FIXTURE").is_none() {
+            for file in &files {
+                std::fs::write(file, &source).unwrap();
+            }
+        }
+        let mut grammar_warmup = FileParser::new();
+        grammar_warmup.parse(&files[0]).unwrap();
+        let request: RawRequest = serde_json::from_value(if mode == "multi" {
+            serde_json::json!({"id":"paired", "command":"outline", "files":files})
+        } else {
+            serde_json::json!({"id":"paired", "command":"outline", "file":files[0]})
+        })
+        .unwrap();
+        let iterations = if mode == "single" { 100 } else { 1 };
+        let contexts = (0..iterations)
+            .map(|_| {
+                AppContext::new(
+                    Box::new(TreeSitterProvider::new()),
+                    crate::config::Config::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if warm {
+            for ctx in &contexts {
+                assert!(handle_outline(&request, ctx).success);
+            }
+        }
+        let parses_before = tree_parses();
+        let start = std::time::Instant::now();
+        let responses = contexts
+            .iter()
+            .map(|ctx| handle_outline(&request, ctx))
+            .collect::<Vec<_>>();
+        let elapsed_ns = start.elapsed().as_nanos();
+        let parses = tree_parses() - parses_before;
+        let expected_parses = if mode == "multi" {
+            200
+        } else if warm {
+            if before {
+                100
+            } else {
+                0
+            }
+        } else if before {
+            200
+        } else {
+            100
+        };
+        assert_eq!(parses, expected_parses);
+        let mut digest = blake3::Hasher::new();
+        for response in responses {
+            assert!(response.success);
+            if mode == "multi" {
+                assert_eq!(response.data["files_shown"], 200);
+            }
+            digest.update(&serde_json::to_vec(&response).unwrap());
+        }
+        println!(
+            "AFT_PAIR_SAMPLE={}",
+            serde_json::json!({
+                "lines":lines, "language":language, "mode":mode, "cache":if warm {"warm"} else {"cold"},
+                "iterations":iterations, "elapsed_ns":elapsed_ns, "parses":parses,
+                "digest":digest.finalize().to_hex().to_string(),
+            })
+        );
     }
 
     fn summary_regression_text() -> String {
