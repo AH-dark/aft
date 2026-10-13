@@ -70,6 +70,27 @@ pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 thread_local! {
     static LEDGER_SPAWN: std::cell::RefCell<Option<crate::db::call_ledger::Key>> = const { std::cell::RefCell::new(None) };
+    static SCOPE_SPAWN: std::cell::RefCell<Option<subc_protocol::scope::ScopeStamp>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Carry the shell task's daemon-authenticated scope identity separately
+/// from tool arguments, so the caller cannot invent or change its owner.
+pub(crate) fn with_scope_spawn<T>(
+    scope: Option<subc_protocol::scope::ScopeStamp>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<subc_protocol::scope::ScopeStamp>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPE_SPAWN.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(SCOPE_SPAWN.with(|slot| slot.replace(scope)));
+    run()
+}
+
+pub(crate) fn scope_for_spawn() -> Option<subc_protocol::scope::ScopeStamp> {
+    SCOPE_SPAWN.with(|slot| slot.borrow().clone())
 }
 
 /// The registry's first task write runs synchronously during dispatch. Carry
@@ -99,6 +120,7 @@ const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
 /// Status reason of a task killed because its caller withdrew the call.
 pub const WITHDRAWN_REASON: &str = "withdrawn";
+pub const SCOPE_REVOKED_REASON: &str = "scope_revoked";
 #[path = "remote.rs"]
 pub(crate) mod remote;
 #[cfg(target_os = "linux")]
@@ -2007,6 +2029,25 @@ impl BgTaskRegistry {
                 ) {
                     crate::slog_warn!("call ledger recovered settlement failed: {error}");
                 }
+            }
+        }
+    }
+
+    /// Record a finished shell call when its attachment left after the task
+    /// already exited. Otherwise no later terminal write would store its result.
+    pub(crate) fn settle_detached_call(&self, task_id: &str) {
+        let Some(task) = self.task(task_id) else {
+            return;
+        };
+        let metadata = match task.lock_state() {
+            Ok(state) => state.metadata.clone(),
+            Err(_) => return,
+        };
+        if metadata.status.is_terminal() {
+            if let Ok(row) = metadata
+                .to_bash_task_row(task.db_harness.as_deref().unwrap_or("runner"), &task.paths)
+            {
+                self.settle_recovered_call(&metadata, &task.paths, row);
             }
         }
     }
@@ -5598,7 +5639,7 @@ impl BgTaskRegistry {
             task_id,
             session_id,
             BgTaskStatus::Killed,
-            Some("scope revoked".into()),
+            Some(SCOPE_REVOKED_REASON.into()),
         )
     }
 
@@ -6830,6 +6871,42 @@ impl BgTaskRegistry {
             .unwrap_or_default()
     }
 
+    /// Find live shell tasks with a persisted daemon scope identity. Keep
+    /// this off the subc frame loop: locks and process sampling may block.
+    pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
+        self.running_tasks()
+            .into_iter()
+            .filter_map(|task| {
+                let scope = task.lock_state().ok()?.metadata.scope.clone()?;
+                self.has_live_task_processes(&task.task_id, &task.session_id)
+                    .then_some(scope)
+            })
+            .collect()
+    }
+
+    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
+        for task in self.running_tasks() {
+            let matches = task
+                .lock_state()
+                .ok()
+                .and_then(|state| state.metadata.scope.clone())
+                .is_some_and(|stamp| {
+                    stamp.owner == scope.owner
+                        && stamp.scope_ref == scope.scope_ref
+                        && stamp.scope_epoch == scope.scope_epoch
+                });
+            if matches {
+                if let Err(error) = self.kill_for_scope_revocation(&task.task_id, &task.session_id)
+                {
+                    log::warn!(
+                        "scope revocation kill failed task={}: {error}",
+                        task.task_id
+                    );
+                }
+            }
+        }
+    }
+
     /// Whether any task is still under watch, without waiting: `None` when
     /// the watch map is locked by another thread right now.
     pub(crate) fn try_has_running_tasks(&self) -> Option<bool> {
@@ -7233,7 +7310,10 @@ impl BgTaskRegistry {
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         #[cfg(unix)]
         if task.lock_state().is_ok_and(|s| s.metadata.remote.is_some()) {
-            if reason.as_deref() == Some("scope revoked") {
+            if matches!(
+                reason.as_deref(),
+                Some(SCOPE_REVOKED_REASON | "scope revoked")
+            ) {
                 let mut db = DeferredDbWrites::new(self, &task);
                 let mut state = task
                     .lock_state()

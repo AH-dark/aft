@@ -210,6 +210,7 @@ mod push;
 mod readiness;
 mod remote_policy;
 mod run_scope;
+mod scope_describe;
 mod stall_watchdog;
 mod standing;
 mod tool_provider;
@@ -3300,6 +3301,7 @@ async fn end_withdrawn_bash_ask(
     shutdown: &Arc<Notify>,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
+    let route = pending.route;
     let withdrawn = ledger_edge.withdrawn_frame(
         pending.route,
         pending.tool_corr,
@@ -3323,7 +3325,7 @@ async fn end_withdrawn_bash_ask(
         metrics,
     )
     .await?;
-    if let Some(frame) = withdrawn {
+    if let Some(frame) = withdrawn.filter(|_| routes.contains_key(&route)) {
         let frame = frame.map_err(SubcError::FrameBuild)?;
         send_reliable_writer_frame(tx, metrics, frame, "withdrawn held call").await?;
     }
@@ -3571,12 +3573,6 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
-    if let Some(scope) = routes
-        .get(&channel)
-        .and_then(|identity| identity.run_scope.get())
-    {
-        scope.route_closed();
-    }
     // Only the consumer's own close withdraws held permission asks. A
     // higher-epoch rebind keeps the logical route, and a transport drop never
     // reaches here, so their asks stay open for the retried call.
@@ -3601,17 +3597,25 @@ async fn teardown_installed_route(
         bg_end_cause,
     )
     .await?;
-    settle_pending_bash_asks_for_route(
-        tx,
-        pending_bash_asks,
-        channel,
-        routes,
-        live_roots,
-        route_bash_cancels,
-        shutdown,
-        metrics,
-    )
-    .await?;
+    // Losing a carrier route does not deny a held scoped shell call.
+    // Keep its permission ask until the daemon confirms scope end, the
+    // caller withdraws, or the ask expires.
+    if routes
+        .get(&channel)
+        .is_none_or(|identity| identity.scope.is_none())
+    {
+        settle_pending_bash_asks_for_route(
+            tx,
+            pending_bash_asks,
+            channel,
+            routes,
+            live_roots,
+            route_bash_cancels,
+            shutdown,
+            metrics,
+        )
+        .await?;
+    }
     if let Some(cancel) = route_bash_cancels.remove(&channel) {
         cancel.token.cancel();
     }
@@ -4012,41 +4016,21 @@ pub fn exit_log_flush_wait() -> Duration {
     exit_tail_remaining().max(EXIT_LOG_FLUSH_FLOOR)
 }
 
-/// Starts the readiness sequence (query live roots, warm, flip ready) beside
-/// the module loop, which must keep running to deliver the daemon's replies.
-/// Returns `None` when the daemon predates readiness: it does not advertise
-/// `catalog.update`, so it ignores `ready: false` and there is nothing to flip.
+/// Queries live roots and flips the module ready using the same control
+/// connection and correlation counter as scope.describe.
 fn spawn_readiness(
-    hello_ack: Option<ModuleHelloAckBody>,
-    writer_tx: &WriterSender,
-    metrics: &Arc<DispatchPathMetrics>,
-    provides: Vec<ProviderRole>,
-    control_replies: readiness::PendingControlReplies,
+    control: Arc<readiness::DaemonControl>,
     spawn_role: readiness::SpawnRole,
     hello_at: tokio::time::Instant,
 ) -> Option<JoinHandle<()>> {
-    let (negotiated_ver, advertised_ops) = match hello_ack {
-        Some(ack) => (ack.negotiated_ver, ack.subc_ops),
-        None => (PROTOCOL_VERSION, Vec::new()),
-    };
-    if !readiness::daemon_supports_ready_flip(&advertised_ops) {
-        log::info!(
-            "readiness: daemon does not advertise catalog.update, so it ignores ready: false; no flip is sent"
-        );
+    if !control.supports_ready_flip() {
+        log::info!("readiness: daemon does not advertise catalog.update; no flip is sent");
         return None;
     }
-    let control = readiness::DaemonControl::new(
-        writer_tx.clone(),
-        Arc::clone(metrics),
-        negotiated_ver,
-        advertised_ops,
-        provides,
-        control_replies,
-        HELLO_CORR + 1,
-    );
     Some(tokio::spawn(async move {
         let report =
-            readiness::run_readiness(&control, &readiness::NoWarmer, spawn_role, hello_at).await;
+            readiness::run_readiness(control.as_ref(), &readiness::NoWarmer, spawn_role, hello_at)
+                .await;
         log::info!("{report}");
     }))
 }
@@ -4684,24 +4668,23 @@ where
         Arc::clone(&dispatch_path_metrics),
     );
     let control_replies = readiness::PendingControlReplies::default();
-    let run_scopes = run_scope::RunScopes::new(
+    let (negotiated_ver, advertised_ops) = hello_ack.map_or((PROTOCOL_VERSION, vec![]), |ack| {
+        (ack.negotiated_ver, ack.subc_ops)
+    });
+    let control = Arc::new(readiness::DaemonControl::new(
         writer_tx.clone(),
         Arc::clone(&dispatch_path_metrics),
-        control_replies.clone(),
-        hello_ack
-            .as_ref()
-            .map_or(PROTOCOL_VERSION, |ack| ack.negotiated_ver),
-    );
-    let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
-    let readiness_task = spawn_readiness(
-        hello_ack,
-        &writer_tx,
-        &dispatch_path_metrics,
+        negotiated_ver,
+        advertised_ops,
         manifest_provides,
         control_replies.clone(),
-        spawn_role,
-        hello_at,
-    );
+        HELLO_CORR + 1,
+    ));
+    let run_scopes = Arc::new(run_scope::RunScopes::new(control.clone()));
+    let (scope_describes, mut scopes_ended_rx, scope_describe_task) =
+        scope_describe::start(control.clone(), executor.clone(), run_scopes.clone());
+    let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
+    let readiness_task = spawn_readiness(control, spawn_role, hello_at);
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
     // the `select!` below: a drain-interval tick (or shutdown) firing while a
     // frame is mid-transit would drop the partially-consumed bytes and desync the
@@ -4812,6 +4795,9 @@ where
     // taken before the first select must be just as recoverable as a later one.
     dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
+        for route in ledger_edge.unrouted_shells(&routes) {
+            ledger_edge.detach_shells(&executor, Some(route)).await;
+        }
         dispatch_path_metrics.mark_frame_loop_tick();
         shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
@@ -5013,8 +4999,25 @@ where
         dispatch_path_metrics.publish_frame_loop_wake_deadline(
             next_drain_at.saturating_duration_since(tokio::time::Instant::now()),
         );
+        scope_describes.routes(&routes);
         tokio::select! {
             biased;
+            Some(ended) = scopes_ended_rx.recv() => {
+                run_scopes.revoke(&ended.stamp);
+                ledger_edge.scope_ended(&ended.keys);
+                let keys: Vec<_> = pending_bash_asks.iter().filter(|(_, pending)| {
+                    pending.cancel.scope.as_ref().is_some_and(|stamp| scope_describe::stamp_key(stamp) == scope_describe::stamp_key(&ended.stamp))
+                        && pending.call_key.as_ref().is_some_and(|key| ended.keys.iter().any(|ended| &ended.call_key == key))
+                }).map(|(key, _)| *key).collect();
+                for key in keys {
+                    if let Some(pending) = pending_bash_asks.remove(&key) {
+                        if let Err(error) = end_withdrawn_bash_ask(&writer_tx, &ledger_edge, pending,
+                            &routes, &mut live_roots, &mut route_bash_cancels, &shutdown, &dispatch_path_metrics).await {
+                            break 'module_loop Err(error);
+                        }
+                    }
+                }
+            }
             Some(completion) = control_completion_rx.recv() => {
                 if let Err(error) = process_route_bind_completion(
                     &writer_tx,
@@ -5066,7 +5069,7 @@ where
                     (hooks.before_frame)();
                 }
 
-                if !ingress_route_should_be_processed(
+                if !(ledger_waited && ledger_edge.is_withdrawn(&frame.frame)) && !ingress_route_should_be_processed(
                     &installed_route_epochs,
                     &reclaimed_routes,
                     &frame.frame,
@@ -5110,6 +5113,9 @@ where
                     }
                     FrameType::Goodbye => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
+                        if let Some(stamp) = routes.get(&channel).and_then(|identity| identity.scope.clone()) {
+                            scope_describes.goodbye(stamp);
+                        }
                         if let Err(error) = teardown_installed_route(
                             &writer_tx,
                             &dispatch_path_metrics,
@@ -5252,14 +5258,14 @@ where
                             ledger_edge.finish_waiting(&frame);
                             match ledger_edge.withdrawn_frame(route, frame.header.corr,
                                 frame.header.ver, frame.header.flags) {
-                                Some(Ok(withdrawn)) => {
+                                 Some(Ok(withdrawn)) if routes.contains_key(&route) => {
                                     if let Err(error) = send_reliable_writer_frame(&writer_tx,
                                         &dispatch_path_metrics, withdrawn, "withdrawn held call").await {
                                         break Err(error);
                                     }
                                 }
                                 Some(Err(error)) => break Err(SubcError::FrameBuild(error)),
-                                None => {}
+                                 Some(Ok(_)) | None => {}
                             }
                             continue;
                         }
@@ -5488,7 +5494,8 @@ where
                                 let until = drain::draining_window_end(deadline_ms);
                                 // Opening the window is what detaches foreground
                                 // bash waits: each checks it on its next poll.
-                                module_drain.begin(until);
+                                 scope_describe_task.abort();
+                                 module_drain.begin(until);
                                 drain_progress = Some(drain::DrainProgress {
                                     until,
                                     quiesced_reported: false,
@@ -5925,6 +5932,8 @@ where
     }
     health_rollup_worker.shutdown();
     // The flip retries until accepted; the connection ending is what stops it.
+    scope_describe_task.abort();
+    ledger_edge.detach_shells(&executor, None).await;
     if let Some(task) = readiness_task {
         task.abort();
         let _ = task.await;
@@ -8755,6 +8764,10 @@ async fn handle_tool_call(
             route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
             let cancel = bash::BashWaitCancel {
                 run_scope: identity.run_scope.get().cloned(),
+                scope: identity.scope.clone(),
+                late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
+                    && identity.scope.is_some()
+                    && call_key.is_some(),
                 connection: connection_cancel.clone(),
                 route: route_cancel.token.clone(),
                 drain: module_drain.clone(),
@@ -8807,6 +8820,10 @@ async fn handle_tool_call(
         route_cancel.active_waits = route_cancel.active_waits.saturating_add(1);
         let cancel = bash::BashWaitCancel {
             run_scope: identity.run_scope.get().cloned(),
+            scope: identity.scope.clone(),
+            late_results: identity.role == tool_provider::RouteRole::ToolProviderV1
+                && identity.scope.is_some()
+                && call_key.is_some(),
             connection: connection_cancel.clone(),
             route: route_cancel.token.clone(),
             drain: module_drain.clone(),
@@ -13654,6 +13671,8 @@ mod tests {
                     format_context: crate::subc_format::FormatContext::default(),
                     cancel: bash::BashWaitCancel {
                         run_scope: None,
+                        scope: None,
+                        late_results: false,
                         connection: PersistentCancelSignal::new(),
                         route: PersistentCancelSignal::new(),
                         drain: drain::ModuleDrainWindow::default(),

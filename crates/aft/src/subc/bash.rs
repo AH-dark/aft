@@ -5,6 +5,8 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct BashWaitCancel {
     pub(super) run_scope: Option<Arc<super::run_scope::RunScope>>,
+    pub(super) scope: Option<subc_protocol::scope::ScopeStamp>,
+    pub(super) late_results: bool,
     pub(super) connection: PersistentCancelSignal,
     pub(super) route: PersistentCancelSignal,
     /// Open while the daemon drains this module; a foreground wait that sees it
@@ -271,18 +273,38 @@ pub(super) fn detach_held_bash_in_background(target: drain::BashDetachTarget, ca
     tokio::task::spawn_blocking(move || detach_held_bash_sync(target, cancelled));
 }
 
+fn build_detached_frame(
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    flags: Flags,
+    task_id: &str,
+    late_results: bool,
+) -> Result<Frame, SubcError> {
+    Frame::build_with_version(
+        ver,
+        FrameType::Error,
+        flags,
+        channel,
+        epoch,
+        corr,
+        serde_json::to_vec(
+            &ErrorBody::new("detached", "call detached; command still running")
+                .with_detail(json!({"task_id": task_id, "late_results": late_results})),
+        )
+        .map_err(SubcError::Json)?,
+    )
+    .map_err(SubcError::FrameBuild)
+}
+
 fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
-    if target.run_scoped {
+    if cancelled && target.server_completion {
+        let _ = target.registry.kill(&target.task_id, &target.session_id);
+    } else if target.run_scoped {
         // A run's carrier can reconnect without ending the run. Leave its
         // process alive until the daemon's scope.describe response confirms the run ended; the
         // command's normal hard timeout still applies while confirmation waits.
-    } else if target.server_completion
-        && (cancelled
-            || !target
-                .registry
-                .is_remote_task(&target.task_id, &target.session_id))
-    {
-        let _ = target.registry.kill(&target.task_id, &target.session_id);
     } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
         crate::slog_warn!(
             "subc attach: bash background handoff failed task_id={:?} session={:?} error={:?}",
@@ -328,28 +350,14 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
         let frame = match (reason, routes.get(&route)) {
             (_, None) => None,
             (drain::BashLoopAnswer::Drain, Some(_)) if target.server_completion => {
-                Some(build_error_frame(
+                Some(build_detached_frame(
                     target.ver,
                     route.channel,
                     route.epoch,
                     corr,
                     target.flags,
-                    if target
-                        .registry
-                        .is_remote_task(&target.task_id, &target.session_id)
-                    {
-                        "outcome_unknown_module_draining"
-                    } else {
-                        "cancelled"
-                    },
-                    &if target
-                        .registry
-                        .is_remote_task(&target.task_id, &target.session_id)
-                    {
-                        format!("remote task {} survives module drain; inspect bash_status after reconnecting, never rerun the command",target.task_id)
-                    } else {
-                        "server-owned call ended during module drain".into()
-                    },
+                    &target.task_id,
+                    target.late_results,
                 )?)
             }
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
@@ -638,6 +646,7 @@ pub(super) fn submit_deferred_bash(
     received_at: Instant,
 ) {
     let run_scope = cancel.run_scope.clone();
+    let scope_stamp = cancel.scope.clone();
     let run_scoped = run_scope.is_some();
     let server_completion = server_completion || run_scoped;
     // Leave room for writer queueing and the daemon relay under the shortest
@@ -889,13 +898,7 @@ pub(super) fn submit_deferred_bash(
                                                                 &remote_source,
                                                             ),
                                                          || {
-                                                             let response = dispatch(raw_req, ctx);
-                                                             // Register before formatting or database work can
-                                                             // delay observation of a newly started command.
-                                                             if let (Some(scope), Some(task)) = (&run_scope, response.data.get("task_id").and_then(Value::as_str)) {
-                                                                 scope.track(ctx.bash_background(), task, &session_for_spawn);
-                                                             }
-                                                             response
+                                                              crate::bash_background::registry::with_scope_spawn(scope_stamp, || dispatch(raw_req, ctx))
                                                          },
                                                         ),
                                                     )
@@ -1142,6 +1145,7 @@ pub(super) fn submit_deferred_bash(
                     wait_mode: detach_on_user_message,
                     worker_session,
                     server_completion,
+                    late_results: cancel.late_results,
                     registry: spawn_ctx.bash_background().clone(),
                     request_id,
                     ver,
@@ -1225,6 +1229,7 @@ pub(super) fn submit_deferred_bash(
                     wait_mode: detach_on_user_message,
                     worker_session,
                     server_completion,
+                    late_results: cancel.late_results,
                     registry: spawn_ctx.bash_background().clone(),
                     request_id: request_id.clone(),
                     ver,
@@ -1495,6 +1500,7 @@ async fn run_deferred_bash_wait(
             wait_mode: detach_on_user_message,
             worker_session,
             server_completion,
+            late_results: cancel.late_results,
             registry: registry.clone(),
             request_id: request_id.clone(),
             ver,
@@ -1532,8 +1538,7 @@ async fn run_deferred_bash_wait(
                     let session_id = session_id.clone();
                     let task_id = task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        if !run_scoped && server_completion && !registry.is_remote_task(&task_id,&session_id) { let _ = registry.kill(&task_id, &session_id); }
-                        else if !run_scoped {
+                        if !run_scoped {
                             // The command keeps running as a task. Promote it so
                             // its completion is queued for the session like any
                             // background task's (a foreground task's completion
@@ -2420,6 +2425,7 @@ mod grant_path_tests {
             wait_mode: false,
             worker_session: false,
             server_completion: false,
+            late_results: false,
             registry: registry.clone(),
             request_id: "detach-log".into(),
             ver: PROTOCOL_VERSION,
@@ -2628,6 +2634,23 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn v1_server_completion_never_returns_a_promoted_or_background_launch() {
+        let detached = build_detached_frame(
+            PROTOCOL_VERSION,
+            1,
+            1,
+            1,
+            Flags::new(false, Priority::Interactive, false),
+            "task",
+            false,
+        )
+        .unwrap();
+        assert_eq!(detached.header.ty, FrameType::Error);
+        let detached: Value = serde_json::from_slice(&detached.body).unwrap();
+        assert_eq!(detached["code"], "detached");
+        assert_eq!(
+            detached["detail"],
+            json!({"task_id":"task","late_results":false})
+        );
         for (background, pty) in [(false, false), (true, false), (false, true)] {
             let (_dir, root) = super::super::test_support::test_root("v1-shell-completion");
             let ctx = super::super::test_support::test_ctx();
@@ -2659,6 +2682,8 @@ mod grant_path_tests {
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
                     run_scope: None,
+                    scope: None,
+                    late_results: false,
                     connection: PersistentCancelSignal::new(),
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
@@ -2757,6 +2782,8 @@ mod grant_path_tests {
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
                 run_scope: None,
+                scope: None,
+                late_results: false,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -3966,6 +3993,8 @@ mod grant_path_tests {
                 crate::subc_format::FormatContext::default(),
                 BashWaitCancel {
                     run_scope: None,
+                    scope: None,
+                    late_results: false,
                     connection,
                     route,
                     drain: drain::ModuleDrainWindow::default(),
@@ -4125,6 +4154,8 @@ mod grant_path_tests {
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
                 run_scope: None,
+                scope: None,
+                late_results: false,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -4244,6 +4275,8 @@ mod run_tests {
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
                 run_scope: Some(super::super::run_scope::RunScope::for_test(deadline)),
+                scope: None,
+                late_results: false,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),

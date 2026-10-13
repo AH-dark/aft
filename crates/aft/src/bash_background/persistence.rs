@@ -575,6 +575,10 @@ pub struct PersistedTask {
     /// written before AFT recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_key: Option<super::TaskCallKey>,
+    /// The daemon's scope owner, reference and epoch at spawn. A reconnect
+    /// must not relabel a running command as belonging to the new route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<subc_protocol::scope::ScopeStamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) remote: Option<super::registry::remote::RemoteTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -663,6 +667,7 @@ impl PersistedTask {
             status_reason: None,
             output_incomplete: false,
             call_key,
+            scope: super::registry::scope_for_spawn(),
             remote: None,
             execution_note: None,
             incomplete_output: Vec::new(),
@@ -791,6 +796,7 @@ impl From<BashTaskRow> for PersistedTask {
             status_reason: None,
             output_incomplete: false,
             call_key: None,
+            scope: None,
             remote: None,
             execution_note: None,
             incomplete_output: Vec::new(),
@@ -2971,6 +2977,50 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scope_stamp_task_versions_and_unstamped_v7_are_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        let (resolved, mut task) = counted_task(directory.path());
+        assert_eq!(SCHEMA_VERSION, 7);
+        let stamp = subc_protocol::scope::ScopeStamp::new(
+            subc_protocol::Principal::Reserved {
+                module_id: "owner".into(),
+            },
+            "scope",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        )
+        .with_owner_authorized(true);
+        task.scope = Some(stamp.clone());
+        task.mark_terminal(
+            BgTaskStatus::Killed,
+            Some(137),
+            Some("scope revoked".into()),
+        );
+        write_task_at(&resolved, &task).unwrap();
+        assert_eq!(read_task_at(&resolved).unwrap().scope, Some(stamp.clone()));
+        assert_eq!(
+            read_task_at(&resolved).unwrap().status_reason.as_deref(),
+            Some("scope revoked")
+        );
+        let mut value = serde_json::to_value(&task).unwrap();
+        // Version-7 background-task files also predate scope tracking.
+        // A file without scope must remain readable and must not gain one.
+        value.as_object_mut().unwrap().remove("scope");
+        std::fs::write(&resolved.paths.json, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(read_task_at(&resolved).unwrap().scope.is_none());
+        value["schema_version"] = serde_json::json!(6);
+        std::fs::write(&resolved.paths.json, serde_json::to_vec(&value).unwrap()).unwrap();
+        let old = read_task_at(&resolved).unwrap();
+        assert_eq!(old.schema_version, 6);
+        write_task_at(&resolved, &old).unwrap();
+        assert_eq!(read_task_at(&resolved).unwrap().schema_version, 7);
+        value["schema_version"] = serde_json::json!(SCHEMA_VERSION + 1);
+        std::fs::write(&resolved.paths.json, serde_json::to_vec(&value).unwrap()).unwrap();
+        let error = read_task_at(&resolved).unwrap_err().to_string();
+        assert!(error.contains("storage_requires_newer_reader"), "{error}");
+        assert!(error.contains("7"), "{error}");
+    }
     #[test]
     fn durability_bash_record_payload_count() {
         let storage = tempfile::tempdir().unwrap();

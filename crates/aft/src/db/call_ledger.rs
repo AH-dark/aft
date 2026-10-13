@@ -263,6 +263,39 @@ pub fn settle(
     Ok(true)
 }
 
+/// Atomically settle Prepared and Authorized calls as scope-ended.
+/// A concurrent approval cannot advance a settled row to DispatchStarted.
+pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite::Result<Vec<Key>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let keys = {
+        let mut statement = tx.prepare("SELECT carrier,call_key FROM call_ledger WHERE owner=?1 AND scope_ref=?2 AND scope_epoch=?3 AND state IN ('Prepared','Authorized')")?;
+        let rows = statement.query_map(
+            params![scope.owner, scope.scope_ref, scope.scope_epoch],
+            |row| {
+                Ok(Key {
+                    carrier: row.get(0)?,
+                    call_key: row.get(1)?,
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for key in &keys {
+        if let Some(row) = get(&tx, key)? {
+            settle_row(
+                &tx,
+                &row,
+                &not_started(key, "scope_ended"),
+                "not_started",
+                Some("scope_ended"),
+                now,
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(keys)
+}
+
 /// Settles an unsettled row inside the caller's transaction. A settlement
 /// with a `reason` means the call never ran, so its `tool.withdraw` answer
 /// follows from that reason alone (see [`never_ran_answer`]: `withdrawn`, or
@@ -906,6 +939,59 @@ fn run_before_recovery_read(conn: &Connection, key: &Key) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scope_end_fences_only_matching_pre_dispatch_rows() {
+        let conn = database();
+        let own = scope("owner-a");
+        for (carrier, state, stamp) in [
+            ("prepared", State::Prepared, own.clone()),
+            ("authorized", State::Authorized, own.clone()),
+            ("started", State::DispatchStarted, own.clone()),
+            ("other-owner", State::Prepared, scope("owner-b")),
+            (
+                "other-epoch",
+                State::Prepared,
+                ScopeIdentity {
+                    scope_epoch: own.scope_epoch + 1,
+                    ..own.clone()
+                },
+            ),
+        ] {
+            admit(&conn, &key(carrier), "content", Some(&stamp), state).unwrap();
+        }
+        let ended = end_scope(&conn, &own, now_ms()).unwrap();
+        assert_eq!(ended.len(), 2);
+        for carrier in ["prepared", "authorized"] {
+            let row = get(&conn, &key(carrier)).unwrap().unwrap();
+            assert_eq!(row.state, State::Settled);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&row.withdraw_answer.unwrap()).unwrap(),
+                json!({"answer":"refused","reason":"scope_ended"})
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(row.late_entry.as_ref().unwrap()).unwrap()["reason"],
+                "scope_ended"
+            );
+            assert!(!transition(
+                &conn,
+                &key(carrier),
+                State::Authorized,
+                State::DispatchStarted
+            )
+            .unwrap());
+        }
+        assert_eq!(
+            get(&conn, &key("started")).unwrap().unwrap().state,
+            State::DispatchStarted
+        );
+        for carrier in ["other-owner", "other-epoch"] {
+            assert_eq!(
+                get(&conn, &key(carrier)).unwrap().unwrap().state,
+                State::Prepared
+            );
+        }
+        assert!(end_scope(&conn, &own, now_ms()).unwrap().is_empty());
+    }
     use super::*;
 
     #[test]

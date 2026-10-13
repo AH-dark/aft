@@ -875,10 +875,12 @@ struct LedgerWait {
 struct LedgerCall {
     root: crate::path_identity::ProjectRootId,
     key: crate::db::call_ledger::Key,
+    shell: bool,
+    detached: bool,
     expires_at: std::time::Instant,
     /// A `tool.withdraw` settled this held call before the frame loop filed
     /// its question; the request is answered `not_started` when it arrives.
-    withdrawn: bool,
+    withdrawn: Option<&'static str>,
 }
 
 /// Test-only gate between a keyed call's durable admission and the frame
@@ -1368,7 +1370,9 @@ impl LedgerEdge {
                                     key: response_key.clone(),
                                     expires_at: std::time::Instant::now()
                                         + bash_elicitation_timeout(),
-                                    withdrawn: false,
+                                    withdrawn: None,
+                                    shell: matches!(call.name.as_str(), "bash" | "powershell"),
+                                    detached: false,
                                 },
                             );
                         }
@@ -1618,7 +1622,7 @@ impl LedgerEdge {
             match result {
                 Ok(reply) => {
                     if let Some(key) = reply.withdrawn_key {
-                        edge.end_withdrawn_held_calls(&key);
+                        edge.end_withdrawn_held_calls(&key, "withdrawn");
                     }
                     if let Ok(frame) = subc_protocol::Frame::build_with_version(
                         request.header.ver,
@@ -1645,14 +1649,17 @@ impl LedgerEdge {
     /// withdrawn call. The frame loop removes the call's pending question
     /// and answers the request `not_started`; a request whose question is not
     /// filed yet is marked, and answered when the frame loop reaches it.
-    fn end_withdrawn_held_calls(&self, key: &crate::db::call_ledger::Key) {
+    fn end_withdrawn_held_calls(&self, key: &crate::db::call_ledger::Key, reason: &'static str) {
         let requests: Vec<_> = self
             .calls
             .lock()
             .unwrap()
-            .iter()
+            .iter_mut()
             .filter(|(_, call)| &call.key == key)
-            .map(|(request, _)| *request)
+            .map(|(request, call)| {
+                call.withdrawn = Some(reason);
+                *request
+            })
             .collect();
         for (route, corr) in requests {
             match subc_protocol::Frame::build(
@@ -1677,12 +1684,70 @@ impl LedgerEdge {
         }
     }
 
+    /// Remove permission questions as tool.withdraw does, but preserve
+    /// scope_ended: the scope ended, not the caller's decision to withdraw.
+    pub(super) fn scope_ended(&self, keys: &[crate::db::call_ledger::Key]) {
+        for key in keys {
+            self.end_withdrawn_held_calls(key, "scope_ended");
+        }
+    }
+
+    /// The shell command outlives the request on its former route. Once that
+    /// request cannot receive a reply, terminal task writes must store the
+    /// result in the call ledger for replay and late_results.
+    pub(super) async fn detach_shells(
+        &self,
+        executor: &std::sync::Arc<crate::executor::Executor>,
+        route: Option<super::RouteChannel>,
+    ) {
+        let calls: Vec<_> = self
+            .calls
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|((channel, _), call)| {
+                call.shell && !call.detached && route.is_none_or(|route| *channel == route)
+            })
+            .map(|(_, call)| {
+                call.detached = true;
+                (call.root.clone(), call.key.clone())
+            })
+            .collect();
+        for (root, key) in calls {
+            let rx = executor.submit_async(
+                root,
+                crate::executor::Lane::Mutating,
+                "ledger-detach".into(),
+                Box::new(move |ctx| {
+                    detach_shell_row(ctx, &key);
+                    crate::protocol::Response::success("ledger-detach", serde_json::json!({}))
+                }),
+            );
+            let _ = super::await_executor_response(rx, "ledger-detach".into()).await;
+        }
+    }
+
+    pub(super) fn unrouted_shells(
+        &self,
+        routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
+    ) -> std::collections::HashSet<super::RouteChannel> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((route, _), call)| {
+                call.shell && !call.detached && !routes.contains_key(route)
+            })
+            .map(|((route, _), _)| *route)
+            .collect()
+    }
+
     /// Marks a held request withdrawn before its question was filed. Returns
     /// false when the request already ended.
     pub(super) fn mark_withdrawn(&self, route: super::RouteChannel, corr: u64) -> bool {
         match self.calls.lock().unwrap().get_mut(&(route, corr)) {
             Some(call) => {
-                call.withdrawn = true;
+                call.withdrawn.get_or_insert("withdrawn");
                 true
             }
             None => false,
@@ -1698,7 +1763,7 @@ impl LedgerEdge {
                 super::route_key(request.header.channel, request.header.epoch),
                 request.header.corr,
             ))
-            .is_some_and(|call| call.withdrawn)
+            .is_some_and(|call| call.withdrawn.is_some())
     }
 
     /// The terminal frame of a held request whose call was withdrawn before
@@ -1710,9 +1775,12 @@ impl LedgerEdge {
         ver: u8,
         flags: subc_protocol::Flags,
     ) -> Option<Result<subc_protocol::Frame, subc_protocol::FrameBuildError>> {
-        let key = self.calls.lock().unwrap().get(&(route, corr))?.key.clone();
-        let recorded =
-            crate::db::call_ledger::not_started(&key, crate::db::call_ledger::WITHDRAWN_REASON);
+        let (key, reason) = {
+            let calls = self.calls.lock().unwrap();
+            let call = calls.get(&(route, corr))?;
+            (call.key.clone(), call.withdrawn.unwrap_or("withdrawn"))
+        };
+        let recorded = crate::db::call_ledger::not_started(&key, reason);
         Some(subc_protocol::Frame::build_with_version(
             ver,
             recorded.ty,
@@ -1932,6 +2000,27 @@ impl LedgerEdge {
                     }
                     continue;
                 };
+                if outgoing.header.ty == FrameType::Error
+                    && serde_json::from_slice::<Value>(&outgoing.body)
+                        .is_ok_and(|body| body["code"] == "detached")
+                {
+                    // ERROR detached ends the waiting request, not the running
+                    // command. A terminal task write will record its real result.
+                    let rx = executor.submit_async(
+                        call.root,
+                        Lane::Mutating,
+                        "ledger-detach".into(),
+                        Box::new(move |ctx| {
+                            detach_shell_row(ctx, &call.key);
+                            Response::success("ledger-detach", json!({}))
+                        }),
+                    );
+                    let _ = await_executor_response(rx, "ledger-detach".into()).await;
+                    if actual.send(outgoing).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 let actual = actual.clone();
                 let metrics = metrics.clone();
                 let recorded = RecordedFrame {
@@ -2001,6 +2090,23 @@ impl LedgerEdge {
             }
         });
         (sender, task)
+    }
+}
+
+fn detach_shell_row(ctx: &crate::context::AppContext, key: &crate::db::call_ledger::Key) {
+    let task = ctx.db().and_then(|db| {
+        let conn = db.lock().ok()?;
+        // recovered=1 makes terminal task writes record the call's result
+        // instead of waiting for an attached reply. A detach needs that same
+        // behavior as restart recovery, since the command keeps running.
+        if let Err(error) = conn.execute("UPDATE call_ledger SET recovered=1 WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted'", rusqlite::params![key.carrier, key.call_key]) {
+            log::warn!("call ledger detach failed: {error}");
+            return None;
+        }
+        crate::db::call_ledger::get(&conn, key).ok().flatten()?.task_id
+    });
+    if let Some(task) = task {
+        ctx.bash_background().settle_detached_call(&task);
     }
 }
 

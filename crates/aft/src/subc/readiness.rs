@@ -519,8 +519,8 @@ impl Drop for PendingGuard<'_> {
 
 /// [`ReadinessControl`] over the module's own daemon connection.
 pub(super) struct DaemonControl {
-    writer: WriterSender,
-    metrics: Arc<DispatchPathMetrics>,
+    pub(super) writer: WriterSender,
+    pub(super) metrics: Arc<DispatchPathMetrics>,
     negotiated_ver: u8,
     advertised_ops: Vec<String>,
     /// The provider roles from the HELLO manifest. `catalog.update` replaces
@@ -528,6 +528,7 @@ pub(super) struct DaemonControl {
     provides: Vec<ProviderRole>,
     pending: PendingControlReplies,
     next_corr: AtomicU64,
+    describe_slots: tokio::sync::Semaphore,
 }
 
 impl DaemonControl {
@@ -548,13 +549,45 @@ impl DaemonControl {
             provides,
             pending,
             next_corr: AtomicU64::new(first_corr),
+            describe_slots: tokio::sync::Semaphore::new(4),
         }
     }
 
-    fn advertises(&self, op: &str) -> bool {
+    pub(super) fn supports_ready_flip(&self) -> bool {
+        daemon_supports_ready_flip(&self.advertised_ops)
+    }
+
+    pub(super) fn advertises(&self, op: &str) -> bool {
         self.advertised_ops
             .iter()
             .any(|advertised| advertised == op)
+    }
+
+    /// Uses readiness's correlation counter and reply table, so control
+    /// replies cannot be delivered to the wrong request. The semaphore limits
+    /// concurrent scope.describe requests, including codemode admission.
+    pub(super) async fn describe(
+        &self,
+        stamp: &subc_protocol::scope::ScopeStamp,
+    ) -> Result<ModuleControlResponseToModule, ControlError> {
+        const OP: &str = subc_protocol::scope::SCOPE_DESCRIBE_OP;
+        if !self.advertises(OP) {
+            return Err(ControlError::NotAdvertised(OP));
+        }
+        let _slot = self
+            .describe_slots
+            .acquire()
+            .await
+            .map_err(|_| ControlError::ConnectionClosed)?;
+        tokio::time::timeout(
+            super::scope_describe::describe_timeout(),
+            self.request(&ModuleControlRequestFromModule::ScopeDescribe {
+                owner: stamp.owner.clone(),
+                scope_ref: stamp.scope_ref.clone(),
+            }),
+        )
+        .await
+        .map_err(|_| ControlError::Timeout)?
     }
 
     async fn request(
@@ -1178,6 +1211,65 @@ mod tests {
         };
         let (result, ()) = tokio::join!(control.live_roots(), daemon);
         assert_eq!(result, Ok(reply(vec![live_root("/r", 1, 1)], 1, 3)));
+    }
+
+    #[tokio::test]
+    async fn scope_describe_and_readiness_share_corrs_with_or_without_ready_flip() {
+        for catalog in [false, true] {
+            let mut ops = vec![LIVE_ROOTS_OP, subc_protocol::scope::SCOPE_DESCRIBE_OP];
+            if catalog {
+                ops.push(MODULE_TO_SUBC_OP_CATALOG_UPDATE);
+            }
+            let (control, mut rx, pending) = wire_control(&ops);
+            let stamp = subc_protocol::scope::ScopeStamp::new(
+                subc_protocol::Principal::Direct,
+                "scope",
+                1,
+                subc_protocol::scope::ScopeKind::Head,
+            );
+            let daemon = async {
+                let first = rx.recv().await.unwrap();
+                let second = rx.recv().await.unwrap();
+                assert_ne!(first.header.corr, second.header.corr);
+                assert_eq!(pending.len(), 2);
+                for request in [first, second] {
+                    let body: ModuleControlRequestFromModule =
+                        serde_json::from_slice(&request.body).unwrap();
+                    let response = match body {
+                        ModuleControlRequestFromModule::LiveRoots {} => {
+                            ModuleControlResponseToModule::LiveRoots {
+                                roots: vec![],
+                                unknown_root_bindings: 0,
+                                total_bindings: 0,
+                            }
+                        }
+                        ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref } => {
+                            assert_eq!(owner, stamp.owner);
+                            assert_eq!(scope_ref, stamp.scope_ref);
+                            ModuleControlResponseToModule::ScopeDescribe {
+                                status: subc_protocol::scope::ScopeStatus::Live,
+                                scope_epoch: Some(1),
+                                daemon_incarnation: "daemon".into(),
+                                owner_synced: true,
+                                owner_configured: true,
+                                scope: Some(stamp.clone()),
+                            }
+                        }
+                        _ => panic!("unexpected request"),
+                    };
+                    assert!(pending.resolve(reply_frame(
+                        FrameType::Response,
+                        request.header.corr,
+                        serde_json::to_vec(&response).unwrap()
+                    )));
+                }
+            };
+            let (roots, describe, ()) =
+                tokio::join!(control.live_roots(), control.describe(&stamp), daemon);
+            assert!(roots.is_ok());
+            assert!(describe.is_ok());
+            assert_eq!(pending.len(), 0);
+        }
     }
 
     #[tokio::test]

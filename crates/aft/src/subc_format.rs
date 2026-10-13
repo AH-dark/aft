@@ -1054,7 +1054,10 @@ fn format_bash_status(
         .unwrap_or_default();
     let mut text = format!("Task {task_id}: {status}");
     if status == "killed"
-        && data.get("status_reason").and_then(Value::as_str) == Some("scope revoked")
+        && matches!(
+            data.get("status_reason").and_then(Value::as_str),
+            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
+        )
     {
         text.push_str(" (scope revoked)");
     }
@@ -4886,10 +4889,14 @@ mod run_scope_status_tests {
 
     #[test]
     fn bash_status_names_scope_revocation() {
-        let data =
-            json!({"task_id":"bash-dead", "status":"killed", "status_reason":"scope revoked"});
-        let text = format_bash_status(&data, None, false, false);
-        assert!(text.contains("killed (scope revoked)"), "{text}");
+        for reason in [
+            "scope revoked",
+            crate::bash_background::registry::SCOPE_REVOKED_REASON,
+        ] {
+            let data = json!({"task_id":"bash-dead", "status":"killed", "status_reason":reason});
+            let text = format_bash_status(&data, None, false, false);
+            assert!(text.contains("killed (scope revoked)"), "{text}");
+        }
         let ordinary = format_bash_status(
             &json!({"task_id":"bash-dead", "status":"killed"}),
             None,

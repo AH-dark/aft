@@ -4456,7 +4456,10 @@ async fn exec_remote_run_scope_revocation_reports_reason() {
     .await
     .unwrap();
     assert_eq!(done.info.status, BgTaskStatus::Killed);
-    assert_eq!(done.info.status_reason.as_deref(), Some("scope revoked"));
+    assert_eq!(
+        done.info.status_reason.as_deref(),
+        Some(crate::bash_background::registry::SCOPE_REVOKED_REASON)
+    );
     assert!(daemon
         .log
         .lock()

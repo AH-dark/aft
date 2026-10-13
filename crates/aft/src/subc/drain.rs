@@ -264,6 +264,7 @@ pub(super) struct BashDetachTarget {
     /// v1 without late_results cannot leave a shell action running after its reply.
     /// Drain and cancellation therefore kill the task instead of promoting it.
     pub(super) server_completion: bool,
+    pub(super) late_results: bool,
     pub(super) registry: crate::bash_background::BgTaskRegistry,
     pub(super) request_id: String,
     pub(super) ver: u8,

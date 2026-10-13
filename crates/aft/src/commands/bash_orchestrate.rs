@@ -47,7 +47,10 @@ pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
         }
     }
     if snapshot.info.status == BgTaskStatus::Killed
-        && snapshot.info.status_reason.as_deref() == Some("scope revoked")
+        && matches!(
+            snapshot.info.status_reason.as_deref(),
+            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
+        )
     {
         rendered.push_str("\n[killed (scope revoked)]");
     }
@@ -1138,6 +1141,21 @@ mod tests {
     use crate::bash_background::persistence::BgMode;
     use crate::bash_background::registry::BgTaskSnapshot;
     use crate::bash_background::BgTaskInfo;
+
+    #[test]
+    fn foreground_scope_revocation_preserves_old_and_new_reason_text() {
+        for reason in [
+            "scope revoked",
+            crate::bash_background::registry::SCOPE_REVOKED_REASON,
+        ] {
+            let mut task = snapshot("output", false, None, BgTaskStatus::Killed, Some(137));
+            task.info.status_reason = Some(reason.into());
+            assert_eq!(
+                format_foreground_result(&task),
+                "output\n[killed (scope revoked)]\n[exit code: 137]"
+            );
+        }
+    }
 
     fn snapshot(
         output_preview: &str,

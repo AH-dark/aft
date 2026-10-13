@@ -1808,9 +1808,12 @@ impl BgTaskRegistry {
                 }
             }
             if status == BgTaskStatus::Killed
-                && state.metadata.status_reason.as_deref() == Some("scope revoked")
+                && matches!(
+                    state.metadata.status_reason.as_deref(),
+                    Some(super::SCOPE_REVOKED_REASON | "scope revoked")
+                )
             {
-                reason = Some("scope revoked".into());
+                reason = state.metadata.status_reason.clone();
             }
             state.metadata.mark_terminal(status, code, reason.clone());
             append_output_loss(&mut state.metadata);

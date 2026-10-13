@@ -955,6 +955,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                 wait_mode: true,
                 worker_session: true,
                 server_completion: true,
+                late_results: false,
                 request_id: "remote-drain".into(),
                 ver: PROTOCOL_VERSION,
                 flags: control_flags(),

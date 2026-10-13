@@ -110,84 +110,12 @@ mod tests {
     }
 }
 
-/// The daemon connection is shared with readiness checks. Run requests use
-/// separate correlation IDs so a run reply cannot be mistaken for a readiness reply.
-struct ScopeControl {
-    writer: WriterSender,
-    metrics: Arc<DispatchPathMetrics>,
-    pending: readiness::PendingControlReplies,
-    ver: u8,
-    next_corr: AtomicU64,
-    slots: tokio::sync::Semaphore,
-}
-
-impl ScopeControl {
-    async fn describe(
-        &self,
-        stamp: &subc_protocol::scope::ScopeStamp,
-    ) -> Result<subc_protocol::session::ModuleControlResponseToModule, ErrorBody> {
-        let request = async {
-            let _slot = self
-                .slots
-                .acquire()
-                .await
-                .map_err(|_| ErrorBody::new("run_scope_unavailable", "scope worker stopped"))?;
-            let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
-            let rx = self.pending.register(corr);
-            struct PendingGuard<'a>(&'a readiness::PendingControlReplies, u64);
-            impl Drop for PendingGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.remove(self.1);
-                }
-            }
-            let _guard = PendingGuard(&self.pending, corr);
-            let body = subc_protocol::session::ModuleControlRequestFromModule::ScopeDescribe {
-                owner: stamp.owner.clone(),
-                scope_ref: stamp.scope_ref.clone(),
-            };
-            let frame = Frame::build_with_version(
-                self.ver,
-                FrameType::Request,
-                control_flags(),
-                0,
-                0,
-                corr,
-                serde_json::to_vec(&body)
-                    .map_err(|e| ErrorBody::new("run_scope_unavailable", e.to_string()))?,
-            )
-            .map_err(|e| ErrorBody::new("run_scope_unavailable", e.to_string()))?;
-            send_reliable_writer_frame(&self.writer, &self.metrics, frame, "scope.describe")
-                .await
-                .map_err(|e| ErrorBody::new("run_scope_unavailable", e.to_string()))?;
-            let reply = rx.await.map_err(|_| {
-                ErrorBody::new("run_scope_unavailable", "scope.describe connection closed")
-            })?;
-            if reply.header.ty == FrameType::Error {
-                return Err(ErrorBody::new(
-                    "run_scope_unavailable",
-                    "scope.describe was refused by the daemon",
-                ));
-            }
-            serde_json::from_slice(&reply.body)
-                .map_err(|e| ErrorBody::new("run_scope_unavailable", e.to_string()))
-        };
-        tokio::time::timeout(Duration::from_secs(2), request)
-            .await
-            .map_err(|_| ErrorBody::new("run_scope_unavailable", "scope.describe timed out"))?
-    }
-}
-
 pub(super) struct RunScope {
     stamp: subc_protocol::scope::ScopeStamp,
-    control: Arc<ScopeControl>,
+    control: Arc<readiness::DaemonControl>,
     describe_lock: tokio::sync::Mutex<()>,
     budget: StdMutex<Option<RunBudget>>,
-    tasks: StdMutex<Vec<(crate::bash_background::BgTaskRegistry, String, String)>>,
     revoked: AtomicBool,
-    closing: AtomicBool,
-    close_requested: AtomicBool,
-    hold_logged: AtomicBool,
-    close_runtime: OnceLock<tokio::runtime::Handle>,
     /// Permission asks this run's calls left open with `access_pending`.
     /// They are withdrawn once the run's scope is confirmed ended.
     parked_asks: StdMutex<Vec<super::consent::ParkedAsk>>,
@@ -265,7 +193,11 @@ impl RunScope {
         {
             return self.cached_budget();
         }
-        let reply = self.control.describe(&self.stamp).await?;
+        let reply = self
+            .control
+            .describe(&self.stamp)
+            .await
+            .map_err(|error| ErrorBody::new("run_scope_unavailable", error.to_string()))?;
         use subc_protocol::{scope::ScopeStatus, session::ModuleControlResponseToModule};
         let ModuleControlResponseToModule::ScopeDescribe {
             status: ScopeStatus::Live,
@@ -300,175 +232,38 @@ impl RunScope {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(budget);
         self.cached_budget()
     }
-
-    pub(super) fn route_closed(self: &Arc<Self>) {
-        self.close_requested.store(true, Ordering::Release);
-        if self.revoked.load(Ordering::Acquire) || self.closing.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let runtime = self
-            .close_runtime
-            .get_or_init(tokio::runtime::Handle::current);
-        let scope = Arc::clone(self);
-        runtime.spawn(async move {
-            // A reconnect can close a route without ending its scope. Only
-            // scope.describe confirming an end, a different live epoch, or a
-            // synced owner's missing scope permits terminating the run's work.
-            let mut backoff = Duration::from_millis(250);
-            loop {
-                let reply = tokio::time::timeout(Duration::from_secs(3), async {
-                    let _describe = scope.describe_lock.lock().await;
-                    scope.control.describe(&scope.stamp).await
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    Err(ErrorBody::new(
-                        "run_scope_unavailable",
-                        "scope close confirmation timed out",
-                    ))
-                });
-                let hold_reason = match reply {
-                    Ok(reply) if scope.ended(&reply) => {
-                        scope.revoked.store(true, Ordering::Release);
-                        scope.withdraw_parked_asks();
-                        let scope_for_kill = Arc::clone(&scope);
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let tasks = scope_for_kill
-                                .tasks
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .clone();
-                            for (registry, task, session) in tasks {
-                                if let Err(error) =
-                                    registry.kill_for_scope_revocation(&task, &session)
-                                {
-                                    log::warn!(
-                                        "run scope process-group kill failed task={task}: {error}"
-                                    );
-                                }
-                            }
-                        })
-                        .await;
-                        break;
-                    }
-                    Ok(_) => "scope.describe has not confirmed scope end".to_string(),
-                    Err(error) => error.message,
-                };
-                if !scope.keep_confirming().await {
-                    return;
-                }
-                scope.hold_once(|| {
-                    log::warn!(
-                        "run scope close confirmation held run_id={} scope={} epoch={}: {hold_reason}",
-                        scope.stamp.attributes.run_id.as_deref().unwrap_or("unknown"),
-                        scope.stamp.scope_ref,
-                        scope.stamp.scope_epoch,
-                    );
-                });
-                tokio::time::sleep(backoff).await;
-                backoff = next_scope_confirmation_backoff(backoff);
-                if !scope.keep_confirming().await {
-                    return;
-                }
-            }
-            scope.closing.store(false, Ordering::Release);
-        });
-    }
-
-    async fn has_live_tasks(self: &Arc<Self>) -> bool {
-        let scope = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            let tasks = scope
-                .tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            tasks
-                .iter()
-                .any(|(registry, task, session)| registry.has_live_task_processes(task, session))
-        })
-        .await
-        .unwrap_or(true)
-    }
-
-    // Recheck after releasing the worker claim so a concurrent registration
-    // either restarts this confirmer or starts its own, never losing the close.
-    async fn keep_confirming(self: &Arc<Self>) -> bool {
-        if self.has_live_tasks().await {
-            return true;
-        }
-        self.closing.store(false, Ordering::Release);
-        self.has_live_tasks().await && !self.closing.swap(true, Ordering::AcqRel)
-    }
-
-    fn hold_once(&self, log_hold: impl FnOnce()) {
-        if !self.hold_logged.swap(true, Ordering::AcqRel) {
-            log_hold();
-        }
-    }
-
-    fn ended(&self, reply: &subc_protocol::session::ModuleControlResponseToModule) -> bool {
-        use subc_protocol::{scope::ScopeStatus, session::ModuleControlResponseToModule};
-        match reply {
-            ModuleControlResponseToModule::ScopeDescribe {
-                status,
-                scope_epoch,
-                owner_synced,
-                ..
-            } => match status {
-                ScopeStatus::Ended => true,
-                ScopeStatus::Live => {
-                    scope_epoch.is_some_and(|epoch| epoch != self.stamp.scope_epoch)
-                }
-                ScopeStatus::NotLive => *owner_synced,
-            },
-            _ => false,
-        }
-    }
-
-    pub(super) fn track(
-        self: &Arc<Self>,
-        registry: &crate::bash_background::BgTaskRegistry,
-        task: &str,
-        session: &str,
-    ) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((registry.clone(), task.into(), session.into()));
-        // Registration can race the close worker's snapshot. A task registered
-        // after revocation must be killed too, not missed by that snapshot.
-        if self.revoked.load(Ordering::Acquire) {
-            let _ = registry.kill_for_scope_revocation(task, session);
-        } else if self.close_requested.load(Ordering::Acquire) {
-            self.route_closed();
-        }
-    }
 }
 
 pub(super) struct RunScopes {
-    control: Arc<ScopeControl>,
+    control: Arc<readiness::DaemonControl>,
     scopes: StdMutex<HashMap<(String, String, u64), Arc<RunScope>>>,
 }
 
 impl RunScopes {
-    pub(super) fn new(
-        writer: WriterSender,
-        metrics: Arc<DispatchPathMetrics>,
-        pending: readiness::PendingControlReplies,
-        ver: u8,
-    ) -> Self {
+    pub(super) fn new(control: Arc<readiness::DaemonControl>) -> Self {
         Self {
-            control: Arc::new(ScopeControl {
-                writer,
-                metrics,
-                pending,
-                ver,
-                next_corr: AtomicU64::new(1 << 62),
-                slots: tokio::sync::Semaphore::new(8),
-            }),
+            control,
             scopes: StdMutex::new(HashMap::new()),
         }
+    }
+
+    pub(super) fn revoke(&self, stamp: &subc_protocol::scope::ScopeStamp) {
+        if let Some(scope) = self
+            .scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&super::scope_describe::stamp_key(stamp))
+        {
+            scope.revoked.store(true, Ordering::Release);
+            scope.withdraw_parked_asks();
+        }
+    }
+
+    pub(super) fn parked_scopes(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
+        self.scopes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values()
+            .filter(|scope| !scope.revoked() && !scope.parked_asks.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).is_empty())
+            .map(|scope| scope.stamp.clone()).collect()
     }
 
     pub(super) fn bind(&self, identity: &RouteIdentity) -> Option<Arc<RunScope>> {
@@ -477,11 +272,7 @@ impl RunScopes {
             .as_ref()
             .filter(|_| identity.call_mode == subc_protocol::call_mode::CallMode::Codemode)?;
         Some(Arc::clone(identity.run_scope.get_or_init(|| {
-            let key = (
-                serde_json::to_string(&stamp.owner).unwrap(),
-                stamp.scope_ref.clone(),
-                stamp.scope_epoch,
-            );
+            let key = super::scope_describe::stamp_key(stamp);
             Arc::clone(
                 self.scopes
                     .lock()
@@ -493,12 +284,7 @@ impl RunScopes {
                             control: Arc::clone(&self.control),
                             describe_lock: tokio::sync::Mutex::new(()),
                             budget: StdMutex::new(None),
-                            tasks: StdMutex::new(Vec::new()),
                             revoked: AtomicBool::new(false),
-                            closing: AtomicBool::new(false),
-                            close_requested: AtomicBool::new(false),
-                            hold_logged: AtomicBool::new(false),
-                            close_runtime: OnceLock::new(),
                             parked_asks: StdMutex::new(Vec::new()),
                         })
                     }),
@@ -658,12 +444,15 @@ impl RunBudget {
 impl RunScope {
     pub(super) fn for_test(deadline: Option<Instant>) -> Arc<Self> {
         let (writer, _) = mpsc::channel(8);
-        let scopes = RunScopes::new(
+        let scopes = RunScopes::new(Arc::new(readiness::DaemonControl::new(
             writer,
             Arc::new(DispatchPathMetrics::new()),
-            readiness::PendingControlReplies::default(),
             PROTOCOL_VERSION,
-        );
+            vec![],
+            vec![],
+            readiness::PendingControlReplies::default(),
+            HELLO_CORR + 1,
+        )));
         Arc::new(Self {
             stamp: serde_json::from_value(json!({
                 "owner":{"kind":"reserved", "module_id":"prefrontal-core"},
@@ -674,12 +463,7 @@ impl RunScope {
             control: scopes.control,
             describe_lock: tokio::sync::Mutex::new(()),
             budget: StdMutex::new(Some(RunBudget { deadline })),
-            tasks: StdMutex::new(Vec::new()),
             revoked: AtomicBool::new(false),
-            closing: AtomicBool::new(false),
-            close_requested: AtomicBool::new(false),
-            hold_logged: AtomicBool::new(false),
-            close_runtime: OnceLock::new(),
             parked_asks: StdMutex::new(Vec::new()),
         })
     }
@@ -690,12 +474,20 @@ mod lifetime_tests {
     use super::*;
 
     #[test]
+    fn confirmed_scope_end_invalidates_cached_run_budget() {
+        let scope = RunScope::for_test(None);
+        assert!(scope.cached_budget().is_ok());
+        scope.revoked.store(true, Ordering::Release);
+        assert_eq!(scope.cached_budget().unwrap_err().code, "run_scope_revoked");
+    }
+
+    #[test]
     fn close_outcomes_are_definitive_only() {
         use subc_protocol::{scope::ScopeStatus, session::ModuleControlResponseToModule};
-        let scope = RunScope::for_test(None);
+
         for (status, epoch, synced, expected) in [
             (ScopeStatus::Live, Some(1), true, false),
-            (ScopeStatus::Live, Some(2), true, true),
+            (ScopeStatus::Live, Some(2), true, false),
             (ScopeStatus::Live, None, true, false),
             (ScopeStatus::Ended, Some(1), true, true),
             (ScopeStatus::NotLive, None, true, true),
@@ -710,12 +502,14 @@ mod lifetime_tests {
                 scope: None,
             };
             assert_eq!(
-                scope.ended(&reply),
+                super::super::scope_describe::describe_answer_ends_scope(&reply),
                 expected,
                 "{status:?}, {epoch:?}, synced={synced}"
             );
         }
-        assert!(!scope.ended(&ModuleControlResponseToModule::CatalogUpdate {}));
+        assert!(!super::super::scope_describe::describe_answer_ends_scope(
+            &ModuleControlResponseToModule::CatalogUpdate {}
+        ));
     }
 
     #[test]
@@ -737,132 +531,5 @@ mod lifetime_tests {
         assert!(!response.success);
         assert_eq!(response.data["code"], "run_deadline_expired");
         assert!(cancel.cancel_already_requested());
-    }
-}
-
-fn next_scope_confirmation_backoff(backoff: Duration) -> Duration {
-    backoff.saturating_mul(2).min(Duration::from_secs(30))
-}
-
-#[cfg(test)]
-mod confirmation_tests {
-    use super::*;
-
-    #[test]
-    fn scope_confirmation_backoff_doubles_until_thirty_seconds() {
-        let mut backoff = Duration::from_millis(250);
-        for expected_ms in [250, 500, 1000, 2000, 4000, 8000, 16000, 30000, 30000] {
-            assert_eq!(backoff, Duration::from_millis(expected_ms));
-            backoff = next_scope_confirmation_backoff(backoff);
-        }
-    }
-
-    #[test]
-    fn scope_confirmation_logs_hold_once_across_workers() {
-        let scope = RunScope::for_test(None);
-        let mut emitted = 0;
-        for _ in 0..4 {
-            scope.hold_once(|| emitted += 1);
-        }
-        assert_eq!(emitted, 1);
-    }
-
-    #[tokio::test]
-    async fn scope_confirmation_stops_when_no_work_is_tracked() {
-        let scope = RunScope::for_test(None);
-        let first_corr = scope.control.next_corr.load(Ordering::Relaxed);
-        scope.route_closed();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while scope.closing.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("idle scope confirmation did not stop");
-        assert_eq!(
-            scope.control.next_corr.load(Ordering::Relaxed),
-            first_corr + 1
-        );
-        assert!(!scope.hold_logged.load(Ordering::Acquire));
-    }
-}
-
-#[cfg(all(test, unix))]
-mod late_confirmation_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn scope_confirmation_restarts_for_late_task_and_stops_after_finish() {
-        let scope = RunScope::for_test(None);
-        scope.route_closed();
-        wait_until_stopped(&scope).await;
-        let idle_corr = scope.control.next_corr.load(Ordering::Relaxed);
-        let ctx = test_support::test_ctx();
-        let response = crate::bash_background::spawn(
-            "late-scope-task",
-            "scope-retry-session",
-            "sleep 30",
-            crate::bash_background::BashShell::Bash,
-            PathBuf::from("/bin/bash"),
-            None,
-            None,
-            crate::bash_background::HardKill::from_timeout_ms(Some(5000)),
-            &ctx,
-            false,
-            false,
-            false,
-            false,
-            24,
-            80,
-            Vec::new(),
-            None,
-            None,
-        );
-        assert!(response.success, "{response:?}");
-        let task = response.data["task_id"].as_str().unwrap().to_string();
-        let registry = ctx.bash_background().clone();
-        let scope_for_track = Arc::clone(&scope);
-        let registry_for_track = registry.clone();
-        let task_for_track = task.clone();
-        std::thread::spawn(move || {
-            scope_for_track.track(&registry_for_track, &task_for_track, "scope-retry-session")
-        })
-        .join()
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !scope.hold_logged.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("late registration did not restart confirmation");
-        assert!(scope.control.next_corr.load(Ordering::Relaxed) > idle_corr);
-        let task_for_kill = task.clone();
-        let registry_for_kill = registry.clone();
-        tokio::task::spawn_blocking(move || {
-            registry_for_kill
-                .kill(&task_for_kill, "scope-retry-session")
-                .unwrap()
-        })
-        .await
-        .unwrap();
-        wait_until_stopped(&scope).await;
-        assert!(!registry.has_live_task_processes(&task, "scope-retry-session"));
-        let stopped_corr = scope.control.next_corr.load(Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(750)).await;
-        assert_eq!(
-            scope.control.next_corr.load(Ordering::Relaxed),
-            stopped_corr
-        );
-    }
-
-    async fn wait_until_stopped(scope: &RunScope) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while scope.closing.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("finished scope work kept confirmation alive");
     }
 }

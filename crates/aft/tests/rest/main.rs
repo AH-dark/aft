@@ -53,6 +53,8 @@ mod onnx_late_arrival_test;
 mod outline_producer_bounds_test;
 #[path = "../read_producer_bounds_test.rs"]
 mod read_producer_bounds_test;
+#[path = "../scope_end_kill.rs"]
+mod scope_end_kill;
 #[path = "../slice_fence.rs"]
 mod slice_fence;
 #[path = "../standing_roots_acceptance_test.rs"]
