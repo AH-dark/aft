@@ -406,7 +406,7 @@ impl Jail {
         assert_eq!(response, ModuleControlResponse::RouteBindAck {});
     }
 
-    async fn tool(&mut self, name: &str, arguments: Value) -> String {
+    async fn tool_reply(&mut self, name: &str, arguments: Value) -> Value {
         for _ in 0..200 {
             let corr = self.next_corr;
             self.next_corr += 1;
@@ -442,20 +442,24 @@ impl Jail {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
-            let value: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
-            let content = value["content"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| item["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            return format!("{content}\n{text}");
+            return serde_json::from_slice(&frame.body).expect("JSON tool reply");
         }
         panic!("database initialization never completed");
+    }
+
+    async fn tool(&mut self, name: &str, arguments: Value) -> String {
+        let value = self.tool_reply(name, arguments).await;
+        let content = value["content"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        format!("{content}\n{value}")
     }
 
     /// Run one shell command as the worker and return the reply as text.
@@ -897,28 +901,80 @@ async fn worker_jail_private_hook_chain_executes_read_only() {
         denied.contains("Operation not permitted") || denied.contains("Permission denied"),
         "{denied}"
     );
-    for dir in [&hooks, &original] {
+    for (key, dir, configured_dir) in [
+        ("core.hooksPath", &hooks, &hook_link),
+        ("mason.originalHooksPath", &original, &original_link),
+    ] {
         let path = dir.join("pre-commit");
         let before = std::fs::read(&path).unwrap();
-        let denied = jail
-            .bash(&format!(
-                "printf tamper >> {0}; touch {1}; rm {0}; mv {0} {2}",
-                quote(&path),
-                quote(&dir.join("new-hook")),
-                quote(&dir.join("renamed-hook"))
-            ))
-            .await;
-        assert!(
-            denied.contains("Operation not permitted") || denied.contains("Permission denied"),
-            "{denied}"
-        );
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "hook was modified: {denied}"
-        );
-        assert!(!dir.join("new-hook").exists(), "{denied}");
-        assert!(!dir.join("renamed-hook").exists(), "{denied}");
+        for (operation, attempt) in [
+            ("append", "printf tamper >> \"$hook_dir/pre-commit\""),
+            ("create", "printf new > \"$hook_dir/new-hook\""),
+            ("delete", "rm \"$hook_dir/pre-commit\""),
+            (
+                "rename",
+                "mv \"$hook_dir/pre-commit\" \"$hook_dir/renamed-hook\"",
+            ),
+        ] {
+            // Resolve each directory inside the jailed child. Disable AFT's
+            // command-scope hooksPath override to exercise the repository's
+            // configured core stub as well as its original-hook target.
+            let command = format!(
+                "cd {} && unset GIT_CONFIG_COUNT && hook_dir=$(git config --path {key}) && test -r \"$hook_dir/pre-commit\" && printf 'HOOK_PROBE_%s path=%s\\n' \"$((1+1))\" \"$hook_dir\" && {attempt}",
+                quote(&jail.worktree),
+            );
+            let reply = jail
+                .tool_reply("bash", json!({"command": command, "timeout": 300_000}))
+                .await;
+            let result = &reply["structuredContent"];
+            let output = result["output"].as_str().unwrap_or_default();
+            eprintln!(
+                "Hook immutability {key} {operation}: status={} exit_code={}\n{output}",
+                result["status"], result["exit_code"]
+            );
+            assert_eq!(
+                result["success"], true,
+                "{key} {operation} did not launch: {reply}"
+            );
+            assert!(
+                output.contains("HOOK_PROBE_2"),
+                "{key} {operation} did not reach the child operation: {reply}"
+            );
+            assert!(
+                output.contains(&format!("path={}", configured_dir.display())),
+                "{key} {operation} resolved the wrong directory: {reply}"
+            );
+            assert_eq!(
+                result["status"], "failed",
+                "{key} {operation} unexpectedly succeeded: {reply}"
+            );
+            assert!(
+                result["exit_code"].as_i64().is_some_and(|code| code != 0),
+                "{key} {operation} has no failing child exit status: {reply}"
+            );
+            let kernel_denial = if cfg!(target_os = "macos") {
+                "Operation not permitted"
+            } else {
+                "Permission denied"
+            };
+            assert!(
+                output.contains(kernel_denial),
+                "{key} {operation} was not a kernel write denial: {reply}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap_or_default(),
+                before,
+                "{key} {operation} changed the hook bytes: {reply}"
+            );
+            assert!(
+                !dir.join("new-hook").exists(),
+                "{key} {operation} created a file: {reply}"
+            );
+            assert!(
+                !dir.join("renamed-hook").exists(),
+                "{key} {operation} renamed the hook: {reply}"
+            );
+        }
     }
 }
 
