@@ -633,6 +633,8 @@ pub(crate) struct RegistryInner {
     /// tests count what persisted-GC sweeps cost.
     #[cfg(test)]
     gc_db_liveness_queries: AtomicU64,
+    #[cfg(test)]
+    pub(crate) child_polls: AtomicU64,
     /// Name of the thread the once-per-process persisted GC ran on. Lets the
     /// integration suite pin that the GC stays off the configure/replay thread
     /// (the replay caller is the standalone request loop).
@@ -648,7 +650,7 @@ pub(crate) struct RegistryInner {
     /// `bash_status`/`list` snapshot reads. When `None`, output is returned
     /// uncompressed.
     pub(crate) compressor:
-        Mutex<Option<Box<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
+        Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     /// Harness of the most recent configure of this root. Routes from several
     /// harnesses share the root, so this is only a fallback for a task,
@@ -723,6 +725,9 @@ pub(crate) struct BgTask {
     #[cfg(unix)]
     adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
     pub(crate) state: Mutex<BgTaskState>,
+    /// Cache construction is serialized independently of task state: renderers
+    /// can read artifacts and invoke callbacks without holding the state lock.
+    terminal_render: Mutex<()>,
     /// Notified, with `state` locked, when a kill clears
     /// `BgTaskState::kill_in_flight`. Readers that must answer with a settled
     /// status wait on it instead of holding `state` across the kill.
@@ -1019,6 +1024,8 @@ impl BgTaskRegistry {
                 persisted_gc_runs: AtomicU64::new(0),
                 #[cfg(test)]
                 gc_db_liveness_queries: AtomicU64::new(0),
+                #[cfg(test)]
+                child_polls: AtomicU64::new(0),
                 persisted_gc_thread: Mutex::new(None),
                 session_recovery: Mutex::new(HashMap::new()),
                 compressor: Mutex::new(None),
@@ -1075,12 +1082,18 @@ impl BgTaskRegistry {
     #[cfg(unix)]
     fn finish_db_hint(&self, metadata: &PersistedTask, buffer: &BgBuffer) {
         if let Some(job) = self.db_hint_job(&metadata.task_id) {
-            let raw = buffer.read_combined_head_tail(
-                COMPRESS_INPUT_CAP_BYTES,
-                COMPRESS_INPUT_HEAD_BYTES,
-                COMPRESS_INPUT_TAIL_BYTES,
+            job.finish_with_output(
+                || {
+                    buffer
+                        .read_combined_head_tail(
+                            COMPRESS_INPUT_CAP_BYTES,
+                            COMPRESS_INPUT_HEAD_BYTES,
+                            COMPRESS_INPUT_TAIL_BYTES,
+                        )
+                        .text
+                },
+                metadata.exit_code,
             );
-            job.finish(&raw.text, metadata.exit_code);
         }
     }
 
@@ -1480,7 +1493,7 @@ impl BgTaskRegistry {
         F: Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync + 'static,
     {
         if let Ok(mut slot) = self.inner.compressor.lock() {
-            *slot = Some(Box::new(compressor));
+            *slot = Some(Arc::new(compressor));
         }
     }
 
@@ -1492,16 +1505,26 @@ impl BgTaskRegistry {
         output: String,
         exit_code: Option<i64>,
     ) -> CompressionResult {
-        let Ok(slot) = self.inner.compressor.lock() else {
-            return CompressionResult::new(output);
-        };
-        match slot.as_ref() {
+        // Select the callback at invocation, then release the configuration lock.
+        // Reconfiguration cannot replace a callback already rendering a task.
+        let compressor = self
+            .inner
+            .compressor
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        match compressor {
             Some(compressor) => compressor(command, output, exit_code),
             None => CompressionResult::new(output),
         }
     }
 
     fn ensure_terminal_output_cache(&self, task: &Arc<BgTask>) -> Option<TerminalOutputCache> {
+        // A failed/panicked fill leaves the cache empty and must be retryable.
+        let _render = task
+            .terminal_render
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let (metadata, buffer) = {
             let state = task.lock_state().ok()?;
             if !state.metadata.status.is_terminal() || state.metadata.mode == BgMode::Pty {
@@ -1535,8 +1558,6 @@ impl BgTaskRegistry {
         disk_truncation: DiskTruncation,
         paths: Option<&TaskPaths>,
     ) -> TerminalOutputCache {
-        #[cfg(unix)]
-        self.finish_db_hint(metadata, buffer);
         let output_readable = buffer
             .output_path()
             .is_some_and(|path| self.is_session_owned_artifact_path(&metadata.session_id, &path));
@@ -1550,6 +1571,8 @@ impl BgTaskRegistry {
         };
 
         if metadata.mode == BgMode::Pty {
+            #[cfg(unix)]
+            self.finish_db_hint(metadata, buffer);
             return TerminalOutputCache {
                 output_preview: String::new(),
                 output_truncated: false,
@@ -1568,8 +1591,12 @@ impl BgTaskRegistry {
             disk_truncation,
             artifact_access.clone(),
         ) {
+            #[cfg(unix)]
+            self.finish_db_hint(metadata, buffer);
             structured
         } else if !metadata.compressed {
+            #[cfg(unix)]
+            self.finish_db_hint(metadata, buffer);
             render_raw_passthrough(buffer, disk_truncation, artifact_access)
         } else {
             let (raw, stdout_end) = buffer.read_combined_head_tail_with_boundary(
@@ -1577,6 +1604,10 @@ impl BgTaskRegistry {
                 COMPRESS_INPUT_HEAD_BYTES,
                 COMPRESS_INPUT_TAIL_BYTES,
             );
+            #[cfg(unix)]
+            if let Some(job) = self.db_hint_job(&metadata.task_id) {
+                job.finish(&raw.text, metadata.exit_code);
+            }
             let endings: Vec<String> = [&raw.text[..stdout_end], &raw.text[stdout_end..]]
                 .into_iter()
                 .map(crate::compress::generic::strip_ansi)
@@ -2998,6 +3029,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -3252,6 +3284,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
@@ -3493,6 +3526,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -4750,8 +4784,16 @@ impl BgTaskRegistry {
         drain: bool,
     ) -> Vec<PatternMatch> {
         const CHUNK: u64 = 64 * 1024;
+        // Catch up on bursts using the freshly validated per-pass handle, but
+        // yield after a bounded amount of I/O so other tasks can be scanned.
+        // Terminal scans still drain fully before routing an exit fallback.
+        const LIVE_BUDGET: usize = 1024 * 1024;
+        let mut bytes_read = 0;
         let mut matches = Vec::new();
         loop {
+            if !drain && bytes_read >= LIVE_BUDGET {
+                break;
+            }
             let cursor = match self.inner.watch_registry.lock() {
                 Ok(registry) if registry.active_count(task_id) > 0 => {
                     registry.file_cursor(cursor_key)
@@ -4766,6 +4808,7 @@ impl BgTaskRegistry {
                 break;
             }
             let len = bytes.len();
+            bytes_read += len;
             let Ok(mut registry) = self.inner.watch_registry.lock() else {
                 break;
             };
@@ -4777,7 +4820,7 @@ impl BgTaskRegistry {
             }
             matches.extend(registry.scan_chunk(cursor_key, task_id, &bytes, start));
             drop(registry);
-            if !drain || len < CHUNK as usize {
+            if len < CHUNK as usize {
                 break;
             }
         }
@@ -6593,6 +6636,8 @@ impl BgTaskRegistry {
             match &mut state.runtime {
                 TaskRuntime::Piped(child_slot) => {
                     if let Some(child) = child_slot.as_mut() {
+                        #[cfg(test)]
+                        self.inner.child_polls.fetch_add(1, Ordering::Relaxed);
                         if let Ok(Some(status)) = child.try_wait() {
                             *child_slot = None;
                             state.detached = true;
@@ -6854,6 +6899,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: if mode == BgMode::Pty {
@@ -16965,6 +17011,64 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a02_running_watch_catches_up_before_child_exit() {
+        use crate::bash_background::persistence::work_counts;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let go = storage.join("go");
+        let command = format!("while [ ! -e '{}' ]; do sleep 0.01; done; head -c 196608 /dev/zero; printf LATE; sleep 30", go.display());
+        let id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                &command,
+                "session".into(),
+                storage.into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                storage.into(),
+                10,
+                true,
+                false,
+                Some(storage.into()),
+            )
+            .unwrap();
+        registry
+            .register_watch(id.clone(), WatchPattern::Substring("LATE".into()), true)
+            .unwrap();
+        let task = registry.task_for_session(&id, "session").unwrap();
+        fs::write(&go, "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::metadata(&task.paths.stdout).unwrap().len() < 196612 {
+            assert!(
+                Instant::now() < deadline,
+                "producer never emitted the burst"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        work_counts::reset();
+        registry.scan_task_watch_output(&task);
+        let work = work_counts::get();
+        let still_running = task.state.lock().unwrap().metadata.status == BgTaskStatus::Running;
+        let hits = pattern_match_frames(&frames);
+        registry.kill(&id, "session").unwrap();
+        assert!(still_running, "the match must not depend on terminal drain");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.task_id == id && hit.match_text == "LATE"),
+            "late-stream match was not caught in one fair running scan; read {} bytes",
+            work.artifact_bytes
+        );
+        assert_eq!(work.artifact_bytes, 196612);
+        assert_eq!(
+            work.artifact_opens, 2,
+            "fresh validation is shared by all chunks in this pass"
+        );
+    }
+
+    #[test]
     fn noisy_watch_scan_is_bounded_and_other_task_matches() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
@@ -17001,7 +17105,7 @@ mod tests {
             .unwrap();
         let noisy_task = registry.task_for_session(&noisy, "session").unwrap();
         let other_task = registry.task_for_session(&other, "session").unwrap();
-        let mut burst = vec![b'x'; 64 * 1024 - 5];
+        let mut burst = vec![b'x'; 1024 * 1024 - 5];
         burst.extend_from_slice(b"CROSS-CHUNK");
         burst.extend(std::iter::repeat_n(b'x', 1024 * 1024));
         std::fs::OpenOptions::new()
@@ -17020,7 +17124,7 @@ mod tests {
         let first = registry.watch_stream_cursors(&noisy).0;
         assert_eq!(
             first,
-            64 * 1024,
+            1024 * 1024,
             "one running tick must not consume the whole burst"
         );
         registry.scan_task_watch_output(&other_task);
@@ -17366,3 +17470,254 @@ mod tests {
 #[cfg(test)]
 #[path = "watchdog_cost_test.rs"]
 mod watchdog_cost_tests;
+
+#[cfg(test)]
+mod a02_tests {
+    use super::*;
+    use crate::bash_background::persistence::write_task;
+
+    fn terminal_fixture() -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>) {
+        let (dir, ctx, task) = default_kill_tests::wait_fixture(None);
+        {
+            let mut state = task.state.lock().unwrap();
+            state
+                .metadata
+                .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+            state.metadata.compressed = true;
+            state.terminal_output_cache = None;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        std::fs::write(&task.paths.stdout, "identical output\n").unwrap();
+        std::fs::write(&task.paths.stderr, "").unwrap();
+        (dir, ctx, task)
+    }
+
+    #[cfg(unix)]
+    fn install_hint(registry: &BgTaskRegistry, task: &Arc<BgTask>, command: &str, enabled: bool) {
+        let job = crate::bash_db_hints::HintJob::new(
+            command,
+            &task.paths.dir,
+            &HashMap::new(),
+            &crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+            enabled,
+        );
+        registry
+            .inner
+            .db_hint_jobs
+            .lock()
+            .unwrap()
+            .insert(task.task_id.clone(), (Arc::downgrade(task), Arc::new(job)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a02_hint_reads_are_lazy_and_once_only() {
+        use crate::bash_background::persistence::work_counts;
+        for size in [0, 1024 * 1024, 10 * 1024 * 1024] {
+            for (command, exit, enabled, expected_opens) in [
+                ("echo done", Some(0), true, 0),
+                ("unknown", Some(1), true, 2),
+                ("unknown | cat", Some(0), true, 2),
+                ("unknown", Some(1), false, 2),
+            ] {
+                let (_dir, ctx, task) = terminal_fixture();
+                std::fs::write(&task.paths.stdout, vec![b'x'; size]).unwrap();
+                let registry = ctx.bash_background();
+                install_hint(registry, &task, command, enabled);
+                let (mut metadata, buffer) = {
+                    let state = task.state.lock().unwrap();
+                    (state.metadata.clone(), state.buffer.clone())
+                };
+                metadata.exit_code = exit;
+                work_counts::reset();
+                registry.finish_db_hint(&metadata, &buffer);
+                let first = work_counts::get();
+                work_counts::reset();
+                registry.finish_db_hint(&metadata, &buffer);
+                let repeat = work_counts::get();
+                assert_eq!(
+                    repeat.opens, 0,
+                    "finished hint reread {size} bytes for {command}"
+                );
+                assert_eq!(
+                    first.artifact_opens, expected_opens,
+                    "first hint for {command}"
+                );
+                assert_eq!(
+                    first.artifact_bytes,
+                    if expected_opens == 0 { 0 } else { size }
+                );
+                assert_eq!(repeat.artifact_bytes, 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a02_render_shares_the_hint_input_bytes() {
+        use crate::bash_background::persistence::work_counts;
+        for size in [0, 1024 * 1024, 10 * 1024 * 1024] {
+            let (_dir, ctx, task) = terminal_fixture();
+            std::fs::write(&task.paths.stdout, vec![b'x'; size]).unwrap();
+            let registry = ctx.bash_background();
+            install_hint(registry, &task, "unknown", true);
+            let (mut metadata, buffer) = {
+                let state = task.state.lock().unwrap();
+                (state.metadata.clone(), state.buffer.clone())
+            };
+            metadata.exit_code = Some(1);
+            registry.set_compressor(|_, _| CompressionResult::new("final"));
+            work_counts::reset();
+            let rendered = registry.render_terminal_output(
+                &metadata,
+                &buffer,
+                DiskTruncation::default(),
+                Some(&task.paths),
+            );
+            let work = work_counts::get();
+            assert!(!rendered.output_preview.is_empty());
+            assert_eq!(
+                work.artifact_bytes, size,
+                "hint and render must share a raw read"
+            );
+        }
+    }
+
+    #[test]
+    fn a02_terminal_cache_fill_is_single_flight() {
+        let (_dir, ctx, task) = terminal_fixture();
+        let registry = ctx.bash_background().clone();
+        let renders = Arc::new(AtomicU64::new(0));
+        let counter = renders.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        registry.set_compressor(move |_, output| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            if n == 0 {
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            CompressionResult::new(output)
+        });
+        let first_registry = registry.clone();
+        let first_task = task.clone();
+        let first = std::thread::spawn(move || {
+            first_registry
+                .ensure_terminal_output_cache(&first_task)
+                .unwrap()
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second_registry = registry.clone();
+        let second_task = task.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            second_registry.snapshot_with_terminal_cache(&second_task, 0)
+        });
+        started_rx.recv().unwrap();
+        // Keep the first render in flight while a second cache reader enters.
+        let _ = entered_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(first.output_preview, second.output_preview);
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            1,
+            "concurrent completion/status must render once"
+        );
+    }
+
+    #[test]
+    fn a02_independent_compressors_overlap() {
+        let registry = BgTaskRegistry::new(Default::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        registry.set_compressor(move |command, output| {
+            entered_tx.send(command.to_string()).unwrap();
+            if command == "first" {
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            CompressionResult::new(output)
+        });
+        let first_registry = registry.clone();
+        let first = std::thread::spawn(move || {
+            first_registry.compress_output("first", "first bytes".into(), Some(0))
+        });
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "first"
+        );
+        let second_registry = registry.clone();
+        let second = std::thread::spawn(move || {
+            second_registry.compress_output("second", "second bytes".into(), Some(0))
+        });
+        let overlapped = entered_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        release_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().text, "first bytes");
+        assert_eq!(second.join().unwrap().text, "second bytes");
+        assert!(
+            overlapped,
+            "independent tasks must not wait for the compressor configuration lock"
+        );
+    }
+
+    #[test]
+    fn a02_failed_fill_retries_and_callback_can_reconfigure() {
+        let (_dir, ctx, task) = terminal_fixture();
+        let registry = ctx.bash_background().clone();
+        registry.set_compressor(|_, _| panic!("injected render failure"));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || registry.ensure_terminal_output_cache(&task)
+        ))
+        .is_err());
+        assert!(task.state.lock().unwrap().terminal_output_cache.is_none());
+        let reconfigure = registry.clone();
+        registry.set_compressor(move |_, output| {
+            reconfigure.set_compressor(|_, _| CompressionResult::new("replacement"));
+            CompressionResult::new(output)
+        });
+        let rendered = registry.ensure_terminal_output_cache(&task).unwrap();
+        assert!(rendered.output_preview.contains("identical output"));
+        assert_eq!(
+            registry.compress_output("next", "raw".into(), Some(0)).text,
+            "replacement"
+        );
+        assert_eq!(
+            registry
+                .ensure_terminal_output_cache(&task)
+                .unwrap()
+                .output_preview,
+            rendered.output_preview
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a02_pty_repeat_and_absent_hint_jobs_do_no_artifact_work() {
+        use crate::bash_background::persistence::work_counts;
+        let (_dir, ctx, task) = terminal_fixture();
+        let registry = ctx.bash_background();
+        let (mut metadata, buffer) = {
+            let state = task.state.lock().unwrap();
+            (state.metadata.clone(), state.buffer.clone())
+        };
+        // Schema probes are created only for local launches; replayed tasks and
+        // remote tasks do not retain the local command's probe environment.
+        work_counts::reset();
+        registry.finish_db_hint(&metadata, &buffer);
+        assert_eq!(work_counts::get().artifact_opens, 0);
+        metadata.mode = BgMode::Pty;
+        metadata.exit_code = Some(1);
+        fs::write(&task.paths.pty, "no such table: missing\n").unwrap();
+        let pty = BgBuffer::registered(&task.paths, BgMode::Pty);
+        install_hint(registry, &task, "unknown", true);
+        registry.finish_db_hint(&metadata, &pty);
+        work_counts::reset();
+        registry.finish_db_hint(&metadata, &pty);
+        assert_eq!(work_counts::get().artifact_opens, 0);
+        assert_eq!(work_counts::get().artifact_bytes, 0);
+    }
+}

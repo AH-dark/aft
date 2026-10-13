@@ -2102,6 +2102,8 @@ pub(crate) mod work_counts {
         pub marker_reads: usize,
         pub stats: usize,
         pub gc_entries: usize,
+        pub artifact_bytes: usize,
+        pub artifact_opens: usize,
     }
 
     thread_local! {
@@ -2118,6 +2120,12 @@ pub(crate) mod work_counts {
 
     pub(crate) fn record_open() {
         record(|counts| counts.opens += 1);
+    }
+    pub(crate) fn record_bytes(bytes: usize) {
+        record(|counts| counts.artifact_bytes += bytes);
+    }
+    pub(crate) fn record_artifact_open() {
+        record(|counts| counts.artifact_opens += 1);
     }
     pub(crate) fn record_read() {
         record(|counts| counts.metadata_reads += 1);
@@ -2150,6 +2158,8 @@ pub struct ValidatedArtifact {
 impl ValidatedArtifact {
     fn new(file: File) -> io::Result<Self> {
         validate_regular_handle(&file)?;
+        #[cfg(test)]
+        work_counts::record_artifact_open();
         Ok(Self { file })
     }
 
@@ -2173,6 +2183,8 @@ impl ValidatedArtifact {
         Read::by_ref(&mut self.file)
             .take(read_len)
             .read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        work_counts::record_bytes(bytes.len());
         Ok((bytes, len > max_bytes as u64))
     }
 
@@ -2182,6 +2194,8 @@ impl ValidatedArtifact {
         Read::by_ref(&mut self.file)
             .take(len)
             .read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        work_counts::record_bytes(bytes.len());
         Ok(bytes)
     }
 
@@ -2189,6 +2203,8 @@ impl ValidatedArtifact {
         self.rewind()?;
         let mut bytes = Vec::new();
         self.file.read_to_end(&mut bytes)?;
+        #[cfg(test)]
+        work_counts::record_bytes(bytes.len());
         Ok(bytes)
     }
 

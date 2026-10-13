@@ -52,7 +52,7 @@ use caps::DropClass;
 use cargo::CargoCompressor;
 use eslint::EslintCompressor;
 use find::FindCompressor;
-use generic::{strip_ansi, GenericCompressor};
+use generic::GenericCompressor;
 use git::GitCompressor;
 use go::{GoCompressor, GolangciLintCompressor};
 use ls::LsCompressor;
@@ -110,6 +110,7 @@ pub enum Specificity {
 pub struct OutputProbe<'a> {
     output: &'a str,
     json: OnceCell<Option<serde_json::Value>>,
+    strict_json_input: OnceCell<bool>,
 }
 
 impl<'a> OutputProbe<'a> {
@@ -117,6 +118,7 @@ impl<'a> OutputProbe<'a> {
         Self {
             output,
             json: OnceCell::new(),
+            strict_json_input: OnceCell::new(),
         }
     }
 
@@ -126,9 +128,25 @@ impl<'a> OutputProbe<'a> {
 
     /// Parse plausible JSON at most once for all matchers in this dispatch.
     pub fn json(&self) -> Option<&serde_json::Value> {
+        // Matchers historically accepted JSON's ASCII trailing whitespace, not
+        // every Unicode whitespace character that Rust's trim removes.
+        if !self.strict_json_input.get_or_init(|| {
+            let trimmed = self.output.trim_start();
+            matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'['))
+                && trimmed.trim_end().len()
+                    == trimmed.trim_end_matches([' ', '\n', '\r', '\t']).len()
+        }) {
+            return None;
+        }
+        self.json_trimmed()
+    }
+
+    /// Ruff's command renderer trims both ends before parsing. Share that parse
+    /// without broadening the stricter output-shape matchers' accepted input.
+    pub(crate) fn json_trimmed(&self) -> Option<&serde_json::Value> {
         self.json
             .get_or_init(|| {
-                let trimmed = self.output.trim_start();
+                let trimmed = self.output.trim();
                 if !matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
                     return None;
                 }
@@ -331,6 +349,25 @@ pub trait Compressor: Send + Sync {
         self.matches_output(probe.output())
     }
 
+    /// Reuse the probe's ANSI-stripped text and lazy JSON parse for a
+    /// command-selected compressor, not only for output-shape matching.
+    fn compress_with_output_probe(
+        &self,
+        command: &str,
+        probe: &OutputProbe<'_>,
+        exit_code: Option<i64>,
+    ) -> CompressionResult {
+        self.compress_with_exit_code(command, probe.output(), exit_code)
+    }
+
+    fn compress_output_probe_match(
+        &self,
+        probe: &OutputProbe<'_>,
+        exit_code: Option<i64>,
+    ) -> CompressionResult {
+        self.compress_output_match_with_exit_code(probe.output(), exit_code)
+    }
+
     /// Compress output after an output-shape match when the process exit code is unknown.
     fn compress_output_match(&self, output: &str) -> CompressionResult {
         self.compress_output_match_with_exit_code(output, None)
@@ -404,7 +441,7 @@ fn compress_with_registry_exit_code_inner(
     exit_code: Option<i64>,
     registry: &FilterRegistry,
 ) -> CompressionResult {
-    let stripped_for_generic = strip_ansi(output);
+    let stripped_for_generic = generic::strip_ansi_cow(output);
 
     // Resolve what to dispatch on: peel shell-prefix idioms (`cd /path && bun
     // test`, `env FOO=bar npm install`, `timeout 30 cargo build`, `(cd /path;
@@ -421,6 +458,7 @@ fn compress_with_registry_exit_code_inner(
     let dispatch_cmd = dispatch_owned.as_str();
 
     let compressors = compressors_in_dispatch_order();
+    let output_probe = OutputProbe::new(&stripped_for_generic);
 
     // Tier 1a: Specific command compressors win first.
     for compressor in compressors
@@ -429,7 +467,7 @@ fn compress_with_registry_exit_code_inner(
     {
         if compressor.matches(dispatch_cmd) {
             let result =
-                compressor.compress_with_exit_code(dispatch_cmd, &stripped_for_generic, exit_code);
+                compressor.compress_with_output_probe(dispatch_cmd, &output_probe, exit_code);
             return failure_preserving_result(command, &stripped_for_generic, result, exit_code);
         }
     }
@@ -439,15 +477,13 @@ fn compress_with_registry_exit_code_inner(
     // `just test`, etc. Collision order is deterministic: Specific compressors
     // in registry order win before PackageManager sniffers (currently Bun's
     // test-output signature).
-    let output_probe = OutputProbe::new(&stripped_for_generic);
     for specificity in [Specificity::Specific, Specificity::PackageManager] {
         for compressor in compressors
             .iter()
             .filter(|c| c.specificity() == specificity)
         {
             if compressor.matches_output_probe(&output_probe) {
-                let result = compressor
-                    .compress_output_match_with_exit_code(&stripped_for_generic, exit_code);
+                let result = compressor.compress_output_probe_match(&output_probe, exit_code);
                 return failure_preserving_result(
                     command,
                     &stripped_for_generic,
@@ -465,7 +501,7 @@ fn compress_with_registry_exit_code_inner(
     {
         if compressor.matches(dispatch_cmd) {
             let result =
-                compressor.compress_with_exit_code(dispatch_cmd, &stripped_for_generic, exit_code);
+                compressor.compress_with_output_probe(dispatch_cmd, &output_probe, exit_code);
             return failure_preserving_result(command, &stripped_for_generic, result, exit_code);
         }
     }
@@ -1629,8 +1665,24 @@ mod tests {
 
 #[cfg(test)]
 mod output_probe_tests {
+    use super::generic::strip_ansi;
     use super::*;
     use serde::Deserialize;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a02_plain_dispatch_borrows_stripped_input() {
+        for command in ["./unknown", "unknown | cat"] {
+            let input = "ordinary output\n".repeat(1000);
+            generic::reset_ansi_strip_alloc_bytes();
+            let _ = compress_with_registry(command, &input, &FilterRegistry::default());
+            assert_eq!(
+                generic::ansi_strip_alloc_bytes(),
+                0,
+                "plain dispatch must not allocate a stripped copy"
+            );
+        }
+    }
 
     #[derive(Deserialize)]
     struct CorpusEntry {
@@ -1673,7 +1725,12 @@ mod output_probe_tests {
                         compressor.matches_output_probe(&probe).then_some(index)
                     })
             });
-        match_phase_result(&compressors, selected, output)
+        MatchPhaseResult {
+            selected,
+            output: selected
+                .map(|index| compressors[index].compress_output_probe_match(&probe, None))
+                .unwrap_or_else(|| GenericCompressor::compress_stripped_output(output).into()),
+        }
     }
 
     fn match_phase_result(
@@ -1795,6 +1852,41 @@ mod output_probe_tests {
 
         assert_eq!(result.selected, None);
         assert_eq!(output_probe_json_parse_count(), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a02_json_arrays_share_one_parse_through_rendering() {
+        for command in ["./check.sh", "eslint", "ruff"] {
+            for output in [
+                "[]",
+                "[{\"payload\":true}]",
+                "[not JSON",
+                "[]\u{a0}",
+                r#"[{"filePath":"a.js","messages":[]}]"#,
+                r#"[{"code":"F401","filename":"a.py","location":{"row":1,"column":2},"message":"unused"}]"#,
+            ] {
+                reset_output_probe_json_parse_count();
+                let _ = compress_with_registry_exit_code(
+                    command,
+                    output,
+                    Some(0),
+                    &FilterRegistry::default(),
+                );
+                assert!(
+                    output_probe_json_parse_count() <= 1,
+                    "{command}: {} JSON parses for {output}",
+                    output_probe_json_parse_count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a02_ruff_command_preserves_unicode_trailing_whitespace() {
+        let result = compress_with_registry("ruff", "[]\u{a0}", &FilterRegistry::default());
+        assert_eq!(result.text, "ruff: clean");
+        assert!(!RuffCompressor.matches_output_probe(&OutputProbe::new("[]\u{a0}")));
     }
 }
 

@@ -137,6 +137,16 @@ impl HintJob {
     }
 
     pub(crate) fn finish(&self, output: &str, exit_code: Option<i64>) -> Option<&str> {
+        self.finish_with_output(|| output, exit_code)
+    }
+
+    /// Acquire output only if this unfinished attempt needs diagnostic text.
+    /// Successful non-pipelines still finish the job and release launch handles.
+    pub(crate) fn finish_with_output<T: AsRef<str>>(
+        &self,
+        output: impl FnOnce() -> T,
+        exit_code: Option<i64>,
+    ) -> Option<&str> {
         self.result
             .get_or_init(|| {
                 let launch = self.launch.lock().ok()?.take();
@@ -145,6 +155,8 @@ impl HintJob {
                 if exit_code == Some(0) && !self.pipeline {
                     return None;
                 }
+                let output = output();
+                let output = output.as_ref();
                 // Ordinary bash calls are not schema-hint attempts. Count skips only
                 // when a supported CLI's missing-schema diagnostic was observed.
                 let cli = self.cli.or_else(|| {
@@ -713,3 +725,39 @@ fn run_probe(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod a02_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn a02_success_still_finishes_and_releases_launch_payload() {
+        let job = HintJob {
+            cli: None,
+            target: None,
+            enabled: true,
+            pipeline: false,
+            launch: std::sync::Mutex::new(Some((
+                SpawnPlan::Unsandboxed,
+                HashMap::from([("KEY".into(), "value".into())]),
+            ))),
+            result: OnceLock::new(),
+        };
+        assert_eq!(
+            job.finish_with_output(
+                || -> &str { panic!("successful non-pipeline must not read output") },
+                Some(0)
+            ),
+            None
+        );
+        assert!(job.result.get().is_some());
+        assert!(job.launch.lock().unwrap().is_none());
+        assert_eq!(
+            job.finish_with_output(
+                || -> &str { panic!("finished job must not read output") },
+                Some(1)
+            ),
+            None
+        );
+    }
+}

@@ -1,10 +1,25 @@
 use crate::compress::{CompressionResult, Compressor};
 
 pub fn strip_ansi(input: &str) -> String {
+    let stripped = strip_ansi_cow(input);
+    #[cfg(test)]
+    if matches!(stripped, std::borrow::Cow::Borrowed(_)) {
+        ANSI_STRIP_ALLOC_BYTES.with(|bytes| bytes.set(bytes.get() + input.len()));
+    }
+    stripped.into_owned()
+}
+
+/// Borrow plain text; ANSI-bearing input still uses the exact same stripping
+/// grammar. Dispatch and its output probe can share this single derived view.
+pub(super) fn strip_ansi_cow(input: &str) -> std::borrow::Cow<'_, str> {
     record_ansi_strip();
     let bytes = input.as_bytes();
+    let Some(mut index) = bytes.iter().position(|byte| *byte == 0x1b) else {
+        return std::borrow::Cow::Borrowed(input);
+    };
     let mut output = String::with_capacity(input.len());
-    let mut index = 0;
+    #[cfg(test)]
+    ANSI_STRIP_ALLOC_BYTES.with(|bytes| bytes.set(bytes.get() + output.capacity()));
     let mut last_kept = 0;
 
     while index < bytes.len() {
@@ -40,7 +55,7 @@ pub fn strip_ansi(input: &str) -> String {
     }
 
     output.push_str(&input[last_kept..]);
-    output
+    std::borrow::Cow::Owned(output)
 }
 
 pub fn dedup_consecutive(input: &str) -> String {
@@ -146,11 +161,22 @@ impl GenericCompressor {
 #[cfg(test)]
 thread_local! {
     static ANSI_STRIP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ANSI_STRIP_ALLOC_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn record_ansi_strip() {
     ANSI_STRIP_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(all(debug_assertions, test))]
+pub(super) fn reset_ansi_strip_alloc_bytes() {
+    ANSI_STRIP_ALLOC_BYTES.with(|bytes| bytes.set(0));
+}
+
+#[cfg(all(debug_assertions, test))]
+pub(super) fn ansi_strip_alloc_bytes() -> usize {
+    ANSI_STRIP_ALLOC_BYTES.with(std::cell::Cell::get)
 }
 
 #[cfg(not(test))]

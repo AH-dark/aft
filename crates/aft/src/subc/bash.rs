@@ -167,7 +167,7 @@ async fn observe_deferred_bash_wait(
             registry.renew_hard_kill(&task_id, &session_id, window);
         }
         let target_finished = registry
-            .observed_status(&task_id, &session_id, 0)
+            .status(&task_id, &session_id, None, None, 0)
             .is_none_or(|snapshot| snapshot.info.status.is_terminal());
         let detach_pending = wait_mode && registry.wait_mode_detach_pending(&session_id);
         DeferredWaitObservation {
@@ -187,6 +187,42 @@ async fn observe_deferred_bash_wait(
 #[cfg(test)]
 mod default_kill_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a02_observation_polls_the_live_child_once() {
+        use std::sync::atomic::Ordering;
+        let (_dir, ctx, task) =
+            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+        let child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        task.state.lock().unwrap().runtime =
+            crate::bash_background::registry::TaskRuntime::Piped(Some(child));
+        let registry = ctx.bash_background();
+        let observation = observe_deferred_bash_wait(
+            registry.clone(),
+            task.task_id.clone(),
+            task.session_id.clone(),
+            false,
+            false,
+            None,
+        )
+        .await;
+        let polls = registry.inner.child_polls.load(Ordering::Relaxed);
+        if let crate::bash_background::registry::TaskRuntime::Piped(Some(mut child)) =
+            std::mem::replace(
+                &mut task.state.lock().unwrap().runtime,
+                crate::bash_background::registry::TaskRuntime::Piped(None),
+            )
+        {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(!observation.target_finished);
+        assert_eq!(polls, 1, "each observation must poll the actual child");
+    }
 
     async fn deferred_wait_limit(worker_session: bool, explicit_timeout: Option<u64>) -> u64 {
         let (_dir, ctx, task) =

@@ -151,69 +151,45 @@ pub fn cap_text_head_tail(input: &str, max_lines: usize) -> String {
     cap_lines_head_tail(&lines, max_lines, "lines").join("\n")
 }
 
-/// Make sure a summary extractor's result still ends with the input's final
-/// line.
-///
-/// Extractors keep the lines their tool's grammar recognises ("test result:",
-/// "Finished", failure blocks) and drop the rest. When the command was a
-/// wrapper, the last lines often belong to the wrapper ("GATE PASSED", an exit
-/// reason) and match no pattern. When the result does not already end with the
-/// input's last non-empty line, this appends a short window of input lines
-/// ending there: up to [`FINAL_LINES_KEEP`] lines and [`FINAL_LINES_BYTES`]
-/// bytes, the last line always. Blank lines inside the window count toward it.
-///
-/// The result's last line is located in the input by text (its latest
-/// occurrence before the window). When found and the window does not follow it
-/// directly, a marker says how many lines sit between them; when the result's
-/// last line is not an input line (a synthesised summary, an existing marker),
-/// no count is known and no marker is added.
+/// Preserve the input's final non-empty line and a short, byte-bounded window
+/// before it. Only that window is retained; a reverse prefix scan computes the
+/// omitted-line marker when the compressed ending occurred earlier in the input.
 pub fn ensure_final_lines(input: &str, compressed: &str) -> String {
-    let input_lines: Vec<&str> = input.lines().map(str::trim_end).collect();
-    let Some(last) = input_lines.iter().rposition(|line| !line.is_empty()) else {
+    let mut earlier = input.lines().map(str::trim_end).rev().peekable();
+    let Some(last) = earlier.find(|line| !line.is_empty()) else {
         return compressed.to_string();
     };
     let compressed_last = compressed
         .lines()
         .map(str::trim_end)
         .rfind(|line| !line.is_empty());
-    if compressed_last == Some(input_lines[last]) {
+    if compressed_last == Some(last) {
         return compressed.to_string();
     }
-
-    // Choose the final window: the last line always, then earlier lines while
-    // they fit the line and byte budgets.
-    let mut start = last;
-    let mut bytes = input_lines[last].len();
-    while start > 0 && last - start + 1 < FINAL_LINES_KEEP {
-        let next = input_lines[start - 1].len() + 1;
-        if bytes + next > FINAL_LINES_BYTES {
+    let mut window = Vec::with_capacity(FINAL_LINES_KEEP);
+    window.push(last);
+    let mut bytes = last.len();
+    while window.len() < FINAL_LINES_KEEP {
+        let Some(next) = earlier.peek() else { break };
+        if bytes + next.len() + 1 > FINAL_LINES_BYTES {
             break;
         }
-        bytes += next;
-        start -= 1;
+        bytes += next.len() + 1;
+        window.push(earlier.next().unwrap());
     }
-
-    // Lines the result already shows are not repeated: if the result's last
-    // line falls inside the window, only what follows it is appended. A marker
-    // line never matches an input line, so a result ending in one gets no
-    // second marker.
-    let mut append_from = start;
+    window.reverse();
+    #[cfg(test)]
+    FINAL_LINE_REFS.with(|refs| refs.set(window.len()));
+    let mut append_from = 0;
     let mut gap = None;
     if let Some(compressed_last) = compressed_last.filter(|line| !is_omitted_lines_marker(line)) {
-        if let Some(offset) = input_lines[start..=last]
-            .iter()
-            .rposition(|line| *line == compressed_last)
-        {
-            append_from = start + offset + 1;
+        if let Some(offset) = window.iter().rposition(|line| *line == compressed_last) {
+            append_from = offset + 1;
             gap = Some(0);
-        } else if let Some(position) = input_lines[..start]
-            .iter()
-            .rposition(|line| *line == compressed_last)
-        {
-            gap = Some(start - position - 1);
+        } else {
+            gap = earlier.position(|line| line == compressed_last);
         }
     }
-
     let mut output = compressed.trim_end().to_string();
     if let Some(omitted) = gap.filter(|omitted| *omitted > 0) {
         if !output.is_empty() {
@@ -221,7 +197,7 @@ pub fn ensure_final_lines(input: &str, compressed: &str) -> String {
         }
         output.push_str(&omitted_marker(omitted, "lines"));
     }
-    for line in &input_lines[append_from..=last] {
+    for line in &window[append_from..] {
         if !output.is_empty() {
             output.push('\n');
         }
@@ -231,8 +207,24 @@ pub fn ensure_final_lines(input: &str, compressed: &str) -> String {
 }
 
 #[cfg(test)]
+thread_local! {
+    static FINAL_LINE_REFS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a02_final_line_window_has_bounded_storage() {
+        let input = "earlier\n".repeat(100_000) + "GATE PASSED\n\n";
+        let result = ensure_final_lines(&input, "earlier");
+        assert!(result.ends_with("GATE PASSED"));
+        assert!(
+            FINAL_LINE_REFS.with(|refs| refs.get()) <= FINAL_LINES_KEEP,
+            "final-line repair retained the entire input line vector"
+        );
+    }
 
     fn numbered(count: usize) -> Vec<String> {
         (1..=count).map(|index| format!("line {index}")).collect()

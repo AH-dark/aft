@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::{dedup_consecutive, strip_ansi, GenericCompressor};
-use crate::compress::{CompressionResult, Compressor};
+use crate::compress::{CompressionResult, Compressor, OutputProbe};
 
 pub struct EslintCompressor;
 
@@ -37,6 +37,41 @@ impl Compressor for EslintCompressor {
             .any(|line| is_summary_line(line.trim_start()))
             || looks_like_eslint_json_output(output)
     }
+
+    fn matches_output_probe(&self, probe: &OutputProbe<'_>) -> bool {
+        probe
+            .output()
+            .lines()
+            .any(|line| is_summary_line(line.trim_start()))
+            || (probe.output().trim_start().starts_with('[')
+                && probe.json().is_some_and(is_eslint_json))
+    }
+
+    fn compress_with_output_probe(
+        &self,
+        _command: &str,
+        probe: &OutputProbe<'_>,
+        _exit_code: Option<i64>,
+    ) -> CompressionResult {
+        compress_eslint_probed(probe)
+    }
+
+    fn compress_output_probe_match(
+        &self,
+        probe: &OutputProbe<'_>,
+        exit_code: Option<i64>,
+    ) -> CompressionResult {
+        self.compress_with_output_probe("", probe, exit_code)
+    }
+}
+
+fn is_eslint_json(value: &Value) -> bool {
+    value.as_array().is_some_and(|files| {
+        !files.is_empty()
+            && files
+                .iter()
+                .any(|file| file.get("filePath").is_some() && file.get("messages").is_some())
+    })
 }
 
 fn looks_like_eslint_json_output(output: &str) -> bool {
@@ -45,22 +80,21 @@ fn looks_like_eslint_json_output(output: &str) -> bool {
         return false;
     }
 
+    super::record_output_probe_json_parse();
     serde_json::from_str::<Value>(trimmed)
         .ok()
-        .is_some_and(|value| {
-            value.as_array().is_some_and(|files| {
-                !files.is_empty()
-                    && files.iter().any(|file| {
-                        file.get("filePath").is_some() && file.get("messages").is_some()
-                    })
-            })
-        })
+        .is_some_and(|value| is_eslint_json(&value))
 }
 
 fn compress_eslint(output: &str) -> CompressionResult {
+    compress_eslint_probed(&OutputProbe::new(output))
+}
+
+fn compress_eslint_probed(probe: &OutputProbe<'_>) -> CompressionResult {
+    let output = probe.output();
     let trimmed = output.trim_start();
     if trimmed.starts_with("[{") {
-        if let Some(compressed) = compress_json(trimmed) {
+        if let Some(compressed) = probe.json().and_then(compress_json) {
             return finish(compressed);
         }
         return GenericCompressor::compress_output(output).into();
@@ -88,8 +122,7 @@ fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
         })
 }
 
-fn compress_json(input: &str) -> Option<CompressionResult> {
-    let results: Value = serde_json::from_str(input).ok()?;
+fn compress_json(results: &Value) -> Option<CompressionResult> {
     let files = results.as_array()?;
     let mut grouped = BTreeMap::new();
     let mut errors = 0usize;

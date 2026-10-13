@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::compress::caps::{cap_classified_blocks, ClassifiedBlock, DropClass};
 use crate::compress::generic::{dedup_consecutive, strip_ansi, GenericCompressor};
-use crate::compress::{CompressionResult, Compressor};
+use crate::compress::{CompressionResult, Compressor, OutputProbe};
 
 pub struct RuffCompressor;
 
@@ -32,6 +32,46 @@ impl Compressor for RuffCompressor {
             || looks_like_ruff_text_output(output)
             || looks_like_ruff_json_output(output)
     }
+
+    fn matches_output_probe(&self, probe: &OutputProbe<'_>) -> bool {
+        looks_like_ruff_clean_output(probe.output())
+            || looks_like_ruff_text_output(probe.output())
+            || (probe.output().trim_start().starts_with('[')
+                && probe.json().is_some_and(is_ruff_json))
+    }
+
+    fn compress_with_output_probe(
+        &self,
+        _command: &str,
+        probe: &OutputProbe<'_>,
+        exit_code: Option<i64>,
+    ) -> CompressionResult {
+        let compressed = compress_ruff_probed(probe);
+        if matches!(exit_code, Some(code) if code != 0) && compressed.text.trim() == "ruff: clean" {
+            GenericCompressor::compress_output(probe.output()).into()
+        } else {
+            compressed
+        }
+    }
+
+    fn compress_output_probe_match(
+        &self,
+        probe: &OutputProbe<'_>,
+        exit_code: Option<i64>,
+    ) -> CompressionResult {
+        self.compress_with_output_probe("", probe, exit_code)
+    }
+}
+
+fn is_ruff_json(value: &Value) -> bool {
+    value.as_array().is_some_and(|diagnostics| {
+        !diagnostics.is_empty()
+            && diagnostics.iter().any(|diagnostic| {
+                diagnostic.get("code").is_some()
+                    && diagnostic.get("filename").is_some()
+                    && diagnostic.get("location").is_some()
+            })
+    })
 }
 
 fn looks_like_ruff_clean_output(output: &str) -> bool {
@@ -57,28 +97,25 @@ fn looks_like_ruff_json_output(output: &str) -> bool {
         return false;
     }
 
+    super::record_output_probe_json_parse();
     serde_json::from_str::<Value>(trimmed)
         .ok()
-        .is_some_and(|value| {
-            value.as_array().is_some_and(|diagnostics| {
-                !diagnostics.is_empty()
-                    && diagnostics.iter().any(|diagnostic| {
-                        diagnostic.get("code").is_some()
-                            && diagnostic.get("filename").is_some()
-                            && diagnostic.get("location").is_some()
-                    })
-            })
-        })
+        .is_some_and(|value| is_ruff_json(&value))
 }
 
 fn compress_ruff(output: &str) -> CompressionResult {
+    compress_ruff_probed(&OutputProbe::new(output))
+}
+
+fn compress_ruff_probed(probe: &OutputProbe<'_>) -> CompressionResult {
+    let output = probe.output();
     let trimmed = output.trim();
     if trimmed.is_empty() || trimmed == "All checks passed!" {
         return CompressionResult::new("ruff: clean");
     }
 
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        if let Some(compressed) = compress_json(trimmed) {
+        if let Some(compressed) = probe.json_trimmed().and_then(compress_json) {
             return finish(compressed);
         }
         return GenericCompressor::compress_output(output).into();
@@ -125,8 +162,8 @@ fn command_tokens(command: &str) -> impl Iterator<Item = String> + '_ {
         })
 }
 
-fn compress_json(input: &str) -> Option<CompressionResult> {
-    let diagnostics: Vec<Value> = serde_json::from_str(input).ok()?;
+fn compress_json(input: &Value) -> Option<CompressionResult> {
+    let diagnostics = input.as_array()?;
     if diagnostics.is_empty() {
         return Some(CompressionResult::new("ruff: clean"));
     }

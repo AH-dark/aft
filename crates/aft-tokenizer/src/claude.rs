@@ -20,7 +20,23 @@ pub fn count_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    encode_internal(text).len()
+    // Keep the same direct-token shortcut and pre-tokenizer as encoding, but
+    // accumulate counts instead of allocating a final token-ID vector.
+    if text.encode_utf16().take(10).count() < 10 && string_encoder().contains_key(text) {
+        return 1;
+    }
+    let mut count = 0;
+    for piece in pattern_regex().find_iter(text) {
+        let piece = piece
+            .expect("Claude pre-tokenizer regex should not fail")
+            .as_str();
+        if string_encoder().contains_key(piece) {
+            count += 1;
+        } else {
+            visit_byte_pair_tokens(piece.as_bytes(), |_| count += 1);
+        }
+    }
+    count
 }
 
 /// Encode `text` into Claude token IDs.
@@ -35,6 +51,8 @@ fn encode_internal(text: &str) -> Vec<u32> {
     // ai-tokenizer checks direct rank before pre-tokenizing for short strings.
     if text.encode_utf16().take(10).count() < 10 {
         if let Some(&rank) = string_encoder().get(text) {
+            #[cfg(test)]
+            TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + 4));
             return vec![rank];
         }
     }
@@ -52,6 +70,8 @@ fn encode_internal(text: &str) -> Vec<u32> {
 
         result.extend(byte_pair_merge(piece.as_bytes()));
     }
+    #[cfg(test)]
+    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + result.capacity() * 4));
     result
 }
 
@@ -77,6 +97,14 @@ fn byte_pair_merge(piece: &[u8]) -> Vec<u32> {
     if LEGACY_BPE.with(|legacy| legacy.get()) {
         return byte_pair_merge_legacy(piece);
     }
+    let mut output = Vec::new();
+    visit_byte_pair_tokens(piece, |rank| output.push(rank));
+    #[cfg(test)]
+    TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(bytes.get() + output.capacity() * 4));
+    output
+}
+
+fn visit_byte_pair_tokens(piece: &[u8], mut emit: impl FnMut(u32)) {
     let len = piece.len();
     // Byte offsets are stable node IDs. Removing a boundary only relinks its
     // neighbours; it never shifts the remaining offsets or pending candidates.
@@ -100,17 +128,15 @@ fn byte_pair_merge(piece: &[u8]) -> Vec<u32> {
             enqueue_pair(piece, &next, previous[left], &mut heap);
         }
     }
-    let mut output = Vec::new();
     let mut left = 0;
     while left < len {
         let right = next[left];
         let rank = get_rank_for_slice(&piece[left..right]);
         if rank != NO_RANK {
-            output.push(rank);
+            emit(rank);
         }
         left = right;
     }
-    output
 }
 
 // Ordering by the original left offset preserves the legacy scan's leftmost
@@ -153,6 +179,7 @@ fn enqueue_pair(
 thread_local! {
     static BPE_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LEGACY_BPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TOKEN_VECTOR_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -233,6 +260,71 @@ fn get_rank_for_slice(slice: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a02_count_only_does_not_materialize_token_vectors() {
+        let lossy = String::from_utf8_lossy(&[0xff, b'a', 0x80, b'\n']).into_owned();
+        let corpus = [
+            String::new(),
+            "!".into(),
+            " café 中文 🦀 e\u{301} 's\n\t \r\n".into(),
+            " ".repeat(8192),
+            "=".repeat(8192),
+            "ordinary log output\n".repeat(100),
+            lossy,
+        ];
+        for text in corpus {
+            let reference = encode(&text).len();
+            TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(0));
+            assert_eq!(
+                count_tokens(&text),
+                reference,
+                "exact encoding length for {text:?}"
+            );
+            assert_eq!(
+                TOKEN_VECTOR_BYTES.with(|bytes| bytes.get()),
+                0,
+                "count-only path allocated token vectors for {} input bytes",
+                text.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "release-mode count latency measurement"]
+    fn a02_count_only_measurement() {
+        for bytes in [1024, 256 * 1024] {
+            let mut text = "ordinary output café 中文\n".repeat(bytes / 29 + 1);
+            let mut end = bytes.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            let expected = encode(&text).len();
+            let mut elapsed = Vec::new();
+            let mut encoded_elapsed = Vec::new();
+            let mut count_bytes = 0;
+            let mut encode_bytes = 0;
+            for _ in 0..16 {
+                TOKEN_VECTOR_BYTES.with(|count| count.set(0));
+                let start = std::time::Instant::now();
+                assert_eq!(count_tokens(std::hint::black_box(&text)), expected);
+                elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
+                count_bytes += TOKEN_VECTOR_BYTES.with(|count| count.get());
+                TOKEN_VECTOR_BYTES.with(|count| count.set(0));
+                let start = std::time::Instant::now();
+                assert_eq!(encode(std::hint::black_box(&text)).len(), expected);
+                encoded_elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
+                encode_bytes += TOKEN_VECTOR_BYTES.with(|count| count.get());
+            }
+            elapsed.sort_by(f64::total_cmp);
+            encoded_elapsed.sort_by(f64::total_cmp);
+            println!("A02_TOKEN_COUNT input_bytes={} calls=16 token_vector_capacity_bytes={} p50_ms={:.3} p95_ms={:.3}",
+                text.len(), count_bytes, (elapsed[7] + elapsed[8]) / 2.0, elapsed[15]);
+            println!("A02_TOKEN_ENCODING_REFERENCE input_bytes={} calls=16 token_vector_capacity_bytes={} p50_ms={:.3} p95_ms={:.3}",
+                text.len(), encode_bytes, (encoded_elapsed[7] + encoded_elapsed[8]) / 2.0, encoded_elapsed[15]);
+        }
+    }
 
     #[test]
     fn empty_input_has_no_tokens() {

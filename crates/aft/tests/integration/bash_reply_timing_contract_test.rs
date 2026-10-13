@@ -1388,3 +1388,141 @@ fn extract_task_id(frame: &Frame) -> String {
 fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
+
+// pidfd readiness observes the direct wrapper's exit without polling the registry,
+// which would itself advance completion and hide a slow observation path.
+#[cfg(target_os = "linux")]
+fn a02_exit_to_reply_samples(enforce_cadence: bool) {
+    run_subc(|mut h| async move {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        send_tool_call(
+            &mut h.stream,
+            900,
+            "bash",
+            json!({"command": "true", "wait": true}),
+        )
+        .await;
+        let warmup = read_tool_response(&mut h.stream, 900, Duration::from_secs(10)).await;
+        assert!(
+            !tool_result_is_error(&warmup),
+            "warmup: {}",
+            frame_body(&warmup)
+        );
+        let mut samples = Vec::new();
+        for (i, gap_ms) in [37, 137, 239, 61, 311, 173, 19, 277, 103, 353, 211, 83]
+            .into_iter()
+            .enumerate()
+        {
+            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+            let pidfile = h.project.path().join(format!("wrapper-{i}.pid"));
+            let observer_file = pidfile.clone();
+            let observer_tasks = session_tasks_dir(&h.storage_root(), SESSION_ID);
+            let observer = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let pid: u32 = loop {
+                    if let Ok(text) = std::fs::read_to_string(&observer_file) {
+                        if let Ok(pid) = text.trim().parse() {
+                            break pid;
+                        }
+                    }
+                    assert!(Instant::now() < deadline, "wrapper pid never appeared");
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                loop {
+                    let registered = std::fs::read_dir(&observer_tasks)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .any(|entry| {
+                            let id = entry.file_name().to_string_lossy().into_owned();
+                            resolve_task_layout(&observer_tasks, &id)
+                                .ok()
+                                .and_then(|layout| read_task_at(&layout).ok())
+                                .is_some_and(|metadata| metadata.child_pid == Some(pid))
+                        });
+                    if registered {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "observed pid was not registered as direct wrapper child"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+                let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+                let mut event = libc::pollfd {
+                    fd: file.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut event, 1, 10_000) };
+                let exited = Instant::now();
+                assert_eq!(ready, 1, "pidfd did not become ready");
+                assert_ne!(event.revents & libc::POLLIN, 0, "not an exit event");
+                (pid, exited)
+            });
+            let command = format!(
+                "printf '%s' \"$PPID\" > {}; sleep 0.1; printf audit-ok",
+                shell_quote(&pidfile)
+            );
+            let corr = 901 + i as u64;
+            send_tool_call(
+                &mut h.stream,
+                corr,
+                "bash",
+                json!({"command": command, "wait": true}),
+            )
+            .await;
+            let reply = read_tool_response(&mut h.stream, corr, Duration::from_secs(10)).await;
+            let replied = Instant::now();
+            let (pid, exited) = observer.join().expect("exit observer");
+            assert!(
+                !tool_result_is_error(&reply),
+                "reply: {}",
+                frame_body(&reply)
+            );
+            assert!(
+                tool_response_text(&reply).contains("audit-ok"),
+                "wrong output: {}",
+                frame_body(&reply)
+            );
+            assert!(replied >= exited, "response preceded actual child exit");
+            let lag = replied.duration_since(exited).as_secs_f64() * 1000.0;
+            samples.push(lag);
+            println!(
+                "A02_SAMPLE n={} phase_gap_ms={} wrapper_pid={} child_exit_to_reply_ms={:.3}",
+                i + 1,
+                gap_ms,
+                pid,
+                lag
+            );
+        }
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let median = (samples[5] + samples[6]) / 2.0;
+        println!("A02_SUMMARY samples={} min_ms={:.3} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} mean_ms={:.3}", samples.len(), samples[0], median, samples[11], samples[11], mean);
+        if enforce_cadence {
+            // The sample median tolerates scheduling noise while distinguishing
+            // the 100 ms observer from phase-dependent 500 ms watchdog polling.
+            assert!(
+                median < 170.0,
+                "quiet child exits still wait for watchdog: p50={median:.3}ms"
+            );
+        }
+        h
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "release-mode latency measurement; run explicitly with --ignored --nocapture"]
+fn a02_subc_piped_exit_to_reply_measurement() {
+    a02_exit_to_reply_samples(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a02_subc_piped_exit_observation_cadence() {
+    a02_exit_to_reply_samples(true);
+}
