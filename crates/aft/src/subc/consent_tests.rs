@@ -608,6 +608,34 @@ async fn consent_same_key_retry_replays_the_recorded_access_pending() {
     assert_eq!(code(&replayed), "access_pending");
 }
 
+fn normalize_access_pending_wire(wire: &str, request_id: &str, target_path: &str) -> String {
+    let encoded_target_path = serde_json::to_string(target_path).unwrap();
+    let escaped_target_path = encoded_target_path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .unwrap();
+    wire.replace(request_id, "${REQUEST_ID}")
+        .replace(escaped_target_path, "${HEAD_ROOT}/shared.txt")
+}
+
+#[test]
+fn access_pending_target_normalization_handles_windows_paths() {
+    let target_path = r"C:\worker\head\shared.txt";
+    let encoded_target_path = serde_json::to_string(target_path).unwrap();
+    let escaped_target_path = encoded_target_path
+        .strip_prefix('"')
+        .and_then(|path| path.strip_suffix('"'))
+        .unwrap();
+    let wire = format!(
+        r#"{{"id":"subc-41-7","message":"read {escaped_target_path}","path":"{escaped_target_path}"}}"#
+    );
+
+    assert_eq!(
+        normalize_access_pending_wire(&wire, "subc-41-7", target_path),
+        r#"{"id":"${REQUEST_ID}","message":"read ${HEAD_ROOT}/shared.txt","path":"${HEAD_ROOT}/shared.txt"}"#
+    );
+}
+
 #[tokio::test]
 async fn access_pending_wire_matches_golden_vector() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -628,11 +656,14 @@ async fn access_pending_wire_matches_golden_vector() {
     assert!(body.get("errorCode").is_none());
     assert!(body["structuredContent"].get("elicitation_id").is_none());
 
-    // Normalize only the transport request id and temp root; every other wire byte stays fixed.
+    // JSON escapes Windows separators, so replace the escaped path in-place to preserve every other wire byte.
     let request_id = body["structuredContent"]["id"].as_str().unwrap();
-    let wire = wire
-        .replace(request_id, "${REQUEST_ID}")
-        .replace(&f.head_root.display().to_string(), "${HEAD_ROOT}");
+    let target_path = body["structuredContent"]["ask"]["path"].as_str().unwrap();
+    assert!(body["structuredContent"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(target_path));
+    let wire = normalize_access_pending_wire(&wire, request_id, target_path);
     assert_eq!(
         wire.as_bytes(),
         include_bytes!("../../../../test-vectors/access-pending-v1/worker-read-outside.json")
