@@ -6380,6 +6380,20 @@ impl AppContext {
         )
     }
 
+    pub(crate) fn database_runtime_unavailable_reason(&self) -> Option<String> {
+        match self.database_runtime_state.load(Ordering::Acquire) {
+            1 => Some("project persistence is still initializing".into()),
+            3 | 4 | 5 => Some(
+                self.database_runtime_failure
+                    .lock()
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "project persistence could not be opened".into()),
+            ),
+            _ => None,
+        }
+    }
+
     /// Persistence-dependent commands must not silently use a JSON fallback.
     /// Read-only commands and unconfigured library contexts remain available.
     pub fn database_runtime_refusal(

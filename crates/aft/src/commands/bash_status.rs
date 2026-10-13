@@ -68,10 +68,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
+    let store_unavailable = ctx.database_runtime_unavailable_reason();
     // A delegated worker reading a task's status is waiting on it (its
     // `bash_watch` polls this): keep the task's default hard kill at least one
     // worker wait limit away. See `BgTaskRegistry::renew_hard_kill`.
-    if req.worker_session() {
+    if req.worker_session() && store_unavailable.is_none() {
         ctx.bash_background().renew_hard_kill(
             &task_id,
             req.session(),
@@ -85,13 +86,29 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     // Settled: a kill in flight is waited out (bounded) so callers that stop
     // polling at the first non-running status see its terminal outcome.
-    match ctx.bash_background().status_settled(
-        &task_id,
-        req.session(),
-        ctx.config().project_root.as_deref(),
-        Some(&storage_dir),
-        PREVIEW_BYTES,
-    ) {
+    let mut disk_paths = None;
+    let snapshot = if store_unavailable.is_some() {
+        ctx.bash_background()
+            .terminal_status_from_disk(
+                &task_id,
+                req.session(),
+                ctx.config().project_root.as_deref(),
+                &storage_dir,
+            )
+            .map(|(snapshot, paths)| {
+                disk_paths = Some(paths);
+                snapshot
+            })
+    } else {
+        ctx.bash_background().status_settled(
+            &task_id,
+            req.session(),
+            ctx.config().project_root.as_deref(),
+            Some(&storage_dir),
+            PREVIEW_BYTES,
+        )
+    };
+    match snapshot {
         Some(mut snapshot) => {
             let pty_raw = maybe_render_pty_screen(
                 ctx,
@@ -99,6 +116,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 &task_id,
                 &mut snapshot,
                 output_mode.as_deref(),
+                disk_paths.as_ref(),
             );
             if snapshot.info.mode == BgMode::Pty && snapshot.info.status.is_terminal() {
                 ctx.bash_background()
@@ -126,6 +144,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             } else {
                 let mode = snapshot.info.mode.clone();
                 let mut data = json!(snapshot);
+                if let Some(reason) = &store_unavailable {
+                    data["store_unavailable"] = json!(reason);
+                    data["output_preview"] = json!(format!(
+                        "[Store unavailable: {reason}; status and output read from the task bundle]\n{}",
+                        data["output_preview"].as_str().unwrap_or_default(),
+                    ));
+                }
                 if matches!(output_mode.as_deref(), Some("raw" | "both")) {
                     if let Some(raw) = pty_raw {
                         data["pty_raw"] = json!(String::from_utf8_lossy(&raw));
@@ -137,7 +162,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     } else {
                         crate::bash_background::persistence::TaskArtifact::Stdout
                     };
-                    match ctx.bash_background().read_artifact_range(
+                    match read_status_artifact_range(
+                        ctx,
+                        disk_paths.as_ref(),
                         &task_id,
                         req.session(),
                         artifact,
@@ -159,7 +186,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 }
                 if mode == BgMode::Pipes {
                     if let Some(offset) = stderr_offset {
-                        match ctx.bash_background().read_artifact_range(
+                        match read_status_artifact_range(
+                            ctx,
+                            disk_paths.as_ref(),
                             &task_id,
                             req.session(),
                             crate::bash_background::persistence::TaskArtifact::Stderr,
@@ -209,6 +238,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     }
                 }
             }
+            if let Some(reason) = &store_unavailable {
+                return Response::error(&req.id, "database_unavailable", format!(
+                    "Store unavailable: {reason}; no readable finished task bundle for {task_id}. Running tasks require the store to recover.",
+                ));
+            }
             let unadopted = ctx.config().project_root.as_deref().and_then(|root| {
                 ctx.bash_background()
                     .unadopted_task_message(&task_id, req.session(), root)
@@ -231,15 +265,26 @@ fn maybe_render_pty_screen(
     task_id: &str,
     snapshot: &mut BgTaskSnapshot,
     output_mode: Option<&str>,
+    disk_paths: Option<&crate::bash_background::persistence::TaskPaths>,
 ) -> Option<Vec<u8>> {
     if snapshot.info.mode != BgMode::Pty {
         return None;
     }
-    match ctx.bash_background().read_artifact(
-        task_id,
-        session_id,
-        crate::bash_background::persistence::TaskArtifact::Pty,
-    ) {
+    let raw = if let Some(paths) = disk_paths {
+        crate::bash_background::persistence::open_task_artifact(
+            paths,
+            crate::bash_background::persistence::TaskArtifact::Pty,
+        )
+        .and_then(|mut file| file.read_all())
+        .map_err(|error| error.to_string())
+    } else {
+        ctx.bash_background().read_artifact(
+            task_id,
+            session_id,
+            crate::bash_background::persistence::TaskArtifact::Pty,
+        )
+    };
+    match raw {
         Ok(raw) => {
             if !matches!(output_mode, Some("raw")) {
                 let rows = snapshot.pty_rows.unwrap_or(24);
@@ -255,6 +300,28 @@ fn maybe_render_pty_screen(
             None
         }
     }
+}
+
+fn read_status_artifact_range(
+    ctx: &AppContext,
+    disk_paths: Option<&crate::bash_background::persistence::TaskPaths>,
+    task_id: &str,
+    session: &str,
+    artifact: crate::bash_background::persistence::TaskArtifact,
+    offset: u64,
+) -> Result<(Vec<u8>, u64), String> {
+    let Some(paths) = disk_paths else {
+        return ctx
+            .bash_background()
+            .read_artifact_range(task_id, session, artifact, offset);
+    };
+    let read = || -> std::io::Result<_> {
+        let mut file = crate::bash_background::persistence::open_task_artifact(paths, artifact)?;
+        let len = file.len()?;
+        let start = offset.min(len);
+        Ok((file.read_range(start, len - start)?, len))
+    };
+    read().map_err(|error| format!("artifact_refused: {error}"))
 }
 
 #[cfg(test)]
@@ -453,6 +520,61 @@ mod tests {
             );
             fixture.assert_output();
         }
+    }
+
+    #[test]
+    fn restart_finished_status_survives_unavailable_store_without_replay() {
+        let fixture = RestoreFixture::new(Harness::Opencode);
+        fixture.ctx.finish_database_runtime_error(
+            "storage_requires_newer_reader: database reader floor".into(),
+            false,
+        );
+        assert!(fixture
+            .ctx
+            .database_runtime_refusal("status", "bash_status")
+            .is_none());
+        let response = fixture.status(COMPLETED_TASK, SESSION);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed");
+        assert_eq!(response.data["exit_code"], 0);
+        assert!(response.data["store_unavailable"]
+            .as_str()
+            .unwrap()
+            .contains("storage_requires_newer_reader"));
+        let output = response.data["output_preview"].as_str().unwrap();
+        assert!(output.contains("stdout before restart"), "{output}");
+        assert!(output.contains("stderr before restart"), "{output}");
+        assert!(fixture.ctx.bash_background().list(0).is_empty());
+        assert_eq!(
+            fs::read(&fixture.future.json).unwrap(),
+            fixture.future_bytes
+        );
+        assert!(!fixture.status(RUNNING_TASK, SESSION).success);
+        fs::write(&fixture.running.exit, "7\n").unwrap();
+        let exited = fixture.status(RUNNING_TASK, SESSION);
+        assert!(exited.success, "{exited:?}");
+        assert_eq!(exited.data["status"], "failed");
+        assert_eq!(exited.data["exit_code"], 7);
+        assert!(fixture.ctx.bash_background().list(0).is_empty());
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "chunk", "command": "bash_status", "session_id": SESSION,
+            "params": { "task_id": RUNNING_TASK, "output_offset": 0, "stderr_offset": 0 },
+        }))
+        .unwrap();
+        let chunk = super::handle(&request, &fixture.ctx);
+        assert!(chunk.success, "{chunk:?}");
+        assert_eq!(
+            chunk.data["output_next_offset"],
+            "stdout before restart\n".len()
+        );
+        assert_eq!(
+            chunk.data["stderr_next_offset"],
+            "stderr before restart\n".len()
+        );
+        assert!(!fixture.status(COMPLETED_TASK, "other-session").success);
+        let refused = fixture.status(FUTURE_TASK, SESSION);
+        assert!(!refused.success);
+        assert_eq!(refused.data["code"], crate::persisted_format::CODE);
     }
 
     #[test]

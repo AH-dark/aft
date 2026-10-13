@@ -771,6 +771,10 @@ pub(crate) struct RegistryInner {
     db_schema_hints: AtomicBool,
     background_admission: Mutex<()>,
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    /// Session owners of output files recovered from task records on disk.
+    /// Directory handles prevent cached permissions from following a replaced I/O directory.
+    persisted_artifact_owners:
+        Mutex<HashMap<PathBuf, (String, Arc<super::persistence::PinnedDir>)>>,
     /// Failed finished-task bundle deletions and their bounded retry count.
     finished_delete_attempts: Mutex<HashMap<String, usize>>,
     cleanup_queue: Mutex<VecDeque<String>>,
@@ -1168,6 +1172,7 @@ impl BgTaskRegistry {
                 db_schema_hints: AtomicBool::new(true),
                 background_admission: Mutex::new(()),
                 tasks: Mutex::new(HashMap::new()),
+                persisted_artifact_owners: Mutex::new(HashMap::new()),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
                 cleanup_queue: Mutex::new(VecDeque::new()),
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
@@ -1272,22 +1277,86 @@ impl BgTaskRegistry {
         let Ok(requested) = fs::canonicalize(path) else {
             return false;
         };
-        let Ok(tasks) = self.inner.tasks.lock() else {
-            return false;
-        };
+        let registered = self.inner.tasks.lock().is_ok_and(|tasks| {
+            tasks.values().any(|task| {
+                task.session_id == session_id
+                    && [
+                        &task.paths.stdout,
+                        &task.paths.stderr,
+                        &task.paths.exit,
+                        &task.paths.pty,
+                    ]
+                    .into_iter()
+                    .filter_map(|known| known.file_name())
+                    .any(|name| task.artifact_root.join(name) == requested)
+            })
+        });
+        if registered {
+            return requested.is_file();
+        }
+        self.persisted_artifact_owner(session_id, &requested)
+            .is_some()
+    }
 
-        tasks.values().any(|task| {
-            task.session_id == session_id
-                && [
-                    &task.paths.stdout,
-                    &task.paths.stderr,
-                    &task.paths.exit,
-                    &task.paths.pty,
-                ]
-                .into_iter()
-                .filter_map(|known| known.file_name())
-                .any(|name| task.artifact_root.join(name) == requested)
-        })
+    fn persisted_artifact_owner(
+        &self,
+        session_id: &str,
+        requested: &Path,
+    ) -> Option<Arc<super::persistence::PinnedDir>> {
+        let cached = self
+            .inner
+            .persisted_artifact_owners
+            .lock()
+            .ok()?
+            .get(requested)
+            .cloned();
+        if let Some((owner, io)) = cached {
+            return (owner == session_id && io.open_file(requested.file_name()?, false).is_ok())
+                .then_some(io);
+        }
+        // A task record may not have been loaded since the daemon restarted.
+        // Check the record named by the output path, not neighboring tasks or files.
+        let parent = requested.parent()?;
+        let (session_dir, task_id) = if parent.file_name()? == "io" {
+            let task_dir = parent.parent()?;
+            (task_dir.parent()?, task_dir.file_name()?.to_str()?)
+        } else {
+            (parent, requested.file_stem()?.to_str()?)
+        };
+        if session_dir.parent()?.file_name()? != "bash-tasks"
+            || session_dir.file_name()?.to_str()? != crate::backup::hash_session(session_id)
+        {
+            return None;
+        }
+        let resolved =
+            super::persistence::resolve_uninitialized_task_layout(session_dir, task_id).ok()?;
+        let metadata = read_task_at(&resolved).ok()?;
+        if metadata.session_id != session_id {
+            return None;
+        }
+        let allowed = [
+            TaskArtifact::Stdout,
+            TaskArtifact::Stderr,
+            TaskArtifact::Exit,
+            TaskArtifact::Pty,
+        ]
+        .into_iter()
+        .any(|artifact| resolved.paths.artifact_path(artifact) == requested);
+        if !allowed
+            || resolved
+                .dirs
+                .io
+                .open_file(requested.file_name()?, false)
+                .is_err()
+        {
+            return None;
+        }
+        let io = Arc::clone(&resolved.dirs.io);
+        self.inner.persisted_artifact_owners.lock().ok()?.insert(
+            requested.to_path_buf(),
+            (session_id.to_string(), Arc::clone(&io)),
+        );
+        Some(io)
     }
 
     pub fn read_artifact_path(
@@ -5196,6 +5265,44 @@ impl BgTaskRegistry {
             preview_bytes,
             Duration::ZERO,
         )
+    }
+
+    /// Read a finished task's files without registering tasks, rewriting records,
+    /// or starting threads to monitor surviving processes.
+    pub(crate) fn terminal_status_from_disk(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: &Path,
+    ) -> Option<(BgTaskSnapshot, TaskPaths)> {
+        let resolved =
+            resolve_task_layout(&session_tasks_dir(storage_dir, session_id), task_id).ok()?;
+        let mut metadata = read_task_at(&resolved).ok()?;
+        if metadata.session_id != session_id
+            || project_root.is_some_and(|root| {
+                metadata.project_root.as_deref().map(canonicalized_path)
+                    != Some(canonicalized_path(root))
+            })
+        {
+            return None;
+        }
+        if !metadata.is_terminal() {
+            let marker = read_exit_marker(&resolved.paths).ok()??;
+            metadata = terminal_metadata_from_marker(metadata, marker, None);
+        }
+        let row = metadata.to_bash_task_row("", &resolved.paths).ok()?;
+        let mut snapshot = terminal_db_row_snapshot(row, metadata.clone());
+        let buffer = BgBuffer::registered(&resolved.paths, metadata.mode.clone());
+        let cache = self.render_terminal_output(
+            &metadata,
+            &buffer,
+            DiskTruncation::default(),
+            Some(&resolved.paths),
+        );
+        snapshot.output_preview = cache.output_preview;
+        snapshot.output_truncated = cache.output_truncated;
+        Some((snapshot, resolved.paths))
     }
 
     /// The status `bash_status` answers with. A kill in flight publishes
@@ -11812,7 +11919,51 @@ mod tests {
     }
 
     #[test]
-    fn recovery_footer_uses_bash_status_when_artifact_is_not_registered() {
+    fn restart_artifact_ownership_recovers_only_registered_session_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = "bash-1111111111111111";
+        let resolved =
+            super::super::persistence::create_task_layout(dir.path(), "session", task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.to_string(),
+            "session".to_string(),
+            "printf output".to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            None,
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        super::super::persistence::write_task_at(&resolved, &metadata).unwrap();
+        fs::write(&resolved.paths.stdout, "retained output\n").unwrap();
+        fs::write(&resolved.paths.stderr, "retained error\n").unwrap();
+        fs::write(&resolved.paths.exit, "0\n").unwrap();
+        let unregistered = resolved.paths.stdout.parent().unwrap().join("unregistered");
+        fs::write(&unregistered, "private\n").unwrap();
+        let registry = BgTaskRegistry::default();
+        registry
+            .insert_rehydrated_task(metadata, resolved.paths.clone(), true)
+            .unwrap();
+        drop(registry);
+
+        let restarted = BgTaskRegistry::default();
+        assert!(restarted.task(task_id).is_none());
+        assert!(!restarted.is_session_owned_artifact_path("other-session", &resolved.paths.stdout));
+        assert!(restarted.is_session_owned_artifact_path("session", &resolved.paths.stdout));
+        assert!(restarted.is_session_owned_artifact_path("session", &resolved.paths.stderr));
+        assert!(restarted.is_session_owned_artifact_path("session", &resolved.paths.exit));
+        assert!(!restarted.is_session_owned_artifact_path("session", &resolved.paths.json));
+        assert!(!restarted.is_session_owned_artifact_path("session", &resolved.paths.dir));
+        assert!(!restarted.is_session_owned_artifact_path("session", &unregistered));
+        assert!(restarted.task(task_id).is_none());
+        super::super::persistence::work_counts::reset();
+        assert!(restarted.is_session_owned_artifact_path("session", &resolved.paths.stdout));
+        assert_eq!(super::super::persistence::work_counts::get().parses, 0);
+    }
+
+    #[test]
+    fn recovery_footer_uses_read_when_artifact_has_persisted_task_record() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let task_id = "bash-1111111111111111";
@@ -11841,10 +11992,8 @@ mod tests {
             .render_terminal_output_from_paths(&metadata, &paths)
             .expect("terminal render");
 
-        assert!(cache
-            .output_preview
-            .contains("use bash_status({taskId: \"bash-1111111111111111\"})"));
-        assert!(!cache.output_preview.contains("full output: read "));
+        assert!(!cache.output_preview.contains("use bash_status("));
+        assert!(cache.output_preview.contains("full output: read "));
     }
 
     fn insert_terminal_pty_task(
