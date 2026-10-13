@@ -35,7 +35,14 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
                 .collect::<Vec<_>>(),
             &profile.read_deny,
         ),
-        (profile.write_allow_roots(), &profile.write_deny),
+        (
+            profile
+                .write_allow_roots()
+                .into_iter()
+                .chain(profile.writable_files.iter().map(PathBuf::as_path))
+                .collect(),
+            &profile.write_deny,
+        ),
     ] {
         for grant in grants {
             for deny in denies {
@@ -59,7 +66,10 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
     profile
         .data_policy
         .validate_grants(
-            profile.write_allow_roots(),
+            profile
+                .write_allow_roots()
+                .into_iter()
+                .chain(profile.writable_files.iter().map(PathBuf::as_path)),
             &profile.data_policy.write_allow,
         )
         .map_err(|error| error.to_string())?;
@@ -75,6 +85,15 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
         profile
             .write_allow_roots()
             .into_iter()
+            // Landlock grants rights on an opened file, so a writable file
+            // that does not exist yet stays unwritable here.
+            .chain(
+                profile
+                    .writable_files
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .filter(|file| file.is_file()),
+            )
             .chain([Path::new("/dev/null")]),
         yama_same_uid_exposed,
     )

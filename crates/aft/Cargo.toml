@@ -55,6 +55,12 @@ path = "tests/watcher_integration/main.rs"
 name = "sandbox_launch_probe"
 path = "tests/sandbox_launch_probe.rs"
 
+# A stamped worker's shell under the real native sandbox (macOS only): a
+# separate binary so it can be built and run on its own on the Mac.
+[[test]]
+name = "worker_jail"
+path = "tests/worker_jail.rs"
+
 # The semantic wrapper changes process cwd; keep it out of the shared harness.
 [[test]]
 name = "semantic_test"

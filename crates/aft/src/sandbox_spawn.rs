@@ -1579,6 +1579,15 @@ fn build_native_profile(
             home.join("Library/Caches/go-build"),
         ]);
         cache_roots.retain(|path| path.is_dir());
+        // A jailed worker's shell keeps writes to its worktree, plus what normal
+        // builds and commits need, all taken from operator configuration.
+        let jail = worker_jail_active()
+            .then(|| worker_jail_grants(&home, &project_roots, &git_policies, &policy));
+        if let Some(jail) = &jail {
+            cache_roots.extend(jail.caches.iter().cloned());
+            cache_roots.sort_unstable();
+            cache_roots.dedup();
+        }
 
         let mut socket_deny = vec![PathBuf::from("/var/run/docker.sock")];
         if let Some(agent_socket) =
@@ -1593,6 +1602,12 @@ fn build_native_profile(
         profile.write_deny.extend(shell_write_deny);
         profile.write_deny_nested = write_deny_nested;
         profile.read_deny.extend(shell_read_deny);
+        if let Some(jail) = jail {
+            profile.writable_roots.extend(jail.roots);
+            profile.writable_roots.sort_unstable();
+            profile.writable_roots.dedup();
+            profile.writable_files = jail.files;
+        }
         profile = profile
             .canonicalize_for_launch()
             .map_err(|error| error.to_string())?;
@@ -1622,6 +1637,268 @@ fn build_native_profile(
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
     result
+}
+
+/// Writes a jailed worker's shell gets beyond its worktree.
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WorkerJailGrants {
+    /// Package-manager and compiler caches (added to the cache roots).
+    caches: Vec<PathBuf>,
+    /// Directories outside the worktree: Git stores and operator build targets.
+    roots: Vec<PathBuf>,
+    /// Single lock and tracking files beside read-only configuration.
+    files: Vec<PathBuf>,
+}
+
+/// Cargo's lock and global-cache tracking files at the root of CARGO_HOME. The
+/// directory itself also holds `bin` and `config.toml`, which stay read-only:
+/// a shell that could rewrite them could run code outside the sandbox later.
+#[cfg(unix)]
+const CARGO_HOME_FILES: &[&str] = &[
+    ".package-cache",
+    ".package-cache-mutate",
+    ".global-cache",
+    ".global-cache-journal",
+    ".global-cache-wal",
+    ".global-cache-shm",
+];
+
+#[cfg(unix)]
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    crate::environment::non_empty_os_var(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+/// What a jailed worker's shell may write outside its worktree. Every entry
+/// comes from operator configuration: the AFT process environment, cargo
+/// configuration files outside the worktree, and the standard cache homes.
+/// Nothing comes from the command, its environment, or files inside the
+/// worktree, which the model can edit.
+///
+/// - Git: a linked worktree's own Git directory, and the shared object, ref and
+///   log stores of its main repository. The shared `config`, hooks, `info` and
+///   other worktrees' entries stay read-only, on Seatbelt and Landlock alike.
+/// - Cargo: `$CARGO_HOME/registry` and `git`, its lock files, and
+///   `$RUSTUP_HOME/downloads` and `tmp`.
+/// - sccache's cache directory, when the configured rustc wrapper is sccache.
+/// - Build targets named by `CARGO_TARGET_DIR` in the AFT environment or by
+///   `build.target-dir` in cargo configuration outside the worktree, unless the
+///   target is a protected path or would contain the home or the worktree.
+#[cfg(unix)]
+fn worker_jail_grants(
+    home: &Path,
+    project_roots: &[PathBuf],
+    git_policies: &[GitPolicy],
+    policy: &crate::access_policy::AccessPolicy,
+) -> WorkerJailGrants {
+    let mut grants = WorkerJailGrants {
+        roots: linked_git_grants(git_policies),
+        ..WorkerJailGrants::default()
+    };
+
+    let cargo_home = absolute_env_path("CARGO_HOME").unwrap_or_else(|| home.join(".cargo"));
+    if cargo_home.is_dir() {
+        for cache in ["registry", "git"] {
+            let cache = cargo_home.join(cache);
+            if std::fs::create_dir_all(&cache).is_ok() {
+                grants.caches.push(cache);
+            }
+        }
+        grants
+            .files
+            .extend(CARGO_HOME_FILES.iter().map(|name| cargo_home.join(name)));
+    }
+    let rustup_home = absolute_env_path("RUSTUP_HOME").unwrap_or_else(|| home.join(".rustup"));
+    if rustup_home.is_dir() {
+        for cache in ["downloads", "tmp"] {
+            let cache = rustup_home.join(cache);
+            if std::fs::create_dir_all(&cache).is_ok() {
+                grants.caches.push(cache);
+            }
+        }
+    }
+
+    // Cargo reads configuration from CARGO_HOME and from every ancestor of the
+    // working directory. Only files outside the worktree are operator-owned.
+    let mut configs = vec![
+        (
+            cargo_home.join("config.toml"),
+            cargo_home.parent().map(Path::to_path_buf),
+        ),
+        (
+            cargo_home.join("config"),
+            cargo_home.parent().map(Path::to_path_buf),
+        ),
+    ];
+    for root in project_roots {
+        for ancestor in root.ancestors().skip(1) {
+            for name in ["config.toml", "config"] {
+                configs.push((
+                    ancestor.join(".cargo").join(name),
+                    Some(ancestor.to_path_buf()),
+                ));
+            }
+        }
+    }
+    let mut targets = ["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"]
+        .into_iter()
+        .filter_map(absolute_env_path)
+        .collect::<Vec<_>>();
+    let mut wrappers = ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"]
+        .into_iter()
+        .filter_map(|name| crate::environment::non_empty_os_var(name))
+        .map(|wrapper| (wrapper.to_string_lossy().into_owned(), None))
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    for (path, base) in configs {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Some(build) = cargo_build_settings(&path) else {
+            continue;
+        };
+        if let Some(target) = build.target_dir {
+            let target = PathBuf::from(target);
+            match (&base, target.is_absolute()) {
+                (_, true) => targets.push(target),
+                (Some(base), false) => targets.push(base.join(target)),
+                (None, false) => {}
+            }
+        }
+        if let Some(wrapper) = build.rustc_wrapper {
+            wrappers.push((wrapper, base));
+        }
+    }
+
+    if wrappers
+        .iter()
+        .any(|(wrapper, base)| wrapper_is_sccache(wrapper, base.as_deref()))
+    {
+        let cache = absolute_env_path("SCCACHE_DIR").unwrap_or_else(|| sccache_default_dir(home));
+        if std::fs::create_dir_all(&cache).is_ok() {
+            grants.caches.push(cache);
+        }
+    }
+
+    for target in targets {
+        let target = crate::inspect::job::normalize_path(&target);
+        if !jail_target_allowed(&target, home, project_roots, policy) {
+            log::warn!(
+                "worker sandbox: ignoring configured cargo target {}: it would contain the home, a project root, or a protected path",
+                target.display()
+            );
+            continue;
+        }
+        if std::fs::create_dir_all(&target).is_ok() {
+            grants.roots.push(target);
+        }
+    }
+    grants
+}
+
+/// A linked worktree's own Git directory and its main repository's shared
+/// object, ref and log stores: what `git add` and `git commit` write. The
+/// shared `config`, hooks, `info` and other worktrees' entries are left out.
+#[cfg(unix)]
+fn linked_git_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (git_dir, common_dir) in git_policies.iter().filter_map(|git| git.linked.as_ref()) {
+        roots.push(git_dir.clone());
+        roots.extend(
+            ["objects", "refs", "logs"]
+                .into_iter()
+                .map(|store| common_dir.join(store))
+                .filter(|store| store.is_dir()),
+        );
+    }
+    roots
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CargoBuildSettings {
+    target_dir: Option<String>,
+    rustc_wrapper: Option<String>,
+}
+
+/// The `[build]` settings of one cargo configuration file, if it exists and parses.
+#[cfg(unix)]
+fn cargo_build_settings(path: &Path) -> Option<CargoBuildSettings> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_cargo_build_settings(&text)
+}
+
+#[cfg(unix)]
+fn parse_cargo_build_settings(text: &str) -> Option<CargoBuildSettings> {
+    let table = text.parse::<toml::Table>().ok()?;
+    let build = table.get("build")?.as_table()?;
+    let field = |name: &str| {
+        build
+            .get(name)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    };
+    Some(CargoBuildSettings {
+        target_dir: field("target-dir"),
+        rustc_wrapper: field("rustc-wrapper"),
+    })
+}
+
+/// Whether a configured rustc wrapper runs sccache: it is named sccache, or it
+/// is a small script that invokes sccache (as wrappers that set the compile
+/// priority do).
+#[cfg(unix)]
+fn wrapper_is_sccache(wrapper: &str, base: Option<&Path>) -> bool {
+    let path = Path::new(wrapper);
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().contains("sccache"))
+    {
+        return true;
+    }
+    let path = match (path.is_absolute(), base) {
+        (true, _) => path.to_path_buf(),
+        (false, Some(base)) if wrapper.contains('/') => base.join(path),
+        _ => return false,
+    };
+    std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 65_536)
+        && std::fs::read(&path).is_ok_and(|bytes| {
+            bytes
+                .windows(b"sccache".len())
+                .any(|window| window == b"sccache")
+        })
+}
+
+#[cfg(unix)]
+fn sccache_default_dir(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Caches/Mozilla.sccache")
+    } else {
+        absolute_env_path("XDG_CACHE_HOME")
+            .unwrap_or_else(|| home.join(".cache"))
+            .join("sccache")
+    }
+}
+
+/// A configured build target may not contain the home or a project root
+/// (granting it would grant them), and may not be a protected path.
+#[cfg(unix)]
+fn jail_target_allowed(
+    target: &Path,
+    home: &Path,
+    project_roots: &[PathBuf],
+    policy: &crate::access_policy::AccessPolicy,
+) -> bool {
+    use crate::access_policy::{AccessDecision, AccessDenial};
+    if !target.is_absolute() || target.parent().is_none() {
+        return false;
+    }
+    let target = crate::access_policy::policy_path(target);
+    !home.starts_with(&target)
+        && !project_roots.iter().any(|root| root.starts_with(&target))
+        && policy.decide_tree_write(&target) != AccessDecision::Deny(AccessDenial::Floor)
 }
 
 #[cfg(unix)]
@@ -1700,6 +1977,9 @@ struct GitPolicy {
     #[cfg(target_os = "linux")]
     read_roots: Vec<PathBuf>,
     hooks: Vec<PathBuf>,
+    /// For a linked worktree: its own Git directory (`<common>/worktrees/<name>`)
+    /// and the shared common directory of the main repository.
+    linked: Option<(PathBuf, PathBuf)>,
 }
 
 #[cfg(unix)]
@@ -1712,6 +1992,7 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
                 #[cfg(target_os = "linux")]
                 read_roots: Vec::new(),
                 hooks: vec![dot_git.join("hooks")],
+                linked: None,
             });
         }
         Err(error) => {
@@ -1817,6 +2098,7 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
     }
 
     let hooks = resolve_hooks_path(project_root, &common_dir)?;
+    let linked = (git_dir != common_dir).then(|| (git_dir.clone(), common_dir.clone()));
     #[cfg(target_os = "linux")]
     let read_roots = {
         let mut read_roots = vec![git_dir, common_dir];
@@ -1828,6 +2110,7 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         #[cfg(target_os = "linux")]
         read_roots,
         hooks: vec![hooks],
+        linked,
     })
 }
 
@@ -2065,6 +2348,13 @@ fn compute_linux_profile(
         profile
             .write_allow_roots()
             .into_iter()
+            .chain(
+                profile
+                    .writable_files
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .filter(|file| file.is_file()),
+            )
             .map(|path| IntendedReadGrant {
                 path: path.to_path_buf(),
                 force_children: false,
@@ -3736,6 +4026,148 @@ mod policy_tests {
 
     #[cfg(unix)]
     #[test]
+    fn worker_jail_reads_only_build_settings_from_cargo_config() {
+        assert_eq!(
+            parse_cargo_build_settings(
+                "[build]\nrustc-wrapper = \"/x/rustc-lowprio\"\ntarget-dir = \"shared-target\"\njobs = 12\n"
+            ),
+            Some(CargoBuildSettings {
+                target_dir: Some("shared-target".into()),
+                rustc_wrapper: Some("/x/rustc-lowprio".into()),
+            })
+        );
+        assert_eq!(parse_cargo_build_settings("[net]\noffline = true\n"), None);
+        assert_eq!(parse_cargo_build_settings("not toml ["), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_jail_recognizes_sccache_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("rustc-lowprio");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nexec /opt/homebrew/bin/sccache \"$@\"\n",
+        )
+        .unwrap();
+        let plain = dir.path().join("rustc-plain");
+        std::fs::write(&plain, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        assert!(wrapper_is_sccache("sccache", None));
+        assert!(wrapper_is_sccache("/opt/homebrew/bin/sccache", None));
+        assert!(wrapper_is_sccache(script.to_str().unwrap(), None));
+        assert!(wrapper_is_sccache("./rustc-lowprio", Some(dir.path())));
+        assert!(!wrapper_is_sccache(plain.to_str().unwrap(), None));
+        assert!(!wrapper_is_sccache("rustc-lowprio", Some(dir.path())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_jail_target_may_not_contain_home_roots_or_protected_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let root = base.join("work").join("worktree");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &crate::config::Config::default(),
+            &base.join("storage"),
+            vec![root.clone()],
+            &home,
+        );
+        let roots = [root.clone()];
+        assert!(jail_target_allowed(
+            &base.join("shared-target"),
+            &home,
+            &roots,
+            &policy
+        ));
+        assert!(jail_target_allowed(
+            &root.join("target"),
+            &home,
+            &roots,
+            &policy
+        ));
+        assert!(!jail_target_allowed(&base, &home, &roots, &policy));
+        assert!(!jail_target_allowed(&home, &home, &roots, &policy));
+        assert!(!jail_target_allowed(
+            &base.join("work"),
+            &home,
+            &roots,
+            &policy
+        ));
+        assert!(!jail_target_allowed(
+            &home.join(".ssh/target"),
+            &home,
+            &roots,
+            &policy
+        ));
+        assert!(!jail_target_allowed(
+            &home.join(".local/share/cortexkit/target"),
+            &home,
+            &roots,
+            &policy
+        ));
+        assert!(!jail_target_allowed(
+            Path::new("relative"),
+            &home,
+            &roots,
+            &policy
+        ));
+        assert!(!jail_target_allowed(Path::new("/"), &home, &roots, &policy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_jail_git_grants_cover_shared_stores_but_not_config_hooks_or_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path().join("main/.git");
+        let own = common.join("worktrees/own");
+        for path in [
+            common.join("objects"),
+            common.join("refs"),
+            common.join("logs"),
+            common.join("hooks"),
+            common.join("info"),
+            own.clone(),
+            common.join("worktrees/sibling"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let linked = GitPolicy {
+            #[cfg(target_os = "linux")]
+            read_roots: Vec::new(),
+            hooks: vec![common.join("hooks")],
+            linked: Some((own.clone(), common.clone())),
+        };
+        let main = GitPolicy {
+            #[cfg(target_os = "linux")]
+            read_roots: Vec::new(),
+            hooks: Vec::new(),
+            linked: None,
+        };
+        let grants = linked_git_grants(&[linked, main]);
+        assert_eq!(
+            grants,
+            vec![
+                own,
+                common.join("objects"),
+                common.join("refs"),
+                common.join("logs")
+            ]
+        );
+        for refused in ["config", "hooks", "info", "worktrees/sibling", ""] {
+            let path = common.join(refused);
+            assert!(
+                !grants.iter().any(|grant| path.starts_with(grant)),
+                "{} must stay read-only",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn sandbox_setup_refusal_names_root_and_cause_before_remedy() {
         let project = tempfile::tempdir().unwrap();
         let ctx = context(project.path().to_path_buf());
@@ -4710,6 +5142,7 @@ mod read_allow_tests {
                 write_allow: vec![project.clone().into(), temp.clone().into()],
             },
             writable_roots: vec![project.into()],
+            writable_files: Vec::new(),
             write_deny: vec![
                 connection.clone(),
                 "/home/alice/.ssh".into(),

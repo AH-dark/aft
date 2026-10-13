@@ -58,6 +58,12 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub data_policy: SandboxDataPolicy,
     pub writable_roots: Vec<PathBuf>,
+    /// Single files that may be written or created, without making their
+    /// directory writable (a cache's lock files beside configuration that must
+    /// stay read-only). Their parent directory must exist. Backends that can
+    /// only grant existing files skip one that does not exist yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable_files: Vec<PathBuf>,
     /// Mandatory write-deny paths for backends that support nested exclusions.
     #[serde(default)]
     pub write_deny: Vec<PathBuf>,
@@ -99,6 +105,7 @@ impl SandboxProfile {
             v: SANDBOX_PROFILE_VERSION,
             data_policy: SandboxDataPolicy::default(),
             writable_roots: canonicalize_required_dirs(writable_roots, "writable_roots")?,
+            writable_files: Vec::new(),
             write_deny: canonicalize_optional_paths(write_deny, "write_deny", &mut deny_paths)?,
             write_deny_nested: canonicalize_optional_paths(
                 write_deny_nested,
@@ -134,6 +141,7 @@ impl SandboxProfile {
             v: self.v,
             data_policy: self.data_policy.canonicalize()?,
             writable_roots: canonicalize_required_dirs(self.writable_roots, "writable_roots")?,
+            writable_files: canonicalize_files(self.writable_files, "writable_files")?,
             write_deny: canonicalize_optional_paths(
                 self.write_deny,
                 "write_deny",
@@ -227,6 +235,28 @@ fn canonicalize_required_dir(path: PathBuf, field: &str) -> Result<PathBuf, Sand
             path.display()
         )));
     }
+    Ok(canonical)
+}
+
+/// Resolve each file through its existing parent directory, keeping the final
+/// name as written: a final symlink is never followed into a wider grant.
+fn canonicalize_files(
+    paths: Vec<PathBuf>,
+    field: &str,
+) -> Result<Vec<PathBuf>, SandboxProfileError> {
+    let mut canonical = Vec::with_capacity(paths.len());
+    for path in paths {
+        validate_absolute(&path, field)?;
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(SandboxProfileError::new(format!(
+                "{field} path has no parent directory: {}",
+                path.display()
+            )));
+        };
+        canonical.push(canonicalize_required_dir(parent.to_path_buf(), field)?.join(name));
+    }
+    canonical.sort_unstable();
+    canonical.dedup();
     Ok(canonical)
 }
 
@@ -743,6 +773,7 @@ mod tests {
             v: SANDBOX_PROFILE_VERSION,
             data_policy: SandboxDataPolicy::default(),
             writable_roots: vec![root.clone()],
+            writable_files: Vec::new(),
             write_deny: vec![root.join("missing-write-deny")],
             write_deny_nested: vec![root.join("missing-nested")],
             read_allow: vec![root.clone()],

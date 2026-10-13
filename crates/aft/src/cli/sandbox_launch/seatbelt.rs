@@ -54,6 +54,12 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
             escape_path(root)?
         ));
     }
+    for file in &profile.writable_files {
+        source.push_str(&format!(
+            "(allow file-write* (literal \"{}\"))\n",
+            escape_path(file)?
+        ));
+    }
     for path in profile.write_deny.iter().chain(&profile.write_deny_nested) {
         source.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
@@ -180,6 +186,7 @@ mod tests {
             v: 1,
             data_policy: Default::default(),
             writable_roots: vec![project],
+            writable_files: Vec::new(),
             write_deny: Vec::new(),
             write_deny_nested: vec![nested_deny],
             read_allow: Vec::new(),

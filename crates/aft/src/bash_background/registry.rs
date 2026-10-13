@@ -10671,6 +10671,7 @@ mod tests {
                 data_policy: Default::default(),
                 v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
                 writable_roots: Vec::new(),
+                writable_files: Vec::new(),
                 write_deny: Vec::new(),
                 write_deny_nested: Vec::new(),
                 read_allow: Vec::new(),
