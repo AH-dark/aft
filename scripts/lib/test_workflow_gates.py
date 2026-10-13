@@ -136,6 +136,10 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertNotIn(probe, shard)
         self.assertIn(probe, GATE_TEXT)
         self.assertIn('"$(uname)" != "Darwin"', GATE_TEXT)
+        self.assertNotIn(
+            "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) panic_hook_preserves_default_backtrace_behavior_and_persists",
+            GATE_TEXT,
+        )
         self.assertIn(
             "serial_backtrace_candidates",
             PROOF_TEXT,
