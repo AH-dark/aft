@@ -625,6 +625,82 @@ fn placeholder_tool_call(aft: &mut AftProcess, id: &str, name: &str, arguments: 
     )
 }
 
+#[test]
+fn relative_import_operations_edit_the_project_root_file() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+    let target = root.join("src/import-target.ts");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("create src");
+    fs::write(
+        &target,
+        "import { beta, alpha } from \"pkg\";\nimport { zeta, aardvark } from \"other\";\nconst answer = 42;\n",
+    )
+    .expect("write import fixture");
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(configure["success"], true, "configure: {configure:#}");
+
+    let add = placeholder_tool_call(
+        &mut aft,
+        "relative-import-add",
+        "import",
+        json!({
+            "op": "add",
+            "filePath": "src/import-target.ts",
+            "module": "pkg",
+            "names": ["gamma"]
+        }),
+    );
+    assert_eq!(add["success"], true, "add import: {add:#}");
+    let after_add = fs::read_to_string(&target).expect("read after add");
+    assert!(
+        after_add.contains("gamma"),
+        "add edited wrong file: {after_add}"
+    );
+
+    let remove = placeholder_tool_call(
+        &mut aft,
+        "relative-import-remove",
+        "import",
+        json!({
+            "op": "remove",
+            "filePath": "src/import-target.ts",
+            "module": "pkg",
+            "removeName": "beta"
+        }),
+    );
+    assert_eq!(remove["success"], true, "remove import: {remove:#}");
+    let after_remove = fs::read_to_string(&target).expect("read after remove");
+    assert!(
+        !after_remove.contains("beta"),
+        "remove edited wrong file: {after_remove}"
+    );
+    assert!(
+        after_remove.contains("gamma"),
+        "remove damaged added import: {after_remove}"
+    );
+
+    let before_organize = after_remove;
+    let organize = placeholder_tool_call(
+        &mut aft,
+        "relative-import-organize",
+        "import",
+        json!({ "op": "organize", "filePath": "src/import-target.ts" }),
+    );
+    assert_eq!(organize["success"], true, "organize imports: {organize:#}");
+    let after_organize = fs::read_to_string(&target).expect("read after organize");
+    assert_ne!(
+        after_organize, before_organize,
+        "organize must edit the project-root file"
+    );
+    assert!(after_organize.contains("aardvark"));
+    assert!(after_organize.contains("gamma"));
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 // Replays a `read` call recorded from a model that fills every property:
 // the line range is inverted, and offset/limit carry their own values. It
 // used to come back as an empty SUCCESS, and a reader concluded code "was not

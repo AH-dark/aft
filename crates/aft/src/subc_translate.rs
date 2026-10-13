@@ -1192,18 +1192,18 @@ pub fn subc_translate_owned_with_context(
         "edit" => translate_edit(agent_args, project_root, ctx),
         "apply_patch" => translate_apply_patch(agent_args),
         "grep" => translate_grep(agent_args, project_root),
-        "glob" => translate_glob(agent_args),
-        "search" => translate_search(agent_args),
+        "glob" => translate_glob(agent_args, project_root),
+        "search" => translate_search(agent_args, project_root),
         "outline" => translate_outline(agent_args, project_root),
         "zoom" => translate_zoom(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
-        "conflicts" => translate_conflicts(agent_args),
-        "ast_search" => translate_ast_search(agent_args),
-        "ast_replace" => translate_ast_replace(agent_args),
+        "conflicts" => translate_conflicts(agent_args, project_root),
+        "ast_search" => translate_ast_search(agent_args, project_root),
+        "ast_replace" => translate_ast_replace(agent_args, project_root),
         "delete" => translate_delete(agent_args, project_root),
         "move" => translate_move(agent_args, project_root),
-        "import" => translate_import(agent_args),
+        "import" => translate_import(agent_args, project_root),
         "safety" => translate_safety(agent_args, project_root),
         "bash_status" | "bash_kill" | "bash_write" | "bash_watch" => {
             Ok(translate_bash_task_tool(bare_name, agent_args))
@@ -1894,7 +1894,7 @@ fn translate_grep(args: Value, project_root: &Path) -> Result<Translated, Transl
     })
 }
 
-fn translate_ast_search(args: Value) -> Result<Translated, TranslateError> {
+fn translate_ast_search(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let pattern = map_in
         .get("pattern")
@@ -1910,7 +1910,7 @@ fn translate_ast_search(args: Value) -> Result<Translated, TranslateError> {
     let mut out = Map::new();
     out.insert("pattern".to_string(), Value::String(pattern.to_string()));
     out.insert("lang".to_string(), Value::String(lang.to_string()));
-    insert_non_empty_array(&mut out, &map_in, "paths");
+    insert_resolved_path_array(&mut out, &map_in, "paths", project_root);
     insert_non_empty_array(&mut out, &map_in, "globs");
     if let Some(context) = coerce_optional_int_result(
         map_in.get("contextLines"),
@@ -1927,7 +1927,7 @@ fn translate_ast_search(args: Value) -> Result<Translated, TranslateError> {
     })
 }
 
-fn translate_ast_replace(args: Value) -> Result<Translated, TranslateError> {
+fn translate_ast_replace(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let pattern = map_in
         .get("pattern")
@@ -1953,7 +1953,7 @@ fn translate_ast_replace(args: Value) -> Result<Translated, TranslateError> {
     out.insert("pattern".to_string(), Value::String(pattern.to_string()));
     out.insert("rewrite".to_string(), Value::String(rewrite.to_string()));
     out.insert("lang".to_string(), Value::String(lang.to_string()));
-    insert_non_empty_array(&mut out, &map_in, "paths");
+    insert_resolved_path_array(&mut out, &map_in, "paths", project_root);
     insert_non_empty_array(&mut out, &map_in, "globs");
     let dry_run = map_in
         .get("dryRun")
@@ -2047,7 +2047,7 @@ fn translate_move(args: Value, project_root: &Path) -> Result<Translated, Transl
     })
 }
 
-fn translate_import(args: Value) -> Result<Translated, TranslateError> {
+fn translate_import(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let op = map_in
         .get("op")
@@ -2070,6 +2070,7 @@ fn translate_import(args: Value) -> Result<Translated, TranslateError> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid_request("aft_import: missing required param 'filePath'"))?;
     reject_github_file_target("aft_import", file_path)?;
+    let file_path = resolve_path_from_project_root(project_root, file_path);
 
     if matches!(op, "add" | "remove") && map_in.get("module").map_or(true, is_empty_param) {
         return Err(invalid_request(format!(
@@ -2078,7 +2079,10 @@ fn translate_import(args: Value) -> Result<Translated, TranslateError> {
     }
 
     let mut out = Map::new();
-    out.insert("file".to_string(), Value::String(file_path.to_string()));
+    out.insert(
+        "file".to_string(),
+        Value::String(file_path.to_string_lossy().into_owned()),
+    );
     insert_present_renamed(&mut out, &map_in, "module", "module");
     insert_present_renamed(&mut out, &map_in, "names", "names");
     insert_present_renamed(&mut out, &map_in, "defaultImport", "default_import");
@@ -2195,7 +2199,31 @@ fn insert_non_empty_array(out: &mut Map<String, Value>, map_in: &Map<String, Val
     }
 }
 
-fn translate_glob(args: Value) -> Result<Translated, TranslateError> {
+fn insert_resolved_path_array(
+    out: &mut Map<String, Value>,
+    map_in: &Map<String, Value>,
+    key: &str,
+    project_root: &Path,
+) {
+    if let Some(items) = map_in.get(key).and_then(Value::as_array) {
+        if !items.is_empty() {
+            let resolved = items
+                .iter()
+                .map(|item| match item.as_str().filter(|path| !path.is_empty()) {
+                    Some(path) => Value::String(
+                        resolve_path_from_project_root(project_root, path)
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    None => item.clone(),
+                })
+                .collect();
+            out.insert(key.to_string(), Value::Array(resolved));
+        }
+    }
+}
+
+fn translate_glob(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let pattern = map_in
         .get("pattern")
@@ -2208,7 +2236,11 @@ fn translate_glob(args: Value) -> Result<Translated, TranslateError> {
     if let Some(path_val) = map_in.get("path") {
         if !is_empty_param(path_val) {
             if let Some(path_str) = path_val.as_str() {
-                out.insert("path".to_string(), Value::String(path_str.to_string()));
+                let resolved = resolve_path_from_project_root(project_root, path_str);
+                out.insert(
+                    "path".to_string(),
+                    Value::String(resolved.to_string_lossy().into_owned()),
+                );
             }
         }
     }
@@ -2299,7 +2331,7 @@ fn resolve_grep_path_arg(project_root: &Path, raw: &str) -> String {
         .join(" ")
 }
 
-fn translate_search(args: Value) -> Result<Translated, TranslateError> {
+fn translate_search(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     // `query` is prose (or a single auto-routed string); `pattern` is a regex
     // in grep's syntax. At least one must be non-empty. A whitespace-only
@@ -2364,7 +2396,11 @@ fn translate_search(args: Value) -> Result<Translated, TranslateError> {
         .map(str::trim)
         .filter(|path| !path.is_empty())
     {
-        out.insert("path".to_string(), Value::String(path.to_string()));
+        let resolved = resolve_path_from_project_root(project_root, path);
+        out.insert(
+            "path".to_string(),
+            Value::String(resolved.to_string_lossy().into_owned()),
+        );
     }
 
     Ok(Translated {
@@ -2767,13 +2803,17 @@ fn insert_zoom_symbols(
     Ok(())
 }
 
-fn translate_conflicts(args: Value) -> Result<Translated, TranslateError> {
+fn translate_conflicts(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
     let mut out = Map::new();
     if let Some(path_val) = map_in.get("path") {
         if !is_empty_param(path_val) {
             if let Some(path_str) = path_val.as_str() {
-                out.insert("path".to_string(), Value::String(path_str.to_string()));
+                let resolved = resolve_path_from_project_root(project_root, path_str);
+                out.insert(
+                    "path".to_string(),
+                    Value::String(resolved.to_string_lossy().into_owned()),
+                );
             }
         }
     }
@@ -2851,6 +2891,68 @@ fn translate_inspect(args: Value, project_root: &Path) -> Result<Translated, Tra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_tool_paths_resolve_against_project_root() {
+        let project_root = Path::new("/workspace/project");
+        let expected_file = "/workspace/project/src/main.ts";
+        for op in ["add", "remove", "organize"] {
+            let mut args = serde_json::json!({ "op": op, "filePath": "src/main.ts" });
+            if matches!(op, "add" | "remove") {
+                args["module"] = Value::String("pkg".to_string());
+            }
+            let translated = subc_translate_owned("import", args, project_root)
+                .expect("translate import operation");
+            assert_eq!(translated.args["file"], expected_file, "op {op}");
+        }
+
+        let cases = [
+            (
+                "ast_search",
+                serde_json::json!({
+                    "pattern": "fn $NAME() { $$$ }",
+                    "lang": "rust",
+                    "paths": ["src/lib.rs"]
+                }),
+                "paths",
+                serde_json::json!(["/workspace/project/src/lib.rs"]),
+            ),
+            (
+                "ast_replace",
+                serde_json::json!({
+                    "pattern": "fn $NAME() { $$$ }",
+                    "rewrite": "fn $NAME() { $$$ }",
+                    "lang": "rust",
+                    "paths": ["src/lib.rs"]
+                }),
+                "paths",
+                serde_json::json!(["/workspace/project/src/lib.rs"]),
+            ),
+            (
+                "glob",
+                serde_json::json!({ "pattern": "*.rs", "path": "src" }),
+                "path",
+                serde_json::json!("/workspace/project/src"),
+            ),
+            (
+                "search",
+                serde_json::json!({ "query": "needle", "path": "src" }),
+                "path",
+                serde_json::json!("/workspace/project/src"),
+            ),
+            (
+                "conflicts",
+                serde_json::json!({ "path": "src" }),
+                "path",
+                serde_json::json!("/workspace/project/src"),
+            ),
+        ];
+        for (tool, args, field, expected) in cases {
+            let translated = subc_translate_owned(tool, args, project_root)
+                .unwrap_or_else(|error| panic!("translate {tool}: {error:?}"));
+            assert_eq!(translated.args[field], expected, "tool {tool}");
+        }
+    }
 
     #[test]
     fn path_aliases_normalize_equal_and_reject_conflicts() {
