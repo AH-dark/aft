@@ -35,13 +35,13 @@
 //! Placement (`scripts/stage-card.sh`) reads the same file and refuses to stage
 //! a card whose `aft --formats` is below it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::persisted_format::{self, PersistedStore, UnsupportedPersistedFormat};
 
@@ -155,6 +155,8 @@ pub fn read(storage_root: &Path) -> Result<Option<ReaderFloor>, FloorError> {
 }
 
 fn parse(path: &Path, bytes: &[u8]) -> Result<ReaderFloor, FloorError> {
+    #[cfg(test)]
+    tests::PARSE_COUNT.with(|count| count.set(count.get() + 1));
     let unparseable = |detail: String| FloorError::Unparseable {
         path: path.to_path_buf(),
         detail,
@@ -304,6 +306,93 @@ fn prepared_roots() -> &'static Mutex<HashSet<PathBuf>> {
     PREPARED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FloorStamp {
+    size: u64,
+    modified: SystemTime,
+}
+
+impl FloorStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
+        Ok(Self {
+            size: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
+}
+
+fn floor_stamps() -> &'static Mutex<HashMap<PathBuf, Option<FloorStamp>>> {
+    static STAMPS: OnceLock<Mutex<HashMap<PathBuf, Option<FloorStamp>>>> = OnceLock::new();
+    STAMPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn stat_floor(path: &Path) -> io::Result<Option<FloorStamp>> {
+    match fs::metadata(path) {
+        Ok(metadata) => FloorStamp::from_metadata(&metadata).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_snapshot(path: &Path) -> io::Result<(Option<FloorStamp>, Option<Vec<u8>>)> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(error) => return Err(error),
+    };
+    let before = FloorStamp::from_metadata(&file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = FloorStamp::from_metadata(&file.metadata()?)?;
+    if before != after || after.size != bytes.len() as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "reader floor changed while being read",
+        ));
+    }
+    Ok((Some(after), Some(bytes)))
+}
+
+/// Recheck a refused root on a persistence retry. The caller must apply its
+/// retry backoff before calling; readable roots incur no filesystem work.
+pub(crate) fn refresh_refused(storage_root: &Path) -> Result<(), FloorError> {
+    let path = floor_path(storage_root);
+    if !persisted_format::refusals_under(storage_root)
+        .iter()
+        .any(|refusal| {
+            refusal.source != persisted_format::RefusalSource::Artifact && refusal.path == path
+        })
+    {
+        return Ok(());
+    }
+    let mut stamps = floor_stamps()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lock_path = storage_root.join(LOCK_FILE);
+    let _lock = crate::fs_lock::try_acquire(&lock_path, LOCK_TIMEOUT).map_err(|error| {
+        FloorError::Lock {
+            path: lock_path,
+            detail: error.to_string(),
+        }
+    })?;
+    let stamp = stat_floor(&path).map_err(|error| FloorError::Io {
+        path: path.clone(),
+        error,
+    })?;
+    if stamps.get(storage_root) == Some(&stamp) {
+        return Ok(());
+    }
+    let (stamp, bytes) = read_snapshot(&path).map_err(|error| FloorError::Io {
+        path: path.clone(),
+        error,
+    })?;
+    let floor = bytes.map_or(Ok(None), |bytes| parse(&path, &bytes).map(Some));
+    let refusals = floor_refusals(&path, floor)?;
+    persisted_format::replace_floor_refusals(storage_root, &refusals);
+    stamps.insert(storage_root.to_path_buf(), stamp);
+    Ok(())
+}
+
 /// Startup check for one storage root, done once per root per process before
 /// any artifact under it is read or written.
 ///
@@ -329,39 +418,24 @@ pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
 
 fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     let path = floor_path(storage_root);
-    let refusals = match read(storage_root) {
-        Ok(floor) => {
-            let floor = floor.unwrap_or_default();
-            let unknown = floor.unknown_stores();
-            if !unknown.is_empty() {
-                // This build cannot refuse a store it has never heard of, so
-                // it only preserves the entry. scripts/stage-card.sh refuses
-                // to stage a build whose `--formats` lacks a store the floor
-                // names, which keeps such a build from being deployed.
-                crate::slog_warn!(
-                    "reader floor {} names stores this build does not know ({}); preserving them",
-                    path.display(),
-                    unknown.join(", ")
-                );
-            }
-            floor.refusals(&path)
+    let observed = read_snapshot(&path);
+    let floor = match observed {
+        Ok((stamp, bytes)) => {
+            floor_stamps()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(storage_root.to_path_buf(), stamp);
+            bytes.map_or(Ok(None), |bytes| parse(&path, &bytes).map(Some))
         }
-        Err(FloorError::NewerSchema { found, .. }) => PersistedStore::ALL
-            .into_iter()
-            .map(|store| UnsupportedPersistedFormat::floor_unreadable(store, &path, found))
-            .collect(),
-        Err(FloorError::Unparseable { detail, .. }) => {
-            crate::slog_warn!("reader floor {} cannot be parsed: {detail}", path.display());
-            PersistedStore::ALL
-                .into_iter()
-                .map(|store| UnsupportedPersistedFormat::floor_unreadable(store, &path, 0))
-                .collect()
-        }
+        Err(error) => Err(FloorError::Io {
+            path: path.clone(),
+            error,
+        }),
+    };
+    let refusals = match floor_refusals(&path, floor) {
+        Ok(refusals) => refusals,
         Err(error) => {
-            // When the floor file cannot be read at all (an I/O error, not a
-            // parse error), every artifact under the root fails on its own
-            // too, so the floor has nothing to add. Forget this root so the
-            // next configure checks it again.
+            // A failed startup read can be retried by the next configure.
             crate::slog_warn!("{error}");
             prepared_roots()
                 .lock()
@@ -388,9 +462,48 @@ fn prepare_uncached(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     refusals
 }
 
+fn floor_refusals(
+    path: &Path,
+    floor: Result<Option<ReaderFloor>, FloorError>,
+) -> Result<Vec<UnsupportedPersistedFormat>, FloorError> {
+    Ok(match floor {
+        Ok(floor) => {
+            let floor = floor.unwrap_or_default();
+            let unknown = floor.unknown_stores();
+            if !unknown.is_empty() {
+                // This build cannot refuse a store it has never heard of, so
+                // it only preserves the entry. scripts/stage-card.sh refuses
+                // to stage a build whose `--formats` lacks a store the floor
+                // names, which keeps such a build from being deployed.
+                crate::slog_warn!(
+                    "reader floor {} names stores this build does not know ({}); preserving them",
+                    path.display(),
+                    unknown.join(", ")
+                );
+            }
+            floor.refusals(path)
+        }
+        Err(FloorError::NewerSchema { found, .. }) => PersistedStore::ALL
+            .into_iter()
+            .map(|store| UnsupportedPersistedFormat::floor_unreadable(store, path, found))
+            .collect(),
+        Err(FloorError::Unparseable { detail, .. }) => {
+            crate::slog_warn!("reader floor {} cannot be parsed: {detail}", path.display());
+            PersistedStore::ALL
+                .into_iter()
+                .map(|store| UnsupportedPersistedFormat::floor_unreadable(store, path, 0))
+                .collect()
+        }
+        Err(error) => return Err(error),
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    thread_local! {
+        pub(super) static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
     #[test]
     fn durability_reader_floor_keeps_two_syncs() {
         let storage = tempfile::tempdir().unwrap();
@@ -572,5 +685,128 @@ pub(crate) mod tests {
         let refusals = prepare_uncached(root.path());
         assert_eq!(refusals.len(), PersistedStore::ALL.len());
         assert_eq!(fs::read(floor_path(root.path())).unwrap(), before);
+    }
+
+    fn prepared_refused_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let mut stores = current_versions();
+        stores.insert(
+            "aft.db".into(),
+            u64::from(PersistedStore::AftDb.supported()) + 1,
+        );
+        write_floor(
+            root.path(),
+            serde_json::json!({"floor_schema": FLOOR_SCHEMA, "stores": stores}),
+        );
+        assert_eq!(prepare(root.path()).len(), 1);
+        root
+    }
+
+    #[test]
+    fn refused_retry_stats_unchanged_floor_without_reparsing() {
+        let root = prepared_refused_root();
+        PARSE_COUNT.with(|count| count.set(0));
+        refresh_refused(root.path()).unwrap();
+        refresh_refused(root.path()).unwrap();
+        assert_eq!(PARSE_COUNT.with(|count| count.get()), 0);
+        assert!(persisted_format::refusal_covering(
+            PersistedStore::AftDb,
+            &root.path().join("aft.db")
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn refused_retry_reparses_on_mtime_change_and_preserves_artifact_refusal() {
+        let root = prepared_refused_root();
+        let path = floor_path(root.path());
+        let before = fs::metadata(&path).unwrap();
+        let mut floor = read(root.path()).unwrap().unwrap();
+        floor.stores.insert(
+            "aft.db".into(),
+            u64::from(PersistedStore::AftDb.supported()),
+        );
+        let artifact = root.path().join("index/k/cache.bin");
+        let artifact_refusal =
+            UnsupportedPersistedFormat::artifact(PersistedStore::SearchIndex, &artifact, 99);
+        persisted_format::record(&artifact_refusal, &artifact);
+        write_floor(root.path(), floor.to_json());
+        assert_eq!(before.len(), fs::metadata(&path).unwrap().len());
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_system_time(
+                before.modified().unwrap() + Duration::from_secs(1),
+            ),
+        )
+        .unwrap();
+        PARSE_COUNT.with(|count| count.set(0));
+        refresh_refused(root.path()).unwrap();
+        assert_eq!(PARSE_COUNT.with(|count| count.get()), 1);
+        assert!(persisted_format::gate(
+            PersistedStore::AftDb,
+            &root.path().join("aft.db"),
+            &root.path().join("aft.db"),
+            None
+        )
+        .is_ok());
+        assert_eq!(
+            persisted_format::refusal_covering(PersistedStore::SearchIndex, &artifact),
+            Some(artifact_refusal)
+        );
+        assert_eq!(
+            read(root.path()).unwrap().unwrap(),
+            floor,
+            "refresh must not write the floor"
+        );
+    }
+
+    #[test]
+    fn refused_retry_reparses_on_size_change_and_caches_newer_schema() {
+        let root = prepared_refused_root();
+        let path = floor_path(root.path());
+        let before = fs::metadata(&path).unwrap();
+        write_floor(
+            root.path(),
+            serde_json::json!({"floor_schema": FLOOR_SCHEMA + 1, "stores": {}}),
+        );
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_system_time(before.modified().unwrap()),
+        )
+        .unwrap();
+        assert_ne!(before.len(), fs::metadata(&path).unwrap().len());
+        let bytes = fs::read(&path).unwrap();
+        PARSE_COUNT.with(|count| count.set(0));
+        refresh_refused(root.path()).unwrap();
+        refresh_refused(root.path()).unwrap();
+        assert_eq!(PARSE_COUNT.with(|count| count.get()), 1);
+        let refusals = persisted_format::refusals_under(root.path());
+        assert_eq!(refusals.len(), PersistedStore::ALL.len());
+        assert!(refusals.iter().all(|refusal| refusal.source
+            == persisted_format::RefusalSource::FloorUnreadable
+            && refusal.found == u64::from(FLOOR_SCHEMA + 1)));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn refused_retry_retains_evidence_when_floor_cannot_be_read_safely() {
+        let root = prepared_refused_root();
+        let path = floor_path(root.path());
+        let before = persisted_format::refusals_under(root.path());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(refresh_refused(root.path()).is_err());
+        assert_eq!(persisted_format::refusals_under(root.path()), before);
+    }
+
+    #[test]
+    fn readable_root_is_not_rechecked_on_retry() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(prepare(root.path()).is_empty());
+        fs::write(floor_path(root.path()), b"unparseable").unwrap();
+        PARSE_COUNT.with(|count| count.set(0));
+        refresh_refused(root.path()).unwrap();
+        assert_eq!(PARSE_COUNT.with(|count| count.get()), 0);
+        assert!(persisted_format::refusals_under(root.path()).is_empty());
     }
 }

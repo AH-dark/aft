@@ -6877,6 +6877,10 @@ impl AppContext {
             return;
         };
         let storage = crate::bash_background::storage_dir(self.config().storage_dir.as_deref());
+        if let Err(error) = crate::reader_floor::refresh_refused(&storage) {
+            self.finish_database_runtime_error(error.to_string(), false);
+            return;
+        }
         crate::commands::configure::configure_database_runtime_with_mode(
             self,
             &root,
@@ -18893,6 +18897,114 @@ mod shared_db_tests {
     fn make_database_retry_due(ctx: &AppContext) {
         ctx.database_runtime_failure.lock().retry_at =
             Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    fn failed_floor_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        std::fs::write(
+            storage.path().join(crate::reader_floor::FLOOR_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "floor_schema": crate::reader_floor::FLOOR_SCHEMA,
+                "stores": { "aft.db": crate::db::CURRENT_SCHEMA_VERSION + 1 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        crate::reader_floor::prepare(storage.path());
+        let ctx = AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.begin_database_runtime(
+            root.path().to_path_buf(),
+            storage.path().to_path_buf(),
+            "floor-recovery".into(),
+        );
+        crate::database_open::run_staged_open(
+            &ctx,
+            crate::database_open::DatabaseOpenRunner::ConfigureTail,
+            true,
+        );
+        let refusal = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert!(refusal["message"]
+            .as_str()
+            .unwrap()
+            .contains("reader floor"));
+        assert!(!storage.path().join("aft.db").exists());
+        (storage, root, ctx)
+    }
+
+    #[test]
+    fn reader_floor_retry_recovers_after_operator_lowers_floor_without_restart() {
+        let (storage, _root, ctx) = failed_floor_context();
+        std::fs::write(
+            storage.path().join(crate::reader_floor::FLOOR_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "floor_schema": crate::reader_floor::FLOOR_SCHEMA,
+                "stores": { "aft.db": crate::db::CURRENT_SCHEMA_VERSION }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(persistence_call(&ctx).is_some(), "backoff must still apply");
+        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(
+            crate::persisted_format::refusal_covering(
+                crate::persisted_format::PersistedStore::AftDb,
+                &storage.path().join("aft.db")
+            )
+            .unwrap()
+            .found,
+            u64::from(crate::db::CURRENT_SCHEMA_VERSION + 1),
+            "the floor must not be refreshed before the retry backoff expires"
+        );
+        make_database_retry_due(&ctx);
+        assert!(
+            persistence_call(&ctx).is_none(),
+            "operator-lowered reader floor remained latched after the retry backoff"
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "floor-recovered", "command": "db_set_host_state",
+            "params": { "key": "floor-recovered", "value": "yes" }
+        }))
+        .unwrap();
+        let response = crate::commands::state::handle_db_set_host_state(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        let db = ctx.db().unwrap();
+        assert_eq!(
+            crate::db::state::get_host_state(&db.lock().unwrap(), "floor-recovered").unwrap(),
+            Some("yes".into())
+        );
+    }
+
+    #[test]
+    fn reader_floor_retry_refuses_unparseable_floor_written_mid_run() {
+        let (storage, _root, ctx) = failed_floor_context();
+        let path = storage.path().join(crate::reader_floor::FLOOR_FILE);
+        std::fs::write(&path, b"not a reader floor").unwrap();
+        for _ in 0..2 {
+            make_database_retry_due(&ctx);
+            let refusal = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+            assert!(
+                refusal["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cannot be parsed"),
+                "{refusal}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"not a reader floor");
+            assert!(!storage.path().join("aft.db").exists());
+            assert_eq!(
+                crate::persisted_format::refusals_under(storage.path()).len(),
+                crate::persisted_format::PersistedStore::ALL.len()
+            );
+        }
     }
 
     fn resident_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
