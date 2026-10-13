@@ -144,13 +144,20 @@ describe("installer regressions", () => {
   }
 
   test("tar size precheck reads sizes rather than numeric filenames", async () => {
-    await cacheFixture(async (root) => {
-      const name = "5000000000-payload";
-      writeFileSync(join(root, name), "four");
-      const archive = join(root, "payload.tar");
-      execFileSync("tar", ["-cf", archive, "-C", root, name]);
-      expect(await precheckArchive(archive, "tar")).toBe(4);
-    });
+    const tarListings = [
+      // macOS bsdtar lists links, owner and group before the entry size.
+      "-rw-r--r--  0 root wheel 4 Jul  3 18:40 5000000000-payload",
+      // GNU tar puts the entry size after the owner/group field.
+      "-rw-r--r-- root/root 4 2026-07-03 18:40 5000000000-payload",
+    ];
+    for (const listing of tarListings) {
+      const runTar = async (_command: string, args: string[]) => {
+        if (args[0] === "-tvf") return listing;
+        if (args[0] === "-tf") return "5000000000-payload\n";
+        throw new Error(`unexpected tar arguments: ${args.join(" ")}`);
+      };
+      expect(await precheckArchive("fixture.tar", "tar", runTar)).toBe(4);
+    }
   });
 
   test("executable upgrade leaves the previous executable inode intact", async () => {

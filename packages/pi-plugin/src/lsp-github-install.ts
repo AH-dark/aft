@@ -905,9 +905,13 @@ async function runTarExtraction(args: string[], timeout: number): Promise<void> 
   }
 }
 
-async function precheckWithTar(archivePath: string, command: string): Promise<number> {
+async function precheckWithTar(
+  archivePath: string,
+  command: string,
+  runner: typeof runArchiveTool = runArchiveTool,
+): Promise<number> {
   let totalBytes = 0;
-  const verbose = await runArchiveTool(command, ["-tvf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
+  const verbose = await runner(command, ["-tvf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
   for (const line of verbose.split("\n")) {
     // Both bsdtar and GNU tar render hardlinks with a leading `h` type marker.
     // Reject them before extraction because the extracted inode cannot reveal
@@ -926,7 +930,7 @@ async function precheckWithTar(archivePath: string, command: string): Promise<nu
     totalBytes += Number(size);
   }
 
-  const names = await runArchiveTool(command, ["-tf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
+  const names = await runner(command, ["-tf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
   for (const entry of names.split("\n")) {
     if (entry.length > 0) assertArchiveEntryPath(entry);
   }

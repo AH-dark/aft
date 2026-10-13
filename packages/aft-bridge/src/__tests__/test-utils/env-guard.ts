@@ -1,3 +1,5 @@
+import { onTestFinished } from "bun:test";
+
 type EnvOverrides = Record<string, string | undefined>;
 type EnvSnapshot = Map<string, string | undefined>;
 
@@ -39,25 +41,35 @@ function applyEnv(values: EnvOverrides | EnvSnapshot): void {
 }
 
 export async function withEnv<T>(overrides: EnvOverrides, fn: () => T | Promise<T>): Promise<T> {
-  const release = await acquireEnvMutex();
-  const snapshot = snapshotEnv(overrides);
-  applyEnv(overrides);
-
+  const release = await acquireEnv(overrides);
   try {
     return await fn();
   } finally {
-    applyEnv(snapshot);
     release();
   }
 }
 
 export async function acquireEnv(overrides: EnvOverrides): Promise<() => void> {
-  const release = await acquireEnvMutex();
-  const snapshot = snapshotEnv(overrides);
-  applyEnv(overrides);
-
-  return () => {
-    applyEnv(snapshot);
-    release();
+  let releaseMutex: (() => void) | undefined;
+  let snapshot: EnvSnapshot | undefined;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    if (snapshot) applyEnv(snapshot);
+    releaseMutex?.();
   };
+
+  // A test may time out while its async fixture is still pending. Bun still
+  // runs this finish hook, so the next fixture can safely acquire the env lock.
+  onTestFinished(release);
+  releaseMutex = await acquireEnvMutex();
+  if (released) {
+    releaseMutex();
+    return release;
+  }
+
+  snapshot = snapshotEnv(overrides);
+  applyEnv(overrides);
+  return release;
 }
