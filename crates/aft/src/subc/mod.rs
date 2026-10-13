@@ -8662,21 +8662,38 @@ async fn handle_tool_call(
 
     // Restore launch capabilities before any shell, deferred or plain call can
     // perform its permission preflight. The catalog is not refetched on revival.
-    if worker_preset && access_grants::launch_key(&identity, "worker").is_some() {
+    if let Some(key) = worker_preset
+        .then(|| access_grants::launch_key(&identity, "worker"))
+        .flatten()
+    {
         if let Some(ctx) = executor.actor_context(&identity.root) {
-            let identity_for_restore = identity.clone();
-            let restored = tokio::task::spawn_blocking(move || {
-                access_grants::restore_launch(&identity_for_restore, &ctx, "worker")
-            })
-            .await
-            .unwrap_or_else(|error| {
-                Err(subc_protocol::ErrorBody::new(
-                    "grants_unavailable",
-                    format!("launch grant restoration failed: {error}"),
-                ))
-            });
-            if let Err(error) = restored {
-                return send_provider_error(tx, metrics, frame, error).await;
+            let scope = crate::db::access_grants::ScopeKey::from_policy(&key);
+            if !ctx.launch_grants_materialized(&scope) {
+                let identity_for_restore = identity.clone();
+                let ctx_for_restore = Arc::clone(&ctx);
+                let restored = tokio::task::spawn_blocking(move || {
+                    access_grants::restore_launch(&identity_for_restore, &ctx_for_restore, "worker")
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    Err(subc_protocol::ErrorBody::new(
+                        "grants_unavailable",
+                        format!("launch grant restoration failed: {error}"),
+                    ))
+                });
+                match restored {
+                    Ok(
+                        crate::db::access_grants::LaunchRestore::Materialized
+                        | crate::db::access_grants::LaunchRestore::AlreadyMaterialized,
+                    ) => ctx.memoize_launch_grants(scope),
+                    Ok(crate::db::access_grants::LaunchRestore::NoParams) => {}
+                    Err(error) => {
+                        // Missing extra grants do not remove authority over the
+                        // worktree; ordinary access checks still guard outside paths.
+                        crate::slog_warn!("launch_grant_restore_failed: owner={} scope_ref={} epoch={} code={} error={}",
+                        scope.owner, scope.scope_ref, scope.epoch, error.code, error.message);
+                    }
+                }
             }
         }
     }

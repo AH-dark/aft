@@ -173,6 +173,130 @@ async fn grants_revived_launch_first_call_restores_without_catalog() {
     assert_eq!(markers, 2, "old-epoch history must remain intact");
 }
 
+#[test]
+fn grants_revived_launch_failed_restore_continues_and_retries() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let target = head.project_root.join("shared");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"write"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    let db = ctx.db().unwrap();
+    db.lock().unwrap().execute_batch("CREATE TRIGGER fail_restore BEFORE INSERT ON access_grants WHEN NEW.epoch='2' BEGIN SELECT RAISE(ABORT,'injected restore failure'); END;").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (_, lines) = crate::logging::capture_log_lines(|| {
+        runtime.block_on(first_read(ctx.clone(), revived.clone(), "worker"))
+    });
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("launch_grant_restore_failed:")
+                && line.contains(&format!("owner={}", scope_key(&revived).owner))
+                && line.contains("scope_ref=worker epoch=2 code=grants_unavailable")
+                && line.contains("injected restore failure")),
+        "{lines:?}"
+    );
+    assert_eq!(ctx.launch_restore_attempts(), 1);
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
+        .unwrap()
+        .is_empty());
+    crate::access_policy::with_scope(Some(scope_key(&revived)), || {
+        assert_ne!(
+            ctx.access_policy("read")
+                .unwrap()
+                .decide(AccessOperation::Read, &target, false),
+            AccessDecision::Allow
+        );
+    });
+    db.lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_restore;")
+        .unwrap();
+    runtime.block_on(first_read(ctx.clone(), revived.clone(), "worker"));
+    assert_eq!(
+        ctx.launch_restore_attempts(),
+        2,
+        "failed restores must retry"
+    );
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn grants_revived_launch_memo_skips_restore_database_on_second_call() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    remote_policy::catalog(
+        catalog_request(json!([{"path":head.project_root.join("shared"),"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let ctx = Arc::new(ctx);
+    for epoch in [1, 2] {
+        let identity = at_epoch(&worker, epoch);
+        first_read(ctx.clone(), identity.clone(), "worker").await;
+        assert_eq!(ctx.launch_restore_attempts(), epoch as usize);
+        // Separately constructed routes for the same scope reuse the cached
+        // launch result instead of repeating its database check.
+        first_read(ctx.clone(), at_epoch(&worker, epoch), "worker").await;
+        assert_eq!(
+            ctx.launch_restore_attempts(),
+            epoch as usize,
+            "second call must not enter the restore database path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grants_revived_launch_no_params_is_not_memoized() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = at_epoch(&worker, 1);
+    let revived = at_epoch(&worker, 2);
+    let ctx = Arc::new(ctx);
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    assert_eq!(
+        ctx.launch_restore_attempts(),
+        2,
+        "no params is not a definite materialization"
+    );
+    let target = head.project_root.join("late-launch");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    first_read(ctx.clone(), revived.clone(), "worker").await;
+    assert_eq!(ctx.launch_restore_attempts(), 3);
+    let db = ctx.db().unwrap();
+    assert_eq!(
+        store::list(&db.lock().unwrap(), &scope_key(&revived)).unwrap(),
+        vec![AccessGrant {
+            path: policy_path(&target),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+    first_read(ctx.clone(), revived, "worker").await;
+    assert_eq!(ctx.launch_restore_attempts(), 3);
+}
+
 #[tokio::test]
 async fn grants_revived_launch_does_not_copy_ask_earned_grants() {
     let (_dir, ctx, head, worker) = fixture();

@@ -400,10 +400,12 @@ pub(super) fn restore_launch(
     identity: &RouteIdentity,
     ctx: &AppContext,
     preset: &str,
-) -> Result<(), subc_protocol::ErrorBody> {
+) -> Result<store::LaunchRestore, subc_protocol::ErrorBody> {
     let Some(key) = launch_key(identity, preset) else {
-        return Ok(());
+        return Ok(store::LaunchRestore::NoParams);
     };
+    #[cfg(test)]
+    ctx.note_launch_restore_attempt();
     let db = ctx
         .db()
         .ok_or_else(|| refusal("grants_unavailable", "scope persistence unavailable"))?;
@@ -412,7 +414,7 @@ pub(super) fn restore_launch(
         .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))?;
     register_on(&conn, identity, ctx)?;
     let mut dropped = Vec::new();
-    store::restore_launch(&conn, &key, |conn, raw| {
+    let restored = store::restore_launch(&conn, &key, |conn, raw| {
         let head = head_scope(identity)
             .map(|scope| policy_for_scope(conn, &scope, ctx))
             .transpose()?
@@ -445,7 +447,7 @@ pub(super) fn restore_launch(
     for message in dropped {
         crate::slog_warn!("{message}");
     }
-    Ok(())
+    Ok(restored)
 }
 
 pub(super) fn catalog(

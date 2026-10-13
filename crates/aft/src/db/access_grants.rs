@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS access_materialized (
 );
 "#;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeKey {
     pub owner: String,
     pub scope_ref: String,
@@ -269,6 +269,13 @@ fn materialize_on(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchRestore {
+    Materialized,
+    AlreadyMaterialized,
+    NoParams,
+}
+
 /// A call can restore only persisted launch inputs, never standing consent grants.
 /// The immediate transaction serializes the marker check, params carry-forward,
 /// current-head validation and grant installation, even across database handles.
@@ -276,7 +283,7 @@ pub fn restore_launch(
     conn: &Connection,
     key: &PolicyKey,
     validate: impl FnOnce(&Connection, &serde_json::Value) -> rusqlite::Result<Vec<AccessGrant>>,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<LaunchRestore> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let scope = ScopeKey::from_policy(key);
     let materialized: bool = tx.query_row(
@@ -285,7 +292,7 @@ pub fn restore_launch(
         |r| r.get(0),
     )?;
     if materialized {
-        return Ok(false);
+        return Ok(LaunchRestore::AlreadyMaterialized);
     }
     let Some((_, json)) = super::remote_exec::catalog_params(
         &tx,
@@ -294,7 +301,7 @@ pub fn restore_launch(
     )?
     else {
         // A call before the initial catalog must not freeze an empty launch.
-        return Ok(false);
+        return Ok(LaunchRestore::NoParams);
     };
     if scope_config(&tx, &scope)?.is_none() {
         return Err(rusqlite::Error::InvalidQuery);
@@ -302,7 +309,7 @@ pub fn restore_launch(
     let grants = validate(&tx, &decode(&json)?)?;
     materialize_on(&tx, &scope, &grants)?;
     tx.commit()?;
-    Ok(true)
+    Ok(LaunchRestore::Materialized)
 }
 
 #[cfg(test)]
@@ -429,7 +436,7 @@ mod tests {
         ];
         let barrier = Arc::new(Barrier::new(2));
         let validations = Arc::new(AtomicUsize::new(0));
-        let installed: Vec<bool> = std::thread::scope(|threads| {
+        let installed: Vec<LaunchRestore> = std::thread::scope(|threads| {
             let jobs: Vec<_> = handles
                 .into_iter()
                 .map(|conn| {
@@ -451,7 +458,20 @@ mod tests {
                 .collect();
             jobs.into_iter().map(|job| job.join().unwrap()).collect()
         });
-        assert_eq!(installed.iter().filter(|first| **first).count(), 1);
+        assert_eq!(
+            installed
+                .iter()
+                .filter(|result| **result == LaunchRestore::Materialized)
+                .count(),
+            1
+        );
+        assert_eq!(
+            installed
+                .iter()
+                .filter(|result| **result == LaunchRestore::AlreadyMaterialized)
+                .count(),
+            1
+        );
         assert_eq!(validations.load(Ordering::SeqCst), 1);
         let installs: i64 = conn
             .query_row("SELECT n FROM installs", [], |r| r.get(0))
@@ -502,7 +522,10 @@ mod tests {
             assert_eq!(count, 0, "failed restore must roll back {table}");
         }
         conn.execute_batch("DROP TRIGGER fail_install;").unwrap();
-        assert!(restore_launch(&conn, &revived, |_, _| Ok(vec![grant.clone()])).unwrap());
+        assert_eq!(
+            restore_launch(&conn, &revived, |_, _| Ok(vec![grant.clone()])).unwrap(),
+            LaunchRestore::Materialized
+        );
         assert_eq!(list(&conn, &second).unwrap(), vec![grant]);
     }
 
@@ -545,10 +568,13 @@ mod tests {
                 &Config::default(),
             )
             .unwrap();
-            assert!(!restore_launch(&conn, &key, |_, _| panic!(
-                "crossed {dimension} identity boundary"
-            ))
-            .unwrap());
+            assert_eq!(
+                restore_launch(&conn, &key, |_, _| panic!(
+                    "crossed {dimension} identity boundary"
+                ))
+                .unwrap(),
+                LaunchRestore::NoParams
+            );
         }
     }
 
