@@ -220,6 +220,15 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             "sandbox host escalation is unavailable to untrusted principals",
         );
     }
+    // A jailed worker has no host prompt to approve an escalation with, and its
+    // shells never leave the sandbox, so refuse before minting a grant.
+    if host_requested && crate::sandbox_spawn::worker_jail_active() {
+        return Response::error(
+            &req.id,
+            "sandbox_escalation_denied",
+            "sandbox host escalation is unavailable to worker shells, which always run in the native sandbox",
+        );
+    }
     if host_requested && crate::bash_background::worker_preset_active() {
         let bound_root = ctx
             .config()

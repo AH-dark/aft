@@ -42,6 +42,61 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
 }
 
+/// Who answers an `ask` decision for the call running on this thread.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AskRoute {
+    /// `ask` is lowered to allow, the behaviour before consent existed.
+    /// Standalone calls and stamped Alfonso heads use it until approval modes
+    /// arrive; restricted configurations already turn outside paths into deny.
+    #[default]
+    Lowered,
+    /// A stamped Alfonso worker: an `ask` refuses with `access_ask_required`
+    /// so the subc layer can put the question to Cingulate. `once` holds the
+    /// capabilities an `allow_once` answer approved for this one dispatch.
+    Consent { once: Vec<AccessGrant> },
+}
+
+/// Internal refusal code for an `ask` that must go to Cingulate. The subc
+/// layer turns it into a held call; it never reaches the agent as-is.
+pub(crate) const ACCESS_ASK_REQUIRED: &str = "access_ask_required";
+
+thread_local! {
+    static ASK_ROUTE: std::cell::RefCell<Option<AskRoute>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct AskRouteGuard(Option<AskRoute>, std::marker::PhantomData<*const ()>);
+
+impl Drop for AskRouteGuard {
+    fn drop(&mut self) {
+        ASK_ROUTE.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+pub(crate) fn ask_route_guard(route: Option<AskRoute>) -> AskRouteGuard {
+    AskRouteGuard(
+        ASK_ROUTE.with(|slot| slot.replace(route)),
+        std::marker::PhantomData,
+    )
+}
+
+pub(crate) fn current_ask_route() -> AskRoute {
+    ASK_ROUTE.with(|slot| slot.borrow().clone()).unwrap_or_default()
+}
+
+impl AccessGrant {
+    /// Whether this capability lets `operation` touch `path`. Write implies
+    /// read, and a subtree matches by whole path component.
+    pub fn covers(&self, operation: AccessOperation, path: &Path) -> bool {
+        (self.operation == AccessOperation::Write || operation == AccessOperation::Read)
+            && match self.kind {
+                GrantKind::File => path == self.path,
+                GrantKind::Subtree => path.starts_with(&self.path),
+            }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessOperation {
@@ -266,13 +321,7 @@ impl AccessPolicy {
         if self.roots.iter().any(|root| path.starts_with(root))
             || exceptions.iter().any(|root| path.starts_with(root))
             || (operation == AccessOperation::Read && owned_artifact)
-            || self.grants.iter().any(|grant| {
-                (grant.operation == AccessOperation::Write || operation == AccessOperation::Read)
-                    && match grant.kind {
-                        GrantKind::File => path == grant.path,
-                        GrantKind::Subtree => path.starts_with(&grant.path),
-                    }
-            })
+            || self.grants.iter().any(|grant| grant.covers(operation, path))
         {
             AccessDecision::Allow
         } else {

@@ -105,6 +105,25 @@ pub fn resolve_scope(
         .transpose()
 }
 
+/// The registered parent of a live scope, if it has one.
+pub fn parent(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<ScopeKey>> {
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT parent_owner,parent,parent_epoch FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0",
+            params![key.owner, key.scope_ref, key.epoch.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((Some(owner), Some(scope_ref), Some(epoch))) => epoch.parse().ok().map(|epoch| ScopeKey {
+            owner,
+            scope_ref,
+            epoch,
+        }),
+        _ => None,
+    })
+}
+
 pub fn authorized(
     conn: &Connection,
     caller: &ScopeKey,

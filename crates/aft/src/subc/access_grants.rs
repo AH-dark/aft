@@ -222,6 +222,59 @@ pub(super) fn head_scope(identity: &RouteIdentity) -> Option<ScopeKey> {
     }
 }
 
+/// Whether this route's calls are a stamped Alfonso worker's: a `worker`
+/// scope, or a codemode run whose scope names a parent. Only heads start runs
+/// today and their runs carry no parent, so a parented run is a worker's run,
+/// judged as that worker.
+pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
+    identity.scope.as_ref().is_some_and(|stamp| {
+        alfonso(stamp)
+            && match stamp.kind {
+                subc_protocol::scope::ScopeKind::Worker => true,
+                subc_protocol::scope::ScopeKind::Ephemeral => stamp.parent.is_some(),
+                _ => false,
+            }
+    })
+}
+
+/// How an `ask` is answered on this route. Stamped Alfonso workers ask
+/// Cingulate. Stamped Alfonso heads keep today's lowering to allow until the
+/// approval modes (full-access, ask, read-only) exist; without them a head
+/// would block on every outside path with no way to opt out. Standalone
+/// routes keep today's behaviour as well.
+pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
+    if alfonso_worker(identity) {
+        crate::access_policy::AskRoute::Consent { once: Vec::new() }
+    } else {
+        crate::access_policy::AskRoute::Lowered
+    }
+}
+
+/// The head whose authority a worker's ask is judged against. A worker's
+/// stamp names its head as `parent`. A worker's run names the worker, whose
+/// registered parent is the head.
+pub(super) fn consent_head(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+) -> rusqlite::Result<Option<ScopeKey>> {
+    let Some(stamp) = identity.scope.as_ref().filter(|s| alfonso(s)) else {
+        return Ok(None);
+    };
+    let Some(parent) = stamp.parent.as_ref() else {
+        return Ok(None);
+    };
+    let parent = ScopeKey {
+        owner: serde_json::to_string(&parent.owner).expect("scope owner serializes"),
+        scope_ref: parent.scope_ref.clone(),
+        epoch: parent.scope_epoch,
+    };
+    match stamp.kind {
+        subc_protocol::scope::ScopeKind::Worker => Ok(Some(parent)),
+        subc_protocol::scope::ScopeKind::Ephemeral => store::parent(conn, &parent),
+        _ => Ok(None),
+    }
+}
+
 pub(super) fn launch_key(
     identity: &RouteIdentity,
     preset: &str,

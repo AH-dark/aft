@@ -12150,6 +12150,55 @@ impl AppContext {
         }
     }
 
+    /// Resolve an `ask` decision for the call on this thread. A lowered route
+    /// allows, as before consent existed. A consent route allows only what an
+    /// `allow_once` answer approved for this dispatch; anything else refuses
+    /// with the internal ask code, carrying the capability to request.
+    fn answer_ask(
+        &self,
+        req_id: &str,
+        original: &Path,
+        identity: &Path,
+        operation: crate::access_policy::AccessOperation,
+    ) -> Result<(), crate::protocol::Response> {
+        use crate::access_policy::{AskRoute, GrantKind};
+        let AskRoute::Consent { once } = crate::access_policy::current_ask_route() else {
+            return Ok(());
+        };
+        if once.iter().any(|grant| grant.covers(operation, identity)) {
+            return Ok(());
+        }
+        // A directory is asked for as a subtree so one answer covers what the
+        // tool reads beneath it. The probe stays on the bounded helper when
+        // one is active, like every other path probe on the request path.
+        let probe = identity.to_path_buf();
+        let is_dir = if crate::bounded_io::current().is_some() {
+            crate::bounded_io::run(&probe, None, |path| Ok(path.is_dir())).unwrap_or(false)
+        } else {
+            probe.is_dir()
+        };
+        let kind = if is_dir {
+            GrantKind::Subtree
+        } else {
+            GrantKind::File
+        };
+        Err(crate::protocol::Response::error_with_data(
+            req_id,
+            crate::access_policy::ACCESS_ASK_REQUIRED,
+            format!(
+                "path '{}' is outside this worker's worktree and needs permission",
+                original.display()
+            ),
+            serde_json::json!({
+                "ask": crate::access_policy::AccessGrant {
+                    path: identity.to_path_buf(),
+                    kind,
+                    operation,
+                },
+            }),
+        ))
+    }
+
     fn check_path_access(
         &self,
         req_id: &str,
@@ -12212,9 +12261,19 @@ impl AppContext {
         }
         match decision {
             // For compatibility, treat Ask as Allow for configurations that do not
-            // restrict access to project roots. Restricted configurations produce
-            // Deny outside roots; protected paths are denied in every configuration.
-            AccessDecision::Allow | AccessDecision::Ask => Ok(()),
+            // restrict access to project roots, except on stamped Alfonso worker
+            // calls, which put the question to Cingulate. Restricted
+            // configurations produce Deny outside roots; protected paths are
+            // denied in every configuration.
+            AccessDecision::Allow => Ok(()),
+            AccessDecision::Ask => {
+                let operation = if preserve_final {
+                    AccessOperation::Write
+                } else {
+                    operation
+                };
+                self.answer_ask(req_id, original, &identity, operation)
+            }
             AccessDecision::Deny(AccessDenial::Floor) => Err(crate::protocol::Response::error(
                 req_id,
                 "denied_floor",

@@ -794,7 +794,7 @@ pub(crate) fn spawn(
     let principal = current_authenticated_principal();
     let requested_tier = if host_escalation.is_some() {
         RequestedSandboxTier::Host
-    } else if ctx.config().sandbox.enabled {
+    } else if crate::sandbox_spawn::sandbox_required(ctx) {
         RequestedSandboxTier::Native
     } else {
         RequestedSandboxTier::Disabled

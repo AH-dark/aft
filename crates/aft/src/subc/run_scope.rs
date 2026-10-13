@@ -188,9 +188,44 @@ pub(super) struct RunScope {
     close_requested: AtomicBool,
     hold_logged: AtomicBool,
     close_runtime: OnceLock<tokio::runtime::Handle>,
+    /// Permission asks this run's calls left open with `access_pending`.
+    /// They are withdrawn once the run's scope is confirmed ended.
+    parked_asks: StdMutex<Vec<super::consent::ParkedAsk>>,
 }
 
 impl RunScope {
+    /// Whether scope.describe confirmed that the run's scope ended.
+    pub(super) fn revoked(&self) -> bool {
+        self.revoked.load(Ordering::Acquire)
+    }
+
+    /// Keep an ask the run left open so the run's end withdraws it. An ask
+    /// parked after the end was confirmed is withdrawn at once.
+    pub(super) fn park_ask(self: &Arc<Self>, ask: super::consent::ParkedAsk) {
+        self.parked_asks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ask);
+        if self.revoked() {
+            self.withdraw_parked_asks();
+        }
+    }
+
+    fn withdraw_parked_asks(&self) {
+        let parked = std::mem::take(
+            &mut *self
+                .parked_asks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if parked.is_empty() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(super::consent::withdraw_parked(parked));
+        }
+    }
+
     pub(super) fn cached_budget(&self) -> Result<RunBudget, ErrorBody> {
         if self.revoked.load(Ordering::Acquire) {
             return Err(ErrorBody::new(
@@ -295,6 +330,7 @@ impl RunScope {
                 let hold_reason = match reply {
                     Ok(reply) if scope.ended(&reply) => {
                         scope.revoked.store(true, Ordering::Release);
+                        scope.withdraw_parked_asks();
                         let scope_for_kill = Arc::clone(&scope);
                         let _ = tokio::task::spawn_blocking(move || {
                             let tasks = scope_for_kill
@@ -463,6 +499,7 @@ impl RunScopes {
                             close_requested: AtomicBool::new(false),
                             hold_logged: AtomicBool::new(false),
                             close_runtime: OnceLock::new(),
+                            parked_asks: StdMutex::new(Vec::new()),
                         })
                     }),
             )
@@ -643,6 +680,7 @@ impl RunScope {
             close_requested: AtomicBool::new(false),
             hold_logged: AtomicBool::new(false),
             close_runtime: OnceLock::new(),
+            parked_asks: StdMutex::new(Vec::new()),
         })
     }
 }

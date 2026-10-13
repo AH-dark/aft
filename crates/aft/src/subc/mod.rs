@@ -199,6 +199,7 @@ type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod access_grants;
 mod bash;
+mod consent;
 #[cfg(test)]
 mod bash_selector_tests;
 mod drain;
@@ -3155,6 +3156,9 @@ async fn handle_bash_elicitation_reply(
             let _grant_scope = crate::access_policy::scope_guard(
                 routes.get(&key.route).map(access_grants::policy_scope_key),
             );
+            let _ask_route = crate::access_policy::ask_route_guard(
+                routes.get(&key.route).map(access_grants::ask_route),
+            );
             bash::submit_deferred_bash(
                 executor,
                 bash_deferred_tx,
@@ -3535,6 +3539,12 @@ async fn teardown_installed_route(
         .and_then(|identity| identity.run_scope.get())
     {
         scope.route_closed();
+    }
+    // Only the consumer's own close withdraws held permission asks. A
+    // higher-epoch rebind keeps the logical route, and a transport drop never
+    // reaches here, so their asks stay open for the retried call.
+    if cancellation_reason == "Goodbye" {
+        consent::note_route_closed(channel);
     }
     remove_installed_route(installed_route_epochs, channel);
     management_routes.remove(&channel);
@@ -4715,6 +4725,8 @@ where
     // Serves the gh shim's bot-write relay on management routes; it dials
     // prefrontal and plexus over its own connection, off the frame loop.
     let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
+    // Stamped workers' permission asks go to Cingulate over this daemon.
+    consent::install_subc_transport(connection_file_path);
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
@@ -6559,6 +6571,7 @@ async fn handle_route_bind_completion(
         .filter(|identity| identity.scope.is_some())
         .cloned()
     {
+        let runtime = tokio::runtime::Handle::current();
         let _ = executor.submit_async(
             identity.root.clone(),
             Lane::Mutating,
@@ -6570,7 +6583,12 @@ async fn handle_route_bind_completion(
                     true,
                 );
                 match access_grants::register(&identity, ctx) {
-                    Ok(()) => Response::success("scope-bind", json!({})),
+                    Ok(()) => {
+                        // After a restart, asks this worker left open are sent
+                        // again under their original call keys, never withdrawn.
+                        consent::reattach(ctx, &identity, &runtime);
+                        Response::success("scope-bind", json!({}))
+                    }
                     Err(error) => {
                         Response::error("scope-bind", "grants_unavailable", error.message)
                     }
@@ -7934,6 +7952,175 @@ async fn submit_provider_read(
 /// the sync command core → wrap the structured Response in a CallToolResult
 /// `{content, isError}`. Tool-result mapping: the whole `{success, ...}` Response
 /// serialized into ONE text block; `isError` carries `success == false`.
+/// Everything one plain (non-deferred) tool-call run needs, kept so a call
+/// held for a consent answer can run again with the approved capabilities.
+#[derive(Clone)]
+struct PlainToolRun {
+    bare_name: String,
+    arguments: Value,
+    format_context: crate::subc_format::FormatContext,
+    tool_call_context: ToolCallContext,
+    dispatch: DispatchFn,
+    identity: RouteIdentity,
+    bind_trust: BindTrust,
+    request_id: String,
+    ledger_key: Option<crate::db::call_ledger::Key>,
+}
+
+impl PlainToolRun {
+    /// The executor job for one run under `ask_route`. The formatted text and
+    /// phase trace go to `done`; the job returns the native response.
+    fn job(
+        &self,
+        ask_route: crate::access_policy::AskRoute,
+        mut phase_trace: PhaseTrace,
+        done: oneshot::Sender<ToolCallCompletion>,
+    ) -> crate::executor::ExecutorJob {
+        let run_spec = self.clone();
+        Box::new(move |ctx| {
+            let PlainToolRun {
+                bare_name,
+                arguments,
+                format_context,
+                tool_call_context,
+                dispatch,
+                identity: identity_for_run,
+                bind_trust,
+                request_id: request_id_for_force,
+                ledger_key,
+            } = run_spec;
+            phase_trace.mark_job_admitted();
+            log_ctx::with_session(Some(identity_for_run.session.clone()), || {
+                let run = || {
+                    let finalizer = |response: &mut Response, text: &mut String| {
+                        crate::response_finalize::finalize_tool_response(
+                            response,
+                            text,
+                            ctx,
+                            &identity_for_run.session,
+                            &bare_name,
+                            bind_trust.allows_bash_observation(),
+                        );
+                    };
+                    match run_tool_call(
+                        &bare_name,
+                        arguments,
+                        &format_context,
+                        &tool_call_context,
+                        ctx,
+                        &dispatch,
+                        Some(&finalizer),
+                        Some(&mut phase_trace),
+                    ) {
+                        ToolCallOutcome::Unary(result) => {
+                            tool_provider::note_native_outcome(
+                                ctx,
+                                ledger_key.as_ref(),
+                                &result.response,
+                            );
+                            let response = result.response;
+                            let _ = done.send(ToolCallCompletion {
+                                text: result.text,
+                                phase_trace,
+                            });
+                            response
+                        }
+                    }
+                };
+                // Undo history and named checkpoints belong to the issuing route,
+                // not to whichever harness configured this shared root last.
+                let harness = identity_for_run.harness.clone();
+                let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
+                crate::access_policy::with_scope(
+                    Some(access_grants::policy_scope_key(&identity_for_run)),
+                    || {
+                        crate::backup::with_request_harness(&harness, || {
+                            if matches!(bind_trust, BindTrust::Untrusted) {
+                                ctx.with_force_restrict(&request_id_for_force, run)
+                            } else {
+                                run()
+                            }
+                        })
+                    },
+                )
+            })
+        })
+    }
+}
+
+/// Hold a stamped worker's call whose access check asked for permission: the
+/// question goes to Cingulate, and the call runs again with what was approved
+/// or ends with a named refusal. Returns `None` when nobody waits for the call
+/// any more (its ask was withdrawn, or kept for the retry after a transport
+/// drop); the call is then no longer tracked.
+#[allow(clippy::too_many_arguments)]
+async fn hold_for_consent(
+    plain_run: &PlainToolRun,
+    response: Response,
+    text: String,
+    executor: &Arc<Executor>,
+    lane: Lane,
+    route: RouteChannel,
+    corr: u64,
+    active_tool_calls: &ActiveToolCalls,
+    connection_cancel: &PersistentCancelSignal,
+    module_drain: &drain::ModuleDrainWindow,
+) -> Option<(Response, String)> {
+    let held = consent::HeldCall {
+        identity: plain_run.identity.clone(),
+        tool: plain_run.bare_name.clone(),
+        arguments: plain_run.arguments.clone(),
+        request_id: plain_run.request_id.clone(),
+        executor: Arc::clone(executor),
+        route,
+        corr,
+        active: Arc::clone(active_tool_calls),
+        connection_cancel: connection_cancel.clone(),
+        drain: module_drain.clone(),
+    };
+    let rerun = |ask_route| {
+        let (done_tx, done_rx) = oneshot::channel::<ToolCallCompletion>();
+        let job = plain_run.job(ask_route, PhaseTrace::new(Instant::now()), done_tx);
+        let rx = executor.submit_async(
+            plain_run.identity.root.clone(),
+            lane,
+            plain_run.request_id.clone(),
+            job,
+        );
+        let request_id = plain_run.request_id.clone();
+        let bare_name = plain_run.bare_name.clone();
+        let format_context = plain_run.format_context.clone();
+        async move {
+            let response = await_executor_response(rx, request_id).await;
+            let text = match done_rx.await {
+                Ok(completion) => completion.text,
+                Err(_) => crate::subc_format::format_response_with_context(
+                    &bare_name,
+                    &response,
+                    &format_context,
+                ),
+            };
+            (response, text)
+        }
+    };
+    match consent::run_with_consent(held, (response, text), rerun).await {
+        Some((response, text)) => {
+            let text = text.unwrap_or_else(|| {
+                crate::subc_format::format_response_with_context(
+                    &plain_run.bare_name,
+                    &response,
+                    &plain_run.format_context,
+                )
+            });
+            Some((response, text))
+        }
+        None => {
+            finish_active_tool_call(active_tool_calls, route, corr);
+            None
+        }
+    }
+}
+
 async fn handle_tool_call(
     tx: &WriterSender,
     frame: &Frame,
@@ -8579,6 +8766,8 @@ async fn handle_tool_call(
 
         let _grant_scope =
             crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(&identity)));
+        let _ask_route =
+            crate::access_policy::ask_route_guard(Some(access_grants::ask_route(&identity)));
         bash::submit_deferred_bash(
             executor,
             bash_deferred_tx,
@@ -8658,6 +8847,19 @@ async fn handle_tool_call(
         let format_context_for_run = format_context.clone();
         let bare_name_for_run = bare_name.clone();
         let ledger_key_for_setup = ledger_key.clone();
+        // A stamped worker's call that asks during setup is held for consent
+        // and, once approved, runs again on the plain tool-call path.
+        let consent_run = access_grants::alfonso_worker(&identity).then(|| PlainToolRun {
+            bare_name: bare_name.clone(),
+            arguments: arguments.clone(),
+            format_context: format_context.clone(),
+            tool_call_context: tool_call_context.clone(),
+            dispatch,
+            identity: identity.clone(),
+            bind_trust,
+            request_id: request_id.clone(),
+            ledger_key: ledger_key.clone(),
+        });
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
         let completion_wake = deferred_response_tx.wake.clone();
         phase_trace.mark_executor_submitted();
@@ -8665,6 +8867,9 @@ async fn handle_tool_call(
             let _deferred_wake_scope = completion_wake.install();
             let _grant_scope = crate::access_policy::scope_guard(Some(
                 access_grants::policy_scope_key(&identity_for_run),
+            ));
+            let _ask_route = crate::access_policy::ask_route_guard(Some(
+                access_grants::ask_route(&identity_for_run),
             ));
             phase_trace.mark_job_admitted();
             // Admission for this deferred tool call: pin the config so the
@@ -8818,6 +9023,9 @@ async fn handle_tool_call(
         let ver = frame.header.ver;
         let root = identity.root.clone();
         let session_id = identity.session.clone();
+        let consent_executor = Arc::clone(executor);
+        let consent_connection_cancel = connection_cancel.clone();
+        let consent_drain = module_drain.clone();
         tokio::spawn(async move {
             let _response_task = ResponseTaskGuard::new(&completion_metrics);
             let _deferred_setup = deferred_setup_guard;
@@ -8852,6 +9060,29 @@ async fn handle_tool_call(
                     }
                 }
                 Ok(DeferredSetupOutcome::Immediate { text, phase_trace }) => {
+                    let (response, text, phase_trace) = match consent_run
+                        .as_ref()
+                        .filter(|_| consent::requested_ask(&response).is_some())
+                    {
+                        Some(plain_run) => match hold_for_consent(
+                            plain_run,
+                            response,
+                            text,
+                            &consent_executor,
+                            lane,
+                            route,
+                            corr,
+                            &active_tool_calls,
+                            &consent_connection_cancel,
+                            &consent_drain,
+                        )
+                        .await
+                        {
+                            Some((response, text)) => (response, text, phase_trace),
+                            None => return,
+                        },
+                        None => (response, text, phase_trace),
+                    };
                     if !claim_active_tool_call(&active_tool_calls, route, corr) {
                         return;
                     }
@@ -8943,69 +9174,27 @@ async fn handle_tool_call(
     }
 
     let bare_name_for_frame = bare_name.clone();
-    let identity_for_run = identity.clone();
     let completion_session = identity.session.clone();
     let completion_root = identity.project_root.clone();
-    let request_id_for_force = request_id.clone();
     let format_context_for_frame = format_context.clone();
     let (tool_call_tx, tool_call_rx) = oneshot::channel::<ToolCallCompletion>();
     phase_trace.mark_executor_submitted();
-    let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
-        phase_trace.mark_job_admitted();
-        log_ctx::with_session(Some(identity_for_run.session.clone()), || {
-            let run = || {
-                let finalizer = |response: &mut Response, text: &mut String| {
-                    crate::response_finalize::finalize_tool_response(
-                        response,
-                        text,
-                        ctx,
-                        &identity_for_run.session,
-                        &bare_name,
-                        bind_trust.allows_bash_observation(),
-                    );
-                };
-                match run_tool_call(
-                    &bare_name,
-                    arguments,
-                    &format_context,
-                    &tool_call_context,
-                    ctx,
-                    &dispatch,
-                    Some(&finalizer),
-                    Some(&mut phase_trace),
-                ) {
-                    ToolCallOutcome::Unary(result) => {
-                        tool_provider::note_native_outcome(
-                            ctx,
-                            ledger_key.as_ref(),
-                            &result.response,
-                        );
-                        let response = result.response;
-                        let _ = tool_call_tx.send(ToolCallCompletion {
-                            text: result.text,
-                            phase_trace,
-                        });
-                        response
-                    }
-                }
-            };
-            // Undo history and named checkpoints belong to the issuing route,
-            // not to whichever harness configured this shared root last.
-            let harness = identity_for_run.harness.clone();
-            crate::access_policy::with_scope(
-                Some(access_grants::policy_scope_key(&identity_for_run)),
-                || {
-                    crate::backup::with_request_harness(&harness, || {
-                        if matches!(bind_trust, BindTrust::Untrusted) {
-                            ctx.with_force_restrict(&request_id_for_force, run)
-                        } else {
-                            run()
-                        }
-                    })
-                },
-            )
-        })
-    });
+    let plain_run = PlainToolRun {
+        bare_name,
+        arguments,
+        format_context,
+        tool_call_context,
+        dispatch,
+        identity: identity.clone(),
+        bind_trust,
+        request_id: request_id.clone(),
+        ledger_key,
+    };
+    let job = plain_run.job(
+        access_grants::ask_route(&identity),
+        phase_trace,
+        tool_call_tx,
+    );
     let rx = submit_active_tool_call(
         executor.as_ref(),
         active_tool_calls,
@@ -9030,6 +9219,9 @@ async fn handle_tool_call(
     let ver = frame.header.ver;
     let completion_metrics = Arc::clone(metrics);
     let active_tool_calls = Arc::clone(active_tool_calls);
+    let consent_executor = Arc::clone(executor);
+    let consent_connection_cancel = connection_cancel.clone();
+    let consent_drain = module_drain.clone();
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&completion_metrics);
         let response = await_executor_response(rx, request_id.clone()).await;
@@ -9043,6 +9235,30 @@ async fn handle_tool_call(
                 ),
                 None,
             ),
+        };
+        // A stamped worker's call that needs permission for an outside path is
+        // held here while Cingulate asks its head, then runs again or ends
+        // with a named refusal.
+        let (response, text, phase_trace) = if consent::requested_ask(&response).is_some() {
+            match hold_for_consent(
+                &plain_run,
+                response,
+                text,
+                &consent_executor,
+                lane,
+                route,
+                corr,
+                &active_tool_calls,
+                &consent_connection_cancel,
+                &consent_drain,
+            )
+            .await
+            {
+                Some((response, text)) => (response, text, None),
+                None => return,
+            }
+        } else {
+            (response, text, phase_trace)
         };
         // Claim, not finish: the call stays tracked (and counted by the drain
         // census) until its response is in the writer queue.

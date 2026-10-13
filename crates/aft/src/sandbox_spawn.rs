@@ -609,6 +609,7 @@ static TEST_OBSERVATIONS: OnceLock<Mutex<HashMap<PathBuf, Vec<SandboxSpawnObserv
 
 thread_local! {
     static CURRENT_PRINCIPAL: RefCell<Option<AuthenticatedPrincipal>> = const { RefCell::new(None) };
+    static WORKER_JAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(test)]
     static TEST_PLAN_OVERRIDE: RefCell<Option<SpawnPlan>> = const { RefCell::new(None) };
 }
@@ -631,6 +632,48 @@ pub(crate) fn with_authenticated_principal<R>(
     let previous = CURRENT_PRINCIPAL.with(|slot| slot.replace(Some(principal)));
     let _scope = PrincipalScope(previous);
     run()
+}
+
+struct WorkerJailScope(bool);
+
+impl Drop for WorkerJailScope {
+    fn drop(&mut self) {
+        WORKER_JAIL.with(|slot| slot.set(self.0));
+    }
+}
+
+/// Run a stamped Alfonso worker's shell dispatch inside the worktree jail.
+///
+/// While `jailed` is true, a shell runs under the native sandbox whatever the
+/// user's `sandbox.enabled` says, with writes confined to the route's roots
+/// (plus `write_allow`, approved directory grants, caches and the task temp
+/// dir). Where the sandbox cannot be enforced the command is refused with
+/// `sandbox_unavailable`; it never runs unconfined. Heads and standalone
+/// sessions keep the configured behaviour.
+pub(crate) fn with_worker_jail<R>(jailed: bool, run: impl FnOnce() -> R) -> R {
+    let previous = WORKER_JAIL.with(|slot| slot.replace(jailed));
+    let _scope = WorkerJailScope(previous);
+    run()
+}
+
+/// Whether the shell dispatch on this thread belongs to a jailed worker.
+pub(crate) fn worker_jail_active() -> bool {
+    WORKER_JAIL.with(std::cell::Cell::get)
+}
+
+/// The configured sandbox switch, forced on for a jailed worker.
+pub(crate) fn sandbox_required(ctx: &AppContext) -> bool {
+    ctx.config().sandbox.enabled || worker_jail_active()
+}
+
+fn worker_jail_refusal(reason: &str) -> SpawnPlan {
+    SpawnPlan::Refused {
+        code: "sandbox_unavailable",
+        message: format!(
+            "worker shells must run in the native sandbox, which cannot be enforced here: {reason}"
+        ),
+        mismatch_class: None,
+    }
 }
 
 /// Current dispatch principal. Standalone requests are first-party by construction.
@@ -1207,11 +1250,17 @@ pub(crate) fn native_sandbox_enforced(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> bool {
-    cfg!(unix) && ctx.config().sandbox.enabled && principal_is_first_party(principal)
+    cfg!(unix) && sandbox_required(ctx) && principal_is_first_party(principal)
 }
 
 pub(crate) fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<SpawnPlan> {
-    (ctx.config().sandbox.enabled && !cfg!(unix)).then(|| SpawnPlan::Refused {
+    if cfg!(unix) {
+        return None;
+    }
+    if worker_jail_active() {
+        return Some(worker_jail_refusal("this platform has no native sandbox"));
+    }
+    ctx.config().sandbox.enabled.then(|| SpawnPlan::Refused {
         code: "sandbox_unavailable",
         message: "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
             .to_string(),
@@ -1248,7 +1297,18 @@ pub fn resolve_sandbox_spawn(
         return refusal;
     }
 
-    if requested_tier == RequestedSandboxTier::Disabled || !ctx.config().sandbox.enabled {
+    if worker_jail_active() {
+        // A jailed worker never runs unconfined: neither an unsandboxed tier
+        // nor a host escalation, nor a principal the native launcher refuses.
+        if requested_tier != RequestedSandboxTier::Native {
+            return worker_jail_refusal("the command asked to leave the sandbox");
+        }
+        if !native_sandbox_enforced(ctx, principal) {
+            return worker_jail_refusal("the route's principal cannot use the native launcher");
+        }
+    }
+
+    if requested_tier == RequestedSandboxTier::Disabled || !sandbox_required(ctx) {
         return SpawnPlan::Unsandboxed;
     }
 

@@ -608,6 +608,12 @@ pub(super) fn submit_deferred_bash(
     // supported client transport deadline (25 s). Explicit waits only extend
     // execution, never startup admission or control-file creation.
     let grant_scope = crate::access_policy::current_scope();
+    // A stamped Alfonso worker (the caller installs its consent route) runs
+    // its shells in the worktree jail.
+    let worker_jail = matches!(
+        crate::access_policy::current_ask_route(),
+        crate::access_policy::AskRoute::Consent { .. }
+    );
     let spawn_ctx = match executor.try_actor_context(&root) {
         Some(Some(ctx)) => ctx,
         state => {
@@ -819,6 +825,7 @@ pub(super) fn submit_deferred_bash(
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             let _grant_scope = crate::access_policy::scope_guard(grant_scope);
+                            crate::sandbox_spawn::with_worker_jail(worker_jail, || {
                             crate::bash_background::with_call_key(call_key, || {
                                 crate::bash_background::registry::with_ledger_spawn(
                                     ledger_key.clone(),
@@ -851,6 +858,7 @@ pub(super) fn submit_deferred_bash(
                                         )
                                     },
                                 )
+                            })
                             })
                         });
                     if let (Some(key), Some(db)) = (&ledger_key, ctx.db()) {
