@@ -10,11 +10,11 @@ By default, this script captures the current workspace inventory from `cargo tes
 * `cargo test -p agent-file-tools --test watcher_integration`
 
 When `AFT_NEXTEST_ARCHIVE_FILE` is set, the archived test inventory is also
-compared by test identity with the two non-watcher nextest buckets. macOS can
-provide separate lib/bin and integration archives, source inventories captured
-with those builds, and a watcher inventory file; that mode checks that each
-archive matches its source inventory and that its hash partitions are exact
-without rebuilding every target in one inventory-proof job.
+compared by test identity with the non-watcher nextest bucket. macOS can provide
+separate lib, bin, and integration archives, source inventories captured with
+those builds, and watcher inventory file; that mode checks that each archive
+matches its source inventory and that its hash partitions are exact without
+rebuilding every target in one inventory-proof job.
 Doctests are checked as a separate cargo bucket only when the baseline inventory
 contains doctest cases.
 """
@@ -262,9 +262,11 @@ def summarize(counter: Counter[str]) -> list[str]:
 
 
 def verify_split_archives(
-    lib_bin_archive_path: str,
+    lib_archive_path: str,
+    bin_archive_path: str,
     integration_archive_path: str,
-    lib_bin_source_inventory_path: str,
+    lib_source_inventory_path: str,
+    bin_source_inventory_path: str,
     integration_source_inventory_path: str,
     watcher_inventory_path: str,
     doc_inventory_path: str,
@@ -282,53 +284,60 @@ def verify_split_archives(
             "json",
         ]
 
-    lib_bin_source_output = Path(lib_bin_source_inventory_path).read_text()
-    unit_bin_entries = parse_nextest_list(lib_bin_source_output, {"lib", "bin"})
+    lib_source_output = Path(lib_source_inventory_path).read_text()
+    lib_entries = parse_nextest_list(lib_source_output, {"lib"})
+    bin_source_output = Path(bin_source_inventory_path).read_text()
+    bin_entries = parse_nextest_list(bin_source_output, {"bin"})
     integration_source_output = Path(integration_source_inventory_path).read_text()
-    nextest_entries = parse_nextest_list(integration_source_output, {"test"})
+    integration_entries = parse_nextest_list(integration_source_output, {"test"})
 
-    lib_bin_archive_entries_all = parse_nextest_list(
-        run_command(archive_command(lib_bin_archive_path), merge_stderr=False),
+    lib_archive_all = parse_nextest_list(
+        run_command(archive_command(lib_archive_path), merge_stderr=False),
         {"lib", "bin", "test"},
     )
-    integration_archive_entries = parse_nextest_list(
+    bin_archive_all = parse_nextest_list(
+        run_command(archive_command(bin_archive_path), merge_stderr=False),
+        {"lib", "bin", "test"},
+    )
+    integration_archive_all = parse_nextest_list(
         run_command(archive_command(integration_archive_path), merge_stderr=False),
         {"lib", "bin", "test"},
     )
-    unit_bin_archive_entries = [
-        entry
-        for entry in lib_bin_archive_entries_all
-        if entry.kind in {"lib", "bin"}
+    lib_archive_entries = [entry for entry in lib_archive_all if entry.kind == "lib"]
+    bin_archive_entries = [entry for entry in bin_archive_all if entry.kind == "bin"]
+    integration_archive_entries = [
+        entry for entry in integration_archive_all if entry.kind == "test"
     ]
-    unexpected_lib_bin = [
-        entry
-        for entry in lib_bin_archive_entries_all
-        if entry.kind not in {"lib", "bin"}
-    ]
-    unexpected_integration = [
-        entry for entry in integration_archive_entries if entry.kind != "test"
-    ]
+    unexpected_archives = {
+        "lib": [entry for entry in lib_archive_all if entry.kind != "lib"],
+        "bin": [entry for entry in bin_archive_all if entry.kind != "bin"],
+        "integration": [
+            entry for entry in integration_archive_all if entry.kind != "test"
+        ],
+    }
+    archive_errors = {
+        "lib": partition_coverage_errors(lib_entries, [lib_archive_entries]),
+        "bin": partition_coverage_errors(bin_entries, [bin_archive_entries]),
+        "integration": partition_coverage_errors(
+            integration_entries, [integration_archive_entries]
+        ),
+    }
     watcher_in_nextest = [
         entry.key
         for entry in integration_archive_entries
         if entry.suite == "watcher_integration"
     ]
-    lib_bin_archive_errors = partition_coverage_errors(
-        unit_bin_entries, [unit_bin_archive_entries]
-    )
-    integration_archive_errors = partition_coverage_errors(
-        nextest_entries, [integration_archive_entries]
-    )
 
+    unit_entries = [*lib_entries, *bin_entries]
     serial_tls_candidates = [
         entry
-        for entry in unit_bin_entries
+        for entry in unit_entries
         if entry.name.endswith("platform_verifier_tls_client_subprocess")
     ]
     serial_tls_entries = [entry for entry in serial_tls_candidates if entry.kind == "lib"]
     serial_backtrace_candidates = [
         entry
-        for entry in unit_bin_entries
+        for entry in unit_entries
         if entry.name.endswith("panic_hook_preserves_default_backtrace_behavior_and_persists")
     ]
     serial_backtrace_entries = [
@@ -338,39 +347,38 @@ def verify_split_archives(
         entry.key for entry in serial_tls_entries + serial_backtrace_entries
     }
 
-    unit_bin_command = [
-        *archive_command(lib_bin_archive_path),
+    lib_command = [
+        *archive_command(lib_archive_path),
         "-E",
-        "(kind(lib) | kind(bin))",
-    ]
-    unit_bin_shardable_entries = [
-        entry
-        for entry in parse_nextest_list(
-            lib_bin_source_output, {"lib", "bin"}, matching_tests_only=True
-        )
-        if entry.key not in serial_unit_keys
-    ]
-    unit_bin_shardable_command = [
-        *unit_bin_command,
+        "kind(lib)",
         "--",
         "--skip",
         "platform_verifier_tls_client_subprocess",
         "--skip",
         "panic_hook_preserves_default_backtrace_behavior_and_persists",
     ]
-    unit_bin_partitions = partition_nextest_entries(
-        unit_bin_shardable_command, {"lib", "bin"}
-    )
-
-    nextest_command = [
-        *archive_command(integration_archive_path),
-        "-E",
-        "kind(test)",
+    bin_command = [*archive_command(bin_archive_path), "-E", "kind(bin)"]
+    integration_command = [*archive_command(integration_archive_path), "-E", "kind(test)"]
+    lib_shardable_entries = [
+        entry
+        for entry in parse_nextest_list(
+            lib_source_output, {"lib"}, matching_tests_only=True
+        )
+        if entry.key not in serial_unit_keys
     ]
-    nextest_shardable_entries = parse_nextest_list(
-        integration_source_output, matching_tests_only=True
+    bin_shardable_entries = parse_nextest_list(
+        bin_source_output, {"bin"}, matching_tests_only=True
     )
-    nextest_partitions = partition_nextest_entries(nextest_command)
+    lib_partitions = partition_nextest_entries(lib_command, {"lib"})
+    bin_partitions = partition_nextest_entries(bin_command, {"bin"})
+    unit_partitions = [
+        [*lib_partitions[index], *bin_partitions[index]] for index in range(3)
+    ]
+    unit_shardable_entries = [*lib_shardable_entries, *bin_shardable_entries]
+    integration_shardable_entries = parse_nextest_list(
+        integration_source_output, {"test"}, matching_tests_only=True
+    )
+    integration_partitions = partition_nextest_entries(integration_command)
 
     watcher_output = Path(watcher_inventory_path).read_text()
     watcher_entries = [
@@ -378,29 +386,9 @@ def verify_split_archives(
     ]
     doc_output = Path(doc_inventory_path).read_text()
     doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
-
-    serial_tests_in_unit_partitions = sorted(
-        entry.key
-        for partition in unit_bin_partitions
-        for entry in partition
-        if entry.key in serial_unit_keys
-    )
-    unit_partition_missing, unit_partition_duplicate, unit_partition_extra = (
-        partition_coverage_errors(unit_bin_shardable_entries, unit_bin_partitions)
-    )
-    nextest_partition_missing, nextest_partition_duplicate, nextest_partition_extra = (
-        partition_coverage_errors(nextest_shardable_entries, nextest_partitions)
-    )
-    watcher_in_nextest_partitions = sorted(
-        entry.key
-        for partition in nextest_partitions
-        for entry in partition
-        if entry.suite == "watcher_integration"
-    )
-
     all_entries: list[NextestEntry | CargoEntry] = [
-        *unit_bin_entries,
-        *nextest_entries,
+        *unit_entries,
+        *integration_entries,
         *watcher_entries,
         *doc_entries,
     ]
@@ -410,6 +398,27 @@ def verify_split_archives(
     )
     baseline_by_bucket = Counter(entry.kind for entry in all_entries)
 
+    serial_tests_in_unit_partitions = sorted(
+        entry.key
+        for partition in unit_partitions
+        for entry in partition
+        if entry.key in serial_unit_keys
+    )
+    unit_partition_errors = partition_coverage_errors(
+        unit_shardable_entries, unit_partitions
+    )
+    integration_partition_errors = partition_coverage_errors(
+        integration_shardable_entries, integration_partitions
+    )
+    watcher_integration_partitions = [
+        entry.key
+        for partition in integration_partitions
+        for entry in partition
+        if entry.suite == "watcher_integration"
+    ]
+    partition_errors = unit_partition_errors + integration_partition_errors
+    source_archive_errors = [error for errors in archive_errors.values() for error in errors]
+
     print(
         "Baseline counts (source inventory):",
         ", ".join(summarize(baseline_by_bucket)),
@@ -418,9 +427,10 @@ def verify_split_archives(
         "Split counts:",
         ", ".join(
             [
-                f"nextest-lib-bin={len(unit_bin_entries)}",
+                f"nextest-lib={len(lib_entries)}",
+                f"nextest-bin={len(bin_entries)}",
                 f"cargo-doc={len(doc_entries)}",
-                f"nextest-integration={len(nextest_entries)}",
+                f"nextest-integration={len(integration_entries)}",
                 f"cargo-watcher={len(watcher_entries)}",
             ]
         ),
@@ -434,31 +444,23 @@ def verify_split_archives(
     print(f"Doctest cases in split inventory: {len(doc_entries)}")
     print(
         "Hash partition counts: "
-        f"nextest-lib-bin={','.join(str(len(partition)) for partition in unit_bin_partitions)}; "
-        f"nextest-integration={','.join(str(len(partition)) for partition in nextest_partitions)}"
+        f"nextest-lib={','.join(str(len(partition)) for partition in lib_partitions)}; "
+        f"nextest-bin={','.join(str(len(partition)) for partition in bin_partitions)}; "
+        f"nextest-integration={','.join(str(len(partition)) for partition in integration_partitions)}"
     )
     print(
         "Archive inventory entries: "
-        f"lib-bin={len(lib_bin_archive_entries_all)}, "
-        f"integration={len(integration_archive_entries)}"
+        f"lib={len(lib_archive_all)}, bin={len(bin_archive_all)}, "
+        f"integration={len(integration_archive_all)}"
     )
 
-    partition_errors = (
-        unit_partition_missing
-        + unit_partition_duplicate
-        + unit_partition_extra
-        + nextest_partition_missing
-        + nextest_partition_duplicate
-        + nextest_partition_extra
-    )
-    source_archive_errors = (*lib_bin_archive_errors, *integration_archive_errors)
     if (
-        unexpected_lib_bin
-        or unexpected_integration
+        any(unexpected_archives.values())
         or watcher_in_nextest
         or not watcher_entries
-        or not unit_bin_entries
-        or not nextest_entries
+        or not lib_entries
+        or not bin_entries
+        or not integration_entries
         or duplicate_inventory_entries
         or any(source_archive_errors)
         or len(serial_tls_candidates) != 1
@@ -466,35 +468,30 @@ def verify_split_archives(
         or len(serial_backtrace_candidates) != 1
         or len(serial_backtrace_entries) != 1
         or serial_tests_in_unit_partitions
-        or watcher_in_nextest_partitions
-        or partition_errors
+        or watcher_integration_partitions
+        or any(partition_errors)
     ):
         print("\nSplit archive inventory proof failed.")
-        if unexpected_lib_bin:
-            print(f"  non-lib/bin entries in libtest archive: {len(unexpected_lib_bin)}")
-        if unexpected_integration:
-            print(f"  non-test entries in integration archive: {len(unexpected_integration)}")
+        for label, entries in unexpected_archives.items():
+            if entries:
+                print(f"  unexpected {label} archive targets: {len(entries)}")
         if watcher_in_nextest:
             print(f"  watcher leaked into integration archive: {len(watcher_in_nextest)}")
         if not watcher_entries:
             print("  watcher inventory is empty or missing")
-        if not unit_bin_entries:
-            print("  lib/bin source inventory is empty")
-        if not nextest_entries:
-            print("  integration source inventory is empty")
+        for label, entries in (
+            ("lib", lib_entries),
+            ("bin", bin_entries),
+            ("integration", integration_entries),
+        ):
+            if not entries:
+                print(f"  {label} source inventory is empty")
         if duplicate_inventory_entries:
             print(f"  repeated source inventory entries: {len(duplicate_inventory_entries)}")
-        for label, missing, duplicate, extra in (
-            ("lib/bin archive", *lib_bin_archive_errors),
-            ("integration archive", *integration_archive_errors),
-        ):
-            for category, keys in (
-                ("uncovered", missing),
-                ("repeated", duplicate),
-                ("extra", extra),
-            ):
+        for label, errors in archive_errors.items():
+            for category, keys in zip(("uncovered", "repeated", "extra"), errors):
                 if keys:
-                    print(f"  {label} {category} ({len(keys)}):")
+                    print(f"  {label} archive {category} ({len(keys)}):")
                     for key in keys[:20]:
                         print(f"    {key}")
         if len(serial_tls_candidates) != 1 or len(serial_tls_entries) != 1:
@@ -511,33 +508,19 @@ def verify_split_archives(
             )
         if serial_tests_in_unit_partitions:
             print(
-                "  serial-only tests present in lib/bin partitions: "
+                "  serial-only tests present in unit partitions: "
                 f"{len(serial_tests_in_unit_partitions)}"
             )
-        if watcher_in_nextest_partitions:
+        if watcher_integration_partitions:
             print(
                 "  watcher leaked into integration partitions: "
-                f"{len(watcher_in_nextest_partitions)}"
+                f"{len(watcher_integration_partitions)}"
             )
-        for label, missing, duplicate, extra in (
-            (
-                "nextest lib/bin partitions",
-                unit_partition_missing,
-                unit_partition_duplicate,
-                unit_partition_extra,
-            ),
-            (
-                "nextest integration partitions",
-                nextest_partition_missing,
-                nextest_partition_duplicate,
-                nextest_partition_extra,
-            ),
+        for label, errors in (
+            ("unit lib/bin partitions", unit_partition_errors),
+            ("integration partitions", integration_partition_errors),
         ):
-            for category, keys in (
-                ("uncovered", missing),
-                ("repeated", duplicate),
-                ("extra", extra),
-            ):
+            for category, keys in zip(("uncovered", "repeated", "extra"), errors):
                 if keys:
                     print(f"  {label} {category} ({len(keys)}):")
                     for key in keys[:20]:
@@ -550,9 +533,11 @@ def verify_split_archives(
     )
 
 
-lib_bin_archive_path = os.environ.get("AFT_NEXTEST_ARCHIVE_LIB_BIN_FILE")
+lib_archive_path = os.environ.get("AFT_NEXTEST_ARCHIVE_LIB_FILE")
+bin_archive_path = os.environ.get("AFT_NEXTEST_ARCHIVE_BIN_FILE")
 integration_archive_path = os.environ.get("AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE")
-lib_bin_source_inventory_path = os.environ.get("AFT_NEXTEST_SOURCE_INVENTORY_LIB_BIN_FILE")
+lib_source_inventory_path = os.environ.get("AFT_NEXTEST_SOURCE_INVENTORY_LIB_FILE")
+bin_source_inventory_path = os.environ.get("AFT_NEXTEST_SOURCE_INVENTORY_BIN_FILE")
 integration_source_inventory_path = os.environ.get(
     "AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE"
 )
@@ -560,32 +545,39 @@ watcher_inventory_path = os.environ.get("AFT_WATCHER_TEST_INVENTORY_FILE")
 doc_inventory_path = os.environ.get("AFT_DOCTEST_INVENTORY_FILE")
 if any(
     (
-        lib_bin_archive_path,
+        lib_archive_path,
+        bin_archive_path,
         integration_archive_path,
-        lib_bin_source_inventory_path,
+        lib_source_inventory_path,
+        bin_source_inventory_path,
         integration_source_inventory_path,
         watcher_inventory_path,
         doc_inventory_path,
     )
 ):
     if (
-        lib_bin_archive_path is None
+        lib_archive_path is None
+        or bin_archive_path is None
         or integration_archive_path is None
-        or lib_bin_source_inventory_path is None
+        or lib_source_inventory_path is None
+        or bin_source_inventory_path is None
         or integration_source_inventory_path is None
         or watcher_inventory_path is None
         or doc_inventory_path is None
     ):
         print(
-            "split archive proof requires both archives, their source inventories, "
+            "split archive proof requires lib, bin, and integration archives, "
+            "their source inventories, "
             "and the watcher and doctest inventory files",
             file=sys.stderr,
         )
         sys.exit(2)
     verify_split_archives(
-        lib_bin_archive_path,
+        lib_archive_path,
+        bin_archive_path,
         integration_archive_path,
-        lib_bin_source_inventory_path,
+        lib_source_inventory_path,
+        bin_source_inventory_path,
         integration_source_inventory_path,
         watcher_inventory_path,
         doc_inventory_path,

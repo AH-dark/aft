@@ -63,6 +63,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         expected_lanes = {
             "unit-macos-nextest-archive",
             "unit-macos-libtest-archive",
+            "unit-macos-bin-archive",
             "unit-macos-inventory-proof",
             "unit-macos-libtest-shard",
             "unit-macos-nextest",
@@ -85,22 +86,33 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("macos-doctest-inventory.txt", integration_archive)
 
         libtest_archive = workflow_job("unit-macos-libtest-archive")
-        self.assertIn("(kind(lib) | kind(bin))", libtest_archive)
+        self.assertIn("kind(lib)", libtest_archive)
+        self.assertNotIn("kind(bin)", libtest_archive)
         self.assertIn('SCCACHE_IDLE_TIMEOUT: "0"', libtest_archive)
         self.assertIn("macos-libtest-inventory.json", libtest_archive)
 
+        bin_archive = workflow_job("unit-macos-bin-archive")
+        self.assertIn("kind(bin)", bin_archive)
+        self.assertIn('SCCACHE_IDLE_TIMEOUT: "0"', bin_archive)
+        self.assertIn("macos-bin-inventory.json", bin_archive)
+
         inventory = workflow_job("unit-macos-inventory-proof")
-        self.assertIn("AFT_NEXTEST_ARCHIVE_LIB_BIN_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_ARCHIVE_LIB_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", inventory)
         self.assertIn("AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE", inventory)
-        self.assertIn("AFT_NEXTEST_SOURCE_INVENTORY_LIB_BIN_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_SOURCE_INVENTORY_LIB_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_SOURCE_INVENTORY_BIN_FILE", inventory)
         self.assertIn("AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE", inventory)
         self.assertIn("AFT_WATCHER_TEST_INVENTORY_FILE", inventory)
         self.assertIn("scripts/rust-test-inventory-proof.py", inventory)
 
         libtest = workflow_job("unit-macos-libtest-shard")
         self.assertIn("unit-macos-libtest-archive", libtest)
+        self.assertIn("unit-macos-bin-archive", libtest)
         self.assertIn("macos-libtest-archive", libtest)
+        self.assertIn("macos-bin-archive", libtest)
         self.assertIn("max-parallel: 3", libtest)
+        self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", libtest)
         self.assertIn("AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}", libtest)
         self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3", libtest)
         self.assertIn("AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}", libtest)
@@ -117,6 +129,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         conformance = workflow_job("unit-macos-conformance")
         self.assertIn("unit-macos-nextest-archive", conformance)
         self.assertIn("unit-macos-libtest-archive", conformance)
+        self.assertIn("unit-macos-bin-archive", conformance)
         self.assertIn("AFT_GATE_PHASES: conformance", conformance)
         self.assertIn("bun run test:unit", conformance)
 
@@ -130,6 +143,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertLess(prewarm, keychain)
         self.assertLess(warm, keychain)
         self.assertIn("extract_nextest_archive_for_prewarm", GATE_TEXT[prewarm_start:keychain])
+        self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", GATE_TEXT[prewarm_start:keychain])
 
     def test_macos_backtrace_probe_runs_once_in_archive_builder_not_shards(self) -> None:
         probe = "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists"
@@ -154,26 +168,29 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
     def test_macos_inventory_proof_checks_source_archives_and_partitions(self) -> None:
         inventory = workflow_job("unit-macos-inventory-proof")
         for variable in (
-            "AFT_NEXTEST_ARCHIVE_LIB_BIN_FILE",
+            "AFT_NEXTEST_ARCHIVE_LIB_FILE",
+            "AFT_NEXTEST_ARCHIVE_BIN_FILE",
             "AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE",
-            "AFT_NEXTEST_SOURCE_INVENTORY_LIB_BIN_FILE",
+            "AFT_NEXTEST_SOURCE_INVENTORY_LIB_FILE",
+            "AFT_NEXTEST_SOURCE_INVENTORY_BIN_FILE",
             "AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE",
             "AFT_WATCHER_TEST_INVENTORY_FILE",
             "AFT_DOCTEST_INVENTORY_FILE",
         ):
             self.assertIn(variable, inventory)
-        self.assertIn("lib_bin_archive_errors = partition_coverage_errors(", PROOF_TEXT)
-        self.assertIn("integration_archive_errors = partition_coverage_errors(", PROOF_TEXT)
+        self.assertIn("AFT_NEXTEST_ARCHIVE_LIB_FILE", inventory)
+        self.assertIn("AFT_NEXTEST_ARCHIVE_BIN_FILE", inventory)
+        self.assertIn('"lib": partition_coverage_errors(lib_entries, [lib_archive_entries])', PROOF_TEXT)
+        self.assertIn('"bin": partition_coverage_errors(bin_entries, [bin_archive_entries])', PROOF_TEXT)
+        self.assertIn('lib_partitions = partition_nextest_entries(lib_command, {"lib"})', PROOF_TEXT)
+        self.assertIn('bin_partitions = partition_nextest_entries(bin_command, {"bin"})', PROOF_TEXT)
+        self.assertIn("any(unexpected_archives.values())", PROOF_TEXT)
         self.assertIn("or any(source_archive_errors)", PROOF_TEXT)
-        self.assertIn("or partition_errors", PROOF_TEXT)
-        self.assertIn(
-            "partition_coverage_errors(unit_bin_shardable_entries, unit_bin_partitions)",
-            PROOF_TEXT,
-        )
-        self.assertIn(
-            "partition_coverage_errors(nextest_shardable_entries, nextest_partitions)",
-            PROOF_TEXT,
-        )
+        self.assertIn("any(partition_errors)", PROOF_TEXT)
+        self.assertIn("unit_partition_errors = partition_coverage_errors(", PROOF_TEXT)
+        self.assertIn("unit_shardable_entries, unit_partitions", PROOF_TEXT)
+        self.assertIn("integration_partition_errors = partition_coverage_errors(", PROOF_TEXT)
+        self.assertIn("integration_shardable_entries, integration_partitions", PROOF_TEXT)
 
     def test_macos_conformance_waits_until_archives_finish(self) -> None:
         conformance = workflow_job("unit-macos-conformance")
@@ -182,6 +199,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("needs:", dependencies)
         self.assertIn("unit-macos-nextest-archive", dependencies)
         self.assertIn("unit-macos-libtest-archive", dependencies)
+        self.assertIn("unit-macos-bin-archive", dependencies)
 
 
 if __name__ == "__main__":

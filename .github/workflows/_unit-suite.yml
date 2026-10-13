@@ -497,10 +497,10 @@ jobs:
   # bash_background SIGTERM handling, and Apple Silicon compilation. Linux
   # cannot exercise these paths.
   #
-  # Build lib/bin and non-watcher integration archives in parallel, then split
-  # each inventory into three hash partitions. This keeps the large lib test
-  # harness from serializing with every integration test binary. Watcher tests
-  # stay serial; conformance and Bun tests use their own lane.
+  # Build library, binary, and non-watcher integration archives in parallel,
+  # then split each inventory into three hash partitions. The library harness
+  # is the dominant link, so it does not share an archive build with other tests.
+  # Watcher tests stay serial; conformance and Bun tests use their own lane.
   # ---------------------------------------------------------------------------
   unit-macos-nextest-archive:
     name: Cargo test archive (macOS)
@@ -597,16 +597,16 @@ jobs:
           cache-bin: false
           cache-on-failure: true
 
-      - name: Build nextest archive (macOS lib and bin tests)
-        run: cargo nextest archive --workspace -E '(kind(lib) | kind(bin))' --archive-file "$MACOS_LIBTEST_ARCHIVE"
+      - name: Build nextest archive (macOS lib tests)
+        run: cargo nextest archive --workspace -E 'kind(lib)' --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
       - name: Run the serial backtrace probe with local debug objects
         run: cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists
 
-      - name: Capture lib and bin source inventory
-        run: cargo nextest list --workspace --lib --bins --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-libtest-inventory.json"
+      - name: Capture lib source inventory
+        run: cargo nextest list --workspace --lib --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-libtest-inventory.json"
 
       - name: Report macOS libtest archive size
         run: |
@@ -624,11 +624,66 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+  unit-macos-bin-archive:
+    name: Cargo bin-test archive (macOS)
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_IDLE_TIMEOUT: "0"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Install cargo-nextest (direct, installer-action-independent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/mac" | tar zxf - -C "$HOME/.cargo/bin"
+          "$HOME/.cargo/bin/cargo-nextest" --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: unit-macos
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Build nextest archive (macOS bin tests)
+        run: cargo nextest archive --workspace -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
+        env:
+          MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
+
+      - name: Capture bin source inventory
+        run: cargo nextest list --workspace --bins --profile gate -T json --cargo-quiet > "$RUNNER_TEMP/macos-bin-inventory.json"
+
+      - name: Report macOS bin archive size
+        run: |
+          bytes=$(stat -f %z "$MACOS_BIN_ARCHIVE")
+          printf 'macOS bin archive: %.2f MiB (%s bytes)\n' "$(awk "BEGIN { print $bytes / 1048576 }")" "$bytes"
+        env:
+          MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-bin-archive
+          path: |
+            ${{ runner.temp }}/macos-bin-nextest.tar.zst
+            ${{ runner.temp }}/macos-bin-inventory.json
+          compression-level: 0
+          if-no-files-found: error
+
   unit-macos-inventory-proof:
     name: Prove Rust test inventory (macOS)
     needs:
       - unit-macos-nextest-archive
       - unit-macos-libtest-archive
+      - unit-macos-bin-archive
       - unit-macos-watcher
     runs-on: macos-26
     timeout-minutes: 10
@@ -657,15 +712,22 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          name: macos-bin-archive
+          path: ${{ runner.temp }}
+
+      - uses: actions/download-artifact@v4
+        with:
           name: macos-watcher-inventory
           path: ${{ runner.temp }}
 
       - name: Prove split Rust test inventory and hash partitions are exact
         run: python3 scripts/rust-test-inventory-proof.py
         env:
-          AFT_NEXTEST_ARCHIVE_LIB_BIN_FILE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_LIB_FILE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
           AFT_NEXTEST_ARCHIVE_INTEGRATION_FILE: ${{ runner.temp }}/macos-nextest.tar.zst
-          AFT_NEXTEST_SOURCE_INVENTORY_LIB_BIN_FILE: ${{ runner.temp }}/macos-libtest-inventory.json
+          AFT_NEXTEST_SOURCE_INVENTORY_LIB_FILE: ${{ runner.temp }}/macos-libtest-inventory.json
+          AFT_NEXTEST_SOURCE_INVENTORY_BIN_FILE: ${{ runner.temp }}/macos-bin-inventory.json
           AFT_NEXTEST_SOURCE_INVENTORY_INTEGRATION_FILE: ${{ runner.temp }}/macos-integration-inventory.json
           AFT_WATCHER_TEST_INVENTORY_FILE: ${{ runner.temp }}/macos-watcher-inventory.txt
           AFT_DOCTEST_INVENTORY_FILE: ${{ runner.temp }}/macos-doctest-inventory.txt
@@ -676,6 +738,7 @@ jobs:
     needs:
       - unit-macos-nextest-archive
       - unit-macos-libtest-archive
+      - unit-macos-bin-archive
       - unit-macos-inventory-proof
       - unit-macos-libtest-shard
       - unit-macos-nextest
@@ -690,6 +753,7 @@ jobs:
         env:
           ARCHIVE_RESULT: ${{ needs.unit-macos-nextest-archive.result }}
           LIBTEST_ARCHIVE_RESULT: ${{ needs.unit-macos-libtest-archive.result }}
+          BIN_ARCHIVE_RESULT: ${{ needs.unit-macos-bin-archive.result }}
           INVENTORY_RESULT: ${{ needs.unit-macos-inventory-proof.result }}
           LIBTEST_RESULT: ${{ needs.unit-macos-libtest-shard.result }}
           INTEGRATION_RESULT: ${{ needs.unit-macos-nextest.result }}
@@ -697,7 +761,7 @@ jobs:
           CONFORMANCE_BUN_RESULT: ${{ needs.unit-macos-conformance.result }}
         run: |
           set -euo pipefail
-          for lane in ARCHIVE LIBTEST_ARCHIVE INVENTORY LIBTEST INTEGRATION WATCHER CONFORMANCE_BUN; do
+          for lane in ARCHIVE LIBTEST_ARCHIVE BIN_ARCHIVE INVENTORY LIBTEST INTEGRATION WATCHER CONFORMANCE_BUN; do
             result_var="${lane}_RESULT"
             result="${!result_var}"
             if [[ "$result" != "success" ]]; then
@@ -785,7 +849,9 @@ jobs:
 
   unit-macos-libtest-shard:
     name: Cargo libtest shard ${{ matrix.shard }}/3 (macOS)
-    needs: unit-macos-libtest-archive
+    needs:
+      - unit-macos-libtest-archive
+      - unit-macos-bin-archive
     runs-on: macos-26
     timeout-minutes: 20
     env:
@@ -823,6 +889,11 @@ jobs:
           name: macos-libtest-archive
           path: ${{ runner.temp }}
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-bin-archive
+          path: ${{ runner.temp }}
+
       - name: Rust libtest shard (nextest archive)
         run: |
           set -o pipefail
@@ -833,6 +904,7 @@ jobs:
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}
           AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
+          AFT_NEXTEST_ARCHIVE_BIN_FILE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
           AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"
@@ -915,6 +987,7 @@ jobs:
     needs:
       - unit-macos-nextest-archive
       - unit-macos-libtest-archive
+      - unit-macos-bin-archive
     runs-on: macos-26
     timeout-minutes: 30
     env:
