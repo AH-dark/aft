@@ -1831,8 +1831,9 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     id: "bash-abort",
     progress: () => Effect.succeed(undefined),
   };
-  const bash = reloaded.tools.find((tool) => tool.name === "bash");
-  if (!bash) throw new Error("enabled V2 effect did not register bash");
+  // OpenCode 2 registers AFT's bash under the host's own name, \`shell\`.
+  const bash = reloaded.tools.find((tool) => tool.name === "shell");
+  if (!bash) throw new Error("enabled V2 effect did not register AFT's bash as shell");
   const abortExit = yield* Effect.exit(
     bash.execute({ command: "sleep 30", description: "cancellation probe" }, executionContext),
   );

@@ -37,7 +37,7 @@ import {
   assertBashDeadTransportRefusal,
   assertBashExecutionPathIdentity,
   assertConfigDenyHidesTool,
-  assertHostShellDisabled,
+  assertV2ToolsAreAft,
   assertPermissionPromptObserved,
   controlPlans,
   sessionPermissionRules,
@@ -771,7 +771,7 @@ async function runOneScenario(options: {
           controlPromises.push(controlPromise);
         }
       },
-    });
+    }, hostGeneration);
     await mock.start();
     isolation = await createScenarioIsolation({
       parent: join(config.runRoot, "scenarios"),
@@ -949,8 +949,10 @@ async function runOneScenario(options: {
     // Scoped to the rows whose host behaviour was observed. The check itself
     // describes any wholly-denying rule and can be widened once another tool's
     // rows have been watched doing the same thing.
-    if (scenario.id.startsWith("bash/T3/")) assertConfigDenyHidesTool(scenario, mock.exchanges);
-    if (hostGeneration === "v2") assertHostShellDisabled(scenario, mock.exchanges);
+    if (scenario.id.startsWith("bash/T3/")) {
+      assertConfigDenyHidesTool(scenario, mock.exchanges, hostGeneration);
+    }
+    if (hostGeneration === "v2") assertV2ToolsAreAft(scenario, mock.exchanges);
     // Ahead of the generic permission assertion: when a bash row's declared
     // execution path (the AFT loop, or the break-glass fallback) is the one
     // that raises its own ask, "which ask is missing" is the more specific

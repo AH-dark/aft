@@ -94,31 +94,46 @@ describe("bash abort ordering", () => {
 describe("a configured denial hides the tool it names", () => {
   const denied = scenario("bash/T3/loop_config_deny");
 
+  // Permission rows run on the OpenCode 2 host, where AFT's bash is offered
+  // as `shell`; the host's own shell plugin is removed by the isolation config.
   test("accepts a tool the host offered before the rule and dropped after it", () => {
     expect(() =>
-      assertConfigDenyHidesTool(denied, [
-        exchange("call-tool", ["bash", "read", "shell"]),
-        exchange("finish", ["read", "shell"]),
-      ]),
+      assertConfigDenyHidesTool(
+        denied,
+        [exchange("call-tool", ["shell", "read"]), exchange("finish", ["read"])],
+        "v2",
+      ),
     ).not.toThrow();
   });
 
   test("rejects a tool the host never offered, which never registered rather than being hidden", () => {
     expect(() =>
-      assertConfigDenyHidesTool(denied, [
-        exchange("call-tool", ["read", "shell"]),
-        exchange("finish", ["read", "shell"]),
-      ]),
-    ).toThrow("the host never offered bash");
+      assertConfigDenyHidesTool(
+        denied,
+        [exchange("call-tool", ["bash", "read"]), exchange("finish", ["read"])],
+        "v2",
+      ),
+    ).toThrow("the host never offered shell");
   });
 
   test("rejects a tool the host kept offering under the rule", () => {
     expect(() =>
-      assertConfigDenyHidesTool(denied, [
-        exchange("call-tool", ["bash", "read"]),
-        exchange("finish", ["bash", "read"]),
-      ]),
-    ).toThrow("kept offering bash");
+      assertConfigDenyHidesTool(
+        denied,
+        [exchange("call-tool", ["shell", "read"]), exchange("finish", ["shell", "read"])],
+        "v2",
+      ),
+    ).toThrow("kept offering shell");
+  });
+
+  test("an OpenCode 1 host names the tool bash", () => {
+    expect(() =>
+      assertConfigDenyHidesTool(
+        denied,
+        [exchange("call-tool", ["bash", "read"]), exchange("finish", ["read"])],
+        "v1",
+      ),
+    ).not.toThrow();
   });
 
   test("rejects a run that never reached the model", () => {

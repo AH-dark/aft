@@ -65,6 +65,7 @@ import {
 } from "./projection.js";
 import {
   assertPermissionPromptObserved,
+  assertV2ToolsAreAft,
   controlPlans,
   permissionAction,
   sessionPermissionRules,
@@ -511,16 +512,17 @@ describe("scenario isolation and liveness", () => {
     expect((openai.settings as Record<string, unknown>).baseURL).toBe("{{AIMOCK_BASE_URL}}/v1");
   });
 
-  test("non-GPT tool-surface scenario rejects leaked apply_patch", async () => {
+  // The surface check runs on the V2 leg, where AFT's apply_patch is `patch`.
+  test("non-GPT tool-surface scenario rejects a leaked patch", async () => {
     const cases = await loadScenarios(join(import.meta.dir, "../scenarios"));
     const selected = cases.find((entry) => entry.id === "read/T1/edit-family/non-gpt")!;
     expect(selected.model).toBe("openai/mock-model");
     const expected = selected.metadata!.tool_surface as { model: string; present: string[]; absent: string[] };
     const exchange = {
       index: 0, label: "call-read", response: {}, observed_at: "test",
-      request: { model: "mock-model", tools: ["read", "edit", "write", "apply_patch"].map((name) => ({ type: "function", function: { name } })) },
+      request: { model: "mock-model", tools: ["read", "edit", "write", "patch"].map((name) => ({ type: "function", function: { name } })) },
     };
-    expect(() => assertRequestToolSurface(exchange, expected)).toThrow("unexpectedly includes apply_patch");
+    expect(() => assertRequestToolSurface(exchange, expected)).toThrow("unexpectedly includes patch");
   });
 
   test("GPT tool-surface scenario checks actual tool names and model", async () => {
@@ -530,12 +532,63 @@ describe("scenario isolation and liveness", () => {
     const expected = selected.metadata!.tool_surface as { model: string; present: string[]; absent: string[] };
     const exchange = {
       index: 0, label: "call-read", response: {}, observed_at: "test",
-      request: { model: "gpt-5-mock", tools: ["read", "apply_patch"].map((name) => ({ type: "function", function: { name } })) },
+      request: { model: "gpt-5-mock", tools: ["read", "patch"].map((name) => ({ type: "function", function: { name } })) },
     };
-    expect(assertRequestToolSurface(exchange, expected)).toEqual(["apply_patch", "read"]);
+    expect(assertRequestToolSurface(exchange, expected)).toEqual(["patch", "read"]);
     expect(() => assertRequestToolSurface({ ...exchange, request: { model: "mock-model", tools: exchange.request.tools } }, expected)).toThrow("expected gpt-5-mock");
     expect(() => assertRequestToolSurface({ ...exchange, request: { model: "gpt-5-mock" } }, expected)).toThrow("contains no tools");
-    expect(() => assertRequestToolSurface({ ...exchange, request: { model: "gpt-5-mock", tools: [{ function: { name: "read" } }] } }, expected)).toThrow("missing apply_patch");
+    expect(() => assertRequestToolSurface({ ...exchange, request: { model: "gpt-5-mock", tools: [{ function: { name: "read" } }] } }, expected)).toThrow("missing patch");
+    // AFT's OpenCode 1 name is not what an OpenCode 2 host offers.
+    expect(() => assertRequestToolSurface({ ...exchange, request: { model: "gpt-5-mock", tools: ["read", "patch", "apply_patch"].map((name) => ({ type: "function", function: { name } })) } }, expected)).toThrow("unexpectedly includes apply_patch");
+  });
+
+  describe("V2 requests offer AFT's shell and patch, never the host's", () => {
+    const scenario = { id: "bash/T1/sample" } as never;
+    const offering = (tools: Array<{ name: string; description?: string }>) => [
+      {
+        index: 0,
+        label: "call",
+        response: {},
+        observed_at: "test",
+        request: { tools: tools.map((fn) => ({ type: "function", function: fn })) },
+      },
+    ];
+
+    test("AFT's own shell and patch pass", () => {
+      expect(() =>
+        assertV2ToolsAreAft(
+          scenario,
+          offering([
+            { name: "shell", description: "Execute shell commands. Output is compressed" },
+            { name: "patch", description: "Use the `patch` tool to edit files. Your patch" },
+            { name: "read", description: "Read a file" },
+          ]),
+        ),
+      ).not.toThrow();
+    });
+
+    test("the host's own shell is caught by its description", () => {
+      expect(() =>
+        assertV2ToolsAreAft(
+          scenario,
+          offering([{ name: "shell", description: "Execute a shell command and return its output." }]),
+        ),
+      ).toThrow("the host offered its own shell tool although -opencode.tool.shell is configured");
+    });
+
+    test("the host's own patch is caught by its description", () => {
+      expect(() =>
+        assertV2ToolsAreAft(scenario, offering([{ name: "patch", description: "Apply a patch." }])),
+      ).toThrow("the host offered its own patch tool although -opencode.tool.patch is configured");
+    });
+
+    test("AFT's OpenCode 1 names are refused on OpenCode 2", () => {
+      for (const name of ["bash", "apply_patch"]) {
+        expect(() =>
+          assertV2ToolsAreAft(scenario, offering([{ name, description: "Execute shell commands." }])),
+        ).toThrow(`the host offered ${name}`);
+      }
+    });
   });
 
   // The pinned V1 host serves a whole scenario and then never ends inside a
@@ -590,10 +643,32 @@ describe("scenario isolation and liveness", () => {
     expect(hostToolName("ast_search")).toBe("ast_grep_search");
     expect(hostToolName("ast_replace")).toBe("ast_grep_replace");
     expect(hostToolName("read")).toBe("read");
+    // OpenCode 1 keeps AFT's names; OpenCode 2 registers bash and apply_patch
+    // under its own `shell` and `patch`.
+    expect(hostToolName("bash", "v1")).toBe("bash");
+    expect(hostToolName("apply_patch", "v1")).toBe("apply_patch");
+    expect(hostToolName("bash", "v2")).toBe("shell");
+    expect(hostToolName("apply_patch", "v2")).toBe("patch");
+    expect(hostToolName("bash_status", "v2")).toBe("bash_status");
+    expect(hostToolName("ast_search", "v2")).toBe("ast_grep_search");
     expect(hostToolArguments("read", { filePath: "sample.txt", limit: 10 })).toEqual({
       path: "sample.txt",
       limit: 10,
     });
+  });
+
+  test("the mock calls AFT's bash by the name each host generation registered", async () => {
+    const turn = {
+      label: "call",
+      response: {
+        kind: "tool_calls" as const,
+        calls: [{ id: "c", name: "bash", arguments: { command: "printf x" } }],
+      },
+    };
+    const v1 = await observeThenRespond(structuredClone(turn) as never, {}, 0, {}, "v1");
+    const v2 = await observeThenRespond(structuredClone(turn) as never, {}, 0, {}, "v2");
+    expect((v1.response.toolCalls as Array<{ name: string }>)[0].name).toBe("bash");
+    expect((v2.response.toolCalls as Array<{ name: string }>)[0].name).toBe("shell");
   });
 
   test("tool result lookup follows the pinned host's 40-character call ids", () => {
@@ -823,6 +898,7 @@ describe("shared-server controls", () => {
     );
 
     expect(order).toEqual(["observe", "respond"]);
+    expect((response.toolCalls as Array<{ name: string }>)[0].name).toBe("bash_watch");
     expect(JSON.parse(String((response.toolCalls as Array<{ arguments: string }>)[0].arguments))).toEqual(
       { taskId: "bash-generated" },
     );

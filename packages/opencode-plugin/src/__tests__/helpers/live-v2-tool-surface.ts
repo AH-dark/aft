@@ -37,7 +37,7 @@ writeFileSync(
 
 interface ModelRequest {
   model: string;
-  tools?: Array<{ function: { name: string } }>;
+  tools?: Array<{ function: { name: string; description?: string } }>;
 }
 const requests: ModelRequest[] = [];
 const mock = Bun.serve({
@@ -123,17 +123,32 @@ try {
     assert.equal(primary.length, 1, `expected one real tool-bearing request for ${id}`);
     const names = primary[0].tools!.map((tool) => tool.function.name).sort();
     surfaces.push({ model: id, tools: names });
-    assert.ok(names.includes("bash"));
+    // OpenCode 2 registers AFT's bash and apply_patch as `shell` and `patch`;
+    // with the host's own shell and patch plugins removed, the descriptions
+    // say the tools are AFT's.
+    const describe = (name: string) =>
+      primary[0].tools!.find((tool) => tool.function.name === name)?.function.description ?? "";
+    assert.ok(names.includes("shell"));
+    assert.ok(describe("shell").startsWith("Execute shell commands."), "shell is not AFT's");
     assert.ok(names.includes("read"));
-    assert.ok(!names.includes("shell"), "host shell plugin was not removed");
-    assert.ok(!names.includes("patch"), "host patch plugin was not removed");
-    assert.equal(names.includes("apply_patch"), id === "gpt-5-probe");
+    assert.ok(!names.includes("bash"), "AFT registered bash under its OpenCode 1 name");
+    assert.ok(
+      !names.includes("apply_patch"),
+      "AFT registered apply_patch under its OpenCode 1 name",
+    );
+    assert.equal(names.includes("patch"), id === "gpt-5-probe");
+    if (id === "gpt-5-probe") {
+      assert.ok(
+        describe("patch").startsWith("Use the `patch` tool to edit files."),
+        "patch is not AFT's",
+      );
+    }
     assert.equal(names.includes("edit"), id !== "gpt-5-probe");
     assert.equal(names.includes("write"), id !== "gpt-5-probe");
     console.log(`${id}: ${names.join(", ")}`);
   }
   console.log(
-    "LIVE PASSED: 2 tool-bearing requests; GPT and non-GPT editing surfaces, host patch/shell absent",
+    "LIVE PASSED: 2 tool-bearing requests; GPT and non-GPT editing surfaces, AFT shell/patch only",
   );
 } finally {
   mock.stop(true);

@@ -39,7 +39,7 @@
       "expected_turns": ["call-read", "finish"],
       "compare_call_id": "edit-family-read",
       "comparison": {"mode": "exact", "expected": "1: alpha\n2: beta\n"},
-      "metadata": {"tool_surface": {"model": "gpt-5-mock", "present": ["read", "apply_patch"], "absent": ["edit", "write", "patch"]}}
+      "metadata": {"tool_surface": {"model": "gpt-5-mock", "present": ["read", "patch"], "absent": ["edit", "write", "apply_patch"]}}
     }
   ]
 }

@@ -1,6 +1,6 @@
 import { fail } from "./errors.js";
 import type { HostEvent } from "./event-stream.js";
-import { hostToolName } from "./mock-server.js";
+import { type HostGeneration, hostToolName } from "./mock-server.js";
 import type {
   ApiControlPlan,
   RecordedMockExchange,
@@ -117,13 +117,14 @@ export function hostOfferedTools(request: unknown): string[] {
 export function assertConfigDenyHidesTool(
   scenario: ScenarioDefinition,
   exchanges: readonly RecordedMockExchange[],
+  generation: HostGeneration = "v2",
 ): void {
   if (asRecord(scenario.metadata?.permission)?.reply !== "config_deny") return;
   const call = gatedCall(scenario);
   if (!call) {
     fail("scenario_invalid", `${scenario.id}: permission scenario has no subject tool call`);
   }
-  const tool = hostToolName(call.name);
+  const tool = hostToolName(call.name, generation);
   const [first, ...later] = exchanges;
   if (!first) {
     fail("host_failed", `${scenario.id}: the host asked the model for nothing, so it offered no tools`);
@@ -515,15 +516,28 @@ export function controlPlans(scenario: ScenarioDefinition): ApiControlPlan[] {
 }
 
 /**
- * Assert the V2 host offered AFT's bash and not its own shell tool.
- *
- * Every V2 scenario is configured the way `aft setup` configures an OpenCode 2
- * host, with `-opencode.tool.shell` under `plugins`. The host's shell plugin
- * would otherwise register a second command tool and rewrite the description
- * of anything named `shell`, so each request the model received must list no
- * `shell`, and every `bash` it lists must carry AFT's own description.
+ * How AFT's own tools describe themselves on OpenCode 2, keyed by the name the
+ * host registered them under. The host's built-in tools of the same names
+ * describe themselves differently ("Execute a shell command ..."), so the
+ * description, not the name, tells AFT's tool from the host's.
  */
-export function assertHostShellDisabled(
+const AFT_V2_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  shell: "Execute shell commands.",
+  patch: "Use the `patch` tool to edit files.",
+};
+
+/**
+ * Assert that the V2 host offered AFT's shell and patch, never its own.
+ *
+ * On OpenCode 2 AFT registers its bash as `shell` and its apply_patch as
+ * `patch`, the names of the host's own tools. Every V2 scenario is configured
+ * the way `aft setup` configures an OpenCode 2 host, with
+ * `-opencode.tool.shell` and `-opencode.tool.patch` under `plugins`, so the
+ * built-ins are removed and every `shell` or `patch` a request lists must be
+ * AFT's, recognised by its description. AFT never registers `bash` or
+ * `apply_patch` on OpenCode 2, so a request listing either is a stale plugin.
+ */
+export function assertV2ToolsAreAft(
   scenario: ScenarioDefinition,
   exchanges: readonly RecordedMockExchange[],
 ): void {
@@ -533,21 +547,23 @@ export function assertHostShellDisabled(
     for (const entry of tools) {
       const record = asRecord(entry);
       const fn = asRecord(record?.function) ?? record;
-      if (fn?.name === "shell") {
+      const name = fn?.name;
+      if (name === "bash" || name === "apply_patch") {
         fail(
           "host_failed",
-          `${scenario.id}: the host offered its own shell tool although -opencode.tool.shell is configured`,
+          `${scenario.id}: the host offered ${name}, but AFT registers it as ${name === "bash" ? "shell" : "patch"} on OpenCode 2`,
           { turn: exchange.label },
         );
       }
-      if (
-        fn?.name === "bash" &&
-        !(typeof fn.description === "string" && fn.description.startsWith("Execute shell commands."))
-      ) {
-        fail("host_failed", `${scenario.id}: the bash tool the host offered does not carry AFT's description`, {
-          turn: exchange.label,
-          description: fn.description,
-        });
+      if (typeof name !== "string") continue;
+      const expected = AFT_V2_TOOL_DESCRIPTIONS[name];
+      if (expected === undefined) continue;
+      if (!(typeof fn?.description === "string" && fn.description.startsWith(expected))) {
+        fail(
+          "host_failed",
+          `${scenario.id}: the host offered its own ${name} tool although -opencode.tool.${name} is configured`,
+          { turn: exchange.label, description: fn?.description },
+        );
       }
     }
   }

@@ -74,14 +74,15 @@ describe("read OpenCode 2 scenarios", () => {
     try {
       for (const [suffix, model, names] of [
         ["non-gpt", "mock-model", ["read", "edit", "write"]],
-        ["gpt", "gpt-5-mock", ["read", "apply_patch"]],
+        // OpenCode 2 offers AFT's apply_patch as `patch`.
+        ["gpt", "gpt-5-mock", ["read", "patch"]],
       ] as const) {
         const scenario = scenarios.find((entry) => entry.id === `read/T1/edit-family/${suffix}`)!;
         const context = { scenario, project_root: project, run_root: project, forensic_dir: project, host_generation: "v2" as const };
         const request = { model, tools: names.map((name) => ({ function: { name } })) };
         const exchange = { index: 0, label: `check-${suffix}`, request, response: {}, observed_at: "test" };
         await extension.observe?.(context, { kind: "mock_exchange", exchange });
-        const leaked = { ...request, tools: [...request.tools, { function: { name: suffix === "gpt" ? "edit" : "apply_patch" } }] };
+        const leaked = { ...request, tools: [...request.tools, { function: { name: suffix === "gpt" ? "edit" : "patch" } }] };
         await expect(extension.observe!(context, { kind: "mock_exchange", exchange: { ...exchange, request: leaked } })).rejects.toThrow("unexpectedly includes");
       }
     } finally {

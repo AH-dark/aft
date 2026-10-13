@@ -14,8 +14,14 @@ setup does, leaving AFT's own model gate in charge of its editing tools.
 rows select `openai/gpt-5-mock`; edit/write rows retain `openai/mock-model`.
 Both models use the same mock provider and endpoint. The paired
 `read/T1/edit-family/{non-gpt,gpt}` cases check real outgoing tool lists and
-persist `tool-surface-<turn>.json`: non-GPT offers edit/write without apply_patch,
-GPT offers apply_patch without edit/write, and neither offers host patch.
+persist `tool-surface-<turn>.json`. The check runs on the V2 leg only, where
+AFT registers its apply_patch as `patch` (and its bash as `shell`): non-GPT
+offers edit/write without patch, GPT offers patch without edit/write, and
+neither offers `apply_patch`. Every V2 request is also checked to list no
+`bash` or `apply_patch` and to carry AFT's own description on any `shell` or
+`patch`, which is how AFT's tool is told apart from the host's built-in of the
+same name. Scenarios keep naming the tools `bash` and `apply_patch`; the mock
+calls them by the name the leg's host registered (`hostToolName`).
 Run this regression with `AFT_E2E_SCENARIO=read/T1/edit-family`. V1 parity
 continues using its captured `mock/mock-model` selector.
 
