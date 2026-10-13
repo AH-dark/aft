@@ -597,9 +597,9 @@ fn consent_routes_asks_by_stamp() {
 
 #[test]
 fn consent_hold_budget_is_capped_at_100_seconds() {
-    assert_eq!(hold_budget(None), Duration::from_secs(20));
+    assert_eq!(declared_hold_budget(None), Duration::from_secs(20));
     assert_eq!(
-        hold_budget(Some(Duration::from_secs(1_800))),
+        declared_hold_budget(Some(Duration::from_secs(1_800))),
         Duration::from_secs(100)
     );
 }

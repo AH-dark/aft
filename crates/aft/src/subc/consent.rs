@@ -141,6 +141,10 @@ pub(super) fn hold_budget(declared_reply: Option<Duration>) -> Duration {
             return Duration::from_millis(ms);
         }
     }
+    declared_hold_budget(declared_reply)
+}
+
+fn declared_hold_budget(declared_reply: Option<Duration>) -> Duration {
     declared_reply
         .unwrap_or(UNDECLARED_REPLY_BUDGET)
         .saturating_sub(RERUN_MARGIN)
