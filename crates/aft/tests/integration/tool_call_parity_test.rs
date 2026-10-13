@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext};
@@ -61,6 +63,13 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
     );
 
     for case in cases {
+        wait_until_watcher_queries_are_current(
+            &mut direct_aft,
+            &mut tool_call_aft,
+            direct_project.path(),
+            tool_call_project.path(),
+            case.label,
+        );
         let request_id = format!("tool-call-parity-{}", case.label);
         let direct_request = direct_request(
             &request_id,
@@ -172,6 +181,66 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
 
     assert!(direct_aft.shutdown().success());
     assert!(tool_call_aft.shutdown().success());
+}
+
+fn wait_until_watcher_queries_are_current(
+    direct_aft: &mut AftProcess,
+    tool_call_aft: &mut AftProcess,
+    direct_project: &Path,
+    tool_call_project: &Path,
+    case_label: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let readiness_arguments = json!({"pattern": "needle", "path": "src/search.txt"});
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        let direct_response = send_json(
+            direct_aft,
+            direct_request(
+                &format!("watcher-readiness-{case_label}-{attempt}-direct"),
+                "grep",
+                &readiness_arguments,
+                direct_project,
+            ),
+        );
+        let tool_call_response = send_json(
+            tool_call_aft,
+            direct_request(
+                &format!("watcher-readiness-{case_label}-{attempt}-tool-call"),
+                "grep",
+                &readiness_arguments,
+                tool_call_project,
+            ),
+        );
+        assert_eq!(
+            direct_response["success"], true,
+            "direct watcher readiness query failed before {case_label}: {direct_response:#}"
+        );
+        assert_eq!(
+            tool_call_response["success"], true,
+            "tool_call watcher readiness query failed before {case_label}: {tool_call_response:#}"
+        );
+
+        let direct_pending = has_pending_watcher_changes(&direct_response);
+        let tool_call_pending = has_pending_watcher_changes(&tool_call_response);
+        if !direct_pending && !tool_call_pending {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for watcher changes to be applied before {case_label}: direct pending={direct_pending}, response={direct_response:#}; tool_call pending={tool_call_pending}, response={tool_call_response:#}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn has_pending_watcher_changes(response: &Value) -> bool {
+    response
+        .get("gaps")
+        .and_then(Value::as_array)
+        .is_some_and(|gaps| gaps.iter().any(|gap| gap["kind"] == "watcher_pending"))
 }
 
 #[test]
