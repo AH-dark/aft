@@ -16,6 +16,134 @@ struct FakeState {
     asks: HashMap<String, String>,
     /// Settled replies per elicitation id.
     answers: HashMap<String, Value>,
+    macos: bool,
+    cards: HashMap<(String, String), String>,
+    next_id: usize,
+}
+
+impl FakeState {
+    fn new_id(&mut self) -> String {
+        self.next_id += 1;
+        format!("acc_{}", self.next_id)
+    }
+}
+
+// Accept only declared fields, correct types, absolute paths, nonblank strings
+// and applicable size/line limits, matching Cingulate's decoder in
+// crates/cingulate-decode/src/access.rs at 6bb5f4d. Malformed requests receive
+// the same named refusal instead of a permissive test-double success.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum FakeAccessRequest {
+    ToolPermission {
+        call_key: String,
+        tool: String,
+        operation: String,
+        paths: Vec<String>,
+        #[serde(default)]
+        command: Option<String>,
+        reason: String,
+        args_hash: String,
+        #[serde(default)]
+        schema_pin: Option<String>,
+        pattern: String,
+        #[serde(default)]
+        head_policy: Option<String>,
+    },
+    MacosPermission {
+        folder: String,
+        program: String,
+        steps: String,
+    },
+}
+
+fn fake_refusal(code: &str, message: &str) -> ConsentError {
+    ConsentError::Refused {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+impl FakeAccessRequest {
+    fn decode(params: &Value) -> Result<Self, ConsentError> {
+        let request: Self = serde_json::from_value(params.clone())
+            .map_err(|error| fake_refusal("elicitation_invalid_request", &error.to_string()))?;
+        let invalid = |message| fake_refusal("elicitation_invalid_request", message);
+        match &request {
+            Self::MacosPermission {
+                folder,
+                program,
+                steps,
+            } => {
+                if !folder.starts_with('/')
+                    || folder.contains('\0')
+                    || program.trim().is_empty()
+                    || steps.trim().is_empty()
+                {
+                    return Err(invalid(
+                        "folder must be absolute; program and steps must be nonblank",
+                    ));
+                }
+            }
+            Self::ToolPermission {
+                call_key,
+                tool,
+                operation,
+                paths,
+                command,
+                reason,
+                args_hash,
+                schema_pin,
+                pattern,
+                head_policy,
+            } => {
+                if tool.chars().count() > 64
+                    || [call_key, tool, args_hash, pattern]
+                        .iter()
+                        .any(|s| s.trim().is_empty())
+                    || schema_pin.as_ref().is_some_and(|s| s.trim().is_empty())
+                {
+                    return Err(invalid(
+                        "call_key, tool, args_hash, pattern and any schema_pin must be nonblank",
+                    ));
+                }
+                if !matches!(operation.as_str(), "read" | "write" | "exec") {
+                    return Err(invalid("operation must be read, write or exec"));
+                }
+                if paths.len() > 16
+                    || paths
+                        .iter()
+                        .any(|p| !p.starts_with('/') || p.contains('\0'))
+                {
+                    return Err(invalid("paths must contain at most 16 absolute paths"));
+                }
+                if (operation == "exec") != command.is_some()
+                    || command
+                        .as_ref()
+                        .is_some_and(|c| c.trim().is_empty() || c.chars().count() > 600)
+                {
+                    return Err(invalid(
+                        "command is required for exec only and limited to 600 characters",
+                    ));
+                }
+                if reason.trim().is_empty()
+                    || reason.chars().count() > 160
+                    || reason.contains(['\r', '\n', '\0'])
+                {
+                    return Err(invalid(
+                        "reason must be a nonblank single line of at most 160 characters",
+                    ));
+                }
+                if head_policy
+                    .as_ref()
+                    .is_some_and(|p| !matches!(p.as_str(), "allow" | "not_held"))
+                {
+                    return Err(invalid("head_policy must be allow or not_held"));
+                }
+            }
+        }
+        Ok(request)
+    }
 }
 
 /// A stand-in for Cingulate that keeps one ask per call key and long-polls.
@@ -27,7 +155,13 @@ struct FakeCingulate {
 impl FakeCingulate {
     fn up() -> Arc<Self> {
         let fake = Arc::new(Self::default());
-        fake.state.lock().unwrap().up = true;
+        {
+            let mut state = fake.state.lock().unwrap();
+            state.up = true;
+            // The fake service models a macOS Cingulate instance even when
+            // the caller's permission probes are simulated on Linux.
+            state.macos = true;
+        }
         fake
     }
 
@@ -56,58 +190,57 @@ impl FakeCingulate {
         state.calls.push((method.to_string(), params.clone()));
         match method {
             "consent.request" => {
-                // Requests from a head omit head_policy; informational cards
-                // have no permission choices and never wait for an answer.
-                let keys: Vec<_> = params.as_object().unwrap().keys().cloned().collect();
-                if params["kind"] == "macos_permission" {
-                    assert_eq!(
-                        params
-                            .as_object()
-                            .unwrap()
-                            .keys()
-                            .map(String::as_str)
-                            .collect::<Vec<_>>(),
-                        ["call_key", "folder", "kind", "program", "steps"]
-                    );
-                } else if params.get("head_policy").is_some() {
-                    assert_eq!(
-                        keys,
-                        [
-                            "args_hash",
-                            "call_key",
-                            "head_policy",
-                            "kind",
-                            "operation",
-                            "paths",
-                            "pattern",
-                            "reason",
-                            "tool"
-                        ]
-                    );
-                } else {
-                    assert_eq!(
-                        keys,
-                        [
-                            "args_hash",
-                            "call_key",
-                            "kind",
-                            "operation",
-                            "paths",
-                            "pattern",
-                            "reason",
-                            "tool"
-                        ]
-                    );
-                }
-                let key = params["call_key"].as_str().unwrap().to_string();
-                let next = format!("acc_{}", state.asks.len() + 1);
-                let id = state.asks.entry(key).or_insert(next).clone();
-                Ok(Some(json!({"elicitation_id": id})))
+                let key = match FakeAccessRequest::decode(params)? {
+                    FakeAccessRequest::ToolPermission { call_key, .. } => call_key,
+                    FakeAccessRequest::MacosPermission {
+                        folder, program, ..
+                    } => {
+                        if !state.macos {
+                            return Err(fake_refusal(
+                                "access_macos_only",
+                                "macOS permission cards require macOS",
+                            ));
+                        }
+                        let key = (folder, program);
+                        let id = match state.cards.get(&key) {
+                            Some(id) => id.clone(),
+                            None => {
+                                let id = state.new_id();
+                                state.cards.insert(key, id.clone());
+                                id
+                            }
+                        };
+                        return Ok(Some(json!({"elicitation_id":id})));
+                    }
+                };
+                let id = match state.asks.get(&key) {
+                    Some(id) => id.clone(),
+                    None => {
+                        let id = state.new_id();
+                        state.asks.insert(key, id.clone());
+                        id
+                    }
+                };
+                Ok(Some(json!({"elicitation_id":id})))
             }
             "consent.await" => {
                 let id = params["elicitation_id"].as_str().unwrap();
+                if state.cards.values().any(|card| card == id) {
+                    return Err(fake_refusal(
+                        "access_informational",
+                        "informational cards cannot be awaited",
+                    ));
+                }
                 assert!(params["timeout_ms"].as_u64().unwrap() <= 120_000);
                 Ok(state.answers.get(id).cloned())
+            }
+            "consent.withdraw" => {
+                if let Some(id) = params["elicitation_id"].as_str() {
+                    state.cards.retain(|_, card| card != id);
+                }
+                Ok(Some(
+                    json!({"state":"refused:access_withdrawn","outcome":"access_withdrawn","code":"access_withdrawn"}),
+                ))
             }
             _ => Ok(Some(
                 json!({"state": "refused:access_withdrawn", "outcome": "access_withdrawn", "code": "access_withdrawn"}),
@@ -1248,4 +1381,201 @@ async fn macos_allowed_read_eperm_returns_named_denial_and_updates_one_card() {
     let reply = f.read(&f.worker, &target, 9).await;
     assert!(text(&reply).contains("protected bytes"), "{reply}");
     wait_for(|| f.fake.calls("consent.withdraw").len() == 1).await;
+}
+
+#[test]
+fn consent_vectors_macos_requests_match_closed_decoder() {
+    let params = macos_request_params(
+        "/protected",
+        "Terminal",
+        "Open System Settings, Privacy & Security, Files and Folders",
+    );
+    for name in ["macos-open-request.json", "macos-repeat-request.json"] {
+        assert_eq!(
+            encode("consent.request", &params).unwrap(),
+            vector(name),
+            "{name}"
+        );
+        assert!(matches!(
+            FakeAccessRequest::decode(&vector_json(name)["params"]),
+            Ok(FakeAccessRequest::MacosPermission { .. })
+        ));
+    }
+    for field in ["call_key", "options", "unknown"] {
+        let mut invalid = params.clone();
+        invalid[field] = json!("unexpected");
+        assert!(
+            matches!(FakeAccessRequest::decode(&invalid), Err(ConsentError::Refused { code, .. }) if code == "elicitation_invalid_request"),
+            "{invalid}"
+        );
+    }
+    for (field, value) in [
+        ("folder", json!("relative")),
+        ("folder", json!("/with\0nul")),
+        ("program", json!(" ")),
+        ("steps", json!(" ")),
+        ("steps", Value::Null),
+    ] {
+        let mut invalid = params.clone();
+        invalid[field] = value;
+        assert!(
+            matches!(FakeAccessRequest::decode(&invalid), Err(ConsentError::Refused { code, .. }) if code == "elicitation_invalid_request"),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn consent_vectors_macos_phone_card_is_informational() {
+    let record = decode_result(&vector("phone-macos-reply.json")).unwrap();
+    assert_eq!(record["kind"], "macos_permission");
+    assert_eq!(record["options"], json!([]));
+    assert_eq!(record["elicitationId"], "acc_3");
+    assert!(
+        matches!(decode_record(&record), Err(ConsentError::Refused { code, .. }) if code == "access_informational")
+    );
+}
+
+#[test]
+fn macos_fake_closed_decoder_deduplicates_and_refuses_await() {
+    let fake = FakeCingulate::up();
+    let first = fake
+        .reply(
+            "consent.request",
+            &vector_json("macos-open-request.json")["params"],
+        )
+        .unwrap()
+        .unwrap();
+    let repeat = fake
+        .reply(
+            "consent.request",
+            &vector_json("macos-repeat-request.json")["params"],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, repeat);
+    let id = decode_elicitation_id(&first).unwrap();
+    assert!(
+        matches!(fake.reply("consent.await", &json!({"elicitation_id":id,"timeout_ms":0})), Err(ConsentError::Refused { code, .. }) if code == "access_informational")
+    );
+    let mut unknown = vector_json("macos-open-request.json")["params"].clone();
+    unknown["call_key"] = json!("forbidden");
+    assert!(
+        matches!(fake.reply("consent.request", &unknown), Err(ConsentError::Refused { code, .. }) if code == "elicitation_invalid_request")
+    );
+    fake.reply("consent.withdraw", &json!({"elicitation_id":id}))
+        .unwrap();
+    let reopened = fake
+        .reply(
+            "consent.request",
+            &vector_json("macos-open-request.json")["params"],
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(first, reopened);
+}
+
+#[tokio::test]
+async fn macos_platform_refusal_is_named_and_drops_unpublished_card() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    f.fake.state.lock().unwrap().macos = false;
+    let db = f.ctx.db().unwrap();
+    let error = macos_permissions(
+        Arc::clone(&db),
+        f.head.clone(),
+        vec![crate::bounded_io::PermissionObservation {
+            folder: f.dir.path().join("protected"),
+            readable: false,
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ConsentError::Refused { code, .. } if code == "access_macos_only"));
+    assert!(f.fake.calls("consent.await").is_empty());
+    let count: u64 = db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM macos_permission_cards", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[cfg(unix)]
+struct BlockedMacosCard {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(unix)]
+impl ConsentTransport for BlockedMacosCard {
+    fn call(&self, call: ConsentCall) -> ConsentFuture {
+        let started = Arc::clone(&self.started);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            assert_eq!(
+                call.method, "consent.request",
+                "an informational card must never be awaited"
+            );
+            assert!(matches!(
+                FakeAccessRequest::decode(&call.params)?,
+                FakeAccessRequest::MacosPermission { .. }
+            ));
+            started.notify_one();
+            release.notified().await;
+            Err(fake_refusal(
+                "access_macos_only",
+                "the service is not running on macOS",
+            ))
+        })
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn macos_blocked_or_refused_card_does_not_block_or_replace_tool_denial() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"full-access"}}),
+        &f.head,
+        &f.ctx,
+    )
+    .unwrap();
+    let folder = crate::access_policy::policy_path(&f.dir.path().join("protected"));
+    std::fs::create_dir(&folder).unwrap();
+    let target = folder.join("file.txt");
+    std::fs::write(&target, "protected bytes").unwrap();
+    let _probe = crate::bounded_io::tests::deny_macos_directory(&folder);
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    install_test_transport(Some(Arc::new(BlockedMacosCard {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    })));
+    let reply = f.read(&f.worker, &target, 7).await;
+    assert_eq!(code(&reply), "macos_permission_denied", "{reply}");
+    assert!(!text(&reply).contains("protected bytes"));
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("card request starts independently of the completed tool call");
+    let db = f.ctx.db().unwrap();
+    let count = || {
+        db.lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM macos_permission_cards", [], |r| {
+                r.get::<_, u64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        count(),
+        1,
+        "the tool already replied while the card request is blocked"
+    );
+    release.notify_one();
+    wait_for(|| count() == 0).await;
+    assert_eq!(code(&reply), "macos_permission_denied");
 }

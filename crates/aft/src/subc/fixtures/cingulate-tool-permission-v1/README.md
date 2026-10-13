@@ -21,3 +21,16 @@ files in `consent_tests.rs`:
 To update, copy the directory again from the Cingulate commit that changes the
 contract, update the commit named above, and rerun
 `cargo test -p agent-file-tools --lib -- consent_vectors`.
+
+## macOS informational-card pin
+
+`macos-open-request.json`, `macos-repeat-request.json` and
+`phone-macos-reply.json` were additionally copied byte for byte from Cingulate
+commit `6bb5f4d`. Their hashes are unchanged from the original corpus manifest.
+The closed request decoder at `crates/cingulate-decode/src/access.rs` and the
+contract at `docs/contracts/consent-requester-v2.md:115-121` at that pin require
+exactly `kind`, `folder`, `program` and `steps`: no `call_key`. Cingulate returns
+one open id per `(folder, program)`; informational cards cannot be awaited.
+
+The macOS vector tests check exact encoded request bytes, repeat-id semantics,
+strict unknown-field rejection, and the phone projection's empty options.

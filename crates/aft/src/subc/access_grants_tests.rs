@@ -42,6 +42,9 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     let work = dir.path().join("worker");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&work).unwrap();
+    // Policy decisions take canonical paths, including macOS's /var alias.
+    let root = root.canonicalize().unwrap();
+    let work = work.canonicalize().unwrap();
     let ctx = context(&root, &dir.path().join("store"));
     let head = identity(&root, "head", "head", None);
     let worker = identity(&work, "worker", "worker", Some("head"));

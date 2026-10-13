@@ -747,6 +747,12 @@ pub(super) fn decode_elicitation_id(result: &Value) -> Result<String, ConsentErr
 /// access. `refused:<code>` (withdrawn, head gone) grants nothing, and the held
 /// call ends with that `<code>` as its error code.
 pub(super) fn decode_record(record: &Value) -> Result<Settlement, ConsentError> {
+    if record.get("kind").and_then(Value::as_str) == Some("macos_permission") {
+        return Err(ConsentError::Refused {
+            code: "access_informational".into(),
+            message: "macOS permission cards are informational and cannot be awaited".into(),
+        });
+    }
     let field = |name: &str| record.get(name).and_then(Value::as_str);
     let state = field("state").ok_or_else(|| malformed("the record has no state"))?;
     match state {
@@ -1260,6 +1266,10 @@ mod tests;
 // concurrent probes from publishing two cards or withdrawing an unrecorded id.
 static MACOS_CARDS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn macos_request_params(folder: &str, program: &str, steps: &str) -> Value {
+    json!({"kind":"macos_permission","folder":folder,"program":program,"steps":steps})
+}
+
 pub(super) async fn macos_permissions(
     db: Arc<StdMutex<crate::db::TrackedConnection>>,
     identity: RouteIdentity,
@@ -1280,29 +1290,32 @@ pub(super) async fn macos_permissions(
     let program = "ck-aft";
     for observation in observations {
         let folder = observation.folder.to_string_lossy().into_owned();
-        let row: Option<(String, String, String, String, Option<String>)> = {
+        let row: Option<(String, String, String, Option<String>)> = {
             let conn = db
                 .lock()
                 .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
             if !observation.readable {
-                conn.execute("INSERT OR IGNORE INTO macos_permission_cards(folder,program,call_key,selector,project_root,session) VALUES (?1,?2,?3,?4,?5,?6)", params![folder,program,new_call_key(),serde_json::to_string(&selector(stamp)).expect("selector serializes"),identity.project_root.to_string_lossy(),identity.session])
+                // The existing database column is not a wire idempotency key:
+                // informational cards use only the folder/program pair.
+                conn.execute("INSERT OR IGNORE INTO macos_permission_cards(folder,program,call_key,selector,project_root,session) VALUES (?1,?2,'',?3,?4,?5)", params![folder,program,serde_json::to_string(&selector(stamp)).expect("selector serializes"),identity.project_root.to_string_lossy(),identity.session])
                     .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
             }
-            conn.query_row("SELECT call_key,selector,project_root,session,elicitation_id FROM macos_permission_cards WHERE folder=?1 AND program=?2", params![folder,program], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()
+            conn.query_row("SELECT selector,project_root,session,elicitation_id FROM macos_permission_cards WHERE folder=?1 AND program=?2", params![folder,program], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()
                 .map_err(|e| ConsentError::Unavailable(e.to_string()))?
         };
-        let Some((key, scope, root, session, id)) = row else {
+        let Some((scope, root, session, id)) = row else {
             continue;
         };
         let scope: ScopeSelector =
             serde_json::from_str(&scope).map_err(|e| ConsentError::Unavailable(e.to_string()))?;
-        // If a request lost its reply, resend the call_key stored in
-        // macos_permission_cards to recover the same Cingulate elicitation id.
-        // Readable-again observations must recover that id before withdrawing.
+        // Cingulate deduplicates informational cards by (folder, program), not
+        // call_key. If consent.request lost its response, resending that pair
+        // recovers the open elicitation id. A folder that can now be read uses
+        // that id to withdraw its existing card.
         let id = match id {
             Some(id) => id,
             None => {
-                let params = json!({"kind":"macos_permission","call_key":key,"folder":folder,"program":program,"steps":"System Settings → Privacy & Security → Files and Folders: allow ck-aft access to this folder, then retry."});
+                let params = macos_request_params(&folder, program, "System Settings → Privacy & Security → Files and Folders: allow ck-aft access to this folder, then retry.");
                 let result = tokio::time::timeout(
                     UNARY_TIMEOUT,
                     transport.call(ConsentCall {
@@ -1317,7 +1330,20 @@ pub(super) async fn macos_permissions(
                 .await
                 .map_err(|_| {
                     ConsentError::Unavailable("macOS permission card request timed out".into())
-                })??;
+                })?;
+                let result = match result {
+                    Err(error @ ConsentError::Refused { .. }) if matches!(&error, ConsentError::Refused { code, .. } if code == "access_macos_only" || code == "access_informational") =>
+                    {
+                        // access_macos_only and access_informational cannot
+                        // produce a permission answer. Remove the unpublished
+                        // local row and preserve the named refusal for logging,
+                        // without changing the tool's macos_permission_denied result.
+                        db.lock().map_err(|e| ConsentError::Unavailable(e.to_string()))?.execute("DELETE FROM macos_permission_cards WHERE folder=?1 AND program=?2 AND elicitation_id IS NULL", params![folder,program])
+                            .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
+                        return Err(error);
+                    }
+                    result => result?,
+                };
                 let id = decode_elicitation_id(&result)?;
                 db.lock().map_err(|e| ConsentError::Unavailable(e.to_string()))?.execute("UPDATE macos_permission_cards SET elicitation_id=?3 WHERE folder=?1 AND program=?2", params![folder,program,id])
                     .map_err(|e| ConsentError::Unavailable(e.to_string()))?;
