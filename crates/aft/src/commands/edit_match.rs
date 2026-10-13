@@ -238,7 +238,6 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     };
 
     // Capture the original text for the host's unified diff.
-    let want_diff = edit::wants_diff(&req.params);
     let before_content = if existed {
         std::fs::read_to_string(path.as_path()).unwrap_or_default()
     } else {
@@ -354,14 +353,6 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         result["no_op"] = serde_json::json!(true);
     }
 
-    if want_diff {
-        // For new files, before-content is empty; compute_diff_info handles
-        // that correctly (additions = number of lines in append_content).
-        // Diff reflects post-format content because we re-read after format.
-        result["diff"] =
-            edit::compute_diff_for_response(&req.params, &before_content, &final_content);
-    }
-
     // Reuse the standard WriteResult formatter so append's response carries
     // the same `lsp_diagnostics`, `lsp_complete`, `lsp_pending_servers`, and
     // `lsp_exited_servers` shape as `write` and `edit_match` find/replace.
@@ -378,6 +369,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             // false until/unless append gains the same rollback flow.
             rolled_back: false,
             lsp_outcome,
+            final_text: None,
             reformatted_excerpt: edit::compute_reformatted_excerpt(
                 &format!("{before_content}{append_content}"),
                 &final_content,
@@ -387,7 +379,13 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         write_result.append_reformatted_excerpt_to(&mut result);
     }
 
-    edit::attach_mutation_diff(&mut result, file, &before_content, &final_content);
+    edit::attach_edit_diff(
+        &mut result,
+        &req.params,
+        file,
+        &before_content,
+        &final_content,
+    );
     Response::success(&req.id, result)
 }
 
@@ -546,14 +544,15 @@ fn handle_glob_edit_match(
         let files = pending
             .iter()
             .map(|edit| {
-                let diff = edit::compute_diff_info(&edit.original_source, &edit.new_source);
-                additions += diff.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                deletions += diff.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                preview_diff.push_str(&edit::build_unified_diff(
+                let (patch, diff) = edit::response_diff(
+                    &serde_json::json!({"include_diff_content": true}),
                     &edit.file_str,
                     &edit.original_source,
                     &edit.new_source,
-                ));
+                );
+                additions += diff.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                deletions += diff.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                preview_diff.push_str(&patch);
                 if !preview_diff.ends_with('\n') {
                     preview_diff.push('\n');
                 }
@@ -1167,7 +1166,7 @@ fn handle_single_file_edit_match(
         );
     }
 
-    let source = match std::fs::read_to_string(&path) {
+    let (source, observation) = match edit::read_edit_source(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
@@ -1227,12 +1226,13 @@ fn handle_single_file_edit_match(
 
     // Multiple matches without occurrence selector → disambiguation (unless replace_all)
     if positions.len() > 1 && occurrence.is_none() && !replace_all {
+        let line_index = edit::SourceLineIndex::new(&source);
         let occurrences: Vec<serde_json::Value> = positions
             .iter()
             .enumerate()
             .map(|(idx, &byte_pos)| {
-                let line = source[..byte_pos].matches('\n').count();
-                let context = build_context(&source, line, 2);
+                let line = line_index.line_at(byte_pos);
+                let context = line_index.context(line, 2);
                 serde_json::json!({
                     "occurrence": idx + 1,
                     "line": line + 1,
@@ -1343,8 +1343,14 @@ fn handle_single_file_edit_match(
     } else {
         format!("edit_match: {}", match_str)
     };
-    let backup_id = match edit::auto_backup(ctx, req.session(), path.as_path(), &label, Some(op_id))
-    {
+    let backup_id = match edit::auto_backup_observed(
+        ctx,
+        req.session(),
+        path.as_path(),
+        &label,
+        Some(op_id),
+        &observation,
+    ) {
         Ok(id) => id,
         Err(e) => {
             return Response::error(&req.id, e.code(), e.to_string());
@@ -1352,11 +1358,13 @@ fn handle_single_file_edit_match(
     };
 
     // Write, format, and validate via shared pipeline
-    let mut write_result = match edit::write_format_validate(
+    let mut write_result = match edit::write_format_validate_observed(
         path.as_path(),
         &new_source,
         &ctx.config(),
         &req.params,
+        &source,
+        &observation,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -1370,8 +1378,8 @@ fn handle_single_file_edit_match(
             .discard_operation_entries(req.session(), op_id);
     }
 
-    if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
-        write_result.lsp_outcome = ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
+    if let Some(final_content) = write_result.final_content(path.as_path()) {
+        write_result.lsp_outcome = ctx.lsp_post_write(path.as_path(), final_content, &req.params);
     }
 
     log::debug!("edit_match: {} in {}", match_str, file);
@@ -1429,25 +1437,13 @@ fn handle_single_file_edit_match(
     // The match was satisfied (replacements > 0) but no net change landed.
     // Pi/OpenCode UIs use this to render "matched but no change" instead of
     // a bare `+0/-0` that looks like a tool failure (see GitHub #45).
-    let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| new_source);
+    let final_content = write_result.final_content(&path).unwrap_or(&new_source);
     if source == final_content {
         result["no_op"] = serde_json::json!(true);
     }
 
-    if edit::wants_diff(&req.params) {
-        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
-    }
-
-    edit::attach_mutation_diff(&mut result, file, &source, &final_content);
+    edit::attach_edit_diff(&mut result, &req.params, file, &source, &final_content);
     Response::success(&req.id, result)
-}
-
-/// Build a context string showing the target line ± `margin` lines.
-fn build_context(source: &str, target_line: usize, margin: usize) -> String {
-    let lines: Vec<&str> = source.lines().collect();
-    let start = target_line.saturating_sub(margin);
-    let end = (target_line + margin + 1).min(lines.len());
-    lines[start..end].join("\n")
 }
 
 #[cfg(test)]

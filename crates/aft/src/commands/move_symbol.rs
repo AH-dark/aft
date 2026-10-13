@@ -1121,6 +1121,38 @@ fn collect_ts_js_files(root: &Path, out: &mut Vec<PathBuf>, source_path: &Path, 
     }
 }
 
+/// Skip parsing a project file only if none of its quoted strings can name
+/// the file being moved from. Check every adjacent pair of like quotes, even
+/// in comments: guessing where strings begin could hide a real import path.
+/// Backslashes or template strings require tree-sitter parsing instead. Quoted
+/// paths use the import rewriter's existing index-file, extension and path
+/// normalization rules; the canonicalizing project walk is unchanged.
+fn may_reference_source(content: &str, consumer_file: &Path, source_file: &Path) -> bool {
+    #[cfg(test)]
+    if MOVE_EXHAUSTIVE_PROBE.with(|force| force.get()) {
+        return true;
+    }
+    if content.contains(['\\', '`']) {
+        return true;
+    }
+    let mut previous = [None, None];
+    for (offset, byte) in content.bytes().enumerate() {
+        let slot = match byte {
+            b'\'' => 0,
+            b'"' => 1,
+            _ => continue,
+        };
+        if let Some(start) = previous[slot] {
+            let candidate = &content[start + 1..offset];
+            if import_path_matches_file(candidate, consumer_file, source_file) {
+                return true;
+            }
+        }
+        previous[slot] = Some(offset);
+    }
+    false
+}
+
 /// Rewrite imports and supported namespace-member references to the destination.
 /// Unsupported namespace usage is returned so the caller can reject before any write.
 fn rewrite_consumer_imports(
@@ -1149,6 +1181,12 @@ fn rewrite_consumer_imports(
     if !consumer_content.contains("import")
         && !consumer_content.contains("export")
         && !paths_equivalent(consumer_file, source_file)
+    {
+        return Ok(None);
+    }
+
+    if !paths_equivalent(consumer_file, source_file)
+        && !may_reference_source(consumer_content, consumer_file, source_file)
     {
         return Ok(None);
     }
@@ -1811,6 +1849,7 @@ fn parse_imports_from_content(
 #[cfg(test)]
 thread_local! {
     static MOVE_CONSUMER_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MOVE_EXHAUSTIVE_PROBE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn build_add_moved_import_edit(
@@ -2623,6 +2662,282 @@ mod tests {
         let from = Path::new("src/components/Button.ts");
         let to = Path::new("src/components/utils.ts");
         assert_eq!(compute_relative_import_path(from, to), "./utils");
+    }
+
+    #[test]
+    #[ignore = "release-only same-input exhaustive/filtered discovery timing"]
+    fn a03_release_move_measurements() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("module/index.ts");
+        let dest = root.path().join("dest.ts");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "export function moved() {}\n").unwrap();
+        std::fs::write(&dest, "").unwrap();
+        let true_consumer = root.path().join("consumer.ts");
+        std::fs::write(
+            &true_consumer,
+            "import { moved as alias } from './module';\nalias();\n",
+        )
+        .unwrap();
+        for count in [1_000, 5_000, 20_000] {
+            for i in 0..count {
+                std::fs::write(
+                    root.path().join(format!("f{i:05}.ts")),
+                    "import { other } from './unrelated';\nexport const value = other;\n",
+                )
+                .unwrap();
+            }
+            let mut baseline = None;
+            for exhaustive in [true, false] {
+                MOVE_EXHAUSTIVE_PROBE.with(|force| force.set(exhaustive));
+                MOVE_CONSUMER_PARSES.with(|count| count.set(0));
+                let start = std::time::Instant::now();
+                let mut paths = Vec::new();
+                collect_ts_js_files(root.path(), &mut paths, &source, &dest);
+                paths.sort();
+                paths.dedup();
+                let scan = start.elapsed();
+                let mut read = std::time::Duration::ZERO;
+                let mut rewrite = std::time::Duration::ZERO;
+                let mut results = Vec::new();
+                for path in &paths {
+                    let start = std::time::Instant::now();
+                    let (_, text) = CapturedRegularFile::read_text(path).unwrap().unwrap();
+                    read += start.elapsed();
+                    let start = std::time::Instant::now();
+                    let result = rewrite_consumer_imports(
+                        &text,
+                        path,
+                        &source,
+                        &dest,
+                        "moved",
+                        Some(LangId::TypeScript),
+                        false,
+                        root.path(),
+                    );
+                    results.push(result);
+                    rewrite += start.elapsed();
+                }
+                let parses = MOVE_CONSUMER_PARSES.with(|count| count.get());
+                eprintln!("A03 move same-input modules={count} exhaustive={exhaustive} reads={} parses={parses} scan={scan:?} read={read:?} rewrite={rewrite:?}", paths.len());
+                assert_eq!(parses, if exhaustive { count + 1 } else { 1 });
+                assert_eq!(
+                    results.iter().filter(|r| matches!(r, Ok(Some(_)))).count(),
+                    1
+                );
+                if let Some(baseline) = baseline.as_ref() {
+                    assert_eq!(&results, baseline);
+                } else {
+                    baseline = Some(results);
+                }
+            }
+            MOVE_EXHAUSTIVE_PROBE.with(|force| force.set(false));
+        }
+    }
+
+    #[test]
+    fn a03_move_module_parse_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("module/index.ts");
+        let dest = root.path().join("dest.ts");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "export function moved() {}\n").unwrap();
+        std::fs::write(&dest, "").unwrap();
+        let mut observed = Vec::new();
+        for count in [1_000, 5_000, 20_000] {
+            for i in 0..count {
+                std::fs::write(
+                    root.path().join(format!("f{i:05}.ts")),
+                    "import { other } from './unrelated';\nexport const value = other;\n",
+                )
+                .unwrap();
+            }
+            let start = std::time::Instant::now();
+            let mut candidates = Vec::new();
+            collect_ts_js_files(root.path(), &mut candidates, &source, &dest);
+            candidates.sort();
+            candidates.dedup();
+            let scan = start.elapsed();
+            let mut read_time = std::time::Duration::ZERO;
+            let mut parse_time = std::time::Duration::ZERO;
+            MOVE_CONSUMER_PARSES.with(|counter| counter.set(0));
+            for path in &candidates {
+                let start = std::time::Instant::now();
+                let (_, content) = CapturedRegularFile::read_text(path).unwrap().unwrap();
+                read_time += start.elapsed();
+                let start = std::time::Instant::now();
+                assert_eq!(
+                    rewrite_consumer_imports(
+                        &content,
+                        path,
+                        &source,
+                        &dest,
+                        "moved",
+                        Some(LangId::TypeScript),
+                        false,
+                        root.path()
+                    ),
+                    Ok(None)
+                );
+                parse_time += start.elapsed();
+            }
+            let parses = MOVE_CONSUMER_PARSES.with(|counter| counter.get());
+            eprintln!("A03 move modules={count} reads={} parses={parses} scan={scan:?} read={read_time:?} rewrite={parse_time:?}", candidates.len());
+            assert_eq!(candidates.len(), count);
+            observed.push(parses);
+        }
+        assert_eq!(
+            observed,
+            [0, 0, 0],
+            "unrelated modules do not need a tree-sitter parse"
+        );
+    }
+
+    #[test]
+    fn a03_move_filter_complete_consumers_and_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("module/index.ts");
+        let dest = root.path().join("dest.ts");
+        let consumer = root.path().join("consumer.ts");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "export function moved() {}\n").unwrap();
+        std::fs::write(&dest, "").unwrap();
+        let fixtures = [
+            (
+                "import { moved as alias } from './module';\nalias();\n",
+                "import { moved as alias } from './dest';\nalias();\n",
+            ),
+            (
+                "export { moved as alias } from './module/index.ts';\n",
+                "export { moved as alias } from './dest';\n",
+            ),
+            (
+                "/* ' odd comment */ import { moved } from './module';\nmoved();\n",
+                "/* ' odd comment */ import { moved } from './dest';\nmoved();\n",
+            ),
+            (
+                "/* \" ' */ import { moved } from \"./module\";\nmoved();\n",
+                "/* \" ' */ import { moved } from \"./dest\";\nmoved();\n",
+            ),
+        ];
+        for (input, expected) in fixtures {
+            assert!(may_reference_source(input, &consumer, &source));
+            assert_eq!(
+                rewrite_consumer_imports(
+                    input,
+                    &consumer,
+                    &source,
+                    &dest,
+                    "moved",
+                    Some(LangId::TypeScript),
+                    false,
+                    root.path()
+                )
+                .unwrap()
+                .unwrap(),
+                expected
+            );
+        }
+        for input in [
+            "import './other'; const value = `template`;",
+            "import './other'; const value = '\\n';",
+        ] {
+            assert!(may_reference_source(input, &consumer, &source));
+            MOVE_CONSUMER_PARSES.with(|count| count.set(0));
+            assert_eq!(
+                rewrite_consumer_imports(
+                    input,
+                    &consumer,
+                    &source,
+                    &dest,
+                    "moved",
+                    Some(LangId::TypeScript),
+                    false,
+                    root.path()
+                ),
+                Ok(None)
+            );
+            assert_eq!(
+                MOVE_CONSUMER_PARSES.with(|count| count.get()),
+                1,
+                "uncertain text uses exhaustive parser fallback"
+            );
+        }
+        std::fs::create_dir_all(root.path().join(".hidden")).unwrap();
+        let hidden = root.path().join(".hidden/consumer.ts");
+        std::fs::write(&hidden, "import { moved } from '../module';\nmoved();\n").unwrap();
+        let mut files = Vec::new();
+        collect_ts_js_files(root.path(), &mut files, &source, &dest);
+        files.sort();
+        files.dedup();
+        assert_eq!(files, vec![hidden.clone()]);
+        let content = std::fs::read_to_string(&hidden).unwrap();
+        assert_eq!(
+            rewrite_consumer_imports(
+                &content,
+                &hidden,
+                &source,
+                &dest,
+                "moved",
+                Some(LangId::TypeScript),
+                false,
+                root.path()
+            )
+            .unwrap()
+            .unwrap(),
+            "import { moved } from '../dest';\nmoved();\n"
+        );
+        // Each attempt examines the newly supplied contents, rather than
+        // remembering an earlier no-match result for the same file.
+        std::fs::write(&hidden, "export { moved } from '../module';\n").unwrap();
+        let content = std::fs::read_to_string(&hidden).unwrap();
+        assert_eq!(
+            rewrite_consumer_imports(
+                &content,
+                &hidden,
+                &source,
+                &dest,
+                "moved",
+                Some(LangId::TypeScript),
+                false,
+                root.path()
+            )
+            .unwrap()
+            .unwrap(),
+            "export { moved } from '../dest';\n"
+        );
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias.ts");
+            std::os::unix::fs::symlink(&source, &alias).unwrap();
+            let input = "import { moved } from './alias';";
+            MOVE_EXHAUSTIVE_PROBE.with(|force| force.set(true));
+            let baseline = rewrite_consumer_imports(
+                input,
+                &consumer,
+                &source,
+                &dest,
+                "moved",
+                Some(LangId::TypeScript),
+                false,
+                root.path(),
+            );
+            MOVE_EXHAUSTIVE_PROBE.with(|force| force.set(false));
+            assert_eq!(baseline, Ok(None));
+            assert_eq!(
+                rewrite_consumer_imports(
+                    input,
+                    &consumer,
+                    &source,
+                    &dest,
+                    "moved",
+                    Some(LangId::TypeScript),
+                    false,
+                    root.path()
+                ),
+                baseline
+            );
+        }
     }
 
     #[test]

@@ -181,7 +181,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let target = &filtered[0].symbol;
 
     // Read file content
-    let source = match std::fs::read_to_string(&path) {
+    let (source, observation) = match edit::read_edit_source(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
@@ -304,12 +304,13 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let _view_intent = crate::views::intent::record_paths([path.as_path()]);
 
     // Auto-backup before writing
-    let backup_id = match edit::auto_backup(
+    let backup_id = match edit::auto_backup_observed(
         ctx,
         req.session(),
         &path,
         &format!("edit_symbol: {} {}", operation, symbol_name),
         Some(&op_id),
+        &observation,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -318,16 +319,22 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Write, format, and validate via shared pipeline
-    let mut write_result =
-        match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let mut write_result = match edit::write_format_validate_observed(
+        &path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+        &source,
+        &observation,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
-    if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
+    if let Some(final_content) = write_result.final_content(&path) {
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, final_content, &req.params);
     }
 
     log::debug!("edit_symbol: {} in {}", symbol_name, file);
@@ -399,7 +406,7 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Include surrounding context for replace/insert ops so the agent can
     // detect issues like duplicated attributes or misplaced decorators.
     if operation == "replace" || operation == "insert_before" || operation == "insert_after" {
-        if let Ok(new_content) = std::fs::read_to_string(&path) {
+        if let Some(new_content) = write_result.final_content(&path) {
             let lines: Vec<&str> = new_content.lines().collect();
             let start = original_range.start_line as usize;
             let context_before: Vec<&str> = if start >= 3 {
@@ -431,16 +438,12 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // Honest reporting: when the symbol replacement produced byte-identical
     // file content (e.g. replacing a symbol with its own body, or formatter
     // normalized the change away), surface `no_op: true`. See GitHub #45.
-    let final_content = std::fs::read_to_string(&path).unwrap_or_default();
+    let final_content = write_result.final_content(&path).unwrap_or_default();
     if source == final_content {
         result["no_op"] = serde_json::json!(true);
     }
 
-    if edit::wants_diff(&req.params) {
-        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
-    }
-
-    edit::attach_mutation_diff(&mut result, file, &source, &final_content);
+    edit::attach_edit_diff(&mut result, &req.params, file, &source, final_content);
     Response::success(&req.id, result)
 }
 

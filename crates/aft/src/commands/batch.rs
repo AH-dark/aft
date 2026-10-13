@@ -75,7 +75,7 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
 
-    let source = match std::fs::read_to_string(&path) {
+    let (source, observation) = match edit::read_edit_source(&path) {
         Ok(s) => s,
         Err(e) => {
             return Response::error(&req.id, "file_not_found", format!("{}: {}", file, e));
@@ -118,17 +118,11 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    // Phase 4: Apply all edits sequentially to the content
-    let mut content = source.clone();
-    for r in &resolved {
-        content = match edit::replace_byte_range(&content, r.byte_start, r.byte_end, &r.replacement)
-        {
-            Ok(updated) => updated,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
-    }
+    // Construct the final output in original-range order.
+    let content = match build_batch_output(&source, &resolved) {
+        Ok(content) => content,
+        Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+    };
 
     if edit::wants_preview(&req.params) {
         let mut result = serde_json::json!({
@@ -151,12 +145,13 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Phase 5: Auto-backup once before applying
-    let backup_id = match edit::auto_backup(
+    let backup_id = match edit::auto_backup_observed(
         ctx,
         req.session(),
         &path,
         "batch: pre-batch backup",
         Some(&op_id),
+        &observation,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -165,16 +160,22 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Phase 6: Write, format, and validate via shared pipeline
-    let mut write_result =
-        match edit::write_format_validate(&path, &content, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                return Response::error(&req.id, e.code(), e.to_string());
-            }
-        };
+    let mut write_result = match edit::write_format_validate_observed(
+        &path,
+        &content,
+        &ctx.config(),
+        &req.params,
+        &source,
+        &observation,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
-    if let Ok(final_content) = std::fs::read_to_string(&path) {
-        write_result.lsp_outcome = ctx.lsp_post_write(&path, &final_content, &req.params);
+    if let Some(final_content) = write_result.final_content(&path) {
+        write_result.lsp_outcome = ctx.lsp_post_write(&path, final_content, &req.params);
     }
 
     log::debug!("batch: {} edits in {}", edits.len(), file);
@@ -187,16 +188,6 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if !fuzzy_matches.is_empty() {
         result["fuzzy_matches"] = serde_json::json!(fuzzy_matches);
-    }
-
-    // Aggregate diff counts across all applied edits, computed from the
-    // original source vs the final (post-format) on-disk content. Without
-    // this, batch responses reported `edits_applied` but +0/-0, so the
-    // agent-facing summary said "Edited (+0/-0, N edits)" even when content
-    // changed. Mirrors the edit_match find/replace path.
-    if edit::wants_diff(&req.params) {
-        let final_content = std::fs::read_to_string(&path).unwrap_or_else(|_| content.clone());
-        result["diff"] = edit::compute_diff_for_response(&req.params, &source, &final_content);
     }
 
     if let Some(valid) = write_result.syntax_valid {
@@ -227,21 +218,33 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);
-    edit::attach_mutation_diff(
-        &mut result,
-        file,
-        &source,
-        &std::fs::read_to_string(&path).unwrap_or(content),
-    );
+    let final_content = write_result.final_content(&path).unwrap_or(&content);
+    edit::attach_edit_diff(&mut result, &req.params, file, &source, final_content);
     Response::success(&req.id, result)
 }
 
-/// Build the context shown for one ambiguous match.
-fn build_context(source: &str, target_line: usize, margin: usize) -> String {
-    let lines: Vec<&str> = source.lines().collect();
-    let start = target_line.saturating_sub(margin);
-    let end = (target_line + margin + 1).min(lines.len());
-    lines[start..end].join("\n")
+fn build_batch_output(
+    source: &str,
+    resolved: &[ResolvedEdit],
+) -> Result<String, crate::error::AftError> {
+    let mut output_len = source.len();
+    for r in resolved {
+        edit::validate_byte_range(source, r.byte_start, r.byte_end)?;
+        output_len = output_len - (r.byte_end - r.byte_start) + r.replacement.len();
+    }
+    #[cfg(test)]
+    BATCH_OUTPUT_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+    let mut output = String::with_capacity(output_len);
+    let mut cursor = 0;
+    // Reverse the stable descending sort, including ties: the last insertion
+    // applied at an offset appears first in the old bottom-to-top result.
+    for r in resolved.iter().rev() {
+        output.push_str(&source[cursor..r.byte_start]);
+        output.push_str(&r.replacement);
+        cursor = r.byte_end;
+    }
+    output.push_str(&source[cursor..]);
+    Ok(output)
 }
 
 /// Resolve a single edit object to byte offsets against the original source.
@@ -398,12 +401,13 @@ fn resolve_edit(
         }
 
         if fuzzy_matches.len() > 1 {
+            let line_index = edit::SourceLineIndex::new(source);
             let occurrences: Vec<serde_json::Value> = fuzzy_matches
                 .iter()
                 .enumerate()
                 .map(|(occurrence_index, matched)| {
-                    let line = source[..matched.byte_start].matches('\n').count();
-                    let context = build_context(source, line, 2);
+                    let line = line_index.line_at(matched.byte_start);
+                    let context = line_index.context(line, 2);
                     serde_json::json!({
                         "occurrence": occurrence_index + 1,
                         "line": line + 1,
@@ -602,5 +606,402 @@ fn resolve_edit(
                 index
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BATCH_OUTPUT_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod a03_tests {
+    use super::*;
+    use crate::{config::Config, language::StubProvider};
+
+    fn request(file: &Path, edits: Value, preview: bool) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "a03", "command": "batch", "file": file,
+            "edits": edits, "preview": preview, "include_diff_content": true
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a03_batch_output_allocation_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.txt");
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let mut observed = Vec::new();
+        for count in [1, 100, 2_000] {
+            let source = format!("{}{}", "TARGET\n".repeat(count), "z".repeat(1024 * 1024));
+            std::fs::write(&path, &source).unwrap();
+            BATCH_OUTPUT_ALLOCATIONS.with(|counter| counter.set(0));
+            let start = std::time::Instant::now();
+            let response = handle_batch(
+                &request(
+                    &path,
+                    serde_json::json!([
+                        {"match": "TARGET", "replacement": "é", "replace_all": true}
+                    ]),
+                    true,
+                ),
+                &ctx,
+            );
+            let elapsed = start.elapsed();
+            assert!(response.success, "{:?}", response);
+            let expected = format!("{}{}", "é\n".repeat(count), "z".repeat(1024 * 1024));
+            assert_eq!(
+                response.data["metadata"]["diff"],
+                edit::build_unified_diff(path.to_str().unwrap(), &source, &expected)
+            );
+            let allocations = BATCH_OUTPUT_ALLOCATIONS.with(|counter| counter.get());
+            eprintln!(
+                "A03 batch matches={count}: output allocations={allocations} elapsed={elapsed:?}"
+            );
+            observed.push(allocations);
+        }
+        assert_eq!(
+            observed,
+            [1, 1, 1],
+            "one batch output allocation per request"
+        );
+    }
+
+    #[test]
+    fn a03_ambiguity_one_index_pass() {
+        let mut observed = Vec::new();
+        for count in [2, 8, 9, 20_000] {
+            let source = format!("{}end", "é TARGET long context\r\n".repeat(count));
+            edit::A03_LINE_INDEX_PASSES.with(|counter| counter.set(0));
+            let response = resolve_edit(
+                &source,
+                &serde_json::json!({"match": "TARGET", "replacement": "x"}),
+                0,
+                "a03",
+            )
+            .err()
+            .unwrap();
+            let occurrences = &response.data["occurrences"];
+            let lines: Vec<_> = source.lines().collect();
+            let expected: Vec<_> = (0..count).map(|line| serde_json::json!({
+                "occurrence": line + 1, "line": line + 1,
+                "context": lines[line.saturating_sub(2)..(line+3).min(lines.len())].join("\n")
+            })).collect();
+            assert_eq!(occurrences, &serde_json::json!(expected));
+            let passes = edit::A03_LINE_INDEX_PASSES.with(|counter| counter.get());
+            eprintln!("A03 ambiguity matches={count}: index passes={passes}");
+            observed.push(passes);
+        }
+        assert_eq!(
+            observed,
+            [1, 1, 1, 1],
+            "one source index for all ambiguity entries"
+        );
+    }
+
+    #[test]
+    fn a03_batch_builder_edge_goldens() {
+        for (source, descending, expected) in [
+            ("abcdef", vec![(4, 6, "世界"), (1, 3, "")], "ad世界"),
+            ("aé中z", vec![(3, 6, "🙂🙂"), (0, 1, "long")], "longé🙂🙂z"),
+            (
+                "abc",
+                vec![(1, 1, "FIRST"), (1, 1, "SECOND")],
+                "aSECONDFIRSTbc",
+            ),
+            ("abc", vec![(1, 2, "R"), (1, 1, "I")], "aIRc"),
+            ("", vec![(0, 0, "A"), (0, 0, "B")], "BA"),
+        ] {
+            let resolved: Vec<_> = descending
+                .into_iter()
+                .map(|(byte_start, byte_end, replacement)| ResolvedEdit {
+                    byte_start,
+                    byte_end,
+                    replacement: replacement.into(),
+                    fuzzy_match: None,
+                })
+                .collect();
+            assert_eq!(build_batch_output(source, &resolved).unwrap(), expected);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fuzzy.txt");
+        std::fs::write(&path, "  TARGET  \r\nsecond\n").unwrap();
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let response = handle_batch(
+            &request(
+                &path,
+                serde_json::json!([{"match": "TARGET", "replacement": "grow\nmore"}]),
+                true,
+            ),
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response);
+        // The exact substring pass preserves whitespace and the original CRLF.
+        assert_eq!(response.data["diff"]["after"], "  grow\nmore  \r\nsecond\n");
+        let source = "  TARGET  \r\n  NEXT  \r\nend\n";
+        std::fs::write(&path, source).unwrap();
+        let response = handle_batch(
+            &request(
+                &path,
+                serde_json::json!([{"match": "TARGET\nNEXT", "replacement": "é"}]),
+                true,
+            ),
+            &ctx,
+        );
+        assert!(response.success, "{:?}", response);
+        let mut frozen = resolve_edit(
+            source,
+            &serde_json::json!({"match": "TARGET\nNEXT", "replacement": "é"}),
+            0,
+            "golden",
+        )
+        .unwrap_or_else(|_| panic!("fuzzy fixture must resolve"));
+        frozen.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+        let mut legacy = source.to_owned();
+        for r in frozen {
+            legacy = edit::replace_byte_range(&legacy, r.byte_start, r.byte_end, &r.replacement)
+                .unwrap();
+        }
+        assert_eq!(legacy, "  é  \r\nend\n");
+        assert_eq!(response.data["diff"]["after"], legacy);
+    }
+
+    #[test]
+    fn a03_single_match_ambiguity_payload_golden() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("long.txt");
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let source = format!(
+            "α\r\n{}\r\nTARGET TARGET\nlast",
+            "TARGET".to_owned() + &"中".repeat(10_000)
+        );
+        std::fs::write(&path, &source).unwrap();
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "ambiguity", "command": "edit_match", "file": path, "match": "TARGET", "replacement": "x"})).unwrap();
+        edit::A03_LINE_INDEX_PASSES.with(|count| count.set(0));
+        let response = crate::commands::edit_match::handle_edit_match(&req, &ctx);
+        assert!(!response.success);
+        let expected = vec![
+            serde_json::json!({"occurrence": 1, "line": 2, "context": source.lines().collect::<Vec<_>>().join("\n")}),
+            serde_json::json!({"occurrence": 2, "line": 3, "context": source.lines().collect::<Vec<_>>().join("\n")}),
+            serde_json::json!({"occurrence": 3, "line": 3, "context": source.lines().collect::<Vec<_>>().join("\n")}),
+        ];
+        assert_eq!(response.data["occurrences"], serde_json::json!(expected));
+        assert_eq!(edit::A03_LINE_INDEX_PASSES.with(|count| count.get()), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a03_write_handler_new_existing_skip_and_preview_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        for extension in ["ts", "txt"] {
+            for existed in [false, true] {
+                for preview in [false, true] {
+                    for include_diff in [false, true] {
+                        let path = temp
+                            .path()
+                            .join(format!("{existed}-{preview}-{include_diff}.{extension}"));
+                        if existed {
+                            std::fs::write(&path, "const value = 1;\n").unwrap();
+                        }
+                        let mut config = Config::default();
+                        config.backup.enabled = Some(false);
+                        let ctx = AppContext::new(Box::new(StubProvider), config);
+                        let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "counts", "command": "write", "file": path, "content": "const value = 2;\n", "preview": preview, "include_diff": include_diff})).unwrap();
+                        edit::A03_HANDLER_READS.with(|count| count.set(0));
+                        edit::A03_SYNTAX_PARSES.with(|count| count.set(0));
+                        crate::backup::reset_capture_read_count(&path);
+                        let response = crate::commands::write::handle_write(&req, &ctx);
+                        assert!(response.success, "{:?}", response);
+                        assert_eq!(response.data["created"], !existed);
+                        assert_eq!(
+                            response.data["metadata"]["diff"],
+                            edit::build_unified_diff(
+                                path.to_str().unwrap(),
+                                if existed { "const value = 1;\n" } else { "" },
+                                "const value = 2;\n"
+                            )
+                        );
+                        let reads = edit::A03_HANDLER_READS.with(|count| count.get())
+                            + crate::backup::capture_read_count(&path);
+                        assert_eq!(reads, usize::from(existed) + usize::from(!preview), "write existed={existed} preview={preview} diff={include_diff} lang={extension}");
+                        assert_eq!(
+                            edit::A03_SYNTAX_PARSES.with(|count| count.get()),
+                            if preview || extension == "txt" {
+                                0
+                            } else {
+                                1 + usize::from(existed)
+                            }
+                        );
+                        assert_eq!(path.exists(), existed || !preview);
+                        if preview && existed {
+                            assert_eq!(
+                                std::fs::read_to_string(&path).unwrap(),
+                                "const value = 1;\n"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a03_live_fingerprint_and_undo_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("live.txt");
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        std::fs::write(&path, "é before\r\n").unwrap();
+        crate::backup::A03_FINGERPRINT_HASHES.with(|count| count.set(0));
+        crate::backup::A03_LIVE_FINGERPRINT_READS.with(|count| count.set(0));
+        crate::backup::reset_capture_read_count(&path);
+        edit::A03_HANDLER_READS.with(|count| count.set(0));
+        let req = request(
+            &path,
+            serde_json::json!([{"match": "before", "replacement": "after"}]),
+            false,
+        );
+        let response = handle_batch(&req, &ctx);
+        assert!(response.success, "{:?}", response);
+        assert_eq!(response.data["diff"]["after"], "é after\r\n");
+        // Finalization must fingerprint the live path, not the cached reply text.
+        std::fs::write(&path, "external post-state\n").unwrap();
+        let mut store = ctx.backup().lock();
+        store.record_post_mutation_states();
+        let hashes = crate::backup::A03_FINGERPRINT_HASHES.with(|count| count.get());
+        let live_reads = crate::backup::A03_LIVE_FINGERPRINT_READS.with(|count| count.get());
+        let reads = edit::A03_HANDLER_READS.with(|count| count.get())
+            + crate::backup::capture_read_count(&path)
+            + live_reads;
+        eprintln!("A03 handler + finalizer reads={reads}, hashes={hashes}, live fingerprint reads={live_reads}");
+        assert_eq!(live_reads, 1);
+        assert_eq!(reads, 3);
+        assert_eq!(hashes, 2);
+        let history = store.history(req.session(), &path);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content_bytes.as_ref(), "é before\r\n".as_bytes());
+        assert_eq!(
+            history[0].post_state,
+            Some(crate::backup::PathFingerprint::Content(
+                blake3::hash(b"external post-state\n").to_hex().to_string()
+            ))
+        );
+        store.restore_last_operation(req.session()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), "é before\r\n".as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a03_handler_buffer_read_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.ts");
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        for preview in [true, false] {
+            std::fs::write(&path, "const value = 1;\n").unwrap();
+            crate::backup::reset_capture_read_count(&path);
+            edit::A03_HANDLER_READS.with(|counter| counter.set(0));
+            edit::A03_SYNTAX_PARSES.with(|counter| counter.set(0));
+            let response = handle_batch(
+                &request(
+                    &path,
+                    serde_json::json!([
+                        {"match": "1", "replacement": "2"}
+                    ]),
+                    preview,
+                ),
+                &ctx,
+            );
+            assert!(response.success, "{:?}", response);
+            let reads = edit::A03_HANDLER_READS.with(|counter| counter.get())
+                + crate::backup::capture_read_count(&path);
+            let parses = edit::A03_SYNTAX_PARSES.with(|counter| counter.get());
+            eprintln!("A03 batch preview={preview}: handler reads={reads}, syntax parses={parses}");
+            assert_eq!(parses, if preview { 0 } else { 2 });
+            assert_eq!(
+                reads,
+                if preview { 1 } else { 2 },
+                "handler-wide content reads"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod a03_measurements {
+    use super::*;
+    use crate::{config::Config, language::StubProvider};
+
+    #[test]
+    #[ignore = "release-only component and handler timing probe"]
+    fn a03_release_measurements() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.txt");
+        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        for bytes in [10 * 1024, 1024 * 1024, 10 * 1024 * 1024] {
+            let source = "x".repeat(bytes) + "TARGET\n";
+            std::fs::write(&path, &source).unwrap();
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "measure", "command": "batch", "file": path, "edits": [{"match": "TARGET", "replacement": "DONE"}], "include_diff_content": true})).unwrap();
+            let start = std::time::Instant::now();
+            let response = handle_batch(&req, &ctx);
+            assert!(response.success, "{:?}", response);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "x".repeat(bytes) + "DONE\n"
+            );
+            eprintln!("A03 handler bytes={bytes} elapsed={:?}", start.elapsed());
+        }
+        for count in [1, 100, 2_000] {
+            let source = "x".repeat(1024 * 1024);
+            let edits: Vec<_> = (0..count)
+                .map(|i| ResolvedEdit {
+                    byte_start: i * 2,
+                    byte_end: i * 2 + 1,
+                    replacement: "y".into(),
+                    fuzzy_match: None,
+                })
+                .rev()
+                .collect();
+            let start = std::time::Instant::now();
+            let content = build_batch_output(&source, &edits).unwrap();
+            assert_eq!(&content[..count * 2], "yx".repeat(count));
+            eprintln!(
+                "A03 batch builder matches={count} elapsed={:?}",
+                start.elapsed()
+            );
+        }
+        for reversed in [false, true] {
+            let before: String = (0..20_000)
+                .map(|i| format!("before-{i:05}-{}\n", "x".repeat(49)))
+                .collect();
+            let after: String = if reversed {
+                (0..20_000)
+                    .rev()
+                    .map(|i| format!("before-{i:05}-{}\n", "x".repeat(49)))
+                    .collect()
+            } else {
+                (0..20_000)
+                    .map(|i| format!("after--{i:05}-{}\n", "y".repeat(49)))
+                    .collect()
+            };
+            let baseline = similar::TextDiff::from_lines(&before, &after);
+            let expected_patch = format!("Index: large.ts\n===================================================================\n{}", baseline.unified_diff().header("large.ts", "large.ts"));
+            let expected_count = if reversed { 19_999 } else { 20_000 };
+            let start = std::time::Instant::now();
+            let mut actual = serde_json::json!({});
+            edit::attach_preview_diff(
+                &mut actual,
+                &serde_json::json!({}),
+                "large.ts",
+                &before,
+                &after,
+            );
+            let elapsed = start.elapsed();
+            assert_eq!(
+                actual,
+                serde_json::json!({"metadata": {"diff": expected_patch}, "preview": true, "preview_diff": expected_patch, "diff": {"additions": expected_count, "deletions": expected_count}})
+            );
+            eprintln!("A03 diff reversed={reversed} elapsed={elapsed:?}");
+        }
     }
 }

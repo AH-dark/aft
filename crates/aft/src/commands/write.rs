@@ -60,20 +60,20 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // writes (file content byte-identical to original) and emit honest
     // `no_op: true` for UIs. Used by diff metadata too when requested.
     // See GitHub #45.
-    let original = if existed {
-        match std::fs::read_to_string(path.as_path()) {
-            Ok(content) => content,
+    let (original, observation) = if existed {
+        match edit::read_edit_source(path.as_path()) {
+            Ok((content, observation)) => (content, Some(observation)),
             Err(error) => {
                 crate::slog_warn!(
                     "write: failed to read existing file before diff for {}: {}",
                     file,
                     error
                 );
-                String::new()
+                (String::new(), None)
             }
         }
     } else {
-        String::new()
+        (String::new(), None)
     };
 
     if edit::wants_preview(&req.params) {
@@ -98,13 +98,25 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // Auto-backup existing files before overwriting. For create-only writes,
     // record a tombstone so operation undo removes the created file.
     let backup_id = if existed {
-        match edit::auto_backup(
-            ctx,
-            req.session(),
-            path.as_path(),
-            "write: pre-write backup",
-            Some(&op_id),
-        ) {
+        let backup = if let Some(observation) = observation.as_ref() {
+            edit::auto_backup_observed(
+                ctx,
+                req.session(),
+                path.as_path(),
+                "write: pre-write backup",
+                Some(&op_id),
+                observation,
+            )
+        } else {
+            edit::auto_backup(
+                ctx,
+                req.session(),
+                path.as_path(),
+                "write: pre-write backup",
+                Some(&op_id),
+            )
+        };
+        match backup {
             Ok(id) => id,
             Err(e) => {
                 return Response::error(&req.id, e.code(), e.to_string());
@@ -143,18 +155,29 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // Write, format, and validate via shared pipeline
-    let mut write_result =
-        match edit::write_format_validate(path.as_path(), content, &ctx.config(), &req.params) {
-            Ok(r) => r,
-            Err(e) => {
-                if !existed {
-                    ctx.backup()
-                        .lock()
-                        .discard_operation_entries(req.session(), &op_id);
-                }
-                return Response::error(&req.id, e.code(), e.to_string());
+    let written = if let Some(observation) = observation.as_ref() {
+        edit::write_format_validate_observed(
+            path.as_path(),
+            content,
+            &ctx.config(),
+            &req.params,
+            &original,
+            observation,
+        )
+    } else {
+        edit::write_format_validate(path.as_path(), content, &ctx.config(), &req.params)
+    };
+    let mut write_result = match written {
+        Ok(r) => r,
+        Err(e) => {
+            if !existed {
+                ctx.backup()
+                    .lock()
+                    .discard_operation_entries(req.session(), &op_id);
             }
-        };
+            return Response::error(&req.id, e.code(), e.to_string());
+        }
+    };
 
     if write_result.rolled_back {
         ctx.backup()
@@ -162,14 +185,14 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
             .discard_operation_entries(req.session(), &op_id);
     }
 
-    if let Ok(final_content) = std::fs::read_to_string(path.as_path()) {
+    if let Some(final_content) = write_result.final_content(path.as_path()) {
         let config_change_type = if existed {
             FileChangeType::CHANGED
         } else {
             FileChangeType::CREATED
         };
         ctx.lsp_notify_watched_config_file(path.as_path(), config_change_type);
-        write_result.lsp_outcome = ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
+        write_result.lsp_outcome = ctx.lsp_post_write(path.as_path(), final_content, &req.params);
     }
 
     log::debug!("write: {}", file);
@@ -214,16 +237,13 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
     // byte-identical to `original`, surface `no_op: true` so UIs can render
     // "wrote, but no net change" instead of a bare "File updated". See
     // GitHub #45.
-    let final_content =
-        std::fs::read_to_string(path.as_path()).unwrap_or_else(|_| content.to_string());
+    let final_content = write_result
+        .final_content(path.as_path())
+        .unwrap_or(content);
     if existed && original == final_content {
         result["no_op"] = serde_json::json!(true);
     }
 
-    if edit::wants_diff(&req.params) {
-        result["diff"] = edit::compute_diff_for_response(&req.params, &original, &final_content);
-    }
-
-    edit::attach_mutation_diff(&mut result, file, &original, &final_content);
+    edit::attach_edit_diff(&mut result, &req.params, file, &original, final_content);
     Response::success(&req.id, result)
 }

@@ -201,6 +201,12 @@ pub enum BackupEntryKind {
     HardLink,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static A03_FINGERPRINT_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static A03_LIVE_FINGERPRINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Identity of what a path held at one moment, reduced to what undo needs to
 /// tell "the state AFT left" from "something else". Content is compared by
 /// hash, never by inode, because editors routinely save through a temp file
@@ -216,6 +222,8 @@ pub enum PathFingerprint {
 
 impl PathFingerprint {
     fn of_bytes(bytes: &[u8]) -> Self {
+        #[cfg(test)]
+        A03_FINGERPRINT_HASHES.with(|count| count.set(count.get() + 1));
         Self::Content(blake3::hash(bytes).to_hex().to_string())
     }
 
@@ -227,9 +235,13 @@ impl PathFingerprint {
             Ok(metadata) if metadata.file_type().is_symlink() => std::fs::read_link(path)
                 .map(Self::Symlink)
                 .unwrap_or(Self::Other),
-            Ok(metadata) if metadata.is_file() => std::fs::read(path)
-                .map(|bytes| Self::of_bytes(&bytes))
-                .unwrap_or(Self::Other),
+            Ok(metadata) if metadata.is_file() => {
+                #[cfg(test)]
+                A03_LIVE_FINGERPRINT_READS.with(|count| count.set(count.get() + 1));
+                std::fs::read(path)
+                    .map(|bytes| Self::of_bytes(&bytes))
+                    .unwrap_or(Self::Other)
+            }
             Ok(_) => Self::Other,
         }
     }

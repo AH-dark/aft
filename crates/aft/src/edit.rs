@@ -181,6 +181,131 @@ pub fn wants_preview(params: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// A shared byte-to-line map and borrowed context lines for ambiguity payloads.
+/// Line endings follow `str::lines`, while offsets count every LF byte.
+pub(crate) struct SourceLineIndex<'a> {
+    starts: Vec<usize>,
+    lines: Vec<&'a str>,
+}
+
+impl<'a> SourceLineIndex<'a> {
+    pub(crate) fn new(source: &'a str) -> Self {
+        #[cfg(test)]
+        A03_LINE_INDEX_PASSES.with(|count| count.set(count.get() + 1));
+        let mut starts = vec![0];
+        let mut lines = Vec::new();
+        let mut offset = 0;
+        for chunk in source.split_inclusive('\n') {
+            let line = if let Some(line) = chunk.strip_suffix('\n') {
+                line.strip_suffix('\r').unwrap_or(line)
+            } else {
+                chunk
+            };
+            lines.push(line);
+            offset += chunk.len();
+            if chunk.ends_with('\n') {
+                starts.push(offset);
+            }
+        }
+        Self { starts, lines }
+    }
+
+    pub(crate) fn line_at(&self, byte: usize) -> usize {
+        self.starts
+            .partition_point(|start| *start <= byte)
+            .saturating_sub(1)
+    }
+
+    pub(crate) fn context(&self, line: usize, margin: usize) -> String {
+        let start = line.saturating_sub(margin);
+        let end = (line + margin + 1).min(self.lines.len());
+        self.lines[start..end].join("\n")
+    }
+}
+
+/// The regular-file capture and identity associated with a handler's source.
+/// Reuse is conditional on live identity; symlinks and platforms without strong
+/// version evidence retain the path-reading pipeline.
+pub(crate) struct EditObservation {
+    capture: Option<crate::backup::CapturedRegularFile>,
+    version: Option<crate::backup::DiskFileVersion>,
+}
+
+pub(crate) fn read_edit_source(path: &Path) -> std::io::Result<(String, EditObservation)> {
+    let before = crate::backup::DiskFileVersion::of_path(path);
+    let (text, capture) = match crate::backup::CapturedRegularFile::read(path)? {
+        Some(capture) => {
+            let text = std::str::from_utf8(capture.bytes())
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stream did not contain valid UTF-8",
+                    )
+                })?
+                .to_owned();
+            (text, Some(capture))
+        }
+        None => (read_edit_text(path)?, None),
+    };
+    let version =
+        before.filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path));
+    Ok((text, EditObservation { capture, version }))
+}
+
+pub(crate) fn auto_backup_observed(
+    ctx: &AppContext,
+    session: &str,
+    path: &Path,
+    description: &str,
+    op_id: Option<&str>,
+    observation: &EditObservation,
+) -> Result<Option<String>, AftError> {
+    if let (Some(capture), Some(version)) = (observation.capture.as_ref(), observation.version) {
+        if std::fs::symlink_metadata(path).is_err() {
+            return Ok(None);
+        }
+        let mut store = ctx.backup().lock();
+        // Validate under the backup mutex immediately before storing. A capture
+        // predating a replacement or an external save must not become undo data.
+        if crate::backup::DiskFileVersion::of_path(path) == Some(version) {
+            let mut capture = capture.clone();
+            if capture.refresh_if_stale(path).is_ok() {
+                return store.snapshot_with_op_from_capture(
+                    session,
+                    path,
+                    description,
+                    op_id,
+                    &capture,
+                );
+            }
+        }
+        store.snapshot_with_op(session, path, description, op_id)
+    } else {
+        auto_backup(ctx, session, path, description, op_id)
+    }
+}
+
+pub(crate) struct ObservedFinalText {
+    text: String,
+    version: Option<crate::backup::DiskFileVersion>,
+}
+
+impl ObservedFinalText {
+    fn read(path: &Path) -> Option<Self> {
+        let before = crate::backup::DiskFileVersion::of_path(path);
+        let text = read_edit_text(path).ok()?;
+        let version = before
+            .filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path));
+        Some(Self { text, version })
+    }
+}
+
+pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
+    std::fs::read_to_string(path)
+}
+
 /// Build the unified-diff string used by internal permission previews.
 ///
 /// The OpenCode approval prompt expects a plain unified-diff string in
@@ -198,7 +323,7 @@ pub fn build_unified_diff(file: &str, before: &str, after: &str) -> String {
         );
     }
 
-    let text_diff = similar::TextDiff::from_lines(before, after);
+    let text_diff = construct_diff(before, after);
     let patch = text_diff.unified_diff().header(file, file).to_string();
     format!(
         "Index: {file}
@@ -229,16 +354,21 @@ pub fn attach_preview_diff(
     before: &str,
     after: &str,
 ) {
-    attach_mutation_diff(result, file, before, after);
+    let (patch, info) = response_diff(params, file, before, after);
+    result["metadata"] = serde_json::json!({ "diff": patch });
     result["preview"] = serde_json::json!(true);
-    result["diff"] = compute_diff_for_response(params, before, after);
-    result["preview_diff"] = serde_json::json!(build_unified_diff(file, before, after));
+    result["diff"] = info;
+    result["preview_diff"] = serde_json::json!(patch);
 }
 
-fn diff_counts(before: &str, after: &str) -> (usize, usize) {
-    use similar::ChangeTag;
+fn construct_diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, 'a, str> {
+    #[cfg(test)]
+    A03_DIFF_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+    similar::TextDiff::from_lines(before, after)
+}
 
-    let diff = similar::TextDiff::from_lines(before, after);
+fn counts_from_diff<'a>(diff: &similar::TextDiff<'a, 'a, 'a, str>) -> (usize, usize) {
+    use similar::ChangeTag;
     let mut additions = 0usize;
     let mut deletions = 0usize;
     for change in diff.iter_all_changes() {
@@ -249,6 +379,51 @@ fn diff_counts(before: &str, after: &str) -> (usize, usize) {
         }
     }
     (additions, deletions)
+}
+
+fn diff_counts(before: &str, after: &str) -> (usize, usize) {
+    counts_from_diff(&construct_diff(before, after))
+}
+
+pub(crate) fn response_diff(
+    params: &serde_json::Value,
+    file: &str,
+    before: &str,
+    after: &str,
+) -> (String, serde_json::Value) {
+    let diff = construct_diff(before, after);
+    let (additions, deletions) = counts_from_diff(&diff);
+    let patch = if before == after {
+        build_unified_diff(file, before, after)
+    } else {
+        format!("Index: {file}\n===================================================================\n{}", diff.unified_diff().header(file, file))
+    };
+    let info = diff_info_from_counts(
+        before,
+        after,
+        additions,
+        deletions,
+        wants_diff_content(params),
+    );
+    (patch, info)
+}
+
+/// Render the optional counts and the host patch from the same line diff.
+/// Both representations describe one observed before/after pair.
+pub(crate) fn attach_edit_diff(
+    result: &mut serde_json::Value,
+    params: &serde_json::Value,
+    file: &str,
+    before: &str,
+    after: &str,
+) {
+    if wants_diff(params) {
+        let (patch, info) = response_diff(params, file, before, after);
+        result["metadata"] = serde_json::json!({ "diff": patch });
+        result["diff"] = info;
+    } else {
+        attach_mutation_diff(result, file, before, after);
+    }
 }
 
 /// Compute compact diff counts (additions/deletions) without echoing any file
@@ -284,7 +459,19 @@ pub fn compute_diff_for_response(
 /// For files >512KB, omits full content and returns only counts.
 pub fn compute_diff_info(before: &str, after: &str) -> serde_json::Value {
     let (additions, deletions) = diff_counts(before, after);
+    diff_info_from_counts(before, after, additions, deletions, true)
+}
 
+fn diff_info_from_counts(
+    before: &str,
+    after: &str,
+    additions: usize,
+    deletions: usize,
+    full: bool,
+) -> serde_json::Value {
+    if !full {
+        return serde_json::json!({"additions": additions, "deletions": deletions});
+    }
     // For large files, skip sending full content to avoid bloating JSON
     let size_limit = 512 * 1024; // 512KB
     if before.len() > size_limit || after.len() > size_limit {
@@ -395,7 +582,7 @@ pub fn compute_reformatted_excerpt(
 
     use similar::DiffTag;
 
-    let diff = similar::TextDiff::from_lines(pre_format, post_format);
+    let diff = construct_diff(pre_format, post_format);
     let post_lines: Vec<&str> = post_format.lines().collect();
     let mut collected: Vec<String> = Vec::new();
     let mut last_post_idx: Option<usize> = None;
@@ -488,6 +675,7 @@ pub struct WriteResult {
     pub lsp_outcome: Option<crate::lsp::manager::PostEditWaitOutcome>,
     /// Post-format excerpt when the formatter reflowed the applied edit.
     pub reformatted_excerpt: Option<ReformattedExcerpt>,
+    pub(crate) final_text: Option<ObservedFinalText>,
 }
 
 /// Render structured validation errors as a compact `line N: message` list for
@@ -501,6 +689,22 @@ pub fn format_validation_errors(errors: &[format::ValidationError]) -> String {
 }
 
 impl WriteResult {
+    /// Return the validated final text only while the live path still has the
+    /// same identity. LSP notifications may wait, so response rendering checks
+    /// again rather than assuming the file stayed unchanged during that wait.
+    pub(crate) fn final_content(&mut self, path: &Path) -> Option<&str> {
+        let current = crate::backup::DiskFileVersion::of_path(path);
+        if !self
+            .final_text
+            .as_ref()
+            .is_some_and(|observed| observed.version.is_some() && observed.version == current)
+        {
+            self.final_text = ObservedFinalText::read(path);
+        }
+        self.final_text
+            .as_ref()
+            .map(|observed| observed.text.as_str())
+    }
     /// Append LSP diagnostics + per-server status to a response JSON
     /// object.
     ///
@@ -656,7 +860,25 @@ pub fn write_format_validate(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, false)
+    write_format_validate_impl(path, content, config, params, false, None)
+}
+
+/// Reuse the captured original only while its strong file identity still matches.
+pub(crate) fn write_format_validate_observed(
+    path: &Path,
+    content: &str,
+    config: &Config,
+    params: &serde_json::Value,
+    original: &str,
+    observation: &EditObservation,
+) -> Result<WriteResult, AftError> {
+    let pre = observation
+        .capture
+        .as_ref()
+        .and(observation.version)
+        .filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path))
+        .map(|_| original);
+    write_format_validate_impl(path, content, config, params, false, pre)
 }
 
 /// Write, format and syntax-check now; the caller checks the completed project
@@ -667,7 +889,7 @@ pub(crate) fn write_format_validate_deferred(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, true)
+    write_format_validate_impl(path, content, config, params, true, None)
 }
 
 fn write_format_validate_impl(
@@ -676,11 +898,14 @@ fn write_format_validate_impl(
     config: &Config,
     params: &serde_json::Value,
     defer_full_validation: bool,
+    captured_original: Option<&str>,
 ) -> Result<WriteResult, AftError> {
-    let pre_write_content = if path.exists() {
+    let pre_write_content = if let Some(source) = captured_original {
+        Some(std::borrow::Cow::Borrowed(source))
+    } else if path.exists() {
         #[cfg(test)]
         WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
-        std::fs::read_to_string(path).ok()
+        read_edit_text(path).ok().map(std::borrow::Cow::Owned)
     } else {
         None
     };
@@ -703,13 +928,14 @@ fn write_format_validate_impl(
     // Step 3: Validate syntax
     #[cfg(test)]
     WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
-    let post_format_content = std::fs::read_to_string(path).ok();
-    let syntax_valid = post_format_content
-        .as_deref()
+    let mut final_text = ObservedFinalText::read(path);
+    let syntax_valid = final_text
+        .as_ref()
+        .map(|observed| observed.text.as_str())
         .and_then(|source| validate_captured_syntax(path, source));
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
-            std::fs::write(path, original).map_err(|e| AftError::InvalidRequest {
+            std::fs::write(path, original.as_bytes()).map_err(|e| AftError::InvalidRequest {
                 message: format!("failed to roll back invalid edit: {}", e),
             })?;
             true
@@ -730,20 +956,21 @@ fn write_format_validate_impl(
         (Vec::new(), None)
     };
 
-    let reformatted_excerpt = if rolled_back {
-        None
-    } else if validate_requested {
-        // A configured checker is an external program, not necessarily read
-        // only. Keep the final observation after it runs as before.
+    if validate_requested {
+        // Checkers can modify files, including a just-rolled-back file. Observe
+        // their post-state before sharing text with response and LSP consumers.
         #[cfg(test)]
         WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|final_on_disk| compute_reformatted_excerpt(content, &final_on_disk))
+        final_text = ObservedFinalText::read(path);
+    } else if rolled_back {
+        final_text = ObservedFinalText::read(path);
+    }
+    let reformatted_excerpt = if rolled_back {
+        None
     } else {
-        post_format_content
-            .as_deref()
-            .and_then(|final_on_disk| compute_reformatted_excerpt(content, final_on_disk))
+        final_text
+            .as_ref()
+            .and_then(|observed| compute_reformatted_excerpt(content, &observed.text))
     };
 
     Ok(WriteResult {
@@ -756,11 +983,14 @@ fn write_format_validate_impl(
         rolled_back,
         lsp_outcome: None,
         reformatted_excerpt,
+        final_text,
     })
 }
 
 fn validate_captured_syntax(path: &Path, source: &str) -> Option<bool> {
     let lang = detect_language(path)?;
+    #[cfg(test)]
+    A03_SYNTAX_PARSES.with(|count| count.set(count.get() + 1));
     crate::parser::parse_source_with_cached_parser(path, source, lang)
         .ok()
         .map(|tree| !tree.root_node().has_error())
@@ -769,11 +999,256 @@ fn validate_captured_syntax(path: &Path, source: &str) -> Option<bool> {
 #[cfg(test)]
 thread_local! {
     static WRITE_PIPELINE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static A03_DIFF_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static A03_LINE_INDEX_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static A03_HANDLER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static A03_SYNTAX_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a03_diff_construction_bound_and_output_goldens() {
+        let cases = [
+            (String::new(), "é\r\n".to_owned()),
+            ("same\n".to_owned(), "same\n".to_owned()),
+            ("one\r\ntwo".to_owned(), "one\r\n三\n".to_owned()),
+            (
+                (0..2_000).map(|i| format!("before-{i:05}\n")).collect(),
+                (0..2_000).map(|i| format!("after--{i:05}\n")).collect(),
+            ),
+            (
+                (0..2_000).map(|i| format!("{i:05}\n")).collect(),
+                (0..2_000).rev().map(|i| format!("{i:05}\n")).collect(),
+            ),
+            ("a\n".repeat(300_000), "a\n".repeat(300_000) + "new\n"),
+        ];
+        for (before, after) in cases {
+            let baseline = similar::TextDiff::from_lines(&before, &after);
+            let patch = if before == after {
+                "Index: golden.ts\n===================================================================\n--- golden.ts\n+++ golden.ts\n".to_owned()
+            } else {
+                format!("Index: golden.ts\n===================================================================\n{}", baseline.unified_diff().header("golden.ts", "golden.ts"))
+            };
+            let additions = baseline
+                .iter_all_changes()
+                .filter(|c| c.tag() == similar::ChangeTag::Insert)
+                .count();
+            let deletions = baseline
+                .iter_all_changes()
+                .filter(|c| c.tag() == similar::ChangeTag::Delete)
+                .count();
+            for full in [false, true] {
+                A03_DIFF_CONSTRUCTIONS.with(|counter| counter.set(0));
+                let params = serde_json::json!({"include_diff_content": full});
+                let mut actual = serde_json::json!({});
+                attach_preview_diff(&mut actual, &params, "golden.ts", &before, &after);
+                let info = if !full {
+                    serde_json::json!({"additions": additions, "deletions": deletions})
+                } else if before.len() > 512 * 1024 || after.len() > 512 * 1024 {
+                    serde_json::json!({"additions": additions, "deletions": deletions, "truncated": true})
+                } else {
+                    serde_json::json!({"additions": additions, "deletions": deletions, "before": before, "after": after})
+                };
+                assert_eq!(
+                    actual,
+                    serde_json::json!({"metadata": {"diff": patch}, "preview": true, "diff": info, "preview_diff": patch})
+                );
+                let constructions = A03_DIFF_CONSTRUCTIONS.with(|counter| counter.get());
+                eprintln!(
+                    "A03 preview diff bytes={}/{}: constructions={constructions}",
+                    before.len(),
+                    after.len()
+                );
+                assert_eq!(
+                    constructions, 1,
+                    "one construction per preview before/after pair"
+                );
+                A03_DIFF_CONSTRUCTIONS.with(|counter| counter.set(0));
+                let mut applied = serde_json::json!({});
+                let apply_params =
+                    serde_json::json!({"include_diff": true, "include_diff_content": full});
+                attach_edit_diff(&mut applied, &apply_params, "golden.ts", &before, &after);
+                assert_eq!(
+                    applied,
+                    serde_json::json!({"metadata": {"diff": patch}, "diff": info})
+                );
+                assert_eq!(
+                    A03_DIFF_CONSTRUCTIONS.with(|counter| counter.get()),
+                    1,
+                    "one construction per apply pair"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a03_stale_capture_backup_preserves_live_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("capture.txt");
+        let ctx = AppContext::new(Box::new(crate::language::StubProvider), Config::default());
+        std::fs::write(&path, "original\n").unwrap();
+        let (_, observation) = read_edit_source(&path).unwrap();
+        let replacement = temp.path().join("replacement.txt");
+        std::fs::write(&replacement, "external\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        auto_backup_observed(
+            &ctx,
+            "freshness",
+            &path,
+            "before edit",
+            Some("freshness-op"),
+            &observation,
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.backup().lock().history("freshness", &path)[0]
+                .content_bytes
+                .as_ref(),
+            b"external\n"
+        );
+    }
+
+    #[test]
+    fn a03_buffer_identity_rollback_and_utf8_parity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("edge.ts");
+        std::fs::write(&path, "const value = 1;\n").unwrap();
+        let (source, observation) = read_edit_source(&path).unwrap();
+        let mut result = write_format_validate_observed(
+            &path,
+            "function {",
+            &Config::default(),
+            &serde_json::json!({}),
+            &source,
+            &observation,
+        )
+        .unwrap();
+        assert!(result.rolled_back);
+        assert_eq!(result.syntax_valid, Some(false));
+        assert_eq!(result.final_content(&path), Some("const value = 1;\n"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::write(&path, "const external = 8;\n").unwrap();
+        assert_eq!(result.final_content(&path), Some("const external = 8;\n"));
+        // A stale valid source must not cause rollback against a now-invalid file.
+        std::fs::write(&path, "function { external-invalid").unwrap();
+        let mut result = write_format_validate_observed(
+            &path,
+            "function { new-invalid",
+            &Config::default(),
+            &serde_json::json!({}),
+            &source,
+            &observation,
+        )
+        .unwrap();
+        assert!(!result.rolled_back);
+        assert_eq!(result.final_content(&path), Some("function { new-invalid"));
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert_eq!(
+            read_edit_source(&path).err().unwrap().to_string(),
+            std::fs::read_to_string(&path).err().unwrap().to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a03_formatter_checker_final_buffer_parity() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("edge.ts");
+        let bin = root.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(root.path().join(".oxfmtrc.json"), "{}").unwrap();
+        std::fs::write(root.path().join("tsconfig.json"), "{}").unwrap();
+        for (tool, value) in [("oxfmt", 3), ("tsc", 4)] {
+            let tool_path = bin.join(tool);
+            std::fs::write(&tool_path, format!("#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo '{tool} 1.0'; exit 0; fi\nprintf 'const value = {value};\\n' > '{}'\n", path.display())).unwrap();
+            std::fs::set_permissions(&tool_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = Config {
+            project_root: Some(root.path().to_path_buf()),
+            format_on_edit: true,
+            formatter: [("typescript".into(), "oxfmt".into())].into(),
+            checker: [("typescript".into(), "tsc".into())].into(),
+            ..Config::default()
+        };
+        for full in [false, true] {
+            std::fs::write(&path, "const value = 1;\n").unwrap();
+            let (original, observation) = read_edit_source(&path).unwrap();
+            A03_HANDLER_READS.with(|count| count.set(0));
+            A03_SYNTAX_PARSES.with(|count| count.set(0));
+            let params = serde_json::json!({"validate": if full {"full"} else {"syntax"}, "include_diff_content": true});
+            let mut result = write_format_validate_observed(
+                &path,
+                "const value = 2;\n",
+                &config,
+                &params,
+                &original,
+                &observation,
+            )
+            .unwrap();
+            let final_text = if full {
+                "const value = 4;\n"
+            } else {
+                "const value = 3;\n"
+            };
+            assert!(result.formatted, "{:?}", result.format_skipped_reason);
+            assert!(result.validation_errors.is_empty());
+            assert_eq!(result.syntax_valid, Some(true));
+            assert_eq!(
+                result.reformatted_excerpt.as_ref().unwrap().text,
+                final_text.trim_end()
+            );
+            assert_eq!(result.final_content(&path), Some(final_text));
+            let mut response = serde_json::json!({});
+            attach_edit_diff(
+                &mut response,
+                &params,
+                "edge.ts",
+                &original,
+                result.final_content(&path).unwrap(),
+            );
+            assert_eq!(
+                response["diff"],
+                serde_json::json!({"before": original, "after": final_text, "additions": 1, "deletions": 1})
+            );
+            assert_eq!(response["metadata"]["diff"], format!("Index: edge.ts\n===================================================================\n--- edge.ts\n+++ edge.ts\n@@ -1 +1 @@\n-const value = 1;\n+{}", final_text));
+            assert_eq!(
+                A03_HANDLER_READS.with(|count| count.get()),
+                if full { 2 } else { 1 }
+            );
+            assert_eq!(A03_SYNTAX_PARSES.with(|count| count.get()), 2);
+
+            std::fs::write(&path, "const value = 1;\n").unwrap();
+            crate::backup::reset_capture_read_count(&path);
+            A03_HANDLER_READS.with(|count| count.set(0));
+            A03_SYNTAX_PARSES.with(|count| count.set(0));
+            let ctx = AppContext::new(Box::new(crate::language::StubProvider), config.clone());
+            let req: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "formatter-checker", "command": "batch", "file": path,
+                "edits": [{"match": "1", "replacement": "2"}],
+                "validate": if full {"full"} else {"syntax"}, "include_diff_content": true
+            }))
+            .unwrap();
+            let response = crate::commands::batch::handle_batch(&req, &ctx);
+            assert!(response.success, "{:?}", response);
+            assert_eq!(response.data["diff"]["after"], final_text);
+            assert_eq!(
+                response.data["metadata"]["diff"],
+                build_unified_diff(path.to_str().unwrap(), "const value = 1;\n", final_text)
+            );
+            let reads = A03_HANDLER_READS.with(|count| count.get())
+                + crate::backup::capture_read_count(&path);
+            assert_eq!(
+                reads,
+                if full { 3 } else { 2 },
+                "handler-wide formatter/checker content reads"
+            );
+            assert_eq!(A03_SYNTAX_PARSES.with(|count| count.get()), 2);
+        }
+    }
 
     // --- line_col_to_byte ---
 

@@ -34,8 +34,7 @@ struct AppliedHunkResult {
     move_path: Option<PathBuf>,
     before: String,
     after: String,
-    additions: usize,
-    deletions: usize,
+    delete_lines: Option<usize>,
 }
 
 struct DiffEntry {
@@ -45,8 +44,7 @@ struct DiffEntry {
     last_kind: &'static str,
     before: String,
     after: String,
-    additions: usize,
-    deletions: usize,
+    delete_lines: Option<usize>,
     hunk_count: usize,
 }
 
@@ -261,22 +259,6 @@ fn line_count(content: &str) -> usize {
         parts.pop();
     }
     parts.len()
-}
-
-fn diff_counts(before: &str, after: &str) -> (usize, usize) {
-    use similar::ChangeTag;
-
-    let diff = similar::TextDiff::from_lines(before, after);
-    let mut additions = 0usize;
-    let mut deletions = 0usize;
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Insert => additions += 1,
-            ChangeTag::Delete => deletions += 1,
-            ChangeTag::Equal => {}
-        }
-    }
-    (additions, deletions)
 }
 
 fn ensure_parent_dirs(path: &Path) -> Result<(), String> {
@@ -614,7 +596,6 @@ fn apply_add(
         "apply_patch: file created by add hunk",
         backed_paths,
     )?;
-    let (additions, deletions) = diff_counts("", &final_content);
     Ok(AppliedHunkResult {
         index: 0,
         kind: "add",
@@ -623,8 +604,7 @@ fn apply_add(
         move_path: None,
         before: String::new(),
         after: final_content,
-        additions,
-        deletions,
+        delete_lines: None,
     })
 }
 
@@ -655,8 +635,7 @@ fn apply_delete(
         move_path: None,
         before,
         after: String::new(),
-        additions: 0,
-        deletions,
+        delete_lines: Some(deletions),
     })
 }
 
@@ -693,7 +672,6 @@ fn apply_update(
             "apply_patch: pre-update backup",
             backed_paths,
         )?;
-        let (additions, deletions) = diff_counts(&original, &final_content);
         Ok(AppliedHunkResult {
             index: 0,
             kind: "update",
@@ -702,8 +680,7 @@ fn apply_update(
             move_path: None,
             before: original,
             after: final_content,
-            additions,
-            deletions,
+            delete_lines: None,
         })
     }
 }
@@ -782,7 +759,6 @@ fn apply_move_update(
     }
     ctx.lsp_notify_watched_config_file(&resolved.source.abs, FileChangeType::DELETED);
 
-    let (additions, deletions) = diff_counts(&original, &final_content);
     Ok(AppliedHunkResult {
         index: 0,
         kind: "update",
@@ -791,8 +767,7 @@ fn apply_move_update(
         move_path: Some(dest.abs.clone()),
         before: original,
         after: final_content,
-        additions,
-        deletions,
+        delete_lines: None,
     })
 }
 
@@ -844,9 +819,6 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
             entry.last_kind = applied_hunk.kind;
             entry.after = applied_hunk.after.clone();
             entry.hunk_count += 1;
-            let (additions, deletions) = diff_counts(&entry.before, &entry.after);
-            entry.additions = additions;
-            entry.deletions = deletions;
         } else {
             entries.push((
                 key,
@@ -857,8 +829,7 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
                     last_kind: applied_hunk.kind,
                     before: applied_hunk.before.clone(),
                     after: applied_hunk.after.clone(),
-                    additions: applied_hunk.additions,
-                    deletions: applied_hunk.deletions,
+                    delete_lines: applied_hunk.delete_lines,
                     hunk_count: 1,
                 },
             ));
@@ -868,11 +839,23 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
     let files = entries
         .into_iter()
         .map(|(_, entry)| {
-            let patch = edit::build_unified_diff(
+            let (patch, counts) = edit::response_diff(
+                &Value::Null,
                 &display_slash(&entry.display_path),
                 &entry.before,
                 &entry.after,
             );
+            let mut additions = counts["additions"].as_u64().unwrap() as usize;
+            let mut deletions = counts["deletions"].as_u64().unwrap() as usize;
+            // A lone delete counts LF-separated lines, counting a nonempty
+            // unterminated final line once. Keep that deletion-only convention;
+            // multiple hunks report the original-to-final line diff instead.
+            if entry.hunk_count == 1 {
+                if let Some(lines) = entry.delete_lines {
+                    additions = 0;
+                    deletions = lines;
+                }
+            }
             let entry_type = if entry.move_path.is_some() {
                 "move"
             } else if entry.hunk_count == 1 {
@@ -889,8 +872,8 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
                 "relativePath": relative_path(&entry.display_path, root),
                 "type": entry_type,
                 "patch": patch,
-                "additions": entry.additions,
-                "deletions": entry.deletions,
+                "additions": additions,
+                "deletions": deletions,
             });
             if let Some(move_path) = entry.move_path {
                 value["movePath"] = json!(display_slash(&move_path));
@@ -1058,12 +1041,43 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]
     fn verbatim_path(path: &Path) -> PathBuf {
         PathBuf::from(format!(r"\\?\{}", path.display()))
+    }
+
+    #[test]
+    fn a03_patch_final_pair_diff_bound() {
+        let path = PathBuf::from("edge.ts");
+        let applied: Vec<_> = ["middle\r\n", "final\n", "é\n"]
+            .into_iter()
+            .map(|after| AppliedHunkResult {
+                index: 0,
+                file_path: path.clone(),
+                display_path: path.clone(),
+                move_path: None,
+                kind: "update",
+                before: "original\n".into(),
+                after: after.into(),
+                delete_lines: None,
+            })
+            .collect();
+        edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.set(0));
+        let (diff, files) = metadata_files(&applied, None);
+        assert_eq!(
+            files,
+            vec![
+                json!({"filePath": "edge.ts", "relativePath": "edge.ts", "type": "update", "patch": "Index: edge.ts\n===================================================================\n--- edge.ts\n+++ edge.ts\n@@ -1 +1 @@\n-original\n+é\n", "additions": 1, "deletions": 1})
+            ]
+        );
+        assert_eq!(diff, files[0]["patch"].as_str().unwrap());
+        assert_eq!(
+            edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.get()),
+            1,
+            "one final aggregated pair computation"
+        );
     }
 
     #[cfg(windows)]
