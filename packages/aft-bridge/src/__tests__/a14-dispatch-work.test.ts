@@ -30,22 +30,24 @@ function makePool(client: SubcClientLike) {
 }
 
 test("A14 dispatch canonicalizes once and retains fresh root stats", async () => {
-  const root = fs.mkdtempSync(join(tmpdir(), "aft-a14-root-"));
+  const rawRoot = fs.mkdtempSync(join(tmpdir(), "aft-a14-root-"));
+  // macOS temp paths can alias /private/var; resolve the expected identity before counting request work.
+  const root = fs.realpathSync(rawRoot);
   const { client, opens } = fixtureClient();
   const pool = new RevivableTransportPool(makePool(client), async () => makePool(client));
   const realpaths = spyOn(fs, "realpathSync");
   const stats = spyOn(fs, "statSync");
   try {
     for (let i = 0; i < 10; i++) {
-      expect((await pool.toolCall(root, { sessionID: "resumed" }, "read")).text).toBe("ok");
+      expect((await pool.toolCall(rawRoot, { sessionID: "resumed" }, "read")).text).toBe("ok");
     }
     expect(opens[0].project_root).toBe(root);
     expect(stats.mock.calls.length).toBeGreaterThanOrEqual(10);
     expect(realpaths.mock.calls.length).toBe(10);
     fs.rmSync(root, { recursive: true });
-    await expect(pool.toolCall(root, { sessionID: "resumed" }, "read")).rejects.toThrow();
+    await expect(pool.toolCall(rawRoot, { sessionID: "resumed" }, "read")).rejects.toThrow();
     fs.mkdirSync(root);
-    expect((await pool.toolCall(root, { sessionID: "resumed" }, "read")).text).toBe("ok");
+    expect((await pool.toolCall(rawRoot, { sessionID: "resumed" }, "read")).text).toBe("ok");
   } finally {
     stats.mockRestore();
     realpaths.mockRestore();
@@ -55,7 +57,9 @@ test("A14 dispatch canonicalizes once and retains fresh root stats", async () =>
 });
 
 test("A14 session lookup visits only matching carriers at 1 100 1000 sessions", async () => {
-  const root = fs.mkdtempSync(join(tmpdir(), "aft-a14-session-"));
+  const rawRoot = fs.mkdtempSync(join(tmpdir(), "aft-a14-session-"));
+  // Requests keep the raw alias, but stored session roots are compared with filesystem identity.
+  const root = fs.realpathSync(rawRoot);
   const second = join(root, "linked");
   fs.mkdirSync(second);
   const { client } = fixtureClient();
@@ -69,7 +73,7 @@ test("A14 session lookup visits only matching carriers at 1 100 1000 sessions", 
   try {
     for (const size of [1, 100, 1000]) {
       for (let i = view.sessions.size; i < size; i++) {
-        await pool.toolCall(root, { sessionID: `session-${i}` }, "read");
+        await pool.toolCall(rawRoot, { sessionID: `session-${i}` }, "read");
       }
       let visits = 0;
       for (const record of view.sessions.values()) {
@@ -95,7 +99,7 @@ test("A14 session lookup visits only matching carriers at 1 100 1000 sessions", 
     expect(view.unscopedHostRecord("session-999")?.identity.project_root).toBe(second);
     await pool.closeSession(second, "session-999");
     expect(view.unscopedHostRecord("session-999")).toBeUndefined();
-    await pool.toolCall(root, { sessionID: "session-999" }, "read");
+    await pool.toolCall(rawRoot, { sessionID: "session-999" }, "read");
     expect(view.unscopedHostRecord("session-999")?.identity.project_root).toBe(root);
     await pool.shutdown();
     expect(view.unscopedHostRecord("session-999")).toBeUndefined();
