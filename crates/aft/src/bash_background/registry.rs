@@ -6350,6 +6350,7 @@ impl BgTaskRegistry {
             BgTaskStatus::Killed,
             Some(WITHDRAWN_REASON.into()),
         )
+        .map_err(|error| error.to_string())
     }
 
     pub fn kill(&self, task_id: &str, session_id: &str) -> Result<BgTaskSnapshot, String> {
