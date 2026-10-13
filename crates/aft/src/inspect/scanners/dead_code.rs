@@ -6036,7 +6036,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn caller_comparison_keys_memoize_root_aliases_without_rewriting_calls() {
-        let (temp, root, _) = fixture_project(&[("src/a.rs", "pub fn run() {}\n")]);
+        // Canonicalize the fixture root so the explicit symlink is the only alias under test;
+        // on macOS the temporary directory itself can also be aliased through /var.
+        let (temp, root, _) = canonical_fixture(&[("src/a.rs", "pub fn run() {}\n")]);
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();
         let mut calls = vec![
