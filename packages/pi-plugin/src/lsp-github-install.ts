@@ -905,13 +905,48 @@ async function runTarExtraction(args: string[], timeout: number): Promise<void> 
   }
 }
 
+async function runTimedTarListing(
+  command: string,
+  archivePath: string,
+  args: string[],
+  runner: typeof runArchiveTool,
+  timeoutMs: number,
+): Promise<string> {
+  const timeoutError = new Error(
+    `tar listing ${args[0]} for ${archivePath} timed out after ${timeoutMs}ms`,
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const execution = runner(command, args, timeoutMs);
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(timeoutError), timeoutMs);
+    });
+    return await Promise.race([execution, deadline]);
+  } catch (error) {
+    if (error === timeoutError) throw error;
+    if (error instanceof Error && "code" in error && error.code === "ETIMEDOUT") {
+      throw new Error(timeoutError.message, { cause: error });
+    }
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 async function precheckWithTar(
   archivePath: string,
   command: string,
   runner: typeof runArchiveTool = runArchiveTool,
+  listingTimeoutMs = ARCHIVE_LIST_TIMEOUT_MS,
 ): Promise<number> {
   let totalBytes = 0;
-  const verbose = await runner(command, ["-tvf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
+  const verbose = await runTimedTarListing(
+    command,
+    archivePath,
+    ["-tvf", archivePath],
+    runner,
+    listingTimeoutMs,
+  );
   for (const line of verbose.split("\n")) {
     // Both bsdtar and GNU tar render hardlinks with a leading `h` type marker.
     // Reject them before extraction because the extracted inode cannot reveal
@@ -930,7 +965,13 @@ async function precheckWithTar(
     totalBytes += Number(size);
   }
 
-  const names = await runner(command, ["-tf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
+  const names = await runTimedTarListing(
+    command,
+    archivePath,
+    ["-tf", archivePath],
+    runner,
+    listingTimeoutMs,
+  );
   for (const entry of names.split("\n")) {
     if (entry.length > 0) assertArchiveEntryPath(entry);
   }

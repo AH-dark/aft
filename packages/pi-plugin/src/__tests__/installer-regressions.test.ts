@@ -160,6 +160,39 @@ describe("installer regressions", () => {
     }
   });
 
+  test("tar listing timeouts name the blocked command", async () => {
+    const timeoutMs = 10;
+    for (const blockedFlag of ["-tvf", "-tf"]) {
+      const passedTimeouts: string[] = [];
+      const runTar = async (_command: string, args: string[], timeout?: number) => {
+        passedTimeouts.push(`${args[0]}:${timeout}`);
+        if (args[0] === blockedFlag) return new Promise<string>(() => {});
+        if (args[0] === "-tvf") return "-rw-r--r--  0 root wheel 4 Jul 3 18:40 payload";
+        if (args[0] === "-tf") return "5000000000-payload\n";
+        throw new Error(`unexpected tar arguments: ${args.join(" ")}`);
+      };
+      let safetyTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const safetyDeadline = new Promise<never>((_, reject) => {
+          safetyTimer = setTimeout(
+            () => reject(new Error("tar listing regression test safety deadline expired")),
+            250,
+          );
+        });
+        await expect(
+          Promise.race([precheckArchive("fixture.tar", "tar", runTar, timeoutMs), safetyDeadline]),
+        ).rejects.toThrow(
+          `tar listing ${blockedFlag} for fixture.tar timed out after ${timeoutMs}ms`,
+        );
+      } finally {
+        if (safetyTimer !== undefined) clearTimeout(safetyTimer);
+      }
+      const expectedTimeouts =
+        blockedFlag === "-tvf" ? [`-tvf:${timeoutMs}`] : [`-tvf:${timeoutMs}`, `-tf:${timeoutMs}`];
+      expect(passedTimeouts).toEqual(expectedTimeouts);
+    }
+  });
+
   test("executable upgrade leaves the previous executable inode intact", async () => {
     await cacheFixture(async (root) => {
       const zls = findGithubServerById("zls");
