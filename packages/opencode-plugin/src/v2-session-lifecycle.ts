@@ -1,4 +1,5 @@
 import { Effect, Stream } from "effect";
+import { markHeldBgCompletions } from "./bg-notifications.js";
 import { warn } from "./logger.js";
 import { resolveIsSubagent } from "./shared/subagent-detect.js";
 import { callBashBridge } from "./tools/_shared.js";
@@ -6,6 +7,8 @@ import type { PluginContext } from "./types.js";
 
 interface SessionWatches {
   stopped: boolean;
+  stopEpoch: number;
+  tasks: Map<string, () => Promise<void>>;
   settling?: { promise: Promise<void>; resolve: () => void };
   wakes: Set<string>;
   watches: Map<string, { taskId: string; cancel: () => Promise<unknown> }>;
@@ -36,7 +39,13 @@ function stateFor(client: unknown, sessionID: string): SessionWatches | undefine
   if (!sessions) return;
   let state = sessions.get(sessionID);
   if (!state) {
-    state = { stopped: false, wakes: new Set(), watches: new Map() };
+    state = {
+      stopped: false,
+      stopEpoch: 0,
+      tasks: new Map(),
+      wakes: new Set(),
+      watches: new Map(),
+    };
     sessions.set(sessionID, state);
   }
   return state;
@@ -44,6 +53,103 @@ function stateFor(client: unknown, sessionID: string): SessionWatches | undefine
 
 export function v2SubagentStopped(client: unknown, sessionID: string): boolean {
   return stateFor(client, sessionID)?.stopped === true;
+}
+
+export function v2StopEpoch(client: unknown, sessionID: string): number {
+  return stateFor(client, sessionID)?.stopEpoch ?? 0;
+}
+
+async function killBackgroundTask(
+  ctx: PluginContext,
+  runtime: { sessionID: string; directory: string },
+  taskId: string,
+): Promise<void> {
+  const result = await callBashBridge(
+    ctx,
+    runtime,
+    "bash_kill",
+    { task_id: taskId },
+    { abortSignal: undefined },
+  );
+  if (result.success === false) throw new Error(String(result.message ?? "bash_kill failed"));
+  // A kill reply can drain the completion before its push callback runs.
+  // Keep that existing notice queued for a resumed tool result too.
+  markHeldBgCompletions(runtime.sessionID);
+}
+
+/** Only a command's spawning call records ownership; watching another session's task does not. */
+export async function trackV2BackgroundTask(
+  ctx: PluginContext,
+  runtime: { sessionID: string; directory: string },
+  taskId: string,
+  startedEpoch: number,
+): Promise<void> {
+  const state = stateFor(ctx.client, runtime.sessionID);
+  if (!state) return;
+  const kill = () => killBackgroundTask(ctx, runtime, taskId);
+  // A background spawn can answer after its tool was interrupted, even after
+  // a new execution started. A deliberate stop still owns that late task.
+  if (state.stopped || state.stopEpoch !== startedEpoch) {
+    await kill();
+    return;
+  }
+  state.tasks.set(taskId, kill);
+}
+
+async function killStoppedBackgroundTasks(
+  client: object,
+  sessionID: string,
+  ctx?: PluginContext,
+  startedBeforeMs?: number,
+): Promise<void> {
+  const kills: Array<Promise<void>> = [];
+  const visited = new Set<string>();
+  const dispatch = (taskId: string, kill: () => Promise<void>) => {
+    if (visited.has(taskId)) return;
+    visited.add(taskId);
+    kills.push(
+      kill().catch((error) => {
+        warn(
+          `[bash] failed to kill stopped session ${sessionID}'s task ${taskId}: ${String(error)}`,
+        );
+      }),
+    );
+  };
+  for (const [owner, state] of locations.get(client) ?? []) {
+    if (owner !== sessionID) continue;
+    const tasks = [...state.tasks];
+    state.tasks.clear();
+    for (const [taskId, kill] of tasks) {
+      dispatch(taskId, kill);
+    }
+  }
+  if (ctx) {
+    // Persisted tasks survive a plugin reload. Bind the query and each kill
+    // as the stopped owner; task records do not prove parent-child links.
+    const runtime = {
+      sessionID,
+      directory: (client as { location: { directory: string } }).location.directory,
+      directoryIsSessionRoot: true,
+    };
+    try {
+      const result = await callBashBridge(
+        ctx,
+        runtime,
+        "bash_owned_tasks",
+        { started_before_ms: startedBeforeMs },
+        { abortSignal: undefined },
+      );
+      if (result.success === false)
+        throw new Error(String(result.message ?? "bash_owned_tasks failed"));
+      for (const taskId of Array.isArray(result.task_ids) ? result.task_ids : []) {
+        if (typeof taskId === "string")
+          dispatch(taskId, () => killBackgroundTask(ctx, runtime, taskId));
+      }
+    } catch (error) {
+      warn(`[bash] failed to enumerate stopped session ${sessionID}'s tasks: ${String(error)}`);
+    }
+  }
+  await Promise.all(kills);
 }
 
 export function allowV2WatchWake(client: unknown, sessionID: string, taskId: string): void {
@@ -60,6 +166,7 @@ export function forgetV2Watch(client: unknown, sessionID: string, taskId: string
   const state = stateFor(client, sessionID);
   if (!state) return;
   state.wakes.delete(taskId);
+  state.tasks.delete(taskId);
   for (const [watchId, watch] of state.watches) {
     if (watch.taskId === taskId) state.watches.delete(watchId);
   }
@@ -91,11 +198,11 @@ export async function trackV2Watch(
 }
 
 /** Own the lazy host subscription before any tool can register a watch. */
-export function registerV2SessionLifecycle(context: unknown) {
+export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext) {
   const host = context as {
     event?: {
       subscribe?: () => Stream.Stream<
-        { type: string; data: { sessionID?: string; reason?: string } },
+        { type: string; created?: number; data: { sessionID?: string; reason?: string } },
         unknown
       >;
     };
@@ -129,42 +236,44 @@ export function registerV2SessionLifecycle(context: unknown) {
                     state.stopped = false;
                     return;
                   }
-                  if (
-                    event.type === "session.execution.failed" ||
-                    event.type === "session.execution.succeeded" ||
-                    (event.type === "session.execution.interrupted" &&
-                      event.data.reason !== "user" &&
-                      event.data.reason !== "inactivity")
-                  ) {
-                    state.settling?.resolve();
-                    state.settling = undefined;
+                  const deliberateStop =
+                    event.type === "session.execution.interrupted" &&
+                    (event.data.reason === "user" || event.data.reason === "inactivity");
+                  if (!deliberateStop) {
+                    if (
+                      event.type === "session.execution.failed" ||
+                      event.type === "session.execution.succeeded" ||
+                      event.type === "session.execution.interrupted"
+                    ) {
+                      state.settling?.resolve();
+                      state.settling = undefined;
+                    }
                     return;
                   }
-                  if (
-                    event.type !== "session.execution.interrupted" ||
-                    (event.data.reason !== "user" && event.data.reason !== "inactivity")
-                  )
-                    return;
                   if (!(await resolveIsSubagent(context, sessionID))) {
                     state.settling?.resolve();
                     state.settling = undefined;
                     return;
                   }
                   state.stopped = true;
+                  state.stopEpoch += 1;
                   state.wakes.clear();
                   state.settling?.resolve();
                   state.settling = undefined;
                   const watches = [...state.watches.values()];
                   state.watches.clear();
-                  await Promise.all(
-                    watches.map((watch) =>
+                  // Cleanup targets are captured now, but do not block later
+                  // lifecycle events for a resumed execution while kills settle.
+                  void Promise.all([
+                    killStoppedBackgroundTasks(context, sessionID, ctx, event.created),
+                    ...watches.map((watch) =>
                       watch.cancel().catch((error) => {
                         warn(
                           `[bash_watch] failed to cancel stopped session ${sessionID}'s watch on ${watch.taskId}: ${String(error)}`,
                         );
                       }),
                     ),
-                  );
+                  ]);
                 }),
               { discard: true },
             ),

@@ -9,12 +9,14 @@ import {
   awaitV2ExecutionSettlement,
   noteV2ToolAbort,
   registerV2SessionLifecycle,
+  trackV2BackgroundTask,
   trackV2Watch,
+  v2StopEpoch,
   v2SubagentStopped,
   v2WatchWakeAllowed,
 } from "../v2-session-lifecycle.js";
 
-async function rig(parentID: string | undefined = "parent") {
+async function rig(parentID: string | undefined = "parent", persistedTaskIds?: string[]) {
   _resetSubagentCacheForTest();
   const bus = await Effect.runPromise(
     PubSub.unbounded<{ type: string; data: { sessionID: string; reason?: string } }>(),
@@ -29,7 +31,9 @@ async function rig(parentID: string | undefined = "parent") {
   const bridge = {
     send: async (name: string, args: Record<string, unknown>) => {
       calls.push({ name, args });
-      return { success: true };
+      return name === "bash_owned_tasks"
+        ? { success: true, task_ids: persistedTaskIds ?? [] }
+        : { success: true };
     },
   };
   const ctx = {
@@ -38,7 +42,9 @@ async function rig(parentID: string | undefined = "parent") {
     config: {},
   } as unknown as PluginContext;
   await Effect.runPromise(
-    registerV2SessionLifecycle(host).pipe(Effect.provideService(Scope.Scope, scope)),
+    registerV2SessionLifecycle(host, persistedTaskIds === undefined ? undefined : ctx).pipe(
+      Effect.provideService(Scope.Scope, scope),
+    ),
   );
   return {
     host,
@@ -153,6 +159,155 @@ test("cancelled worker watch does not acknowledge a racing inline completion", a
     } as never);
     expect(commands).toEqual(["bash_status"]);
     expect(metadata.at(-1)?.waited).toMatchObject({ reason: "aborted" });
+  } finally {
+    await r.close();
+  }
+});
+
+for (const reason of ["user", "inactivity"] as const) {
+  test(`V2 ${reason} stop kills only its session's background tasks`, async () => {
+    const r = await rig();
+    try {
+      for (const owner of ["parent", "sibling", "child"]) {
+        await trackV2BackgroundTask(
+          r.ctx,
+          { sessionID: owner, directory: process.cwd() },
+          `bash-${owner}`,
+          v2StopEpoch(r.host, owner),
+        );
+      }
+      await r.event("session.execution.interrupted", reason);
+      const kills = r.calls.filter((call) => call.name === "bash_kill");
+      expect(kills.map((call) => call.args.task_id)).toEqual(["bash-child"]);
+      expect(kills.map((call) => call.args.session_id)).toEqual(["child"]);
+    } finally {
+      await r.close();
+    }
+  });
+}
+
+for (const [type, reason] of [
+  ["session.execution.interrupted", "shutdown"],
+  ["session.execution.interrupted", "superseded"],
+  ["session.execution.failed", undefined],
+  ["session.execution.succeeded", undefined],
+] as const) {
+  test(`V2 ${type}/${reason ?? "terminal"} kills no background tasks`, async () => {
+    const r = await rig();
+    try {
+      await trackV2BackgroundTask(
+        r.ctx,
+        { sessionID: "child", directory: process.cwd() },
+        "bash-child",
+        v2StopEpoch(r.host, "child"),
+      );
+      await r.event(type, reason);
+      expect(r.calls.filter((call) => call.name === "bash_kill")).toEqual([]);
+      expect(v2StopEpoch(r.host, "child")).toBe(0);
+    } finally {
+      await r.close();
+    }
+  });
+}
+
+test("V2 stop kills a late background reply without killing resumed execution's task", async () => {
+  const r = await rig();
+  try {
+    const runtime = { sessionID: "child", directory: process.cwd() };
+    const oldEpoch = v2StopEpoch(r.host, "child");
+    await r.event("session.execution.interrupted", "user");
+    await r.event("session.execution.started");
+    await trackV2BackgroundTask(r.ctx, runtime, "bash-late", oldEpoch);
+    await trackV2BackgroundTask(r.ctx, runtime, "bash-resumed", v2StopEpoch(r.host, "child"));
+    expect(
+      r.calls.filter((call) => call.name === "bash_kill").map((call) => call.args.task_id),
+    ).toEqual(["bash-late"]);
+  } finally {
+    await r.close();
+  }
+});
+
+test("background task tracking without V2 lifecycle registration never kills", async () => {
+  const r = await rig();
+  try {
+    const ctx = { ...r.ctx, client: {} } as unknown as PluginContext;
+    await trackV2BackgroundTask(
+      ctx,
+      { sessionID: "child", directory: process.cwd() },
+      "bash-v1",
+      0,
+    );
+    expect(r.calls).toEqual([]);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 main-session interruption kills no background tasks", async () => {
+  const r = await rig("");
+  try {
+    await trackV2BackgroundTask(
+      r.ctx,
+      { sessionID: "child", directory: process.cwd() },
+      "bash-main",
+      0,
+    );
+    await r.event("session.execution.interrupted", "user");
+    expect(r.calls.filter((call) => call.name === "bash_kill")).toEqual([]);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 stopping a watcher does not kill the task spawned by its parent", async () => {
+  const r = await rig();
+  try {
+    await trackV2BackgroundTask(
+      r.ctx,
+      { sessionID: "parent", directory: process.cwd() },
+      "bash-parent",
+      0,
+    );
+    await trackV2Watch(
+      r.ctx,
+      { sessionID: "child", directory: process.cwd() },
+      "bash-parent",
+      "watch-parent",
+    );
+    await r.event("session.execution.interrupted", "user");
+    expect(r.calls.filter((call) => call.name === "bash_unnotify")).toHaveLength(1);
+    expect(r.calls.filter((call) => call.name === "bash_kill")).toEqual([]);
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 stop enumerates persisted tasks under the stopped owner's identity after reload", async () => {
+  const r = await rig("parent", ["bash-before-reload"]);
+  try {
+    await r.event("session.execution.interrupted", "user");
+    expect(r.calls.map((call) => call.name)).toEqual(["bash_owned_tasks", "bash_kill"]);
+    expect(r.calls.map((call) => call.args.session_id)).toEqual(["child", "child"]);
+    expect(r.calls.at(-1)?.args.task_id).toBe("bash-before-reload");
+  } finally {
+    await r.close();
+  }
+});
+
+test("V2 stop unions in-memory and persisted task ids without duplicate kills", async () => {
+  const r = await rig("parent", ["bash-live", "bash-before-reload"]);
+  try {
+    await trackV2BackgroundTask(
+      r.ctx,
+      { sessionID: "child", directory: process.cwd() },
+      "bash-live",
+      0,
+    );
+    await r.event("session.execution.interrupted", "user");
+    const killed = r.calls
+      .filter((call) => call.name === "bash_kill")
+      .map((call) => call.args.task_id);
+    expect(killed).toEqual(["bash-live", "bash-before-reload"]);
   } finally {
     await r.close();
   }

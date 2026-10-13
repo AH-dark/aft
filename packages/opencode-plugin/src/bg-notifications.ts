@@ -429,7 +429,14 @@ export function holdBgCompletion(
 
 export function hasHeldBgCompletions(sessionID: string): boolean {
   const state = stateFor(sessionID);
-  return state.heldWorkerCompletions === true && state.pendingCompletions.length > 0;
+  return (
+    state.heldWorkerCompletions === true &&
+    (state.pendingCompletions.length > 0 || state.pendingPatternMatches.length > 0)
+  );
+}
+
+export function markHeldBgCompletions(sessionID: string): void {
+  stateFor(sessionID).heldWorkerCompletions = true;
 }
 
 function queuePendingPatternMatch(state: SessionBgState, entry: PatternMatchEntry): void {

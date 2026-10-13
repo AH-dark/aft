@@ -23,6 +23,7 @@ import { flushLog, sessionLog } from "../logger.js";
 import { normalizeToolArgSchemas } from "../normalize-schemas.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
+import { trackV2BackgroundTask, v2StopEpoch } from "../v2-session-lifecycle.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
 import { runAsk } from "./permissions.js";
 
@@ -587,6 +588,7 @@ export function createBashTool(
     },
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);
+      const startedEpoch = v2StopEpoch(ctx.client, context.sessionID);
       const ctxAftSearchRegistered =
         (ctx as { aftSearchRegistered?: boolean }).aftSearchRegistered === true;
       const aftSearchRegistered = aftSearchRegisteredOverride ?? ctxAftSearchRegistered;
@@ -775,6 +777,7 @@ export function createBashTool(
       if (data.status === "running" && typeof data.task_id === "string") {
         const taskId = data.task_id;
         trackBgTask(context.sessionID, taskId);
+        await trackV2BackgroundTask(ctx, context, taskId, startedEpoch);
         let rendered = (data.output as string | undefined) ?? "";
         // Also when subagent background is off: a blocking call that reached
         // the worker wait limit hands back a still-running task the worker

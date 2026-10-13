@@ -233,7 +233,7 @@ export function makeServerEffect(overrides = {}) {
       );
       const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
-      yield* registerV2SessionLifecycle(context);
+      yield* registerV2SessionLifecycle(context, runtime.toolContext);
       // OpenCode 2 has no chat.message hook; its session prompt hook is where a
       // new message detaches a waiting bash, as chat.message does on OpenCode 1.
       // The config is read through the tool context so live reloads apply.

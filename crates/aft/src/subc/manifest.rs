@@ -59,6 +59,8 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   the requesting session's own background-bash output files?", which the
 ///   plugins ask before raising an external-directory prompt for a read. It
 ///   reads no file and grants nothing; the answer is scoped to the session.
+/// - `bash_owned_tasks`: read-only active task ids from the bound session's
+///   persisted owner records, used to clean up deliberately stopped workers.
 /// - `inspect_tier2_run`: the plugins' background Tier-2 refresh trigger for
 ///   the bound root; scan work runs on the maintenance class either way.
 /// - `hashline_preflight`: parse-only, zero-mutation permission preflight for
@@ -80,6 +82,7 @@ pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_wait_detach"
             | "bash_regex_match"
             | "bash_artifact_owned"
+            | "bash_owned_tasks"
             | "inspect_tier2_run"
             | "hashline_preflight"
     )
@@ -115,6 +118,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "bash_drain_completions"
         | "bash_regex_match"
         | "bash_artifact_owned"
+        | "bash_owned_tasks"
         | "bash_wait_detach"
         | "db_get_state"
         | "db_get_host_state"
@@ -571,6 +575,13 @@ mod tests {
     use super::*;
     use crate::subc_translate::supports_tool;
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn owned_tasks_is_consumer_only() {
+        assert!(is_subc_native_plumbing_tool("bash_owned_tasks"));
+        assert!(!is_subc_agent_core_tool("bash_owned_tasks"));
+        assert_eq!(command_lane("bash_owned_tasks"), Lane::PureRead);
+    }
 
     const CORE_TOOLS: &[&str] = &[
         "status",

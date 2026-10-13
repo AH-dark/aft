@@ -6003,6 +6003,106 @@ impl BgTaskRegistry {
             .collect()
     }
 
+    /// Enumerate active persisted records for the caller's exact session and
+    /// harness. Directory names and replay's legacy owner fallbacks are not
+    /// ownership evidence for automatic cancellation.
+    pub fn owned_running_task_ids(
+        &self,
+        storage_dir: &Path,
+        project_root: &Path,
+        session_id: &str,
+        started_before_ms: Option<u64>,
+    ) -> Result<(Vec<String>, usize), String> {
+        let harness = super::route_harness()
+            .map(|harness| harness.storage_segment())
+            .or_else(|| self.fallback_db_harness())
+            .ok_or_else(|| "background task harness unavailable".to_string())?;
+        let project_key = crate::path_identity::project_scope_key(project_root);
+        let mut ids = HashSet::new();
+        let mut skipped_missing_owner = HashSet::new();
+        let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
+        if let Some(pool) = pool {
+            let rows = {
+                let conn = pool.lock().map_err(|_| "db mutex poisoned".to_string())?;
+                crate::db::bash_tasks::list_replayable_bash_tasks_for_project(
+                    &conn,
+                    &harness,
+                    &project_key,
+                )
+                .map_err(|error| error.to_string())?
+            };
+            for row in rows {
+                if row.session_id != session_id {
+                    continue;
+                }
+                let metadata = match serde_json::from_str::<PersistedTask>(&row.metadata) {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        skipped_missing_owner.insert(row.task_id);
+                        continue;
+                    }
+                };
+                if metadata.session_id.is_empty() || metadata.harness.is_none() {
+                    skipped_missing_owner.insert(row.task_id);
+                    continue;
+                }
+                if metadata.session_id != row.session_id
+                    || metadata.task_id != row.task_id
+                    || metadata.harness.as_deref() != Some(harness.as_str())
+                {
+                    continue;
+                }
+                if !metadata.status.is_terminal()
+                    && started_before_ms.is_none_or(|before| metadata.started_at <= before)
+                {
+                    ids.insert(row.task_id);
+                }
+            }
+        }
+        // Atomic task files can be ahead of the database mirror, including
+        // when a stop arrives before the lazy database handle was attached.
+        let dir = session_tasks_dir(storage_dir, session_id);
+        if dir.exists() {
+            let (task_ids, _) = discover_task_ids(&dir).map_err(|error| error.to_string())?;
+            for task_id in task_ids {
+                // A newer atomic record wins over an older database mirror,
+                // including a record whose owner can no longer be proved.
+                ids.remove(&task_id);
+                let metadata =
+                    resolve_task_layout(&dir, &task_id).and_then(|task| read_task_at(&task));
+                let metadata = match metadata {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        skipped_missing_owner.insert(task_id);
+                        continue;
+                    }
+                };
+                if metadata.session_id.is_empty() || metadata.harness.is_none() {
+                    skipped_missing_owner.insert(task_id);
+                    continue;
+                }
+                if metadata.session_id != session_id
+                    || metadata.harness.as_deref() != Some(harness.as_str())
+                {
+                    continue;
+                }
+                let root = metadata
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(&metadata.workdir);
+                if crate::path_identity::project_scope_key(root) == project_key
+                    && !metadata.status.is_terminal()
+                    && started_before_ms.is_none_or(|before| metadata.started_at <= before)
+                {
+                    ids.insert(task_id);
+                }
+            }
+        }
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort();
+        Ok((ids, skipped_missing_owner.len()))
+    }
+
     /// Replace terminal pipe snapshots with the task's cached rendered output.
     /// Running tasks stay raw (tail-only) so agents debugging a live process see
     /// exactly what it emitted. PTY tasks are explicitly excluded: their raw

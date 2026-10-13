@@ -133,6 +133,29 @@ export function toolResult(requests: ModelRequest[], command: string): string | 
   return undefined;
 }
 
+export function taskStatusResult(requests: ModelRequest[], taskId: string): string | undefined {
+  for (const request of [...requests].reverse()) {
+    const calls = new Set(
+      request.messages.flatMap((message) =>
+        (message.tool_calls ?? [])
+          .filter(
+            (call) =>
+              call.function.name === "bash_status" &&
+              JSON.parse(call.function.arguments).taskId === taskId,
+          )
+          .map((call) => call.id),
+      ),
+    );
+    const result = [...request.messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "tool" && message.tool_call_id && calls.has(message.tool_call_id),
+      );
+    if (result) return messageText(result.content);
+  }
+}
+
 export interface V2HostOptions {
   label: string;
   script: ModelScript;

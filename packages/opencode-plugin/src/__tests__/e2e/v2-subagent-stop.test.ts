@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { access, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { bootV2Host, type ModelScript, toolResult, until } from "./v2-host.js";
+import { bootV2Host, type ModelScript, taskStatusResult, toolResult, until } from "./v2-host.js";
 
 const hostBinary = process.env.AFT_V2_HOST_BINARY;
 
@@ -73,11 +73,13 @@ for (const scenario of [
             () => false,
           ),
         );
+        let backgroundTaskId: string | undefined;
         if (scenario === "plain") await host.client.session.wait({ sessionID });
         if (scenario !== "foreground" && scenario !== "plain") {
           await host.client.session.wait({ sessionID });
           const result = toolResult(host.requests, command);
           const taskId = result?.match(/bash-[a-f0-9]+/)?.[0];
+          backgroundTaskId = taskId;
           expect(taskId).toBeDefined();
           script.watch = {
             name: "bash_watch",
@@ -129,7 +131,7 @@ for (const scenario of [
             "converted to an async watch",
           );
         }
-        if (scenario === "foreground") {
+        if (["foreground", "sync", "sync-exit", "plain", "async"].includes(scenario)) {
           const pid = Number(await readFile(startedMarker, "utf8"));
           await until("the interrupted foreground process to exit", async () => {
             try {
@@ -165,7 +167,13 @@ for (const scenario of [
           if (scenario !== "foreground") {
             script.resume = { name: "shell", arguments: { command: "echo resumed" } };
             await host.turn(sessionID, "resume");
-            expect(toolResult(host.requests, "echo resumed")).toContain("stop-test-done");
+            const resumed = toolResult(host.requests, "echo resumed");
+            if (scenario === "sync-gap") expect(resumed).toMatch(/killed|stop-test-done/);
+            else if (scenario === "async") {
+              script.status = { name: "bash_status", arguments: { taskId: backgroundTaskId } };
+              await host.turn(sessionID, "status");
+              expect(taskStatusResult(host.requests, backgroundTaskId!)).toContain("killed");
+            } else expect(resumed).toContain("killed");
           }
         }
       } catch (error) {
