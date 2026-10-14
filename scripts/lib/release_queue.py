@@ -1,0 +1,145 @@
+"""Persist release preparation and tag only the exact green landed merge OID."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from land_pr import gh, log, save
+from landing_policy import ROOT, git
+
+
+def state_path(version: str) -> Path:
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?(?:\+[a-zA-Z0-9.]+)?", version) is None:
+        raise ValueError("invalid release version")
+    return Path(git("rev-parse", "--git-path", f"aft-release/v{version}.json"))
+
+
+def versions_at(oid: str, version: str) -> None:
+    for package in ("aft-bridge", "opencode-plugin", "pi-plugin"):
+        if json.loads(git("show", f"{oid}:packages/{package}/package.json"))["version"] != version:
+            raise ValueError(f"{oid}: {package} version does not match release {version}")
+
+
+def start(version: str) -> None:
+    path = state_path(version)
+    if path.exists():
+        raise ValueError("release already has a preparation checkpoint")
+    git("fetch", "--quiet", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    base = git("rev-parse", "origin/main")
+    if git("branch", "--show-current") != "main" or git("rev-parse", "HEAD") != base:
+        raise ValueError("a new release must start from current origin/main")
+    branch = f"land/release-{version}"
+    git("checkout", "-b", branch, base)
+    save(path, {"version": version, "branch": branch, "base": base, "phase": "preparing"})
+
+
+def checkpoint(version: str) -> None:
+    branch = f"land/release-{version}"
+    head = git("rev-parse", "HEAD")
+    if git("branch", "--show-current") != branch:
+        raise ValueError("release preparation must be on its dedicated PR branch")
+    versions_at(head, version)
+    path = state_path(version)
+    state = json.loads(path.read_text())
+    if state["phase"] != "preparing" or state["branch"] != branch:
+        raise ValueError("release already prepared; resume instead of replacing its source")
+    state.update(release_head=head, phase="prepared")
+    save(path, state)
+
+
+def resume(version: str) -> None:
+    if git("status", "--porcelain"):
+        raise ValueError("cannot resume a release with a dirty worktree")
+    state = json.loads(state_path(version).read_text())
+    branch = f"land/release-{version}"
+    if state["version"] != version or state["branch"] != branch:
+        raise ValueError("release checkpoint identity mismatch")
+    head = git("rev-parse", branch)
+    land_path = Path(git("rev-parse", "--git-path", f"aft-land/release-{version}.json"))
+    if state["phase"] == "preparing":
+        git("merge-base", "--is-ancestor", state["base"], head)
+        git("checkout", branch)
+        return
+    allowed = {state["release_head"]}
+    if land_path.exists():
+        allowed.add(json.loads(land_path.read_text())["head"])
+    if head not in allowed:
+        raise ValueError("release branch changed outside its saved preparation/delivery")
+    versions_at(head, version)
+    git("checkout", branch)
+
+
+def publish(version: str, legacy: bool) -> str:
+    path = state_path(version)
+    state = json.loads(path.read_text())
+    resume(version)
+    command = [str(ROOT / "scripts/land-pr.sh"), f"release-{version}", "--title", f"release: v{version}"]
+    if legacy:
+        command.append("--legacy-merge")
+    oid = subprocess.check_output(command, text=True).strip()
+    if re.fullmatch(r"[0-9a-f]{40}", oid) is None:
+        raise ValueError("landing did not return an exact final merge OID")
+    if state.get("merge_oid") and state["merge_oid"] != oid:
+        raise ValueError("release's final merge OID changed across resume")
+    state["merge_oid"] = oid
+    save(path, state)
+    git("fetch", "--quiet", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    git("merge-base", "--is-ancestor", oid, "origin/main")
+    git("merge-base", "--is-ancestor", state["release_head"], oid)
+    versions_at(oid, version)
+    repo = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+    env = {**os.environ, "REPO": repo, "GITHUB_REPOSITORY": repo,
+           "WATCH_CI_WORKFLOW": "tests.yml", "WATCH_CI_EVENT": "push", "WATCH_CI_BRANCH": "main"}
+    subprocess.run([str(ROOT / "scripts/watch-ci.sh"), oid], env=env, stdout=sys.stderr, check=True)
+    # A green run summary is not enough: this gate checks every required job.
+    subprocess.run([str(ROOT / "scripts/release-ci-gate.sh"), oid], env=env, stdout=sys.stderr, check=True)
+    tag = f"v{version}"
+    remote = git("ls-remote", "--tags", "origin", f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}")
+    remote_refs = {line.split()[1]: line.split()[0] for line in remote.splitlines()}
+    remote_oid = remote_refs.get(f"refs/tags/{tag}^{{}}") or remote_refs.get(f"refs/tags/{tag}")
+    if remote_oid and remote_oid != oid:
+        raise ValueError("remote release tag points at a different commit")
+    local = subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/tags/{tag}"], check=False)
+    if local.returncode == 0:
+        if git("rev-list", "-n", "1", tag) != oid:
+            raise ValueError("local release tag points at a different commit")
+    else:
+        git("tag", "-a", tag, "-m", f"Release {tag}", oid)
+    git("push", "origin", f"refs/tags/{tag}")
+    state["tagged"] = True
+    save(path, state)
+    log(f"released {tag} at final merge {oid}")
+    return oid
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("operation", choices=("start", "checkpoint", "resume", "publish", "phase"))
+    parser.add_argument("version")
+    parser.add_argument("--legacy-merge", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.operation == "start":
+            start(args.version)
+        elif args.operation == "phase":
+            print(json.loads(state_path(args.version).read_text())["phase"])
+        elif args.operation == "checkpoint":
+            checkpoint(args.version)
+        elif args.operation == "resume":
+            resume(args.version)
+        else:
+            print(publish(args.version, args.legacy_merge))
+        return 0
+    except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
+        log(f"release REFUSED: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -47,6 +47,28 @@ env:
   SCCACHE_IDLE_TIMEOUT: "0"
 
 jobs:
+  landing-policy:
+    name: Landing policy
+    # The main branch must run Landing policy too: release publication requires
+    # every required check to succeed on the exact final commit that landed.
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Original PR commit identity and agent attribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/landing-policy.py --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"
+      - name: Governed-docs aggregate validator (separate integration placeholder)
+        run: echo "The read-only governed-docs aggregate validator is integrated separately here."
+
   # ---------------------------------------------------------------------------
   # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e),
   # defined as a reusable workflow. Windows bash e2e is continue-on-error;

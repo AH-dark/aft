@@ -78,7 +78,7 @@ def member_descriptor(head: str, branch: str, group_head: str) -> tuple[str, dic
     return path, descriptor
 
 
-def plan(base: str, head: str, head_ref: str, repository: str) -> dict:
+def queue_members(base: str, head: str, head_ref: str | None, repository: str) -> list[dict]:
     for sha in (base, head):
         if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
             raise InputFault("queue_requires_full_base_and_head_shas")
@@ -86,33 +86,39 @@ def plan(base: str, head: str, head_ref: str, repository: str) -> dict:
         raise InputFault("queue_checkout_head_mismatch")
     if git("merge-base", base, head) != base:
         raise InputFault("queue_base_not_ancestor")
-    tail = re.fullmatch(r"(?:refs/heads/)?gh-readonly-queue/main/pr-(\d+)-.+", head_ref)
-    if tail is None:
-        raise InputFault(f"unknown_queue_ref:{head_ref}")
+    tail = None
+    if head_ref is not None:
+        tail = re.fullmatch(r"(?:refs/heads/)?gh-readonly-queue/main/pr-(\d+)-.+", head_ref)
+        if tail is None:
+            raise InputFault(f"unknown_queue_ref:{head_ref}")
     members = []
-    descriptors = {}
     previous = base
     for commit in git("rev-list", "--first-parent", "--reverse", f"{base}..{head}").splitlines():
         parents = git("show", "-s", "--format=%P", commit).split()
-        # Only synthetic two-parent merges can identify each PR head exactly.
-        # Squash/rebase commits lack that binding and require another adapter.
+        # Only two-parent merges bind the synthetic commit to an exact PR head.
         if len(parents) != 2 or parents[0] != previous:
             raise InputFault(f"unsupported_queue_topology:{commit}")
         pr = member_pr(repository, parents[1])
         if any(member["number"] == pr["number"] for member in members):
             raise InputFault(f"duplicate_queue_member:{pr['number']}")
-        branch = pr["head"]["ref"]
-        path, descriptor = member_descriptor(parents[1], branch, head)
-        member_base = git("merge-base", base, parents[1])
-        resolved, missing = resolve_descriptor(descriptor, paths(member_base, parents[1]))
-        if missing:
-            raise InputFault(f"missing_queue_descriptor:{pr['number']}")
-        members.append({"number": pr["number"], "branch": branch, "head": parents[1],
-                        "descriptor": path, "slice_class": resolved["slice_class"]})
-        descriptors[path] = descriptor
+        members.append({"number": pr["number"], "branch": pr["head"]["ref"], "head": parents[1]})
         previous = commit
-    if not members or members[-1]["number"] != int(tail[1]):
+    if not members or (tail is not None and members[-1]["number"] != int(tail[1])):
         raise InputFault("queue_ref_member_mismatch")
+    return members
+
+
+def plan(base: str, head: str, head_ref: str, repository: str) -> dict:
+    members = queue_members(base, head, head_ref, repository)
+    descriptors = {}
+    for member in members:
+        path, descriptor = member_descriptor(member["head"], member["branch"], head)
+        member_base = git("merge-base", base, member["head"])
+        resolved, missing = resolve_descriptor(descriptor, paths(member_base, member["head"]))
+        if missing:
+            raise InputFault(f"missing_queue_descriptor:{member['number']}")
+        member.update(descriptor=path, slice_class=resolved["slice_class"])
+        descriptors[path] = descriptor
     ranking = [member for member in members if member["slice_class"] == "ranking"]
     if len(ranking) > 1:
         raise InputFault("multiple_ranking_queue_members:land these ranking PRs separately")
@@ -127,6 +133,7 @@ def plan(base: str, head: str, head_ref: str, repository: str) -> dict:
     for path in evaluations:
         resolve_descriptor(descriptors[path], group_paths)
     return {"base": base, "head": head, "members": members, "evaluations": evaluations}
+
 
 
 def evaluate(candidate: dict, mode: str) -> None:

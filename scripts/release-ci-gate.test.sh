@@ -163,11 +163,11 @@ expect() {
 
 # --- green run --------------------------------------------------------------
 reset_state
-write_runs "$(run_json 101 "$LANDED" train/release-1.0.0 push completed success 1)"
+write_runs "$(run_json 101 "$LANDED" main push completed success 1)"
 all_green_jobs 101
 gate "$LANDED"
-expect 0 "OK: https://github.com/example/repo/actions/runs/101 (branch train/release-1.0.0, attempt 1) is green with all 3 required checks success" \
-  "green train run is releasable"
+expect 0 "OK: https://github.com/example/repo/actions/runs/101 (branch main, attempt 1) is green with all 3 required checks success" \
+  "green main push run is releasable"
 expect 0 "required checks: 3 from .github/required-checks.txt" "unreadable protection falls back to the committed list"
 
 # An annotated tag resolves to the commit it points at.
@@ -179,47 +179,46 @@ expect 0 "commit $LANDED (v1.0.0)" "annotated tag is peeled to its commit"
 # Every required job passed, but a blocking job that is not required failed,
 # so the run concluded failure. Only the run conclusion can refuse this.
 reset_state
-write_runs "$(run_json 102 "$LANDED" train/release-1.0.0 push completed failure 1)"
+write_runs "$(run_json 102 "$LANDED" main push completed failure 1)"
 write_jobs 102 \
   "Unit / Unit tests (Linux)=success" \
   "E2E / E2E (Linux Docker)=success" \
   "Unit / Bash permission e2e (Windows)=success" \
   "Unit / Plugin e2e (pi, Linux)=failure"
 gate "$LANDED"
-expect 1 "no green tests.yml run for $LANDED: https://github.com/example/repo/actions/runs/102 on train/release-1.0.0 is completed/failure" \
+expect 1 "no green tests.yml run for $LANDED: https://github.com/example/repo/actions/runs/102 on main is completed/failure" \
   "red run is refused"
 
 # --- rerun green ------------------------------------------------------------
 # GitHub reports the latest attempt; attempt 2 of a once-red run is green.
 reset_state
-write_runs "$(run_json 103 "$LANDED" train/release-1.0.0 push completed success 2)"
+write_runs "$(run_json 103 "$LANDED" main push completed success 2)"
 all_green_jobs 103
 gate "$LANDED"
-expect 0 "runs/103 (branch train/release-1.0.0, attempt 2) is green" "run rerun to green is releasable"
+expect 0 "runs/103 (branch main, attempt 2) is green" "run rerun to green is releasable"
 
-# A green train run is enough even when the later main run of the same commit
-# was cancelled, a combination real release commits have had.
+# A green train candidate cannot replace cancelled final-main-SHA evidence.
 reset_state
 write_runs "$(run_json 105 "$LANDED" main push completed cancelled 1)" \
   "$(run_json 104 "$LANDED" train/release-1.0.0 push completed success 1)"
 all_green_jobs 104
 gate "$LANDED"
-expect 0 "runs/104 (branch train/release-1.0.0, attempt 1) is green" "green train run outweighs a cancelled main run"
+expect 1 "no green tests.yml run for $LANDED" "green train run cannot replace cancelled main evidence"
 
 # --- wrong sha --------------------------------------------------------------
 # A response carrying another commit's green run must not count, even if the
 # server ignored the commit filter.
 reset_state
-write_runs "$(run_json 106 "$OTHER_SHA" train/other push completed success 1)"
+write_runs "$(run_json 106 "$OTHER_SHA" main push completed success 1)"
 all_green_jobs 106
 gate "$LANDED"
-expect 1 "no tests.yml run for $LANDED was started by a push to main or train/*" "another commit's green run is refused"
+expect 1 "no tests.yml run for $LANDED was started by a push to main" "another commit's green run is refused"
 
 # --- missing run ------------------------------------------------------------
 reset_state
 write_runs
 gate "$LANDED"
-expect 1 "no tests.yml run for $LANDED was started by a push to main or train/*" "commit without any run is refused"
+expect 1 "no tests.yml run for $LANDED was started by a push to main" "commit without any run is refused"
 
 # Runs from other triggers or branches do not count.
 reset_state
@@ -228,30 +227,30 @@ write_runs "$(run_json 107 "$LANDED" main workflow_dispatch completed success 1)
 all_green_jobs 107
 all_green_jobs 108
 gate "$LANDED"
-expect 1 "no tests.yml run for $LANDED was started by a push to main or train/*" "dispatch and non-train branch runs are refused"
+expect 1 "no tests.yml run for $LANDED was started by a push to main" "dispatch and non-main branch runs are refused"
 
 # A run still in progress is not green.
 reset_state
-write_runs "$(run_json 109 "$LANDED" train/release-1.0.0 push in_progress "" 1)"
+write_runs "$(run_json 109 "$LANDED" main push in_progress "" 1)"
 gate "$LANDED"
-expect 1 "runs/109 on train/release-1.0.0 is in_progress/none" "unfinished run is refused"
+expect 1 "runs/109 on main is in_progress/none" "unfinished run is refused"
 
 # --- cancelled required job -------------------------------------------------
 # The run concluded success, but a required job did not succeed (a
 # continue-on-error job reports its own conclusion inside a green run).
 reset_state
-write_runs "$(run_json 110 "$LANDED" train/release-1.0.0 push completed success 1)"
+write_runs "$(run_json 110 "$LANDED" main push completed success 1)"
 write_jobs 110 \
   "Unit / Unit tests (Linux)=success" \
   "E2E / E2E (Linux Docker)=cancelled" \
   "Unit / Bash permission e2e (Windows)=failure"
 gate "$LANDED"
-expect 1 "runs/110 (branch train/release-1.0.0, attempt 1): 'E2E / E2E (Linux Docker)' cancelled; 'Unit / Bash permission e2e (Windows)' failure" \
+expect 1 "runs/110 (branch main, attempt 1): 'E2E / E2E (Linux Docker)' cancelled; 'Unit / Bash permission e2e (Windows)' failure" \
   "cancelled and failed required jobs are refused by name"
 
 # A required check that is not a job of the run is refused too.
 reset_state
-write_runs "$(run_json 111 "$LANDED" train/release-1.0.0 push completed success 1)"
+write_runs "$(run_json 111 "$LANDED" main push completed success 1)"
 write_jobs 111 \
   "Unit / Unit tests (Linux)=success" \
   "Unit / Bash permission e2e (Windows)=success"
@@ -274,7 +273,7 @@ fi
 # Readable protection wins over the list: here it requires a job the list
 # does not name, and that job failed.
 reset_state
-write_runs "$(run_json 113 "$LANDED" train/release-1.0.0 push completed success 1)"
+write_runs "$(run_json 113 "$LANDED" main push completed success 1)"
 write_jobs 113 \
   "Unit / Unit tests (Linux)=success" \
   "E2E / E2E (Linux Docker)=success" \
@@ -289,7 +288,7 @@ expect 1 "release-ci-gate:   < Unit / Release storm (Linux)" "the drift report n
 
 # No readable protection and no list: fail closed.
 reset_state
-write_runs "$(run_json 114 "$LANDED" train/release-1.0.0 push completed success 1)"
+write_runs "$(run_json 114 "$LANDED" main push completed success 1)"
 all_green_jobs 114
 mv "$REPO_DIR/.github/required-checks.txt" "$TMP_ROOT/required-checks.txt"
 gate "$LANDED"

@@ -15,16 +15,21 @@
 #   4. CI on the head is red/pending (merge rides gh's own check gate).
 #
 # Usage: scripts/merge-pr.sh <pr-number> [--settle-minutes N] [--force-reason "..."]
+#        [--expected-head SHA] [--legacy-merge]
 set -euo pipefail
 
 PR="${1:?usage: merge-pr.sh <pr-number> [--settle-minutes N] [--force-reason ...]}"
 shift || true
 SETTLE_MIN=5
 FORCE_REASON=""
+LEGACY_MERGE=0
+EXPECTED_HEAD=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --settle-minutes) SETTLE_MIN="$2"; shift 2 ;;
     --force-reason) FORCE_REASON="$2"; shift 2 ;;
+    --legacy-merge) LEGACY_MERGE=1; shift ;;
+    --expected-head) EXPECTED_HEAD="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -58,13 +63,16 @@ UNRESOLVED=$("$OPERATOR_GH" api graphql -f query='
 
 # --- 2. Findings newer than the head commit --------------------------------
 HEAD_SHA=$("$OPERATOR_GH" pr view "$PR" --json headRefOid --jq .headRefOid)
+if [[ -n "$EXPECTED_HEAD" && "$HEAD_SHA" != "$EXPECTED_HEAD" ]]; then
+  echo "merge-pr: REFUSED - PR head changed from the accepted delivery; not overridable" >&2
+  exit 1
+fi
 HEAD_TS=$("$OPERATOR_GH" api "repos/$OWNER_REPO/commits/$HEAD_SHA" --jq .commit.committer.date)
-NEWER=$(
-  {
-    "$OPERATOR_GH" api "repos/$OWNER_REPO/pulls/$PR/comments" --paginate --jq '.[].created_at'
-    "$OPERATOR_GH" api "repos/$OWNER_REPO/pulls/$PR/reviews" --paginate --jq '.[] | select(.state != "APPROVED" and .state != "PENDING") | .submitted_at'
-  } | awk -v head="$HEAD_TS" '$0 > head' | wc -l | tr -d ' '
-)
+# Fetch comments and reviews separately so a failed comments query cannot be
+# hidden by the successful reviews query or the counting pipeline.
+COMMENTS=$("$OPERATOR_GH" api "repos/$OWNER_REPO/pulls/$PR/comments" --paginate --jq '.[].created_at')
+REVIEWS=$("$OPERATOR_GH" api "repos/$OWNER_REPO/pulls/$PR/reviews" --paginate --jq '.[] | select(.state != "APPROVED" and .state != "PENDING") | .submitted_at')
+NEWER=$(printf '%s\n%s\n' "$COMMENTS" "$REVIEWS" | awk -v head="$HEAD_TS" '$0 > head' | wc -l | tr -d ' ')
 if [ "$NEWER" -ne 0 ]; then
   # The check exists to stop merging while an author is still addressing
   # findings. When the maintainer resolved the outstanding threads with a
@@ -84,8 +92,35 @@ HEAD_EPOCH=$(python3 -c "import datetime;print(int(datetime.datetime.fromisoform
 AGE_MIN=$(( (NOW_EPOCH - HEAD_EPOCH) / 60 ))
 [ "$AGE_MIN" -ge "$SETTLE_MIN" ] || refuse "head commit is ${AGE_MIN}m old (< ${SETTLE_MIN}m settle window) - author may be mid-iteration"
 
-# --- 4. Merge (upstream gh enforces its own check-state gate) --------------
-echo "merge-pr: gates green (threads=0, newer-findings=0, head ${AGE_MIN}m settled) - merging #$PR at $HEAD_SHA"
-# Admin merges use the real GitHub CLI directly, bypassing the shim used for
-# AI agent commands.
-GH_SHIM_BYPASS=operator "$OPERATOR_GH" pr merge "$PR" --squash --match-head-commit "$HEAD_SHA"
+# --- 4. Queue admission (upstream gh enforces required checks) -------------
+# REST's branch-protection response omits merge-queue policy. The PR's
+# isMergeQueueEnabled GraphQL field is the effective base-ref policy used by
+# the real GitHub CLI; an absent/error response never permits a legacy merge.
+POLICY=$("$OPERATOR_GH" api graphql -f query='
+  query($owner:String!,$repo:String!,$pr:Int!){
+    repository(owner:$owner,name:$repo){
+      pullRequest(number:$pr){baseRefName isMergeQueueEnabled}
+    }
+  }' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" \
+  --jq '[.data.repository.pullRequest.baseRefName, .data.repository.pullRequest.isMergeQueueEnabled] | @tsv')
+IFS=$'\t' read -r BASE_BRANCH QUEUE_ENABLED <<< "$POLICY"
+if [[ "$BASE_BRANCH" != main || ("$QUEUE_ENABLED" != true && "$QUEUE_ENABLED" != false) ]]; then
+  echo "merge-pr: REFUSED - unknown queue policy or non-main base; not overridable" >&2
+  exit 1
+fi
+MERGE_ARGS=(--match-head-commit "$HEAD_SHA")
+if [[ "$QUEUE_ENABLED" == true ]]; then
+  if [[ "$LEGACY_MERGE" == 1 ]]; then
+    echo "merge-pr: REFUSED - --legacy-merge cannot bypass enabled queue protection" >&2
+    exit 1
+  fi
+elif [[ "$LEGACY_MERGE" == 1 ]]; then
+  MERGE_ARGS+=(--merge)
+else
+  echo "merge-pr: REFUSED - queue is not enabled; explicit --legacy-merge is required before cutover" >&2
+  exit 1
+fi
+
+echo "merge-pr: admission gates satisfied (head ${AGE_MIN}m settled) - submitting #$PR at $HEAD_SHA"
+# Submit with the operator's real GitHub CLI, not the agent's bot-routed shim.
+GH_SHIM_BYPASS=operator "$OPERATOR_GH" pr merge "$PR" "${MERGE_ARGS[@]}"

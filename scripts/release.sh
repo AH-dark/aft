@@ -13,14 +13,23 @@ set -euo pipefail
 #   2. Checks for clean working tree (no uncommitted changes)
 #   3. Syncs version across all 7 package files
 #   4. Commits the version bump
-#   5. Creates a git tag (v0.2.0)
-#   6. Lands the commit on main through train-push (tests.yml must go green),
-#      then pushes the tag
+#   5. Opens the release PR and waits for queue integration
+#   6. Checks the exact final merge OID's green main push run, then tags it
 #   7. CI takes over: gate on that green tests.yml run → build → publish npm +
 #      GitHub release (release.yml does not rerun the tests)
 
 VERSION="${1:-}"
-DRY="${2:-}"
+DRY=""
+LEGACY_ARGS=()
+if [[ $# -gt 0 ]]; then shift; fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry) DRY=--dry ;;
+    --legacy-merge) LEGACY_ARGS+=(--legacy-merge) ;;
+    *) echo "Unknown release option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 if [[ -z "$VERSION" ]]; then
   echo "Usage: ./scripts/release.sh <version> [--dry]"
@@ -37,32 +46,15 @@ TAG="v$VERSION"
 CURRENT_HEAD=$(git rev-parse HEAD)
 RESUME_RELEASE=0
 
-# Check if tag already exists. If it points at HEAD, this is a resumable
-# release: commit/tag creation already succeeded and only the push/CI handoff
-# needs another attempt.
-check_existing_tag_for_resume() {
-  local source="$1"
-  local tag_commit
-
-  tag_commit=$(git rev-list -n 1 "$TAG")
-  if [[ "$tag_commit" == "$CURRENT_HEAD" ]]; then
-    echo "→ Tag '$TAG' already exists on $source at HEAD; resuming release push."
-    RESUME_RELEASE=1
-    return
+RELEASE_STATE=$(git rev-parse --git-path "aft-release/$TAG.json")
+if [[ -f "$RELEASE_STATE" ]]; then
+  PHASE=$(python3 scripts/lib/release_queue.py phase "$VERSION")
+  if [[ "$PHASE" == prepared ]]; then RESUME_RELEASE=1; fi
+else
+  if git show-ref --verify --quiet "refs/tags/$TAG" || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+    echo "Error: tag '$TAG' exists without this release's PR checkpoint; refusing to reuse it" >&2
+    exit 1
   fi
-
-  echo "Error: tag '$TAG' already exists on $source but points at $tag_commit"
-  echo "       current HEAD is $CURRENT_HEAD"
-  echo "       Refusing to reuse a release tag from a different commit."
-  exit 1
-}
-
-if git show-ref --verify --quiet "refs/tags/$TAG"; then
-  check_existing_tag_for_resume "local"
-elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-  echo "→ Tag '$TAG' exists on origin; fetching to check resume state..."
-  git fetch --quiet origin "refs/tags/$TAG:refs/tags/$TAG"
-  check_existing_tag_for_resume "origin"
 fi
 
 # Check for clean working tree
@@ -72,15 +64,14 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-# Check we're on main
+# Resume only the saved dedicated branch; never manufacture a second bump/PR.
+if [[ -f "$RELEASE_STATE" && "$DRY" != --dry ]]; then
+  python3 scripts/lib/release_queue.py resume "$VERSION"
+fi
 BRANCH=$(git branch --show-current)
-if [[ "$BRANCH" != "main" ]]; then
-  echo "Warning: releasing from '$BRANCH' (not main)"
-  read -rp "Continue? [y/N] " confirm
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    echo "Aborted."
-    exit 1
-  fi
+if [[ ! -f "$RELEASE_STATE" && "$BRANCH" != main ]]; then
+  echo "Error: a new release must start on main" >&2
+  exit 1
 fi
 
 echo ""
@@ -89,32 +80,16 @@ echo "  ─────────────────────"
 echo ""
 
 push_release() {
-  # main is branch-protected: a direct push of an unchecked sha is refused with
-  # GH006 even for admins, so the release commit lands the same way every train
-  # does (CI on all platforms, then a fast-forward of main), and the tag goes
-  # up only once its sha is on origin/main.
-  echo "→ Landing the release commit through train-push (CI-gated main)..."
-  local release_sha
-  release_sha=$(git rev-parse HEAD)
-  scripts/train-push.sh "release-${VERSION}"
-  git fetch --quiet origin main
-  if ! git merge-base --is-ancestor "$release_sha" origin/main; then
-    echo "Error: release commit $release_sha is not on origin/main after train-push; not pushing the tag"
-    exit 1
-  fi
-  echo "→ Pushing tag $TAG..."
-  git push origin "$TAG"
-  echo ""
-
+  echo "→ Landing the release PR, checking its exact main push run, then tagging..."
+  python3 scripts/lib/release_queue.py publish "$VERSION" "${LEGACY_ARGS[@]}"
   echo "  ✓ Released $TAG"
-  echo "  → GitHub Actions will now: check the green tests.yml run → build → publish"
-  echo "  → Watch: https://github.com/cortexkit/aft/actions"
+  echo "  → GitHub Actions will now: enforce exact-SHA release gate → build → publish"
 }
 
 if [[ "$RESUME_RELEASE" == "1" ]]; then
-  echo "→ Resume mode: skipping local checks, version sync, commit, and tag creation."
+  echo "→ Resume mode: keeping the prepared release PR and waiting for exact-main-SHA evidence."
   if [[ "$DRY" == "--dry" ]]; then
-    echo "[DRY RUN] Would push branch '$BRANCH' and tag '$TAG' to origin."
+    echo "[DRY RUN] Would resume the saved release PR and tag its green final merge OID."
     exit 0
   fi
   echo ""
@@ -212,10 +187,17 @@ if [[ "$DRY" == "--dry" ]]; then
   echo "→ Version sync (dry run):"
   bun scripts/version-sync.mjs "$VERSION" --dry-run
   echo ""
-  echo "[DRY RUN] Would commit, tag $TAG, and push to origin."
+  echo "[DRY RUN] Would open the release PR, wait for its final main push CI, and tag that merge OID."
   exit 0
 fi
 
+if [[ ! -f "$RELEASE_STATE" ]]; then
+  python3 scripts/lib/release_queue.py start "$VERSION"
+fi
+
+# Attribution is explicit because operators may prepare a release without the
+# managed agent commit hook. Agent delivery PRs still require every trailer.
+RELEASE_COAUTHOR=$(python3 scripts/landing-policy.py --coauthor)
 echo "→ Running pre-release checks..."
 echo ""
 
@@ -275,7 +257,7 @@ fi
 
 if [ "${SKIP_RUST_TESTS:-}" = "1" ]; then
   echo "  (skipping local cargo tests — SKIP_RUST_TESTS=1)"
-  echo "  ↳ train-push still runs the full suite in CI, and the release publishes only after it is green."
+  echo "  ↳ PR/queue CI and the exact final main push run still gate publication."
 else
   echo "  rust test gate (unit on libtest, integration on nextest, watcher isolated)..."
   ./scripts/rust-test-gate.sh 2>&1 || { echo "Error: Rust tests failed"; exit 1; }
@@ -358,7 +340,7 @@ git add -A
 if git diff --cached --quiet; then
   echo "  (no changes — versions already at $VERSION)"
 else
-  git commit -m "release: $TAG"
+  git commit -m "release: $TAG" -m "Co-authored-by: $RELEASE_COAUTHOR"
 fi
 
 # Freeze and validate the exact committed candidate before tagging. The publish
@@ -373,7 +355,9 @@ if [[ -f "$gate_script" ]]; then
   ) || { echo "Error: committed release candidate failed publication gates"; exit 1; }
 fi
 
-# Step 3: Tag
+python3 scripts/lib/release_queue.py checkpoint "$VERSION"
+
+# Build the prepared bump locally; create no tag before final main CI succeeds.
 echo "→ Rebuilding local binary with new version..."
 # RUSTC_WRAPPER is cleared: the 0.56.2 cut wedged for minutes inside an sccache
 # client that held an idle socket while the server compiled other seats' crates;
@@ -437,9 +421,5 @@ if mkdir -p "$CACHE_DIR/$TAG" && cp target/release/aft "$CACHE_DIR/$TAG/aft" 2>/
   echo "  Updated $CACHE_DIR/$TAG/aft"
 fi
 
-echo "→ Creating tag $TAG..."
-git tag -a "$TAG" -m "Release $TAG"
-echo ""
-
-# Step 4: Push
+# Queue admission, exact final main push evidence, then tag creation/publication.
 push_release

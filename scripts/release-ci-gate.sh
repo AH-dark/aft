@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # Release CI gate: publish a tag only if tests.yml already passed on its commit.
 #
-# Every commit reaches main through scripts/train-push.sh, which fast-forwards
-# main only after the tests.yml run on the commit's train branch went green, and
-# main's branch protection requires those checks. Rerunning that matrix when the
-# tag is pushed tests the same commit a second time and adds nothing but flake
-# exposure, so release.yml runs this gate instead. It proves three things about
+# Queued release PRs land with a new merge OID. The publication gate checks the
+# Tests run from a push of that exact final OID to main, not an earlier PR/train
+# candidate or an ancestor's green run. It proves three things about
 # the commit the tag points at:
 #
 #   1. it is on main: an ancestor of, or equal to, origin/main;
 #   2. a completed tests.yml run for exactly this commit, started by a push to
-#      main or to a train/* branch, concluded success. GitHub reports the latest
+#      main concluded success. GitHub reports the latest
 #      attempt, so a run whose failed jobs were rerun green counts as green;
 #   3. every required status check of main is a job of that run and concluded
 #      success. A job marked continue-on-error can fail inside a run that still
@@ -81,10 +79,10 @@ say "on $main_branch: yes ($main_ref is $(git rev-parse "$main_ref"))"
 # --- 2. A green tests.yml push run for exactly this commit -------------------
 # The server filters by commit too; the filter is repeated here so a response
 # that ignores it can never let another commit's run through. Only push runs on
-# main or a train branch count: a workflow_dispatch run of tests.yml can test a
-# different ref than its own head sha, and a pull request run's branch is not
-# one train-push lands from. Newest run first.
-runs_jq='[.[] | select(.headSha == "'"$sha"'" and .event == "push" and (.headBranch == "'"$main_branch"'" or (.headBranch | startswith("train/"))))]'
+# main count. A queue, PR or workflow_dispatch candidate may not be the final
+# commit that landed, even when its tree or ancestry looks compatible. Newest
+# main push run first.
+runs_jq='[.[] | select(.headSha == "'"$sha"'" and .event == "push" and .headBranch == "'"$main_branch"'")]'
 # An unfinished run has no conclusion; "none" keeps the tab-separated fields
 # from collapsing when bash splits the line.
 runs_jq+=' | sort_by(-.databaseId) | .[] | [.databaseId, .headBranch, .status, (if (.conclusion // "") == "" then "none" else .conclusion end), .attempt, .url] | @tsv'
@@ -106,7 +104,7 @@ while IFS=$'\t' read -r id branch status conclusion attempt url; do
   fi
 done <<< "$runs"
 [ "${#seen[@]}" -gt 0 ] ||
-  refuse "no $workflow run for $sha was started by a push to $main_branch or train/*; land the commit through scripts/train-push.sh"
+  refuse "no $workflow run for $sha was started by a push to $main_branch; wait for exact landed-SHA CI"
 if [ "${#green_ids[@]}" -eq 0 ]; then
   summary="$(printf '%s; ' "${seen[@]}")"
   refuse "no green $workflow run for $sha: ${summary%; }"

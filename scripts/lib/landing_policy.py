@@ -1,0 +1,85 @@
+"""Read-only identity rules for original PR commits, never queue merge authors."""
+
+from __future__ import annotations
+
+from importlib import import_module
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+# Agent delivery branches and the bot author are the attribution source of
+# truth. The owner also commits by hand without the agent hook, so owner and
+# other human authors are exempt off land/*, but never on an agent delivery PR.
+AGENT_ATTRIBUTION_POLICY = {
+    "branch_prefix": "land/",
+    "bot_name": "alfonso-aft",
+    "bot_email": "289616620+alfonso-aft@users.noreply.github.com",
+    "coauthor": "alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>",
+}
+
+
+def git(*args: str, input: str | None = None) -> str:
+    return subprocess.check_output(["git", *args], input=input, text=True).strip()
+
+
+def check_commits(base: str, head: str, branch: str) -> int:
+    for sha in (base, head):
+        if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+            raise ValueError("identity policy requires full base/head SHAs")
+        git("cat-file", "-e", f"{sha}^{{commit}}")
+    count = 0
+    for sha in git("rev-list", f"{base}..{head}").splitlines():
+        name, author, committer, message = git(
+            "show", "-s", "--format=%an%x00%ae%x00%ce%x00%B", sha
+        ).split("\0", 3)
+        for role, email in (("author", author), ("committer", committer)):
+            if not (re.fullmatch(r"[^@\s]+@users\.noreply\.github\.com", email)
+                    or email == "noreply@github.com"):
+                # Do not repeat a private email in public CI logs.
+                raise ValueError(f"{sha}: {role} email must be GitHub noreply")
+        agent = (branch.startswith(AGENT_ATTRIBUTION_POLICY["branch_prefix"])
+                 or name == AGENT_ATTRIBUTION_POLICY["bot_name"]
+                 or author == AGENT_ATTRIBUTION_POLICY["bot_email"])
+        trailers = git("interpret-trailers", "--parse", input=message).splitlines()
+        attributed = any(
+            line.partition(":")[0].lower() == "co-authored-by"
+            and line.partition(":")[2].strip() == AGENT_ATTRIBUTION_POLICY["coauthor"]
+            for line in trailers
+        )
+        if agent and not attributed:
+            raise ValueError(f"{sha}: {branch} agent commit missing alfonso-aft co-author trailer")
+        count += 1
+    return count
+
+
+def check_event(event: str, payload: dict) -> int:
+    queue = import_module("merge-queue-search")
+    if event == "pull_request":
+        pr = payload["pull_request"]
+        head = pr["head"]["sha"]
+        if git("rev-parse", "HEAD") != head:
+            raise ValueError("PR identity checkout does not match the original head")
+        return check_commits(pr["base"]["sha"], head, pr["head"]["ref"])
+    if event == "merge_group":
+        group = payload["merge_group"]
+        members = queue.queue_members(group["base_sha"], group["head_sha"],
+                                      group["head_ref"], payload["repository"]["full_name"])
+        return sum(check_commits(group["base_sha"], member["head"], member["branch"])
+                   for member in members)
+    if event == "push" and payload["ref"] == "refs/heads/main":
+        base, head = payload["before"], payload["after"]
+        if git("rev-parse", "HEAD") != head:
+            raise ValueError("main identity checkout does not match the push SHA")
+        commits = git("rev-list", "--first-parent", f"{base}..{head}").splitlines()
+        if commits and all(len(git("show", "-s", "--format=%P", sha).split()) == 2 for sha in commits):
+            members = queue.queue_members(base, head, None, payload["repository"]["full_name"])
+            return sum(check_commits(base, member["head"], member["branch"]) for member in members)
+        # Pre-cutover direct pushes still get the universal email check. Once
+        # queue protection is enabled, main arrives through the PR path above.
+        return check_commits(base, head, "main")
+    raise ValueError(f"unsupported landing identity event: {event}")
