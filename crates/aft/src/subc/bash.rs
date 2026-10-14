@@ -646,6 +646,10 @@ pub(super) fn submit_deferred_bash(
     remote_source: super::remote_policy::RemoteSource,
     received_at: Instant,
 ) {
+    #[cfg(test)]
+    let timing_for_test = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone());
+    #[cfg(test)]
+    let spawn_timing_for_test = timing_for_test.clone();
     let run_scope = cancel.run_scope.clone();
     let scope_stamp = cancel.scope.clone();
     let run_scoped = run_scope.is_some();
@@ -896,7 +900,11 @@ pub(super) fn submit_deferred_bash(
                                                             ),
                                                          || {
                                                               crate::bash_background::registry::with_scope_spawn(scope_stamp.clone(), || {
-                                                                  let response = dispatch(raw_req, ctx);
+                                                                  let run_dispatch = || dispatch(raw_req, ctx);
+                                                                  #[cfg(not(test))]
+                                                                  let response = run_dispatch();
+                                                                  #[cfg(test)]
+                                                                  let response = with_bash_timing_for_test(spawn_timing_for_test.clone(), run_dispatch);
                                                                   // Registration and revocation can race across actors.
                                                                   // Recheck after dispatch so neither ordering loses the task.
                                                                   if let Some(scope) = &scope_stamp {
@@ -1101,7 +1109,13 @@ pub(super) fn submit_deferred_bash(
         let spawn_response = tokio::select! {
             biased;
             response = &mut spawn_future => response,
-            _ = tokio::time::sleep_until(startup_deadline.into()) => {
+            _ = async {
+                #[cfg(test)]
+                if let Some(timing) = &timing_for_test {
+                    return timing.startup.wait().await;
+                }
+                tokio::time::sleep_until(startup_deadline.into()).await;
+            } => {
                 // Settling the receipt is the one synchronization point with
                 // the startup job: it takes the receipt lock that every commit
                 // takes, so the outcome read here is final (see `SpawnReceipt`).
@@ -1113,6 +1127,17 @@ pub(super) fn submit_deferred_bash(
                 // reply is the only way to learn what it did. It is normally a
                 // file read or a small edit; give it a short bounded wait.
                 let settled = if outcome == crate::bash_background::StartupOutcome::Inline {
+                    #[cfg(test)]
+                    if let Some(timing) = &timing_for_test {
+                        tokio::select! {
+                            biased;
+                            response = &mut spawn_future => Some(response),
+                            _ = timing.inline_settle.wait() => None,
+                        }
+                    } else {
+                        tokio::time::timeout(INLINE_STARTUP_SETTLE, &mut spawn_future).await.ok()
+                    }
+                    #[cfg(not(test))]
                     tokio::time::timeout(INLINE_STARTUP_SETTLE, &mut spawn_future).await.ok()
                 } else if !server_completion && matches!(outcome, crate::bash_background::StartupOutcome::Task(_)) && blocking_cap_ms.is_some() {
                     let wait_deadline = received_at + Duration::from_millis(blocking_cap_ms.unwrap());
@@ -2310,6 +2335,57 @@ pub(super) fn bash_denied_untrusted_response(request_id: impl Into<String>) -> R
         "bash_denied_untrusted",
         "remote/MCP-facade binds cannot run shell commands",
     )
+}
+
+// These gates belong to one call, not the process: parallel tests cannot move
+// another startup's clock or release its deadline.
+#[cfg(test)]
+#[derive(Default)]
+struct BashTestDeadline {
+    armed: tokio::sync::Notify,
+    fire: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl BashTestDeadline {
+    async fn wait(&self) {
+        self.armed.notify_one();
+        self.fire.notified().await;
+    }
+}
+
+#[cfg(test)]
+struct BashTimingForTest {
+    commit_time: Instant,
+    startup: BashTestDeadline,
+    inline_settle: BashTestDeadline,
+    committed: tokio::sync::Notify,
+    admission: (std::sync::Mutex<bool>, std::sync::Condvar),
+    result: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+
+#[cfg(test)]
+thread_local! {
+    static BASH_TIMING_FOR_TEST: std::cell::RefCell<Option<Arc<BashTimingForTest>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_bash_timing_for_test<T>(
+    timing: Option<Arc<BashTimingForTest>>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<BashTimingForTest>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BASH_TIMING_FOR_TEST.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let commit_time = timing.as_ref().map(|timing| timing.commit_time);
+    let _restore = Restore(BASH_TIMING_FOR_TEST.with(|slot| slot.replace(timing)));
+    match commit_time {
+        Some(now) => crate::bash_background::with_spawn_commit_time_for_test(now, run),
+        None => run(),
+    }
 }
 
 #[cfg(test)]
@@ -3892,59 +3968,93 @@ mod grant_path_tests {
         );
     }
 
-    fn inline_commit_then_sleep_stub(sleep: Duration, req: RawRequest) -> Response {
-        crate::bash_background::commit_spawn_receipt_inline().expect("commit before deadline");
-        std::thread::sleep(sleep);
+    impl BashTimingForTest {
+        fn new(commit_time: Instant) -> Arc<Self> {
+            Arc::new(Self {
+                commit_time,
+                startup: BashTestDeadline::default(),
+                inline_settle: BashTestDeadline::default(),
+                committed: tokio::sync::Notify::new(),
+                admission: Default::default(),
+                result: Default::default(),
+            })
+        }
+
+        fn release(gate: &(std::sync::Mutex<bool>, std::sync::Condvar)) {
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+        }
+
+        fn wait(gate: &(std::sync::Mutex<bool>, std::sync::Condvar), label: &str) {
+            let (open, _) = gate
+                .1
+                .wait_timeout_while(
+                    gate.0.lock().unwrap(),
+                    Duration::from_millis(3000),
+                    |open| !*open,
+                )
+                .unwrap();
+            assert!(*open, "{label} gate was not released");
+        }
+
+        async fn event(event: &tokio::sync::Notify, label: &str) {
+            tokio::time::timeout(Duration::from_millis(3000), event.notified())
+                .await
+                .unwrap_or_else(|_| panic!("{label} event was not observed"));
+        }
+    }
+
+    fn gated_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
+        let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
+        BashTimingForTest::wait(&timing.admission, "inline admission");
+        crate::bash_background::commit_spawn_receipt_inline()
+            .expect("commit before injected deadline");
+        timing.committed.notify_one();
+        BashTimingForTest::wait(&timing.result, "inline result");
         Response::success(req.id, json!({ "output": "inline done" }))
-    }
-
-    fn short_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
-        // Longer than the startup window below, shorter than INLINE_STARTUP_SETTLE.
-        inline_commit_then_sleep_stub(Duration::from_millis(1000), req)
-    }
-
-    fn stuck_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
-        inline_commit_then_sleep_stub(INLINE_STARTUP_SETTLE + Duration::from_millis(800), req)
     }
 
     #[tokio::test]
     async fn committed_inline_rewrite_answers_with_its_result_or_outcome_unknown() {
-        // The startup window must outlast executor admission on a loaded CI
-        // runner (an 80 ms window let a slow Windows runner refuse the call
-        // before the stub could commit), yet stay shorter than the stub's work,
-        // so the reply still has to come from the committed inline result.
-        const WINDOW_MS: u64 = 500;
-        let mut call = startup_call(
-            short_inline_stub,
-            WINDOW_MS,
-            "unused",
-            Instant::now(),
-            false,
-            false,
-        );
-        let done = first_reply(&mut call, Duration::from_millis(3000)).await;
-        let response = done.response_for_test();
-        assert!(
-            response.success,
-            "a settled rewrite returns its own reply: {response:?}"
-        );
-
-        let mut call = startup_call(
-            stuck_inline_stub,
-            WINDOW_MS,
-            "unused",
-            Instant::now(),
-            false,
-            false,
-        );
-        let done = first_reply(
-            &mut call,
-            INLINE_STARTUP_SETTLE + Duration::from_millis(1500),
-        )
-        .await;
-        let response = done.response_for_test();
-        assert!(!response.success, "{response:?}");
-        assert_eq!(response.data["code"], "outcome_unknown_startup_deadline");
+        for settles in [true, false] {
+            // Start with the 500 ms admission budget already elapsed. Freeze
+            // the receipt's commit clock at request arrival and release the
+            // startup timer only after the stub reports its inline commit;
+            // executor scheduling speed must not decide the startup outcome.
+            let received_at = Instant::now() - Duration::from_millis(1000);
+            let timing = BashTimingForTest::new(received_at);
+            let mut call = with_bash_timing_for_test(Some(timing.clone()), || {
+                startup_call(gated_inline_stub, 500, "unused", received_at, false, false)
+            });
+            BashTimingForTest::event(&timing.startup.armed, "startup deadline armed").await;
+            BashTimingForTest::release(&timing.admission);
+            tokio::select! {
+                biased;
+                done = call.rx.recv() => panic!("startup answered before inline commit: {:?}", done.unwrap().response_for_test()),
+                _ = BashTimingForTest::event(&timing.committed, "inline receipt committed") => {},
+            }
+            timing.startup.fire.notify_one();
+            BashTimingForTest::event(&timing.inline_settle.armed, "inline settle entered").await;
+            if settles {
+                BashTimingForTest::release(&timing.result);
+            } else {
+                timing.inline_settle.fire.notify_one();
+            }
+            let done = first_reply(&mut call, Duration::from_millis(3000)).await;
+            // Release the blocked stub even if the assertions below fail.
+            BashTimingForTest::release(&timing.result);
+            let response = done.response_for_test();
+            if settles {
+                assert!(
+                    response.success,
+                    "a settled rewrite returns its own reply: {response:?}"
+                );
+                assert_eq!(response.data["output"], "inline done");
+            } else {
+                assert!(!response.success, "{response:?}");
+                assert_eq!(response.data["code"], "outcome_unknown_startup_deadline");
+            }
+        }
     }
 
     #[tokio::test]

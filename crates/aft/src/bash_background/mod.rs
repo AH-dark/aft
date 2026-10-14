@@ -159,7 +159,7 @@ thread_local! {
 
 /// Overrides only the receipt's clock on this thread, leaving other startups
 /// and the real process/persistence path untouched.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn with_spawn_commit_time_for_test<T>(
     now: std::time::Instant,
     run: impl FnOnce() -> T,
