@@ -124,115 +124,41 @@ removed harnesses. Consider it only if post-fold measurements still identify
 fake-server first execution as a material bottleneck; a shared cache would need
 its own invalidation, compatibility and concurrency design.
 
-## Native Windows pre-push slice
+## Native Windows Rust test gate
 
-Run `scripts/windows-gate.sh` **before** `scripts/train-push.sh` to catch native
-Windows x64/MSVC failures without waiting for a train. This is an operator smoke,
-not a replacement for three-platform CI; train-push behavior is unchanged.
-Python 3, Git, OpenSSH and the provisioned Windows builder must be available.
-The VM budget is four vCPUs / 16 GiB: both Cargo jobs and test threads stay at four.
+Run `scripts/windows-gate.sh` before `scripts/train-push.sh` when changes need a
+native Windows x64 check. This gate is an operator smoke, not a replacement for
+three-platform CI; train-push behavior is unchanged. Run the command with the
+bash runner's `runon: "windows"` setting. The runner executes it in Git Bash on
+Windows. The command runs in that job without separate machine setup.
 
 ```sh
-scripts/windows-gate.sh --plan                     # inspect origin/main..HEAD
-scripts/windows-gate.sh --base origin/main         # run touched Rust slices
-scripts/windows-gate.sh --full                     # lib + integration
-scripts/windows-gate.sh --filter bash_background::persistence
-scripts/windows-gate.sh --timeout-minutes 30 --full # default cap: 60 minutes
-scripts/windows-gate.sh --status                   # C: free space, target size, lock
+bash scripts/windows-gate.sh --plan                     # inspect the selected slices
+bash scripts/windows-gate.sh --base origin/main         # run changed Rust slices
+bash scripts/windows-gate.sh --full                     # lib + integration
+bash scripts/windows-gate.sh --filter search_index::    # one library slice
+bash scripts/windows-gate.sh --timeout-minutes 30 --full
+bash scripts/windows-gate.sh --status                   # local runner and target info
 ```
 
-`AFT_WINDOWS_GATE_SSH_CONFIG` overrides
-`~/Work/Projects/CortexKit/prefrontal/script/windows-vm/ssh-config`. Connections
-use its `windows-build-vm` alias and current operator key; strict host-key checking
-is always on. VM ownership, start/stop and snapshot procedures live in prefrontal's
-`docs/runbooks/windows-build-vm.md`. The gate does not change those services.
+The Windows job receives a snapshot of the checkout: tracked and untracked files
+are included, while ignored files are not. Keep any fixture or generated input
+needed by a test out of ignored paths, or the remote job will not have it. The
+gate plans changed slices from the base diff plus tracked working-tree changes
+and non-ignored untracked files. Cargo manifests, build scripts, shared library
+infrastructure and configuration changes select the whole library suite. Other
+touched Rust modules and test harnesses select their corresponding slices.
+`--filter` overrides that selection for the library; with `--full` it filters
+both library and integration. `--plan` prints commands without running them, and
+`--status` reports local runner information. `--timeout-minutes` caps the test
+run. A diff with no Rust changes selects nothing; use `--full` or `--filter` to
+request an explicit run.
 
-The printed plan uses committed `git diff --name-only <base>..HEAD` (not the
-working tree). Source files select their top-level lib module; integration files
-select their named module in the integration harness. Cargo manifests/lockfiles,
-build scripts, lib/context/config, executor and db changes broaden to the whole
-lib suite. Other touched test harnesses and the aft binary are selected too.
-`--filter` overrides the diff with an ad-hoc lib slice; with `--full` it filters
-both lib and integration. Empty slices fail rather than silently reporting green.
-A diff with no Rust changes explicitly selects nothing; use an override to run.
-Every run first executes the production storage/config isolation test.
+Every non-empty gate first runs the production storage/config isolation test.
+A selected Cargo command that executes zero tests fails the gate rather than
+silently reporting green. Direct Cargo invocations are also supported for
+narrow checks, but verify that their `test result` reports at least one executed
+test; Cargo itself returns success when a filter matches nothing.
 
-Only a Git bundle of the exact HEAD and its history reaches the product checkout;
-uncommitted/untracked product files are never sent. The gate's PowerShell control
-helper is transferred separately, not compiled as product source. A verified
-ancestor already in the locked guest checkout permits an incremental bundle;
-first use or snapshot rollback automatically uses full history. The guest fetches
-and checks out the specified SHA detached in `C:\build\aft\repo`, keeping Cargo's
-`C:\build\aft\target` and toolchain/dependency caches warm. The x64 VS dev shell
-is sourced for each remote command; provisioning and vm-smoke are never modified.
-
-A guest-side exclusive lock names its holder, start and cap. Before creating run
-data or taking that lock, the gate checks `C:\build\maintenance.lock` and refuses
-with **VM in maintenance**, exit **75** (test/setup failures use exit 1). The
-supervisor rechecks before acquiring its lock; it never creates or removes the
-maintenance marker. The VM owner can place that marker, let any existing gate
-finish, then maintain/reboot/snapshot the guest. `--status` is read-only and also
-reports the marker. Local tests inspect the actual encoded remote command and
-fake its exit 75; no marker is created on the real guest by these checks.
-
-Busy runs refuse;
-expired abandoned locks are reclaimed, never a still-held lock. The supervisor
-bounds transfer/build/tests, kills the complete process tree on timeout/cancel,
-and uses a kill-on-close Windows Job Object to cover supervisor/SSH death. Fresh
-HOME/USERPROFILE/APPDATA/LOCALAPPDATA, XDG and temp directories are created per
-run under `C:\build\aft\runs`; ambient AFT storage/config overrides and injected
-Git config are removed. Test fixture Git identity is disposable. Cleanup deletes
-run data after stopping descendants, leaving repo and target warm. Abandoned
-run directories are reclaimed on a later run. Output streams live and repeats
-libtest failing names, panic blocks and compilation/setup failures at the end.
-
-Local control checks: `python3 scripts/lib/test_windows_gate.py`,
+Local control checks: `bash scripts/lib/test_windows_gate.sh`,
 `bash -n scripts/windows-gate.sh`, `shellcheck -S warning scripts/windows-gate.sh`.
-
-### Native proof and timing
-
-On the OVH Server 2022 x64 VM, Cargo/Rust **1.99.0 MSVC** and PowerShell **5.1**,
-`--filter bash_background::persistence` against origin/main
-`0a6eeb56f711a48afbbe1d1600ef152d5b14cca3` produced:
-
-```text
-Guest exact commit: 0a6eeb56f711a48afbbe1d1600ef152d5b14cca3
-cargo 1.99.0 (5f94df478 2026-08-27)
-host: x86_64-pc-windows-msvc
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4939 filtered out; finished in 0.00s
-test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 4930 filtered out; finished in 0.03s
-GATE PASSED
-exit 0
-```
-
-A disposable local-only branch added one `#[cfg(windows)]` panic to that module.
-The native failure was named in live output and repeated by the end summary:
-
-```text
-Guest exact commit: 2c2cf3a13a5b27123fba69412563eb18a00d407f
-test bash_background::persistence::windows_gate_deliberate_failure ... FAILED
-thread 'bash_background::persistence::windows_gate_deliberate_failure' (3548) panicked at crates\aft\src\bash_background\persistence.rs:2729:5:
-NON-VACUITY BREAK: deliberately failing native Windows test
-test result: FAILED. 10 passed; 1 failed; 0 ignored; 0 measured; 4930 filtered out; finished in 0.37s
-GATE FAILED
-exit 1
-```
-
-The other ten tests and isolation preflight stayed green. The proof branch/ref
-was deleted, its test removed, and the guest reset to the clean task commit with
-another passing 1 + 10 test run; no mutant is part of the delivery.
-
-Two further runs of the same filter/commit
-`c76726ed1f70129f259d2920c02eb1a4da1734a9` took **207.70 s cold** (empty gate-owned
-target, registry cache retained; Cargo build 2m 32s) and **42.65 s warm** (Cargo
-0.46s preflight / 0.41s slice). Both exited 0 with 1 + 10 tests passed. Wall time
-includes SSH, bundle upload and cleanup. Target reset was done under the guest
-lock; the final target was left warm. A live reservation smoke also verified a
-busy refusal naming holder/age, a 45s transfer timeout, and lock/run-dir cleanup.
-
-First use found no checkout and initialized it from a full-history bundle.
-After the VM's maintenance snapshot, the existing origin/main checkout and
-2.52 GiB target survived; the red proof used a verified incremental bundle.
-`ssh -G` for both hops then showed the rotated operator key
-`~/.ssh/cortexkit_runner_operator_ed25519`; subsequent runs took it from the
-SSH config, never from a hardcoded identity option.

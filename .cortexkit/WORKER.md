@@ -13,6 +13,7 @@ A check that prints nothing and exits 0 is not a pass unless this guide says tha
 | Unit (lib) | `cargo test -p agent-file-tools --lib -- <filter>` | `test result: ok. N passed` with N > 0. A filter that matches nothing reports `0 passed`, which is not a pass. |
 | Binary tests | `cargo test -p agent-file-tools --bin aft -- <filter>` | Same as above. Shared infrastructure (locks, leases, capability gates, path identity) breaks fixtures here too. |
 | Integration | `cargo test -p agent-file-tools --test integration -- <filter>` | Same as above. |
+| Windows native tests | `bash scripts/windows-gate.sh --filter <filter>` or `cargo test -p agent-file-tools --lib -- <filter>` | Run with `runon: "windows"`. The Windows job snapshots tracked and untracked files, but not ignored files. A gate filter that runs zero tests fails. |
 | Other test targets | `--test engine`, `--test list_envelope`, `--test rest`, `--test semantic`, `--test alert`, `--test watcher_integration` | Same as above. |
 | Real rust-analyzer | prefix with `AFT_TEST_REQUIRE_RUST_ANALYZER=1` | Without it, real-server tests skip silently. |
 | Full suite | `cargo test -p agent-file-tools`, or `scripts/rust-test-gate.sh` | The gate prints `GATE PASSED` / `GATE FAILED` as its last line. |

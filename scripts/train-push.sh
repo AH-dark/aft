@@ -2,7 +2,8 @@
 # Push a train to its own branch, let CI be the gate, and advance main only on
 # green. Operator tooling runs through the real GitHub CLI (gh) via watch-ci.sh;
 # the shim is only for AI agent commands.
-# Native Windows pre-push smoke is available via scripts/windows-gate.sh (opt-in).
+# Native Windows pre-push smoke: scripts/windows-gate.sh with runon "windows"
+# (opt-in).
 #
 # Lifting this into another repository: carry five files together —
 # scripts/train-push.sh, scripts/watch-ci.sh, scripts/check-path-deps.py,
