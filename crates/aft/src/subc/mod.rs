@@ -11118,8 +11118,8 @@ pub(crate) mod test_support {
             epoch: 1,
         };
 
-        let disabled_iterations = Arc::new(AtomicUsize::new(0));
-        let disabled_probe = Arc::clone(&disabled_iterations);
+        let (disabled_probe_tx, disabled_probe_rx) = std::sync::mpsc::sync_channel(1);
+        let (disabled_progress_tx, disabled_progress_rx) = std::sync::mpsc::sync_channel(1);
         let (disabled_started_tx, disabled_started_rx) = std::sync::mpsc::sync_channel(1);
         let (disabled_rx, disabled_cancellation) = executor.submit_cancellable_async(
             root.clone(),
@@ -11138,8 +11138,15 @@ pub(crate) mod test_support {
                             "untracked search did not receive cancellation",
                         );
                     }
-                    disabled_probe.fetch_add(1, Ordering::Relaxed);
-                    std::thread::yield_now();
+                    if disabled_probe_rx
+                        .recv_timeout(Duration::from_millis(10))
+                        .is_ok()
+                        && !crate::commands::semantic_search::search_cancellation_requested()
+                    {
+                        disabled_progress_tx
+                            .send(())
+                            .expect("untracked search progress");
+                    }
                 }
                 Response::error(
                     "untracked-search",
@@ -11161,20 +11168,21 @@ pub(crate) mod test_support {
             ),
             0
         );
-        let iterations_before = disabled_iterations.load(Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(
-            disabled_iterations.load(Ordering::Relaxed) > iterations_before,
-            "without route registration the search keeps computing"
-        );
+        // Ask for a checkpoint after the disposition change. An acknowledgment
+        // proves the worker is still computing without requiring it to be
+        // scheduled inside a ten-millisecond observation window.
+        disabled_probe_tx.send(()).expect("probe untracked search");
+        disabled_progress_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("without route registration the search keeps computing");
         disabled_cancellation.request_cancel();
         let disabled_response = disabled_rx
             .blocking_recv()
             .expect("untracked search settles after explicit cleanup");
         assert_eq!(disabled_response.data["code"], "request_cancelled");
 
-        let tracked_iterations = Arc::new(AtomicUsize::new(0));
-        let tracked_probe = Arc::clone(&tracked_iterations);
+        let (tracked_probe_tx, tracked_probe_rx) = std::sync::mpsc::sync_channel(1);
+        let (tracked_progress_tx, tracked_progress_rx) = std::sync::mpsc::sync_channel(1);
         let (tracked_started_tx, tracked_started_rx) = std::sync::mpsc::sync_channel(1);
         let tracked_rx = submit_active_tool_call(
             executor.as_ref(),
@@ -11198,8 +11206,15 @@ pub(crate) mod test_support {
                             "tracked search did not receive cancellation",
                         );
                     }
-                    tracked_probe.fetch_add(1, Ordering::Relaxed);
-                    std::thread::yield_now();
+                    if tracked_probe_rx
+                        .recv_timeout(Duration::from_millis(10))
+                        .is_ok()
+                        && !crate::commands::semantic_search::search_cancellation_requested()
+                    {
+                        tracked_progress_tx
+                            .send(())
+                            .expect("tracked search progress");
+                    }
                 }
                 Response::error(
                     "tracked-search",
@@ -11264,12 +11279,10 @@ pub(crate) mod test_support {
             .blocking_recv()
             .expect("teardown-terminal call stops at cancellation checkpoint");
         assert_eq!(terminal_response.data["code"], "request_cancelled");
-        let iterations_before_detach = tracked_iterations.load(Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(
-            tracked_iterations.load(Ordering::Relaxed) > iterations_before_detach,
-            "route detach must retain work whose response can replay after rebind"
-        );
+        tracked_probe_tx.send(()).expect("probe retained search");
+        tracked_progress_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("route detach must retain work whose response can replay after rebind");
         assert_eq!(
             apply_route_work_disposition(
                 &active,
