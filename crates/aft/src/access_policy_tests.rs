@@ -608,6 +608,9 @@ fn artifact_read_ast_replace_still_requires_write_access() {
 
 #[test]
 fn artifact_read_search_does_not_authorize_containing_git_store() {
+    // Storage resolution gives AFT_STORAGE_DIR precedence over configuration.
+    // Keep other tests' process-wide overrides out of this private-store fixture.
+    let _storage_override = crate::test_env::without_storage_override();
     let (_directory, ctx, artifact) = artifact_read_context();
     let storage = ctx.config().storage_dir.clone().unwrap();
     let initialized = std::process::Command::new("git")
