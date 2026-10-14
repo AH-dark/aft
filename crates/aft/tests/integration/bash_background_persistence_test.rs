@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aft::bash_background::persistence::{
@@ -1360,6 +1360,7 @@ fn cleanup_finished_deletes_disk_bundle_of_delivered_terminal() {
 }
 
 #[test]
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
@@ -1405,52 +1406,75 @@ fn cleanup_finished_does_not_block_other_registry_operations_during_delete() {
             .len(),
         1
     );
-    fs::write(
-        task_file(storage.path(), SESSION, &removable, "sh"),
-        vec![b'x'; 8 * 1024 * 1024],
-    )
-    .unwrap();
+    let removable_dir =
+        resolve_task_layout(&session_tasks_dir(storage.path(), SESSION), &removable)
+            .unwrap()
+            .paths
+            .dir;
+    let mut delete_gate = registry.park_finished_delete_for_test(&removable);
+    let cleanup_registry = registry.clone();
+    let (cleanup_done_tx, cleanup_done_rx) = std::sync::mpsc::channel();
+    let cleanup_thread = std::thread::spawn(move || {
+        cleanup_registry.cleanup_finished(Duration::ZERO);
+        cleanup_done_tx.send(()).unwrap();
+    });
+    let join_bound = Duration::from_secs(5);
+    delete_gate
+        .wait_until_parked(join_bound)
+        .expect("cleanup must reach the task's filesystem-delete boundary");
+    assert!(
+        removable_dir.exists(),
+        "task folder must exist while delete is parked"
+    );
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let calls = Arc::new(AtomicU64::new(0));
-    let max_call_ms = Arc::new(AtomicU64::new(0));
     let status_registry = registry.clone();
     let status_storage = storage.path().to_path_buf();
     let status_live = live.clone();
-    let status_stop = Arc::clone(&stop);
-    let status_calls = Arc::clone(&calls);
-    let status_max_call_ms = Arc::clone(&max_call_ms);
+    let (status_done_tx, status_done_rx) = std::sync::mpsc::channel();
     let status_thread = std::thread::spawn(move || {
-        while !status_stop.load(Ordering::SeqCst) {
-            let started = Instant::now();
-            let snapshot = status_registry.status(
-                &status_live,
-                SESSION,
-                None,
-                Some(status_storage.as_path()),
-                1024,
-            );
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            status_max_call_ms.fetch_max(elapsed_ms, Ordering::SeqCst);
-            status_calls.fetch_add(1, Ordering::SeqCst);
-            assert!(snapshot.is_some(), "live task status disappeared");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let snapshot = status_registry.status(
+            &status_live,
+            SESSION,
+            None,
+            Some(status_storage.as_path()),
+            1024,
+        );
+        status_done_tx.send(snapshot).unwrap();
     });
 
-    while calls.load(Ordering::SeqCst) == 0 {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    registry.cleanup_finished(Duration::ZERO);
-    stop.store(true, Ordering::SeqCst);
-    status_thread.join().unwrap();
-
+    // No release has been sent and the gate never releases itself. Receiving a
+    // snapshot here proves status completed during deletion, not before it.
+    // The join bound only diagnoses a deadlock, rather than measuring latency.
+    let status_while_parked = status_done_rx.recv_timeout(join_bound);
     assert!(
-        max_call_ms.load(Ordering::SeqCst) < 100,
-        "status calls were blocked for {}ms",
-        max_call_ms.load(Ordering::SeqCst)
+        matches!(
+            cleanup_done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "cleanup must remain parked until the delete fence is released"
+    );
+    delete_gate.release();
+    cleanup_done_rx
+        .recv_timeout(join_bound)
+        .expect("cleanup must finish after the delete fence is released");
+    cleanup_thread.join().unwrap();
+    if status_while_parked.is_err() {
+        // Unpark deletion before reporting a failed lock fence so a blocked
+        // status worker can settle instead of leaking into another test.
+        let _ = status_done_rx
+            .recv_timeout(join_bound)
+            .expect("status must settle after deletion is released");
+    }
+    status_thread.join().unwrap();
+    assert!(
+        !removable_dir.exists(),
+        "cleanup must remove the task folder"
     );
     let _ = registry.kill(&live, SESSION);
+    let snapshot = status_while_parked.expect(
+        "status() did not complete while task deletion was parked; cleanup_finished may hold the registry lock across deletion",
+    );
+    assert!(snapshot.is_some(), "live task status disappeared");
 }
 
 #[test]

@@ -303,6 +303,65 @@ fn wait_on_kill_signal_gate_for_test(task_id: &str) {
     }
 }
 
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+struct FinishedDeletePark {
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+static FINISHED_DELETE_PARKS: std::sync::OnceLock<Mutex<HashMap<String, FinishedDeletePark>>> =
+    std::sync::OnceLock::new();
+
+/// A task-specific deletion fence for integration tests. Dropping the fence
+/// releases cleanup even if an assertion fails before the explicit release.
+#[doc(hidden)]
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+pub struct FinishedDeleteGateForTest {
+    task_id: String,
+    reached: crossbeam_channel::Receiver<()>,
+    release: Option<crossbeam_channel::Sender<()>>,
+}
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+impl FinishedDeleteGateForTest {
+    pub fn wait_until_parked(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), crossbeam_channel::RecvTimeoutError> {
+        self.reached.recv_timeout(timeout)
+    }
+
+    pub fn release(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+impl Drop for FinishedDeleteGateForTest {
+    fn drop(&mut self) {
+        self.release();
+        if let Some(parks) = FINISHED_DELETE_PARKS.get() {
+            parks.lock().unwrap().remove(&self.task_id);
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+fn wait_on_finished_delete_gate_for_test(task_id: &str) {
+    let park = FINISHED_DELETE_PARKS
+        .get()
+        .and_then(|parks| parks.lock().unwrap().remove(task_id));
+    if let Some(park) = park {
+        let _ = park.reached.send(());
+        // Only the test's release channel can end this pause. An elapsed-time
+        // auto-release would invalidate a concurrent status-operation proof.
+        let _ = park.release.recv();
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BgCompletion {
     pub task_id: String,
@@ -5981,6 +6040,36 @@ impl BgTaskRegistry {
         task.lock_state().unwrap().metadata.timeout_ms = Some(limit_ms);
     }
 
+    /// Park deletion of exactly this task at the filesystem-delete boundary.
+    /// Available in debug or explicitly instrumented builds so the ordinary
+    /// integration suite can prove lock independence without a speed bound.
+    #[doc(hidden)]
+    #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+    pub fn park_finished_delete_for_test(&self, task_id: &str) -> FinishedDeleteGateForTest {
+        let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let mut parks = FINISHED_DELETE_PARKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap();
+        assert!(
+            !parks.contains_key(task_id),
+            "task deletion is already parked"
+        );
+        parks.insert(
+            task_id.to_string(),
+            FinishedDeletePark {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+        FinishedDeleteGateForTest {
+            task_id: task_id.to_string(),
+            reached: reached_rx,
+            release: Some(release_tx),
+        }
+    }
+
     /// Inspect at most one queue slice per pass. Rotate retained tasks so a
     /// long runner or an undelivered result cannot starve later history, and
     /// remove a task from memory only after its disk deletion succeeds.
@@ -6050,6 +6139,8 @@ impl BgTaskRegistry {
             }
             let delete_result = if handles_released {
                 self.retire_watchdog_task(&task_id);
+                #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+                wait_on_finished_delete_gate_for_test(&task_id);
                 delete_bundle(&task)
             } else {
                 Err(std::io::Error::new(
