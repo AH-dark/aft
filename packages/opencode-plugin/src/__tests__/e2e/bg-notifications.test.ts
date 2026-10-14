@@ -143,11 +143,11 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
       h,
       bash,
       process.platform === "win32"
-        ? "Start-Sleep -Seconds 2; Write-Output older-finished"
-        : "sleep 2; printf older-finished",
+        ? "Start-Sleep -Seconds 3; Write-Output older-finished"
+        : "sleep 3; printf older-finished",
     );
     expect(sessionBgStates.get(sessionID)?.pendingCompletions ?? []).toHaveLength(0);
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    await waitForQueuedCompletion(bridge, sessionID, alreadyFinishedTaskId);
     const waitResult = bash.execute(
       {
         command:
@@ -249,7 +249,7 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
         : "sleep 2; printf older-promote",
     );
     expect(sessionBgStates.get(sessionID)?.pendingCompletions ?? []).toHaveLength(0);
-    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    await waitForQueuedCompletion(bridge, sessionID, alreadyFinishedTaskId);
 
     const promoted = (await bash.execute(
       {
@@ -359,6 +359,22 @@ async function spawnBackground(
   const taskId = match[1];
   trackBgTask("e2e-session", taskId);
   return taskId;
+}
+
+async function waitForQueuedCompletion(
+  bridge: E2EHarness["bridge"],
+  sessionID: string,
+  taskId: string,
+): Promise<void> {
+  // Terminal status can precede completion publication. Inspect the actual
+  // queue without ACKing: the next tool-result drain must still receive it.
+  await waitUntil(async () => {
+    const response = await bridge.send("bash_drain_completions", { session_id: sessionID });
+    return (
+      Array.isArray(response.bg_completions) &&
+      response.bg_completions.some((completion) => completion.task_id === taskId)
+    );
+  });
 }
 
 async function waitUntil(
