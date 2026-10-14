@@ -8569,6 +8569,28 @@
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 996,
+      "column": 28,
+      "token": "filePath",
+      "text": "arguments: json!({\"filePath\":outside}),",
+      "location": "line 996, column 28",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/consent_tests.rs",
+      "line": 1743,
+      "column": 32,
+      "token": "filePath",
+      "text": "arguments: json!({\"filePath\":path}),",
+      "location": "line 1743, column 32",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     }
   ]
 }
