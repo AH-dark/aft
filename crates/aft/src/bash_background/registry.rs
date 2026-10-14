@@ -7525,6 +7525,19 @@ impl BgTaskRegistry {
         terminal_status: BgTaskStatus,
         reason: Option<String>,
     ) -> Result<BgTaskSnapshot, String> {
+        #[cfg(feature = "test-timing-hooks")]
+        let scope_diagnostic = matches!(
+            reason.as_deref(),
+            Some(SCOPE_REVOKED_REASON | "scope revoked")
+        );
+        #[cfg(feature = "test-timing-hooks")]
+        let diagnostic_start = Instant::now();
+        #[cfg(feature = "test-timing-hooks")]
+        if scope_diagnostic {
+            crate::slog_info!(
+                "scope diagnostic phase=kill_started task={task_id} session={session_id}"
+            );
+        }
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
@@ -7717,8 +7730,23 @@ impl BgTaskRegistry {
                     .ok()
                     .flatten()
                     .filter(|marker| matches!(marker, ExitMarker::Code(_)));
+                #[cfg(feature = "test-timing-hooks")]
+                if scope_diagnostic {
+                    crate::slog_info!("scope diagnostic phase=signal_started task={task_id} child_pid={child_pid:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
+                }
                 terminate_piped_task(&task.task_id, pgid, child_pid, child.as_mut());
+                #[cfg(feature = "test-timing-hooks")]
+                if scope_diagnostic {
+                    crate::slog_info!(
+                        "scope diagnostic phase=signal_returned task={task_id} elapsed_ms={}",
+                        diagnostic_start.elapsed().as_millis()
+                    );
+                }
                 let child_exit_observed = child.as_mut().is_some_and(|child| child.wait().is_ok());
+                #[cfg(feature = "test-timing-hooks")]
+                if scope_diagnostic {
+                    crate::slog_info!("scope diagnostic phase=child_reaped task={task_id} observed={child_exit_observed} natural_marker={natural_exit_before_signal:?} elapsed_ms={}", diagnostic_start.elapsed().as_millis());
+                }
                 drop(child);
                 settle_killed_process_group(&task.task_id, pgid);
 
@@ -7814,6 +7842,14 @@ impl BgTaskRegistry {
         }
         snapshot.kill_signaled = kill_signaled;
         snapshot.kill_reached = kill_reached;
+        #[cfg(feature = "test-timing-hooks")]
+        if scope_diagnostic {
+            crate::slog_info!(
+                "scope diagnostic phase=terminal_snapshot task={task_id} status={:?} elapsed_ms={}",
+                snapshot.info.status,
+                diagnostic_start.elapsed().as_millis()
+            );
+        }
         Ok(snapshot)
     }
 

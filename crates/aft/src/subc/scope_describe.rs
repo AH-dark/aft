@@ -158,6 +158,8 @@ where
                         let _ = std::fs::write(path, matches.to_string());
                     }
                     if scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
+                        #[cfg(feature = "test-timing-hooks")]
+                        crate::slog_info!("scope diagnostic phase=goodbye_describe_queued scope_epoch={}", stamp.scope_epoch);
                         queued.insert(key, stamp);
                     }
                 }
@@ -183,6 +185,8 @@ where
                         // before rechecking shell tasks with that owner/ref/epoch.
                         next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
                         if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
+                            #[cfg(feature = "test-timing-hooks")]
+                            crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             let keys = revoke(executor.clone(), &stamp).await;
                             let _ = ended.send(EndedScope { stamp, keys });
                             retry.remove(&key);
@@ -225,12 +229,20 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> Vec<crate::db::c
     let mut keys = Vec::new();
     for (root, _) in entries {
         let stamp = stamp.clone();
+        #[cfg(feature = "test-timing-hooks")]
+        let submitted_at = std::time::Instant::now();
         let (result, receiver) = oneshot::channel();
         let job = executor.submit_async(
             root,
             Lane::Mutating,
             "scope-ended".into(),
             Box::new(move |ctx| {
+                #[cfg(feature = "test-timing-hooks")]
+                crate::slog_info!(
+                    "scope diagnostic phase=revoke_admitted scope_epoch={} queue_ms={}",
+                    stamp.scope_epoch,
+                    submitted_at.elapsed().as_millis()
+                );
                 let scope = crate::db::call_ledger::ScopeIdentity {
                     owner: principal_id(&Some(stamp.owner.clone()))
                         .expect("scope owner is verified"),
@@ -257,6 +269,12 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> Vec<crate::db::c
                 // Drop the ledger lock before killing: terminal task writes use
                 // the actor's same connection and must not deadlock on it.
                 ctx.bash_background().kill_scope(&stamp);
+                #[cfg(feature = "test-timing-hooks")]
+                crate::slog_info!(
+                    "scope diagnostic phase=revoke_finished scope_epoch={} elapsed_ms={}",
+                    stamp.scope_epoch,
+                    submitted_at.elapsed().as_millis()
+                );
                 let _ = result.send(keys);
                 Response::success("scope-ended", json!({}))
             }),

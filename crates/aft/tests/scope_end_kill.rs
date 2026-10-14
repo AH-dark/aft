@@ -31,12 +31,21 @@ struct Daemon {
     parked: VecDeque<Frame>,
     corr: u64,
     controls: Vec<(u64, String)>,
+    stderr_path: PathBuf,
+    frame_trace: Vec<String>,
 }
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.reader.abort();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() || std::env::var_os("AFT_TEST_SCOPE_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "scope daemon stderr:\n{}",
+                std::fs::read_to_string(&self.stderr_path)
+                    .unwrap_or_else(|error| error.to_string())
+            );
+        }
     }
 }
 fn flags() -> Flags {
@@ -90,6 +99,7 @@ impl Daemon {
         let connection_path = root.join("connection.json");
         connection_file::write_atomic(&connection_path, &connection).unwrap();
         let mut command = Command::new(aft_binary::aft_binary());
+        let stderr_path = root.join("daemon.stderr");
         command
             .current_dir(root)
             .arg("--subc")
@@ -102,7 +112,7 @@ impl Daemon {
             .env("AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS", "200")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()));
         for (variable, directory) in [
             ("XDG_CONFIG_HOME", "config"),
             ("XDG_DATA_HOME", "data"),
@@ -168,6 +178,8 @@ impl Daemon {
             parked: VecDeque::new(),
             corr: 100,
             controls: vec![],
+            stderr_path,
+            frame_trace: Vec::new(),
         }
     }
     async fn send(
@@ -181,6 +193,11 @@ impl Daemon {
         let bytes = value
             .map(|value| serde_json::to_vec(&value).unwrap())
             .unwrap_or_default();
+        self.frame_trace.push(format!(
+            "at_ms={} sent type={ty:?} channel={channel} epoch={epoch} corr={corr} body={}",
+            aft::bash_background::persistence::unix_millis(),
+            String::from_utf8_lossy(&bytes)
+        ));
         write_frame(
             &mut self.writer,
             &Frame::build(ty, flags(), channel, epoch, corr, bytes).unwrap(),
@@ -201,6 +218,15 @@ impl Daemon {
             let frame = tokio::time::timeout_at(until, self.frames.recv())
                 .await
                 .ok()??;
+            self.frame_trace.push(format!(
+                "at_ms={} received type={:?} channel={} epoch={} corr={} body={}",
+                aft::bash_background::persistence::unix_millis(),
+                frame.header.ty,
+                frame.header.channel,
+                frame.header.epoch,
+                frame.header.corr,
+                String::from_utf8_lossy(&frame.body)
+            ));
             if frame.header.ty == FrameType::Ping {
                 self.send(FrameType::Pong, 0, 0, frame.header.corr, None)
                     .await;
@@ -323,7 +349,8 @@ impl Daemon {
                 && matches!(frame.header.ty, FrameType::Error | FrameType::Response)
         })
         .await
-        .expect("terminal reply")
+        .unwrap_or_else(|| panic!("terminal reply timed out for channel={channel} corr={corr}; all sent/received frames:\n{}\ndaemon stderr (including tail):\n{}",
+            self.frame_trace.join("\n"), std::fs::read_to_string(&self.stderr_path).unwrap_or_else(|error| error.to_string())))
     }
     async fn call(&mut self, channel: u16, request: Value) -> Frame {
         let corr = self.start(channel, 1, request).await;
@@ -334,7 +361,12 @@ impl Daemon {
             frame.header.channel == channel && frame.header.ty == FrameType::Request
         })
         .await
-        .expect("permission question")
+        .unwrap_or_else(|| {
+            panic!(
+                "permission question; parked frames: {:?}",
+                self.parked.iter().map(body).collect::<Vec<_>>()
+            )
+        })
     }
     async fn allow(&mut self, channel: u16) {
         let ask = self.ask(channel).await;
@@ -957,9 +989,21 @@ async fn goodbye_ended_kills_powershell_through_the_same_stamped_registry() {
     daemon.start(1, 1, request).await;
     daemon.allow(1).await;
     let task = running_task(&root, "session-1").await.1;
+    eprintln!(
+        "scope test phase=goodbye_sent at_ms={}",
+        aft::bash_background::persistence::unix_millis()
+    );
     daemon.goodbye(1, 1).await;
     let query = daemon.describe().await;
+    eprintln!(
+        "scope test phase=describe_received at_ms={}",
+        aft::bash_background::persistence::unix_millis()
+    );
     daemon.answer(&query, "ended", true, 1).await;
+    eprintln!(
+        "scope test phase=ended_answer_sent at_ms={}",
+        aft::bash_background::persistence::unix_millis()
+    );
     daemon
         .bind(1, 2, "direct", Some(stamp("owner", 1)), false)
         .await;
@@ -971,7 +1015,24 @@ async fn goodbye_ended_kills_powershell_through_the_same_stamped_registry() {
             assert!(status.contains("scope revoked"));
             break;
         }
-        assert!(tokio::time::Instant::now() < until);
+        assert!(
+            tokio::time::Instant::now() < until,
+            "scope PowerShell kill did not finish within 10 s; last_status={status}; records={:?}",
+            task_metadata(&root)
+                .into_iter()
+                .filter(|(_, record)| record["task_id"] == task["task_id"])
+                .map(|(path, record)| {
+                    let exit = path
+                        .parent()
+                        .and_then(Path::parent)
+                        .unwrap()
+                        .join("io/exit");
+                    let exit_record =
+                        std::fs::read_to_string(&exit).map_err(|error| error.to_string());
+                    (path, record, exit, exit_record)
+                })
+                .collect::<Vec<_>>()
+        );
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
 }
