@@ -1305,7 +1305,13 @@ pub(super) fn submit_deferred_bash(
                 tokio::select! {
                     biased;
                     _ = &mut wait_task => {}
-                    _ = wait_for_bash_reply_deadline(reply_deadline), if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
+                    _ = async {
+                        #[cfg(test)]
+                        if let Some(timing) = &timing_for_test {
+                            return timing.reply.wait().await;
+                        }
+                        wait_for_bash_reply_deadline(reply_deadline).await;
+                    }, if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
                         if claim.claim_for_deadline_handoff() {
                             let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session));
                             // Status-bar formatting can wait on diagnostic-cache or
@@ -2359,7 +2365,9 @@ struct BashTimingForTest {
     commit_time: Instant,
     startup: BashTestDeadline,
     inline_settle: BashTestDeadline,
+    reply: BashTestDeadline,
     committed: tokio::sync::Notify,
+    task_id: std::sync::Mutex<Option<String>>,
     admission: (std::sync::Mutex<bool>, std::sync::Condvar),
     result: (std::sync::Mutex<bool>, std::sync::Condvar),
 }
@@ -3974,7 +3982,9 @@ mod grant_path_tests {
                 commit_time,
                 startup: BashTestDeadline::default(),
                 inline_settle: BashTestDeadline::default(),
+                reply: BashTestDeadline::default(),
                 committed: tokio::sync::Notify::new(),
+                task_id: Default::default(),
                 admission: Default::default(),
                 result: Default::default(),
             })
@@ -4012,6 +4022,21 @@ mod grant_path_tests {
         timing.committed.notify_one();
         BashTimingForTest::wait(&timing.result, "inline result");
         Response::success(req.id, json!({ "output": "inline done" }))
+    }
+
+    fn gated_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
+        BashTimingForTest::wait(&timing.admission, "task admission");
+        let response = running_bash_stub(req, ctx);
+        assert!(response.success, "{response:?}");
+        *timing.task_id.lock().unwrap() = Some(
+            response.data["task_id"]
+                .as_str()
+                .expect("registered task id")
+                .to_string(),
+        );
+        timing.committed.notify_one();
+        response
     }
 
     #[tokio::test]
@@ -4148,22 +4173,31 @@ mod grant_path_tests {
         }
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
-        let mut rx = deadline_test_call(&executor, &root, running_bash_stub, arguments);
-        let started_by = Instant::now() + Duration::from_millis(1500);
-        let task = loop {
-            if let Some(snapshot) = ctx.bash_background().list(0).first() {
-                break ctx
-                    .bash_background()
-                    .task_for_test(&snapshot.info.task_id)
-                    .unwrap();
-            }
-            assert!(
-                Instant::now() < started_by,
-                "task must start before the reply deadline"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        // Admission is deliberately later than the foreground deadline. The
+        // test fires that deadline only after registration and lock acquisition,
+        // so it exercises handoff under contention rather than scheduler speed.
+        let received_at = Instant::now() - Duration::from_millis(3000);
+        let timing = BashTimingForTest::new(received_at);
+        let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
+            deadline_test_call_received(
+                &executor,
+                &root,
+                gated_running_stub,
+                arguments,
+                received_at,
+            )
+        });
+        BashTimingForTest::event(&timing.startup.armed, "task startup deadline armed").await;
+        BashTimingForTest::release(&timing.admission);
+        tokio::select! {
+            biased;
+            done = rx.recv() => panic!("startup answered before task registration: {:?}", done.unwrap().response_for_test()),
+            _ = BashTimingForTest::event(&timing.committed, "task registered") => {},
+        }
+        let task_id = timing.task_id.lock().unwrap().clone().unwrap();
+        let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+        BashTimingForTest::event(&timing.reply.armed, "foreground deadline armed").await;
+        let (held_tx, held_rx) = oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder = executor.submit_async(
             root,
@@ -4176,7 +4210,11 @@ mod grant_path_tests {
                 Response::success("held-writer", json!({}))
             }),
         );
-        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), held_rx)
+            .await
+            .expect("writer must acquire task lock")
+            .unwrap();
+        timing.reply.fire.notify_one();
         let done = tokio::time::timeout(Duration::from_millis(2300), rx.recv()).await;
         release_tx.send(()).unwrap();
         holder.await.unwrap();
