@@ -331,12 +331,33 @@ pub(crate) fn verify_files_bounded<K: Send>(
             .collect();
     }
 
-    match strict_verify_pool() {
+    #[cfg(test)]
+    let probe = files.first().and_then(|file| verify_stat_probe(&file.1));
+    #[cfg(test)]
+    let pool = match &probe {
+        Some(probe) => Some(&probe.pool),
+        None => strict_verify_pool(),
+    };
+    #[cfg(not(test))]
+    let pool = strict_verify_pool();
+    #[cfg(test)]
+    if let Some(probe) = &probe {
+        probe.stats.lock().unwrap().pool_size = pool.map(|pool| pool.current_num_threads());
+    }
+    #[cfg(test)]
+    let min_len = probe.as_ref().map_or(1, |probe| {
+        if probe.schedule == VerifyScheduleForTest::SingleWorkerDrain {
+            files.len()
+        } else {
+            1
+        }
+    });
+    match pool {
         Some(pool) => pool.install(|| {
-            files
-                .into_par_iter()
-                .map(|file| verify_one(file, strategy))
-                .collect()
+            let files = files.into_par_iter();
+            #[cfg(test)]
+            let files = files.with_min_len(min_len);
+            files.map(|file| verify_one(file, strategy)).collect()
         }),
         None => files
             .into_iter()
@@ -439,43 +460,118 @@ pub fn watched_hash_file_count_for_debug() -> usize {
 }
 
 #[cfg(test)]
-static WATCHED_VERIFY_STATS: OnceLock<Mutex<Option<VerifyStatWatch>>> = OnceLock::new();
+static WATCHED_VERIFY_STATS: OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Arc<VerifyStatProbe>>>> =
+    OnceLock::new();
 
 #[cfg(test)]
+#[derive(Default)]
 pub(crate) struct VerifyStatWatch {
-    root: PathBuf,
     pub(crate) calls: Vec<(PathBuf, std::thread::ThreadId)>,
+    pub(crate) pool_size: Option<usize>,
+    pub(crate) concurrent: bool,
 }
 
 #[cfg(test)]
-pub(crate) fn watch_verify_stats(root: &Path) {
-    *WATCHED_VERIFY_STATS
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap() = Some(VerifyStatWatch {
-        root: root.to_path_buf(),
-        calls: Vec::new(),
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifyScheduleForTest {
+    SingleWorkerDrain,
+    Concurrent,
+}
+
+#[cfg(test)]
+struct VerifyStatProbe {
+    pool: rayon::ThreadPool,
+    schedule: VerifyScheduleForTest,
+    stats: Mutex<VerifyStatWatch>,
+    second_worker: std::sync::Condvar,
+}
+
+#[cfg(test)]
+pub(crate) struct VerifyStatGuard {
+    root: PathBuf,
+    probe: std::sync::Arc<VerifyStatProbe>,
+}
+
+#[cfg(test)]
+pub(crate) fn watch_verify_stats(root: &Path, schedule: VerifyScheduleForTest) -> VerifyStatGuard {
+    let probe = std::sync::Arc::new(VerifyStatProbe {
+        pool: rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("two-worker verification test pool"),
+        schedule,
+        stats: Mutex::new(VerifyStatWatch::default()),
+        second_worker: std::sync::Condvar::new(),
     });
+    let previous = WATCHED_VERIFY_STATS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), probe.clone());
+    assert!(
+        previous.is_none(),
+        "verification stat observer already registered for root"
+    );
+    VerifyStatGuard {
+        root: root.to_path_buf(),
+        probe,
+    }
 }
 
 #[cfg(test)]
-pub(crate) fn take_verify_stats() -> VerifyStatWatch {
+impl VerifyStatGuard {
+    pub(crate) fn take_stats(&self) -> VerifyStatWatch {
+        std::mem::take(&mut *self.probe.stats.lock().unwrap())
+    }
+}
+
+#[cfg(test)]
+impl Drop for VerifyStatGuard {
+    fn drop(&mut self) {
+        WATCHED_VERIFY_STATS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&self.root);
+    }
+}
+
+#[cfg(test)]
+fn verify_stat_probe(path: &Path) -> Option<std::sync::Arc<VerifyStatProbe>> {
     WATCHED_VERIFY_STATS
-        .get_or_init(|| Mutex::new(None))
+        .get()?
         .lock()
         .unwrap()
-        .take()
-        .unwrap()
+        .iter()
+        .find(|(root, _)| path.starts_with(root))
+        .map(|(_, probe)| probe.clone())
 }
 
 #[cfg(test)]
 pub(crate) fn record_metadata_call(path: &Path) {
-    if let Some(watch) = WATCHED_VERIFY_STATS.get() {
-        let mut watch = watch.lock().unwrap();
-        if let Some(watch) = watch.as_mut().filter(|watch| path.starts_with(&watch.root)) {
-            watch
-                .calls
-                .push((path.to_path_buf(), std::thread::current().id()));
+    if let Some(probe) = verify_stat_probe(path) {
+        let thread = std::thread::current().id();
+        let mut stats = probe.stats.lock().unwrap();
+        stats.calls.push((path.to_path_buf(), thread));
+        if probe.schedule == VerifyScheduleForTest::Concurrent {
+            // The first item cannot finish until another worker has taken an
+            // item. Merely creating two threads is not evidence of concurrency.
+            if stats.calls[0].1 != thread {
+                stats.concurrent = true;
+                probe.second_worker.notify_all();
+            } else if !stats.concurrent {
+                let (stats, _) = probe
+                    .second_worker
+                    .wait_timeout_while(stats, std::time::Duration::from_secs(2), |stats| {
+                        !stats.concurrent
+                    })
+                    .unwrap();
+                assert!(
+                    stats.concurrent,
+                    "verification remained serial: a second worker never took an item"
+                );
+            }
         }
     }
 }

@@ -11412,28 +11412,54 @@ mod warm_reload_verification_tests {
             fs::write(root.join(format!("file-{n}.rs")), vec![b'x'; 64 * 1024]).unwrap();
         }
         let mut index = SearchIndex::build(&root);
-        cache_freshness::watch_verify_stats(&root);
-        verify_file_mtimes(&mut index, cache_freshness::VerifyStrategy::Strict);
-        let stats = cache_freshness::take_verify_stats();
-        let mut counts = HashMap::new();
-        let mut threads = HashSet::new();
-        for (path, thread) in stats.calls {
-            *counts.entry(path).or_insert(0) += 1;
-            threads.insert(thread);
-        }
-        for path in index.path_to_id.keys() {
+        for schedule in [
+            cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+            cache_freshness::VerifyScheduleForTest::Concurrent,
+        ] {
+            // A two-worker pool may legitimately drain a small batch on one
+            // worker. Check the installed pool independently of that schedule,
+            // then force overlap to prove verification can run concurrently.
+            let watch = cache_freshness::watch_verify_stats(&root, schedule);
+            verify_file_mtimes(&mut index, cache_freshness::VerifyStrategy::Strict);
+            let stats = watch.take_stats();
             assert_eq!(
-                counts.get(path),
-                Some(&1),
-                "indexed file stat count: {}",
-                path.display()
+                stats.pool_size,
+                Some(2),
+                "bounded verification must install the two-worker pool"
             );
-        }
-        if cache_freshness::strict_verify_pool_size() > 1 {
             assert!(
-                threads.len() > 1,
-                "strict warm verification must use multiple workers"
+                !index.path_to_id.is_empty(),
+                "verification fixture has indexed files"
             );
+            let mut counts = HashMap::new();
+            let mut threads = HashSet::new();
+            for (path, thread) in stats.calls {
+                *counts.entry(path).or_insert(0) += 1;
+                threads.insert(thread);
+            }
+            for path in index.path_to_id.keys() {
+                assert_eq!(
+                    counts.get(path),
+                    Some(&1),
+                    "indexed file stat count: {}",
+                    path.display()
+                );
+            }
+            match schedule {
+                cache_freshness::VerifyScheduleForTest::SingleWorkerDrain => {
+                    assert_eq!(
+                        threads.len(),
+                        1,
+                        "forced unsplit batch drains on one worker"
+                    );
+                }
+                cache_freshness::VerifyScheduleForTest::Concurrent => {
+                    assert!(
+                        stats.concurrent,
+                        "two workers must take items before the first completes"
+                    );
+                }
+            }
         }
     }
 
