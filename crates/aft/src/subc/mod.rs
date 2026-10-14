@@ -204,6 +204,8 @@ mod bash_selector_tests;
 mod consent;
 mod drain;
 mod health;
+#[doc(hidden)]
+pub use self::health::SubcTestHealthRollupProbe;
 mod manifest;
 mod persistence;
 mod push;
@@ -281,6 +283,7 @@ pub enum SubcLifecycleEvent {
 pub struct SubcTestLifecycleProbe {
     events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>,
     bind_priority: Arc<StdMutex<Option<RouteBindPriorityProbe>>>,
+    health_rollup: Option<SubcTestHealthRollupProbe>,
 }
 
 struct RouteBindPriorityProbe {
@@ -296,6 +299,7 @@ impl SubcTestLifecycleProbe {
         Self {
             events_tx,
             bind_priority: Arc::new(StdMutex::new(None)),
+            health_rollup: None,
         }
     }
 
@@ -3826,6 +3830,47 @@ pub fn run_subc_mode(
     dispatch: DispatchFn,
     user_config_path: Option<PathBuf>,
 ) -> Result<(), SubcError> {
+    run_subc_mode_with_probe(
+        connection_file_path,
+        ctx,
+        executor,
+        dispatch,
+        user_config_path,
+        None,
+    )
+}
+
+/// Production-wire test entry with an owned health-publication rendezvous.
+#[doc(hidden)]
+pub fn run_subc_mode_for_test_with_health_rollup_probe(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    health_rollup: SubcTestHealthRollupProbe,
+) -> Result<(), SubcError> {
+    let (events_tx, _events_rx) = mpsc::unbounded_channel();
+    let mut probe = SubcTestLifecycleProbe::new(events_tx);
+    probe.health_rollup = Some(health_rollup);
+    run_subc_mode_with_probe(
+        connection_file_path,
+        ctx,
+        executor,
+        dispatch,
+        user_config_path,
+        Some(probe),
+    )
+}
+
+fn run_subc_mode_with_probe(
+    connection_file_path: &Path,
+    ctx: Arc<AppContext>,
+    executor: Arc<Executor>,
+    dispatch: DispatchFn,
+    user_config_path: Option<PathBuf>,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
+) -> Result<(), SubcError> {
     // One watch on the user config file serves every root in this process:
     // an edit asks each live root to reload its config.
     let _user_config_watch = user_config_path.clone().map(|path| {
@@ -3848,7 +3893,7 @@ pub fn run_subc_mode(
         user_config_path,
         false,
         MAX_FRAME_BODY_LEN as usize,
-        None,
+        lifecycle_probe,
     )
 }
 
@@ -4785,11 +4830,22 @@ where
     let mut pending_responses = PendingSubcResponses::default();
     let mut database_waits = persistence::DatabaseWaits::default();
     let health_rollup_cache = Arc::new(HealthRollupCache::new());
-    let health_rollup_worker = HealthRollupWorker::start(
-        Arc::clone(&health_rollup_cache),
-        Arc::clone(&executor),
-        Arc::clone(&shared_app),
-    );
+    let health_rollup_worker = match lifecycle_probe
+        .as_ref()
+        .and_then(|probe| probe.health_rollup.clone())
+    {
+        Some(probe) => HealthRollupWorker::start_with_test_probe(
+            Arc::clone(&health_rollup_cache),
+            Arc::clone(&executor),
+            Arc::clone(&shared_app),
+            probe,
+        ),
+        None => HealthRollupWorker::start(
+            Arc::clone(&health_rollup_cache),
+            Arc::clone(&executor),
+            Arc::clone(&shared_app),
+        ),
+    };
 
     // Arm the existing promised-wake marker before the first turn too: a lock
     // taken before the first select must be just as recoverable as a later one.

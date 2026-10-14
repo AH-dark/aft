@@ -20,9 +20,9 @@ use aft::protocol::{
     Response, StatusChangedFrame,
 };
 use aft::subc::{
-    run_subc_mode, run_subc_mode_for_test, run_subc_mode_for_test_with_lifecycle_probe,
-    run_subc_mode_for_test_with_response_body_limit, SubcError, SubcLifecycleEvent,
-    SubcTestLifecycleProbe,
+    run_subc_mode, run_subc_mode_for_test, run_subc_mode_for_test_with_health_rollup_probe,
+    run_subc_mode_for_test_with_lifecycle_probe, run_subc_mode_for_test_with_response_body_limit,
+    SubcError, SubcLifecycleEvent, SubcTestHealthRollupProbe, SubcTestLifecycleProbe,
 };
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
@@ -63,6 +63,7 @@ pub(super) struct FakeDaemonInput {
     pub(super) user_config_path: std::path::PathBuf,
     pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
+    health_rollup_probe: Option<SubcTestHealthRollupProbe>,
 }
 
 struct InitialAttachInput {
@@ -1433,6 +1434,7 @@ fn run_subc_bridge_test_with_response_body_limit<F, Fut, A>(
         bridge_executor_config(),
         false,
         None,
+        None,
     );
 }
 
@@ -1467,6 +1469,7 @@ fn run_subc_bridge_test_with_env<E, F, Fut, A>(
         bridge_dispatch,
         bridge_executor_config(),
         false,
+        None,
         None,
     );
 }
@@ -1507,6 +1510,7 @@ fn run_subc_bridge_production_test_with_dispatch<F, Fut, A>(
         bridge_executor_config(),
         false,
         None,
+        None,
     );
 }
 
@@ -1536,6 +1540,7 @@ fn run_subc_bridge_production_test_with_user_config<F, Fut, A>(
         bridge_executor_config(),
         false,
         Some(user_doc),
+        None,
     );
 }
 
@@ -1562,6 +1567,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch<F, Fut, A>(
         bridge_executor_config(),
         false,
         None,
+        None,
     );
 }
 
@@ -1587,6 +1593,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_lifecycle_probe<F, Fut, A>(
         dispatch,
         bridge_executor_config(),
         true,
+        None,
         None,
     );
 }
@@ -1615,6 +1622,7 @@ pub(super) fn run_subc_bridge_test_with_dispatch_and_executor_config<F, Fut, A>(
         executor_config,
         false,
         None,
+        None,
     );
 }
 
@@ -1631,6 +1639,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     executor_config: ExecutorConfig,
     with_lifecycle_probe: bool,
     user_config_doc: Option<&'static str>,
+    health_rollup_probe: Option<SubcTestHealthRollupProbe>,
 ) where
     E: FnOnce() -> Vec<EnvVarGuard>,
     F: FnOnce(FakeDaemonInput) -> Fut + Send + 'static,
@@ -1727,6 +1736,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let callgraph_file_path = roots.callgraph_file.clone();
     let user_config_path_for_daemon = user_config_path.clone();
     let lifecycle_probe_for_daemon = lifecycle_probe.clone();
+    let health_rollup_probe_for_daemon = health_rollup_probe.clone();
     let daemon = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1753,6 +1763,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
                     user_config_path: user_config_path_for_daemon,
                     lifecycle_events,
                     lifecycle_probe: lifecycle_probe_for_daemon,
+                    health_rollup_probe: health_rollup_probe_for_daemon,
                 }),
             )
             .await
@@ -1763,7 +1774,16 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     // Inject a hermetic user config path so local config reads never touch a
     // real ~/.config/cortexkit/aft.jsonc on the dev/CI machine. Most tests leave
     // it absent; storm tests can write it through FakeDaemonInput.
-    let run_result = if let Some(response_body_limit) = response_body_limit {
+    let run_result = if let Some(probe) = health_rollup_probe {
+        run_subc_mode_for_test_with_health_rollup_probe(
+            &conn_path,
+            ctx,
+            executor,
+            dispatch,
+            Some(user_config_path),
+            probe,
+        )
+    } else if let Some(response_body_limit) = response_body_limit {
         run_subc_mode_for_test_with_response_body_limit(
             &conn_path,
             ctx,
@@ -3047,9 +3067,10 @@ fn subc_bridge_management_surface_is_passive_closed_and_first_party() {
 
 #[test]
 fn subc_bridge_health_check_returns_root_status_report() {
-    run_subc_bridge_production_test(
+    run_subc_bridge_test_inner(
         "subc_bridge_health_check_returns_root_status_report",
         Duration::from_secs(30),
+        Vec::new,
         drive_health_check_daemon,
         |_, executor, roots| {
             let root_id = ProjectRootId::from_path(roots.root1.path()).expect("root1 id");
@@ -3072,6 +3093,13 @@ fn subc_bridge_health_check_returns_root_status_report() {
                 "connection teardown must cancel queued root maintenance"
             );
         },
+        false,
+        None,
+        bridge_dispatch,
+        bridge_executor_config(),
+        false,
+        None,
+        Some(SubcTestHealthRollupProbe::new()),
     );
 }
 
@@ -3243,6 +3271,7 @@ fn subc_bridge_bash_wait_true_outlasts_slow_startup_reply() {
         bridge_executor_config(),
         false,
         None,
+        None,
     );
 }
 
@@ -3287,6 +3316,7 @@ fn subc_bridge_repeat_breaker_steers_bash_on_every_answer_path() {
         bash_repeat_dispatch,
         bridge_executor_config(),
         false,
+        None,
         None,
     );
 }
@@ -3496,6 +3526,7 @@ fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
         bridge_executor_config(),
         false,
         None,
+        None,
     );
 }
 
@@ -3529,6 +3560,7 @@ fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive
         slow_started_promotion_dispatch,
         bridge_executor_config(),
         false,
+        None,
         None,
     );
 }
@@ -4046,6 +4078,7 @@ pub(super) async fn open_fake_daemon_session_with_ops(
         user_config_path: _,
         lifecycle_events,
         lifecycle_probe: _,
+        health_rollup_probe: _,
     } = input;
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
     authenticate_server(
@@ -12203,6 +12236,11 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
 }
 
 async fn drive_health_check_daemon(input: FakeDaemonInput) {
+    let health_probe = input
+        .health_rollup_probe
+        .clone()
+        .expect("owned health probe");
+    let executor = Arc::clone(&input.executor);
     let FakeDaemonSession {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
@@ -12220,28 +12258,24 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
     .await;
     expect_route_bind_ack(&mut stream, 10).await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let (report, metrics) = loop {
-        send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
-        let report = expect_health_check_report(&mut stream, 20).await;
-        let metrics = report.metrics.clone().expect("health check metrics");
-        // The verdict turns Ok while a root is still warming, so settle on
-        // the component field the assertions below read, not the verdict
-        // alone: a cached rollup can still carry the pre-configure callgraph
-        // state for a beat after the verdict has settled.
-        let callgraph_settled = metrics
-            .pointer("/roots/0/callgraph_store/status")
-            .and_then(Value::as_str)
-            == Some("disabled");
-        if report.status == subc_protocol::session::HealthStatus::Ok && callgraph_settled {
-            break (report, metrics);
+    // Bind acknowledgement follows configure commit, not health publication.
+    // Wait for the actor to release its configure work, then acknowledge an
+    // actual post-bind cache refresh instead of polling a throttled snapshot.
+    let root_id = ProjectRootId::from_path(&root1).expect("bound root identity");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !executor.actor_is_idle(&root_id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "health check should settle to ok with disabled components: {report:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+        health_probe
+            .request_refresh()
+            .await
+            .expect("rollup published");
+    })
+    .await
+    .expect("post-bind health publication barrier");
+    send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
+    let report = expect_health_check_report(&mut stream, 20).await;
+    let metrics = report.metrics.clone().expect("health check metrics");
     assert_eq!(report.status, subc_protocol::session::HealthStatus::Ok);
     for (section, fields) in [
         (

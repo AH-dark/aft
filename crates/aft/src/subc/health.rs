@@ -1705,7 +1705,22 @@ impl HealthRollupCache {
     pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) {
         #[cfg(test)]
         self.root_details_assembled.store(0, Ordering::Relaxed);
-        let rollup = Arc::new(build_health_diagnostic_rollup(self, executor, shared_app));
+        self.publish(build_health_diagnostic_rollup(self, executor, shared_app));
+    }
+
+    fn refresh_for_test(&self, executor: &Executor, shared_app: &App) {
+        // The owned test worker may wait for the scheduler snapshot. Production
+        // probes and periodic rollups retain their non-blocking census policy.
+        self.publish(build_health_diagnostic_rollup_from_actors(
+            self,
+            executor,
+            shared_app,
+            Some(executor.actor_entries()),
+        ));
+    }
+
+    fn publish(&self, rollup: HealthDiagnosticRollup) {
+        let rollup = Arc::new(rollup);
         let generated_at_ms = duration_millis_u64(self.origin.elapsed());
         match self.snapshot.write() {
             Ok(mut snapshot) => *snapshot = rollup,
@@ -1849,12 +1864,74 @@ impl HealthRollupCache {
     }
 }
 
+/// Owned test rendezvous for publishing a rollup after configure has committed.
+/// A probe-backed worker refreshes only on explicit requests, so a later periodic
+/// census cannot replace the acknowledged snapshot before the wire assertion.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct SubcTestHealthRollupProbe {
+    wake: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<bool>>>>,
+    requests: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+}
+
+impl SubcTestHealthRollupProbe {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[doc(hidden)]
+    pub fn request_refresh(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.requests.lock().unwrap().push(tx);
+        self.wake
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("health worker started")
+            .send(true)
+            .expect("health worker running");
+        rx
+    }
+}
+
 pub(super) struct HealthRollupWorker {
     wake_tx: std::sync::mpsc::SyncSender<bool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HealthRollupWorker {
+    pub(super) fn start_with_test_probe(
+        cache: Arc<HealthRollupCache>,
+        executor: Arc<Executor>,
+        shared_app: Arc<App>,
+        probe: SubcTestHealthRollupProbe,
+    ) -> Self {
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        *probe.wake.lock().unwrap() = Some(wake_tx.clone());
+        let join = std::thread::Builder::new()
+            .name("aft-health-rollup".to_string())
+            .spawn(move || {
+                while let Ok(true) = wake_rx.recv() {
+                    let requests = std::mem::take(&mut *probe.requests.lock().unwrap());
+                    if requests.is_empty() {
+                        continue;
+                    }
+                    cache.refresh_for_test(&executor, &shared_app);
+                    // Tickets are taken before assembly, not after publication:
+                    // a request arriving mid-census needs a subsequent rollup.
+                    for request in requests {
+                        let _ = request.send(());
+                    }
+                }
+            })
+            .expect("spawn test health rollup worker");
+        Self {
+            wake_tx,
+            join: Some(join),
+        }
+    }
+
     pub(super) fn start(
         cache: Arc<HealthRollupCache>,
         executor: Arc<Executor>,
@@ -2110,6 +2187,20 @@ fn build_health_diagnostic_rollup(
     executor: &Executor,
     shared_app: &App,
 ) -> HealthDiagnosticRollup {
+    build_health_diagnostic_rollup_from_actors(
+        cache,
+        executor,
+        shared_app,
+        executor.try_actor_entries(),
+    )
+}
+
+fn build_health_diagnostic_rollup_from_actors(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    shared_app: &App,
+    actor_entries: Option<Vec<(ProjectRootId, Arc<AppContext>)>>,
+) -> HealthDiagnosticRollup {
     struct RootCandidate {
         root_label: String,
         health: RootHealthSnapshot,
@@ -2126,7 +2217,7 @@ fn build_health_diagnostic_rollup(
         standing: Option<StandingHealthEntry>,
     }
 
-    let Some(actor_entries) = executor.try_actor_entries() else {
+    let Some(actor_entries) = actor_entries else {
         return HealthDiagnosticRollup {
             status: HealthStatus::Degraded,
             detail: Some(
