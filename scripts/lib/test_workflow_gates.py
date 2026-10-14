@@ -58,6 +58,9 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class CISpeedWorkflowTests(unittest.TestCase):
+    def test_direct_ci_storm_nextest_run_keeps_all_failures(self) -> None:
+        self.assertIn("cargo nextest run --no-fail-fast", workflow_job("unit-linux-storm"))
+
     def test_library_does_not_embed_per_commit_build_script_environment(self) -> None:
         root = Path(__file__).resolve().parents[2] / "crates/aft"
         emitted = set(re.findall(r"cargo:rustc-env=([A-Z0-9_]+)=", (root / "build.rs").read_text()))

@@ -472,3 +472,162 @@ rather than raise these limits or remove tests. Combining all archives on
 one runner would serialize compilation; a prebuild dependency also needs
 end-to-end measurement because it can merely move the cold compile before
 all shards. No unmeasured split is claimed as an implemented fix here.
+
+## D hosted cross-commit result
+
+D1 run **38560151097** built `c9fcdf4c3ee20d7843dd9406702308fe80c35d63`;
+D2 run **38565562787** built `fc75af761b81bc1f5e393708ce9d5502201a4cef`.
+The second commit changes only this report: Rust sources, manifests, lockfile
+and `.cargo` build inputs are identical. This is a different-commit test,
+not a same-SHA rerun.
+
+```text
+D1: AFT_LIBRARY_CACHE_PROOF {"decision":"miss","compiler_exit":0,"hits":0,"misses":1,"requests":1,"write_errors":0}
+D2: AFT_LIBRARY_CACHE_PROOF {"decision":"hit","compiler_exit":0,"hits":1,"misses":0,"requests":1,"write_errors":0}
+```
+
+The exact final AFT-library request hit in the real GHA backend despite a new
+compiled Git SHA. Search-quality producer execution fell **17.62 → 7.95 min**;
+its evaluation job took **12.12 → 9.42 min**. Native macOS E2E fell
+**25.98 → 10.27 min**, Windows native **22.35 → 6.07 min**. This demonstrates
+library reuse, not a policy change to quality evaluation or binary provenance.
+
+Whole workflow wall was **31.00 → 26.80 min**, both failed. D1 hit the macOS
+integration archive timeout and did not run its integration consumers;
+D2's continuing conformance/scope failures remain red. **The well-under-25
+full passing CI objective is not achieved by this delivery.** Main's separate
+fat-LTO E2E shape has not been measured with D and must not be inferred from
+these train-profile runs.
+
+D2 archive headroom is structurally better on the cached-source path:
+integration **13.33/30 min** (16.67 left), library **12.65/30** (17.35 left),
+binary **15.12/25** (9.88 left). D1 cold still had zero integration headroom,
+8.45 library and 4.18 binary. There is no guarantee for empty caches or new
+Rust-source changes; no larger timeout has been used to disguise that gap.
+
+| Job | D1 cold min | D2 new-commit warm min |
+| --- | ---: | ---: |
+| E2E / E2E (Linux Docker) | 2.73 | 2.68 |
+| E2E / E2E (Pi RPC) | 1.25 | 1.42 |
+| E2E / E2E (Windows native) | 22.35 | 6.07 |
+| E2E / E2E (macOS native) | 25.98 | 10.27 |
+| E2E / E2E binary (Linux x64) | 11.65 | 1.22 |
+| E2E / OpenCode 2 (Linux Docker) | 10.88 | 11.50 |
+| Search quality binary (Linux x64) | 17.62 | 7.95 |
+| Unit / Bash permission e2e (Windows) | 9.33 | 6.88 |
+| Unit / Cargo bin-test archive (macOS) | 20.82 | 15.12 |
+| Unit / Cargo check deny-warnings (Windows) | 5.72 | 3.67 |
+| Unit / Cargo conformance + Bun tests (macOS) | not run | 11.12† |
+| Unit / Cargo integration shard 1/3 (Linux) | 4.12 | 5.00 |
+| Unit / Cargo integration shard 1/3 (Windows) | 5.02 | 5.75 |
+| Unit / Cargo integration shard 1/3 (macOS) | not run | 6.08 |
+| Unit / Cargo integration shard 2/3 (Linux) | 3.45 | 4.08 |
+| Unit / Cargo integration shard 2/3 (Windows) | 5.23 | 6.42 |
+| Unit / Cargo integration shard 2/3 (macOS) | not run | 4.93 |
+| Unit / Cargo integration shard 3/3 (Linux) | 5.00 | 4.95 |
+| Unit / Cargo integration shard 3/3 (Windows) | 12.12 | 10.75 |
+| Unit / Cargo integration shard 3/3 (macOS) | not run | 6.77 |
+| Unit / Cargo libtest + watcher (Windows) | 0.07 | 0.07† |
+| Unit / Cargo libtest archive (macOS) | 21.55 | 12.65 |
+| Unit / Cargo libtest shard 1/3 (Windows) | 11.97 | 12.08 |
+| Unit / Cargo libtest shard 1/3 (macOS) | 3.87 | 3.78 |
+| Unit / Cargo libtest shard 2/3 (Windows) | 9.83 | 6.82 |
+| Unit / Cargo libtest shard 2/3 (macOS) | 4.27 | 4.07 |
+| Unit / Cargo libtest shard 3/3 (Windows) | 5.98 | 6.32 |
+| Unit / Cargo libtest shard 3/3 (macOS) | 4.10 | 3.47 |
+| Unit / Cargo test archive (Linux) | 7.35 | 4.47 |
+| Unit / Cargo test archive (Windows) | 13.85 | 10.67 |
+| Unit / Cargo test archive (macOS) | 30.72† | 13.33 |
+| Unit / Cargo watcher + conformance (Windows) | 11.53 | 8.78† |
+| Unit / Cargo watcher tests (macOS) | 11.47 | 3.88 |
+| Unit / MSRV check (rustc 1.92) | 3.23 | 4.27 |
+| Unit / Plugin e2e (bridge, Linux) | 4.70 | 4.30 |
+| Unit / Plugin e2e (opencode-ndjson, Linux) | 6.00 | 5.43 |
+| Unit / Plugin e2e (opencode-subc, Linux) | 4.00 | 4.37 |
+| Unit / Plugin e2e (pi, Linux) | 3.22 | 4.08 |
+| Unit / Prove Rust test inventory (macOS) | not run | 2.00 |
+| Unit / Release storm (Linux) | 21.78 | 14.48 |
+| Unit / Sandbox real-kernel Landlock probes | 5.03 | 4.78 |
+| Unit / Unit tests (Linux) | 17.87† | 14.78† |
+| Unit / Unit tests (macOS) | 0.03† | 0.07† |
+| search-quality-gate | 12.12 | 9.42 |
+
+## Iteration cost: collect all CI failures
+
+Every CI nextest execution in `rust-test-gate.sh` now delegates through
+`gate_cargo`, which adds `--no-fail-fast` before test-filter separators. The
+direct Linux release-storm workflow command also has that flag. Existing
+profiles, retry debt register, filters, partitions and per-test timeouts are
+unchanged. Cargo test execution gets its own `--no-fail-fast` so a failing
+unit harness cannot prevent later selected binary harnesses from running.
+
+Previously shell `set -e` made a red `run_phase` terminate all later phases.
+In CI, independent failed test phases are now recorded and subsequent selected
+test phases run; the final `GATE FAILED` returns the **first** failure status,
+never success because the last phase passed. Lint, extraction, signing,
+configuration and log-write failures remain fatal prerequisites. Local gates
+keep first-failure behavior. The required check and summary names are unchanged.
+
+The regression harness exercises two controlled failed conformance phases,
+a later passing phase, cargo-only mode, local fail-fast and failed log writes.
+A real nextest 0.9.138 two-test fixture ran only the first failing test under
+fail-fast, versus **both tests (one fail, one pass)** with `--no-fail-fast`;
+both executions retained exit 100. These controls prove collection, not a
+passing product suite. Existing job-level nextest per-test timeouts remain.
+
+The change cannot by itself force later GitHub **steps** to run after the Rust
+gate step is red: later Bun fetching/tests still need guarded `if` conditions
+or independent jobs after successful build/preflight. That remaining step-level
+barrier is reported, not silently bypassed in this change.
+
+## Dependency edges and next recommendation
+
+There is no top-level `unit → e2e` edge; those suites already run in parallel.
+The observed D2 longest chain is:
+
+```text
+macOS bin archive (15.12 min)
+  → macOS conformance+Bun (11.12 min)
+  → Unit tests (macOS) summary
+```
+
+The conformance job also needs the integration and lib archives. These are
+scheduling barriers: it builds/runs its own binaries and does not download
+those archives. The first next structural experiment should start that job
+with the archive producers after the same short path/toolchain preflight,
+keep its required check, and keep the summary requiring all lanes. This could
+overlap approximately 11 minutes on D2, but must be measured cold/warm;
+cache contention and the existing workflow-wiring guard asserting the barrier
+must be addressed explicitly, not just deleted without explanation.
+
+Other critical subgraph edges, all retained here:
+
+- `Search quality binary → search-quality-gate`: evaluation needs the exact
+  executable. Import resolution, harness/mode goldens and pinned corpus
+  provisioning could run in a short parallel preflight, but cannot evaluate
+  before an artifact or correct source-build fallback exists.
+- `macOS integration archive → integration shards 1–3 → macOS summary`.
+  These consume the archive and cannot run before it is built.
+- `macOS lib and bin archives → libtest shards 1–3 → macOS summary`.
+  Both archive dependencies are real; their source inventories/partitions
+  must stay exact.
+- `macOS integration/lib/bin archives + watcher → inventory proof → summary`.
+  Proof and execution shards are siblings, not sequential. Watcher inventory
+  is captured before execution but uploaded afterward; a separate inventory
+  preflight/upload could shorten the proof wait while the summary still waits
+  for the actual watcher tests.
+- All archive producers, proof, watcher, integration shards, libtest shards
+  and conformance also have direct edges into the macOS summary. No summary
+  may turn a failed, cancelled or omitted lane into success.
+- `Windows archive → integration and libtest shards`; libtest archive/shards
+  plus watcher/conformance feed the existing Windows summary. D2's archive
+  10.67 minutes plus slowest libtest shard 12.08 minutes is a remaining
+  approximately 23-minute path; duration-aware rebalancing of the existing
+  three partitions, with exact inventory proof, is a follow-up candidate.
+- `Linux integration archive → integration shards 1–3` and
+  `Linux E2E binary → Docker/OpenCode2/Pi RPC` are actual artifact handoffs.
+  Producer-independent setup can preflight, but test execution still requires
+  the exact compiled artifact.
+
+These are recommendations, not claims that the edges were removed or that
+an unmeasured DAG meets the under-25-minute objective.
