@@ -1816,7 +1816,8 @@ fn absolute_env_path(name: &str) -> Option<PathBuf> {
 /// worktree, which the model can edit.
 ///
 /// - Git: a linked worktree's own Git directory, the shared object, ref and
-///   log stores, and exactly `packed-refs` and `packed-refs.lock`. The shared
+///   log stores, and exactly `packed-refs`, `packed-refs.lock`, and
+///   `packed-refs.new`. The shared
 ///   `config`, hooks, `info` and other worktrees' entries stay read-only.
 /// - Cargo: `$CARGO_HOME/registry` and `git`, its lock files, and
 ///   `$RUSTUP_HOME/downloads` and `tmp`.
@@ -2055,15 +2056,16 @@ fn linked_git_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
     roots
 }
 
-/// Git's post-commit AUTO_MERGE cleanup and packed-ref deletion lock this
-/// shared pair. Exact-file grants keep the adjacent config and hooks read-only.
+/// Git locks packed refs and stages a rewritten table in `packed-refs.new`
+/// before renaming it into place. Exact-file grants keep adjacent config and
+/// hooks read-only, including when the lock and staging files do not exist yet.
 #[cfg(unix)]
 fn linked_git_file_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
     git_policies
         .iter()
         .filter_map(|git| git.linked.as_ref())
         .flat_map(|(_, common_dir)| {
-            ["packed-refs", "packed-refs.lock"].map(|name| common_dir.join(name))
+            ["packed-refs", "packed-refs.lock", "packed-refs.new"].map(|name| common_dir.join(name))
         })
         .collect()
 }
@@ -5377,7 +5379,11 @@ mod policy_tests {
             metadata_allow: Vec::new(),
         };
         let grants = worker_jail_grants(&home, &[worktree], &[git], &policy);
-        let files = [common.join("packed-refs"), common.join("packed-refs.lock")];
+        let files = [
+            common.join("packed-refs"),
+            common.join("packed-refs.lock"),
+            common.join("packed-refs.new"),
+        ];
         for file in &files {
             assert!(!file.exists());
             assert!(
@@ -5391,6 +5397,10 @@ mod policy_tests {
             "hooks/post-commit",
             "info/exclude",
             "packed-refs.other",
+            "packed-refs.new.other",
+            "HEAD.lock",
+            "ORIG_HEAD",
+            "FETCH_HEAD",
         ] {
             let refused = common.join(name);
             assert!(!grants.files.contains(&refused));
