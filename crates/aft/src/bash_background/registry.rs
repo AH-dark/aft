@@ -196,7 +196,25 @@ enum KillSignalPlan {
 /// Signal a piped task: SIGTERM to its process group, a grace period that
 /// ends early once the direct child exits, then SIGKILL (Unix); `taskkill`
 /// on the process tree (Windows).
-fn terminate_piped_task(pgid: Option<i32>, child_pid: Option<u32>, child: Option<&mut Child>) {
+fn terminate_piped_task(
+    task_id: &str,
+    pgid: Option<i32>,
+    child_pid: Option<u32>,
+    child: Option<&mut Child>,
+) {
+    #[cfg(all(test, unix))]
+    if TERM_ONLY_KILL_TASKS
+        .get()
+        .is_some_and(|tasks| tasks.lock().unwrap().remove(task_id))
+    {
+        if let Some(pgid) = pgid {
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+        }
+        return;
+    }
+    let _ = task_id;
     #[cfg(unix)]
     {
         let _ = child_pid;
@@ -214,6 +232,69 @@ fn terminate_piped_task(pgid: Option<i32>, child_pid: Option<u32>, child: Option
         }
     }
 }
+
+// Sending a group signal and reaping its leader do not mean descendants have
+// exited yet. Settle the signalled group before sampling the kill completion,
+// but keep reporting real survivors when this bounded grace expires.
+#[cfg(unix)]
+const KILL_GROUP_SETTLEMENT_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(all(test, unix))]
+static TERM_ONLY_KILL_TASKS: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+#[cfg(all(test, unix))]
+static KILL_SETTLEMENT_NOTICES: std::sync::OnceLock<
+    Mutex<HashMap<String, crossbeam_channel::Sender<()>>>,
+> = std::sync::OnceLock::new();
+#[cfg(all(test, unix))]
+thread_local! {
+    static KILL_SETTLEMENT_TEST_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(unix)]
+fn kill_settlement_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = KILL_SETTLEMENT_TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(unix)]
+fn settle_killed_process_group(task_id: &str, pgid: Option<i32>) {
+    let Some(pgid) = pgid else {
+        return;
+    };
+    let started = kill_settlement_now();
+    loop {
+        let exists = unsafe { libc::killpg(pgid, 0) } == 0;
+        if !exists && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        // Zombies cannot run or retain output pipes. An unreaped orphan may
+        // still make killpg(0) succeed, but is not a live descendant to report.
+        if live_process_group_members(pgid)
+            .is_some_and(|(members, omitted)| members.is_empty() && omitted == 0)
+        {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(notice) = KILL_SETTLEMENT_NOTICES
+            .get()
+            .and_then(|notices| notices.lock().unwrap().remove(task_id))
+        {
+            let _ = notice.send(());
+        }
+        let _ = task_id;
+        if kill_settlement_now().saturating_duration_since(started) >= KILL_GROUP_SETTLEMENT_GRACE {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(unix))]
+fn settle_killed_process_group(_task_id: &str, _pgid: Option<i32>) {}
 
 /// Close a PTY's pseudoterminal so its reader reaches end-of-file and
 /// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
@@ -1793,7 +1874,7 @@ impl BgTaskRegistry {
             let mut state = task
                 .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
-            if !state.metadata.status.is_terminal() {
+            if !state.metadata.status.is_terminal() || state.kill_in_flight {
                 return Ok(());
             }
             if state.metadata.mode != BgMode::Pipes || state.descendant_sampling_started {
@@ -1888,7 +1969,7 @@ impl BgTaskRegistry {
             let state = task
                 .lock_state()
                 .map_err(|_| "background task lock poisoned".to_string())?;
-            if !state.metadata.status.is_terminal() {
+            if !state.metadata.status.is_terminal() || state.kill_in_flight {
                 return Ok(());
             }
             (state.metadata.clone(), state.buffer.clone())
@@ -4462,7 +4543,13 @@ impl BgTaskRegistry {
                     // Killing records intent, not proof that the daemon sent a
                     // signal. Finish that work before publishing its outcome.
                     if Self::persisted_task_process_is_alive(&metadata) {
-                        terminate_piped_task(metadata.pgid, metadata.child_pid, None);
+                        terminate_piped_task(
+                            &metadata.task_id,
+                            metadata.pgid,
+                            metadata.child_pid,
+                            None,
+                        );
+                        settle_killed_process_group(&metadata.task_id, metadata.pgid);
                     }
                     let recovered = "recovered from inconsistent killing state on replay";
                     let reason = match write_kill_marker_if_absent(&paths) {
@@ -7630,9 +7717,10 @@ impl BgTaskRegistry {
                     .ok()
                     .flatten()
                     .filter(|marker| matches!(marker, ExitMarker::Code(_)));
-                terminate_piped_task(pgid, child_pid, child.as_mut());
+                terminate_piped_task(&task.task_id, pgid, child_pid, child.as_mut());
                 let child_exit_observed = child.as_mut().is_some_and(|child| child.wait().is_ok());
                 drop(child);
+                settle_killed_process_group(&task.task_id, pgid);
 
                 let mut db = DeferredDbWrites::new(self, &task);
                 let mut state = task
@@ -7707,6 +7795,7 @@ impl BgTaskRegistry {
                 if let Some(pid) = pid {
                     terminate_pty_group(pid);
                 }
+                settle_killed_process_group(&task.task_id, pid.map(|pid| pid as i32));
                 close_pty_master(master);
                 terminalized = self.finish_pty_kill(&task, terminal_status, reason)?;
             }
@@ -7734,6 +7823,7 @@ impl BgTaskRegistry {
     #[cfg(unix)]
     fn terminate_terminal_survivors(&self, task: &Arc<BgTask>, pgid: i32) -> Result<(), String> {
         terminate_pgid(pgid, None);
+        settle_killed_process_group(&task.task_id, Some(pgid));
         let sample = live_process_group_members(pgid);
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task
@@ -14997,6 +15087,77 @@ mod tests {
             .into_iter()
             .filter(|completion| completion.task_id == task_id)
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_completion_waits_for_a_term_trapped_descendant_to_exit() {
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("child.sh"),
+            "trap 'echo trapped > trapped; while [ ! -e release ]; do sleep 0.01; done; exit 0' TERM\necho ready > ready\nwhile :; do sleep 30 & wait $!; done\n").unwrap();
+        let task_id =
+            spawn_unsandboxed_for_kill_test(&registry, dir.path(), "bash child.sh & wait");
+        let ready_deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("ready").exists() {
+            assert!(
+                Instant::now() < ready_deadline,
+                "descendant did not install its TERM trap"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Keep a real descendant alive through the signal. Only this task uses
+        // TERM alone; production and the escalation regression still send KILL.
+        TERM_ONLY_KILL_TASKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(task_id.clone());
+        let (waiting_tx, waiting_rx) = crossbeam_channel::bounded(1);
+        KILL_SETTLEMENT_NOTICES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), waiting_tx);
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let killer_registry = registry.clone();
+        let killer_task = task_id.clone();
+        let killer = std::thread::spawn(move || {
+            // Freeze only this kill's settlement clock: the release handshake,
+            // not scheduler speed, decides when the descendant can exit.
+            KILL_SETTLEMENT_TEST_NOW.with(|clock| clock.set(Some(Instant::now())));
+            let _ = result_tx.send(killer_registry.kill(&killer_task, "session"));
+        });
+        let premature = crossbeam_channel::select! {
+            recv(waiting_rx) -> waiting => {
+                waiting.expect("settlement observed the live descendant");
+                assert!(completions_for(&registry, &task_id).is_empty());
+                None
+            }
+            recv(result_rx) -> result => Some(result.unwrap().unwrap()),
+            default(Duration::from_secs(10)) => panic!("kill neither waited nor completed"),
+        };
+        fs::write(dir.path().join("release"), "release\n").unwrap();
+        let snapshot = premature.unwrap_or_else(|| {
+            result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+        });
+        killer.join().unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        assert!(
+            snapshot.live_descendants_summary.is_none(),
+            "kill returned before the descendant exited: {:?}",
+            snapshot.live_descendants_summary
+        );
+        let completions = completions_for(&registry, &task_id);
+        assert_eq!(completions.len(), 1);
+        assert!(
+            completions[0].live_descendants_summary.is_none(),
+            "completion sampled a still-exiting descendant: {:?}",
+            completions[0].live_descendants_summary
+        );
     }
 
     /// A kill must not hold the task's state lock while it signals and waits

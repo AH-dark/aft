@@ -2419,6 +2419,15 @@ describe("a parity row compares the two hosts", () => {
 
       expect(() => projectText(stillRunning, rules)).toThrow("projection_unparsed");
     });
+
+    test("a live-descendant warning is not swallowed by the happy reminder", async () => {
+      const rules = await killRules();
+      const descendants = V1_RESULT.replace(
+        "\n</system-reminder>",
+        "\n  1 live descendants still running: sleep infinity\n</system-reminder>",
+      );
+      expect(() => projectText(descendants, rules)).toThrow("projection_unparsed");
+    });
   });
 });
 
