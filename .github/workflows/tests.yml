@@ -45,6 +45,8 @@ env:
   # Keep the compiler cache server alive between build steps so its final
   # statistics cover the whole job instead of a newly started daemon.
   SCCACHE_IDLE_TIMEOUT: "0"
+  # Forks, queues and trial branches read main's compiler cache but never save.
+  SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
 
 jobs:
   landing-policy:
@@ -148,7 +150,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.11
       # Executables include the commit's build provenance. Never restore a
       # fallback binary from another SHA or compiler, even with identical source.
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: release-binary
         with:
           path: target/release/aft
@@ -158,6 +160,7 @@ jobs:
         with:
           shared-key: search-quality-release
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build shared release AFT
         if: steps.release-binary.outputs.cache-hit != 'true'
         run: cargo build --release --locked -p agent-file-tools --bin aft
@@ -171,6 +174,13 @@ jobs:
           path: target/release/aft
           if-no-files-found: error
           retention-days: 1
+
+      - name: Save exact release executable on main
+        if: ${{ github.ref == 'refs/heads/main' && steps.release-binary.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: target/release/aft
+          key: ${{ steps.release-binary.outputs.cache-primary-key }}
 
   search-quality-gate:
     name: search-quality-gate

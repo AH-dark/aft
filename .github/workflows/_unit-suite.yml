@@ -17,6 +17,8 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # Preserve the compiler cache daemon and its statistics between build steps.
   SCCACHE_IDLE_TIMEOUT: "0"
+  # Only main populates the shared compiler baseline; other refs still read it.
+  SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
   # Line tables retain named frames for the native backtrace/dSYM probes without
   # the full variable/type debug information that dominates test-harness builds.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -56,6 +58,7 @@ jobs:
         with:
           shared-key: unit-linux
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -113,6 +116,7 @@ jobs:
         with:
           shared-key: unit-linux
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -150,6 +154,7 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
+          python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
           python3 -m unittest discover -s scripts/lib -p test_select_native_release_artifact.py -v
@@ -270,6 +275,7 @@ jobs:
         with:
           shared-key: unit-linux
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -354,7 +360,8 @@ jobs:
       # Real TypeScript 7 and TypeScript 5 installs for
       # typescript_native_lsp_test; the script exports their paths. Without
       # them those tests skip, and the native server path has no coverage.
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: typescript-servers
         with:
           path: ${{ runner.temp }}/typescript-test-servers
           key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
@@ -382,6 +389,13 @@ jobs:
           # fail instead of skipping when it is missing.
           AFT_TEST_REQUIRE_RUST_ANALYZER: "1"
           AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ matrix.shard == 2 && '1' || '0' }}
+
+      - name: Save TypeScript test servers on main
+        if: ${{ github.ref == 'refs/heads/main' && steps.typescript-servers.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/typescript-test-servers
+          key: ${{ steps.typescript-servers.outputs.cache-primary-key }}
 
       - name: Upload Linux integration crash cores
         if: failure() && matrix.shard == 2
@@ -411,6 +425,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build aft binary for sandbox probes
         run: cargo build -p agent-file-tools --bin aft
@@ -452,6 +467,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -499,6 +515,7 @@ jobs:
         with:
           shared-key: unit-linux-msrv
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cargo check (locked, MSRV floor)
         run: cargo check --workspace --all-targets --locked
@@ -550,6 +567,7 @@ jobs:
           shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Split compilation as well as archive contents: a nextest filter alone
       # still builds the large lib/bin harnesses owned by the other archive jobs.
@@ -612,6 +630,7 @@ jobs:
           shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build nextest archive (macOS lib tests)
         # The selected integration probe makes Cargo build the real aft CLI.
@@ -671,6 +690,7 @@ jobs:
           shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build nextest archive (macOS bin tests)
         # Keep the real CLI alongside the binary test harness without compiling
@@ -829,7 +849,8 @@ jobs:
       # Real TypeScript 7 and TypeScript 5 installs for
       # typescript_native_lsp_test; the script exports their paths. Without
       # them those tests skip, and the native server path has no coverage.
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: typescript-servers
         with:
           path: ${{ runner.temp }}/typescript-test-servers
           key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
@@ -854,6 +875,13 @@ jobs:
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"
           AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ matrix.shard == 2 && '1' || '0' }}
+
+      - name: Save TypeScript test servers on main
+        if: ${{ github.ref == 'refs/heads/main' && steps.typescript-servers.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/typescript-test-servers
+          key: ${{ steps.typescript-servers.outputs.cache-primary-key }}
 
       - name: Upload macOS integration crash cores
         if: failure() && matrix.shard == 2
@@ -895,6 +923,7 @@ jobs:
           shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -958,6 +987,7 @@ jobs:
           shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -1027,6 +1057,7 @@ jobs:
           shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -1118,6 +1149,7 @@ jobs:
         with:
           shared-key: unit-windows-cargo
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -1214,6 +1246,7 @@ jobs:
         with:
           shared-key: unit-windows-cargo
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest (direct, installer-action-independent)
         shell: bash
@@ -1273,6 +1306,7 @@ jobs:
         with:
           shared-key: unit-windows-cargo
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The gate script checks for cargo-nextest before running any phase.
       - name: Install cargo-nextest (direct, installer-action-independent)
@@ -1372,6 +1406,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cargo check (deny warnings)
         run: cargo check --workspace --all-targets
@@ -1423,6 +1458,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: oven-sh/setup-bun@v2
         with:

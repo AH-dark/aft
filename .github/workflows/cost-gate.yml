@@ -51,6 +51,7 @@ jobs:
         with:
           shared-key: nightly-cost-gate
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --release -p agent-file-tools --quiet

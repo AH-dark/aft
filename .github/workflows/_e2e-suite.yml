@@ -28,6 +28,8 @@ on:
 env:
   # Preserve the compiler cache daemon and its statistics between build steps.
   SCCACHE_IDLE_TIMEOUT: "0"
+  # Branch-private writes compete with the shared main cache quota.
+  SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # cargo puts `stage`-profile output under target/stage/, `release` under
   # target/release/. Every path below derives from this pair.
@@ -60,6 +62,7 @@ jobs:
         with:
           shared-key: e2e-linux-${{ inputs.cargo_profile }}
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build shared AFT binary (Linux x64)
         run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
@@ -425,6 +428,7 @@ jobs:
         with:
           shared-key: e2e-windows-release
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Release library codegen (shipped profile)
         run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings
         shell: pwsh
@@ -464,6 +468,7 @@ jobs:
         with:
           shared-key: e2e-windows-${{ inputs.cargo_profile }}
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -565,6 +570,7 @@ jobs:
           shared-key: e2e-macos-release
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Release library codegen (shipped profile)
         run: cargo build --release --lib -p agent-file-tools --timings
         env:
@@ -610,6 +616,7 @@ jobs:
           shared-key: e2e-macos-${{ inputs.cargo_profile }}
           cache-bin: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: oven-sh/setup-bun@v2
         with:
