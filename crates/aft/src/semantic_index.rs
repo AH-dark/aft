@@ -636,13 +636,17 @@ pub(crate) fn reserved_refused_backend_for_test() -> (tokio::net::TcpSocket, std
     (socket, addr)
 }
 
-/// Reserve the normal test-server port while probing another unused loopback address.
-/// This keeps parallel listeners from claiming the port without relying on a
-/// non-listening socket to produce an immediate refusal on every operating system.
+/// Reserve an IPv4 test-server port while probing the same port on IPv6 loopback.
+/// The IPv6 address remains loopback on systems that configure only 127.0.0.1
+/// on their IPv4 loopback interface, and parallel IPv4 listeners cannot claim
+/// the reserved port.
 #[cfg(test)]
 fn reserved_refused_embedding_backend_for_test() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
     let (reservation, reserved_addr) = reserved_refused_backend_for_test();
-    let refused_addr = std::net::SocketAddr::from(([127, 0, 0, 2], reserved_addr.port()));
+    let refused_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        reserved_addr.port(),
+    );
     (reservation, refused_addr)
 }
 
@@ -2103,14 +2107,15 @@ enum EmbeddingExchange {
 
 #[cfg(test)]
 thread_local! {
-    static REFUSED_EXCHANGE_OBSERVER: std::cell::RefCell<Option<(usize, Duration)>> = const { std::cell::RefCell::new(None) };
+    // Keep the observer thread-local and let each test own its exchange count.
+    static REFUSED_EXCHANGE_OBSERVER: std::cell::RefCell<Option<(Arc<AtomicUsize>, Duration)>> = const { std::cell::RefCell::new(None) };
 }
 
 fn execute_embedding_exchange(request: reqwest::blocking::RequestBuilder) -> EmbeddingExchange {
     #[cfg(test)]
     REFUSED_EXCHANGE_OBSERVER.with(|slot| {
         if let Some((attempts, delay)) = slot.borrow_mut().as_mut() {
-            *attempts += 1;
+            attempts.fetch_add(1, Ordering::Relaxed);
             std::thread::sleep(*delay);
         }
     });
@@ -11212,6 +11217,10 @@ Connection: close
                     Err(error) => panic!("accept request: {error}"),
                 }
             }
+            assert_eq!(
+                accepted, attempts,
+                "truncated-body fixture must accept every expected retry"
+            );
         });
 
         (format!("http://{}", addr), handle)
@@ -15189,8 +15198,8 @@ public class Greeter {
         let competing_addr = std::net::SocketAddr::from(([127, 0, 0, 1], refused_addr.port()));
         assert_eq!(
             refused_addr.ip(),
-            std::net::Ipv4Addr::new(127, 0, 0, 2),
-            "the request must target the unused loopback address"
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            "the request must target IPv6 loopback"
         );
         assert!(
             TcpListener::bind(competing_addr).is_err(),
@@ -15213,14 +15222,18 @@ public class Greeter {
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         // Count actual HTTP sends rather than using scheduler latency as evidence
         // that connection refusal bypassed the retry ladder.
+        let attempts = Arc::new(AtomicUsize::new(0));
         REFUSED_EXCHANGE_OBSERVER.with(|slot| {
-            *slot.borrow_mut() = Some((0, Duration::from_millis(750)));
+            *slot.borrow_mut() = Some((Arc::clone(&attempts), Duration::from_millis(750)));
         });
         let error = model
             .embed(vec!["connection probe".to_string()])
             .expect_err("closed listener must refuse the request");
 
-        let attempts = REFUSED_EXCHANGE_OBSERVER.with(|slot| slot.borrow_mut().take().unwrap().0);
+        REFUSED_EXCHANGE_OBSERVER.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        let attempts = attempts.load(Ordering::Relaxed);
         assert_eq!(attempts, 1, "connection refusal must not retry");
         assert!(embedding_failure_is_transient(&error), "error: {error}");
         // Unix answers a closed loopback port with RST, so the request fails at
