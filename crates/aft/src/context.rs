@@ -1835,6 +1835,7 @@ pub(crate) struct PreparedViewUpdate {
     snapshot: Option<ViewRuntimeSnapshot>,
     pin: Option<Arc<crate::pins::QueryPin>>,
     retired: Option<ViewRuntimeState>,
+    callgraph_install_test_gate: Option<CallgraphViewInstallTestGate>,
     assembly: crate::views::assembly::PreparedAssembly,
     _semantic_pin: Option<crate::pins::AssemblyPin>,
     pub(crate) content_generation: u64,
@@ -3647,6 +3648,74 @@ enum CallgraphBackgroundWork {
     Ensure,
     ForceRebuild(u64),
     LegacyMigration,
+}
+
+#[derive(Clone)]
+struct CallgraphViewInstallTestGate {
+    reached: crossbeam_channel::Sender<String>,
+    release: crossbeam_channel::Receiver<()>,
+    installed: crossbeam_channel::Sender<String>,
+}
+
+static CALLGRAPH_VIEW_INSTALL_TEST_GATES: std::sync::OnceLock<
+    parking_lot::Mutex<BTreeMap<PathBuf, CallgraphViewInstallTestGate>>,
+> = std::sync::OnceLock::new();
+
+/// Hold this root between callgraph preparation and runtime installation.
+/// Integration tests observe both sides of that boundary without delaying other roots.
+#[doc(hidden)]
+pub fn install_callgraph_view_install_test_gate(
+    root: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<String>,
+    crossbeam_channel::Sender<()>,
+    crossbeam_channel::Receiver<String>,
+) {
+    let (reached, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release) = crossbeam_channel::bounded(1);
+    let (installed, installed_rx) = crossbeam_channel::bounded(1);
+    let previous = CALLGRAPH_VIEW_INSTALL_TEST_GATES
+        .get_or_init(Default::default)
+        .lock()
+        .insert(
+            root,
+            CallgraphViewInstallTestGate {
+                reached,
+                release,
+                installed,
+            },
+        );
+    assert!(
+        previous.is_none(),
+        "callgraph view install gate already registered"
+    );
+    (reached_rx, release_tx, installed_rx)
+}
+
+fn take_callgraph_view_install_test_gate(
+    root: &Path,
+    snapshot: &ViewRuntimeSnapshot,
+    pinned: bool,
+) -> Option<CallgraphViewInstallTestGate> {
+    let gates = CALLGRAPH_VIEW_INSTALL_TEST_GATES.get()?;
+    // No filesystem readiness probe runs at the publication barrier unless
+    // this exact root has explicitly installed a test observer.
+    if !gates.lock().contains_key(root) {
+        return None;
+    }
+    let generation = snapshot.generation.as_deref()?;
+    if pinned
+        && crate::views::generation_matches_head(generation, &snapshot.head_fingerprint)
+        && !snapshot
+            .pending_inputs
+            .values()
+            .any(|input| input.plane == "checkout")
+        && crate::views::read::derived_built(&snapshot.view_dir, generation)
+    {
+        gates.lock().remove(root)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -7380,16 +7449,29 @@ impl AppContext {
             .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
             .transpose()
             .map_err(|error| error.to_string())?;
+        let snapshot = ViewRuntimeSnapshot {
+            generation,
+            manifest,
+            head_fingerprint: desired_head,
+            head_metadata,
+            pending_paths: report.pending_paths.clone(),
+            pending_inputs: report.pending_inputs.clone(),
+            ..snapshot
+        };
+        let callgraph_install_test_gate = take_callgraph_view_install_test_gate(
+            &self.canonical_cache_root(),
+            &snapshot,
+            pin.is_some(),
+        );
+        if let Some(gate) = &callgraph_install_test_gate {
+            let _ = gate.reached.send(snapshot.generation.clone().unwrap());
+            gate.release
+                .recv_timeout(Duration::from_secs(30))
+                .expect("callgraph view install test gate was not released");
+        }
         Ok(PreparedViewUpdate {
-            snapshot: Some(ViewRuntimeSnapshot {
-                generation,
-                manifest,
-                head_fingerprint: desired_head,
-                head_metadata,
-                pending_paths: report.pending_paths.clone(),
-                pending_inputs: report.pending_inputs.clone(),
-                ..snapshot
-            }),
+            snapshot: Some(snapshot),
+            callgraph_install_test_gate,
             pin: pin.map(Arc::new),
             retired: None,
             assembly,
@@ -7428,6 +7510,9 @@ impl AppContext {
                     snapshot,
                     pin: prepared.pin.take(),
                 });
+            if let Some(gate) = prepared.callgraph_install_test_gate.take() {
+                let _ = gate.installed.send(report.generation.clone().unwrap());
+            }
         }
         Ok(report)
     }

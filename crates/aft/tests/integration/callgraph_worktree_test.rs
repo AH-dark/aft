@@ -531,7 +531,44 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
 
     // The worktree contributes its own source blob during maintenance. The
     // owner keeps its original source and is never asked to build this branch.
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    let ctx = std::sync::Arc::new(ctx);
+    let (prepared, release, installed) =
+        aft::context::install_callgraph_view_install_test_gate(checkout.clone());
+    let executor = aft::executor::Executor::new();
+    let root_id = cortexkit_paths::ProjectRootId::from_path(&checkout).unwrap();
+    executor.register_actor(root_id.clone(), ctx.clone());
+    let maintenance = executor.submit(
+        root_id,
+        aft::executor::Lane::Mutating,
+        "worktree-maintenance".into(),
+        Box::new(|ctx| {
+            aft::runtime_drain::drain_deferred_configure_maintenance(ctx);
+            Response::success("worktree-maintenance", json!({}))
+        }),
+    );
+    let generation = prepared
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("worktree lazy callgraph generation was not prepared");
+    // Configure maintenance schedules lazy publication but does not join it.
+    // Release the prepared graph, then await installation of that exact
+    // generation before asking either query path to use the worktree reader.
+    release.send(()).unwrap();
+    assert_eq!(
+        installed
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!(
+                "worktree lazy callgraph generation {generation} was not installed for {}",
+                checkout.display()
+            )),
+        generation
+    );
+    match ctx.callgraph_store_for_ops() {
+        aft::context::CallgraphStoreAccess::Ready(store) => {
+            assert_eq!(store.reader_kind(), "view");
+            assert_eq!(store.project_root(), checkout);
+        }
+        _ => panic!("expected this checkout's view reader"),
+    }
     let response = query(&ctx, &checkout, "callers", "checkoutCaller");
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["total_callers"], 1);
@@ -548,13 +585,12 @@ fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
         owner_generation,
         "worktree publication must not replace the owner's view"
     );
-    match ctx.callgraph_store_for_ops() {
-        aft::context::CallgraphStoreAccess::Ready(store) => {
-            assert_eq!(store.reader_kind(), "view");
-            assert_eq!(store.project_root(), checkout);
-        }
-        _ => panic!("expected this checkout's view reader"),
-    }
+    assert!(
+        maintenance
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("worktree configure maintenance did not finish")
+            .success
+    );
     assert!(
         aft::callgraph_store::CallGraphStore::open_readonly(ctx.callgraph_store_dir(), checkout)
             .unwrap()
