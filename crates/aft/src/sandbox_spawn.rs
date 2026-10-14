@@ -1575,34 +1575,28 @@ fn build_native_profile(
                     .private_stores
                     .read_allow
                     .extend(git_policy.read_roots.iter().cloned());
-                for key in [
-                    "core.hooksPath",
-                    "mason.originalHooksPath",
-                    "core.excludesFile",
-                ] {
-                    if let Some(path) = configured_git_path(
-                        root,
-                        key,
-                        &mut policy.private_stores.read_metadata_allow,
-                    )? {
-                        if (key == "core.excludesFile" && path.is_file())
-                            || (key != "core.excludesFile" && path.is_dir())
+                policy
+                    .private_stores
+                    .read_metadata_allow
+                    .extend(git_policy.metadata_allow.iter().cloned());
+                for (key, path) in &git_policy.configured_paths {
+                    if (key == "core.excludesFile" && path.is_file())
+                        || (key != "core.excludesFile" && path.is_dir())
+                    {
+                        policy.private_stores.read_allow.push(path.clone());
+                        if key == "core.excludesFile"
+                            && git_policy
+                                .linked
+                                .as_ref()
+                                .is_some_and(|(git_dir, _)| path.starts_with(git_dir))
                         {
-                            policy.private_stores.read_allow.push(path.clone());
-                            if key == "core.excludesFile"
-                                && git_policy
-                                    .linked
-                                    .as_ref()
-                                    .is_some_and(|(git_dir, _)| path.starts_with(git_dir))
-                            {
-                                // core.excludesFile can be inside the linked worktree's Git
-                                // directory. Landlock cannot subtract a file from that
-                                // writable directory; report the nested exclusion
-                                // instead of refusing all Git commands.
-                                write_deny_nested.push(path);
-                            } else {
-                                shell_write_deny.push(path);
-                            }
+                            // core.excludesFile can be inside the linked worktree's Git
+                            // directory. Landlock cannot subtract a file from that
+                            // writable directory; report the nested exclusion
+                            // instead of refusing all Git commands.
+                            write_deny_nested.push(path.clone());
+                        } else {
+                            shell_write_deny.push(path.clone());
                         }
                     }
                 }
@@ -2194,26 +2188,308 @@ fn refuse_store_overlap(
 }
 
 #[cfg(unix)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct GitPolicy {
     read_roots: Vec<PathBuf>,
     hooks: Vec<PathBuf>,
     /// For a linked worktree: its own Git directory (`<common>/worktrees/<name>`)
     /// and the shared common directory of the main repository.
     linked: Option<(PathBuf, PathBuf)>,
+    configured_paths: Vec<(String, PathBuf)>,
+    metadata_allow: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct CachedGitPolicy {
+    policy: GitPolicy,
+    inputs: GitPolicyInputs,
+    worker: bool,
+}
+
+#[cfg(unix)]
+fn git_policy_cache() -> &'static Mutex<HashMap<PathBuf, CachedGitPolicy>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedGitPolicy>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitInputIdentity {
+    device: u64,
+    inode: u64,
+    symlink: bool,
+    // Directory contents (index.lock, refs, etc.) change on ordinary Git use.
+    // Only a directory replacement affects config lookup, not its mtime.
+    contents: Option<(u64, i64, i64, i64, i64)>,
+}
+
+#[cfg(unix)]
+fn git_input_identity(path: &Path) -> std::io::Result<Option<GitInputIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(GitInputIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            symlink: metadata.file_type().is_symlink(),
+            contents: (!metadata.is_dir()).then(|| {
+                (
+                    metadata.len(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            }),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct GitPolicyInputs {
+    environment: Vec<(OsString, OsString)>,
+    files: BTreeMap<PathBuf, Option<GitInputIdentity>>,
+    resolved_paths: Vec<(PathBuf, PathBuf)>,
+}
+
+#[cfg(unix)]
+impl GitPolicyInputs {
+    fn watch(&mut self, path: &Path) -> Option<()> {
+        // Include parent identities: a config symlink or any ancestor can be
+        // retargeted without changing the inode of the previously read target.
+        for ancestor in path.ancestors() {
+            self.files
+                .entry(ancestor.to_path_buf())
+                .or_insert(git_input_identity(ancestor).ok()?);
+        }
+        let target = match path.canonicalize() {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return (!path.ancestors().any(|ancestor| {
+                    self.files
+                        .get(ancestor)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|identity| identity.symlink)
+                }))
+                .then_some(());
+            }
+            Err(_) => return None,
+        };
+        if target != path {
+            for ancestor in target.ancestors() {
+                self.files
+                    .entry(ancestor.to_path_buf())
+                    .or_insert(git_input_identity(ancestor).ok()?);
+            }
+            self.resolved_paths.push((path.to_path_buf(), target));
+        }
+        Some(())
+    }
+
+    fn unchanged(&self) -> bool {
+        self.environment == git_policy_environment()
+            && self.files.iter().all(|(path, identity)| {
+                git_input_identity(path).is_ok_and(|current| current == *identity)
+            })
+            && self.resolved_paths.iter().all(|(path, expected)| {
+                canonicalize_policy_path(path.clone(), "cached Git policy")
+                    .is_ok_and(|current| current == *expected)
+            })
+    }
+}
+
+#[cfg(unix)]
+fn git_policy_environment() -> Vec<(OsString, OsString)> {
+    #[cfg(test)]
+    if let Some(environment) = GIT_POLICY_TEST_ENV.with(|value| value.borrow().clone()) {
+        return environment;
+    }
+    let mut environment = std::env::vars_os()
+        .filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            key.starts_with("GIT_") || matches!(key.as_ref(), "HOME" | "XDG_CONFIG_HOME" | "PATH")
+        })
+        .collect::<Vec<_>>();
+    environment.sort_unstable();
+    environment
+}
+
+#[cfg(unix)]
+fn mentions_git_include(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"include".len())
+        .any(|word| word.eq_ignore_ascii_case(b"include"))
+}
+
+#[cfg(unix)]
+fn git_policy_inputs(
+    project_root: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+    environment: Vec<(OsString, OsString)>,
+) -> Option<GitPolicyInputs> {
+    #[cfg(test)]
+    if GIT_POLICY_BENCH_OLD.with(|value| value.get()) {
+        return None;
+    }
+    if !crate::developer_tools::git_usable() {
+        return None;
+    }
+    // Command-scope includes can load arbitrary files too. Treat any mention
+    // conservatively, including comments and inactive includeIf directives.
+    if environment.iter().any(|(key, value)| {
+        key.to_string_lossy().starts_with("GIT_CONFIG") && mentions_git_include(&os_bytes(value))
+    }) {
+        return None;
+    }
+    let mut configs = vec![common_dir.join("config"), git_dir.join("config.worktree")];
+    // Git knows its compiled-in system prefix and the global-file overrides.
+    // Query the *candidate* files, not only --show-origin's existing files, so
+    // creating a previously absent system/global config invalidates the cache.
+    // Older Git without these variables remains correct but uncached.
+    for variable in ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"] {
+        let output = git_policy_output(project_root, &["var", variable]).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            for path in output
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|path| !path.is_empty())
+            {
+                let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+                configs.push(if path.is_absolute() {
+                    path
+                } else {
+                    project_root.join(path)
+                });
+            }
+        }
+    }
+    if let Some((_, path)) = environment.iter().find(|(key, _)| key == "GIT_CONFIG") {
+        let path = PathBuf::from(path);
+        configs.push(if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        });
+    }
+    let mut inputs = GitPolicyInputs {
+        environment,
+        files: BTreeMap::new(),
+        resolved_paths: Vec::new(),
+    };
+    inputs.watch(&project_root.join(".git"))?;
+    inputs.watch(&git_dir.join("commondir"))?;
+    // Capture the identity before reading: a concurrent rewrite during either
+    // config inspection or policy resolution must not publish a cache entry.
+    for config in configs {
+        inputs.watch(&config)?;
+        match std::fs::read(&config) {
+            Ok(bytes) if mentions_git_include(&bytes) => return None,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(inputs)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static GIT_POLICY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GIT_POLICY_TEST_ENV: RefCell<Option<Vec<(OsString, OsString)>>> = const { RefCell::new(None) };
+    static GIT_POLICY_BENCH_OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(unix)]
+fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    #[cfg(test)]
+    GIT_POLICY_CALLS.with(|count| count.set(count.get() + 1));
+    let mut command = crate::effective_path::new_command("git");
+    #[cfg(test)]
+    if GIT_POLICY_BENCH_OLD.with(|value| value.get()) {
+        command.env("PATH", crate::effective_path::effective_path());
+    }
+    #[cfg(test)]
+    GIT_POLICY_TEST_ENV.with(|value| {
+        if let Some(environment) = value.borrow().as_ref() {
+            for (key, _) in
+                std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+            {
+                command.env_remove(key);
+            }
+            command.envs(environment.iter().cloned());
+        }
+    });
+    command.arg("-C").arg(project_root).args(args).output()
 }
 
 #[cfg(unix)]
 fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
+    let environment = git_policy_environment();
+    let worker = worker_jail_active();
+    let cached = git_policy_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(project_root)
+        .cloned();
+    // Neither filesystem inspection nor a git subprocess runs under this lock.
+    // Concurrent cold misses may duplicate queries rather than block other roots.
+    if let Some(cached) = cached {
+        if cached.worker == worker
+            && cached.inputs.environment == environment
+            && cached.inputs.unchanged()
+        {
+            return Ok(cached.policy);
+        }
+    }
+    let (policy, inputs) = resolve_git_policy_uncached(project_root, environment, worker)?;
+    let entry = inputs
+        .filter(GitPolicyInputs::unchanged)
+        .map(|inputs| CachedGitPolicy {
+            policy: policy.clone(),
+            inputs,
+            worker,
+        });
+    let mut cache = git_policy_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(entry) = entry {
+        cache.insert(project_root.to_path_buf(), entry);
+    } else {
+        cache.remove(project_root);
+    }
+    Ok(policy)
+}
+
+#[cfg(unix)]
+fn resolve_git_policy_uncached(
+    project_root: &Path,
+    environment: Vec<(OsString, OsString)>,
+    worker: bool,
+) -> Result<(GitPolicy, Option<GitPolicyInputs>), String> {
     let dot_git = project_root.join(".git");
+    let dot_git_identity = git_input_identity(&dot_git).ok();
     let metadata = match std::fs::symlink_metadata(&dot_git) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(GitPolicy {
-                read_roots: Vec::new(),
-                hooks: vec![dot_git.join("hooks")],
-                linked: None,
-            });
+            return Ok((
+                GitPolicy {
+                    read_roots: Vec::new(),
+                    hooks: vec![dot_git.join("hooks")],
+                    linked: None,
+                    configured_paths: Vec::new(),
+                    metadata_allow: Vec::new(),
+                },
+                None,
+            ));
         }
         Err(error) => {
             return Err(format!(
@@ -2280,6 +2556,7 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
     }
 
     let commondir_file = git_dir.join("commondir");
+    let commondir_identity = git_input_identity(&commondir_file).ok();
     let common_dir = match std::fs::read_to_string(&commondir_file) {
         Ok(value) => {
             let value = value.trim();
@@ -2317,7 +2594,39 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         ));
     }
 
-    let hooks = resolve_hooks_path(project_root, &common_dir)?;
+    let mut inputs = git_policy_inputs(project_root, &git_dir, &common_dir, environment);
+    if dot_git_identity != git_input_identity(&dot_git).ok()
+        || commondir_identity != git_input_identity(&commondir_file).ok()
+    {
+        inputs = None;
+    }
+    let (hooks_input, hooks) = resolve_hooks_path(project_root, &common_dir)?;
+    let mut metadata_allow = Vec::new();
+    let mut configured_paths = Vec::new();
+    for key in if worker {
+        &[
+            "core.hooksPath",
+            "mason.originalHooksPath",
+            "core.excludesFile",
+        ][..]
+    } else {
+        &[]
+    } {
+        if let Some((input, path)) = configured_git_path(project_root, key, &mut metadata_allow)? {
+            if let Some(inputs) = &mut inputs {
+                inputs.resolved_paths.push((input, path.clone()));
+            }
+            configured_paths.push((key.to_string(), path));
+        }
+    }
+    // Re-resolve canonical paths on hits so creation of, or changes to, symlinks
+    // in hooks/excludes paths cannot leave a deny pointing at the old target.
+    if let Some(inputs) = &mut inputs {
+        inputs.resolved_paths.push((hooks_input, hooks.clone()));
+    }
+    if !metadata_allow.is_empty() {
+        inputs = None;
+    }
     let linked = (git_dir != common_dir).then(|| (git_dir.clone(), common_dir.clone()));
     let read_roots = {
         let mut read_roots = vec![git_dir, common_dir];
@@ -2325,26 +2634,30 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         read_roots.dedup();
         read_roots
     };
-    Ok(GitPolicy {
-        read_roots,
-        hooks: vec![hooks],
-        linked,
-    })
+    Ok((
+        GitPolicy {
+            read_roots,
+            hooks: vec![hooks],
+            linked,
+            configured_paths,
+            metadata_allow,
+        },
+        inputs,
+    ))
 }
 
 #[cfg(unix)]
-fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf, String> {
+fn resolve_hooks_path(
+    project_root: &Path,
+    common_dir: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
     // Without runnable git nothing can read core.hooksPath, and nothing can
     // run a hook either; deny the default hooks directory, which is what an
     // unset core.hooksPath resolves to.
     if !crate::developer_tools::git_usable() {
-        return canonicalize_policy_path(common_dir.join("hooks"), "Git hooks");
+        return resolve_git_policy_path(common_dir.join("hooks"), "Git hooks");
     }
-    let configured = crate::effective_path::new_command("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["config", "--path", "core.hooksPath"])
-        .output()
+    let configured = git_policy_output(project_root, &["config", "--path", "core.hooksPath"])
         .map_err(|error| {
             format!(
                 "failed to query core.hooksPath for {}: {error}",
@@ -2364,17 +2677,16 @@ fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf,
                 project_root.display()
             ));
         }
-        let resolved = crate::effective_path::new_command("git")
-            .arg("-C")
-            .arg(project_root)
-            .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
-            .output()
-            .map_err(|error| {
-                format!(
-                    "failed to resolve core.hooksPath for {}: {error}",
-                    project_root.display()
-                )
-            })?;
+        let resolved = git_policy_output(
+            project_root,
+            &["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+        )
+        .map_err(|error| {
+            format!(
+                "failed to resolve core.hooksPath for {}: {error}",
+                project_root.display()
+            )
+        })?;
         if !resolved.status.success() {
             return Err(format!(
                 "git could not resolve core.hooksPath for {}: {}",
@@ -2396,7 +2708,7 @@ fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf,
                 resolved.display()
             ));
         }
-        return canonicalize_policy_path(resolved, "core.hooksPath");
+        return resolve_git_policy_path(resolved, "core.hooksPath");
     }
 
     if configured.status.code() != Some(1) || !configured.stdout.is_empty() {
@@ -2406,7 +2718,7 @@ fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf,
             String::from_utf8_lossy(&configured.stderr).trim()
         ));
     }
-    canonicalize_policy_path(common_dir.join("hooks"), "Git hooks")
+    resolve_git_policy_path(common_dir.join("hooks"), "Git hooks")
 }
 
 /// Resolve operator-owned Git path settings before any command-supplied
@@ -2416,16 +2728,15 @@ fn configured_git_path(
     project_root: &Path,
     key: &str,
     metadata_allow: &mut Vec<PathBuf>,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
     if !project_root.join(".git").exists() || !crate::developer_tools::git_usable() {
         return Ok(None);
     }
-    let worktree_config = crate::effective_path::new_command("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["config", "--local", "--bool", "extensions.worktreeConfig"])
-        .output()
-        .map_err(|error| format!("failed to query worktree config extension: {error}"))?;
+    let worktree_config = git_policy_output(
+        project_root,
+        &["config", "--local", "--bool", "extensions.worktreeConfig"],
+    )
+    .map_err(|error| format!("failed to query worktree config extension: {error}"))?;
     let worktree_config = worktree_config.status.success() && worktree_config.stdout == b"true\n";
     // AFT injects core.hooksPath through command-scope GIT_CONFIG_* settings.
     // Its hooks then query repository scopes to run the configured policy.
@@ -2434,11 +2745,7 @@ fn configured_git_path(
         if scope == "--worktree" && !worktree_config {
             continue;
         }
-        let output = crate::effective_path::new_command("git")
-            .arg("-C")
-            .arg(project_root)
-            .args(["config", scope, "--path", "--get", key])
-            .output()
+        let output = git_policy_output(project_root, &["config", scope, "--path", "--get", key])
             .map_err(|error| format!("failed to query {key}: {error}"))?;
         if output.status.code() == Some(1) && output.stdout.is_empty() {
             continue;
@@ -2465,10 +2772,15 @@ fn configured_git_path(
                     metadata_allow.push(ancestor.to_path_buf());
                 }
             }
-            return canonicalize_policy_path(path, key).map(Some);
+            return resolve_git_policy_path(path, key).map(Some);
         }
     }
     Ok(None)
+}
+
+#[cfg(unix)]
+fn resolve_git_policy_path(path: PathBuf, field: &str) -> Result<(PathBuf, PathBuf), String> {
+    canonicalize_policy_path(path.clone(), field).map(|resolved| (path, resolved))
 }
 
 #[cfg(unix)]
@@ -4213,6 +4525,374 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod git_policy_cache_tests {
+    use super::*;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let environment = vec![
+                (OsString::from("HOME"), root.clone().into_os_string()),
+                (
+                    OsString::from("XDG_CONFIG_HOME"),
+                    root.join("xdg").into_os_string(),
+                ),
+                (
+                    OsString::from("GIT_CONFIG_GLOBAL"),
+                    root.join("global").into_os_string(),
+                ),
+                (
+                    OsString::from("GIT_CONFIG_SYSTEM"),
+                    root.join("system").into_os_string(),
+                ),
+            ];
+            GIT_POLICY_TEST_ENV.with(|value| *value.borrow_mut() = Some(environment));
+            let output = git_policy_output(&root, &["init", "--quiet"]).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let fixture = Self { _dir: dir, root };
+            fixture.hooks("first-hooks");
+            GIT_POLICY_CALLS.with(|count| count.set(0));
+            fixture
+        }
+
+        fn hooks(&self, path: &str) {
+            std::fs::create_dir_all(self.root.join(path)).unwrap();
+            std::fs::write(
+                self.root.join(".git/config"),
+                format!(
+                    "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\thooksPath = {path}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        fn resolve(&self) -> (GitPolicy, usize) {
+            let before = GIT_POLICY_CALLS.with(|count| count.get());
+            let policy = with_worker_jail(true, || resolve_git_policy(&self.root)).unwrap();
+            (policy, GIT_POLICY_CALLS.with(|count| count.get()) - before)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            git_policy_cache().lock().unwrap().remove(&self.root);
+            GIT_POLICY_TEST_ENV.with(|value| *value.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn git_policy_cache_second_spawn_uses_zero_git_queries() {
+        let fixture = Fixture::new();
+        let (first, cold) = fixture.resolve();
+        assert!(cold > 0);
+        let (second, warm) = fixture.resolve();
+        assert_eq!(second.hooks, first.hooks);
+        assert_eq!(warm, 0, "unchanged policy must not spawn git");
+    }
+
+    #[test]
+    fn git_policy_cache_changed_config_reports_new_not_stale_hooks() {
+        let fixture = Fixture::new();
+        let (old, cold) = fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+        fixture.hooks("changed-longer-hooks");
+        let (new, changed) = fixture.resolve();
+        assert_eq!(
+            new.hooks,
+            vec![fixture.root.join("changed-longer-hooks")],
+            "stale hooks path after common config change: {:?}",
+            new.hooks
+        );
+        assert_ne!(new.hooks, old.hooks);
+        assert_eq!(changed, cold, "one complete re-resolution is required");
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
+    fn git_policy_cache_include_directives_always_recompute() {
+        let fixture = Fixture::new();
+        let included = fixture.root.join("included");
+        std::fs::write(&included, "[core]\n hooksPath = included-hooks\n").unwrap();
+        std::fs::create_dir(fixture.root.join("included-hooks")).unwrap();
+        std::fs::write(
+            fixture.root.join(".git/config"),
+            format!("[include]\n path = {}\n", included.display()),
+        )
+        .unwrap();
+        let (first, cold) = fixture.resolve();
+        assert_eq!(first.hooks, vec![fixture.root.join("included-hooks")]);
+        assert!(cold > 0);
+        assert!(
+            fixture.resolve().1 > 0,
+            "include config must never be cached"
+        );
+        std::fs::write(
+            &included,
+            "[core]\n hooksPath = replacement-included-hooks\n",
+        )
+        .unwrap();
+        let (changed, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(
+            changed.hooks,
+            vec![fixture.root.join("replacement-included-hooks")]
+        );
+    }
+
+    #[test]
+    fn git_policy_cache_global_system_worktree_and_environment_invalidate() {
+        let fixture = Fixture::new();
+        fixture.resolve();
+        for name in ["global", "system"] {
+            std::fs::write(
+                fixture.root.join(name),
+                "[mason]\n originalHooksPath = policy-hooks\n",
+            )
+            .unwrap();
+            let (policy, calls) = fixture.resolve();
+            assert!(calls > 0, "creating {name} config must invalidate");
+            assert!(policy.configured_paths.contains(&(
+                "mason.originalHooksPath".into(),
+                fixture.root.join("policy-hooks")
+            )));
+            assert_eq!(fixture.resolve().1, 0);
+        }
+        let config = fixture.root.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[extensions]\n worktreeConfig = true\n");
+        std::fs::write(config, text).unwrap();
+        fixture.resolve();
+        std::fs::write(
+            fixture.root.join(".git/config.worktree"),
+            "[core]\n hooksPath = worktree-hooks\n",
+        )
+        .unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("worktree-hooks")]);
+        assert_eq!(fixture.resolve().1, 0);
+        GIT_POLICY_TEST_ENV.with(|value| {
+            value.borrow_mut().as_mut().unwrap().extend([
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), "core.hooksPath".into()),
+                ("GIT_CONFIG_VALUE_0".into(), "environment-hooks".into()),
+            ])
+        });
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("environment-hooks")]);
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
+    fn git_policy_cache_detects_hooks_symlink_retargeting() {
+        let fixture = Fixture::new();
+        fixture.resolve();
+        std::fs::create_dir(fixture.root.join("redirected-hooks")).unwrap();
+        std::fs::remove_dir(fixture.root.join("first-hooks")).unwrap();
+        std::os::unix::fs::symlink("redirected-hooks", fixture.root.join("first-hooks")).unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("redirected-hooks")]);
+    }
+
+    #[test]
+    fn git_policy_cache_pointer_and_commondir_invalidate() {
+        let fixture = Fixture::new();
+        let first = fixture.root.join("first-git");
+        std::fs::rename(fixture.root.join(".git"), &first).unwrap();
+        std::fs::write(fixture.root.join(".git"), "gitdir: first-git\n").unwrap();
+        fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+        let other = fixture.root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(git_policy_output(&other, &["init", "--quiet"])
+            .unwrap()
+            .status
+            .success());
+        std::fs::write(
+            other.join(".git/config"),
+            "[core]\n bare = false\n hooksPath = other-hooks\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.root.join(".git"), "gitdir: other/.git\n").unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("other-hooks")]);
+        std::fs::write(fixture.root.join(".git"), "gitdir: first-git\n").unwrap();
+        fixture.resolve();
+        assert_eq!(fixture.resolve().1, 0);
+        std::fs::write(first.join("commondir"), "../other/.git\n").unwrap();
+        let (policy, calls) = fixture.resolve();
+        assert!(calls > 0);
+        assert_eq!(policy.hooks, vec![fixture.root.join("other-hooks")]);
+        assert_eq!(fixture.resolve().1, 0);
+    }
+
+    #[test]
+    fn git_policy_cache_include_if_even_inactive_disables_caching() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents
+            .push_str("[includeIf \"gitdir:/nonexistent-aft-repo/\"]\n path = absent-include\n");
+        std::fs::write(config, contents).unwrap();
+        assert!(fixture.resolve().1 > 0);
+        assert!(fixture.resolve().1 > 0);
+    }
+
+    /// Compare the old explicit-PATH fork with inherited-PATH helper launches.
+    /// This measures jail policy preparation without entering a nested sandbox.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "manual large-heap spawn measurement; run alone with --nocapture"]
+    fn large_heap_spawn_latency() {
+        crate::effective_path::initialize_process_path();
+        let fixture = Fixture::new();
+        assert!(git_policy_inputs(
+            &fixture.root,
+            &fixture.root.join(".git"),
+            &fixture.root.join(".git"),
+            git_policy_environment()
+        )
+        .is_some());
+        let commit = git_policy_output(
+            &fixture.root,
+            &[
+                "-c",
+                "user.name=Bench",
+                "-c",
+                "user.email=bench@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "benchmark",
+            ],
+        )
+        .unwrap();
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let mib: usize = std::env::var("AFT_SPAWN_BENCH_HEAP_MIB")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(2048);
+        // Touch real allocations, and park threads rather than generating load.
+        let heap: Vec<Vec<u8>> = (0..mib * 8).map(|_| vec![1u8; 128 * 1024]).collect();
+        let barrier = Arc::new(std::sync::Barrier::new(65));
+        let threads: Vec<_> = (0..64)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let allocation = vec![7u8; 128 * 1024];
+                    barrier.wait();
+                    barrier.wait();
+                    std::hint::black_box(allocation);
+                })
+            })
+            .collect();
+        barrier.wait();
+        fn measure(name: &str, mut run: impl FnMut()) {
+            let mut samples = Vec::new();
+            for _ in 0..20 {
+                let started = Instant::now();
+                run();
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{name}: n=20 mean_ms={:.3} median_ms={:.3} p95_ms={:.3}",
+                samples.iter().sum::<f64>() / 20.0,
+                samples[10],
+                samples[18]
+            );
+        }
+        eprintln!(
+            "heap_mib={mib} parked_threads=64 git={}",
+            String::from_utf8_lossy(
+                &git_policy_output(&fixture.root, &["--version"])
+                    .unwrap()
+                    .stdout
+            )
+            .trim()
+        );
+        for old in [true, false] {
+            GIT_POLICY_BENCH_OLD.with(|value| value.set(old));
+            let label = if old {
+                "before_fork"
+            } else {
+                "after_posix_spawn"
+            };
+            measure(&format!("worktree_probe/{label}"), || {
+                assert!(git_policy_output(
+                    &fixture.root,
+                    &[
+                        "rev-parse",
+                        "--path-format=absolute",
+                        "--git-dir",
+                        "--git-common-dir"
+                    ]
+                )
+                .unwrap()
+                .status
+                .success());
+            });
+            measure(&format!("cache_key_resolve/{label}"), || {
+                assert!(
+                    git_policy_output(&fixture.root, &["rev-list", "--max-parents=0", "HEAD"])
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            });
+            measure(&format!("jail_policy_cold/{label}"), || {
+                git_policy_cache().lock().unwrap().remove(&fixture.root);
+                fixture.resolve();
+            });
+            fixture.resolve();
+            measure(&format!("jail_policy_warm/{label}"), || {
+                fixture.resolve();
+            });
+            measure(&format!("shell_preexec/{label}"), || {
+                use std::os::fd::AsRawFd;
+                let marker = File::open("/dev/null").unwrap();
+                let mut command = crate::effective_path::new_command("/bin/sh");
+                if old {
+                    command.env("PATH", crate::effective_path::effective_path());
+                }
+                command.args(["-c", "true"]);
+                crate::bash_background::process::start_new_session(&mut command);
+                apply_marker_fd_allowlist(&mut command, marker.as_raw_fd(), marker.as_raw_fd())
+                    .unwrap();
+                crate::privacy_spawn::install(&mut command, true, false).unwrap();
+                assert!(command.status().unwrap().success());
+            });
+        }
+        GIT_POLICY_BENCH_OLD.with(|value| value.set(false));
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        std::hint::black_box(heap);
+    }
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;
@@ -4594,11 +5274,15 @@ mod policy_tests {
             read_roots: Vec::new(),
             hooks: vec![common.join("hooks")],
             linked: Some((own.clone(), common.clone())),
+            configured_paths: Vec::new(),
+            metadata_allow: Vec::new(),
         };
         let main = GitPolicy {
             read_roots: Vec::new(),
             hooks: Vec::new(),
             linked: None,
+            configured_paths: Vec::new(),
+            metadata_allow: Vec::new(),
         };
         let grants = linked_git_grants(&[linked, main]);
         assert_eq!(
@@ -4642,6 +5326,8 @@ mod policy_tests {
             read_roots: Vec::new(),
             hooks: vec![common.join("hooks")],
             linked: Some((own, common.clone())),
+            configured_paths: Vec::new(),
+            metadata_allow: Vec::new(),
         };
         let grants = worker_jail_grants(&home, &[worktree], &[git], &policy);
         let files = [common.join("packed-refs"), common.join("packed-refs.lock")];

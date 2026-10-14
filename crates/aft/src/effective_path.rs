@@ -115,8 +115,20 @@ pub fn log_startup_probe_result() {
 /// Create a new `Command` with the effective PATH set on Unix.
 #[cfg(unix)]
 pub fn new_command<S: AsRef<OsStr>>(program: S) -> std::process::Command {
+    command_with_path(program.as_ref(), effective_path())
+}
+
+#[cfg(unix)]
+fn command_with_path(program: &OsStr, path: &OsStr) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
-    cmd.env("PATH", effective_path());
+    // Startup exports the effective PATH before threads start. Reapplying even
+    // the same value marks PATH as changed in Rust's Command and disables
+    // posix_spawn for bare executable names, forcing a costly daemon fork.
+    // Library callers that have not initialized process PATH still need the
+    // override to preserve executable lookup and the child's environment.
+    if std::env::var_os("PATH").as_deref() != Some(path) {
+        cmd.env("PATH", path);
+    }
     cmd
 }
 
@@ -767,6 +779,25 @@ fn reap_child_in_background(mut child: Child) {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
+    #[test]
+    fn helpers_do_not_override_inherited_path() {
+        let path = std::env::var_os("PATH").unwrap();
+        let command = super::command_with_path(std::ffi::OsStr::new("git"), &path);
+        assert!(
+            !command.get_envs().any(|(key, _)| key == "PATH"),
+            "an explicit PATH, even unchanged, forces Rust's macOS Command to fork"
+        );
+    }
+
+    #[test]
+    fn helpers_preserve_distinct_effective_path() {
+        let path = std::ffi::OsStr::new("/aft-test-distinct-path");
+        let command = super::command_with_path(std::ffi::OsStr::new("git"), path);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "PATH" && value == Some(path)));
+    }
+
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
