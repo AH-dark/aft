@@ -631,3 +631,21 @@ Other critical subgraph edges, all retained here:
 
 These are recommendations, not claims that the edges were removed or that
 an unmeasured DAG meets the under-25-minute objective.
+
+### Local cross-commit library reuse control
+
+The Linux Motor runner's default sccache filesystem backend was configured
+read-only: diagnostic output named `Cannot write to read-only storage`, not
+a library-key/provenance mismatch. An isolated cache under this worktree's
+remote target directory with `SCCACHE_LOCAL_RW_MODE=READ_WRITE` fixed that
+measurement prerequisite without changing CI configuration or shared caches.
+
+At `fc75af761`, `cargo rustc -p agent-file-tools --lib -- -C extra-filename=-ci-stamp-proof`
+stored one library request (miss=1, write-errors=0, 90 MiB cache). At
+`6d9197a80`, with identical Rust/Cargo inputs and the same flags/backend, the
+actual next request reported **requests=1, Rust hits=1, misses=0,
+write-errors=0**, compiler wall **4.99 seconds** rather than **1m14s** to seed.
+Cargo still invoked the library compiler after the Git-sensitive build script
+changed; sccache reused the result. This demonstrates cross-commit library
+reuse even though Cargo invoked the compiler rather than declaring the
+package Fresh. Raw debug environments were not published.
