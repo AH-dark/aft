@@ -157,7 +157,6 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
-          python3 -m unittest discover -s scripts/lib -p test_select_native_release_artifact.py -v
       - name: Merge queue workflow and search contracts
         run: |
           python3 --version

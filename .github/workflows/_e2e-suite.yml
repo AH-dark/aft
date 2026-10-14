@@ -5,14 +5,13 @@ name: E2E Suite
 #   - macOS native e2e   — same stack on a real macOS-arm64 runner
 #   - Windows native e2e — same stack on a real Windows runner (no containers)
 #
-# Called from tests.yml (pull requests and pushes to main and train/*). A
-# release does not run it again: release.yml requires the tagged commit's
-# tests.yml run to be green instead (scripts/release-ci-gate.sh).
+# Called from tests.yml for all refs. Landing CI uses stage; release.yml
+# separately tests the shipped binaries before publication.
 #
 # IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
 # locking, or platform-conditional code paths SHOULD touch the matching
 # integration test or e2e scenario here. The Linux harness has caught real
-# regressions before; the Windows e2e covers issue-#26-class Windows-specific
+# regressions before; the Windows e2e covers Windows-specific
 # bugs (bash timeouts, lock recovery, path separators); the macOS e2e covers
 # FSEvents watcher behavior, /var vs /private/var symlink canonicalization,
 # .dylib loading paths for ONNX, and Apple Silicon native codegen for aft.
@@ -21,9 +20,9 @@ on:
   workflow_call:
     inputs:
       cargo_profile:
-        description: "Cargo profile for the aft binaries under test: 'release' (fat LTO, the shipped shape; pushes to main) or 'stage' (optimized, no LTO — minutes less link time; PRs and trains)"
+        description: "Cargo profile for landing CI: stage is optimized without fat LTO"
         type: string
-        default: release
+        default: stage
 
 env:
   # Preserve the compiler cache daemon and its statistics between build steps.
@@ -407,47 +406,8 @@ jobs:
   # recovery). Windows containers require a Windows Docker host and add no
   # value over running natively on `windows-2022`.
   # ---------------------------------------------------------------------------
-  release-library-windows:
-    name: Release library codegen (Windows x64)
-    if: inputs.cargo_profile == 'release'
-    runs-on: windows-2022
-    timeout-minutes: 30
-    outputs:
-      rust_version: ${{ steps.bundle.outputs.rust_version }}
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: e2e-windows-release
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Release library codegen (shipped profile)
-        run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings
-        shell: pwsh
-      - name: Bundle release library and exact inputs
-        id: bundle
-        run: python scripts/native-release-artifact.py pack-library --target x86_64-pc-windows-msvc --archive "$env:RUNNER_TEMP/windows-release-library.tar"
-        shell: pwsh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-release-library-${{ github.sha }}
-          path: ${{ runner.temp }}/windows-release-library.tar
-          compression-level: 1
-          if-no-files-found: error
-          retention-days: 7
-
   e2e-windows:
     name: E2E (Windows native)
-    needs: release-library-windows
-    if: ${{ !cancelled() && (inputs.cargo_profile != 'release' || needs.release-library-windows.result == 'success') }}
     runs-on: windows-2022
     timeout-minutes: 30
     env:
@@ -459,7 +419,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ inputs.cargo_profile == 'release' && needs.release-library-windows.outputs.rust_version || 'stable' }}
           targets: x86_64-pc-windows-msvc
 
       - uses: mozilla-actions/sccache-action@v0.0.11
@@ -473,18 +432,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-
-      - name: Download exact release library codegen
-        if: inputs.cargo_profile == 'release'
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-release-library-${{ github.sha }}
-          path: ${{ runner.temp }}/windows-release-input
-
-      - name: Verify and restore release library inputs
-        if: inputs.cargo_profile == 'release'
-        run: python scripts/native-release-artifact.py unpack-library --target x86_64-pc-windows-msvc --archive "$env:RUNNER_TEMP/windows-release-input/windows-release-library.tar"
-        shell: pwsh
 
       - name: Build AFT binary (Windows x64)
         run: cargo build --profile $env:CARGO_PROFILE --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
@@ -506,20 +453,6 @@ jobs:
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}\aft.exe
           AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
-
-      - name: Bundle tested shipped Windows binary
-        if: inputs.cargo_profile == 'release'
-        run: python scripts/native-release-artifact.py pack-binary --target x86_64-pc-windows-msvc --archive "$env:RUNNER_TEMP/windows-shipped-release.tar"
-        shell: pwsh
-      - uses: actions/upload-artifact@v4
-        if: inputs.cargo_profile == 'release'
-        with:
-          name: windows-shipped-release-${{ github.sha }}
-          path: ${{ runner.temp }}/windows-shipped-release.tar
-          compression-level: 1
-          overwrite: true
-          if-no-files-found: error
-          retention-days: 30
 
       - name: Collect Windows plugin log on failure
         if: failure()
@@ -550,49 +483,10 @@ jobs:
   # Catches: FSEvents watcher behavior, /var vs /private/var canonicalization,
   # broken-symlink-chain fallback, .dylib loading, and Apple Silicon codegen.
   # ---------------------------------------------------------------------------
-  release-library-macos:
-    name: Release library codegen (macOS ARM64)
-    if: inputs.cargo_profile == 'release'
-    runs-on: macos-26
-    timeout-minutes: 45
-    outputs:
-      rust_version: ${{ steps.bundle.outputs.rust_version }}
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.11
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: e2e-macos-release
-          cache-bin: false
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Release library codegen (shipped profile)
-        run: cargo build --release --lib -p agent-file-tools --timings
-        env:
-          RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-rustc-cache.py
-      - name: Bundle release library and exact inputs
-        id: bundle
-        run: python3 scripts/native-release-artifact.py pack-library --archive "$RUNNER_TEMP/macos-release-library.tar"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-release-library-${{ github.sha }}
-          path: ${{ runner.temp }}/macos-release-library.tar
-          compression-level: 1
-          if-no-files-found: error
-          retention-days: 7
-
   e2e-macos:
     name: E2E (macOS native)
-    needs: release-library-macos
-    if: ${{ !cancelled() && (inputs.cargo_profile != 'release' || needs.release-library-macos.result == 'success') }}
     runs-on: macos-26
-    # Library codegen and final linking each retain the existing 45-minute
-    # runner limit. This runner links and tests the exact shipped binary.
+    # Stage codegen avoids the shipped profile's long fat-LTO link.
     timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -602,8 +496,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ inputs.cargo_profile == 'release' && needs.release-library-macos.outputs.rust_version || 'stable' }}
 
       - uses: mozilla-actions/sccache-action@v0.0.11
 
@@ -622,23 +514,8 @@ jobs:
         with:
           bun-version: latest
 
-      - name: Download exact release library codegen
-        if: inputs.cargo_profile == 'release'
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-release-library-${{ github.sha }}
-          path: ${{ runner.temp }}/macos-release-input
-
-      - name: Verify and restore release library inputs
-        if: inputs.cargo_profile == 'release'
-        run: python3 scripts/native-release-artifact.py unpack-library --archive "$RUNNER_TEMP/macos-release-input/macos-release-library.tar"
-
       - name: Build AFT binary (macOS native)
         run: cargo build --profile "$CARGO_PROFILE" --bin aft -p agent-file-tools --timings
-
-      - name: Strip shipped binary before signing
-        if: inputs.cargo_profile == 'release'
-        run: strip target/release/aft
 
       # Ad-hoc sign + verify + exec once: an unsigned fresh binary gets
       # SIGKILLed on newer macOS, and the first exec pays a syspolicyd
@@ -664,22 +541,6 @@ jobs:
         env:
           AFT_BINARY_PATH: ${{ github.workspace }}/target/${{ inputs.cargo_profile == 'stage' && 'stage' || 'release' }}/aft
           AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist
-
-      - name: Package tested shipped macOS binary and dSYM
-        if: inputs.cargo_profile == 'release'
-        run: |
-          ditto target/release/aft.dSYM "$RUNNER_TEMP/release-dsym/aft.dSYM"
-          ditto -c -k --keepParent "$RUNNER_TEMP/release-dsym/aft.dSYM" "$RUNNER_TEMP/aft-darwin-arm64-dsym.zip"
-          python3 scripts/native-release-artifact.py pack-binary --archive "$RUNNER_TEMP/macos-shipped-release.tar" --dsym "$RUNNER_TEMP/aft-darwin-arm64-dsym.zip"
-      - uses: actions/upload-artifact@v4
-        if: inputs.cargo_profile == 'release'
-        with:
-          name: macos-shipped-release-${{ github.sha }}
-          path: ${{ runner.temp }}/macos-shipped-release.tar
-          compression-level: 1
-          overwrite: true
-          if-no-files-found: error
-          retention-days: 30
 
       - name: Upload macOS plugin log on failure
         if: failure()

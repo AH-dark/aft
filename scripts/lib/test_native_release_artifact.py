@@ -26,21 +26,26 @@ def facts():
 
 
 @contextmanager
-def handoff(kind="library"):
+def handoff(kind="library", target="aarch64-apple-darwin", explicit=False):
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         source = root / "Cargo.toml"
         source.write_bytes(b"tracked source before transfer")
         clocks = {"Cargo.toml": {"mtime_ns": source.stat().st_mtime_ns,
                                 "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}}
-        directory = root / "target/release"
+        directory = root / "target" / target / "release" if explicit else root / "target/release"
         directory.mkdir(parents=True)
-        product = directory / ("libaft.rlib" if kind == "library" else "aft")
+        filename = "aft.exe" if target.endswith("windows-msvc") else "aft"
+        product = directory / ("libaft.rlib" if kind == "library" else filename)
         product.write_bytes(b"compiled native release output")
         archive = root / "handoff.tar"
-        with patch.object(native, "ROOT", root), patch.object(native, "facts", return_value=facts()), \
+        expected = {**facts(), "target": target, "profile_manifest_sha256": native.digest(source)}
+        with patch.object(native, "ROOT", root), patch.object(native, "facts", return_value=expected), \
                 patch.object(native, "input_clocks", return_value=clocks):
-            with patch("sys.argv", ["native-release-artifact.py", f"pack-{kind}", "--archive", str(archive)]):
+            argv = ["native-release-artifact.py", f"pack-{kind}", "--archive", str(archive)]
+            if explicit:
+                argv += ["--target", target]
+            with patch("sys.argv", argv):
                 native.main()
             yield root, archive, product, clocks
 
@@ -80,6 +85,61 @@ class NativeReleaseArtifactTests(unittest.TestCase):
                 bundle.add(product, arcname="target/release/aft")
             with self.assertRaisesRegex(ValueError, "binary checksum mismatch"):
                 unpack(archive, "binary")
+
+    def test_post_e2e_verification_rejects_mutation_without_restoring_binary(self):
+        with handoff("binary") as (_, archive, product, _):
+            product.write_bytes(b"changed while E2E ran")
+            with patch("sys.argv", ["native-release-artifact.py", "verify-binary", "--archive", str(archive)]):
+                with self.assertRaisesRegex(ValueError, "binary checksum mismatch"):
+                    native.main()
+            self.assertEqual(product.read_bytes(), b"changed while E2E ran")
+
+    def test_published_binary_checksum_equals_tested_bytes_without_rust(self):
+        for target, explicit in (("aarch64-apple-darwin", False), ("x86_64-pc-windows-msvc", True),
+                                 ("x86_64-unknown-linux-gnu", True)):
+            with self.subTest(target=target), handoff("binary", target, explicit) as (root, archive, product, _):
+                tested = product.read_bytes()
+                destination = root / "npm/bin" / product.name
+                product.unlink()
+                with patch.object(native, "output", return_value="a" * 40) as output, \
+                        patch.object(native, "facts", side_effect=AssertionError("publication must not run Rust")):
+                    native.unpack_published(archive, target, destination, None)
+                output.assert_called_once_with("git", "rev-parse", "HEAD")
+                self.assertEqual(destination.read_bytes(), tested)
+                self.assertEqual(hashlib.sha256(destination.read_bytes()).hexdigest(), hashlib.sha256(tested).hexdigest())
+
+    def test_publication_rejects_a_different_sha_or_target(self):
+        with handoff("binary") as (root, archive, _, _):
+            destination = root / "release-assets/aft"
+            for sha, target, error in (("c" * 40, "aarch64-apple-darwin", "git_sha"),
+                                       ("a" * 40, "x86_64-unknown-linux-gnu", "target")):
+                with self.subTest(error=error), patch.object(native, "output", return_value=sha):
+                    with self.assertRaisesRegex(ValueError, error):
+                        native.unpack_published(archive, target, destination, None)
+                    self.assertFalse(destination.exists())
+
+    def test_publication_rejects_tampered_tested_bundle(self):
+        with handoff("binary") as (root, archive, product, _):
+            product.write_bytes(b"rebuild that never passed E2E")
+            with tarfile.open(archive, "w") as bundle:
+                bundle.add(root / "native-release-manifest.json", arcname="native-release-manifest.json")
+                bundle.add(product, arcname="target/release/aft")
+            destination = root / "npm/bin/aft"
+            with patch.object(native, "output", return_value="a" * 40):
+                with self.assertRaisesRegex(ValueError, "binary checksum mismatch"):
+                    native.unpack_published(archive, "aarch64-apple-darwin", destination, None)
+            self.assertFalse(destination.exists())
+
+    def test_publication_preserves_verified_dsym_bytes(self):
+        with handoff("binary") as (root, archive, _, _):
+            debug = root / "producer-dsym.zip"
+            debug.write_bytes(b"debug symbols for the tested executable")
+            with patch("sys.argv", ["native-release-artifact.py", "pack-binary", "--archive", str(archive), "--dsym", str(debug)]):
+                native.main()
+            destination = root / "release-assets/aft-dsym.zip"
+            with patch.object(native, "output", return_value="a" * 40):
+                native.unpack_published(archive, "aarch64-apple-darwin", root / "release-assets/aft", destination)
+            self.assertEqual(destination.read_bytes(), debug.read_bytes())
 
     def test_exact_native_release_metadata_is_accepted(self):
         native.validate(facts(), facts())
