@@ -2679,6 +2679,8 @@ mod grant_path_tests {
                     crate::subc_format::FormatContext::default(),
                     BashWaitCancel {
                         run_scope: None,
+                        scope: None,
+                        late_results: false,
                         connection: PersistentCancelSignal::new(),
                         route: PersistentCancelSignal::new(),
                         drain: drain::ModuleDrainWindow::default(),

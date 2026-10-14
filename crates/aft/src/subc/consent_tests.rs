@@ -633,6 +633,7 @@ async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry
     worker.abort();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
