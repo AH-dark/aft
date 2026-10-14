@@ -50,6 +50,7 @@ on:
     branches:
       - main
       - "train/**"
+      - "ci-speed/**"
   workflow_dispatch:
     inputs:
       ref:
@@ -62,6 +63,11 @@ on:
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Keep the compiler cache server alive between build steps so its final
+  # statistics cover the whole job instead of a newly started daemon.
+  SCCACHE_IDLE_TIMEOUT: "0"
 
 jobs:
   # ---------------------------------------------------------------------------
