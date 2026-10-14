@@ -581,8 +581,8 @@ const BACKUP_BUSY_DEADLINE: Duration = Duration::from_secs(5);
 ///
 /// `SQLITE_BUSY` or `SQLITE_LOCKED` leaves the copy position unchanged, so
 /// retrying the same all-pages step after a short pause is correct. The
-/// retries are bounded so that a stuck lock fails the clone instead of
-/// spinning forever.
+/// retries are bounded so that a stuck lock defers the clone as typed SQLite
+/// contention, rather than declaring a valid published manifest corrupt.
 pub(super) fn copy_all_pages(backup: &rusqlite::backup::Backup<'_, '_>) -> Result<BackupCopy> {
     use rusqlite::backup::StepResult;
     let started = Instant::now();
@@ -598,13 +598,20 @@ pub(super) fn copy_all_pages(backup: &rusqlite::backup::Backup<'_, '_>) -> Resul
             // should not report partial progress. Continue without sleeping
             // if it ever does.
             StepResult::More => {}
-            StepResult::Busy | StepResult::Locked => {
+            contention @ (StepResult::Busy | StepResult::Locked) => {
                 copy.busy_retries += 1;
                 if started.elapsed() >= BACKUP_BUSY_DEADLINE {
-                    return Err(ViewError::InvalidManifest(format!(
-                        "derived clone stayed busy for {} ms after {} attempt(s)",
-                        started.elapsed().as_millis(),
-                        copy.steps
+                    let code = match contention {
+                        StepResult::Locked => rusqlite::ffi::SQLITE_LOCKED,
+                        _ => rusqlite::ffi::SQLITE_BUSY,
+                    };
+                    return Err(ViewError::Sqlite(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(code),
+                        Some(format!(
+                            "derived clone stayed busy for {} ms after {} attempt(s)",
+                            started.elapsed().as_millis(),
+                            copy.steps
+                        )),
                     )));
                 }
                 std::thread::sleep(BACKUP_BUSY_RETRY_PAUSE);
@@ -774,6 +781,37 @@ mod tests {
                 .unwrap(),
             "committed-in-wal"
         );
+    }
+
+    #[test]
+    fn clone_busy_donor_exhaustion_remains_building() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        let writer =
+            crate::db::file_identity::IdentityConnection::open(&source, "busy donor test").unwrap();
+        writer
+            .execute_batch("CREATE TABLE state (value TEXT); BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        // An exclusive donor lock must exhaust the real backup step, not a
+        // readiness probe or an injected error before the copy is attempted.
+        let error = clone_derived(&source, &destination).unwrap_err();
+        writer.execute_batch("ROLLBACK;").unwrap();
+        let ViewError::Sqlite(error) = error else {
+            panic!("backup contention lost its SQLite error type: {error:?}");
+        };
+        assert!(crate::db::is_busy_error(&error));
+        let response = crate::commands::callgraph_store_adapter::store_error_response(
+            "busy-donor",
+            "clone",
+            crate::callgraph_store::CallGraphStoreError::Sqlite(error),
+        );
+        assert_eq!(response.data["code"], "callgraph_building");
+
+        let copy = clone_derived(&source, &destination).unwrap();
+        assert_eq!(copy.steps, 1);
+        assert_eq!(copy.busy_retries, 0);
     }
 
     #[test]

@@ -84,6 +84,14 @@ fn assert_cold_parity(request: &AssemblyRequest, report: &AssemblyReport) {
     let derived = view
         .derived_path(report.generation.as_deref().unwrap())
         .unwrap();
+    // Request readers deliberately fail fast during checkpoint contention.
+    // This fixture compares settled graph content, not that transient state.
+    crate::views::generation::wait_for_derived_checkpoint_for_test(view.view_dir());
+    assert_eq!(
+        crate::db::file_identity::open_connections(&derived),
+        0,
+        "the parity fixture must settle its deferred checkpoint before opening a reader"
+    );
     let blobs = BlobStore::open(&request.storage, &request.family, BlobPlane::Callgraph).unwrap();
     let cold_dir = tempfile::tempdir().unwrap();
     let cold = cold_dir.path().join("derived-cold.sqlite");
