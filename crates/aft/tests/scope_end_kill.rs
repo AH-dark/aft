@@ -854,21 +854,47 @@ async fn restart_recovers_stamped_task_and_polls_only_after_interval() {
     daemon
         .bind(1, 1, "owner", Some(stamp("owner", 1)), false)
         .await;
-    daemon
-        .start(1, 1, shell(Some("recovered"), false, 15))
-        .await;
+    let marker = root.join("project/started");
+    let mut call = gated_shell(&root, Some("recovered"));
+    call["arguments"]["timeout"] = json!(120000);
+    #[cfg(windows)]
+    let signal = format!(
+        "Set-Content -LiteralPath '{}' -Value ready",
+        marker.display().to_string().replace('\'', "''")
+    );
+    #[cfg(not(windows))]
+    let signal = format!(
+        "printf ready > '{}'",
+        marker.display().to_string().replace('\'', "'\\''")
+    );
+    call["arguments"]["command"] = json!(format!(
+        "{signal}; {}",
+        call["arguments"]["command"].as_str().unwrap()
+    ));
+    daemon.start(1, 1, call).await;
     daemon.allow(1).await;
     let task = running_task(&root, "session-1").await.1;
+    // A running metadata record can precede wrapper startup. Wait for the
+    // command itself, and gate its exit so restart latency cannot finish it.
+    let until = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            tokio::time::Instant::now() < until,
+            "recovery command never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(daemon);
     let mut daemon = Daemon::spawn(&root, &["scope.describe"]).await;
     // Recover the original session under a new epoch without revoking it.
     daemon
         .bind(1, 1, "direct", Some(stamp("owner", 2)), false)
         .await;
-    assert!(daemon
-        .status(1, task["task_id"].as_str().unwrap())
-        .await
-        .contains("running"));
+    // Opening aft.db does not acknowledge restoration of task records
+    // into the registry. Await bash_status confirming the live command.
+    daemon
+        .wait_status(1, task["task_id"].as_str().unwrap(), "running")
+        .await;
     let poll = daemon.describe().await;
     daemon.answer(&poll, "not_live", true, 1).await;
     let status = daemon

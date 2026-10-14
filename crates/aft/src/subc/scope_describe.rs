@@ -85,6 +85,25 @@ pub(super) fn start(
     mpsc::UnboundedReceiver<EndedScope>,
     JoinHandle<()>,
 ) {
+    start_with_scope_source(control, executor.clone(), poll_interval(), move || {
+        work_scopes(executor.clone(), run_scopes.clone())
+    })
+}
+
+fn start_with_scope_source<F, Fut>(
+    control: Arc<readiness::DaemonControl>,
+    executor: Arc<Executor>,
+    interval: Duration,
+    scope_source: F,
+) -> (
+    ScopeDescribes,
+    mpsc::UnboundedReceiver<EndedScope>,
+    JoinHandle<()>,
+)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
+{
     let (goodbye, mut closes) = mpsc::unbounded_channel();
     let (ended, receiver) = mpsc::unbounded_channel();
     let routed = Arc::new(StdMutex::new(HashSet::new()));
@@ -99,12 +118,9 @@ pub(super) fn start(
         let mut queued = HashMap::new();
         let mut retry = HashMap::new();
         let mut pending = HashSet::new();
+        let mut next_poll: HashMap<_, tokio::time::Instant> = HashMap::new();
         let mut inflight = tokio::task::JoinSet::new();
-        let mut poll = tokio::time::interval_at(
-            tokio::time::Instant::now() + poll_interval(),
-            poll_interval(),
-        );
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut next_scan = tokio::time::Instant::now() + interval;
         loop {
             while inflight.len() < 4 && !queued.is_empty() {
                 let key = queued.keys().next().cloned().unwrap();
@@ -115,29 +131,50 @@ pub(super) fn start(
                     (key, stamp, reply)
                 });
             }
+            let routed_now = routed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let wake_at = next_poll
+                .iter()
+                .filter(|(key, _)| {
+                    !pending.contains(*key)
+                        && (!routed_now.contains(*key) || retry.contains_key(*key))
+                })
+                .map(|(_, due)| *due)
+                .min()
+                .map_or(next_scan, |due| due.min(next_scan));
             tokio::select! {
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
-                    let scopes = work_scopes(executor.clone(), run_scopes.clone()).await;
+                    let scopes = scope_source().await;
                     let key = stamp_key(&stamp);
                     if scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
                         queued.insert(key, stamp);
                     }
                 }
-                _ = poll.tick() => {
-                    let scopes = work_scopes(executor.clone(), run_scopes.clone()).await;
+                _ = tokio::time::sleep_until(wake_at) => {
+                    let scopes = scope_source().await;
+                    next_scan = tokio::time::Instant::now() + interval;
                     retry.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
+                    next_poll.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
                     let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     for stamp in scopes {
                         let key = stamp_key(&stamp);
-                        if (!routed.contains(&key) || retry.contains_key(&key)) && pending.insert(key.clone()) {
+                        if (!routed.contains(&key) || retry.contains_key(&key))
+                            && next_poll.get(&key).is_none_or(|due| tokio::time::Instant::now() >= *due)
+                            && pending.insert(key.clone()) {
                             queued.insert(key, stamp);
                         }
                     }
                 }
                 Some(result) = inflight.join_next(), if !inflight.is_empty() => {
                     if let Ok((key, stamp, reply)) = result {
+                        // A Goodbye query can finish just before the connection's
+                        // periodic tick. Wait a full interval after its answer
+                        // before rechecking shell tasks with that owner/ref/epoch.
+                        next_poll.insert(key.clone(), tokio::time::Instant::now() + interval);
                         if reply.as_ref().is_ok_and(describe_answer_ends_scope) {
                             let keys = revoke(executor.clone(), &stamp).await;
                             let _ = ended.send(EndedScope { stamp, keys });
@@ -223,12 +260,92 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> Vec<crate::db::c
     keys
 }
 
-#[cfg(all(test, not(feature = "test-timing-hooks")))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "test-timing-hooks"))]
     #[test]
     fn production_scope_timing_is_exact() {
         assert_eq!(describe_timeout(), Duration::from_secs(10));
         assert_eq!(poll_interval(), Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_epoch_move_repolls_only_after_scope_poll_interval() {
+        let interval = Duration::from_millis(500);
+        let stamp = ScopeStamp::new(
+            subc_protocol::Principal::Direct,
+            "scope",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        let (writer, mut frames) = mpsc::channel(8);
+        let pending = readiness::PendingControlReplies::default();
+        let control = Arc::new(readiness::DaemonControl::new(
+            writer,
+            Arc::new(DispatchPathMetrics::new()),
+            PROTOCOL_VERSION,
+            vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
+            vec![],
+            pending.clone(),
+            HELLO_CORR + 1,
+        ));
+        let live = stamp.clone();
+        let (scopes, mut ended, worker) =
+            start_with_scope_source(control, Arc::new(Executor::new()), interval, move || {
+                std::future::ready(vec![live.clone()])
+            });
+        tokio::task::yield_now().await;
+        // Finish a Goodbye query shortly before the connection's periodic tick.
+        tokio::time::advance(Duration::from_millis(400)).await;
+        scopes.goodbye(stamp.clone());
+        let first = frames.recv().await.unwrap();
+        let answer = ModuleControlResponseToModule::ScopeDescribe {
+            status: subc_protocol::scope::ScopeStatus::Live,
+            scope_epoch: Some(2),
+            daemon_incarnation: "test-daemon".into(),
+            owner_synced: true,
+            owner_configured: true,
+            scope: None,
+        };
+        assert!(pending.resolve(
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                first.header.corr,
+                serde_json::to_vec(&answer).unwrap(),
+            )
+            .unwrap()
+        ));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let answered_at = tokio::time::Instant::now();
+        tokio::time::advance(interval - Duration::from_millis(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            frames.try_recv().is_err(),
+            "scope.describe repeated before the interval"
+        );
+        assert!(
+            ended.try_recv().is_err(),
+            "live epoch movement revoked the scope"
+        );
+        // The task's route closed, but Live did not end its scope.
+        // A later timer must keep checking for an actual scope end.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let repeated = frames.recv().await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), answered_at + interval);
+        assert_eq!(repeated.header.ty, FrameType::Request);
+        let body: serde_json::Value = serde_json::from_slice(&repeated.body).unwrap();
+        assert_eq!(body["op"], "scope.describe");
+        assert_eq!(body["ref"], stamp.scope_ref);
+        assert_ne!(repeated.header.corr, first.header.corr);
+        assert!(ended.try_recv().is_err());
+        worker.abort();
     }
 }

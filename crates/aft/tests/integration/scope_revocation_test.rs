@@ -669,13 +669,36 @@ fn close_case(name: &'static str, case: CloseCase) {
                             Some(2),
                         )
                         .await;
-                        assert!(read_frame_within(
+                        // Goodbye removed the task's route without ending its
+                        // scope. Later scope.describe requests are valid while
+                        // it runs. The paused-clock worker test checks cadence;
+                        // until our Ping receives a Pong, reject all other frames.
+                        send_frame(
                             &mut daemon.stream,
-                            Duration::from_millis(300),
-                            "live epoch move"
+                            Frame::build(FrameType::Ping, control_flags(), 0, 0, 9002, Vec::new())
+                                .unwrap(),
                         )
-                        .await
-                        .is_none());
+                        .await;
+                        loop {
+                            let frame =
+                                read_frame_timeout(&mut daemon.stream, "live epoch barrier").await;
+                            if frame.header.ty == FrameType::Pong && frame.header.corr == 9002 {
+                                break;
+                            }
+                            assert_eq!(
+                                frame.header.ty,
+                                FrameType::Request,
+                                "unexpected frame after live epoch move: {:?}",
+                                frame
+                            );
+                            assert_eq!(frame.header.channel, 0);
+                            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+                            assert_eq!(body["op"], "scope.describe", "{body}");
+                            assert_eq!(body["owner"], serde_json::to_value(stamp().owner).unwrap());
+                            assert_eq!(body["ref"], "run-scope");
+                            answer(&mut daemon.stream, &frame, ScopeStatus::Live, true, Some(2))
+                                .await;
+                        }
                         assert!(alive(pid), "a live epoch move must not kill");
                         assert_run_not_killing();
                     }
