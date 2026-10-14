@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
@@ -384,6 +384,9 @@ fn canonicalize_missing_path(path: PathBuf, field: &str) -> Result<PathBuf, Sand
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 match std::fs::symlink_metadata(&ancestor) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return resolve_dangling_symlinks(&original, field);
+                    }
                     Ok(_) => return Err(canonicalization_error(&original, field, &error)),
                     Err(probe_error) if probe_error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(probe_error) => {
@@ -403,7 +406,85 @@ fn canonicalize_missing_path(path: PathBuf, field: &str) -> Result<PathBuf, Sand
     }
 }
 
+fn resolve_dangling_symlinks(path: &Path, field: &str) -> Result<PathBuf, SandboxProfileError> {
+    const MAX_SYMLINKS: usize = 8;
+    let mut pending: VecDeque<_> = path
+        .components()
+        .map(|component| component.as_os_str().to_owned())
+        .collect();
+    let mut canonical = PathBuf::new();
+    let mut visited = BTreeSet::new();
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        match Path::new(&component).components().next().unwrap() {
+            Component::ParentDir => {
+                canonical.pop();
+                continue;
+            }
+            Component::CurDir => continue,
+            _ => canonical.push(&component),
+        }
+        match std::fs::symlink_metadata(&canonical) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                // Include the remaining suffix so a finite path that visits a
+                // link twice (for example via `..`) is not mistaken for a loop.
+                if !visited.insert((canonical.clone(), pending.clone())) {
+                    return Err(SandboxProfileError::new(format!(
+                        "symlink loop in {field} path: {}",
+                        path.display()
+                    )));
+                }
+                links += 1;
+                if links > MAX_SYMLINKS {
+                    return Err(SandboxProfileError::new(format!(
+                        "symlink limit ({MAX_SYMLINKS}) exceeded in {field} path: {}",
+                        path.display()
+                    )));
+                }
+                let target = std::fs::read_link(&canonical)
+                    .map_err(|error| canonicalization_error(path, field, &error))?;
+                if target.to_str().is_none() {
+                    return Err(SandboxProfileError::new(format!(
+                        "non-UTF-8 symlink target in {field} path: {}",
+                        path.display()
+                    )));
+                }
+                // Resolve relative targets against the link's resolved parent.
+                // Process components in order: lexical cleanup before following
+                // another symlink would give `..` the wrong parent.
+                if target.is_absolute() {
+                    canonical.clear();
+                } else {
+                    canonical.pop();
+                }
+                for part in target.components().rev() {
+                    pending.push_front(part.as_os_str().to_owned());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(canonicalization_error(path, field, &error)),
+        }
+    }
+    // Seatbelt matches the resolved target, not the symlink's spelling.
+    // Landlock grants also follow links, but cannot express negative socket
+    // rules; the launcher reports that existing limitation separately.
+    canonicalize_missing_path(canonical, field)
+}
+
 fn canonicalization_error(path: &Path, field: &str, error: &std::io::Error) -> SandboxProfileError {
+    #[cfg(unix)]
+    let symlink_loop = error.raw_os_error() == Some(libc::ELOOP);
+    #[cfg(windows)]
+    let symlink_loop = error.raw_os_error() == Some(1921); // ERROR_CANT_RESOLVE_FILENAME
+    #[cfg(not(any(unix, windows)))]
+    let symlink_loop = false;
+    if symlink_loop {
+        return SandboxProfileError::new(format!(
+            "symlink loop while canonicalizing {field} path {}: {error}",
+            path.display()
+        ));
+    }
     SandboxProfileError::new(format!(
         "failed to canonicalize {field} path {}: {error}",
         path.display()
@@ -588,6 +669,162 @@ mod tests {
         );
         std::fs::remove_file(&deny).unwrap();
         assert_eq!(build().read_deny, vec![deny]);
+    }
+
+    #[cfg(unix)]
+    fn dangling_deny_profile(root: &Path, deny: &Path) -> SandboxProfile {
+        SandboxProfile {
+            write_deny: vec![deny.to_path_buf()],
+            write_deny_nested: vec![deny.to_path_buf()],
+            read_deny: vec![deny.to_path_buf()],
+            socket_deny: vec![deny.to_path_buf()],
+            ..SandboxProfile::build(
+                vec![root.to_path_buf()],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                root.to_path_buf(),
+            )
+            .unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_dangling_denies_resolve(root: &Path, deny: &Path, target: &Path) {
+        let raw = dangling_deny_profile(root, deny);
+        let socket_only = SandboxProfile::build(
+            raw.writable_roots.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            raw.socket_deny.clone(),
+            Vec::new(),
+            root.to_path_buf(),
+        )
+        .expect("compile dangling socket deny");
+        assert_eq!(socket_only.socket_deny, &[target.to_path_buf()]);
+        let compiled = SandboxProfile::build(
+            raw.writable_roots.clone(),
+            raw.write_deny.clone(),
+            raw.write_deny_nested.clone(),
+            raw.read_allow.clone(),
+            raw.read_deny.clone(),
+            raw.socket_deny.clone(),
+            raw.cache_roots.clone(),
+            raw.temp_dir.clone(),
+        )
+        .expect("compile dangling deny");
+        let launched = raw.canonicalize_for_launch().expect("launch dangling deny");
+        assert_eq!(compiled, launched);
+        for paths in [
+            &compiled.write_deny,
+            &compiled.write_deny_nested,
+            &compiled.read_deny,
+            &compiled.socket_deny,
+        ] {
+            assert_eq!(paths, &[target.to_path_buf()]);
+        }
+        assert_eq!(
+            compiled.clone().canonicalize_for_launch().unwrap(),
+            compiled
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_denies_resolve_missing_target() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let target_dir = root.join("target-dir");
+        std::fs::create_dir(&target_dir).unwrap();
+        let alias = root.join("target-alias");
+        std::os::unix::fs::symlink(&target_dir, &alias).unwrap();
+        let deny = root.join("docker.sock");
+        std::os::unix::fs::symlink(alias.join("missing/docker.sock"), &deny).unwrap();
+        assert_dangling_denies_resolve(&root, &deny, &target_dir.join("missing/docker.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_denies_resolve_relative_two_hop_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("links")).unwrap();
+        let deny = root.join("links/docker.sock");
+        std::os::unix::fs::symlink("../relay", &deny).unwrap();
+        std::os::unix::fs::symlink("missing/docker.sock", root.join("relay")).unwrap();
+        assert_dangling_denies_resolve(&root, &deny, &root.join("missing/docker.sock"));
+        assert_dangling_denies_resolve(
+            &root,
+            &deny.join("nested"),
+            &root.join("missing/docker.sock/nested"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_denies_reject_loop_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let deny = root.path().join("docker.sock");
+        std::os::unix::fs::symlink("relay", &deny).unwrap();
+        std::os::unix::fs::symlink("docker.sock", root.path().join("relay")).unwrap();
+        let error = dangling_deny_profile(root.path(), &deny)
+            .canonicalize_for_launch()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink loop"), "{error}");
+        assert!(error.contains("write_deny"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_denies_reject_chain_limit_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..9 {
+            std::os::unix::fs::symlink(
+                format!("link-{}", index + 1),
+                root.path().join(format!("link-{index}")),
+            )
+            .unwrap();
+        }
+        let error = dangling_deny_profile(root.path(), &root.path().join("link-0"))
+            .canonicalize_for_launch()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink limit (8)"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_denies_accept_eight_hops() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        for index in 0..8 {
+            std::os::unix::fs::symlink(
+                format!("link-{}", index + 1),
+                root.join(format!("link-{index}")),
+            )
+            .unwrap();
+        }
+        assert_dangling_denies_resolve(&root, &root.join("link-0"), &root.join("link-8"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_denies_reject_non_utf8_target_by_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        let deny = root.path().join("docker.sock");
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(b"missing-\xff"), &deny).unwrap();
+        let error = dangling_deny_profile(root.path(), &deny)
+            .canonicalize_for_launch()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-UTF-8 symlink target"), "{error}");
     }
 
     #[test]

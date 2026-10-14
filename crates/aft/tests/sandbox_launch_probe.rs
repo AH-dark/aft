@@ -273,6 +273,100 @@ fn connect_unix_socket(fixture: &mut ProbeFixture, path: &Path) -> Output {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn dangling_socket_deny_launches_with_linux_limitation_warning() {
+    skip_if_landlock_absent!();
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("not-running.sock");
+    let alias = root.path().join("docker.sock");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let profile = SandboxProfile::build(
+        vec![root.path().to_path_buf()],
+        Vec::new(),
+        Vec::new(),
+        linux_system_read_allow(),
+        Vec::new(),
+        vec![alias],
+        Vec::new(),
+        root.path().to_path_buf(),
+    )
+    .expect("compile dangling socket deny on Linux");
+    let inherited = InheritedProfile::new(&profile);
+    let output = launcher_command(inherited.fd(), &["/bin/bash", "-c", "echo SHELL_RAN"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "SHELL_RAN");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sandbox-launch: unenforced=[socket_deny]"),
+        "{stderr}"
+    );
+    assert!(!target.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn dangling_socket_deny_blocks_target_created_after_sandbox_start() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let target = root.join("late.sock");
+    let alias = root.join("docker.sock");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let profile = SandboxProfile::build(
+        vec![root.clone()],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![alias.clone()],
+        Vec::new(),
+        root.clone(),
+    )
+    .expect("compile dangling socket deny");
+    assert_eq!(profile.socket_deny, vec![target.clone()]);
+    let inherited = InheritedProfile::new(&profile);
+    let release = root.join("release");
+    let python = "import socket,sys,errno\nfor path in sys.argv[1:]:\n try:\n  socket.socket(socket.AF_UNIX).connect(path)\n except OSError as e:\n  assert e.errno in (errno.EPERM, errno.EACCES), e\n else:\n  raise AssertionError('socket connection escaped deny: ' + path)\nprint('BOTH_DENIED')";
+    let script = format!(
+        "printf 'ready\\n'; while [ ! -e {} ]; do sleep 0.01; done; python3 -B -c {} {} {}",
+        shell_path(&release),
+        shell_path(Path::new(python)),
+        shell_path(&alias),
+        shell_path(&target),
+    );
+    let mut child = launcher_command(inherited.fd(), &["/bin/bash", "-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    if ready.is_empty() {
+        let output = child.wait_with_output().unwrap();
+        panic!("sandboxed shell exited before readiness: {output:?}");
+    }
+    assert_eq!(ready, "ready\n", "sandboxed shell did not become ready");
+    let listener = UnixListener::bind(&target).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    for path in [&alias, &target] {
+        let _connection = std::os::unix::net::UnixStream::connect(path).unwrap();
+        listener.accept().expect("unsandboxed positive control");
+    }
+    fs::write(&release, b"go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let mut result = String::new();
+    stdout.read_to_string(&mut result).unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(result.trim(), "BOTH_DENIED");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn native_background_exit_marker_survives_landlock_launcher() {
     skip_if_landlock_absent!();
     let fixture = tempfile::tempdir().expect("create marker fixture");

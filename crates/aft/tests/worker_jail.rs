@@ -402,7 +402,13 @@ impl Jail {
         .unwrap();
         let ack = next_frame(&mut self.stream).await;
         assert_eq!(ack.header.corr, corr);
-        let response: ModuleControlResponse = serde_json::from_slice(&ack.body).unwrap();
+        let response: ModuleControlResponse =
+            serde_json::from_slice(&ack.body).unwrap_or_else(|error| {
+                panic!(
+                    "invalid bind response: {error}: {}",
+                    String::from_utf8_lossy(&ack.body)
+                )
+            });
         assert_eq!(response, ModuleControlResponse::RouteBindAck {});
     }
 
@@ -720,6 +726,19 @@ async fn worker_jail_denies_shared_sccache_uds() {
     let reply = jail.bash(&script).await;
     assert!(reply.contains("DENIED_BY_SANDBOX"), "{reply}");
     assert!(!reply.contains("CONNECTED"), "{reply}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_jail_spawns_with_dangling_socket_deny() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("docker.sock");
+    let target = root.path().join("not-running.sock");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let mut jail = Jail::start_with_sccache(None, Some(&path)).await;
+    let reply = jail.bash("printf 'DANGLING_SOCKET_SHELL_RAN\\n'").await;
+    assert!(reply.contains("DANGLING_SOCKET_SHELL_RAN"), "{reply}");
+    assert!(!target.exists());
 }
 
 fn native_available() -> bool {
