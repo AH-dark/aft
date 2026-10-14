@@ -8591,6 +8591,50 @@
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 2909,
+      "column": 59,
+      "token": "filePath",
+      "text": "let mut args = serde_json::json!({ \"op\": op, \"filePath\": \"src/main.ts\" });",
+      "location": "line 2909, column 59",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 650,
+      "column": 14,
+      "token": "filePath",
+      "text": "\"filePath\": \"src/import-target.ts\",",
+      "location": "line 650, column 14",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 689,
+      "column": 36,
+      "token": "filePath",
+      "text": "json!({ \"op\": \"organize\", \"filePath\": \"src/import-target.ts\" }),",
+      "location": "line 689, column 36",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 668,
+      "column": 14,
+      "token": "filePath",
+      "text": "\"filePath\": \"src/import-target.ts\",",
+      "location": "line 668, column 14",
+      "ordinal": 2,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     }
   ]
 }
