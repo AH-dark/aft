@@ -60,10 +60,18 @@ class MergeQueueWorkflowTests(unittest.TestCase):
                 condition = nested.get("if", "")
                 self.assertNotIn("github.event_name", condition)
                 self.assertNotIn("github.ref", condition)
+        profile = jobs["e2e"]["with"]["cargo_profile"]
         self.assertEqual(
-            jobs["e2e"]["with"]["cargo_profile"],
-            "${{ github.ref == 'refs/heads/main' && 'release' || 'stage' }}",
+            profile,
+            "${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/ci-speed/release-')) && 'release' || 'stage' }}",
         )
+        # main and ci-speed/release-* measure the shipped release build. GitHub's
+        # gh-readonly-queue/* branches retain the faster stage build while
+        # running both required Unit and E2E suites.
+        queue_ref = "refs/heads/gh-readonly-queue/main/pr-314-0123456789abcdef"
+        release_prefix = profile.partition("startsWith(github.ref, '")[2].partition("'")[0]
+        self.assertFalse(queue_ref.startswith(release_prefix))
+        self.assertEqual("release" if queue_ref == "refs/heads/main" or queue_ref.startswith(release_prefix) else "stage", "stage")
 
     def test_landing_policy_reports_original_commits_on_pr_group_and_main(self) -> None:
         job = self.workflow["jobs"]["landing-policy"]
