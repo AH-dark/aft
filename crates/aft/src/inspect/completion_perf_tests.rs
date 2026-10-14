@@ -147,55 +147,68 @@ fn tier2_changed_rollup_loads_contributions_once() {
 
 #[test]
 fn duplicate_cache_upgrade_rebuilds_legacy_fragment_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = std::fs::canonicalize(dir.path()).unwrap();
-    write_projection_cache_file(
-        &root.join("src/a.rs"),
-        "fn example() { let number = 1; println!(\"{number}\"); }\n",
-    );
-    let job = duplicate_perf_job(&root);
-    let cache = InspectCache::open(job.inspect_dir.clone(), root).unwrap();
-    let mut legacy = super::super::scanners::duplicates::run_duplicates_scan(&job)
-        .outcome
-        .unwrap();
-    let expected = legacy.aggregate.clone();
-    for contribution in &mut legacy.contributions {
-        let fragments = contribution.contribution["fragments"].as_array().unwrap().iter().map(|fragment| {
+    for legacy_version in [34, 35, 36] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        write_projection_cache_file(
+            &root.join("src/a.rs"),
+            "fn example() { let number = 1; println!(\"{number}\"); }\n",
+        );
+        let job = duplicate_perf_job(&root);
+        let cache = InspectCache::open(job.inspect_dir.clone(), root).unwrap();
+        let mut legacy = super::super::scanners::duplicates::run_duplicates_scan(&job)
+            .outcome
+            .unwrap();
+        let expected = legacy.aggregate.clone();
+        for contribution in &mut legacy.contributions {
+            let fragments = contribution.contribution["fragments"].as_array().unwrap().iter().map(|fragment| {
             json!({"hash":fragment[0],"start_line":fragment[1],"end_line":fragment[2],"cost":fragment[3]})
         }).collect();
-        contribution.contribution["fragments"] = Value::Array(fragments);
-        contribution
-            .contribution
-            .as_object_mut()
-            .unwrap()
-            .remove("line_count");
+            contribution.contribution["fragments"] = Value::Array(fragments);
+            contribution
+                .contribution
+                .as_object_mut()
+                .unwrap()
+                .remove("line_count");
+        }
+        cache
+            .store_tier2_result_for_config(
+                job.key.clone(),
+                &legacy.scanned_files,
+                &legacy.contributions,
+                legacy.aggregate,
+                &job.config,
+            )
+            .unwrap();
+        let legacy_hash = cache
+            .contribution_set_hash_for_version_for_test(job.category, &job.config, legacy_version)
+            .unwrap();
+        cache
+            .store_tier2_aggregate(job.key.clone(), &legacy_hash, expected.clone())
+            .unwrap();
+        assert!(
+            cache
+                .get_aggregated_for_config(&job.key, &job.config)
+                .unwrap()
+                .is_none(),
+            "version {legacy_version} aggregate must be rejected before rebuilding rows"
+        );
+        assert!(cache.contributions_need_fact_refresh(job.category).unwrap());
+        let result = InspectManager::new()
+            .tier2_run_with_reuse_job(&job, &cache, &Tier2ReuseOptions::default())
+            .unwrap();
+        assert_eq!(result.scanned_files, job.scope_files);
+        assert_eq!(result.aggregate, expected);
+        assert!(!cache.contributions_need_fact_refresh(job.category).unwrap());
+        assert!(
+            cache.load_tier2_contributions(job.category).unwrap()[0].contribution["fragments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(Value::is_array)
+        );
+        println!("legacy version {legacy_version}: aggregate rejected, source row rebuilt, exact payload preserved");
     }
-    cache
-        .store_tier2_result_for_config(
-            job.key.clone(),
-            &legacy.scanned_files,
-            &legacy.contributions,
-            legacy.aggregate,
-            &job.config,
-        )
-        .unwrap();
-    cache
-        .store_tier2_aggregate(job.key.clone(), "legacy-v34", expected.clone())
-        .unwrap();
-    assert!(cache.contributions_need_fact_refresh(job.category).unwrap());
-    let result = InspectManager::new()
-        .tier2_run_with_reuse_job(&job, &cache, &Tier2ReuseOptions::default())
-        .unwrap();
-    assert_eq!(result.scanned_files, job.scope_files);
-    assert_eq!(result.aggregate, expected);
-    assert!(!cache.contributions_need_fact_refresh(job.category).unwrap());
-    assert!(
-        cache.load_tier2_contributions(job.category).unwrap()[0].contribution["fragments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(Value::is_array)
-    );
 }
 
 #[test]

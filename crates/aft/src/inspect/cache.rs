@@ -1407,6 +1407,27 @@ impl InspectCache {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn contribution_set_hash_for_version_for_test(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+        version: u32,
+    ) -> Result<String, InspectCacheError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| InspectCacheError::LockPoisoned("connection"))?;
+        contribution_set_hash_with_version(
+            &conn,
+            category,
+            &self.project_key,
+            &self.project_root,
+            Some(config),
+            version,
+        )
+    }
+
     pub fn last_full_run(
         &self,
         category: InspectCategory,
@@ -3249,27 +3270,30 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_cache_version_rejects_v34_aggregate() {
+    fn duplicate_cache_version_rejects_pre_compact_aggregates() {
         let dir = tempfile::tempdir().unwrap();
         let cache = InspectCache::open(dir.path().join("inspect"), dir.path().into()).unwrap();
         let config = Config::default();
-        let legacy_hash = contribution_set_hash_with_version(
-            &cache.conn.lock().unwrap(),
-            InspectCategory::Duplicates,
-            &cache.project_key,
-            &cache.project_root,
-            Some(&config),
-            34,
-        )
-        .unwrap();
         let key = JobKey::for_project_category(InspectCategory::Duplicates);
-        cache
-            .store_tier2_aggregate(key.clone(), &legacy_hash, serde_json::json!({"count":99}))
-            .unwrap();
-        assert!(cache
-            .get_aggregated_for_config(&key, &config)
-            .unwrap()
-            .is_none());
+        for version in [34, 35, 36] {
+            let legacy_hash = cache
+                .contribution_set_hash_for_version_for_test(
+                    InspectCategory::Duplicates,
+                    &config,
+                    version,
+                )
+                .unwrap();
+            cache
+                .store_tier2_aggregate(key.clone(), &legacy_hash, serde_json::json!({"count":99}))
+                .unwrap();
+            assert!(
+                cache
+                    .get_aggregated_for_config(&key, &config)
+                    .unwrap()
+                    .is_none(),
+                "version {version} aggregate must be rejected"
+            );
+        }
     }
 
     #[test]
