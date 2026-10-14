@@ -148,6 +148,7 @@ struct Wire {
     waiters: Mutex<HashMap<(u16, u64), mpsc::UnboundedSender<Frame>>>,
     next_corr: AtomicU64,
     next_channel: AtomicU16,
+    last_exchange_outcome: Mutex<Option<String>>,
 }
 impl Wire {
     fn corr(&self) -> u64 {
@@ -541,6 +542,7 @@ impl Harness for Subject {
             waiters: Mutex::default(),
             next_corr: AtomicU64::new(100),
             next_channel: AtomicU16::new(1),
+            last_exchange_outcome: Mutex::default(),
         });
         let reader = spawn_reader(read, wire.clone(), unclaimed_tx, self.stand_in.clone());
         Ok(Process {
@@ -590,20 +592,8 @@ impl Harness for Subject {
                 serde_json::to_vec(&json!({"point":name,"signal_path":signal})).unwrap(),
             )
             .map_err(harness_error)?;
-            let reached = async {
-                tokio::time::timeout(Duration::from_secs(30), async {
-                    while !signal.exists() {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .map_err(harness_error)
-            };
-            tokio::pin!(trigger);
-            tokio::select! {
-                result = reached => result?,
-                _ = &mut trigger => return Err(HarnessError::new("trigger ended before durable kill point")),
-            }
+            *handle.wire.last_exchange_outcome.lock().unwrap() = None;
+            wait_for_kill_signal(&signal, trigger, &handle.wire.last_exchange_outcome).await?;
             let mut child = handle.child.lock().unwrap();
             child.kill().map_err(harness_error)?;
             child.wait().map_err(harness_error)?;
@@ -616,6 +606,160 @@ impl Harness for Subject {
     async fn restart(&self, root: &Path) -> Result<Process, HarnessError> {
         let _ = std::fs::remove_file(root.join("ledger-control.json"));
         self.spawn(root).await
+    }
+}
+
+#[cfg(feature = "test-timing-hooks")]
+async fn wait_for_kill_signal(
+    signal: &Path,
+    trigger: Trigger<'_>,
+    outcome: &Mutex<Option<String>>,
+) -> Result<(), HarnessError> {
+    let started = tokio::time::Instant::now();
+    let reached = async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !signal.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(harness_error)
+    };
+    tokio::select! {
+        result = reached => result,
+        _ = trigger => {
+            // The marker can arrive while the observer's poll is asleep. A
+            // completed trigger is an error only if the durable point is absent
+            // at this recheck; do not wait for a later marker after completion.
+            let marker_present = signal.exists();
+            if marker_present {
+                return Ok(());
+            }
+            let message = format!(
+                "trigger ended before durable kill point: marker_present={}, elapsed={:?}, {}",
+                marker_present,
+                started.elapsed(),
+                outcome.lock().unwrap().as_deref().unwrap_or("no route outcome recorded"),
+            );
+            // The inventory abbreviates case reasons, so also retain the full
+            // terminal frame or transport error in the failed test's output.
+            eprintln!("{message}");
+            Err(HarnessError::new(message))
+        }
+    }
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[tokio::test(start_paused = true)]
+async fn kill_signal_written_while_poll_sleeps_wins_over_completed_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let signal = dir.path().join("ledger-signal");
+    let trigger: Trigger<'_> = Box::pin(async {
+        // Paused time makes the trigger finish between the observer's first
+        // absent-marker check and its next 10 ms poll, without a wall-clock race.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        std::fs::write(&signal, "Authorized").unwrap();
+    });
+    wait_for_kill_signal(&signal, trigger, &Mutex::default())
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[tokio::test(start_paused = true)]
+async fn completed_trigger_without_kill_signal_still_fails_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let signal = dir.path().join("ledger-signal");
+    let started = tokio::time::Instant::now();
+    let error = wait_for_kill_signal(&signal, Box::pin(async {}), &Mutex::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    assert!(
+        error.contains("trigger ended before durable kill point"),
+        "{error}"
+    );
+    assert!(error.contains("marker_present=false"), "{error}");
+    assert!(error.contains("elapsed=0ns"), "{error}");
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[tokio::test]
+async fn premature_trigger_diagnostics_include_response_error_and_eof() {
+    for (terminal, expected) in [
+        (
+            Some((FrameType::Response, json!({"output":"early response"}))),
+            "early response",
+        ),
+        (
+            Some((
+                FrameType::Error,
+                json!({"code":"unknown_tool","message":"early refusal"}),
+            )),
+            "unknown_tool",
+        ),
+        (None, "module EOF"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let signal = dir.path().join("ledger-signal");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (read, write) = stream.into_split();
+        let (unclaimed_tx, unclaimed_rx) = mpsc::unbounded_channel();
+        let wire = Arc::new(Wire {
+            writer: AsyncMutex::new(write),
+            unclaimed: AsyncMutex::new(unclaimed_rx),
+            waiters: Mutex::default(),
+            next_corr: AtomicU64::new(100),
+            next_channel: AtomicU16::new(1),
+            last_exchange_outcome: Mutex::default(),
+        });
+        let reader = spawn_reader(read, wire.clone(), unclaimed_tx, Arc::default());
+        let route = Route {
+            wire: wire.clone(),
+            channel: 1,
+            scoped_preset: None,
+        };
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = async move {
+            let request = next_frame(&mut peer).await.unwrap();
+            if let Some((ty, body)) = terminal {
+                let reply = Frame::build(
+                    ty,
+                    flags(),
+                    1,
+                    1,
+                    request.header.corr,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut peer, &reply).await.unwrap();
+                // Keep the transport alive through the route's terminal-frame
+                // quiet window; only the EOF case closes without a reply.
+                let _ = done_rx.await;
+            }
+        };
+        let trigger: Trigger<'_> = Box::pin(async {
+            tokio::join!(
+                async {
+                    let _ = route.request(json!({"name":"read","arguments":{}})).await;
+                    let _ = done_tx.send(());
+                },
+                server
+            );
+        });
+        let error = wait_for_kill_signal(&signal, trigger, &wire.last_exchange_outcome)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("marker_present=false"), "{error}");
+        assert!(error.contains("elapsed="), "{error}");
+        reader.await.unwrap();
     }
 }
 
@@ -1434,6 +1578,7 @@ async fn s1_crash_at_prepared_restarts_not_started() {
 async fn s1_crash_at_authorized_restarts_not_started() {
     crash_before_dispatch("Authorized", "bash").await;
 }
+
 #[cfg(all(windows, feature = "test-timing-hooks"))]
 #[tokio::test]
 async fn s1_powershell_crash_at_prepared_restarts_not_started() {
@@ -2239,9 +2384,19 @@ fn decode_principal(principal: &str) -> Result<Principal, HarnessError> {
 }
 impl Route {
     async fn exchange(&self, body: Value, cancel: bool) -> Result<Exchange, RouteFailure> {
-        self.exchange_inner(body, cancel)
-            .await
-            .map_err(|error| RouteFailure::new(error.to_string()))
+        let result = self.exchange_inner(body, cancel).await;
+        *self.wire.last_exchange_outcome.lock().unwrap() = Some(match &result {
+            Ok(exchange) => format!(
+                "terminal_frames={:?}",
+                exchange
+                    .frames
+                    .iter()
+                    .filter(|frame| frame.is_terminal())
+                    .collect::<Vec<_>>()
+            ),
+            Err(error) => format!("route_error={error}"),
+        });
+        result.map_err(|error| RouteFailure::new(error.to_string()))
     }
     async fn exchange_inner(
         &self,
