@@ -15304,8 +15304,34 @@ mod tests {
         let starts = super::schedule_artifact_loads(&ctx, true, false);
         assert!(starts.0.is_some());
         assert!(starts.1.is_none());
+        let search_rx = ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("borrowed search receiver installed")
+            .clone();
+        let mut completion = crossbeam_channel::Select::new();
+        completion.recv(&search_rx);
         assert!(super::start_artifact_loads(starts));
-        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
+        // Channel readiness observes publication without consuming the index;
+        // the normal drain still installs it. The held permits prove bypass,
+        // not how fast Windows schedules the loader or reads its cache file.
+        completion.ready();
+        assert!(
+            !search_rx.is_empty(),
+            "borrowed loader must publish an index"
+        );
+        crate::runtime_drain::drain_build_completions(&ctx);
+        assert!(ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+        assert!(
+            limiter.try_acquire().is_none(),
+            "control permits remain held"
+        );
         assert!(ctx
             .search_index()
             .read()
