@@ -349,21 +349,13 @@ fn worker_main(shared: Arc<Shared>, loader: ScorerLoader) {
     }
 }
 
-impl RerankBackend for OnnxReranker {
-    fn fingerprint(&self) -> RerankFingerprint {
-        self.fingerprint.clone()
-    }
-
-    fn max_batch(&self) -> usize {
-        MAX_PAIRS_PER_CALL
-    }
-
-    fn score(
+impl OnnxReranker {
+    pub(super) fn enqueue(
         &self,
         query: &str,
         docs: &[RerankDoc<'_>],
         deadline: Instant,
-    ) -> Result<Vec<f32>, RerankError> {
+    ) -> Result<Receiver<Result<Vec<f32>, RerankError>>, RerankError> {
         if docs.len() > MAX_PAIRS_PER_CALL {
             return Err(RerankError::Refused(format!(
                 "{} pairs exceed the limit of {MAX_PAIRS_PER_CALL}",
@@ -390,13 +382,41 @@ impl RerankBackend for OnnxReranker {
             self.shared.busy.store(false, Ordering::Release);
             return Err(RerankError::Unavailable("worker stopped".to_string()));
         }
-        match response.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(response)
+    }
+
+    pub(super) fn wait_for_reply(
+        response: &Receiver<Result<Vec<f32>, RerankError>>,
+        deadline: Instant,
+        now: Instant,
+    ) -> Result<Vec<f32>, RerankError> {
+        match response.recv_timeout(deadline.saturating_duration_since(now)) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => Err(RerankError::Timeout),
             Err(RecvTimeoutError::Disconnected) => {
                 Err(RerankError::Failed("worker stopped".to_string()))
             }
         }
+    }
+}
+
+impl RerankBackend for OnnxReranker {
+    fn fingerprint(&self) -> RerankFingerprint {
+        self.fingerprint.clone()
+    }
+
+    fn max_batch(&self) -> usize {
+        MAX_PAIRS_PER_CALL
+    }
+
+    fn score(
+        &self,
+        query: &str,
+        docs: &[RerankDoc<'_>],
+        deadline: Instant,
+    ) -> Result<Vec<f32>, RerankError> {
+        let response = self.enqueue(query, docs, deadline)?;
+        Self::wait_for_reply(&response, deadline, Instant::now())
     }
 }
 

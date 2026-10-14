@@ -1417,43 +1417,79 @@ fn onnx_first_use_starts_loading_off_the_request_and_skips() {
 
 #[test]
 fn onnx_worker_drops_a_request_whose_deadline_passed_and_refuses_while_busy() {
-    let loads = Arc::new(AtomicUsize::new(0));
     let computed = Arc::new(AtomicUsize::new(0));
-    let backend = Arc::new(fake_onnx(
-        Duration::from_millis(300),
-        loads,
-        computed.clone(),
-    ));
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    struct GatedScorer {
+        computed: Arc<AtomicUsize>,
+        entered: crossbeam_channel::Sender<()>,
+        release: crossbeam_channel::Receiver<()>,
+    }
+    impl PairScorer for GatedScorer {
+        fn score_pairs(
+            &mut self,
+            query: &str,
+            docs: &[String],
+            _deadline: Instant,
+        ) -> Result<Vec<f32>, RerankError> {
+            self.computed.fetch_add(1, Ordering::SeqCst);
+            if query == "held" {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            Ok(docs.iter().map(|doc| doc.len() as f32).collect())
+        }
+    }
+    let scorer_count = computed.clone();
+    let loader: ScorerLoader = Arc::new(move || {
+        Ok(Box::new(GatedScorer {
+            computed: scorer_count.clone(),
+            entered: entered_tx.clone(),
+            release: release_rx.clone(),
+        }) as Box<dyn PairScorer>)
+    });
+    let backend = OnnxReranker::with_loader(
+        RerankFingerprint {
+            backend: "onnx",
+            model: "gated".into(),
+            revision: "0".into(),
+        },
+        loader,
+    );
     wait_until_ready(&backend);
     let baseline = computed.load(Ordering::SeqCst);
     let docs = [RerankDoc { text: "abc" }];
 
     // A slow job occupies the worker; a second request is refused as busy
     // instead of queuing behind it.
-    let slow = {
-        let backend = backend.clone();
-        std::thread::spawn(move || {
-            let docs = [RerankDoc { text: "abc" }];
-            backend.score("q", &docs, Instant::now() + Duration::from_millis(50))
-        })
-    };
-    std::thread::sleep(Duration::from_millis(20));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let slow = backend.enqueue("held", &docs, deadline).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
     assert_eq!(
         backend.score("q", &docs, Instant::now() + Duration::from_secs(5)),
         Err(RerankError::Unavailable("busy".to_string()))
     );
     // The caller of the slow job gave up at its deadline.
-    assert_eq!(slow.join().unwrap(), Err(RerankError::Timeout));
+    assert_eq!(
+        OnnxReranker::wait_for_reply(&slow, deadline, deadline),
+        Err(RerankError::Timeout)
+    );
+    release_tx.send(()).unwrap();
+    // The worker clears busy before sending the reply, even after the caller
+    // has timed out. Receiving it is an idle handshake, not a timing guess.
+    assert_eq!(
+        slow.recv_timeout(Duration::from_secs(30)).unwrap(),
+        Ok(vec![3.0])
+    );
 
     // A request whose deadline has already passed when the worker receives it
     // is dropped without inference.
-    std::thread::sleep(Duration::from_millis(400));
     let computed_before = computed.load(Ordering::SeqCst);
+    let expired = backend.enqueue("q", &docs, Instant::now()).unwrap();
     assert_eq!(
-        backend.score("q", &docs, Instant::now()),
+        expired.recv_timeout(Duration::from_secs(30)).unwrap(),
         Err(RerankError::Timeout)
     );
-    std::thread::sleep(Duration::from_millis(50));
     assert_eq!(computed.load(Ordering::SeqCst), computed_before);
     assert!(computed_before > baseline);
 }
