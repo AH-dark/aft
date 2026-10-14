@@ -149,6 +149,7 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
       - name: Merge queue workflow and search contracts
         run: |
           python3 --version
@@ -547,13 +548,15 @@ jobs:
           cache-bin: false
           cache-on-failure: true
 
+      # Split compilation as well as archive contents: a nextest filter alone
+      # still builds the large lib/bin harnesses owned by the other archive jobs.
       - name: Build nextest archive (macOS integration suite)
-        run: cargo nextest archive --workspace -E 'kind(test) - binary(=watcher_integration)' --archive-file "$MACOS_NEXTEST_ARCHIVE"
+        run: python3 scripts/ci-macos-integration-archive.py archive --archive-file "$MACOS_NEXTEST_ARCHIVE"
         env:
           MACOS_NEXTEST_ARCHIVE: ${{ runner.temp }}/macos-nextest.tar.zst
 
       - name: Capture integration source inventory
-        run: cargo nextest list --workspace --profile gate -E 'kind(test) - binary(=watcher_integration)' -T json --cargo-quiet > "$RUNNER_TEMP/macos-integration-inventory.json"
+        run: python3 scripts/ci-macos-integration-archive.py list --output "$RUNNER_TEMP/macos-integration-inventory.json"
 
       - name: Capture doctest inventory
         run: cargo test --workspace --doc -- --list > "$RUNNER_TEMP/macos-doctest-inventory.txt" 2>&1
@@ -992,12 +995,8 @@ jobs:
 
   unit-macos-conformance:
     name: Cargo conformance + Bun tests (macOS)
-    # Let the large archive compiles finish before running Bun's short
-    # event-loop deadline tests alongside the Cargo workload.
-    needs:
-      - unit-macos-nextest-archive
-      - unit-macos-libtest-archive
-      - unit-macos-bin-archive
+    # This runner builds its own binary and consumes no archive artifacts.
+    # The summary still requires both conformance and every archive/shard lane.
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -1006,6 +1005,11 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+
+      - name: Refuse dependency paths outside the repository
+        run: |
+          python3 scripts/check-path-deps.py
+          python3 scripts/check-path-deps.py --self-test
 
       - uses: dtolnay/rust-toolchain@stable
 
