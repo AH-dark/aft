@@ -65,7 +65,7 @@ class CISpeedWorkflowTests(unittest.TestCase):
         caches = [step for step in producer["steps"] if step.get("id") == "release-binary"]
         self.assertEqual(len(caches), 1)
         cache = caches[0]
-        self.assertEqual(cache["uses"], "actions/cache@v4")
+        self.assertEqual(cache["uses"], "actions/cache/restore@v4")
         self.assertEqual(cache["with"]["path"], "target/release/aft")
         self.assertIn("${{ github.sha }}", cache["with"]["key"])
         self.assertIn("${{ steps.rust.outputs.cachekey }}", cache["with"]["key"])

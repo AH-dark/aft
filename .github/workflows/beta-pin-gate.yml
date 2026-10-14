@@ -31,6 +31,7 @@ jobs:
         with:
           shared-key: beta-pin-gate
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: oven-sh/setup-bun@v2
         with:
