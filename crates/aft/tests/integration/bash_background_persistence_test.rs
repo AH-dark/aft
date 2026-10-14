@@ -3136,7 +3136,13 @@ fn background_bash_uses_bash_syntax_when_available() {
     }
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let registry = registry();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let sender: aft::context::ProgressSender = Arc::new(Box::new(move |frame| {
+        if let aft::protocol::PushFrame::BashCompleted(completed) = frame {
+            let _ = completed_tx.send(completed);
+        }
+    }));
+    let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
     let task_id = registry
         .spawn(
             aft::sandbox_spawn::SpawnPlan::Unsandboxed,
@@ -3152,6 +3158,13 @@ fn background_bash_uses_bash_syntax_when_available() {
             Some(project.path().to_path_buf()),
         )
         .unwrap();
+    // The wrapper publishes its exit marker before the process exits. Wait for
+    // the registry's terminal notification, not just the marker's publication,
+    // before asserting the snapshot has consumed the child exit and its output.
+    let completed = completed_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("registry must publish bash completion");
+    assert_eq!(completed.task_id, task_id);
     wait_for_path(&task_file(storage.path(), SESSION, &task_id, "exit"));
 
     let snapshot = registry
