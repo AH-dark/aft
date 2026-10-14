@@ -122,15 +122,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        id: rust
       - uses: mozilla-actions/sccache-action@v0.0.11
+      # Executables include the commit's build provenance. Never restore a
+      # fallback binary from another SHA or compiler, even with identical source.
+      - uses: actions/cache@v4
+        id: release-binary
+        with:
+          path: target/release/aft
+          key: search-quality-release-bin-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.cachekey }}-${{ github.sha }}
       - uses: Swatinem/rust-cache@v2
+        if: steps.release-binary.outputs.cache-hit != 'true'
         with:
           shared-key: search-quality-release
           cache-on-failure: true
       - name: Build shared release AFT
+        if: steps.release-binary.outputs.cache-hit != 'true'
         run: cargo build --release --locked -p agent-file-tools --bin aft
         env:
           RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-rustc-cache.py
+      - name: Verify release executable can self-report
+        run: target/release/aft --version
       - uses: actions/upload-artifact@v4
         with:
           name: search-quality-aft-${{ github.sha }}
