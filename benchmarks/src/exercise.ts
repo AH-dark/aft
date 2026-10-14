@@ -158,9 +158,6 @@ export async function runExercise(opts: {
       if (verbose) console.log(`    Failed to extract metrics: ${e}`);
     }
   }
-      if (verbose) console.log(`    Failed to extract metrics: ${e}`);
-    }
-  }
 
   // Clean up
   try {
