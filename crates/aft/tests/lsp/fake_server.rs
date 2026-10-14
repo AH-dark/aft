@@ -447,6 +447,27 @@ fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
 }
 
 pub(crate) fn main() -> io::Result<()> {
+    if std::env::var_os("AFT_FAKE_CARGO_CHECK").is_some() {
+        match std::env::args().nth(1).as_deref() {
+            Some("check") => {
+                if let Some(marker) = std::env::var_os("AFT_FAKE_CARGO_CHECK_MARKER") {
+                    std::fs::write(marker, "checked\n")?;
+                }
+                println!("{{\"reason\":\"build-finished\",\"success\":true}}");
+                return Ok(());
+            }
+            Some("metadata") => {
+                let target = std::env::current_dir()?.join("target");
+                println!("{}", serde_json::json!({"target_directory": target}));
+                return Ok(());
+            }
+            Some("-vV") => {
+                println!("aft fake rustc 1");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if let Some(program) = std::env::var_os("AFT_FAKE_LSP_PROXY") {
         // Version probes are plain text, not JSON-RPC frames. Forward them
         // directly so persistence tests fingerprint the real analyzer version.

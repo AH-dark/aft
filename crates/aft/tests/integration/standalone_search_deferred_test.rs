@@ -1051,7 +1051,7 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
 fn warming_rust_inspect_response(
     cargo_owned: bool,
     diagnostics_timeout_ms: u64,
-    rust_env: Value,
+    mut rust_env: Value,
 ) -> (Value, Duration) {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
@@ -1083,6 +1083,14 @@ fn warming_rust_inspect_response(
     fs::write(project.join("package.json"), "{}").unwrap();
     fs::write(project.join("outside.ts"), "export const value = 1;\n").unwrap();
     let binary = fake_lsp_server_path();
+    let check_marker = temp.path().join("cargo-checked");
+    if rust_env.get("AFT_FAKE_CARGO_CHECK").is_some() {
+        // This fixture checks completed-check/LSP overlap, not compiler speed.
+        // Real compiler diagnostics are covered by the cargo-check tests.
+        rust_env["CARGO"] = json!(binary);
+        rust_env["RUSTC"] = json!(binary);
+        rust_env["AFT_FAKE_CARGO_CHECK_MARKER"] = json!(check_marker);
+    }
     let mut aft =
         AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_SERVER_STATUS", std::ffi::OsStr::new("1"))]);
     let configured = aft.send(
@@ -1114,6 +1122,9 @@ fn warming_rust_inspect_response(
         started.elapsed()
     );
     let elapsed = started.elapsed();
+    if rust_env.get("AFT_FAKE_CARGO_CHECK").is_some() {
+        assert_eq!(fs::read_to_string(check_marker).unwrap(), "checked\n");
+    }
     assert!(aft.shutdown().success());
     (response, elapsed)
 }
@@ -1149,7 +1160,8 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
 #[test]
 fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming() {
     // A completed explicit Cargo check supplies diagnostics while the analyzer is still warming.
-    let (response, elapsed) = warming_rust_inspect_response(true, 10_000, json!({}));
+    let (response, elapsed) =
+        warming_rust_inspect_response(true, 10_000, json!({"AFT_FAKE_CARGO_CHECK": "1"}));
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], true, "{response:#}");
 

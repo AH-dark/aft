@@ -1271,9 +1271,14 @@ impl CompletedRustCheck {
         }
         self.pending = Some(before);
         self.finished = true;
-        self.complete_until(deadline, true);
-        self.validated(deadline)
-            .ok_or_else(|| "aft_inspect: cannot certify completed cargo check; retry".into())
+        // Completion already captures and certifies the post-check inputs. A
+        // second fingerprint worker can lose the remaining request budget to
+        // scheduling even though this check has just been certified.
+        let completed = self.complete_until(deadline, true);
+        if cancelled() || Instant::now() >= deadline {
+            return Err("aft_inspect: cannot certify completed cargo check; retry".into());
+        }
+        completed.ok_or_else(|| "aft_inspect: cannot certify completed cargo check; retry".into())
     }
 
     fn cargo(
@@ -1471,31 +1476,35 @@ impl CompletedRustCheck {
     }
 
     pub(crate) fn complete(&mut self) {
-        self.complete_until(Instant::now() + BUDGET, false);
+        let _ = self.complete_until(Instant::now() + BUDGET, false);
     }
 
-    fn complete_until(&mut self, deadline: Instant, captured_before_spawn: bool) {
+    fn complete_until(
+        &mut self,
+        deadline: Instant,
+        captured_before_spawn: bool,
+    ) -> Option<SavedCheck> {
         if !self.finished {
-            return;
+            return None;
         }
         self.finished = false;
         let started = self.started.take();
         let Some(pending) = self.pending.take() else {
-            return;
+            return None;
         };
         let Some(mut current) = self
             .runtime
             .capture(&self.root, Some(&pending), deadline, None)
         else {
-            return;
+            return None;
         };
         if current.digest != pending.digest {
-            return;
+            return None;
         }
         let Some((build_inputs, env_keys)) =
             self.runtime.build_inputs(&self.root, &current, deadline)
         else {
-            return;
+            return None;
         };
         if captured_before_spawn {
             // Newly discovered build-script inputs were not in the pre-spawn
@@ -1507,25 +1516,25 @@ impl CompletedRustCheck {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|time| time.as_nanos())
             else {
-                return;
+                return None;
             };
             for input in &build_inputs {
                 let Some(input) = canonical(input) else {
-                    return;
+                    return None;
                 };
                 if pending.files.contains_key(&input) {
                     continue;
                 }
                 let Some(metadata) = fs::metadata(input).ok().and_then(|meta| stamp(&meta)) else {
-                    return;
+                    return None;
                 };
                 if metadata.modified >= cutoff {
-                    return;
+                    return None;
                 }
                 if metadata.changed.is_none_or(|(s, ns)| {
                     s < 0 || (s as u128 * 1_000_000_000 + ns as u128) >= cutoff
                 }) {
-                    return;
+                    return None;
                 }
             }
         }
@@ -1545,11 +1554,11 @@ impl CompletedRustCheck {
                 self.began
             },
         ) else {
-            return;
+            return None;
         };
         #[cfg(not(unix))]
         if current.digest != pending.digest {
-            return;
+            return None;
         }
         let record = SavedCheck {
             schema: RECORD_SCHEMA,
@@ -1565,8 +1574,8 @@ impl CompletedRustCheck {
         };
         let path = self.path.clone();
         if !self.persistence_enabled {
-            self.saved = Some(Arc::new(record));
-            return;
+            self.saved = Some(Arc::new(record.clone()));
+            return Some(record);
         }
         let persisted = record.clone();
         if let Ok(worker) = std::thread::Builder::new()
@@ -1582,12 +1591,14 @@ impl CompletedRustCheck {
         {
             // The compiler check is already certified; a disk-cache failure does
             // not prevent using its authoritative in-memory snapshot.
-            self.saved = Some(Arc::new(record));
+            self.saved = Some(Arc::new(record.clone()));
             #[cfg(test)]
             worker.join().unwrap();
             #[cfg(not(test))]
             drop(worker);
+            return Some(record);
         }
+        None
     }
 
     pub(crate) fn validated(&self, deadline: Instant) -> Option<SavedCheck> {
@@ -2549,6 +2560,43 @@ mod tests {
         assert!(cache.validated(Instant::now() + BUDGET).is_some());
         cache.runtime.options = Some(serde_json::json!({"check":{"features":["changed-feature"]}}));
         assert!(cache.validated(Instant::now() + BUDGET).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_uses_new_certificate_while_an_older_validation_is_still_pending() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::test_env::process_env_lock();
+        let (temp, mut check) = live_fixture();
+        let cargo = temp.path().join("cargo");
+        fs::write(
+            &cargo,
+            "#!/bin/sh\nprintf 'checked\\n' > check-ran\nprintf '%s\\n' '{\"reason\":\"build-finished\",\"success\":true}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        check
+            .runtime
+            .env
+            .insert("CARGO".into(), cargo.to_string_lossy().into_owned());
+        check.runtime.launch_env = Some(check.runtime.effective_env().unwrap());
+        // A timed-out fingerprint worker remains owned until its reply arrives.
+        // Its pending verdict must not veto a newly certified explicit check.
+        let (_retained_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        *check.validation.lock() = Some(receiver);
+        let completed = check
+            .run_for_inspect(Instant::now() + Duration::from_secs(30), || false)
+            .expect("the new check supplies its own post-check certificate");
+        assert_eq!(
+            fs::read_to_string(check.root.join("check-ran")).unwrap(),
+            "checked\n"
+        );
+        assert!(completed.covers(&check.root.join("member/src/lib.rs")));
+        assert!(completed.diagnostics.is_empty());
+        assert!(
+            check.validation.lock().is_some(),
+            "the older worker is still owned"
+        );
     }
 
     #[cfg(unix)]
