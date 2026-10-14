@@ -7857,6 +7857,11 @@ fn delay_configure_storage_sweeps_for_debug() {
         if let Some(path) = std::env::var_os("AFT_TEST_CONFIGURE_STORAGE_SWEEP_START_FILE") {
             let _ = fs::write(path, "started\n");
         }
+        if let Some(path) = std::env::var_os("AFT_TEST_CONFIGURE_STORAGE_SWEEP_RELEASE_FILE") {
+            while !Path::new(&path).exists() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
         if let Some(delay_ms) = std::env::var("AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())

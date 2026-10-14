@@ -459,6 +459,21 @@ fn main() {
         }
     });
 
+    #[cfg(debug_assertions)]
+    if let Some(count) = std::env::var("AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+    {
+        // Queue the fixture's entire initial burst before configure can start
+        // maintenance, rather than guessing when the stdin reader is scheduled.
+        for _ in 0..count {
+            match line_rx.recv() {
+                Ok(line) => queued_lines.push_back(line),
+                Err(_) => break,
+            }
+        }
+    }
+
     loop {
         if shutdown_requested.load(Ordering::SeqCst) {
             break;

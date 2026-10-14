@@ -74,7 +74,9 @@ fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps
     let project = tempfile::tempdir().expect("create queued-ping project");
     let storage = tempfile::tempdir().expect("create shared storage fixture");
     let transient_root = tempfile::tempdir().expect("create transient cache root");
-    seed_stale_storage_entries(storage.path(), transient_root.path(), 200);
+    let stale_entries = seed_stale_storage_entries(storage.path(), transient_root.path(), 200);
+    let sweep_release = storage.path().join("sweep-release");
+    let sweep_started = storage.path().join("sweep-started");
 
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_STORAGE_DIR", storage.path().as_os_str()),
@@ -82,29 +84,44 @@ fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps
         ("TMP", transient_root.path().as_os_str()),
         ("TEMP", transient_root.path().as_os_str()),
         (
-            "AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS",
-            std::ffi::OsStr::new("3000"),
+            "AFT_TEST_CONFIGURE_STORAGE_SWEEP_RELEASE_FILE",
+            sweep_release.as_os_str(),
+        ),
+        (
+            "AFT_TEST_CONFIGURE_STORAGE_SWEEP_START_FILE",
+            sweep_started.as_os_str(),
+        ),
+        (
+            "AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT",
+            std::ffi::OsStr::new("2"),
         ),
     ]);
     aft.send_silent(&configure_without_indexes(project.path()));
     aft.send_silent(r#"{"id":"queued-ping","command":"ping"}"#);
 
-    let (configure, configure_received_at) =
-        read_response(&mut aft, "configure-maintenance", Duration::from_secs(5));
+    let (configure, _) = read_response(&mut aft, "configure-maintenance", Duration::from_secs(5));
     assert_eq!(
         configure["success"], true,
         "configure failed: {configure:?}"
     );
-    let (ping, ping_received_at) = read_response(&mut aft, "queued-ping", Duration::from_secs(2));
+    let (ping, _) = read_response(&mut aft, "queued-ping", Duration::from_secs(2));
     assert_eq!(ping["command"], "pong", "ping failed: {ping:?}");
-    let latency = ping_received_at.duration_since(configure_received_at);
-    // The sweep is held for 3 s, so answering within 1.5 s proves the ping did
-    // not queue behind it, with room for a loaded Windows runner (568 ms was
-    // seen against the old 500 ms bound with a 750 ms sweep).
-    assert!(
-        latency < Duration::from_millis(1_500),
-        "queued ping waited {latency:?} after configure acknowledgement"
-    );
+    let gate_deadline = Instant::now() + Duration::from_secs(5);
+    while !sweep_started.exists() {
+        assert!(
+            Instant::now() < gate_deadline,
+            "storage sweep did not reach its gate"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    aft.send_silent(r#"{"id":"gated-ping","command":"ping"}"#);
+    let (gated_ping, _) = read_response(&mut aft, "gated-ping", Duration::from_secs(2));
+    assert_eq!(gated_ping["command"], "pong", "ping failed: {gated_ping:?}");
+    // The sweep cannot finish until this release. A pong received before it
+    // proves non-blocking service regardless of how long CI deschedules us.
+    assert!(!sweep_release.exists());
+    assert!(stale_entries.iter().all(|entry| entry.exists()));
+    fs::write(&sweep_release, "release\n").unwrap();
 
     let (status, stderr) = aft.stderr_output();
     assert!(status.success());
