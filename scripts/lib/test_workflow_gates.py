@@ -58,34 +58,14 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class CISpeedWorkflowTests(unittest.TestCase):
-    def test_compile_producers_cache_workspace_libraries(self) -> None:
-        root = Path(__file__).resolve().parents[2] / ".github/workflows"
-        expected = {
-            "tests.yml": ("search-quality-binary",),
-            "_unit-suite.yml": (
-                "unit-linux-nextest-archive", "unit-linux", "unit-linux-storm",
-                "unit-macos-nextest-archive", "unit-macos-libtest-archive", "unit-macos-bin-archive",
-                "unit-windows-nextest-archive",
-            ),
-            "_e2e-suite.yml": ("e2e-linux-binary", "e2e-windows", "e2e-macos"),
-        }
-        for name, jobs in expected.items():
-            workflow = workflow_gates.parse_workflow(str(root / name))
-            for job in jobs:
-                with self.subTest(workflow=name, job=job):
-                    caches = [step for step in workflow["jobs"][job]["steps"]
-                              if step.get("uses") == "Swatinem/rust-cache@v2"]
-                    self.assertEqual(len(caches), 1)
-                    self.assertEqual(str(caches[0]["with"].get("cache-workspace-crates")).lower(), "true")
-
-    def test_archive_cache_keys_do_not_race_between_compile_inventories(self) -> None:
+    def test_test_builds_keep_symbolication_without_full_debug_types(self) -> None:
         workflow = workflow_gates.parse_workflow(str(
             Path(__file__).resolve().parents[2] / ".github/workflows/_unit-suite.yml",
         ))
-        jobs = ("unit-macos-nextest-archive", "unit-macos-libtest-archive", "unit-macos-bin-archive")
-        keys = [next(step["with"]["shared-key"] for step in workflow["jobs"][job]["steps"]
-                     if step.get("uses") == "Swatinem/rust-cache@v2") for job in jobs]
-        self.assertEqual(len(set(keys)), len(jobs))
+        self.assertEqual(workflow["env"].get("CARGO_PROFILE_TEST_DEBUG"), "line-tables-only")
+        self.assertEqual(workflow["env"].get("CARGO_PROFILE_DEV_DEBUG"), "line-tables-only")
+        self.assertNotIn("CARGO_PROFILE_RELEASE_DEBUG", workflow["env"])
+        self.assertNotIn("CARGO_PROFILE_STAGE_DEBUG", workflow["env"])
 
     def test_long_compiles_keep_sccache_server_alive(self) -> None:
         root = Path(__file__).resolve().parents[2]

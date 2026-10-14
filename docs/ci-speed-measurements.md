@@ -199,3 +199,41 @@ serialize large test-harness compiles rather than remove the critical path.
 Cold and warm attempts are collected separately after they complete. Do not
 claim the under-25-minute objective from an incomplete run or from a faster
 failed test gate that stopped before running its full inventory.
+
+### C: reduced CI test/debug information, without broad workspace caches
+
+C restores A's dependency-only cache configuration and sets
+`CARGO_PROFILE_DEV_DEBUG=line-tables-only` and
+`CARGO_PROFILE_TEST_DEBUG=line-tables-only` in the unit reusable workflow.
+The dev setting keeps the explicit debug builds and test builds compatible;
+otherwise the same library can be compiled with two debug-info settings.
+These overrides change debug information only: they do not remove debug
+assertions, optimization checks, test invocations, or the existing native
+backtrace/dSYM/`atos` probes. `stage` and `release` profiles are not overridden.
+
+The broad workspace-cache guard tests added solely for variant B are removed
+with that experiment's cache settings, not weakened into passing assertions.
+All pre-existing tests remain, and the replacement guard checks that both CI
+debug profiles retain line tables and that release/stage debug settings are
+not overridden. A Linux real backtrace probe with both settings ran and
+passed: `logging::tests::panic_hook_preserves_default_backtrace_behavior_and_persists`
+(1 test, cargo 1.99.0). Native macOS probes still require hosted-run evidence.
+
+### Cache pressure observed during A/B
+
+An Actions cache-usage snapshot reported **11,427,931,461 bytes / 753 entries**
+while the variants coexisted. A paginated inventory taken afterward showed
+about **7,489 MiB** associated with B's branch, including three separate
+**721 MiB** macOS archive caches. The inventory is not an atomic snapshot:
+concurrent saves and eviction can change entries while it is paged. It
+therefore cannot be added to the earlier usage snapshot as though collected
+at the same instant. Saved cache sizes, per-attempt cache-hit behavior and
+write-error counters matter more than assuming an attempt is warm.
+
+A cold macOS native log reported 617 compile requests, 87 hits, 409 misses
+and 75 cache-write errors. Unlike the baseline's final two-request daemon,
+its counters cover the build; these errors' cause is not established by the
+stats alone. The default cache budget is approximately 10 GB, so retaining
+large per-job copies across sibling measurement/train branches risks evicting
+useful default-branch and compiler entries. C deliberately does not keep B's
+broad workspace-cache settings.

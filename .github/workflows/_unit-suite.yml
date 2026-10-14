@@ -17,6 +17,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # Preserve the compiler cache daemon and its statistics between build steps.
   SCCACHE_IDLE_TIMEOUT: "0"
+  # Line tables retain named frames for the native backtrace/dSYM probes without
+  # the full variable/type debug information that dominates test-harness builds.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -50,8 +54,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: unit-linux-integration
-          cache-workspace-crates: true
+          shared-key: unit-linux
           cache-on-failure: true
 
       - name: Install cargo-nextest (direct, installer-action-independent)
@@ -108,8 +111,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: unit-linux-libtest
-          cache-workspace-crates: true
+          shared-key: unit-linux
           cache-on-failure: true
 
       - name: Install cargo-nextest (direct, installer-action-independent)
@@ -441,7 +443,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-workspace-crates: true
           cache-on-failure: true
 
       - name: Install cargo-nextest (direct, installer-action-independent)
@@ -538,9 +539,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # Different archive producers must not race to save a partial inventory.
-          shared-key: unit-macos-integration
-          cache-workspace-crates: true
+          shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
 
@@ -600,8 +599,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: unit-macos-libtest
-          cache-workspace-crates: true
+          shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
 
@@ -658,8 +656,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: unit-macos-bin
-          cache-workspace-crates: true
+          shared-key: unit-macos
           cache-bin: false
           cache-on-failure: true
 
@@ -1098,12 +1095,12 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      # Keep the complete archive's workspace cache separate from jobs that
-      # build only a subset of its test targets.
+      # Both the archive builder and the libtest job use the established
+      # unit-windows-cargo cache key. Keeping that key stable preserves the
+      # existing hot MSVC dependency cache while the jobs run independently.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: unit-windows-archive
-          cache-workspace-crates: true
+          shared-key: unit-windows-cargo
           cache-on-failure: true
 
       - name: Install cargo-nextest (direct, installer-action-independent)
