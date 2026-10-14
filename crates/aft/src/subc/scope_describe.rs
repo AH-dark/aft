@@ -150,6 +150,13 @@ where
                     // need a scope-end determination even without a process.
                     let scopes = scope_source().await;
                     let key = stamp_key(&stamp);
+                    // Let the test daemon observe the exact Goodbye snapshot,
+                    // including a close that found no registered shell task.
+                    #[cfg(feature = "test-timing-hooks")]
+                    if let Some(path) = std::env::var_os("AFT_TEST_SCOPE_GOODBYE_SAMPLED_FILE") {
+                        let matches = scopes.iter().filter(|live| stamp_key(live) == key).count();
+                        let _ = std::fs::write(path, matches.to_string());
+                    }
                     if scopes.iter().any(|live| stamp_key(live) == key) && pending.insert(key.clone()) {
                         queued.insert(key, stamp);
                     }

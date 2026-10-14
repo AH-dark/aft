@@ -370,8 +370,19 @@ fn codemode_bash_clamps_requested_timeout_to_bind_deadline() {
 }
 
 async fn describe(stream: &mut tokio::net::TcpStream) -> Frame {
-    let request = read_frame_timeout(stream, "scope.describe").await;
-    assert_eq!(request.header.ty, FrameType::Request);
+    describe_phase(stream, "scope.describe").await
+}
+
+async fn describe_phase(stream: &mut tokio::net::TcpStream, phase: &str) -> Frame {
+    let request = read_frame_timeout(stream, phase).await;
+    assert_eq!(
+        request.header.ty,
+        FrameType::Request,
+        "{phase}: channel={} corr={} body={}",
+        request.header.channel,
+        request.header.corr,
+        String::from_utf8_lossy(&request.body)
+    );
     assert_eq!(request.header.channel, 0);
     let body: subc_protocol::session::ModuleControlRequestFromModule =
         serde_json::from_slice(&request.body).unwrap();
@@ -443,6 +454,57 @@ async fn child_pid(path: &Path) -> u32 {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[cfg(all(unix, feature = "test-timing-hooks"))]
+async fn wait_test_marker(path: &Path) {
+    let until = Instant::now() + Duration::from_secs(5);
+    while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+        assert!(
+            Instant::now() < until,
+            "missing test marker {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn await_registered_run_task() {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let registered = OBSERVED_TASK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .is_some();
+        if registered {
+            assert_run_not_killing();
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "bash dispatch never acknowledged task registration"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn no_extra_frames_until_pong(stream: &mut tokio::net::TcpStream, corr: u64, phase: &str) {
+    send_frame(
+        stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new()).unwrap(),
+    )
+    .await;
+    let frame = read_frame_timeout(stream, phase).await;
+    assert_eq!(
+        frame.header.ty,
+        FrameType::Pong,
+        "{phase}: unexpected frame {:?}",
+        frame
+    );
+    assert_eq!(frame.header.corr, corr, "{phase}");
 }
 
 #[cfg(unix)]
@@ -519,12 +581,40 @@ fn close_case(name: &'static str, case: CloseCase) {
             #[cfg(feature = "test-timing-hooks")]
             let _poll = set_test_env("AFT_TEST_SCOPE_POLL_MS", "500");
             #[cfg(feature = "test-timing-hooks")]
-            let _timeout = set_test_env("AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS", "1000");
+            let _timeout = set_test_env(
+                "AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS",
+                if matches!(case, CloseCase::Duplicate) {
+                    "10000"
+                } else {
+                    "1000"
+                },
+            );
             let mut daemon = open_scope_daemon_session(input).await;
             let run = !matches!(case, CloseCase::NonRun);
             bind(&mut daemon.stream, &daemon.root1, 1, run).await;
             if matches!(case, CloseCase::Duplicate) {
                 bind(&mut daemon.stream, &daemon.root1, 2, true).await;
+            }
+            #[cfg(feature = "test-timing-hooks")]
+            let registration = if matches!(case, CloseCase::Duplicate) {
+                let gate = daemon.root1.join("registration.gate");
+                let sampled = daemon.root1.join("goodbye-sampled");
+                std::fs::write(&gate, "hold").unwrap();
+                let gate_env =
+                    set_test_env("AFT_TEST_BASH_REGISTRATION_GATE", gate.to_str().unwrap());
+                let sampled_env = set_test_env(
+                    "AFT_TEST_SCOPE_GOODBYE_SAMPLED_FILE",
+                    sampled.to_str().unwrap(),
+                );
+                Some((gate, sampled, gate_env, sampled_env))
+            } else {
+                None
+            };
+            if matches!(case, CloseCase::Duplicate) {
+                *OBSERVED_TASK
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .unwrap() = None;
             }
             let pid_path = daemon.root1.join("grandchild.pid");
             let command = format!(
@@ -539,7 +629,7 @@ fn close_case(name: &'static str, case: CloseCase) {
             )
             .await;
             if run {
-                let request = describe(&mut daemon.stream).await;
+                let request = describe_phase(&mut daemon.stream, "pre-bash Live check").await;
                 // The daemon confirms the same live epoch before bash starts;
                 // the bind's deadline remains the upper bound on its timeout.
                 answer(
@@ -552,11 +642,23 @@ fn close_case(name: &'static str, case: CloseCase) {
                 .await;
             }
             let pid = child_pid(&pid_path).await;
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some((gate, _, _, _)) = &registration {
+                wait_test_marker(&gate.with_extension("reached")).await;
+                std::fs::remove_file(gate).unwrap();
+            }
             let _cleanup = ChildCleanup(pid);
             assert!(
                 alive(pid),
                 "control: grandchild must be live before closing the scope"
             );
+            if matches!(case, CloseCase::Duplicate) {
+                // The shell can publish its PID before registry insertion.
+                // If route 2 closes before insertion, Goodbye finds no task to
+                // describe. Route 1 still binds the stamp, so periodic polling
+                // cannot recover that missing query. Wait for spawn dispatch.
+                await_registered_run_task().await;
+            }
             // Close the unused sibling first: it must already share the run's
             // lifetime state even though it has never made a tool call.
             let first_close = if matches!(case, CloseCase::Duplicate) {
@@ -565,22 +667,32 @@ fn close_case(name: &'static str, case: CloseCase) {
                 1
             };
             send_route_goodbye(&mut daemon.stream, first_close, 200).await;
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some((_, sampled, _, _)) = &registration {
+                wait_test_marker(sampled).await;
+                assert_eq!(std::fs::read_to_string(sampled).unwrap(), "1");
+            }
             {
                 // Scope end governs classic and codemode tasks alike.
-                let request = describe(&mut daemon.stream).await;
+                let request = describe_phase(&mut daemon.stream, "first-close describe").await;
                 assert!(alive(pid), "route close alone must not kill");
                 if matches!(case, CloseCase::Duplicate) {
+                    #[cfg(feature = "test-timing-hooks")]
+                    if let Some((_, sampled, _, _)) = &registration {
+                        std::fs::remove_file(sampled).unwrap();
+                    }
                     send_route_goodbye(&mut daemon.stream, 1, 201).await;
-                    assert!(
-                        read_frame_within(
-                            &mut daemon.stream,
-                            Duration::from_millis(300),
-                            "duplicate describe"
-                        )
-                        .await
-                        .is_none(),
-                        "duplicate closes must share one in-flight describe"
-                    );
+                    #[cfg(feature = "test-timing-hooks")]
+                    if let Some((_, sampled, _, _)) = &registration {
+                        wait_test_marker(sampled).await;
+                        assert_eq!(std::fs::read_to_string(sampled).unwrap(), "1");
+                    }
+                    no_extra_frames_until_pong(
+                        &mut daemon.stream,
+                        9003,
+                        "duplicate closes must share one in-flight describe",
+                    )
+                    .await;
                 }
                 match case {
                     CloseCase::NotSynced => {
@@ -734,6 +846,12 @@ fn close_case(name: &'static str, case: CloseCase) {
                     assert_scope_kill_settled().await;
                 }
                 if matches!(case, CloseCase::Duplicate) {
+                    no_extra_frames_until_pong(
+                        &mut daemon.stream,
+                        9004,
+                        "duplicate closes must not queue another describe after settlement",
+                    )
+                    .await;
                     assert!(
                         read_frame_within(
                             &mut daemon.stream,

@@ -3161,6 +3161,19 @@ impl BgTaskRegistry {
         }
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(&task);
+        // The command may already have run while its task is not yet visible
+        // in the registry. Tests hold that gap to check startup barriers.
+        #[cfg(feature = "test-timing-hooks")]
+        if let Some(gate) = std::env::var_os("AFT_TEST_BASH_REGISTRATION_GATE") {
+            let gate = PathBuf::from(gate);
+            if gate.exists() {
+                let _ = std::fs::write(gate.with_extension("reached"), b"spawned");
+                let until = Instant::now() + Duration::from_secs(10);
+                while gate.exists() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
         self.inner
             .tasks
             .lock()
