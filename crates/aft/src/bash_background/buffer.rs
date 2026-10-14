@@ -12,6 +12,40 @@ static TAIL_READS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> = 
 
 pub const DISK_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
 
+struct RecoveredReadDiagnostics {
+    task_id: String,
+    #[cfg(feature = "test-timing-hooks")]
+    fail_stdout: bool,
+    #[cfg(test)]
+    messages: Vec<String>,
+}
+
+thread_local! {
+    static RECOVERED_READ_DIAGNOSTICS: std::cell::RefCell<Option<RecoveredReadDiagnostics>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Log reads of stored stdout/stderr while rebuilding a shell reply after restart.
+/// Diagnostics leave the reply unchanged: read errors still follow the existing
+/// empty-output fallback.
+pub(crate) fn with_recovered_read_diagnostics<T>(task_id: &str, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<RecoveredReadDiagnostics>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECOVERED_READ_DIAGNOSTICS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let scope = RecoveredReadDiagnostics {
+        task_id: task_id.to_string(),
+        #[cfg(feature = "test-timing-hooks")]
+        fail_stdout: std::env::var_os("AFT_TEST_RECOVERED_STDOUT_READ_FAILURE_FILE")
+            .is_some_and(|path| Path::new(&path).exists()),
+        #[cfg(test)]
+        messages: Vec::new(),
+    };
+    let _restore = Restore(RECOVERED_READ_DIAGNOSTICS.with(|slot| slot.replace(Some(scope))));
+    run()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum StreamKind {
     Stdout,
@@ -52,16 +86,74 @@ pub(crate) enum ArtifactSource {
 
 impl ArtifactSource {
     fn open(&self) -> io::Result<ValidatedArtifact> {
-        match self {
+        #[cfg(feature = "test-timing-hooks")]
+        if matches!(
+            self,
+            Self::Registered {
+                artifact: TaskArtifact::Stdout,
+                ..
+            }
+        ) && RECOVERED_READ_DIAGNOSTICS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|scope| scope.fail_stdout)
+        }) {
+            return self.record_result(
+                "open",
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected recovered stdout read failure",
+                )),
+                |_| None,
+            );
+        }
+        let result = match self {
             Self::Registered { paths, artifact } => open_task_artifact(paths, *artifact),
             #[cfg(test)]
             Self::Exact(path) => super::persistence::open_unregistered_artifact(path),
-        }
+        };
+        self.record_result("open", result, |_| None)
+    }
+
+    fn record_result<T>(
+        &self,
+        operation: &str,
+        result: io::Result<T>,
+        bytes: impl FnOnce(&T) -> Option<u64>,
+    ) -> io::Result<T> {
+        RECOVERED_READ_DIAGNOSTICS.with(|slot| {
+            if let Some(scope) = slot.borrow_mut().as_mut() {
+                let outcome = match &result {
+                    Ok(value) => format!("ok bytes={:?}", bytes(value)),
+                    Err(error) => format!("error kind={:?} detail={error}", error.kind()),
+                };
+                let message = format!("recovered artifact read task={} artifact={} operation={operation} result={outcome}", scope.task_id, self.path().display());
+                crate::slog_info!("{message}");
+                #[cfg(test)]
+                scope.messages.push(message);
+            }
+        });
+        result
+    }
+
+    fn len(&self, file: &ValidatedArtifact) -> io::Result<u64> {
+        self.record_result("stat", file.len(), |len| Some(*len))
+    }
+
+    fn read_range(
+        &self,
+        file: &mut ValidatedArtifact,
+        start: u64,
+        len: u64,
+    ) -> io::Result<Vec<u8>> {
+        self.record_result("read_range", file.read_range(start, len), |bytes| {
+            Some(bytes.len() as u64)
+        })
     }
 
     fn sampled(&self) -> io::Result<(ValidatedArtifact, u64)> {
         let file = self.open()?;
-        let len = file.len()?;
+        let len = self.len(&file)?;
         #[cfg(test)]
         GROW_AFTER_STAT.with(|hook| {
             if let Some(bytes) = hook.borrow_mut().take() {
@@ -86,7 +178,7 @@ impl ArtifactSource {
     }
 
     fn replace_with_tail(&self, retain_bytes: u64) -> io::Result<u64> {
-        match self {
+        let result = match self {
             Self::Registered { paths, artifact } => {
                 replace_artifact_with_tail(paths, *artifact, retain_bytes)
             }
@@ -94,7 +186,8 @@ impl ArtifactSource {
             Self::Exact(path) => {
                 super::persistence::replace_unregistered_with_tail(path, retain_bytes)
             }
-        }
+        };
+        self.record_result("cap_removed_prefix", result, |bytes| Some(*bytes))
     }
 }
 
@@ -203,7 +296,7 @@ impl BgBuffer {
 
     pub fn stream_len(&self, stream: StreamKind) -> u64 {
         self.source(stream)
-            .and_then(|source| source.open().and_then(|file| file.len()).ok())
+            .and_then(|source| source.open().and_then(|file| source.len(&file)).ok())
             .unwrap_or(0)
     }
 
@@ -327,9 +420,12 @@ pub fn combine_streams(stdout: &str, stderr: &str) -> String {
 fn read_source_tail(source: &ArtifactSource, max_bytes: usize) -> io::Result<(Vec<u8>, bool)> {
     let mut file = source.open()?;
     if max_bytes == 0 {
-        return Ok((Vec::new(), file.len()? > 0));
+        return Ok((Vec::new(), source.len(&file)? > 0));
     }
-    let (mut bytes, truncated) = file.tail(max_bytes)?;
+    let (mut bytes, truncated) =
+        source.record_result("read_tail", file.tail(max_bytes), |(bytes, _)| {
+            Some(bytes.len() as u64)
+        })?;
     if truncated {
         bytes = align_start_to_utf8(bytes);
     }
@@ -358,7 +454,7 @@ fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<
             max_bytes - max_bytes / 2,
         );
     }
-    let bytes = file.read_range(0, total_bytes)?;
+    let bytes = source.read_range(&mut file, 0, total_bytes)?;
     Ok(BoundedRead {
         text: String::from_utf8_lossy(&bytes).into_owned(),
         truncated: false,
@@ -379,7 +475,7 @@ fn read_single_file_head_tail(
 ) -> io::Result<BoundedRead> {
     let (mut file, total_bytes) = source.sampled()?;
     if total_bytes <= max_bytes as u64 {
-        let bytes = file.read_range(0, total_bytes)?;
+        let bytes = source.read_range(&mut file, 0, total_bytes)?;
         return Ok(BoundedRead {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             truncated: false,
@@ -417,13 +513,13 @@ fn read_two_file_head_tail(
     if total_bytes <= max_bytes as u64 {
         let first_bytes = first_file
             .as_mut()
-            .map(|file| file.read_range(0, first_len))
+            .map(|file| first.read_range(file, 0, first_len))
             .transpose()
             .map(Option::unwrap_or_default)
             .unwrap_or_default();
         let second_bytes = second_file
             .as_mut()
-            .map(|file| file.read_range(0, second_len))
+            .map(|file| second.read_range(file, 0, second_len))
             .transpose()
             .map(Option::unwrap_or_default)
             .unwrap_or_default();
@@ -479,13 +575,13 @@ fn read_two_file_tails(
     if total_bytes <= max_bytes as u64 {
         let first_bytes = first_file
             .as_mut()
-            .map(|file| file.read_range(0, first_len))
+            .map(|file| first.read_range(file, 0, first_len))
             .transpose()
             .map(Option::unwrap_or_default)
             .unwrap_or_default();
         let second_bytes = second_file
             .as_mut()
-            .map(|file| file.read_range(0, second_len))
+            .map(|file| second.read_range(file, 0, second_len))
             .transpose()
             .map(Option::unwrap_or_default)
             .unwrap_or_default();
@@ -542,7 +638,8 @@ fn read_source_range(source: &ArtifactSource, start: u64, len: u64) -> io::Resul
     if len == 0 {
         return Ok(Vec::new());
     }
-    let mut bytes = source.open()?.read_range(start, len)?;
+    let mut file = source.open()?;
+    let mut bytes = source.read_range(&mut file, start, len)?;
     if start > 0 {
         bytes = align_start_to_utf8(bytes);
     }
@@ -923,5 +1020,36 @@ late tail
         assert!(removed > 0);
         assert!(!retained.contains("early root cause"));
         assert!(retained.contains("late tail"));
+    }
+    #[test]
+    fn recovered_read_diagnostics_preserve_output_and_report_missing_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("stdout");
+        let stderr = dir.path().join("missing-stderr");
+        std::fs::write(&stdout, b"recovered-output").unwrap();
+        let buffer = BgBuffer::new(stdout.clone(), stderr.clone());
+        with_recovered_read_diagnostics("diagnostic-task", || {
+            let read = buffer.read_combined_head_tail(1024, 512, 512);
+            assert_eq!(read.text, "recovered-output");
+            let messages = RECOVERED_READ_DIAGNOSTICS
+                .with(|slot| slot.borrow().as_ref().unwrap().messages.clone());
+            assert!(
+                messages.iter().any(
+                    |message| message.contains("operation=read_range result=ok bytes=Some(16)")
+                ),
+                "successful stdout read was not logged: {messages:?}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains(&stderr.display().to_string())
+                        && message.contains("operation=open result=error kind=NotFound")),
+                "missing stderr read was not logged: {messages:?}"
+            );
+        });
+        assert!(
+            RECOVERED_READ_DIAGNOSTICS.with(|slot| slot.borrow().is_none()),
+            "recovered-read scope leaked to the next render"
+        );
     }
 }

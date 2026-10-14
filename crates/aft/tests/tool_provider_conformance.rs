@@ -216,9 +216,20 @@ struct Route {
 impl Drop for Process {
     fn drop(&mut self) {
         self.reader.abort();
-        let child = self.child.get_mut().unwrap();
+        let child = self
+            .child
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = child.kill();
         let _ = child.wait();
+        if std::thread::panicking() {
+            eprintln!(
+                "conformance daemon stderr for {}:\n{}",
+                self.root.display(),
+                std::fs::read_to_string(self.root.join("daemon.stderr"))
+                    .unwrap_or_else(|error| error.to_string())
+            );
+        }
     }
 }
 fn flags() -> Flags {
@@ -360,9 +371,19 @@ fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, Harn
             "AFT_TEST_LEDGER_ADMISSION_GATE",
             root.join("admission-gate"),
         )
+        .env(
+            "AFT_TEST_RECOVERED_STDOUT_READ_FAILURE_FILE",
+            root.join("recovered-stdout-read-failure"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join("daemon.stderr"))
+                .map_err(harness_error)?,
+        ));
     Ok(command)
 }
 

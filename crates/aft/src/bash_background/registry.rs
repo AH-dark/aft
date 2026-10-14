@@ -2140,7 +2140,17 @@ impl BgTaskRegistry {
         }
         // Output rendering may read artifacts and take registry locks. Keep it
         // outside the database mutex and never take a task-state lock here.
-        let render = self.render_terminal_output_from_paths(metadata, paths);
+        crate::slog_info!("recovered bash reply phase=render_started task={} status={:?} mode={:?} captured_bytes={:?} stdout={} stderr={}",
+            metadata.task_id, metadata.status, metadata.mode, row.output_bytes, paths.stdout.display(), paths.stderr.display());
+        let render = super::buffer::with_recovered_read_diagnostics(&metadata.task_id, || {
+            self.render_terminal_output_from_paths(metadata, paths)
+        });
+        crate::slog_info!(
+            "recovered bash reply phase=render_finished task={} preview_bytes={:?} truncated={:?}",
+            metadata.task_id,
+            render.as_ref().map(|render| render.output_preview.len()),
+            render.as_ref().map(|render| render.output_truncated)
+        );
         let mut snapshot = terminal_db_row_snapshot(row, metadata.clone());
         if let Some(render) = render {
             snapshot.output_preview = render.output_preview.clone();
@@ -2160,6 +2170,11 @@ impl BgTaskRegistry {
                 .as_deref()
                 .unwrap_or(&metadata.workdir),
         ) {
+            crate::slog_info!(
+                "recovered bash reply phase=settle task={} reply_bytes={} outcome={outcome}",
+                metadata.task_id,
+                frame.body.len()
+            );
             if let Ok(conn) = pool.lock() {
                 if let Err(error) = crate::db::call_ledger::observe_task(
                     &conn,
