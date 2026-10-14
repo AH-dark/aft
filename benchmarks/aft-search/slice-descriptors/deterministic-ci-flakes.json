@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The semantic_search/rerank fence is touched only to split unchanged ONNX admission and reply waiting into helpers and synchronize its lifecycle test. No scores, routing, ranking, model selection or search results change. All benchmark rows must remain byte-identical to the reference. The remaining changes fix inspect publication/certification, isolate an access fixture, and make watcher, configure and bash_kill tests deterministic."
+}
