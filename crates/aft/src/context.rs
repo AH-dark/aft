@@ -11506,6 +11506,11 @@ impl AppContext {
             .unwrap_or(pending)
     }
 
+    #[cfg(test)]
+    pub(crate) fn lsp_post_edit_worker_running_for_test(&self) -> bool {
+        self.lsp_post_edit_worker_running.load(Ordering::Acquire)
+    }
+
     fn lsp_collect_post_edit_diagnostics(
         manager: &Arc<parking_lot::Mutex<LspManager>>,
         slot: &crate::lsp::pending_changes::PendingLspChangeSlot,

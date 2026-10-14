@@ -1397,6 +1397,10 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/didChange" => {
+                    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_DID_CHANGE_LOG") {
+                        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+                        writeln!(log, "{}", serde_json::to_string(&params)?)?;
+                    }
                     let uri = document_uri(&params);
                     let version = document_version(&params);
                     if let Some(uri) = uri.as_str() {

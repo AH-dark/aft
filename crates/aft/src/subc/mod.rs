@@ -16981,6 +16981,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("main.ts");
         let release = dir.path().join("resume");
+        let changes_log = dir.path().join("did-change.jsonl");
         std::fs::write(dir.path().join("package.json"), "{}").unwrap();
         std::fs::write(&file, "// original\n").unwrap();
         let ctx = test_ctx();
@@ -16988,6 +16989,8 @@ mod tests {
             .override_binary(ServerKind::TypeScript, fake_lsp::fake_server_binary());
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_FREEZE_AFTER_OPEN", release.to_str().unwrap());
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_DID_CHANGE_LOG", changes_log.to_str().unwrap());
         ctx.lsp()
             .notify_file_changed(&file, "// original\n", &ctx.config())
             .unwrap();
@@ -17018,13 +17021,18 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let started = Instant::now();
+        // The caller's timeout is not a collector join. Quarantine can become
+        // visible before the collector releases admission for the next edit.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while ctx.lsp_post_edit_worker_running_for_test() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let collector_idle = !ctx.lsp_post_edit_worker_running_for_test();
         let skipped = ctx.lsp_notify_and_collect_diagnostics(
             &file,
             "// another edit\n",
             Duration::from_secs(2),
         );
-        let skipped_elapsed = started.elapsed();
         let count = ctx.lsp().server_count();
         std::fs::write(&release, "resume").unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -17053,20 +17061,41 @@ mod tests {
             marked,
             "diagnostics timeout did not mark the silent server unresponsive"
         );
+        assert!(
+            collector_idle,
+            "the timed-out diagnostics collector did not settle"
+        );
         assert_eq!(count, 1, "timeout removed the suspended server");
         assert!(
             resumed && recovered.complete(),
             "resumed server could not resync the current document: {recovered:?}"
         );
-        // Consulting the silent server again would wait out the whole 2 s
-        // budget, so the discriminating bound is half of it. The time spent
-        // is otherwise the notify path's own cost, which a loaded Windows
-        // runner measured at about 200 ms.
         assert!(
-            !skipped.complete()
-                && skipped.unresponsive_servers.contains(&key)
-                && skipped_elapsed < Duration::from_millis(1000),
-            "unresponsive diagnostics were consulted again: {skipped:?} {skipped_elapsed:?}"
+            !skipped.complete() && skipped.unresponsive_servers.contains(&key),
+            "unresponsive diagnostics were consulted again: {skipped:?}"
+        );
+        // This fake uses push diagnostics, so didChange asks it to recheck.
+        // The `recovered` result above requires diagnostics for the final edit
+        // sent after the release-file gate opened. The fake handles stdin in
+        // order and logs each change before publishing its versioned snapshot,
+        // so that final result fences all notifications queued while it was held.
+        let changes: Vec<String> = std::fs::read_to_string(&changes_log)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let params: serde_json::Value = serde_json::from_str(line).unwrap();
+                params
+                    .pointer("/contentChanges/0/text")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            ["// small edit\n", "// current after resume\n"],
+            "the quarantined edit must send zero diagnostics consultations"
         );
     }
 
