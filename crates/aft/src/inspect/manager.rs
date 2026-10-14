@@ -1066,23 +1066,33 @@ impl InspectManager {
         identity: Option<&Arc<()>>,
         outcome: JobOutcome,
     ) {
-        let Some(waiters) = self.take_waiters(key, identity) else {
+        let Some(waiters) = self.take_waiters_after(key, identity, || {
+            let succeeded = matches!(
+                builder_attempt_terminal(&outcome),
+                BuilderAttemptTerminal::Succeeded
+            );
+            self.record_builder_attempt_outcome(key, &outcome);
+            self.reuse_completions.fetch_add(1, Ordering::SeqCst);
+            if succeeded {
+                self.successful_reuse_completions
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+        }) else {
             return;
         };
-        let succeeded = matches!(
-            builder_attempt_terminal(&outcome),
-            BuilderAttemptTerminal::Succeeded
-        );
-        self.record_builder_attempt_outcome(key, &outcome);
-        self.reuse_completions.fetch_add(1, Ordering::SeqCst);
-        if succeeded {
-            self.successful_reuse_completions
-                .fetch_add(1, Ordering::SeqCst);
-        }
         Self::deliver_waiters(waiters, outcome);
     }
 
     fn take_waiters(&self, key: &JobKey, identity: Option<&Arc<()>>) -> Option<Vec<Waiter>> {
+        self.take_waiters_after(key, identity, || {})
+    }
+
+    fn take_waiters_after(
+        &self,
+        key: &JobKey,
+        identity: Option<&Arc<()>>,
+        publish: impl FnOnce(),
+    ) -> Option<Vec<Waiter>> {
         let mut in_flight = self
             .in_flight
             .lock()
@@ -1097,6 +1107,13 @@ impl InspectManager {
                 return None;
             }
         }
+        if !in_flight.contains_key(key) {
+            return None;
+        }
+        // Idle must imply that the terminal state (including the retry pause)
+        // is visible. Otherwise an automatic refresh can rerun a failed build
+        // between flight removal and publication of its failure.
+        publish();
         let waiters = in_flight
             .remove(key)
             .map(|registration| registration.waiters);
@@ -11499,6 +11516,31 @@ mod tier2_unreadable_source_tests {
         assert!(manager
             .tier2_retry_pause(InspectCategory::Complexity)
             .is_none());
+    }
+
+    #[test]
+    fn tier2_terminal_state_is_published_before_flight_is_removed() {
+        let manager = InspectManager::new();
+        let key = JobKey::for_project_category(InspectCategory::Complexity);
+        manager
+            .in_flight
+            .lock()
+            .unwrap()
+            .insert(key.clone(), InFlightRegistration::new(Vec::new()));
+        let mut published = false;
+        let waiters = manager.take_waiters_after(&key, None, || {
+            assert!(
+                matches!(
+                    manager.in_flight.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "flight removal must remain locked until publication completes"
+            );
+            published = true;
+        });
+        assert!(published);
+        assert!(waiters.is_some());
+        assert!(!manager.tier2_any_in_flight());
     }
 
     #[test]
