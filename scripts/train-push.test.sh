@@ -376,7 +376,7 @@ ALIGN
   git -C "$dir/work" remote set-head origin -a >/dev/null
 
   mkdir -p "$dir/ci-state"
-  echo "4242" > "$dir/ci-state/run_id"
+  echo "42424242424" > "$dir/ci-state/run_id"
   echo "success" > "$dir/ci-state/conclusion"
   echo "completed" > "$dir/ci-state/recorded_status"
   echo "1" > "$dir/ci-state/attempt"
@@ -517,7 +517,7 @@ test_same_sha_failed_rerun_message() {
   echo "failure|9199" > "$dir/ci-state/rerun_jobs"
   echo "success" > "$dir/ci-state/rerun_conclusion"
   run_train "$dir" same-sha-failed-rerun-message
-  expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+  expect_out "sha already ran in https://github.com/example/repo/actions/runs/42424242424 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
     "same-sha failed-run rerun result"
 }
 
@@ -1506,8 +1506,8 @@ add_train_commit "$dir/work" "probe"
 run_train "$dir" probe
 expect_rc 0 "the first train probes the trigger and lands"
 expect_out "first train in this repo" "first run announces the probe"
-expect_out "trigger proven by run 4242" "first run records the run that proved it"
-grep -q "run 4242" "$dir/work/.git/train-push-proven" ||
+expect_out "trigger proven by run 42424242424" "first run records the run that proved it"
+grep -q "run 42424242424" "$dir/work/.git/train-push-proven" ||
   fail "probe marker does not carry the run id"
 [ -z "$(origin_ref "$dir" refs/heads/train/trigger-probe)" ] ||
   fail "probe left its branch behind on origin"
@@ -1868,7 +1868,7 @@ echo "failure" > "$dir/ci-state/conclusion"
 run_train "$dir" red
 expect_rc 1 "red CI exits 1"
 expect_out "Unit (ubuntu-latest)" "red CI names the failing job"
-expect_out "actions/runs/4242" "red CI prints the run url"
+expect_out "actions/runs/42424242424" "red CI prints the run url"
 [ -n "$(origin_ref "$dir" refs/heads/train/red)" ] ||
   fail "red CI deleted the train branch instead of leaving it to fix"
 [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$(git -C "$dir/work" rev-parse HEAD~1)" ] ||
@@ -1980,7 +1980,7 @@ heartbeat="$dir/work/.git/train-push-watch-signal.watch"
   exec env PATH="$BIN_DIR:$PATH" REPO=example/repo \
     OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
     TRAIN_PUSH_TEST_STATE="$dir/ci-state" WATCH_CI_HEARTBEAT="$heartbeat" \
-    WATCH_CI_POLL_SLEEP=60 scripts/watch-ci.sh 4242 > "$dir/watch-signal.out" 2>&1
+    WATCH_CI_POLL_SLEEP=60 scripts/watch-ci.sh 42424242424 > "$dir/watch-signal.out" 2>&1
 ) &
 watcher_pid=$!
 sleep_child=""
@@ -2065,7 +2065,7 @@ run_train "$dir" removed-repo
 expect_rc 4 "a repository removed after green exits in the landing-failed state"
 expect_out "repository path" "a removed repository root is identified distinctly"
 expect_out "no longer exists" "a removed repository root says what disappeared"
-expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+expect_out "green run: https://github.com/example/repo/actions/runs/42424242424" \
   "removed-repository failure preserves the green run"
 expect_out "train sha: $train_sha" "removed-repository failure preserves the verified sha"
 expect_out "scripts/train-push.sh removed-repo --land" \
@@ -2174,11 +2174,11 @@ echo "failure|9101" > "$dir/ci-state/rerun_jobs"
 echo "failure" > "$dir/ci-state/rerun_conclusion"
 run_train "$dir" existing-red
 expect_rc 1 "an existing red train refuses to land"
-expect_out "sha already ran in https://github.com/example/repo/actions/runs/4242 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
+expect_out "sha already ran in https://github.com/example/repo/actions/runs/42424242424 (failure); rerunning its failed and cancelled jobs (attempt 2)" \
   "an existing failed sha announces the rerun and new attempt"
 expect_out "fix, commit, and re-run: scripts/train-push.sh existing-red" \
   "recorded red preserves the fix-and-repush instruction"
-[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 42424242424 --failed" ] ||
   fail "an existing failed run was not rerun through the operator gh bypass"
 grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
   fail "an existing failed run was not watched at attempt 2"
@@ -2199,9 +2199,9 @@ run_train "$dir" existing-failed-rerun-green
 expect_rc 0 "a failed existing run reruns and lands when the new attempt passes"
 expect_out "(failure); rerunning its failed and cancelled jobs (attempt 2)" \
   "failed recovery identifies the new attempt"
-expect_out "CI_DONE run=4242 conclusion=success attempt=2" \
+expect_out "CI_DONE run=42424242424 conclusion=success attempt=2" \
   "recovery reports the new attempt's success"
-[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --failed" ] ||
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 42424242424 --failed" ] ||
   fail "the failed existing run did not request a failed-jobs rerun"
 grep -q -- '--attempt 2' "$dir/ci-state/gh-calls" ||
   fail "the successful retry was not watched at attempt 2"
@@ -2222,8 +2222,8 @@ run_train "$dir" existing-cancelled-job
 expect_rc 0 "a cancelled job is rerun and its new attempt lands"
 expect_out "(cancelled); rerunning its failed and cancelled jobs (attempt 3)" \
   "cancelled recovery announces the new attempt"
-[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 4242 --job 9102
-bypass=operator run rerun 4242 --job 9104" ] ||
+[ "$(cat "$dir/ci-state/reruns")" = "bypass=operator run rerun 42424242424 --job 9102
+bypass=operator run rerun 42424242424 --job 9104" ] ||
   fail "cancelled jobs were not rerun by job id through the operator gh bypass"
 grep -q -- '--attempt 3' "$dir/ci-state/gh-calls" ||
   fail "the cancelled-job recovery did not watch attempt 3"
@@ -2465,7 +2465,7 @@ run_train "$dir" protected
 expect_rc 4 "a protection refusal after green exits in the landing-failed state"
 expect_out "refused: $protected_sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards." \
   "protection refusal prints the merge-as-a-train remedy"
-expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+expect_out "green run: https://github.com/example/repo/actions/runs/42424242424" \
   "post-CI failure names the green run"
 expect_out "train sha: $protected_sha" "post-CI failure names the verified train sha"
 expect_out "scripts/train-push.sh protected --land" \

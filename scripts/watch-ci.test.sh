@@ -88,26 +88,46 @@ response() {
   printf '%s\n' "$*" > "$STATE/responses/$index"
 }
 
-api_error() { printf 'ERROR\n' > "$STATE/responses/$1"; }
+api_error() {
+  printf 'ERROR\n%s\n' "${2:-same fake gh error}" > "$STATE/responses/$1"
+}
 
 run_watch() {
-  local poll_sleep="${1:-1}" max_sleep="${2:-8}" fail_jq="${3:-}" workflow="${4:-}"
+  local poll_sleep="${1:-1}" max_sleep="${2:-8}" fail_jq="${3:-}" workflow="${4:-}" argument="${5:-42424242424}"
   set +e
   if [ -n "$workflow" ]; then
     (cd "$REPO" && env -u WATCH_CI_WORKFLOW WATCH_CI_WORKFLOW="$workflow" PATH="$BIN:$PATH" WATCH_CI_TEST_STATE="$STATE" \
       WATCH_CI_TEST_REAL_JQ="$REAL_JQ" WATCH_CI_TEST_FAIL_JQ="$fail_jq" \
       OPERATOR_GH_FALLBACK_PATHS="$BIN/gh" WATCH_CI_POLL_SLEEP="$poll_sleep" \
-      WATCH_CI_POLL_MAX_SLEEP="$max_sleep" "$WATCH_CI" 4242) \
+      WATCH_CI_POLL_MAX_SLEEP="$max_sleep" "$WATCH_CI" "$argument") \
       > "$TMP_ROOT/output" 2>&1
   else
     (cd "$REPO" && env -u WATCH_CI_WORKFLOW PATH="$BIN:$PATH" WATCH_CI_TEST_STATE="$STATE" \
       WATCH_CI_TEST_REAL_JQ="$REAL_JQ" WATCH_CI_TEST_FAIL_JQ="$fail_jq" \
       OPERATOR_GH_FALLBACK_PATHS="$BIN/gh" WATCH_CI_POLL_SLEEP="$poll_sleep" \
-      WATCH_CI_POLL_MAX_SLEEP="$max_sleep" "$WATCH_CI" 4242) \
+      WATCH_CI_POLL_MAX_SLEEP="$max_sleep" "$WATCH_CI" "$argument") \
       > "$TMP_ROOT/output" 2>&1
   fi
   WATCH_RC=$?
   set -e
+}
+
+make_numeric_short_sha() {
+  local attempt timestamp sha short resolved
+  for ((attempt = 1; attempt <= 4096; attempt++)); do
+    timestamp=$((1700000000 + attempt))
+    GIT_AUTHOR_DATE="$timestamp +0000" GIT_COMMITTER_DATE="$timestamp +0000" \
+      git -C "$REPO" -c commit.gpgsign=false commit --allow-empty -qm "numeric SHA fixture $attempt" || return 1
+    sha="$(git -C "$REPO" rev-parse HEAD)" || return 1
+    short="${sha:0:7}"
+    if [[ "$short" =~ ^[0-9]{7}$ ]] &&
+      resolved="$(git -C "$REPO" rev-parse --verify --quiet "${short}^{commit}")" &&
+      [ "$resolved" = "$sha" ]; then
+      printf '%s\n' "$sha"
+      return 0
+    fi
+  done
+  return 1
 }
 
 run_watch_repeated_gh_error() {
@@ -132,7 +152,7 @@ env.update({
     "WATCH_CI_POLL_MAX_SLEEP": max_sleep,
 })
 process = subprocess.Popen(
-    [script, "4242"], cwd=repo, env=env,
+    [script, "42424242424"], cwd=repo, env=env,
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     start_new_session=True,
 )
@@ -151,7 +171,49 @@ PY
   set -e
 }
 
-completed_success='{"status":"completed","conclusion":"success","jobs":[{"name":"Unit","databaseId":101,"conclusion":"success"}],"url":"https://github.com/example/repo/actions/runs/4242"}'
+completed_success='{"status":"completed","conclusion":"success","jobs":[{"name":"Unit","databaseId":101,"conclusion":"success"}],"url":"https://github.com/example/repo/actions/runs/42424242424"}'
+
+# A missing run is a permanent lookup error, not a pollable run state.
+reset_case
+for attempt in 1 2 3 4; do
+  response "$attempt" 'run not found: 42424242424'
+done
+run_watch 1 8
+calls=0
+[ ! -f "$STATE/calls" ] || calls="$(wc -l < "$STATE/calls" | tr -d ' ')"
+sleeps=0
+[ ! -f "$STATE/sleeps" ] || sleeps="$(wc -l < "$STATE/sleeps" | tr -d ' ')"
+if [ "$WATCH_RC" -ne 0 ] && [ "$calls" -eq 1 ] && [ "$sleeps" -eq 0 ] &&
+  grep -qi 'run.*not found' "$TMP_ROOT/output"; then
+  ok 'a missing run exits immediately with a clear diagnostic'
+else
+  fail "a missing run exits immediately with a clear diagnostic (rc=$WATCH_RC calls=$calls sleeps=$sleeps)"
+fi
+
+# Git's abbreviated object name can look like a decimal run ID.
+reset_case
+if numeric_full_sha="$(make_numeric_short_sha)"; then
+  numeric_short_sha="${numeric_full_sha:0:7}"
+  response 1 '42424242424'
+  response 2 "$completed_success"
+  run_watch 1 8 '' '' "$numeric_short_sha"
+  calls=0
+  [ ! -f "$STATE/calls" ] || calls="$(wc -l < "$STATE/calls" | tr -d ' ')"
+  first_call="$(head -n 1 "$STATE/calls" 2>/dev/null || true)"
+  second_call="$(sed -n '2p' "$STATE/calls" 2>/dev/null || true)"
+  sleeps=0
+  [ ! -f "$STATE/sleeps" ] || sleeps="$(wc -l < "$STATE/sleeps" | tr -d ' ')"
+  if [[ "$numeric_short_sha" =~ ^[0-9]{7}$ ]] && [ "$WATCH_RC" -eq 0 ] &&
+    [ "$calls" -eq 2 ] && [ "$sleeps" -eq 0 ] && [[ "$first_call" == 'run list '* ]] &&
+    [[ "$first_call" == *"select(.headSha==\"$numeric_full_sha\")"* ]] &&
+    [[ "$second_call" == 'run view 42424242424 '* ]]; then
+    ok 'an all-digit short commit resolves as a SHA before run-ID matching'
+  else
+    fail "an all-digit short commit resolves as a SHA before run-ID matching (rc=$WATCH_RC calls=$calls sleeps=$sleeps first='$first_call')"
+  fi
+else
+  fail 'the test repository can create an all-digit short commit SHA'
+fi
 
 # The default workflow is tests.yml. It must not silently guess ci.yml when the
 # default is absent; an explicit override remains available for callers that use
@@ -172,7 +234,7 @@ printf 'name: CI\n' > "$REPO/.github/workflows/ci.yml"
 reset_case
 response 1 "$completed_success"
 run_watch 1 8 '' ci.yml
-if [ "$WATCH_RC" -eq 0 ] && grep -q 'CI_DONE run=4242 conclusion=success' "$TMP_ROOT/output"; then
+if [ "$WATCH_RC" -eq 0 ] && grep -q 'CI_DONE run=42424242424 conclusion=success' "$TMP_ROOT/output"; then
   ok 'explicit workflow override watches a non-default workflow'
 else
   fail 'explicit workflow override watches a non-default workflow'
@@ -191,7 +253,7 @@ if [ -f "$STATE/calls" ]; then
 fi
 if [ "$WATCH_RC" -eq 0 ] && [ "$calls" -eq 1 ] &&
   grep -q -- '--json status,conclusion,jobs,url' "$STATE/calls" &&
-  grep -q '^CI_RUN_URL https://github.com/example/repo/actions/runs/4242$' "$TMP_ROOT/output"; then
+  grep -q '^CI_RUN_URL https://github.com/example/repo/actions/runs/42424242424$' "$TMP_ROOT/output"; then
   ok 'one combined gh query supplies the first completed tick and run URL'
 else
   fail 'one combined gh query supplies the first completed tick and run URL'
@@ -203,7 +265,7 @@ reset_case
 api_error 1
 api_error 2
 api_error 3
-response 4 '{"status":"in_progress","conclusion":null,"jobs":[],"url":"https://github.com/example/repo/actions/runs/4242"}'
+response 4 '{"status":"in_progress","conclusion":null,"jobs":[],"url":"https://github.com/example/repo/actions/runs/42424242424"}'
 api_error 5
 response 6 "$completed_success"
 run_watch 1 4
@@ -275,7 +337,7 @@ fi
 reset_case
 response 1 '{"status":"completed","conclusion":"cancelled","jobs":[{"name":"Unit","databaseId":101,"conclusion":"success"}],"url":""}'
 run_watch
-if [ "$WATCH_RC" -eq 0 ] && grep -q 'CI_DONE run=4242 conclusion=cancelled jobs_all_passed=1' "$TMP_ROOT/output"; then
+if [ "$WATCH_RC" -eq 0 ] && grep -q 'CI_DONE run=42424242424 conclusion=cancelled jobs_all_passed=1' "$TMP_ROOT/output"; then
   ok 'non-success run retains watcher output while the landing guard stays authoritative'
 else
   fail 'non-success run retains watcher output while the landing guard stays authoritative'
@@ -286,7 +348,7 @@ fi
 reset_case
 response 1 '{"status":"completed","conclusion":"cancelled","jobs":[{"name":null,"databaseId":101,"conclusion":"failure"}],"url":""}'
 run_watch
-if [ "$WATCH_RC" -eq 1 ] && grep -q "CI_EARLY_FAIL job='<unnamed>' run=4242" "$TMP_ROOT/output"; then
+if [ "$WATCH_RC" -eq 1 ] && grep -q "CI_EARLY_FAIL job='<unnamed>' run=42424242424" "$TMP_ROOT/output"; then
   ok 'failed job with a null name remains fail-fast red'
 else
   fail 'failed job with a null name remains fail-fast red'

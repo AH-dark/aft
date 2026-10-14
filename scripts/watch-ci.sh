@@ -173,10 +173,22 @@ poll_error_wait() {
   POLL_DELAY="$(poll_delay_double "$POLL_DELAY")"
 }
 
+run_not_found() {
+  printf '%s\n' "$1" | grep -Eiq 'not found|could not find.*run'
+}
+
+report_run_not_found() {
+  printf 'watch-ci: run %s not found: %s\n' "$RID" "$1" >&2
+  exit 5
+}
+
 # A failed gh query is not evidence that the run is still progressing. Keep
 # polling transient outages with back-off, but stop before a broken CLI call
 # can keep a train waiting forever.
 poll_gh_error_wait() {
+  if run_not_found "$GH_LAST_ERROR"; then
+    report_run_not_found "$GH_LAST_ERROR"
+  fi
   GH_ERROR_ATTEMPTS=$((GH_ERROR_ATTEMPTS + 1))
   if [ "$GH_ERROR_ATTEMPTS" -ge "$GH_ERROR_MAX_ATTEMPTS" ]; then
     printf 'watch-ci: GitHub CLI query failed after %s attempts: %s\n' \
@@ -198,13 +210,9 @@ undetermined() {
 ARG="${1:-}"
 RID=""
 WATCH_SHA=""
-# The only positional is a numeric run id or a commit sha. A flag-shaped or
-# otherwise unrecognized argument would be passed to gh as a run id and cause
-# pointless API failures; reject it here so callers get a clear usage message.
-#
-# Run ids are decimal and around 11 digits; a sha is 7-40 hex characters. The
-# two only overlap for an all-decimal sha, so length decides that case: a
-# 32-or-longer all-decimal string is a sha, never a run id.
+# Run ids are decimal and at least 9 digits; current GitHub ids are 11 digits.
+# Resolve a possible commit ref first because an abbreviated sha can itself be
+# all decimal digits. Only an unresolved decimal value of run-id length is a run.
 #
 # Anything that is not a run id is resolved through git rather than pattern
 # matched: the run lookup below compares against the FULL head sha, so a short
@@ -212,10 +220,10 @@ WATCH_SHA=""
 # after the whole poll budget. Resolving also admits tags, branch names and
 # HEAD~n, and dereferences an annotated tag to the commit that carries runs.
 if [ -n "$ARG" ]; then
-  if [[ "$ARG" =~ ^[0-9]+$ ]] && [ "${#ARG}" -lt 32 ]; then
-    RID="$ARG"
-  elif WATCH_SHA=$(git rev-parse --verify --quiet "${ARG}^{commit}"); then
+  if WATCH_SHA=$(git rev-parse --verify --quiet "${ARG}^{commit}"); then
     :
+  elif [[ "$ARG" =~ ^[0-9]+$ ]] && [ "${#ARG}" -ge 9 ]; then
+    RID="$ARG"
   else
     echo "watch-ci: argument must be a numeric run id or a commit ref this checkout can resolve (got '$ARG'); pass nothing to watch HEAD's run" >&2
     exit 2
@@ -268,8 +276,14 @@ while true; do
   fi
   if ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
     <<< "$RUN_VIEW" 2>/dev/null); then
+    if run_not_found "$RUN_VIEW"; then
+      report_run_not_found "$RUN_VIEW"
+    fi
     poll_error_wait
     continue
+  fi
+  if run_not_found "$STATUS"; then
+    report_run_not_found "$STATUS"
   fi
   if ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
     if [ "$STATUS" = "completed" ]; then
