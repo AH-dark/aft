@@ -1,5 +1,10 @@
 # Own-repository liveness and TypeORM capture follow-up
 
+**Later review:** the newly scoreable U104 rows have since been individually
+reviewed against Fallow and source, with 104 judged/0 unjudged and unchanged
+scores. See [the unused-export review](own-unused-exports.md). The tables and
+unjudged counts below retain this capture's original review state.
+
 ## Comparison and provenance
 
 This follow-up compares the upgrade-and-report candidate captures from

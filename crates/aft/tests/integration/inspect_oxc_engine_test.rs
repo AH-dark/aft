@@ -1270,6 +1270,29 @@ fn own_repo_query_suffix_template_imports_are_test_only_references() {
 }
 
 #[test]
+fn consumed_local_alias_does_not_consume_an_unimported_primary_export_name() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/service.ts",
+            "export function check() { return 1; }\nexport { check as checkForTests };\n",
+        ),
+        (
+            "src/__tests__/service.test.ts",
+            "import { checkForTests } from '../service';\ncheckForTests();\n",
+        ),
+    ]);
+    let result = analyze_with_options(&root, &paths, AnalyzeOptions::default());
+    let primary = verdict(&result, "src/service.ts", "check");
+    assert!(primary.only_same_file_references, "the primary name has no importing consumer; same-file liveness alone does not consume its export: {primary:?}");
+    let alias = verdict(&result, "src/service.ts", "checkForTests");
+    assert_eq!(alias.verdict, LivenessVerdict::Used, "{alias:?}");
+    assert!(
+        !alias.only_same_file_references,
+        "the alias name, unlike the primary name, has a cross-module importing consumer: {alias:?}"
+    );
+}
+
+#[test]
 fn ts_liveness_dynamic_statement_default_only() {
     dynamic_usage_fixture(
         "import('./m');",
