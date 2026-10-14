@@ -21,6 +21,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SCCACHE_IDLE_TIMEOUT: "0"
 jobs:
   # The tagged commit has already passed the unit and E2E matrix in tests.yml:
   # every commit reaches main through scripts/train-push.sh, which fast-forwards
@@ -151,13 +152,16 @@ jobs:
   # The six platform builds have no `needs:` and start immediately, in
   # parallel with the gate. Every publishing job needs the gate and all six
   # builds, so a refused gate or a failed build blocks every side effect.
-  # The shipped bytes are built here and only smoke-tested (macOS ARM64 and
-  # Windows x64 run `--version`), while the same source in the release profile
-  # is e2e-tested by the tests.yml run on the push to main.
+  # macOS ARM64 and Windows x64 reuse the exact release-profile bytes tested by
+  # tests.yml when available. Otherwise they build from the same source; both
+  # paths still smoke-test with --version before the publishing gate admits them.
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64
     runs-on: macos-26
+    permissions:
+      contents: read
+      actions: read
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -181,13 +185,34 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: node scripts/version-sync.mjs --from-tag
 
+      - name: Find exact tested shipped macOS artifact
+        id: tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/select-native-release-artifact.py macos
+      - uses: actions/download-artifact@v4
+        if: steps.tested.outputs.found == 'true'
+        with:
+          name: macos-shipped-release-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-macos-release
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.tested.outputs.run_id }}
+      - name: Verify exact tested macOS build provenance
+        if: steps.tested.outputs.found == 'true'
+        run: python3 scripts/native-release-artifact.py unpack-binary --archive "$RUNNER_TEMP/tested-macos-release/macos-shipped-release.tar"
+
+      - name: Release library codegen (shipped profile fallback)
+        if: steps.tested.outputs.found != 'true'
+        run: cargo build --release --lib -p agent-file-tools --timings
       - name: Build
-        run: cargo build --release -p agent-file-tools
+        if: steps.tested.outputs.found != 'true'
+        run: cargo build --release --bin aft -p agent-file-tools --timings
 
       # Strip BEFORE signing, never after: v0.51.1 shipped a SIGKILL-on-load
       # arm64 binary (#238) because strip ran after signing, and strip's
       # automatic re-sign produced a corrupt signature.
       - name: Strip binary
+        if: steps.tested.outputs.found != 'true'
         run: strip target/release/aft
 
       # Ad-hoc sign, hard-verify, and execute once. --verify --strict fails on
@@ -195,7 +220,9 @@ jobs:
       # exact bytes being published start on macOS.
       - name: Sign, verify, and smoke-test binary
         run: |
-          codesign -f -s - target/release/aft
+          if [[ "${{ steps.tested.outputs.found }}" != "true" ]]; then
+            codesign -f -s - target/release/aft
+          fi
           codesign --verify --strict target/release/aft
           target/release/aft --version
 
@@ -205,8 +232,13 @@ jobs:
       # self-contained.
       - name: Package dSYM
         run: |
-          ditto target/release/aft.dSYM release-dsym/aft.dSYM
-          ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-arm64-dsym.zip
+          mkdir -p release-dsym
+          if [[ "${{ steps.tested.outputs.found }}" == "true" ]]; then
+            cp native-release-dsym.zip release-dsym/aft-darwin-arm64-dsym.zip
+          else
+            ditto target/release/aft.dSYM release-dsym/aft.dSYM
+            ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-arm64-dsym.zip
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -411,6 +443,9 @@ jobs:
   build-win32-x64:
     name: Build Windows x64
     runs-on: windows-2022
+    permissions:
+      contents: read
+      actions: read
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -434,8 +469,30 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
         shell: pwsh
 
+      - name: Find exact tested shipped Windows artifact
+        id: tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/select-native-release-artifact.py windows
+        shell: pwsh
+      - uses: actions/download-artifact@v4
+        if: steps.tested.outputs.found == 'true'
+        with:
+          name: windows-shipped-release-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-windows-release
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.tested.outputs.run_id }}
+      - name: Verify exact tested Windows build provenance
+        if: steps.tested.outputs.found == 'true'
+        run: python scripts/native-release-artifact.py unpack-binary --target x86_64-pc-windows-msvc --archive "$env:RUNNER_TEMP/tested-windows-release/windows-shipped-release.tar"
+        shell: pwsh
+      - name: Release library codegen (shipped profile fallback)
+        if: steps.tested.outputs.found != 'true'
+        run: cargo build --release --lib --target x86_64-pc-windows-msvc -p agent-file-tools --timings
+        shell: pwsh
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc -p agent-file-tools
+        if: steps.tested.outputs.found != 'true'
+        run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings
         shell: pwsh
 
       # Execute the exact bytes being published once on Windows.

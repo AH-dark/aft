@@ -129,7 +129,7 @@ jobs:
       actions: read
       checks: read
     with:
-      cargo_profile: ${{ github.ref == 'refs/heads/main' && 'release' || 'stage' }}
+      cargo_profile: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/ci-speed/release-')) && 'release' || 'stage' }}
 
   search-quality-binary:
     name: Search quality binary (Linux x64)
