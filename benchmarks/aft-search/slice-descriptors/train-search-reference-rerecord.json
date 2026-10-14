@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Re-records the real-query reference on the landed engine after the identifier-prose ranking train (main c41f56320). Changes only real-query-baseline.json, manifest.sha256 and this descriptor. No engine file changes."
+}
