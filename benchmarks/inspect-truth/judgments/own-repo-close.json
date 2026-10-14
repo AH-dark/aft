@@ -4,7 +4,7 @@
   },
   "provenance": {
     "origin": "Original upgrade-and-report capture; all 33 Rust rows and 10 in-domain TypeScript rows reviewed against source at 294159aef plus the separately queued exercise syntax repair 342737adf.",
-    "candidate": "b040edec4: cfg(test) declaration exclusion, used private trait receiver roots, referenced static initializer nodes, and query-suffix template import references. No per-symbol product allowlist.",
+    "candidate": "Product repairs at b040edec4 plus narrowed test-file tally at 009941f58; final release/source capture at 972d87b8157db1f5b23141ae47f7a2c85371873a. No per-symbol product allowlist.",
     "oracle_policy": "The three TypeScript exports used only by tests are not production dead-code oracle rows. These category-specific removals are applied identically to before and after, not to unused_exports. AFT-side judgments annotate every original row without removing it."
   },
   "entries": [

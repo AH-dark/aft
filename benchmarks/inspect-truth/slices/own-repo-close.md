@@ -4,11 +4,13 @@
 
 This follow-up compares the upgrade-and-report candidate captures from
 `ffe59a5d7d1f333deaca3f84b798459ea9b088df` with fresh Linux release captures from
-`b040edec480a5992d2f3a9f9f5d9ed46ec6c8613`. The latter includes the separately
+`972d87b8157db1f5b23141ae47f7a2c85371873a`, including the test-file tally
+refinement `009941f58ded3d1c2dcc1e1fa41ed0f3b9e92f76`. The latter includes the separately
 queued exercise-syntax repair `342737adfcd8b179bbcd3eaebe7594508807fc8b`, applied as
 `97db9691607eccf0553b1afe249594d495e2274c`; `benchmarks/src/exercise.ts` is **not
 excluded**. All six external source pins remain exactly those in `corpus.json`.
-The own source pin is the candidate commit; no plugin implementation changed.
+The own repository's analyzed source is fixed to the candidate commit; no plugin
+implementation changed.
 
 For each of the seven repositories, `collect_aft_record` started a new AFT
 process/storage generation and collected summaries and full paginated finding
@@ -27,7 +29,7 @@ TypeORM >100-row typings omission are preserved. `own-repo-close.json` adds a
 reason for each of the original 33 Rust and 10 in-domain TypeScript dead-code rows.
 It also identifies three test-only TS oracle rows, removed only from dead_code
 on **both** comparison sides. That explains the own TS before cell changing from
-the unreviewed 10/38 agreement to judged agreement 7/35; it is not a product gain
+38 oracle rows (10 agreements) to 35 oracle rows (7 agreements); it is not a product gain
 claimed by changing only the after denominator. Unused-export oracles are not
 trimmed by those judgments.
 
@@ -39,7 +41,8 @@ scorer cells (`recall_in_aft_domain`, `recall_exported`) are n/a on both sides i
 all 20 buckets. A direct `cell_changes` comparison, **including AFT despite its
 historical no-baseline designation**, checked all 80 cells: zero lowered cells.
 Counts here are in-domain findings after the unchanged test/truncation filters,
-not project-wide totals. AFT-side judgments annotate rows, never remove them.
+not project-wide totals. AFT-side judgments annotate finding rows without
+removing those rows from the counts.
 
 | Repo | Language/category | AFT before -> after | Oracle | Precision before -> after | Recall before -> after | After judged / unjudged |
 |---|---|---:|---:|---|---|---:|
@@ -77,7 +80,9 @@ no Rust oracle row was removed to improve precision.
 - **cfg(test) declarations:** call origins were already classified by cfg ranges,
   but declarations inside an inline test module or a cfg-gated function were
   still product candidates. Declaration exclusion now uses those same ranges,
-  including preceding attributes because parser symbol ranges begin there.
+  including preceding attributes because parser symbol ranges begin there. Existing
+  test-file processing still checks reachability before tallying withheld dead
+  findings; a used export in a test file must not increase that tally.
 - **Private trait dispatch:** the public-module-path rule severed a used private
   receiver's Default/Drop body. Receiver references outside impl headers now
   keep its trait method bodies and constructor/callback chains reachable. An
@@ -101,7 +106,7 @@ old extraction. The aggregate version remains 35; changed producer identities
 and fact formats invalidate the old inputs rather than inventing another
 aggregate encoding change. The contribution golden tests explicitly pin the new
 format and receiver/initializer fields; the producer-pair test pins the new key.
-Their dead-code behavioral assertions were not reversed.
+The tests' existing dead-code behavioral assertions remain in place.
 
 29 original Rust rows are false positives; the remaining four are the explicitly
 allowed logging wrapper and superseded orphan-sweep chain retained for fixtures.
@@ -135,12 +140,16 @@ exactly `{status:"not_requested"}`, and no diagnostics details.
 
 | Mode | Five seconds samples | Median |
 |---|---|---:|
-| Disabled | 10.141961 / 9.915733 / 9.836523 / 9.864406 / 10.016225 | 9.915733s |
-| Enabled | 10.548030 / 10.616472 / 10.114079 / 9.817649 / 10.023143 | 10.114079s |
+| Disabled | 5.505742 / 5.405043 / 5.405096 / 5.405199 / 5.706288 | 5.405199s |
+| Enabled | 6.408237 / 6.308367 / 6.909799 / 7.431910 / 8.419120 | 6.909799s |
 
-Enabled minus disabled is **0.198346s**, but the enabled median still misses
-**<5s**. The miss is real in this four-vCPU environment, not cured by correcting
-the upgrade-and-report run's two-vCPU allocation. The preceding REPORT.md timing
+Enabled minus disabled is **1.504600s**, not the earlier 0.4-second gap, and the
+enabled median still misses **<5s**. The initial four-vCPU run of b040edec4 also
+missed (10.114079s enabled, 9.915733s disabled, gap 0.198346s); its captures remain
+retained separately. The enabled samples in the final run rise noticeably, so
+these results do not establish stable producer overhead. Both four-vCPU attempts
+miss: the old miss cannot simply be dismissed as a two-vCPU allocation artifact.
+The preceding REPORT.md timing
 section recorded five calls per mode on two vCPUs; it named two as the measured
 allocation, not as a two-vCPU target. This rerun uses four vCPUs. These
 measurements are not proof that configured producers returned authoritative
@@ -158,7 +167,7 @@ failure of an earlier source archive nested beneath a different Git index.
 
 | Test | Plain origin/main | Candidate full gate | Interpretation |
 |---|---|---|---|
-| outline_portability_goldens_stay_lf_with_autocrlf | 1 passed | passed | Prior failure not reproduced in the proper checkout |
+| outline_portability_goldens_stay_lf_with_autocrlf | 1 passed | passed | Old ownership failure not reproduced; the baseline here has the checkout's actual Git index |
 | blackholed_backend_never_blocks_status_or_search | failed | failed | Offline runner reports unavailable instead of the expected timeout |
 | storage_debug_archive_ignores_public_member_modes | failed | failed | `zip` executable absent (NotFound at spawn) |
 | candidate_bytes_are_released_before_derived_materialization | 1 passed | passed | Prior failure not reproduced |
@@ -172,7 +181,7 @@ failures reproduce on plain origin/main. Full-gate
 later phases were not reached; it is **not** reported as passing. No unrelated
 failure was fixed. Narrow authoritative verification (Cargo 1.99.0):
 
-- dead-code scanner lib suite: 58 passed;
+- dead-code scanner lib suite: 59 passed;
 - Oxc engine integration: 51 passed, 1 manual benchmark ignored;
 - dead-code integration: 31 passed;
 - calls lib suite: 16 passed;
@@ -186,12 +195,14 @@ failure was fixed. Narrow authoritative verification (Cargo 1.99.0):
   partial while rust-analyzer's Cargo check was running; compiled tests and the
   release build are authoritative, not a claim of complete editor diagnostics.
 
-Each fix was shown red before implementation. Separate staged-state mutations
+Each regression test was observed failing with its corresponding repair absent.
+Separate staged-state mutations
 neutralized cfg-declaration exclusion, private trait roots, static-owner
-reassignment, template import handling, and the fixture exclusion policy. Each
+reassignment, template import handling, the fixture exclusion policy, and the
+used-test-file tally check. Each
 named regression alone failed; sibling controls passed or were filtered out.
 Every mutation has a non-empty applied diff and an empty diff after restoration.
-The five controls and captured output are retained outside build directories:
+The six controls and captured output are retained outside build directories:
 
 | Neutralized behavior | Exact regression test | Evidence under `local-ignore/truth-close/logs/` |
 |---|---|---|
@@ -200,18 +211,25 @@ The five controls and captured output are retained outside build directories:
 | static initializer owner reassignment | `inspect::scanners::dead_code::tests::own_repo_static_receiver_and_index_uses_keep_initializers_live` | `mutation-static.stdout` |
 | fixed-path template import | `inspect_oxc_engine_test::own_repo_query_suffix_template_imports_are_test_only_references` | `mutation-template.stdout` |
 | fixture exclusion policy | `ScoreFixtures.test_typeorm_fixture_exclusions_are_applied_and_restored` | `mutation-exclusions.stderr` |
+| used test-file tally | `inspect::scanners::dead_code::tests::used_test_file_exports_are_not_tallied_as_excluded_dead_findings` | `mutation-test-tally.stdout` |
 
-No mutation remains in the tree.
+The task checkout was restored after every deliberate test-breaking edit; none
+of those edits remains in its source files.
 
 ## Retained evidence and acceptance boundary
 
-Raw records, own rerun oracle, all ten timing responses, relocated original
-judgments, both scored tables, and all 80 cell comparisons are retained outside
+Raw AFT findings, rerun rustc/Fallow reference findings for the own repository,
+all ten final timing responses, path-relocated original judgment descriptors,
+both scored tables, and all 80 cell comparisons support the counts and score
+claims above. They are retained outside
 build directories in `local-ignore/truth-close/`. Key SHA-256 values:
 
-- `final-metadata.json`: `b15deabc53d5a59097e4cea48288742f77e18e3aa961ea01aff4fa3d469bc0eb`
-- `scored/results.json`: `34a6ffe27d2528d8160e863f9ad9eb9c6169b81113a7e9d331985374ad9f9ede`
-- `scored/cell-diff.json`: `e625d4ef9e4845f840a3e1ea8578eec2079358d9f4b4a558c4b41b0e499f4091`
+- `final2-metadata.json`: `7e9aecd011e5ae8089a92e9312e486e326e561201c2459bd844a74ebc0288cc8`
+- `scored2/results.json`: `79d24004c240b79d6dc93bf3d3838bd6ea57e0640d16a002e0e700813335ed4f`
+- `scored2/cell-diff.json`: `de898fa180036c56b37974cf5d55f9df6a24ad265ac9d97ee4a84eb81cfd0ff0`
+- Linux `aft` release executable built from `972d87b8157db1f5b23141ae47f7a2c85371873a`
+  (`/run/motor/target/release/aft` during collection):
+  `0780e19b598552b85a8a11e61b4e8475ceaa483a183fb58b84dbf73c4470c1ba`
 
 All seven source trees have unchanged empty tracked status before/after
 collection. The own config was restored byte-for-byte. As in the previous

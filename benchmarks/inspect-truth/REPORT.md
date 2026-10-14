@@ -2,9 +2,9 @@
 
 ## Acceptance-blocker follow-up: own repository and TypeORM
 
-Seven-corpus release measurements using new AFT processes/storage and full
-finding-list collection from
-`b040edec480a5992d2f3a9f9f5d9ed46ec6c8613` supersede the remaining-row and TypeORM
+Seven-corpus release measurements using new Agent File Tools (AFT) processes,
+storage generations and full finding-list collection from
+`972d87b8157db1f5b23141ae47f7a2c85371873a` supersede the remaining-row and TypeORM
 completeness outcomes of the upgrade-and-report run below. The complete
 [follow-up report](slices/own-repo-close.md) gives every before/after cell,
 row decisions, measurement policy, raw evidence hashes, timing samples, and
@@ -13,12 +13,12 @@ evidence, not overwritten results.
 
 | Blocker | Before | Follow-up |
 |---|---|---|
-| Own Rust dead code <=rustc+10 | 33 vs rustc 0; 33 unjudged | **4 vs 0**; source review explains 29 removed false positives and the four remaining allowed/retired helpers, with one reason per original row |
+| Own Rust findings no more than ten above rustc's dead-code lint count | AFT 33 vs rustc 0; 33 unjudged | **4 vs 0**; source review explains 29 removed false positives and four unreachable production helpers retained for fixtures or under a dead-code lint allowance, with one reason per original row |
 | Own in-domain TS dead-code review | 10 unjudged | All original 10 judged; three query-suffix-import test exports move to test-only usage, **7 remaining, 0 unjudged** |
 | Own unused-export scoring | Unknown: real exercise driver syntax error | Queued repair `342737adf` included, **not excluded**; **104/162**, precision 1.000, recall 0.642; 104 newly available rows still unjudged |
 | TypeORM scoring | D/U unknown: four invalid codemod fixtures | Historical four-path exclusion declared in `corpus.json`, applied/restored by the collector; **U3**, precision 1.000/recall 0.750; **D0**, recall 0.000 |
 | Score-cell monotonicity | Four TypeORM cells unknown | **No lowered cell**, 20 buckets/80 comparisons including the own checkout; external cells otherwise unchanged except axum D9 -> D5 |
-| TypeORM scoped timing, four vCPUs | Two-vCPU enabled 5.707473s, disabled 5.307470s | **Still a real miss**: enabled 10.114079s, disabled 9.915733s; difference 0.198346s passes, <5s does not |
+| TypeORM scoped timing, four vCPUs | Two-vCPU enabled 5.707473s, disabled 5.307470s | **Still a real miss**: enabled 6.909799s, disabled 5.405199s; difference 1.504600s; <5s does not pass |
 | Four old full-gate failures on plain origin/main | Not compared there | Outline portability and candidate-byte release pass on both; blackholed backend and missing `zip` fail on both |
 
 The product fixes are generic: cfg(test) declaration exclusion, used private
@@ -30,13 +30,15 @@ encoding version remains 35. The historical judgment files remain unchanged;
 `judgments/own-repo-close.json` adds the requested 43 row decisions and three
 category-specific test-only oracle decisions applied equally to both sides.
 
-All six external pins and frozen oracle snapshots are retained. The own oracles
+All six external source commits and their reference analyzers' frozen finding
+snapshots are retained. The own oracles
 were rerun on the repaired tree. Raw captures, timing responses and scored output
 are ignored under `local-ignore/truth-close/`, not committed. Collection leaves
 all seven source trees' tracked status and the own config unchanged.
 
 **This is not an overall campaign pass.** Timing still misses on four allocated
-vCPUs; soft-serve's function precision remains 0.346; the newly scoreable own U104
+vCPUs; only 9 of soft-serve's 26 reported dead functions match its oracle
+(precision 0.346); the newly scoreable own U104
 rows are not manually reviewed; and the corpus diagnostics/footer comparison is
 still unrun. The full gate also remains red for environment failures reproduced
 on exact plain `origin/main` (`1a87fec37`), including a separate missing-build-SHA
