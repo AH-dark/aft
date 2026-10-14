@@ -150,6 +150,9 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
           python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
+          python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
+          python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
+          python3 -m unittest discover -s scripts/lib -p test_select_native_release_artifact.py -v
       - name: Merge queue workflow and search contracts
         run: |
           python3 --version
@@ -1077,6 +1080,7 @@ jobs:
       - name: Bun test (all packages)
         run: bun run test:unit
         env:
+          AFT_TEST_NATIVE_FIXTURE_TIMING: "1"
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}

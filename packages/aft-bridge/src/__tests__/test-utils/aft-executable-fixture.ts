@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { cachedExecutable } from "./cached-executable.js";
@@ -42,11 +51,25 @@ function writeNativeFixture(path: string, behavior: AftFixtureBehavior): void {
     .update(`${process.platform}\0${source}`)
     .digest("hex")
     .slice(0, 16);
-  const cacheDir = join(tmpdir(), "aft-fixture-cache");
+  // macOS can assess freshly written executables in /var/folders before spawn
+  // returns. Keep executable inodes in /tmp even when resolver symlinks use TMPDIR.
+  const cacheDir =
+    process.platform === "darwin"
+      ? join("/tmp", `aft-fixture-cache-${process.getuid?.()}`)
+      : join(tmpdir(), "aft-fixture-cache");
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  const directory = lstatSync(cacheDir);
+  if (!directory.isDirectory() || (process.getuid && directory.uid !== process.getuid())) {
+    throw new Error(`Native fixture cache is not an owned directory: ${cacheDir}`);
+  }
   const cachedBinary = join(cacheDir, `aft-fixture-${cacheKey}`);
 
   if (!existsSync(cachedBinary)) {
     compileNativeFixture(source, cacheDir, cachedBinary);
+  }
+
+  if (process.platform === "darwin") {
+    prepareMacOSFixture(cachedBinary);
   }
 
   // Keep each test's resolver-visible path, without copying a new executable inode.
@@ -54,13 +77,98 @@ function writeNativeFixture(path: string, behavior: AftFixtureBehavior): void {
   symlinkSync(cachedBinary, path);
 }
 
+const preparedMacOSFixtures = new Set<string>();
+
+function prepareMacOSFixture(path: string): void {
+  if (preparedMacOSFixtures.has(path)) return;
+  // Assess the signed inode in a separate runtime process. If posix_spawn blocks
+  // its event loop, the supervising process can still enforce the deadline.
+  const verified = spawnSync("/usr/bin/codesign", ["--verify", "--strict", path], {
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  if (verified.error || verified.status !== 0) {
+    throw new Error(
+      `macOS native fixture signature verification failed: ${verified.error?.message ?? verified.stderr}`,
+    );
+  }
+  const warmed = probeNativeFixture(path);
+  if (process.env.AFT_TEST_NATIVE_FIXTURE_TIMING === "1") {
+    console.log(`NATIVE_FIXTURE_FIRST_BYTE ${JSON.stringify({ path, ...warmed })}`);
+  }
+  preparedMacOSFixtures.add(path);
+}
+
+export interface NativeFixtureTiming {
+  spawnReturnMs: number;
+  firstByteMs: number;
+  closeMs: number;
+}
+
+function probeNativeFixture(path: string): NativeFixtureTiming {
+  const script = `
+    const { spawn } = require("node:child_process");
+    const start = performance.now();
+    let firstByteMs = null, stdout = "", stderr = "";
+    const child = spawn(process.argv[1], ["--aft-fixture-warm"], { stdio: ["ignore", "pipe", "pipe"] });
+    const spawnReturnMs = performance.now() - start;
+    child.stdout.on("data", (data) => {
+      if (firstByteMs === null) firstByteMs = performance.now() - start;
+      stdout += data.toString();
+    });
+    child.stderr.on("data", (data) => { stderr += data.toString(); });
+    child.on("error", (error) => { console.error(error); process.exitCode = 1; });
+    child.on("close", (status) => {
+      console.log(JSON.stringify({ spawnReturnMs, firstByteMs, closeMs: performance.now() - start, stdout, stderr, status }));
+    });
+  `;
+  const probe = spawnSync(process.execPath, ["--eval", script, path], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 65_000,
+  });
+  if (probe.error || probe.status !== 0) {
+    throw new Error(
+      `Native fixture first-byte probe failed: ${probe.error?.message ?? probe.stderr}`,
+    );
+  }
+  const measured = JSON.parse(probe.stdout.trim());
+  if (
+    measured.status !== 0 ||
+    measured.stdout !== "aft-fixture-ready\n" ||
+    measured.stderr !== "" ||
+    typeof measured.firstByteMs !== "number"
+  ) {
+    throw new Error(`Native fixture assessment did not emit its ready byte: ${probe.stdout}`);
+  }
+  return {
+    spawnReturnMs: measured.spawnReturnMs,
+    firstByteMs: measured.firstByteMs,
+    closeMs: measured.closeMs,
+  };
+}
+
+/** Measure first execution and inode reuse without pre-warming either location. */
+export function measureColdNativeFixture(
+  directory: string,
+  uniqueSource: string,
+): {
+  path: string;
+  cold: NativeFixtureTiming;
+  warm: NativeFixtureTiming;
+} {
+  const path = join(directory, "aft-cold-probe");
+  compileNativeFixture(nativeFixtureSource({ stdout: uniqueSource }), directory, path);
+  return { path, cold: probeNativeFixture(path), warm: probeNativeFixture(path) };
+}
+
 function compileNativeFixture(source: string, cacheDir: string, cachedBinary: string): void {
   if (!nativeCompiler)
     throw new Error("Native aft test fixtures are not available on this platform");
 
   mkdirSync(cacheDir, { recursive: true });
-  // Unique staging names so concurrent test files never race on the same
-  // output; the final publish renames the complete binary to the keyed name.
+  // Unique staging names isolate compilers. Atomic hard-link publication keeps
+  // the first complete signed inode, rather than replacing a warmed cache entry.
   const staging = join(
     cacheDir,
     `stage-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -94,7 +202,27 @@ function compileNativeFixture(source: string, cacheDir: string, cachedBinary: st
   }
 
   chmodSync(staging, 0o755);
-  renameSync(staging, cachedBinary);
+  if (process.platform === "darwin") {
+    // Publish only signed bytes so concurrent users never rewrite a fixture
+    // that another test is executing from the shared content-keyed cache.
+    const signed = spawnSync("/usr/bin/codesign", ["-f", "-s", "-", staging], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    if (signed.error || signed.status !== 0) {
+      throw new Error(
+        `macOS native fixture signing failed: ${signed.error?.message ?? signed.stderr}`,
+      );
+    }
+  }
+  try {
+    linkSync(staging, cachedBinary);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  } finally {
+    rmSync(staging, { force: true });
+    rmSync(sourcePath, { force: true });
+  }
 }
 
 function nativeFixtureSource(behavior: AftFixtureBehavior): string {
@@ -107,6 +235,7 @@ function nativeFixtureSource(behavior: AftFixtureBehavior): string {
 #define _POSIX_C_SOURCE 199309L
 #endif
 #include <stdio.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <windows.h>
 #else
@@ -127,8 +256,11 @@ static void aft_fixture_sleep(unsigned int milliseconds) {
 }
 
 int main(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
+  if (argc == 2 && strcmp(argv[1], "--aft-fixture-warm") == 0) {
+    fputs("aft-fixture-ready\\n", stdout);
+    fflush(stdout);
+    return 0;
+  }
   static const unsigned char stdout_bytes[] = { ${stdout.literal} };
   static const unsigned char stderr_bytes[] = { ${stderr.literal} };
 

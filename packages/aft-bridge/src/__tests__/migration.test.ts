@@ -68,10 +68,28 @@ describe("storage migration bootstrap", () => {
     writeFileSync(join(legacyRoot, "warned_tools.json"), "{}", "utf8");
     const aft = binary({ exitCode: 0 });
 
-    await expect(
-      ensureStorageMigrated({ harness: "opencode", binaryPath: aft }),
-    ).resolves.toBeUndefined();
-  }, 30_000);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await expect(
+        Promise.race([
+          ensureStorageMigrated({ harness: "opencode", binaryPath: aft, timeoutMs: 59_000 }),
+          new Promise<never>((_, reject) => {
+            deadline = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    "ensureStorageMigrated_spawns_and_succeeds: native fixture did not close within 60 seconds",
+                  ),
+                ),
+              60_000,
+            );
+          }),
+        ]),
+      ).resolves.toBeUndefined();
+    } finally {
+      if (deadline) clearTimeout(deadline);
+    }
+  }, 65_000);
 
   test("storage migration leaves the host event loop running", async () => {
     mkdirSync(resolveLegacyStorageRoot("opencode"), { recursive: true });
