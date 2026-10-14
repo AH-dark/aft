@@ -1325,6 +1325,32 @@ mod tests {
     }
 
     #[test]
+    fn swift_write_pipeline_accepts_try_await_optional_binding() {
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("ViewModel.swift");
+        std::fs::write(&path, "class ViewModel {\n}\n").unwrap();
+        let updated = "class ViewModel {
+    func probe() async {
+        if let fresh = try? await fleet.fetch() {
+            rows = fresh.rows
+        }
+    }
+}
+";
+        let config = Config {
+            format_on_edit: false,
+            ..Config::default()
+        };
+
+        let result =
+            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+
+        assert_eq!(result.syntax_valid, Some(true));
+        assert!(!result.rolled_back);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+    }
+
+    #[test]
     fn line_col_to_byte_single_line() {
         let source = "hello";
         assert_eq!(line_col_to_byte(source, 0, 0), 0);

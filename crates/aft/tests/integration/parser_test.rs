@@ -1,6 +1,30 @@
 use aft::parser::FileParser;
 
 #[test]
+fn swift_optional_binding_try_await_conditions_have_no_parse_errors() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("ViewModel.swift");
+    for condition in [
+        "if let fresh = try? await fleet.fetch() {\n            rows = fresh.rows\n        }",
+        "if ready, let fresh = try? await fleet.fetch() {\n            rows = fresh.rows\n        }",
+        "guard let fresh = try? await fleet.fetch() else { return }\n        rows = fresh.rows",
+        "while let fresh = try? await fleet.fetch() {\n            rows = fresh.rows\n        }",
+    ] {
+        let source = format!(
+            "class ViewModel {{\n    func probe() async {{\n        {condition}\n    }}\n}}\n"
+        );
+        std::fs::write(&file, &source).expect("write Swift file");
+        let mut parser = FileParser::new();
+        let (tree, _) = parser.parse(&file).expect("parse Swift file");
+        assert!(
+            !tree.root_node().has_error(),
+            "condition {condition:?} parsed with errors: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+}
+
+#[test]
 fn python_decorated_function_range_includes_decorators() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let file = tmp.path().join("decorated.py");

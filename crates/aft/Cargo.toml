@@ -124,7 +124,7 @@ tree-sitter-scala = "0.26"
 tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-kotlin-sg = "0.4"
-tree-sitter-swift = "0.7"
+tree-sitter-swift = "0.7.4"
 tree-sitter-php = "0.24"
 tree-sitter-lua = "0.5"
 # `ts-parser-perl` is the crate for github.com/tree-sitter-perl/tree-sitter-perl,
