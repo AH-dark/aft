@@ -586,12 +586,19 @@ fn project_watcher_filter_recognises_the_config_file() {
 #[test]
 fn root_without_a_project_watcher_watches_its_config_files_itself() {
     enable_config_watches_for_test();
-    let fixture = Fixture::new("{}", Some(r#"{ "bash": { "enabled": true } }"#));
+    let attach_gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let fixture = with_config_watch_attach_gate(attach_gate.clone(), || {
+        Fixture::new("{}", Some(r#"{ "bash": { "enabled": true } }"#))
+    });
     // Unit tests start no project watcher, so the root's own watches cover
     // both files.
     assert!(fixture.ctx.config_live().has_project_fallback_watch());
     assert!(fixture.ctx.config_live().has_user_watch());
-    std::thread::sleep(Duration::from_millis(500));
+    // Watch handles exist before their threads attach. Hold that startup until
+    // the fixture is configured, then await backend registration before editing.
+    *attach_gate.0.lock().unwrap() = true;
+    attach_gate.1.notify_all();
+    fixture.ctx.config_live().wait_for_watch_attachment();
 
     write(&fixture.project_path, r#"{ "bash": { "enabled": false } }"#);
     let deadline = Instant::now() + Duration::from_secs(10);

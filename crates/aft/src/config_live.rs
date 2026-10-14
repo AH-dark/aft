@@ -311,6 +311,31 @@ impl ConfigLiveState {
     pub fn has_user_watch(&self) -> bool {
         self.watches.lock().user.is_some()
     }
+
+    #[cfg(test)]
+    fn wait_for_watch_attachment(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let watches = self.watches.lock();
+        for watch in [watches.user.as_ref(), watches.project_fallback.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let (attached, _) = watch
+                .attached
+                .1
+                .wait_timeout_while(
+                    watch.attached.0.lock().unwrap(),
+                    deadline.saturating_duration_since(Instant::now()),
+                    |attached| !*attached,
+                )
+                .unwrap();
+            assert!(
+                *attached,
+                "config watch did not attach to {}",
+                watch.file.display()
+            );
+        }
+    }
 }
 
 /// Start or stop this root's own file watches to match its state: a user-file
@@ -1049,6 +1074,29 @@ fn classification_is_exhaustive(config: &Config) {
 pub struct ConfigFileWatch {
     file: PathBuf,
     shutdown: Arc<AtomicBool>,
+    #[cfg(test)]
+    attached: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    // Captured when a watch is created, so only watches from this fixture wait.
+    static CONFIG_WATCH_ATTACH_GATE: std::cell::RefCell<Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_config_watch_attach_gate<T>(
+    gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONFIG_WATCH_ATTACH_GATE.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CONFIG_WATCH_ATTACH_GATE.with(|slot| slot.replace(Some(gate))));
+    run()
 }
 
 impl ConfigFileWatch {
@@ -1078,10 +1126,25 @@ impl ConfigFileWatch {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_file = file.clone();
+        #[cfg(test)]
+        let attached = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        #[cfg(test)]
+        let thread_attached = attached.clone();
+        #[cfg(test)]
+        let attach_gate = CONFIG_WATCH_ATTACH_GATE.with(|slot| slot.borrow().clone());
         let spawned = thread::Builder::new()
             .name("aft-config-watch".to_string())
             .spawn(move || {
-                run_config_file_watch(thread_file, on_change, thread_shutdown, counters)
+                run_config_file_watch(
+                    thread_file,
+                    on_change,
+                    thread_shutdown,
+                    counters,
+                    #[cfg(test)]
+                    thread_attached,
+                    #[cfg(test)]
+                    attach_gate,
+                )
             });
         if let Err(error) = spawned {
             crate::slog_warn!(
@@ -1090,7 +1153,12 @@ impl ConfigFileWatch {
                 error
             );
         }
-        Self { file, shutdown }
+        Self {
+            file,
+            shutdown,
+            #[cfg(test)]
+            attached,
+        }
     }
 
     pub fn file(&self) -> &Path {
@@ -1111,6 +1179,8 @@ fn run_config_file_watch(
     on_change: Arc<dyn Fn() + Send + Sync>,
     shutdown: Arc<AtomicBool>,
     counters: Arc<crate::context::WatcherCounters>,
+    #[cfg(test)] attached: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    #[cfg(test)] attach_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
 ) {
     use notify::RecursiveMode;
     #[cfg(not(target_os = "macos"))]
@@ -1124,6 +1194,20 @@ fn run_config_file_watch(
     let Some(dir) = file.parent().map(Path::to_path_buf) else {
         return;
     };
+    #[cfg(test)]
+    if let Some(gate) = attach_gate {
+        let (open, _) = gate
+            .1
+            .wait_timeout_while(gate.0.lock().unwrap(), Duration::from_secs(10), |open| {
+                !*open
+            })
+            .unwrap();
+        assert!(
+            *open,
+            "config watch attachment gate was not released for {}",
+            file.display()
+        );
+    }
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
     #[cfg(target_os = "macos")]
     let mut watcher = ConfigDirectoryWatcher::new(tx, counters);
@@ -1150,6 +1234,17 @@ fn run_config_file_watch(
         })
     };
     attach(&mut watcher, &mut attachment);
+    #[cfg(test)]
+    let notify_attached = |attachment: &DirAttachment| {
+        // On macOS, watch() returns after the FSEvents stream-start handshake;
+        // other backends likewise register their directory before returning.
+        if attachment.watched() == Some(dir.as_path()) {
+            *attached.0.lock().unwrap() = true;
+            attached.1.notify_all();
+        }
+    };
+    #[cfg(test)]
+    notify_attached(&attachment);
 
     while !shutdown.load(Ordering::Acquire) {
         match rx.recv_timeout(CONFIG_WATCH_POLL) {
@@ -1169,6 +1264,8 @@ fn run_config_file_watch(
         if attach(&mut watcher, &mut attachment) {
             on_change();
         }
+        #[cfg(test)]
+        notify_attached(&attachment);
     }
 }
 
