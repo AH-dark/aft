@@ -80,7 +80,8 @@ echo ""
 
 push_release() {
   echo "→ Landing the release PR, checking its exact main push run, then tagging..."
-  python3 scripts/lib/release_queue.py publish "$VERSION" "${LEGACY_ARGS[@]}"
+  # macOS ships bash 3.2, where "${arr[@]}" of an empty array fails under set -u.
+  python3 scripts/lib/release_queue.py publish "$VERSION" ${LEGACY_ARGS[@]+"${LEGACY_ARGS[@]}"}
   echo "  ✓ Released $TAG"
   echo "  → GitHub Actions will now: enforce exact-SHA release gate → build → publish"
 }
