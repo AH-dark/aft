@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import subprocess
 import tarfile
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,13 +95,68 @@ def validate(expected: dict, actual: dict, compiler: bool = True) -> None:
             raise ValueError(f"release artifact mismatch: {name}")
 
 
+def verify_binary(data: dict, executable: Path, dsym: Path | None = None) -> None:
+    if data.get("kind") != "binary":
+        raise ValueError("native release artifact has the wrong build stage")
+    if digest(executable) != data["binary_sha256"]:
+        raise ValueError("native release binary checksum mismatch")
+    if dsym is not None and digest(dsym) != data.get("dsym_sha256"):
+        raise ValueError("native release dSYM checksum mismatch")
+
+
+def unpack_published(archive: Path, target: str, executable: Path, dsym: Path | None) -> None:
+    # Publication runs on Linux even for macOS and Windows artifacts. It checks
+    # release identity and bytes without requiring the producer's Rust compiler.
+    with tempfile.TemporaryDirectory(prefix="aft-release-") as temp:
+        root = Path(temp)
+        safe_extract(archive, root, ("target", "native-release-manifest.json", "native-release-dsym.zip"))
+        data = json.loads((root / "native-release-manifest.json").read_text())
+        expected = {"schema": 1, "git_sha": output("git", "rev-parse", "HEAD"),
+                    "profile": "release", "target": target,
+                    "profile_manifest_sha256": digest(ROOT / "Cargo.toml")}
+        for name, value in expected.items():
+            if data.get(name) != value:
+                raise ValueError(f"release artifact mismatch: {name}")
+        filename = "aft.exe" if target.endswith("windows-msvc") else "aft"
+        source = root / "target" / target / "release" / filename
+        if not source.exists():
+            source = root / "target/release" / filename
+        debug = root / "native-release-dsym.zip" if data.get("dsym_sha256") or dsym else None
+        verify_binary(data, source, debug)
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, executable)
+        if dsym is not None:
+            assert debug is not None
+            dsym.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(debug, dsym)
+        verify_binary(data, executable, dsym)
+        print(f"Verified published binary SHA256 {data['binary_sha256']} from {data['git_sha']} / {target}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("pack-library", "unpack-library", "pack-binary", "unpack-binary"))
+    parser.add_argument("mode", choices=("pack-library", "unpack-library", "pack-binary", "unpack-binary", "verify-binary", "unpack-published"))
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--target", default="")
     parser.add_argument("--dsym", type=Path)
+    parser.add_argument("--binary", type=Path)
     args = parser.parse_args()
+    if args.mode == "unpack-published":
+        if not args.target or args.binary is None:
+            parser.error("unpack-published requires --target and --binary")
+        unpack_published(args.archive, args.target, args.binary, args.dsym)
+        return
+    if args.mode == "verify-binary":
+        with tarfile.open(args.archive) as bundle:
+            manifest = bundle.extractfile("native-release-manifest.json")
+            if manifest is None:
+                raise ValueError("native release binary manifest is missing")
+            data = json.load(manifest)
+        validate(facts(args.target), data)
+        executable = args.binary or release_dir(args.target) / ("aft.exe" if data["target"].endswith("windows-msvc") else "aft")
+        verify_binary(data, executable)
+        print(f"Verified tested binary SHA256 {data['binary_sha256']} from {data['git_sha']}")
+        return
     directory = release_dir(args.target)
     manifest_path = ROOT / "native-release-manifest.json"
     if args.mode.startswith("pack"):
@@ -158,10 +215,7 @@ def main() -> None:
                 os.utime(path, ns=(path.stat().st_atime_ns, clock["mtime_ns"]))
         else:
             executable = directory / ("aft.exe" if data["target"].endswith("windows-msvc") else "aft")
-            if digest(executable) != data["binary_sha256"]:
-                raise ValueError("native release binary checksum mismatch")
-            if data.get("dsym_sha256") and digest(ROOT / "native-release-dsym.zip") != data["dsym_sha256"]:
-                raise ValueError("native release dSYM checksum mismatch")
+            verify_binary(data, executable, ROOT / "native-release-dsym.zip" if data.get("dsym_sha256") else None)
         print(f"Verified native release {expected_kind} artifact from {data['git_sha']}")
 
 
