@@ -2673,6 +2673,8 @@ mod tests {
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, "export function moved() {}\n").unwrap();
         std::fs::write(&dest, "").unwrap();
+        let source = std::fs::canonicalize(source).unwrap();
+        let dest = std::fs::canonicalize(dest).unwrap();
         let true_consumer = root.path().join("consumer.ts");
         std::fs::write(
             &true_consumer,
@@ -2743,6 +2745,10 @@ mod tests {
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         std::fs::write(&source, "export function moved() {}\n").unwrap();
         std::fs::write(&dest, "").unwrap();
+        // Production passes canonical source/destination identities to the walk.
+        // Match those inputs so filesystem aliases cannot add two false consumers.
+        let source = std::fs::canonicalize(source).unwrap();
+        let dest = std::fs::canonicalize(dest).unwrap();
         let mut observed = Vec::new();
         for count in [1_000, 5_000, 20_000] {
             for i in 0..count {
@@ -2907,10 +2913,12 @@ mod tests {
         let hidden = root.path().join(".hidden/consumer.ts");
         std::fs::write(&hidden, "import { moved } from '../module';\nmoved();\n").unwrap();
         let mut files = Vec::new();
-        collect_ts_js_files(root.path(), &mut files, &source, &dest);
+        let source_canon = std::fs::canonicalize(&source).unwrap();
+        let dest_canon = std::fs::canonicalize(&dest).unwrap();
+        collect_ts_js_files(root.path(), &mut files, &source_canon, &dest_canon);
         files.sort();
         files.dedup();
-        assert_eq!(files, vec![hidden.clone()]);
+        assert_eq!(files, vec![std::fs::canonicalize(&hidden).unwrap()]);
         let content = std::fs::read_to_string(&hidden).unwrap();
         assert_eq!(
             rewrite_consumer_imports(
