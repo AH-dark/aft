@@ -319,3 +319,156 @@ logs/environments are not published, because they may contain cache-service
 credentials. None of the ranking/routing source paths registered in
 `benchmarks/aft-search/search_quality_lib.py:RANKING_FENCE_PREFIXES` is edited;
 this experiment changes compilation/provenance, not query ranking policy.
+
+## Completed A/B/C comparison
+
+All attempts used GitHub-hosted runners and the train-like `stage` E2E
+profile. Each has 44 job records; none is a successful full-suite result.
+A/B/C preserve all existing required check names and summary jobs. B had an
+operator-triggered third attempt; attempt 2 is the primary warm comparison,
+and attempt 3 overlapped A/C execution while sharing the repository-wide
+cache storage/eviction budget. Jobs marked † below failed or
+stopped early, so their elapsed time is not a complete-inventory speedup.
+
+| Variant | Run/attempt | Wall min | Median queue s | Max queue s | Rust-cache uploaded bytes | Restores / misses | sccache hit rate | sccache write errors |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A cold | 38543321218/1 | 34.43 | 4 | 13 | 1,639,289,990 | 25 / 3 | 13.75% | 229 |
+| A warm | 38543321218/2 | 31.17 | 4 | 12 | 3,111,392,554 | 16 / 11 | 14.67% | 2,179 |
+| B cold | 38544407835/1 | 32.77 | 3.5 | 12 | 6,845,851,555 | 19 / 9 | 15.14% | 2,441 |
+| B warm | 38544407835/2 | 35.27 | 5 | 14 | 5,509,322,083 | 16 / 12 | 11.42% | 2,488 |
+| B warm, coexistence | 38544407835/3 | 42.42 | — | — | 8,959,210,463 | 6 / 22 | 11.98% | 3,453 |
+| C cold | 38551284210/1 | 32.40 | 4 | 11 | 5,684,163,409 | 7 / 21 | 7.68% | 4,989 |
+| C warm | 38551284210/2 | 39.30 | 4 | 13 | 4,702,775,859 | 10 / 18 | 4.26% | 2,335 |
+
+Rust-cache bytes count completed `Sent N of N (100%)` uploads during each
+job's rust-cache post step. They exclude sccache object bytes (not exposed by
+its stats) and other tool/artifact caches. Hit rates aggregate reported
+sccache hits/misses across Rust, C/C++ and assembler, not just AFT's library.
+Use the last JSON stats record per job, not the duplicate human-readable
+summary. Historical attempt ZIPs sometimes contain only whole-job logs;
+step-file-only parsing would incorrectly report zero bytes/counters for B2.
+The retained raw ZIPs and JSON summaries allow auditing these totals.
+
+Warm labels did **not** mean the caches survived: B2 rebuilt/reuploaded
+5.51 GB, B3 8.96 GB, and B3 restored only six rust-cache entries while missing
+22. C's warm hit rate fell to 4.26%. Queue medians stayed at 3.5–5 seconds;
+these regressions cannot be explained by runner queue time alone. The cause
+of individual cache-write errors is not proved by aggregate counters, but
+cache churn and failure to persist/reuse artifacts are directly observed.
+**Reject B's broad workspace caching as a default**; C and D retain the
+original dependency-only layout instead.
+
+### Job execution minutes (queue excluded)
+
+| Job | A cold | A warm | B cold | B warm | C cold | C warm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| E2E / E2E (Linux Docker) | 2.28 | 2.67 | 2.30 | 2.62 | 4.07 | 2.77 |
+| E2E / E2E (Pi RPC) | 0.98 | 1.38 | 1.47 | 1.45 | 1.58 | 1.27 |
+| E2E / E2E (Windows native) | 22.93 | 0.67† | 22.15 | 6.55 | 24.23 | 10.83 |
+| E2E / E2E (macOS native) | 22.73 | 15.92 | 23.35 | 27.35 | 26.63 | 19.42 |
+| E2E / E2E binary (Linux x64) | 7.37 | 8.42 | 8.62 | 10.70 | 8.20 | 10.97 |
+| E2E / OpenCode 2 (Linux Docker) | 11.18 | 11.18 | 10.88 | 8.83 | 10.05 | 10.82 |
+| Search quality binary (Linux x64) | 13.52 | 19.23 | 16.25 | 18.52 | 14.28 | 21.17 |
+| Unit / Bash permission e2e (Windows) | 5.07 | 5.22 | 6.42 | 4.82 | 8.42 | 7.90 |
+| Unit / Cargo bin-test archive (macOS) | 23.15 | 21.85 | 13.93 | 20.62 | 19.80 | 24.98 |
+| Unit / Cargo check deny-warnings (Windows) | 3.82 | 3.88 | 3.60 | 3.82 | 5.53 | 5.45 |
+| Unit / Cargo conformance + Bun tests (macOS) | 9.92† | 5.80† | 7.25 | 10.70† | 9.90† | 13.88 |
+| Unit / Cargo integration shard 1/3 (Linux) | 3.85 | 3.35 | 4.13 | 3.88 | 4.28 | 4.58 |
+| Unit / Cargo integration shard 1/3 (Windows) | 6.98 | 4.25 | 4.82 | 7.48 | 8.53 | 4.88 |
+| Unit / Cargo integration shard 1/3 (macOS) | 5.45 | 6.07 | 7.68 | 6.63 | 6.08 | 7.00 |
+| Unit / Cargo integration shard 2/3 (Linux) | 3.65 | 4.43 | 4.03 | 4.08 | 4.33 | 3.73 |
+| Unit / Cargo integration shard 2/3 (Windows) | 4.48 | 6.00 | 5.53 | 5.62 | 4.95 | 5.12 |
+| Unit / Cargo integration shard 2/3 (macOS) | 6.12 | 5.93 | 5.93 | 5.50 | 6.15 | 5.55 |
+| Unit / Cargo integration shard 3/3 (Linux) | 5.28 | 4.22 | 4.78 | 4.80 | 4.07 | 5.20 |
+| Unit / Cargo integration shard 3/3 (Windows) | 10.45 | 10.23 | 10.57 | 10.47 | 11.67† | 12.83 |
+| Unit / Cargo integration shard 3/3 (macOS) | 7.03 | 6.98 | 7.72 | 6.48 | 7.00 | 2.40† |
+| Unit / Cargo libtest + watcher (Windows) | 0.03 | 0.05 | 0.05 | 0.05 | 0.03 | 0.07 |
+| Unit / Cargo libtest archive (macOS) | 24.03 | 15.13 | 25.07 | 24.08 | 9.97 | 10.57 |
+| Unit / Cargo libtest shard 1/3 (Windows) | 11.05 | 10.73 | 11.38 | 12.10 | 11.02 | 11.53 |
+| Unit / Cargo libtest shard 1/3 (macOS) | 3.67 | 4.22 | 1.72† | 4.62 | 3.92 | 4.20 |
+| Unit / Cargo libtest shard 2/3 (Windows) | 8.05 | 12.05 | 6.20 | 10.57 | 6.05 | 6.57 |
+| Unit / Cargo libtest shard 2/3 (macOS) | 4.52 | 4.10 | 4.32 | 3.38 | 3.88 | 4.15 |
+| Unit / Cargo libtest shard 3/3 (Windows) | 5.92 | 6.58 | 6.25 | 5.68 | 6.32 | 6.72 |
+| Unit / Cargo libtest shard 3/3 (macOS) | 3.33 | 4.08 | 2.92† | 4.55 | 3.47 | 4.07 |
+| Unit / Cargo test archive (Linux) | 5.15 | 7.28 | 6.77 | 7.48 | 5.40 | 6.88 |
+| Unit / Cargo test archive (Windows) | 7.68 | 10.22 | 13.97 | 11.02 | 11.22 | 10.32 |
+| Unit / Cargo test archive (macOS) | 22.62 | 17.83 | 20.80 | 21.92 | 22.02 | 8.53 |
+| Unit / Cargo watcher + conformance (Windows) | 8.93 | 9.28 | 8.52 | 9.52 | 11.77 | 9.95 |
+| Unit / Cargo watcher tests (macOS) | 6.73 | 7.22 | 7.00 | 7.67 | 9.38 | 5.08 |
+| Unit / MSRV check (rustc 1.92) | 1.67 | 3.00 | 1.62 | 3.75 | 2.85 | 3.98 |
+| Unit / Plugin e2e (bridge, Linux) | 2.60 | 4.23 | 2.82 | 4.03 | 4.05 | 3.73 |
+| Unit / Plugin e2e (opencode-ndjson, Linux) | 3.82 | 4.32 | 5.13 | 5.70 | 5.57 | 5.88 |
+| Unit / Plugin e2e (opencode-subc, Linux) | 2.47 | 3.32 | 2.92 | 4.22 | 4.02 | 3.50 |
+| Unit / Plugin e2e (pi, Linux) | 2.27 | 3.92 | 2.45 | 3.93 | 3.47 | 3.87 |
+| Unit / Prove Rust test inventory (macOS) | 1.60 | 1.50 | 1.10 | 1.03 | 1.50 | 1.28 |
+| Unit / Release storm (Linux) | 17.47 | 27.00 | 22.83 | 21.65 | 25.75 | 22.47 |
+| Unit / Sandbox real-kernel Landlock probes | 3.17 | 5.10 | 2.78 | 4.63 | 4.85 | 4.10 |
+| Unit / Unit tests (Linux) | 16.48† | 16.93† | 16.18 | 14.40† | 16.33† | 15.87† |
+| Unit / Unit tests (macOS) | 0.05† | 0.05† | 0.12† | 0.05† | 0.07† | 0.03† |
+| search-quality-gate | 9.22 | 11.77 | 6.80 | 11.80 | 9.68 | 9.07 |
+
+C materially cuts the macOS libtest archive from A's 24.03/15.13 minutes to
+9.97/10.57 minutes and keeps the native symbolication/backtrace tests. It does
+**not** achieve the whole-workflow objective: the bin archive and conformance
+chain still reached roughly 39 minutes in C warm, and release compilation
+plus search-quality evaluation remained around 24–31 minutes. D must prove
+cross-commit library cache reuse before claiming those paths are solved.
+
+### Search build policy candidates (report only)
+
+The current `ci_quality_mode.py` permits `verify` only for a manifest-only
+diff; every other diff evaluates. This change does not alter that selector,
+its registered ranking/routing source restrictions or any quality threshold.
+
+Using each historical gate's **logged merge-base**, not just the tip commit's
+parent, one sampled train has neither a registered ranking-source difference
+nor a conservative product build-input difference (the registered
+`RANKING_FENCE_PREFIXES` list above, plus all product Rust/tokenizer sources,
+Cargo manifests/lockfile, build script and `.cargo` configuration):
+
+- `train/identifier-prose-rows`, run 38522238644,
+  `1a87fec37ba54a0edcd6ac65bffdbd38851cff87...bf2cd8f0ffea30f63ef3566510355f7a3cbb6e82`.
+  Changes are `.gitignore`, benchmark row authoring/harness/tests, query vectors,
+  manifest/baseline/descriptors and versioned evidence JSON under `docs/`.
+  No `crates/aft/src`, tokenizer, Cargo manifest/lockfile, build script or
+  `.cargo` input changes. It still needs quality evaluation for the changed
+  benchmark inputs, but not a newly optimized search implementation.
+
+Other sampled trains without ranking-prefix changes still modify product
+Rust input (for example parser/outline, retention or subc code), so the
+conservative audit does **not** declare them safe to skip a fresh build.
+The dependency-cache/stats control A, workspace-cache experiment B and
+CI test-debuginfo experiment C (defined above) likewise leave the production
+release recipe/source untouched. Reusing an older executable would still
+require preserving accurate build-Git provenance; excluding that requirement
+is a separate policy decision, not an optimization made here. The exact
+13 train diff inventories are retained in `search-build-eligibility.json`.
+
+### macOS archive deadline headroom
+
+No timeout is increased. These are whole-job execution times, so successful
+headroom includes setup/upload overhead; a cancellation at the limit can
+report a slightly longer job duration because cleanup follows the killed step.
+
+| Archive | Existing limit min | C cold min | C cold headroom min | D1 cold min | D1 cold headroom |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Integration (`Cargo test archive (macOS)`) | 30 | 22.02 | 7.98 | 30.72, cancelled | 0; limit reached |
+| Library (`Cargo libtest archive (macOS)`) | 30 | 9.97 | 20.03 | 21.55 | 8.45 min |
+| Binary (`Cargo bin-test archive (macOS)`) | 25 | 19.80 | 5.20 | 20.82 | 4.18 min |
+
+C warm's bin archive finished at 24.98 minutes, only about 1 second inside
+its 25-minute limit. A separate train run 38560400715 also cancelled its bin
+archive at that limit. The cold integration path therefore **does not fit
+structurally yet**, and bin headroom is not robust.
+
+Line-tables already reduce the oversized libtest harness while retaining the
+native probes. D can remove repeated production-library compilation on warm
+same-source commits only if its library result was actually stored and the
+next runner hits it. That can improve integration/bin archive budgets, but
+is not a guarantee for a genuinely empty cache or changed Rust source. If D2
+still misses or cold deadlines remain unsafe, the next structural experiment
+should partition archive compilation targets (and prove exact inventory)
+rather than raise these limits or remove tests. Combining all archives on
+one runner would serialize compilation; a prebuild dependency also needs
+end-to-end measurement because it can merely move the cold compile before
+all shards. No unmeasured split is claimed as an implemented fix here.
