@@ -736,9 +736,54 @@ async fn worker_jail_spawns_with_dangling_socket_deny() {
     let target = root.path().join("not-running.sock");
     std::os::unix::fs::symlink(&target, &path).unwrap();
     let mut jail = Jail::start_with_sccache(None, Some(&path)).await;
-    let reply = jail.bash("printf 'DANGLING_SOCKET_SHELL_RAN\\n'").await;
-    assert!(reply.contains("DANGLING_SOCKET_SHELL_RAN"), "{reply}");
+    let reply = jail.bash("echo DANGLING_SOCKET_$((1+1))").await;
+    assert!(reply.contains("DANGLING_SOCKET_2"), "{reply}");
     assert!(!target.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn worker_jail_commits_and_deletes_packed_ref_without_errors() {
+    let mut jail = Jail::start().await;
+    git(&jail.main, &["branch", "packed-delete", "work"]);
+    git(&jail.main, &["pack-refs", "--all"]);
+    let common = jail.main.join(".git");
+    let packed = std::fs::read_to_string(common.join("packed-refs")).unwrap();
+    assert!(packed.contains(" refs/heads/packed-delete\n"));
+    assert!(!common.join("refs/heads/packed-delete").exists());
+    let committed = jail
+        .bash(&format!(
+            "cd {} && git -c user.name=w -c user.email=w@example.com commit --allow-empty -q -m packed-probe && echo PACKED_COMMIT_$((1+1))",
+            quote(&jail.worktree),
+        ))
+        .await;
+    assert!(committed.contains("PACKED_COMMIT_2"), "{committed}");
+    assert!(!committed.contains("error:"), "{committed}");
+    assert!(!committed.contains("fatal:"), "{committed}");
+    assert!(git(&jail.main, &["log", "-1", "--format=%s", "work"]).contains("packed-probe"));
+    let deleted = jail
+        .bash(&format!(
+            "cd {} && git branch -D packed-delete && echo PACKED_DELETE_$((1+1))",
+            quote(&jail.worktree),
+        ))
+        .await;
+    assert!(deleted.contains("PACKED_DELETE_2"), "{deleted}");
+    assert!(!deleted.contains("error:"), "{deleted}");
+    assert!(!deleted.contains("fatal:"), "{deleted}");
+    let absent = Command::new("git")
+        .current_dir(&jail.main)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/packed-delete",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(absent.code(), Some(1));
+    let packed = std::fs::read_to_string(common.join("packed-refs")).unwrap();
+    assert!(!packed.contains(" refs/heads/packed-delete\n"));
+    assert!(!common.join("packed-refs.lock").exists());
 }
 
 fn native_available() -> bool {

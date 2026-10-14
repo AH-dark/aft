@@ -1788,7 +1788,8 @@ struct WorkerJailGrants {
     caches: Vec<PathBuf>,
     /// Directories outside the worktree: Git stores and operator build targets.
     roots: Vec<PathBuf>,
-    /// Single lock and tracking files beside read-only configuration.
+    /// Exact-file write grants for packed refs, Cargo cache tracking and
+    /// build-slot locks, without granting their parent directories.
     files: Vec<PathBuf>,
     /// Cargo configuration, .rust-build-seeds, and immutable compiler launcher files.
     read_only: Vec<PathBuf>,
@@ -1820,9 +1821,9 @@ fn absolute_env_path(name: &str) -> Option<PathBuf> {
 /// Nothing comes from the command, its environment, or files inside the
 /// worktree, which the model can edit.
 ///
-/// - Git: a linked worktree's own Git directory, and the shared object, ref and
-///   log stores of its main repository. The shared `config`, hooks, `info` and
-///   other worktrees' entries stay read-only, on Seatbelt and Landlock alike.
+/// - Git: a linked worktree's own Git directory, the shared object, ref and
+///   log stores, and exactly `packed-refs` and `packed-refs.lock`. The shared
+///   `config`, hooks, `info` and other worktrees' entries stay read-only.
 /// - Cargo: `$CARGO_HOME/registry` and `git`, its lock files, and
 ///   `$RUSTUP_HOME/downloads` and `tmp`.
 /// - Build targets named by `CARGO_TARGET_DIR` in the AFT environment or by
@@ -1837,6 +1838,7 @@ fn worker_jail_grants(
 ) -> WorkerJailGrants {
     let mut grants = WorkerJailGrants {
         roots: linked_git_grants(git_policies),
+        files: linked_git_file_grants(git_policies),
         ..WorkerJailGrants::default()
     };
 
@@ -2057,6 +2059,19 @@ fn linked_git_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
         );
     }
     roots
+}
+
+/// Git's post-commit AUTO_MERGE cleanup and packed-ref deletion lock this
+/// shared pair. Exact-file grants keep the adjacent config and hooks read-only.
+#[cfg(unix)]
+fn linked_git_file_grants(git_policies: &[GitPolicy]) -> Vec<PathBuf> {
+    git_policies
+        .iter()
+        .filter_map(|git| git.linked.as_ref())
+        .flat_map(|(_, common_dir)| {
+            ["packed-refs", "packed-refs.lock"].map(|name| common_dir.join(name))
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -4602,6 +4617,51 @@ mod policy_tests {
                 "{} must stay read-only",
                 path.display()
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_jail_packed_refs_grants_are_exact_files_even_before_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let worktree = base.join("worktree");
+        let common = base.join("main/.git");
+        let own = common.join("worktrees/own");
+        for path in [&home, &worktree, &own] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let policy = crate::access_policy::AccessPolicy::from_config(
+            &crate::config::Config::default(),
+            &base.join("storage"),
+            vec![worktree.clone()],
+            &home,
+        );
+        let git = GitPolicy {
+            read_roots: Vec::new(),
+            hooks: vec![common.join("hooks")],
+            linked: Some((own, common.clone())),
+        };
+        let grants = worker_jail_grants(&home, &[worktree], &[git], &policy);
+        let files = [common.join("packed-refs"), common.join("packed-refs.lock")];
+        for file in &files {
+            assert!(!file.exists());
+            assert!(
+                grants.files.contains(file),
+                "missing exact file grant: {file:?}"
+            );
+        }
+        assert!(!grants.roots.iter().any(|root| common.starts_with(root)));
+        for name in [
+            "config",
+            "hooks/post-commit",
+            "info/exclude",
+            "packed-refs.other",
+        ] {
+            let refused = common.join(name);
+            assert!(!grants.files.contains(&refused));
+            assert!(!grants.roots.iter().any(|root| refused.starts_with(root)));
         }
     }
 
