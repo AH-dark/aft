@@ -5754,6 +5754,7 @@ mod fresh_payload_tests {
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_harness(crate::harness::Harness::Opencode);
         let manager = ctx.inspect_manager();
+        let metrics_wait = manager.non_expiring_metrics_wait_for_test();
         for params in [
             serde_json::json!({}),
             serde_json::json!({"scope":root.join("lib.ts")}),
@@ -5777,6 +5778,10 @@ mod fresh_payload_tests {
             assert_eq!(manager.source_scan_files_for_test(), 0);
             assert_eq!(ctx.lsp().server_count(), 0);
         }
+        assert!(
+            metrics_wait.worker_was_held(),
+            "delayed metrics worker hook was not reached"
+        );
     }
 
     fn snapshot() -> InspectSnapshot {

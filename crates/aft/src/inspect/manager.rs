@@ -744,6 +744,8 @@ pub struct InspectManager {
     callgraph_projection: Arc<ProjectionSlot>,
     oxc_facts_cache: Mutex<OxcFactsCache>,
     soft_deadline: Duration,
+    #[cfg(test)]
+    metrics_wait_for_test: Arc<Mutex<Option<Arc<MetricsWaitControlForTest>>>>,
     next_job_id: AtomicU64,
     heavy_root_work_allowed: Arc<AtomicBool>,
     semantic_cold_seed_active: Arc<AtomicBool>,
@@ -782,6 +784,32 @@ pub struct InspectManager {
     /// in the inspect cache, so status readers consult this set instead of a
     /// cached count from an earlier pass.
     dead_code_borrow_only_roots: Mutex<BTreeSet<PathBuf>>,
+}
+
+#[cfg(test)]
+struct MetricsWaitControlForTest {
+    non_expiring: bool,
+    worker_held: AtomicBool,
+    release_tx: Sender<()>,
+    release_rx: Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct MetricsWaitForTest(Arc<MetricsWaitControlForTest>);
+
+#[cfg(test)]
+impl MetricsWaitForTest {
+    pub(crate) fn worker_was_held(&self) -> bool {
+        self.0.worker_held.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetricsWaitForTest {
+    fn drop(&mut self) {
+        // A failed assertion must not leave the metrics worker parked forever.
+        let _ = self.0.release_tx.try_send(());
+    }
 }
 
 impl InspectManager {
@@ -832,7 +860,20 @@ impl InspectManager {
     ) -> Self {
         let root_work_cancellation = Arc::new(Mutex::new(crate::executor::JobCancellation::new()));
         let worker_cancellation = Arc::clone(&root_work_cancellation);
+        #[cfg(test)]
+        let metrics_wait_for_test = Arc::new(Mutex::new(None::<Arc<MetricsWaitControlForTest>>));
+        #[cfg(test)]
+        let metrics_worker_control = metrics_wait_for_test.clone();
         let guarded_worker: InspectWorker = Arc::new(move |job| {
+            #[cfg(test)]
+            if job.category == InspectCategory::Metrics {
+                let control = metrics_worker_control.lock().unwrap().clone();
+                if let Some(control) = control {
+                    if !control.worker_held.swap(true, Ordering::SeqCst) {
+                        let _ = control.release_rx.recv();
+                    }
+                }
+            }
             let token = worker_cancellation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -860,6 +901,8 @@ impl InspectManager {
             callgraph_projection: Arc::new(Mutex::new(None)),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
+            #[cfg(test)]
+            metrics_wait_for_test,
             next_job_id: AtomicU64::new(1),
             heavy_root_work_allowed,
             semantic_cold_seed_active,
@@ -880,6 +923,27 @@ impl InspectManager {
             reuse_starts: AtomicU64::new(0),
             source_scan_files: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn non_expiring_metrics_wait_for_test(&self) -> MetricsWaitForTest {
+        let (release_tx, release_rx) = bounded(1);
+        let control = Arc::new(MetricsWaitControlForTest {
+            non_expiring: true,
+            worker_held: AtomicBool::new(false),
+            release_tx,
+            release_rx,
+        });
+        let previous = self
+            .metrics_wait_for_test
+            .lock()
+            .unwrap()
+            .replace(control.clone());
+        assert!(
+            previous.is_none(),
+            "metrics wait control already installed for manager"
+        );
+        MetricsWaitForTest(control)
     }
 
     fn heavy_root_work_allowed(&self) -> bool {
@@ -3982,6 +4046,23 @@ impl InspectManager {
         wait_budget: Duration,
     ) -> JobOutcome {
         let timeout = after(deadline.saturating_duration_since(Instant::now()));
+        #[cfg(test)]
+        let timeout = match self.metrics_wait_for_test.lock().unwrap().clone() {
+            Some(control) if key.category == InspectCategory::Metrics => {
+                if control.non_expiring {
+                    // Install a clock that cannot expire before releasing the
+                    // real metrics worker; scheduling latency is not freshness.
+                    let timeout = crossbeam_channel::never();
+                    let _ = control.release_tx.try_send(());
+                    timeout
+                } else {
+                    // The expired-clock control keeps metrics pending, forcing
+                    // the old deadline/result ordering without a wall sleep.
+                    after(Duration::ZERO)
+                }
+            }
+            _ => timeout,
+        };
         let result_rx = self.result_rx.clone();
         loop {
             // Route a worker result before an equally ready deadline notification.
