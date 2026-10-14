@@ -2892,6 +2892,15 @@ fn translate_inspect(args: Value, project_root: &Path) -> Result<Translated, Tra
 mod tests {
     use super::*;
 
+    /// Compares by path components, so Windows separators in the translated
+    /// path still match the slash-written expectation.
+    fn assert_same_path(actual: &Value, expected: &str, context: &str) {
+        let actual = actual
+            .as_str()
+            .unwrap_or_else(|| panic!("{context}: expected a path string, got {actual}"));
+        assert_eq!(Path::new(actual), Path::new(expected), "{context}");
+    }
+
     #[test]
     fn relative_tool_paths_resolve_against_project_root() {
         let project_root = Path::new("/workspace/project");
@@ -2903,7 +2912,7 @@ mod tests {
             }
             let translated = subc_translate_owned("import", args, project_root)
                 .expect("translate import operation");
-            assert_eq!(translated.args["file"], expected_file, "op {op}");
+            assert_same_path(&translated.args["file"], expected_file, &format!("op {op}"));
         }
 
         let cases = [
@@ -2950,7 +2959,26 @@ mod tests {
         for (tool, args, field, expected) in cases {
             let translated = subc_translate_owned(tool, args, project_root)
                 .unwrap_or_else(|error| panic!("translate {tool}: {error:?}"));
-            assert_eq!(translated.args[field], expected, "tool {tool}");
+            let actual = &translated.args[field];
+            match &expected {
+                Value::Array(items) => {
+                    let actual = actual
+                        .as_array()
+                        .unwrap_or_else(|| panic!("tool {tool}: expected an array, got {actual}"));
+                    assert_eq!(actual.len(), items.len(), "tool {tool}");
+                    for (actual, expected) in actual.iter().zip(items) {
+                        assert_same_path(
+                            actual,
+                            expected.as_str().unwrap(),
+                            &format!("tool {tool}"),
+                        );
+                    }
+                }
+                Value::String(expected) => {
+                    assert_same_path(actual, expected, &format!("tool {tool}"))
+                }
+                other => panic!("tool {tool}: unexpected expectation {other}"),
+            }
         }
     }
 
