@@ -122,7 +122,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
 
     def test_macos_rust_buckets_and_bun_suite_run_in_parallel_lanes(self) -> None:
         integration_archive = workflow_job("unit-macos-nextest-archive")
-        self.assertIn("kind(test) - binary(=watcher_integration)", integration_archive)
+        self.assertIn("scripts/ci-macos-integration-archive.py archive", integration_archive)
+        self.assertIn("scripts/ci-macos-integration-archive.py list", integration_archive)
         self.assertIn('SCCACHE_IDLE_TIMEOUT: "0"', integration_archive)
         self.assertIn("macos-integration-inventory.json", integration_archive)
         self.assertIn("macos-doctest-inventory.txt", integration_archive)
@@ -169,9 +170,6 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("AFT_GATE_PHASES: watcher", watcher)
 
         conformance = workflow_job("unit-macos-conformance")
-        self.assertIn("unit-macos-nextest-archive", conformance)
-        self.assertIn("unit-macos-libtest-archive", conformance)
-        self.assertIn("unit-macos-bin-archive", conformance)
         self.assertIn("AFT_GATE_PHASES: conformance", conformance)
         self.assertIn("bun run test:unit", conformance)
 
@@ -234,14 +232,15 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("integration_partition_errors = partition_coverage_errors(", PROOF_TEXT)
         self.assertIn("integration_shardable_entries, integration_partitions", PROOF_TEXT)
 
-    def test_macos_conformance_waits_until_archives_finish(self) -> None:
+    def test_macos_conformance_starts_with_its_own_build_not_archive_artifacts(self) -> None:
         conformance = workflow_job("unit-macos-conformance")
         dependencies = conformance.split("    steps:", 1)[0]
 
-        self.assertIn("needs:", dependencies)
-        self.assertIn("unit-macos-nextest-archive", dependencies)
-        self.assertIn("unit-macos-libtest-archive", dependencies)
-        self.assertIn("unit-macos-bin-archive", dependencies)
+        self.assertNotIn("needs:", dependencies)
+        self.assertNotIn("actions/download-artifact", conformance)
+        self.assertIn("python3 scripts/check-path-deps.py", conformance)
+        self.assertIn("cargo build -p agent-file-tools", conformance)
+        self.assertIn("AFT_BINARY_PATH: ${{ github.workspace }}/target/debug/aft", conformance)
 
 
 if __name__ == "__main__":
