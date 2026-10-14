@@ -26,6 +26,8 @@ on:
         default: release
 
 env:
+  # Preserve the compiler cache daemon and its statistics between build steps.
+  SCCACHE_IDLE_TIMEOUT: "0"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # cargo puts `stage`-profile output under target/stage/, `release` under
   # target/release/. Every path below derives from this pair.

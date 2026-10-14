@@ -57,6 +57,23 @@ class BranchPatternTests(unittest.TestCase):
         ))
 
 
+class CISpeedWorkflowTests(unittest.TestCase):
+    def test_long_compiles_keep_sccache_server_alive(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        for name in ("tests.yml", "_unit-suite.yml", "_e2e-suite.yml"):
+            with self.subTest(workflow=name):
+                workflow = workflow_gates.parse_workflow(str(root / ".github/workflows" / name))
+                self.assertEqual(str(workflow.get("env", {}).get("SCCACHE_IDLE_TIMEOUT")), "0")
+
+    def test_measurement_pushes_run_the_full_tests_workflow(self) -> None:
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/tests.yml"
+        workflow = workflow_gates.parse_workflow(str(path))
+        for branch in ("main", "train/nested/fix", "ci-speed/sccache", "ci-speed/workspace"):
+            with self.subTest(branch=branch):
+                self.assertTrue(workflow_gates.push_matches(workflow, branch))
+        self.assertNotIn("paths", workflow_gates.on_section(workflow)["push"])
+
+
 class MacOSUnitWorkflowTests(unittest.TestCase):
     def test_required_macos_check_aggregates_every_lane(self) -> None:
         summary = workflow_job("unit-macos")
