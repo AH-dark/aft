@@ -213,7 +213,7 @@ fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
         req_id,
         code,
         format!("{}: {error}", path.display()),
-        serde_json::json!({"path":path}),
+        serde_json::json!({"path":path,"os_error":error.raw_os_error()}),
     )
 }
 

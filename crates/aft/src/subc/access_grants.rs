@@ -111,15 +111,15 @@ fn register_on(
             stamp.kind,
             subc_protocol::scope::ScopeKind::Head | subc_protocol::scope::ScopeKind::Ephemeral
         ) {
-            if let Some(agent_id) = stamp.attributes.agent_id.as_deref() {
-                store::register_agent(
-                    conn,
-                    &scope_key(identity),
-                    agent_id,
-                    stamp.kind == subc_protocol::scope::ScopeKind::Head,
-                )
-                .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
-            }
+            // Preserve the attested role even when no agent id was supplied.
+            // Empty ids are never used to link a run to another session.
+            store::register_agent(
+                conn,
+                &scope_key(identity),
+                stamp.attributes.agent_id.as_deref().unwrap_or(""),
+                stamp.kind == subc_protocol::scope::ScopeKind::Head,
+            )
+            .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
         }
     }
     Ok(())

@@ -360,6 +360,14 @@ fn fixture(fake: Arc<FakeCingulate>) -> Fixture {
     let worker = identity(&worker_root, Some(stamp("worker", "worker", Some("head"))));
     access_grants::register(&head, &ctx).unwrap();
     access_grants::register(&worker, &ctx).unwrap();
+    // These permission-request cases exercise an explicitly selected ask mode,
+    // not the primary agent's temporary full-access default.
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"ask"}}),
+        &head,
+        &ctx,
+    )
+    .unwrap();
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(worker.root.clone(), Arc::clone(&ctx)));
     install_test_transport(Some(Arc::new(SharedFake(Arc::clone(&fake)))));
@@ -808,7 +816,7 @@ async fn consent_user_answer_is_not_rechecked_against_the_head() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn consent_stamped_head_defaults_to_ask_and_full_access_opts_out() {
+async fn consent_stamped_head_with_explicit_ask_requests_user_and_full_access_opts_out() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let target = f.dir.path().join("elsewhere.txt");
@@ -937,6 +945,7 @@ fn access_pending_target_normalization_handles_windows_paths() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn access_pending_wire_matches_golden_vector() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -969,6 +978,73 @@ async fn access_pending_wire_matches_golden_vector() {
         wire.as_bytes(),
         include_bytes!("../../../../test-vectors/access-pending-v1/worker-read-outside.json")
     );
+}
+
+#[tokio::test]
+async fn access_pending_renderer_wire_matches_golden_vector_without_consent() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let outside = f.head_root.join("shared.txt");
+    // The consent service cannot express native Windows drive/UNC paths.
+    // Every platform still pins the exact pending reply bytes through AFT's
+    // production message builder and transport serializer, without an ask.
+    let call = HeldCall {
+        reply_deadline: Instant::now() + Duration::from_secs(5),
+        identity: f.worker.clone(),
+        tool: "read".into(),
+        arguments: json!({"filePath":outside}),
+        request_id: "subc-41-7".into(),
+        executor: Arc::clone(&f.executor),
+        route: RouteChannel {
+            channel: 41,
+            epoch: 1,
+        },
+        corr: 7,
+        active: Arc::clone(&f.active),
+        connection_cancel: f.connection_cancel.clone(),
+        drain: drain::ModuleDrainWindow::default(),
+    };
+    let grant = AccessGrant {
+        path: outside.clone(),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let result = finish_tool_call_response(
+        "read",
+        &crate::subc_format::FormatContext::default(),
+        pending_answer(&call, &grant),
+        false,
+        None,
+        None,
+    );
+    let frame = super::super::wire::build_tool_response_frame(
+        PROTOCOL_VERSION,
+        call.route,
+        call.corr,
+        control_flags(),
+        &result,
+        BindTrust::FirstParty,
+    )
+    .unwrap();
+    let wire = String::from_utf8(frame.body).unwrap();
+    let body: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["isError"], true);
+    assert_eq!(code(&body), "access_pending");
+    assert!(body.get("errorCode").is_none());
+    assert!(body["structuredContent"].get("elicitation_id").is_none());
+    let request_id = body["structuredContent"]["id"].as_str().unwrap();
+    let target_path = body["structuredContent"]["ask"]["path"].as_str().unwrap();
+    assert!(body["structuredContent"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(target_path));
+    let wire = normalize_access_pending_wire(&wire, request_id, target_path);
+    assert_eq!(
+        wire.as_bytes(),
+        include_bytes!("../../../../test-vectors/access-pending-v1/worker-read-outside.json")
+    );
+    assert!(f.fake.calls("consent.request").is_empty());
 }
 
 #[test]

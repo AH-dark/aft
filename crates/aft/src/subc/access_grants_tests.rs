@@ -36,7 +36,7 @@ fn context(root: &Path, storage: &Path) -> AppContext {
     )));
     ctx
 }
-fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
+fn default_fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("head");
     let work = dir.path().join("worker");
@@ -52,6 +52,16 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     register(&head, &ctx).unwrap();
     register(&worker, &ctx).unwrap();
     (dir, ctx, head, worker)
+}
+fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
+    let result = default_fixture();
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"ask"}}),
+        &result.2,
+        &result.1,
+    )
+    .unwrap();
+    result
 }
 fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
@@ -444,8 +454,34 @@ fn grants_codemode_run_uses_agent_policy_and_revocation_without_copying() {
 }
 
 #[test]
-fn modes_new_heads_ask_instead_of_lowering_outside_access() {
-    let (_dir, _ctx, head, _worker) = fixture();
+fn modes_unstored_head_defaults_to_full_access_but_worker_still_asks() {
+    use crate::access_policy::ApprovalMode;
+    let (dir, ctx, head, worker) = default_fixture();
+    let outside = policy_path(&dir.path().join("outside"));
+    let db = ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    assert_eq!(
+        store::mode(&conn, &scope_key(&head)).unwrap(),
+        ApprovalMode::FullAccess
+    );
+    assert_eq!(
+        store::mode(&conn, &scope_key(&worker)).unwrap(),
+        ApprovalMode::Ask
+    );
+    let head_policy = policy_for_scope(&conn, &scope_key(&head), &ctx)
+        .unwrap()
+        .unwrap();
+    let worker_policy = policy_for_scope(&conn, &scope_key(&worker), &ctx)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        head_policy.decide(AccessOperation::Read, &outside, false),
+        AccessDecision::Allow
+    );
+    assert_eq!(
+        worker_policy.decide(AccessOperation::Read, &outside, false),
+        AccessDecision::Ask
+    );
     assert!(matches!(
         ask_route(&head),
         crate::access_policy::AskRoute::Consent { .. }
@@ -587,26 +623,18 @@ fn modes_worker_inherits_live_head_until_plan_override_and_survives_restart() {
 #[test]
 fn modes_full_access_head_holds_outside_allow_paths_except_denied_floor() {
     use crate::access_policy::ApprovalMode;
-    let (dir, ctx, head, worker) = fixture();
+    let (dir, ctx, head, worker) = default_fixture();
     let outside = dir.path().join("scratch-checkout");
     std::fs::create_dir(&outside).unwrap();
     let outside = policy_path(&outside);
     let raw = json!([{"path":outside,"mode":"write"}]);
-    let refused = remote_policy::catalog(catalog_request(raw.clone()), &head, &ctx).unwrap_err();
-    assert_eq!(refused.detail.unwrap()["reason"], "head_not_held");
     {
         let db = ctx.db().unwrap();
         assert_eq!(
             store::mode(&db.lock().unwrap(), &scope_key(&head)).unwrap(),
-            ApprovalMode::Ask
+            ApprovalMode::FullAccess
         );
     }
-    remote_policy::catalog(
-        json!({"preset":"head","params":{"mode":"full-access"}}),
-        &head,
-        &ctx,
-    )
-    .unwrap();
     remote_policy::catalog(catalog_request(raw.clone()), &head, &ctx).unwrap();
     remote_policy::catalog(catalog_request(raw.clone()), &worker, &ctx).unwrap();
     {

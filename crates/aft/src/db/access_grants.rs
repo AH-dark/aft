@@ -65,7 +65,7 @@ pub fn register_agent(
 }
 
 fn agent_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<ScopeKey>> {
-    conn.query_row("SELECT h.scope_ref,h.epoch FROM access_scope_agents r JOIN access_scope_agents h ON h.owner=r.owner AND h.agent_id=r.agent_id AND h.kind='head' JOIN access_scopes s ON s.owner=h.owner AND s.scope_ref=h.scope_ref AND s.epoch=h.epoch AND s.ended=0 WHERE r.owner=?1 AND r.scope_ref=?2 AND r.epoch=?3 AND r.kind='run' ORDER BY length(h.epoch) DESC,h.epoch DESC LIMIT 1", params![key.owner,key.scope_ref,key.epoch.to_string()], |r| {
+    conn.query_row("SELECT h.scope_ref,h.epoch FROM access_scope_agents r JOIN access_scope_agents h ON h.owner=r.owner AND h.agent_id=r.agent_id AND h.kind='head' JOIN access_scopes s ON s.owner=h.owner AND s.scope_ref=h.scope_ref AND s.epoch=h.epoch AND s.ended=0 WHERE r.owner=?1 AND r.scope_ref=?2 AND r.epoch=?3 AND r.kind='run' AND r.agent_id<>'' ORDER BY length(h.epoch) DESC,h.epoch DESC LIMIT 1", params![key.owner,key.scope_ref,key.epoch.to_string()], |r| {
         let epoch: String = r.get(1)?;
         Ok(ScopeKey {owner:key.owner.clone(),scope_ref:r.get(0)?,epoch:epoch.parse().map_err(|e| rusqlite::Error::FromSqlConversionFailure(1,rusqlite::types::Type::Text,Box::new(e)))?})
     }).optional()
@@ -81,12 +81,26 @@ pub fn set_mode(
     Ok(())
 }
 
-/// Unset worker modes follow the live head instead of copying its setting at
-/// launch. Bound ancestry traversal also fails closed on corrupt cyclic rows.
+/// For attested heads, absent stored settings allow outside-root access for now
+/// (the deny floor still wins). Workers and standalone scopes still ask. Only
+/// explicitly stored parent settings are inherited, never the head's fallback.
+/// Bound ancestry traversal also fails closed on corrupt cyclic rows.
 pub fn mode(
     conn: &Connection,
     key: &ScopeKey,
 ) -> rusqlite::Result<crate::access_policy::ApprovalMode> {
+    use crate::access_policy::ApprovalMode;
+    let kind: Option<String> = conn.query_row(
+        "SELECT a.kind FROM access_scope_agents a JOIN access_scopes s ON s.owner=a.owner AND s.scope_ref=a.scope_ref AND s.epoch=a.epoch AND s.ended=0 WHERE a.owner=?1 AND a.scope_ref=?2 AND a.epoch=?3",
+        params![key.owner,key.scope_ref,key.epoch.to_string()], |row| row.get(0),
+    ).optional()?;
+    let fallback = if kind.as_deref() == Some("head")
+        || (kind.as_deref() == Some("run") && parent(conn, key)?.is_none())
+    {
+        ApprovalMode::FullAccess
+    } else {
+        ApprovalMode::Ask
+    };
     let mut scope = key.clone();
     for _ in 0..16 {
         let value: Option<String> = conn
@@ -101,7 +115,7 @@ pub fn mode(
         }
         let next = parent(conn, &scope)?.or(agent_head(conn, &scope)?);
         let Some(next) = next else {
-            return Ok(Default::default());
+            return Ok(fallback);
         };
         scope = next;
     }
