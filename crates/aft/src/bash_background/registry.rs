@@ -14075,113 +14075,57 @@ mod tests {
         );
     }
 
-    /// Verify that the live watchdog path (reap_child) gives an exited
-    /// child one watchdog pass for its exit marker to land, then marks the
-    /// task Failed if the next pass still sees no marker.
-    ///
-    /// Cross-platform: uses a quick-exiting command that does NOT go
-    /// through the wrapper script (we manually clear the exit marker
-    /// after spawn to simulate the wrapper crashing before write).
+    /// An observed child exit gets one watchdog pass for its marker to land;
+    /// the next pass fails the task if the marker is still absent.
     #[test]
     fn reap_child_marks_failed_when_child_exits_without_exit_marker() {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         let dir = tempfile::tempdir().unwrap();
-        let task_id = registry
-            .spawn(
-                SpawnPlan::Unsandboxed,
-                QUICK_SUCCESS_COMMAND,
-                "session".to_string(),
-                dir.path().to_path_buf(),
-                HashMap::new(),
-                crate::bash_background::HardKill::After(Duration::from_secs(30)),
-                dir.path().to_path_buf(),
-                10,
-                true,
-                false,
-                Some(dir.path().to_path_buf()),
-            )
-            .unwrap();
+        let task_id = random_slug();
+        let layout = create_task_layout(dir.path(), "session", &task_id).unwrap();
 
-        let task = registry.task_for_session(&task_id, "session").unwrap();
+        // This test exercises reaping, not shell startup. Own a direct child
+        // and wait for its exit instead of racing a wrapper and the watchdog.
+        // Child::wait leaves its exit status observable through try_wait.
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("true");
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/c", "exit", "0"]);
+            command
+        };
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child for reap test");
+        assert!(child.wait().expect("wait for child exit").success());
+        assert!(child.try_wait().unwrap().is_some());
 
-        // Wait for the child to actually exit and the wrapper to either
-        // write the marker or fail. Then nuke the marker to simulate
-        // wrapper crash before write. Poll up to 5s; this is plenty for a
-        // `true`/`cmd /c exit 0` invocation.
-        let started = Instant::now();
-        loop {
-            let exited = {
-                let mut state = task.lock_state().unwrap();
-                match &mut state.runtime {
-                    TaskRuntime::Piped(Some(child)) => matches!(child.try_wait(), Ok(Some(_))),
-                    _ => true,
-                }
-            };
-            if exited {
-                break;
-            }
-            assert!(
-                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
-                "child should exit quickly"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        // Stop the watchdog so it doesn't race with our manual reap_child.
-        // On fast Windows runners the watchdog ticks (every 500ms) can
-        // observe the child exit and reap it before this test's assertion
-        // fires, leaving us with state.child = None and an already-terminal
-        // status. We specifically want to test reap_child's logic when
-        // invoked manually on a Running-but-actually-dead task, so we need
-        // exclusive control over the reap path here.
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            QUICK_SUCCESS_COMMAND.to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.status = BgTaskStatus::Running;
+        metadata.child_pid = Some(child.id());
+        write_task_at(&layout, &metadata).unwrap();
+        // Restore the task from metadata without starting the watchdog. Restored
+        // tasks have no open output handles, so reaping cannot write an exit
+        // marker on the child's behalf. This models a wrapper that crashed
+        // before it could publish its exit code.
         registry
-            .inner
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        // Give the watchdog at most one tick (500ms) to notice shutdown
-        // before we touch task state. Without this, an in-flight watchdog
-        // iteration could still race with our state setup below.
-        std::thread::sleep(Duration::from_millis(550));
-
-        // Wrapper likely wrote the marker by now; remove it to simulate
-        // a wrapper crash that exited before persisting the exit code.
-        let _ = std::fs::remove_file(&task.paths.exit);
-
-        // The watchdog may have already reaped the child handle and
-        // marked the task terminal before we got here. Reset both so
-        // reap_child has the "Running task whose child just exited"
-        // shape it's designed to handle. If the original child handle is
-        // gone, install a quick-exited stand-in so the first reap exercises
-        // the same try_wait path as production.
-        //
-        // CRITICAL on Windows: the watchdog ticks fast enough that the
-        // JSON on disk may already say `Completed`. `update_task` (called
-        // by `reap_child`) reads from disk, applies the closure, but
-        // ROLLS BACK if the original on-disk state was already terminal
-        // (see persistence.rs::update_task). So we must reset BOTH
-        // in-memory metadata AND the JSON on disk to a Running state to
-        // give reap_child the fresh shape it expects to operate on.
-        {
-            let mut state = task.lock_state().unwrap();
-            state.metadata.status = BgTaskStatus::Running;
-            state.metadata.status_reason = None;
-            state.metadata.exit_code = None;
-            state.metadata.finished_at = None;
-            state.metadata.duration_ms = None;
-            // Persist the reset state to disk so update_task's terminal
-            // rollback guard sees a non-terminal starting point.
-            crate::bash_background::persistence::write_task(&task.paths.json, &state.metadata)
-                .expect("persist reset Running metadata for reap_child test");
-            // If the watchdog already nulled state.child, we need to
-            // simulate "child exists and is dead" so reap_child's
-            // try_wait path runs. Spawn a quick-exit child as a stand-in.
-            if matches!(state.runtime, TaskRuntime::Piped(None)) {
-                state.runtime = TaskRuntime::Piped(Some(spawn_dead_child()));
-            }
-        }
-        // Clear the terminal_at marker too so mark_terminal_now() can fire
-        // again inside reap_child.
-        *task.terminal_at.lock().unwrap() = None;
+            .insert_rehydrated_task(metadata, layout.paths.clone(), false)
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        task.lock_state().unwrap().runtime = TaskRuntime::Piped(Some(child));
 
         // Sanity: task is still Running per metadata (replay/poll hasn't
         // observed the missing marker yet).
