@@ -917,6 +917,326 @@ fn fast_schedule(root: &Path) -> FillSchedule {
     }
 }
 
+#[test]
+fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let source = "pub fn reused() -> u8 { 1 }\n";
+    write_tree(root.path(), &[("file.rs", source)]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let model = Arc::new(Model::default());
+    refresh(&runtime, &model);
+    let embedded = model.texts();
+    let path = root.path().join("file.rs");
+    std::fs::write(&path, format!("\n\n{source}")).unwrap();
+    runtime.driver().record_absolute_change(&path);
+    runtime.load().unwrap();
+    assert_eq!(pending_semantic(&runtime), 1);
+    runtime.driver().take_reconcile_work();
+    runtime.plane().take_source_reads();
+    let schedule = fast_schedule(root.path());
+    let held = schedule.limiter.try_acquire().unwrap();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        let model = Arc::clone(&model);
+        std::thread::spawn(move || {
+            super::super::semantic::before_claim_for_test(|| {
+                std::thread::sleep(Duration::from_millis(30));
+            });
+            let (outcome, lines) = crate::logging::capture_log_lines(|| {
+                catch_up(
+                    &weak,
+                    epoch,
+                    &runtime,
+                    &schedule,
+                    FillBudget::default(),
+                    &mut |texts| model.embed(texts),
+                )
+            });
+            tx.send((matches!(outcome, FillOutcome::Settled), lines))
+                .unwrap();
+        })
+    };
+    let completed = rx.recv_timeout(Duration::from_secs(2));
+    if completed.is_err() {
+        slot.clear();
+    }
+    drop(held);
+    worker.join().unwrap();
+    let (settled, lines) = completed.expect("reuse-only fill waited for the cold-build cap");
+    assert!(settled);
+    assert_eq!(model.texts(), embedded);
+    assert!(query(&runtime, "reused").complete());
+    let work = runtime.driver().take_reconcile_work();
+    assert_eq!(
+        (work.walks, work.reads),
+        (0, 0),
+        "fold repeated source reconciliation: {work:?}"
+    );
+    assert_eq!(runtime.plane().take_source_reads().get(&path), Some(&1));
+    let summary = lines
+        .iter()
+        .find(|line| line.contains("INFO semantic view fill"))
+        .unwrap();
+    assert!(
+        summary.contains("chunk_reused=1") && summary.contains("calls=0"),
+        "{summary}"
+    );
+    assert!(summary.contains("cold_admitted=false"), "{summary}");
+    let lookup_ms: u128 = summary
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("file_lookup_ms="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        lookup_ms >= 30,
+        "lookup delay was not attributed: {summary}"
+    );
+    eprintln!(
+        "{summary}; reconcile_walks={} reconcile_reads={} fill_reads=1",
+        work.walks, work.reads
+    );
+}
+
+fn wait_for_fill_queue(limiter: &crate::cold_build_limiter::ColdBuildLimiter) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !limiter.census().queued.is_empty() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+#[test]
+fn small_missing_vectors_wait_for_cold_slot_and_stay_pending() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), &[("file.rs", "pub fn new_vector() {}\n")]);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let limiter = Arc::clone(&schedule.limiter);
+    let held = limiter.try_acquire().unwrap();
+    let model = Arc::new(Model::default());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let runtime = Arc::clone(&runtime);
+        let model = Arc::clone(&model);
+        let limiter = Arc::clone(&limiter);
+        std::thread::spawn(move || {
+            catch_up(
+                &weak,
+                epoch,
+                &runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| {
+                    assert!(
+                        !limiter.census().holders.is_empty(),
+                        "model ran without admission"
+                    );
+                    model.embed(texts)
+                },
+            )
+        })
+    };
+    let queued = wait_for_fill_queue(&limiter);
+    let calls_while_held = model.calls();
+    let pending_while_held = query(&runtime, "new vector").pending.len();
+    let reads_while_held = runtime.plane().take_source_reads();
+    drop(held);
+    assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    assert!(queued);
+    assert_eq!(calls_while_held, 0, "queued fill called the model");
+    assert_eq!(pending_while_held, 1, "queued fill was reported as ready");
+    assert_eq!(
+        reads_while_held.get(&root.path().join("file.rs")),
+        Some(&1),
+        "small preparation did not reach the vector miss"
+    );
+    assert_eq!(model.calls(), 1);
+    assert!(query(&runtime, "new vector").complete());
+}
+
+#[test]
+fn large_fill_size_gate_takes_cold_slot_before_source_preparation() {
+    for many_files in [true, false] {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        if many_files {
+            for i in 0..33 {
+                std::fs::write(
+                    root.path().join(format!("file_{i}.rs")),
+                    "pub fn large_queue() {}\n",
+                )
+                .unwrap();
+            }
+        } else {
+            std::fs::write(
+                root.path().join("large.rs"),
+                format!("pub fn large_input() {{}}\n{}", " ".repeat(256 * 1024)),
+            )
+            .unwrap();
+        }
+        let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+        let schedule = fast_schedule(root.path());
+        let limiter = Arc::clone(&schedule.limiter);
+        let held = limiter.try_acquire().unwrap();
+        runtime.plane().take_source_reads();
+        let worker = {
+            let weak = Arc::downgrade(&slot);
+            let runtime = Arc::clone(&runtime);
+            std::thread::spawn(move || {
+                catch_up(
+                    &weak,
+                    epoch,
+                    &runtime,
+                    &schedule,
+                    FillBudget {
+                        max_files: 1,
+                        ..FillBudget::default()
+                    },
+                    &mut |texts| Model::default().embed(texts),
+                )
+            })
+        };
+        let queued = wait_for_fill_queue(&limiter);
+        let reads_while_held = runtime.plane().take_source_reads();
+        let pending_while_held = query(&runtime, "large").pending.len();
+        drop(held);
+        assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+        assert!(
+            queued,
+            "large fill bypassed cold admission: many_files={many_files}"
+        );
+        assert!(
+            reads_while_held.is_empty(),
+            "large fill prepared before admission: {reads_while_held:?}"
+        );
+        assert_eq!(pending_while_held, if many_files { 33 } else { 1 });
+        assert!(query(&runtime, "large").complete());
+    }
+}
+
+#[test]
+fn small_preparation_bounds_reads_when_queued_file_grows() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let source = "pub fn small_input() {}\n";
+    write_tree(root.path(), &[("file.rs", source)]);
+    let (_slot, _epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let report = runtime
+        .refresh_admitted(
+            FillBudget::default(),
+            &mut |_| panic!("moved source reached the model"),
+            &mut |small| {
+                assert!(small, "fixture did not reach small preparation");
+                std::fs::write(root.path().join("file.rs"), " ".repeat(1024 * 1024)).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            report.queued,
+            report.moved,
+            report.installed,
+            report.model_calls
+        ),
+        (1, 1, 0, 0)
+    );
+    assert_eq!(report.source_reads, 1);
+    assert_eq!(
+        report.source_bytes,
+        source.len() as u64 + 1,
+        "small preparation read unbounded growth"
+    );
+    assert_eq!(query(&runtime, "small input").pending.len(), 1);
+}
+
+#[test]
+fn fifth_small_fill_waits_for_preparation_capacity_and_stays_pending() {
+    let storage: Vec<_> = (0..5).map(|_| tempfile::tempdir().unwrap()).collect();
+    let roots: Vec<_> = (0..5).map(|_| tempfile::tempdir().unwrap()).collect();
+    let preparation = crate::cold_build_limiter::isolated_limiter(PREPARATION_LIMIT);
+    let (entered_tx, entered_rx) = crossbeam_channel::bounded(5);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(5);
+    let mut lanes = Vec::new();
+    let mut workers = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        write_tree(
+            root.path(),
+            &[("file.rs", &format!("pub fn small_{i}() {{}}\n"))],
+        );
+        let (slot, epoch, _wake, runtime) = served_lane(storage[i].path(), root.path());
+        let schedule = fast_schedule(root.path());
+        let weak = Arc::downgrade(&slot);
+        let worker_runtime = Arc::clone(&runtime);
+        let preparation = Arc::clone(&preparation);
+        let entered = entered_tx.clone();
+        let release = release_rx.clone();
+        workers.push(std::thread::spawn(move || {
+            super::super::semantic::before_claim_for_test(move || {
+                entered.send(i).unwrap();
+                release.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            catch_up_with_preparation_limiter(
+                &weak,
+                epoch,
+                &worker_runtime,
+                &schedule,
+                FillBudget::default(),
+                &mut |texts| Model::default().embed(texts),
+                &preparation,
+            )
+        }));
+        lanes.push((slot, runtime));
+    }
+    let first_four: Vec<_> = (0..4)
+        .filter_map(|_| entered_rx.recv_timeout(Duration::from_secs(3)).ok())
+        .collect();
+    let queued = wait_for_fill_queue(&preparation);
+    let holders = preparation.census().holders.len();
+    let early_fifth = entered_rx.try_recv().ok();
+    let pending: Vec<_> = lanes
+        .iter()
+        .map(|(_, runtime)| query(runtime, "small").pending.len())
+        .collect();
+    let queued_visible = roots.iter().any(|root| {
+        crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0)
+            .queued
+            .iter()
+            .any(|job| job.kind == PREPARATION_KIND)
+    });
+    release_tx.send(()).unwrap();
+    let fifth = entered_rx.recv_timeout(Duration::from_secs(3)).ok();
+    for _ in 0..4 {
+        release_tx.send(()).unwrap();
+    }
+    for worker in workers {
+        assert!(matches!(worker.join().unwrap(), FillOutcome::Settled));
+    }
+    assert_eq!(first_four.len(), 4);
+    assert!(queued && queued_visible, "preparation wait was not visible");
+    assert_eq!(holders, 4);
+    assert!(
+        early_fifth.is_none(),
+        "fifth fill exceeded preparation capacity"
+    );
+    assert!(
+        fifth.is_some_and(|i| !first_four.contains(&i)),
+        "fifth fill did not resume after a preparation finished"
+    );
+    assert_eq!(pending, vec![1; 5], "preparations were reported as filled");
+    assert!(lanes
+        .iter()
+        .all(|(_, runtime)| query(runtime, "small").complete()));
+}
+
 /// A real HTTP backend, initially refusing connections, with counts separated
 /// into identity probes and source texts. Binding is delayed until the test
 /// has observed the worker's first failure.
@@ -1475,7 +1795,25 @@ fn semantic_view_fill_summary_reports_backend_embedding_timing() {
         .iter()
         .find(|line| line.contains("INFO semantic view fill"))
         .unwrap_or_else(|| panic!("missing view fill summary in {lines:?}"));
-    for field in ["elapsed_ms=", "embed_ms=", "embed_max_ms="] {
+    for field in [
+        "elapsed_ms=",
+        "embed_ms=",
+        "embed_max_ms=",
+        "admission_wait_ms=",
+        "mutex_wait_ms=",
+        "reconcile_ms=",
+        "queue_setup_ms=",
+        "read_hash_ms=",
+        "file_lookup_ms=",
+        "chunk_ms=",
+        "chunk_wait_ms=",
+        "vector_lookup_ms=",
+        "store_write_ms=",
+        "shared_wait_ms=",
+        "fold_ms=",
+        "source_reads=",
+        "source_bytes=",
+    ] {
         assert!(summary.contains(field), "{summary}");
     }
     let field = |name: &str| -> u128 {

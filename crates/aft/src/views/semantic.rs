@@ -28,9 +28,10 @@
 //! Registration is opt-in: constructing a plane changes no routing.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::blob_store::v2::{
     ContentHash, FamilyKey, FamilyPlane, FamilyStore, FamilyStoreReader, PutOrTouch,
@@ -258,9 +259,8 @@ impl Default for FillBudget {
     }
 }
 
-/// What one fill did. `model_calls` and `embedded_texts` count real calls
-/// into the embedding function; every other counter is work that was avoided
-/// or deferred.
+/// What one fill did, including source work, reuse, completion and elapsed phase times.
+/// `model_calls` and `embedded_texts` count real calls into the embedding function.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FillReport {
     /// Work items queued when the fill started.
@@ -282,6 +282,8 @@ pub struct FillReport {
     /// Chunks in claimed file versions, including reused chunks.
     pub chunks: usize,
     pub chunk_reused: usize,
+    pub source_reads: usize,
+    pub source_bytes: u64,
     /// Completions installed into the fill map.
     pub installed: usize,
     /// Completions dropped because content or producer moved on.
@@ -294,6 +296,25 @@ pub struct FillReport {
     /// Store errors other than busy: the store refused what was embedded.
     /// Their items stay pending, but retrying on a timer would not help.
     pub store_errors: Vec<String>,
+    pub timing: FillTiming,
+}
+
+/// Wall-clock phases of a fill. `file_lookup`, `store_write` and `fold` include
+/// their SQLite waits and pin-file I/O. `chunk_wait` measures the lock shared by
+/// a repository family's chunk batches; `vector_lookup` excludes that lock wait.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FillTiming {
+    pub mutex_wait: Duration,
+    pub reconcile: Duration,
+    pub queue_setup: Duration,
+    pub read_hash: Duration,
+    pub file_lookup: Duration,
+    pub chunk: Duration,
+    pub chunk_wait: Duration,
+    pub vector_lookup: Duration,
+    pub store_write: Duration,
+    pub shared_wait: Duration,
+    pub fold: Duration,
 }
 
 /// A semantic answer for one snapshot. Paths without current vectors are
@@ -626,6 +647,31 @@ impl SemanticPlane {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        self.fill_admitted(
+            owner,
+            snapshot,
+            budget,
+            embed,
+            current,
+            &mut || Ok(()),
+            false,
+        )
+    }
+
+    pub(crate) fn fill_admitted<F>(
+        &self,
+        owner: &ViewRegistration,
+        snapshot: &Snapshot,
+        budget: FillBudget,
+        embed: &mut F,
+        current: &dyn Fn() -> Snapshot,
+        before_embed: &mut dyn FnMut() -> Result<(), String>,
+        bounded_reads: bool,
+    ) -> Result<FillReport, PlaneError>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        let setup_started = Instant::now();
         let access = ViewAccess::Owner(owner.clone());
         if owner.registry().storage() != self.storage {
             return Err(plane_error("view belongs to another storage root"));
@@ -652,8 +698,10 @@ impl SemanticPlane {
         crate::cold_build_limiter::progress::remaining(items.len());
         report.deferred = items.len().saturating_sub(budget.max_files);
         items.truncate(budget.max_files);
+        report.timing.queue_setup = setup_started.elapsed();
 
         let root = owner.root().to_path_buf();
+        let read_started = Instant::now();
         let mut prepared = Vec::new();
         let mut by_path = BTreeMap::new();
         for item in items {
@@ -670,7 +718,26 @@ impl SemanticPlane {
             {
                 *lock(&self.source_reads).entry(source.clone()).or_default() += 1;
             }
-            match std::fs::read(&source) {
+            // A file can grow after its snapshot size was counted toward the
+            // small-input limit. Read at most that recorded size plus one byte
+            // to detect growth without allocating it. Content that no longer
+            // matches the snapshot stays pending for reconciliation.
+            let bytes = if bounded_reads {
+                let size = match snapshot.disk_state(&item.rel_path) {
+                    DiskState::Present { size, .. } => size,
+                    DiskState::Absent => 0,
+                };
+                std::fs::File::open(&source).and_then(|file| {
+                    let mut bytes = Vec::new();
+                    file.take(size.saturating_add(1)).read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                })
+            } else {
+                std::fs::read(&source)
+            };
+            report.source_reads += 1;
+            report.source_bytes += bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);
+            match bytes {
                 Ok(bytes) if ContentHash::of(&bytes) == item.content => {
                     prepared.push(PreparedWork {
                         rel_path: item.rel_path.as_bytes().to_vec(),
@@ -690,7 +757,9 @@ impl SemanticPlane {
             let state = lock(&view);
             groups.retain(|group| !state.tracker.is_quarantined(&group.full_key));
         }
+        report.timing.read_hash += read_started.elapsed();
 
+        let lookup_started = Instant::now();
         let arena = self.arena(owner.family());
         let store = owner
             .open_store(FamilyPlane::Semantic)
@@ -740,8 +809,10 @@ impl SemanticPlane {
                 waiting.push((item.clone(), relative.clone(), key));
             }
         }
+        report.timing.file_lookup += lookup_started.elapsed();
 
         // Chunk what this fill must embed, from the bytes that were hashed.
+        let chunk_started = Instant::now();
         let mut to_embed = Vec::new();
         let mut chunks = Vec::new();
         let mut failures = Vec::new();
@@ -761,6 +832,7 @@ impl SemanticPlane {
                 Err(reason) => failures.push((item, group.full_key, reason)),
             }
         }
+        report.timing.chunk += chunk_started.elapsed();
         let mut transient = Vec::new();
         let mut succeeded = Vec::new();
         // Protect all planned keys once, even though complete file runs are
@@ -777,7 +849,9 @@ impl SemanticPlane {
                     .map(|chunk| self.producer.chunk_key(&chunk.embed_text)),
             )
             .collect::<Vec<_>>();
+        let store_started = Instant::now();
         protect(&view, &keys)?;
+        report.timing.store_write += store_started.elapsed();
         let mut pending = to_embed.into_iter().zip(chunks).peekable();
         while pending.peek().is_some() {
             // Keep whole files together so every successful request can be
@@ -799,7 +873,7 @@ impl SemanticPlane {
             }
             let embedded = {
                 let mut rows = |batch: Vec<String>| {
-                    self.embed_chunks(&arena, &store, batch, embed, &mut report)
+                    self.embed_chunks(&arena, &store, batch, embed, &mut report, before_embed)
                 };
                 crate::semantic_index::embed_view_files_with_rows(
                     chunks,
@@ -809,6 +883,7 @@ impl SemanticPlane {
             };
             match embedded {
                 Ok(runs) => {
+                    let store_started = Instant::now();
                     for ((item, relative, full_key, claim), mut run) in
                         to_embed.into_iter().zip(runs)
                     {
@@ -863,6 +938,7 @@ impl SemanticPlane {
                         current,
                         &mut report,
                     )?;
+                    report.timing.store_write += store_started.elapsed();
                     if !report.errors.is_empty() || !report.store_errors.is_empty() {
                         report.deferred += pending.count();
                         break;
@@ -878,7 +954,10 @@ impl SemanticPlane {
         }
 
         for (item, relative, key) in waiting {
+            let wait_started = Instant::now();
             arena.wait_released(&key, budget.shared_wait);
+            report.timing.shared_wait += wait_started.elapsed();
+            let lookup_started = Instant::now();
             if arena.get(&key).is_some()
                 || arena
                     .load(&store.reader(), &key, &relative, &payload_producer)
@@ -888,8 +967,10 @@ impl SemanticPlane {
                 report.shared_waits += 1;
                 ready.push((item, key));
             }
+            report.timing.file_lookup += lookup_started.elapsed();
         }
 
+        let store_started = Instant::now();
         admit_ready(
             &view,
             &store,
@@ -898,6 +979,7 @@ impl SemanticPlane {
             current,
             &mut report,
         )?;
+        report.timing.store_write += store_started.elapsed();
         let mut state = lock(&view);
         for full_key in &succeeded {
             state.tracker.record_success(full_key);
@@ -929,6 +1011,7 @@ impl SemanticPlane {
         texts: Vec<String>,
         embed: &mut F,
         report: &mut FillReport,
+        before_embed: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Vec<crate::semantic_index::BuildEmbeddingRow>, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -938,28 +1021,47 @@ impl SemanticPlane {
         // Hold a family batch gate through lookup, model and persistence. No
         // file-claim wait occurs under it, and it bounds retained work to one
         // model batch without acquiring chunk claims in conflicting orders.
-        let _gate = arena.chunk_batch();
+        let key_started = Instant::now();
         let identity = self.producer.chunk_identity();
         let keys = texts
             .iter()
             .map(|text| self.producer.chunk_key(text))
             .collect::<Vec<_>>();
-        let mut rows = Vec::with_capacity(texts.len());
-        let mut misses = Vec::new();
-        for (text, key) in texts.iter().zip(&keys) {
-            if let Some(vector) = load_chunk(store, key, &identity, text)
-                .map_err(|error| chunk_store_error(error, report))?
-            {
-                report.chunk_reused += 1;
-                rows.push(Some(BuildEmbeddingRow::Embedded {
-                    embedded_text: text.clone(),
-                    vector,
-                }));
-            } else {
-                misses.push(text.clone());
-                rows.push(None);
+        report.timing.vector_lookup += key_started.elapsed();
+        let mut admitted = false;
+        let (_gate, mut rows, misses) = loop {
+            let wait_started = Instant::now();
+            let gate = arena.chunk_batch();
+            report.timing.chunk_wait += wait_started.elapsed();
+            let lookup_started = Instant::now();
+            let mut rows = Vec::with_capacity(texts.len());
+            let mut misses = Vec::new();
+            for (text, key) in texts.iter().zip(&keys) {
+                if let Some(vector) = load_chunk(store, key, &identity, text)
+                    .map_err(|error| chunk_store_error(error, report))?
+                {
+                    rows.push(Some(BuildEmbeddingRow::Embedded {
+                        embedded_text: text.clone(),
+                        vector,
+                    }));
+                } else {
+                    misses.push(text.clone());
+                    rows.push(None);
+                }
             }
-        }
+            report.timing.vector_lookup += lookup_started.elapsed();
+            if !misses.is_empty() && !admitted {
+                // Never wait for cold admission while holding the family gate:
+                // a slotted build may need that gate to finish and free a slot.
+                // Recheck after admission because a sibling may fill the misses.
+                drop(gate);
+                before_embed()?;
+                admitted = true;
+                continue;
+            }
+            report.chunk_reused += texts.len() - misses.len();
+            break (gate, rows, misses);
+        };
         if !misses.is_empty() {
             report.model_calls += 1;
             report.embedded_texts += misses.len();
@@ -978,6 +1080,7 @@ impl SemanticPlane {
                 } = &mut result
                 {
                     if embedded_text == text {
+                        let store_started = Instant::now();
                         let payload = encode_chunk_vector(&identity, text, vector)?;
                         match store.put_or_touch(key, &payload) {
                             Ok(_) => {}
@@ -992,14 +1095,17 @@ impl SemanticPlane {
                             }
                             Err(error) => return Err(chunk_store_error(error, report)),
                         }
+                        report.timing.store_write += store_started.elapsed();
                     }
                 }
                 *row = Some(result);
             }
         }
+        let store_started = Instant::now();
         store
             .touch(&keys)
             .map_err(|error| chunk_store_error(error, report))?;
+        report.timing.store_write += store_started.elapsed();
         Ok(rows
             .into_iter()
             .map(|row| row.expect("resolved chunk"))
@@ -2010,6 +2116,7 @@ mod tests {
                 vec![text.into()],
                 &mut |_| Ok(vec![vector.clone()]),
                 &mut FillReport::default(),
+                &mut || Ok(()),
             )
             .unwrap();
         let key = producer.chunk_key(text);
@@ -2103,6 +2210,7 @@ mod tests {
                 vec![text.into()],
                 &mut |texts| Model::default().embed("model-a", texts),
                 &mut report,
+                &mut || Ok(()),
             )
             .unwrap();
         match &result[0] {

@@ -33,7 +33,7 @@ use super::intent::{WriteIntent, WriteIntentListener, WritePhase};
 use super::manifest_v2::Producers;
 use super::registry::{FamilyRegistry, ViewRegistration};
 use super::semantic::{FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery};
-use super::snapshot::Snapshot;
+use super::snapshot::{DiskState, Snapshot};
 
 /// Producer written into the manifest header for the trigram and callgraph
 /// planes, which this semantic-only runtime does not register.
@@ -201,9 +201,43 @@ impl CheckoutSemantic {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        self.refresh_admitted(budget, embed, &mut |_| Ok(()))
+    }
+
+    fn refresh_admitted<F>(
+        &self,
+        budget: FillBudget,
+        embed: &mut F,
+        admit: &mut dyn FnMut(bool) -> Result<(), String>,
+    ) -> Result<FillReport, RefreshError>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
+        let mutex_started = Instant::now();
         let _serial = lock(&self.refresh);
+        let mutex_wait = mutex_started.elapsed();
         self.refresh_attempts.fetch_add(1, Ordering::SeqCst);
         let mut snapshot = self.installed();
+        // Reconciliation can walk the entire tree, so an empty snapshot or one
+        // with unreconciled edits needs cold admission. Otherwise a queue within
+        // both SMALL_PREPARATION limits may prepare without a cold slot. Its
+        // in-memory size probe also uses the process-wide preparation limit.
+        let mut queue_setup = Duration::ZERO;
+        let small = if needs_reload(&snapshot) {
+            admit(false).map_err(RefreshError::classify)?;
+            false
+        } else {
+            admit(true).map_err(RefreshError::classify)?;
+            let probe_started = Instant::now();
+            let small = self.small_preparation(&snapshot);
+            queue_setup = probe_started.elapsed();
+            if !small {
+                admit(false).map_err(RefreshError::classify)?;
+            }
+            small
+        };
+        crate::cold_build_limiter::progress::stage("preparing");
+        let reconcile_started = Instant::now();
         if needs_reload(&snapshot) {
             snapshot = if snapshot.generation().name() == "empty" {
                 self.load().map_err(RefreshError::classify)?
@@ -213,26 +247,60 @@ impl CheckoutSemantic {
                     .map_err(|error| RefreshError::classify(error.to_string()))?
             };
         }
+        let reconcile = reconcile_started.elapsed();
         let driver = Arc::clone(&self.driver);
-        let report = self
+        let mut report = self
             .plane
-            .fill(&self.owner, &snapshot, budget, embed, &move || {
-                driver.installed_snapshot()
-            })
+            .fill_admitted(
+                &self.owner,
+                &snapshot,
+                budget,
+                embed,
+                &move || driver.installed_snapshot(),
+                &mut || {
+                    admit(false)?;
+                    crate::cold_build_limiter::progress::stage("embedding");
+                    Ok(())
+                },
+                small,
+            )
             .map_err(|error| RefreshError::classify(error.to_string()))?;
+        report.timing.mutex_wait = mutex_wait;
+        report.timing.reconcile = reconcile;
+        report.timing.queue_setup += queue_setup;
         if report.installed > 0 || report.failed > 0 {
             self.unfolded.store(true, Ordering::SeqCst);
         }
         let caught_up = report.deferred == 0 || (report.installed == 0 && report.failed == 0);
         if caught_up && self.unfolded.swap(false, Ordering::SeqCst) {
+            let fold_started = Instant::now();
             crate::cold_build_limiter::progress::phase("publishing", None);
             let (snapshot, revision) = self.driver.installed_cut();
             if let Err(error) = self.loader.fold(&self.access, &snapshot, revision) {
                 self.unfolded.store(true, Ordering::SeqCst);
                 return Err(RefreshError::classify(error.to_string()));
             }
+            report.timing.fold = fold_started.elapsed();
         }
         Ok(report)
+    }
+
+    fn small_preparation(&self, snapshot: &Snapshot) -> bool {
+        let items = self.plane.pending_work(&self.access, snapshot);
+        if items.len() > SMALL_PREPARATION_FILES {
+            return false;
+        }
+        let mut bytes = 0u64;
+        for item in items {
+            let DiskState::Present { size, .. } = snapshot.disk_state(&item.rel_path) else {
+                return false;
+            };
+            bytes = bytes.saturating_add(size);
+            if bytes > SMALL_PREPARATION_BYTES {
+                return false;
+            }
+        }
+        true
     }
 
     /// How many times `refresh` has run, successful or not.
@@ -624,6 +692,19 @@ pub(crate) const RETRY_INITIAL: Duration = Duration::from_secs(5);
 pub(crate) const RETRY_MAX: Duration = Duration::from_secs(300);
 
 const LIMITER_KIND: &str = "semantic view fill";
+
+// These file-count and byte bounds admit small edits, including a typical file
+// with dozens of reusable chunks, but not thousands of fresh worktree files.
+// Count the entire queue, not just one budgeted round.
+const SMALL_PREPARATION_FILES: usize = 32;
+const SMALL_PREPARATION_BYTES: u64 = 256 * 1024;
+const PREPARATION_KIND: &str = "semantic view preparation";
+const PREPARATION_LIMIT: usize = 4;
+
+fn preparation_limiter() -> &'static Arc<crate::cold_build_limiter::ColdBuildLimiter> {
+    static LIMITER: OnceLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>> = OnceLock::new();
+    LIMITER.get_or_init(|| crate::cold_build_limiter::isolated_limiter(PREPARATION_LIMIT))
+}
 
 /// Lets a lane's driver publish its checkout's view only while the lane's
 /// epoch is current. The check and the pointer publication run under the
@@ -1189,32 +1270,91 @@ fn catch_up<F>(
 where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
 {
+    catch_up_with_preparation_limiter(
+        slot,
+        epoch,
+        runtime,
+        schedule,
+        budget,
+        embed,
+        preparation_limiter(),
+    )
+}
+
+fn catch_up_with_preparation_limiter<F>(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    runtime: &CheckoutSemantic,
+    schedule: &FillSchedule,
+    budget: FillBudget,
+    embed: &mut F,
+    preparation_limiter: &Arc<crate::cold_build_limiter::ColdBuildLimiter>,
+) -> FillOutcome
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
     let mut progress = false;
     let mut telemetry = None;
     loop {
-        let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-            &schedule.limiter,
-            LIMITER_KIND,
-            &schedule.root,
-            || is_current(slot, epoch),
-        ) else {
+        if !is_current(slot, epoch) {
             return FillOutcome::Stop;
-        };
-        if telemetry.is_none() {
-            telemetry = Some(crate::cold_build_limiter::progress::start(
-                &schedule.root,
-                LIMITER_KIND,
-                None,
-                crate::cold_build_limiter::progress::StartLog::Info,
-            ));
-            crate::cold_build_limiter::progress::phase("embedding", None);
         }
         let elapsed_started = Instant::now();
         let embedding_timing_scope = crate::semantic_index::EmbeddingTimingScope::new();
-        let refresh = runtime.refresh(budget, embed);
+        let mut cold_permit = None;
+        let mut preparation_permit = None;
+        let mut admission_wait = Duration::ZERO;
+        let mut cold_admitted = false;
+        let refresh = runtime.refresh_admitted(budget, embed, &mut |small| {
+            if cold_permit.is_some() {
+                return Ok(());
+            }
+            // Missing vectors require cold admission. Release the preparation
+            // slot before waiting so fills that only reuse stored vectors can
+            // continue without waiting behind this model request.
+            let (limiter, kind) = if small {
+                (preparation_limiter, PREPARATION_KIND)
+            } else {
+                preparation_permit.take();
+                (&schedule.limiter, LIMITER_KIND)
+            };
+            crate::cold_build_limiter::progress::stage("waiting for admission");
+            let wait_started = Instant::now();
+            let permit = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                limiter,
+                kind,
+                &schedule.root,
+                || is_current(slot, epoch),
+            );
+            admission_wait += wait_started.elapsed();
+            let permit = permit.ok_or_else(|| "semantic lane superseded".to_owned())?;
+            if small {
+                preparation_permit = Some(permit);
+            } else {
+                cold_admitted = true;
+                cold_permit = Some(permit);
+            }
+            if telemetry.is_none() {
+                telemetry = Some(crate::cold_build_limiter::progress::start(
+                    &schedule.root,
+                    LIMITER_KIND,
+                    None,
+                    crate::cold_build_limiter::progress::StartLog::Info,
+                ));
+            }
+            Ok(())
+        });
         let embedding_timing = embedding_timing_scope.snapshot();
         drop(embedding_timing_scope);
-        let elapsed_ms = elapsed_started.elapsed().as_millis();
+        // Keep elapsed_ms comparable to older summaries, which started after
+        // admission. Admission can now occur in the middle of a refresh.
+        let elapsed_ms = elapsed_started
+            .elapsed()
+            .saturating_sub(admission_wait)
+            .as_millis();
+        if !is_current(slot, epoch) {
+            return FillOutcome::Stop;
+        }
         match refresh {
             Ok(report) => {
                 if report.model_calls > 0
@@ -1223,7 +1363,7 @@ where
                     || !report.store_errors.is_empty()
                 {
                     crate::slog_info!(
-                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={} elapsed_ms={} embed_ms={} embed_max_ms={}",
+                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={} elapsed_ms={} embed_ms={} embed_max_ms={} admission_wait_ms={} cold_admitted={} mutex_wait_ms={} reconcile_ms={} queue_setup_ms={} read_hash_ms={} file_lookup_ms={} chunk_ms={} chunk_wait_ms={} vector_lookup_ms={} store_write_ms={} shared_wait_ms={} fold_ms={} source_reads={} source_bytes={}",
                         schedule.root.display(),
                         report.queued,
                         report.deferred,
@@ -1240,7 +1380,22 @@ where
                         report.store_errors.len(),
                         elapsed_ms,
                         embedding_timing.total_ms(),
-                        embedding_timing.max_ms()
+                        embedding_timing.max_ms(),
+                        admission_wait.as_millis(),
+                        cold_admitted,
+                        report.timing.mutex_wait.as_millis(),
+                        report.timing.reconcile.as_millis(),
+                        report.timing.queue_setup.as_millis(),
+                        report.timing.read_hash.as_millis(),
+                        report.timing.file_lookup.as_millis(),
+                        report.timing.chunk.as_millis(),
+                        report.timing.chunk_wait.as_millis(),
+                        report.timing.vector_lookup.as_millis(),
+                        report.timing.store_write.as_millis(),
+                        report.timing.shared_wait.as_millis(),
+                        report.timing.fold.as_millis(),
+                        report.source_reads,
+                        report.source_bytes
                     );
                 }
                 let advanced = report.installed > 0 || report.failed > 0;
