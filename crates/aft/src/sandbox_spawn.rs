@@ -2251,6 +2251,7 @@ fn git_input_identity(path: &Path) -> std::io::Result<Option<GitInputIdentity>> 
 #[derive(Clone)]
 struct GitPolicyInputs {
     environment: Vec<(OsString, OsString)>,
+    executable: PathBuf,
     files: BTreeMap<PathBuf, Option<GitInputIdentity>>,
     resolved_paths: Vec<(PathBuf, PathBuf)>,
 }
@@ -2291,6 +2292,7 @@ impl GitPolicyInputs {
 
     fn unchanged(&self) -> bool {
         self.environment == git_policy_environment()
+            && git_policy_executable().as_ref() == Some(&self.executable)
             && self.files.iter().all(|(path, identity)| {
                 git_input_identity(path).is_ok_and(|current| current == *identity)
             })
@@ -2325,6 +2327,16 @@ fn mentions_git_include(bytes: &[u8]) -> bool {
 }
 
 #[cfg(unix)]
+fn git_policy_executable() -> Option<PathBuf> {
+    which::which_in(
+        "git",
+        Some(crate::effective_path::effective_path()),
+        std::env::current_dir().ok()?,
+    )
+    .ok()
+}
+
+#[cfg(unix)]
 fn git_policy_inputs(
     project_root: &Path,
     git_dir: &Path,
@@ -2338,6 +2350,16 @@ fn git_policy_inputs(
     if !crate::developer_tools::git_usable() {
         return None;
     }
+    // These overrides redirect Git away from the .git/commondir topology whose
+    // config files we track. Resolve normally, but never reuse that policy.
+    if environment.iter().any(|(key, _)| {
+        matches!(
+            key.to_str(),
+            Some("GIT_DIR" | "GIT_COMMON_DIR" | "GIT_WORK_TREE")
+        )
+    }) {
+        return None;
+    }
     // Command-scope includes can load arbitrary files too. Treat any mention
     // conservatively, including comments and inactive includeIf directives.
     if environment.iter().any(|(key, value)| {
@@ -2345,6 +2367,15 @@ fn git_policy_inputs(
     }) {
         return None;
     }
+    let mut inputs = GitPolicyInputs {
+        environment,
+        executable: git_policy_executable()?,
+        files: BTreeMap::new(),
+        resolved_paths: Vec::new(),
+    };
+    // Git's compiled-in system-config location can change if its executable is
+    // replaced, or another git appears earlier on PATH.
+    inputs.watch(&inputs.executable.clone())?;
     let mut configs = vec![common_dir.join("config"), git_dir.join("config.worktree")];
     // Git knows its compiled-in system prefix and the global-file overrides.
     // Query the *candidate* files, not only --show-origin's existing files, so
@@ -2372,7 +2403,11 @@ fn git_policy_inputs(
             }
         }
     }
-    if let Some((_, path)) = environment.iter().find(|(key, _)| key == "GIT_CONFIG") {
+    if let Some((_, path)) = inputs
+        .environment
+        .iter()
+        .find(|(key, _)| key == "GIT_CONFIG")
+    {
         let path = PathBuf::from(path);
         configs.push(if path.is_absolute() {
             path
@@ -2380,11 +2415,6 @@ fn git_policy_inputs(
             project_root.join(path)
         });
     }
-    let mut inputs = GitPolicyInputs {
-        environment,
-        files: BTreeMap::new(),
-        resolved_paths: Vec::new(),
-    };
     inputs.watch(&project_root.join(".git"))?;
     inputs.watch(&git_dir.join("commondir"))?;
     // Capture the identity before reading: a concurrent rewrite during either
@@ -4750,6 +4780,23 @@ mod git_policy_cache_tests {
         std::fs::write(config, contents).unwrap();
         assert!(fixture.resolve().1 > 0);
         assert!(fixture.resolve().1 > 0);
+    }
+
+    #[test]
+    fn git_policy_cache_redirected_git_directory_is_never_cached() {
+        let fixture = Fixture::new();
+        GIT_POLICY_TEST_ENV.with(|value| {
+            value
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .push(("GIT_DIR".into(), fixture.root.join(".git").into_os_string()))
+        });
+        assert!(fixture.resolve().1 > 0);
+        assert!(
+            fixture.resolve().1 > 0,
+            "redirected Git config inputs are not tracked"
+        );
     }
 
     /// Compare the old explicit-PATH fork with inherited-PATH helper launches.
