@@ -1865,8 +1865,10 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
             "{done:?}"
         );
         assert!(!done.output_preview.contains("did not run"), "{done:?}");
+        // `>>` creates the file before printf writes to it, so existence alone
+        // can be observed while the file is still empty; wait for the byte.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !counter.exists() {
+            while fs::read(&counter).map_or(true, |bytes| bytes.is_empty()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -1936,8 +1938,9 @@ async fn exec_remote_bash_double_restart_starts_local_fallback_once() {
     crash_tasks().lock().unwrap().insert(task_id.clone());
     let first = registry();
     first.replay_session(dir.path(), "session").unwrap();
+    // Wait for the byte, not the file: `>>` creates it before printf writes.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !counter.exists() {
+        while fs::read(&counter).map_or(true, |bytes| bytes.is_empty()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
