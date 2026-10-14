@@ -188,6 +188,31 @@ announce_gate_line() {
 
 announce_gate_line "gate log: $gate_log"
 
+failed_test_phases=0
+first_test_failure=0
+
+# CI needs one complete failure inventory per runner allocation. Keep local
+# fail-fast behavior and every existing nextest profile/timeout unchanged.
+gate_cargo() {
+  if [[ -n "${CI:-}" && "${1:-}" == "nextest" && "${2:-}" == "run" ]]; then
+    shift 2
+    cargo nextest run --no-fail-fast "$@"
+  elif [[ -n "${CI:-}" && "${1:-}" == "test" ]]; then
+    shift
+    cargo test --no-fail-fast "$@"
+  else
+    cargo "$@"
+  fi
+}
+
+finish_gate() {
+  if [[ "$failed_test_phases" -ne 0 ]]; then
+    announce_gate_line "GATE FAILED ($failed_test_phases test phases failed)"
+    return "$first_test_failure"
+  fi
+  announce_gate_line "GATE PASSED"
+}
+
 report_gate_failure() {
   local label="$1"
   local rc="$2"
@@ -230,6 +255,17 @@ run_phase() {
       rc="$tee_rc"
     fi
     report_gate_failure "$label" "$rc"
+    # Only independent test commands may continue after a red phase. Failed
+    # archive extraction, signing, lint or log writes are fatal prerequisites.
+    if [[ -n "${CI:-}" && "$tee_rc" -eq 0 && "${1:-}" == "gate_cargo" \
+      && ( "${2:-}" == "test" || ( "${2:-}" == "nextest" && "${3:-}" == "run" ) ) ]]; then
+      failed_test_phases=$((failed_test_phases + 1))
+      if [[ "$first_test_failure" -eq 0 ]]; then
+        first_test_failure="$rc"
+      fi
+      return 0
+    fi
+    announce_gate_line "GATE FAILED"
     return "$rc"
   fi
 
@@ -304,7 +340,8 @@ if [[ "$runner" == "cargo" ]]; then
     run_phase "warm macOS Gatekeeper assessment: sign + exec debug test binaries and target/debug/aft" \
       warm_macos_test_binaries --workspace
   fi
-  run_phase "cargo test --workspace --quiet" cargo test --workspace --quiet
+  run_phase "cargo test --workspace --quiet" gate_cargo test --workspace --quiet
+  finish_gate
   exit 0
 fi
 
@@ -401,11 +438,11 @@ if phase_enabled lib; then
   # first (seconds when serial), then exclude it from the parallel phase.
   if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" ]]; then
     run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) platform_verifier_tls_client_subprocess (serial: keychain-latency-sensitive)" \
-      cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
         -E 'kind(lib)' -- platform_verifier_tls_client_subprocess
   else
     run_phase "cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet (serial: keychain-latency-sensitive)" \
-      cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
+      gate_cargo test -p agent-file-tools --lib platform_verifier_tls_client_subprocess --quiet
   fi
 
   if phase_enabled lib-shard \
@@ -413,7 +450,7 @@ if phase_enabled lib; then
     # Windows needs its local PDB for the child backtrace; the macOS archive job
     # runs this probe before upload while its linked debug objects are present.
     run_phase "cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet (serial: child backtrace needs the local PDB)" \
-      cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
+      gate_cargo test -p agent-file-tools --lib panic_hook_preserves_default_backtrace_behavior_and_persists --quiet
   fi
 
   # When lib-shard is selected, the archive-backed command below owns the rest
@@ -421,11 +458,11 @@ if phase_enabled lib; then
   if ! phase_enabled lib-shard; then
     if [[ "$unit_runner" == "nextest" ]]; then
       run_phase "cargo nextest run --workspace --lib --bins --profile gate" \
-        cargo nextest run --workspace --lib --bins --profile gate -- \
+        gate_cargo nextest run --workspace --lib --bins --profile gate -- \
           --skip platform_verifier_tls_client_subprocess
     else
       run_phase "cargo test --workspace --lib --bins --quiet" \
-        cargo test --workspace --lib --bins --quiet -- \
+        gate_cargo test --workspace --lib --bins --quiet -- \
           --skip platform_verifier_tls_client_subprocess
     fi
   fi
@@ -442,19 +479,19 @@ if phase_enabled lib-shard; then
   fi
   if [[ -n "${AFT_NEXTEST_ARCHIVE_BIN_FILE:-}" ]]; then
     run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E kind(lib) --partition $AFT_NEXTEST_PARTITION --profile gate" \
-      cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
         -E 'kind(lib)' \
         --partition "$AFT_NEXTEST_PARTITION" \
         -- \
           --skip platform_verifier_tls_client_subprocess \
           --skip panic_hook_preserves_default_backtrace_behavior_and_persists
     run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_BIN_FILE -E kind(bin) --partition $AFT_NEXTEST_PARTITION --profile gate" \
-      cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_BIN_FILE" --profile gate \
+      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_BIN_FILE" --profile gate \
         -E 'kind(bin)' \
         --partition "$AFT_NEXTEST_PARTITION"
   else
     run_phase "cargo nextest run --archive-file $AFT_NEXTEST_ARCHIVE_FILE -E 'kind(lib) | kind(bin)' --partition $AFT_NEXTEST_PARTITION --profile gate" \
-      cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
+      gate_cargo nextest run --archive-file "$AFT_NEXTEST_ARCHIVE_FILE" --profile gate \
         -E 'kind(lib) | kind(bin)' \
         --partition "$AFT_NEXTEST_PARTITION" \
         -- \
@@ -474,7 +511,7 @@ if phase_enabled nextest; then
   # The gate profile disables retries by default; only the specific test overrides
   # listed in .config/nextest.toml may retry. Do not replace this with a blanket
   # retry profile.
-  nextest_args=(cargo nextest run --profile gate)
+  nextest_args=(gate_cargo nextest run --profile gate)
   if [[ -n "${AFT_NEXTEST_ARCHIVE_FILE:-}" && -n "${AFT_NEXTEST_EXTRACT_TO:-}" ]]; then
     # macOS archive shards need a stable extraction path so fresh test-binary
     # inodes can be signed and executed before nextest starts timed tests.
@@ -510,20 +547,20 @@ if phase_enabled watcher; then
   # test-timing-hooks compiles in the test-only gates the linked-worktree
   # semantic quiet-window test holds; without the feature that test is not built.
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1" \
-    cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
+    gate_cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
 fi
 
 if phase_enabled conformance; then
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill" \
-    cargo test -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill
+    gate_cargo test -p agent-file-tools --features test-timing-hooks --test rest -- scope_end_kill
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation" \
-    cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation
+    gate_cargo test -p agent-file-tools --features test-timing-hooks --test integration -- scope_revocation
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
-    cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
+    gate_cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
   # Keep promotion failure, deadline handoff, and elicitation TTL coverage in
   # the hook-enabled phase; ordinary production builds cannot inject them.
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl" \
-    cargo test -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl
+    gate_cargo test -p agent-file-tools --features test-timing-hooks --test integration -- subc_bridge_bash_promote subc_bridge_bash_started_promotion subc_bridge_bash_late_promote subc_bridge_untrusted_bash_elicitation_ttl
 fi
 
 # The main subc storm test asserts production-calibrated absolute latencies
@@ -541,6 +578,8 @@ if phase_enabled storm; then
     # Storm is intentionally on the retry-free default nextest profile: a retry
     # would hide a real latency regression behind a second warm attempt.
     run_phase "cargo nextest run --profile default --cargo-profile release -E 'test(subc_storm)' (release-calibrated latency bounds)" \
-      cargo nextest run --profile default --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+      gate_cargo nextest run --profile default --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
   fi
 fi
+
+finish_gate

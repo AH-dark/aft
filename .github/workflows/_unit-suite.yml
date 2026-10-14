@@ -148,6 +148,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
           python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
+          python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
 
 
       # The publish job refuses a package.json shape this validator rejects,
@@ -464,7 +465,7 @@ jobs:
           "$HOME/.cargo/bin/cargo-nextest" --version
 
       - name: Release storm tests (production-calibrated latency bounds)
-        run: cargo nextest run --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
+        run: cargo nextest run --no-fail-fast --cargo-profile release -p agent-file-tools --test integration -E 'test(subc_storm)'
 
   # ---------------------------------------------------------------------------
   # MSRV floor check (Linux, pinned to the declared rust-version).
