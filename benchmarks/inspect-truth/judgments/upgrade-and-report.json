@@ -1,0 +1,27 @@
+{
+  "after_outputs": {
+    "outline": "local-ignore/upgrade-and-report/final/corpus/_results/outline/ffe59a5d7d1f333deaca3f84b798459ea9b088df",
+    "typeorm": "local-ignore/upgrade-and-report/final/corpus/_results/typeorm/ffe59a5d7d1f333deaca3f84b798459ea9b088df",
+    "ripgrep": "local-ignore/upgrade-and-report/final/corpus/_results/ripgrep/ffe59a5d7d1f333deaca3f84b798459ea9b088df",
+    "axum": "local-ignore/upgrade-and-report/final/corpus/_results/axum/ffe59a5d7d1f333deaca3f84b798459ea9b088df",
+    "soft-serve": "local-ignore/upgrade-and-report/final/corpus/_results/soft-serve/ffe59a5d7d1f333deaca3f84b798459ea9b088df",
+    "fastapi": "local-ignore/upgrade-and-report/final/corpus/_results/fastapi/ffe59a5d7d1f333deaca3f84b798459ea9b088df",
+    "aft": "local-ignore/upgrade-and-report/final/corpus/_results/aft/ffe59a5d7d1f333deaca3f84b798459ea9b088df"
+  },
+  "entries": [],
+  "provenance": {
+    "baseline_source_commit": "13dd9cb71a7bbf9076377ac1ba1717dabf15e586",
+    "candidate_source_commit": "ffe59a5d7d1f333deaca3f84b798459ea9b088df",
+    "aggregate_upgrade": "The single campaign bump, 34 to 35, landed with the callgraph slice. This slice retains it and proves reopening frozen version-34 storage; later version bumps must still invalidate that storage.",
+    "raw_archive_sha256": "54546c6604b8f8ea681d1a3b06f2a822da2b7baedfc09fae5771daacf1d9578a",
+    "supplemental_archive_sha256": "703a6b4f8614c40434d05f5f60abb6f8523c3d8a24f04736473a373ba6358119",
+    "existing_judgments": "No earlier entry was removed or reassigned. Runtime copies relocate origin directories only. Three repositories reuse preserved origin captures; Outline and TypeORM origins were regenerated from exact 9f382ddf14a4a9c8f1a8a094caf01c9ad78884f6 source with the TS slice's documented codemod fixture exclusions.",
+    "diagnostics": "Final collections use diagnostics-sample 0. This is not a corpus diagnostics or footer pass.",
+    "limitations": [
+      "Default TypeORM dead_code and unused_exports remain unknown because four deliberately invalid codemod fixtures carry analysis_incomplete. The final candidate capture has no measurement exclusions.",
+      "Default AFT unused_exports remains unknown because benchmarks/src/exercise.ts has a real duplicated catch-tail syntax error; it is benchmark runner code, not an intentionally broken fixture.",
+      "AFT Rust dead_code is 33 against rustc 0, above the +10 target. Its 33 Rust and 10 in-domain TypeScript dead_code rows remain unjudged; no blanket judgments were invented.",
+      "Scoped TypeORM payload checks pass, but the 2-vCPU Linux release median with servers enabled is 5.707473 seconds, above the 5-second target."
+    ]
+  }
+}
