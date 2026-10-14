@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The ranking-fenced semantic_index change touches only test fixtures and a test-only exchange counter, so concurrent tests no longer share a backend port. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
