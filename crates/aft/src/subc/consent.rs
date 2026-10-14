@@ -495,6 +495,14 @@ where
     }
 }
 
+fn consent_path_representable(path: &Path) -> bool {
+    // The consent service's pinned decoder (Cingulate 6bb5f4d) requires paths
+    // to start with '/'. Drive and UNC paths have no agreed representation:
+    // do not send them and do not invent a conversion.
+    path.to_str()
+        .is_some_and(|path| path.starts_with('/') && !path.contains('\0'))
+}
+
 async fn with_db<T: Send + 'static>(
     call: &HeldCall,
     work: impl FnOnce(&rusqlite::Connection, &AppContext) -> rusqlite::Result<T> + Send + 'static,
@@ -943,6 +951,11 @@ async fn hold(
     route_hold: &RouteHold,
     own_holder: Option<String>,
 ) -> Hold {
+    if !consent_path_representable(&grant.path) {
+        let mut response = refused_answer(call, &grant, "access_not_placed", None);
+        response.data["reason"] = json!("consent_path_unrepresentable");
+        return Hold::Answer(response);
+    }
     let identity = call.identity.clone();
     let tool = call.tool.clone();
     let arguments = call.arguments.clone();

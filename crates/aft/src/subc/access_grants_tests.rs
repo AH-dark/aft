@@ -42,9 +42,10 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     let work = dir.path().join("worker");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&work).unwrap();
-    // Policy decisions take canonical paths, including macOS's /var alias.
-    let root = root.canonicalize().unwrap();
-    let work = work.canonicalize().unwrap();
+    // Resolve macOS's /var -> /private/var alias, but remove Windows's verbatim
+    // `\\?\` prefix: launch params are plain paths, where `?` denotes a glob.
+    let root = policy_path(&root);
+    let work = policy_path(&work);
     let ctx = context(&root, &dir.path().join("store"));
     let head = identity(&root, "head", "head", None);
     let worker = identity(&work, "worker", "worker", Some("head"));
@@ -581,4 +582,73 @@ fn modes_worker_inherits_live_head_until_plan_override_and_survives_restart() {
         &ctx
     )
     .is_err());
+}
+
+#[test]
+fn modes_full_access_head_holds_outside_allow_paths_except_denied_floor() {
+    use crate::access_policy::ApprovalMode;
+    let (dir, ctx, head, worker) = fixture();
+    let outside = dir.path().join("scratch-checkout");
+    std::fs::create_dir(&outside).unwrap();
+    let outside = policy_path(&outside);
+    let raw = json!([{"path":outside,"mode":"write"}]);
+    let refused = remote_policy::catalog(catalog_request(raw.clone()), &head, &ctx).unwrap_err();
+    assert_eq!(refused.detail.unwrap()["reason"], "head_not_held");
+    {
+        let db = ctx.db().unwrap();
+        assert_eq!(
+            store::mode(&db.lock().unwrap(), &scope_key(&head)).unwrap(),
+            ApprovalMode::Ask
+        );
+    }
+    remote_policy::catalog(
+        json!({"preset":"head","params":{"mode":"full-access"}}),
+        &head,
+        &ctx,
+    )
+    .unwrap();
+    remote_policy::catalog(catalog_request(raw.clone()), &head, &ctx).unwrap();
+    remote_policy::catalog(catalog_request(raw.clone()), &worker, &ctx).unwrap();
+    {
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        let grant = AccessGrant {
+            path: outside.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Write,
+        };
+        assert_eq!(
+            policy_for_scope(&conn, &scope_key(&head), &ctx)
+                .unwrap()
+                .unwrap()
+                .head_policy(&grant),
+            HeadPolicy::Allow
+        );
+        assert_eq!(
+            store::list(&conn, &scope_key(&worker)).unwrap(),
+            vec![grant]
+        );
+    }
+    ctx.update_config(|config| config.sandbox.read_deny.push(outside.join("secret")));
+    register(&head, &ctx).unwrap();
+    for caller in [&head, &worker] {
+        let refused =
+            remote_policy::catalog(catalog_request(raw.clone()), caller, &ctx).unwrap_err();
+        assert_eq!(refused.detail.unwrap()["reason"], "denied_floor");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn grants_launch_fixture_roots_do_not_contain_windows_verbatim_glob_prefix() {
+    let (_dir, _ctx, head, worker) = fixture();
+    for root in [&head.project_root, &worker.project_root] {
+        assert!(root.is_absolute());
+        assert!(
+            !root.to_string_lossy().contains('?'),
+            "launch paths must be plain: {}",
+            root.display()
+        );
+        assert_eq!(root, &policy_path(root));
+    }
 }

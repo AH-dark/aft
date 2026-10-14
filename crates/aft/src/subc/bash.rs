@@ -641,6 +641,7 @@ pub(super) fn submit_deferred_bash(
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
     worker_preset: bool,
+    worker_jail: bool,
     server_completion: bool,
     remote_source: super::remote_policy::RemoteSource,
     received_at: Instant,
@@ -653,12 +654,8 @@ pub(super) fn submit_deferred_bash(
     // supported client transport deadline (25 s). Explicit waits only extend
     // execution, never startup admission or control-file creation.
     let grant_scope = crate::access_policy::current_scope();
-    // A stamped Alfonso worker (the caller installs its consent route) runs
-    // its shells in the worktree jail.
-    let worker_jail = matches!(
-        crate::access_policy::current_ask_route(),
-        crate::access_policy::AskRoute::Consent { .. }
-    );
+    // The attested scope decides confinement independently of consent routing:
+    // heads and workers both ask, but only worker shells require the jail.
     let spawn_ctx = match executor.try_actor_context(&root) {
         Some(Some(ctx)) => ctx,
         state => {
@@ -2639,6 +2636,81 @@ mod grant_path_tests {
         )
     }
 
+    fn observe_worker_jail(req: RawRequest, _ctx: &AppContext) -> Response {
+        Response::error_with_data(
+            &req.id,
+            "worker_jail_observation",
+            "test dispatch observes the shell policy without spawning",
+            json!({"worker_jail": crate::sandbox_spawn::worker_jail_active()}),
+        )
+    }
+
+    #[tokio::test]
+    async fn consent_routing_does_not_choose_worker_shell_confinement() {
+        for worker_jail in [false, true] {
+            let (_dir, root) = super::super::test_support::test_root("consent-shell-policy");
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let (tx, mut rx) = mpsc::channel(8);
+            let (touch, _touch_rx) = mpsc::channel(8);
+            {
+                let _route = crate::access_policy::ask_route_guard(Some(
+                    crate::access_policy::AskRoute::Consent { once: Vec::new() },
+                ));
+                submit_deferred_bash(
+                    &executor,
+                    &tx,
+                    &touch,
+                    &metrics,
+                    observe_worker_jail,
+                    root.clone(),
+                    root.as_path().into(),
+                    "consent-shell".into(),
+                    "jail-observation".into(),
+                    RouteChannel {
+                        channel: 1,
+                        epoch: 1,
+                    },
+                    1,
+                    Flags::new(false, Priority::Interactive, false),
+                    PROTOCOL_VERSION,
+                    json!({"command":"echo test","timeout":5000}),
+                    crate::subc_format::FormatContext::default(),
+                    BashWaitCancel {
+                        run_scope: None,
+                        connection: PersistentCancelSignal::new(),
+                        route: PersistentCancelSignal::new(),
+                        drain: drain::ModuleDrainWindow::default(),
+                    },
+                    BindTrust::FirstParty,
+                    crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    false,
+                    worker_jail,
+                    true,
+                    super::remote_policy::RemoteSource::None,
+                    Instant::now(),
+                );
+            }
+            let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = done.response_for_test();
+            assert_eq!(response.data["code"], "worker_jail_observation");
+            assert_eq!(
+                response.data["worker_jail"],
+                json!(worker_jail),
+                "heads ask without confinement; workers still require it"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn scope_confirmation_kills_a_task_registered_after_its_snapshot() {
@@ -2782,6 +2854,7 @@ mod grant_path_tests {
                 None,
                 false,
                 false,
+                false,
                 true,
                 super::remote_policy::RemoteSource::None,
                 Instant::now(),
@@ -2880,6 +2953,7 @@ mod grant_path_tests {
             None,
             None,
             repeat,
+            false,
             false,
             false,
             server_completion,
@@ -4112,6 +4186,7 @@ mod grant_path_tests {
                 false,
                 false,
                 false,
+                false,
                 super::remote_policy::RemoteSource::None,
                 Instant::now(),
             );
@@ -4273,6 +4348,7 @@ mod grant_path_tests {
             false,
             false,
             false,
+            false,
             super::remote_policy::RemoteSource::None,
             Instant::now(),
         );
@@ -4391,6 +4467,7 @@ mod run_tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             false,

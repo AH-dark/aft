@@ -1,5 +1,9 @@
 use super::*;
 
+// Consent workflow/vector cases use the consent service's '/'-rooted path
+// contract on Unix, pinned to Cingulate 6bb5f4d. Windows drive and UNC paths
+// have no agreed representation; fail-closed tests below check zero traffic.
+
 use crate::sandbox_spawn::{
     resolve_sandbox_spawn, with_worker_jail, RequestedSandboxTier, SandboxTaskKind, SpawnPlan,
 };
@@ -176,6 +180,7 @@ impl FakeCingulate {
             .collect()
     }
 
+    #[cfg(unix)]
     fn answer(&self, call_key: &str, reply: Value) {
         let mut state = self.state.lock().unwrap();
         let id = state.asks[call_key].clone();
@@ -501,6 +506,7 @@ fn text(reply: &Value) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(unix)]
 async fn wait_for(mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
@@ -509,6 +515,7 @@ async fn wait_for(mut done: impl FnMut() -> bool) {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_parked_ask_only_scope_goodbye_ended_withdraws_and_refuses_retry() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -665,6 +672,7 @@ async fn consent_held_call_becomes_pending_and_retry_runs_after_allow_once() {
     assert_ne!(requests[2]["call_key"], json!(call_key));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_answer_within_the_budget_runs_the_held_call() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -722,6 +730,7 @@ async fn consent_floor_path_is_denied_without_asking() {
     assert!(f.fake.calls("consent.request").is_empty());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_cingulate_down_returns_access_unavailable_never_a_host_prompt() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -732,6 +741,7 @@ async fn consent_cingulate_down_returns_access_unavailable_never_a_host_prompt()
     assert!(!text(&reply).contains("head-owned contents"));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -777,6 +787,7 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
     assert!(f.asks().is_empty());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_user_answer_is_not_rechecked_against_the_head() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -795,6 +806,7 @@ async fn consent_user_answer_is_not_rechecked_against_the_head() {
     assert!(text(&allowed).contains("unheld contents"), "{allowed}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_stamped_head_defaults_to_ask_and_full_access_opts_out() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -824,6 +836,7 @@ async fn consent_stamped_head_defaults_to_ask_and_full_access_opts_out() {
     assert_eq!(f.fake.calls("consent.request").len(), count);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_cancel_and_route_close_withdraw_but_a_transport_drop_keeps_the_ask() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -860,6 +873,7 @@ async fn consent_cancel_and_route_close_withdraw_but_a_transport_drop_keeps_the_
     assert_eq!(f.asks()[0].call_key.as_deref(), call_key.as_str());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_same_key_retry_replays_the_recorded_access_pending() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -992,6 +1006,7 @@ fn consent_hold_budget_is_capped_at_100_seconds() {
     );
 }
 
+#[cfg(unix)]
 fn vector(name: &str) -> Vec<u8> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/subc/fixtures/cingulate-tool-permission-v1/vectors");
@@ -1014,10 +1029,12 @@ fn vector(name: &str) -> Vec<u8> {
     bytes
 }
 
+#[cfg(unix)]
 fn vector_json(name: &str) -> Value {
     serde_json::from_slice(&vector(name)).unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn consent_vectors_requests_encode_byte_for_byte() {
     let open = request_params(
@@ -1057,6 +1074,7 @@ fn consent_vectors_requests_encode_byte_for_byte() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn consent_vectors_replies_decode() {
     for name in ["worker-open-reply.json", "replay-reply.json"] {
@@ -1094,6 +1112,7 @@ fn consent_vectors_replies_decode() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn consent_vectors_settled_allow_without_answered_by_is_the_head() {
     let mut record = decode_result(&vector("await-settled-reply.json")).unwrap();
@@ -1127,6 +1146,7 @@ fn consent_vectors_settled_allow_without_answered_by_is_the_head() {
     assert!(decode_result(br#"{"elicitation_id":"acc_1"}"#).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn consent_vectors_bind_stamps_route_asks_under_the_worker_stamp() {
     let stamps = vector_json("bind-stamps.json");
@@ -1237,11 +1257,14 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
     assert!(!crate::sandbox_spawn::worker_jail_active());
 }
 
+#[cfg(unix)]
 static RERUN_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static RERUN_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// Reads normally, except that an approved rerun (one carrying `allow_once`
 /// approvals) waits until its job is cancelled, and records whether it was.
+#[cfg(unix)]
 fn blocking_rerun_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     if let AskRoute::Consent { once } = crate::access_policy::current_ask_route() {
         if !once.is_empty() {
@@ -1257,6 +1280,7 @@ fn blocking_rerun_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     read_dispatch(request, ctx)
 }
 
+#[cfg(unix)]
 async fn start_blocked_rerun(f: &Fixture, corr: u64) -> mpsc::Receiver<WriterFrame> {
     RERUN_STARTED.store(false, Ordering::SeqCst);
     RERUN_CANCELLED.store(false, Ordering::SeqCst);
@@ -1283,6 +1307,7 @@ async fn start_blocked_rerun(f: &Fixture, corr: u64) -> mpsc::Receiver<WriterFra
     replies
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_cancel_reaches_the_approved_rerun() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -1293,6 +1318,7 @@ async fn consent_cancel_reaches_the_approved_rerun() {
     wait_for(|| RERUN_CANCELLED.load(Ordering::SeqCst)).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_route_close_reaches_the_approved_rerun() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -1303,6 +1329,7 @@ async fn consent_route_close_reaches_the_approved_rerun() {
     wait_for(|| f.asks().is_empty()).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn macos_permission_cards_deduplicate_and_withdraw_on_readable_probe() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -1383,6 +1410,7 @@ async fn macos_allowed_read_eperm_returns_named_denial_and_updates_one_card() {
     wait_for(|| f.fake.calls("consent.withdraw").len() == 1).await;
 }
 
+#[cfg(unix)]
 #[test]
 fn consent_vectors_macos_requests_match_closed_decoder() {
     let params = macos_request_params(
@@ -1425,6 +1453,7 @@ fn consent_vectors_macos_requests_match_closed_decoder() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn consent_vectors_macos_phone_card_is_informational() {
     let record = decode_result(&vector("phone-macos-reply.json")).unwrap();
@@ -1436,6 +1465,7 @@ fn consent_vectors_macos_phone_card_is_informational() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn macos_fake_closed_decoder_deduplicates_and_refuses_await() {
     let fake = FakeCingulate::up();
@@ -1475,6 +1505,7 @@ fn macos_fake_closed_decoder_deduplicates_and_refuses_await() {
     assert_ne!(first, reopened);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn macos_platform_refusal_is_named_and_drops_unpublished_card() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -1580,6 +1611,7 @@ async fn macos_blocked_or_refused_card_does_not_block_or_replace_tool_denial() {
     assert_eq!(code(&reply), "macos_permission_denied");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_pending_messages_pin_worker_and_head_recipients() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -1598,4 +1630,103 @@ async fn consent_pending_messages_pin_worker_and_head_recipients() {
         "Waiting for permission to read {}. The request has gone to the user. End your turn now; you will be resumed with the answer, and then you should run this same call again.",
         target.display()
     ));
+}
+
+async fn assert_unrepresentable_paths_send_nothing(paths: Vec<PathBuf>) {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    #[cfg(windows)]
+    {
+        assert!(f
+            .head_root
+            .starts_with(crate::access_policy::policy_path(f.dir.path())));
+        let db = f.ctx.db().unwrap();
+        assert_eq!(
+            crate::db::access_grants::mode(&db.lock().unwrap(), &access_grants::scope_key(&f.head))
+                .unwrap(),
+            crate::access_policy::ApprovalMode::Ask
+        );
+    }
+    for (index, path) in paths.into_iter().enumerate() {
+        let grant = AccessGrant {
+            path: path.clone(),
+            kind: crate::access_policy::GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let first = Response::error_with_data(
+            "unrepresentable",
+            crate::access_policy::ACCESS_ASK_REQUIRED,
+            "test access check asks",
+            json!({"ask":grant}),
+        );
+        let call = HeldCall {
+            reply_deadline: Instant::now() + Duration::from_secs(5),
+            identity: f.worker.clone(),
+            tool: "read".into(),
+            arguments: json!({"filePath":path}),
+            request_id: "unrepresentable".into(),
+            executor: Arc::clone(&f.executor),
+            route: RouteChannel {
+                channel: 41,
+                epoch: 1,
+            },
+            corr: 100 + index as u64,
+            active: Arc::clone(&f.active),
+            connection_cancel: f.connection_cancel.clone(),
+            drain: drain::ModuleDrainWindow::default(),
+        };
+        let (response, _) = run_with_consent(call, (first, String::new()), |_| async {
+            panic!("an unrepresentable consent path must never execute");
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.data["code"], "access_not_placed");
+        assert_eq!(response.data["reason"], "consent_path_unrepresentable");
+        assert_eq!(
+            response.data["message"],
+            format!(
+                "Outside access denied: the request for permission to read {} could not be placed.",
+                path.display()
+            )
+        );
+    }
+    for method in ["consent.request", "consent.await", "consent.withdraw"] {
+        assert!(f.fake.calls(method).is_empty(), "{method} must not be sent");
+    }
+    assert!(f.asks().is_empty());
+    assert!(f.worker_grants().is_empty());
+}
+
+#[tokio::test]
+async fn consent_unrepresentable_drive_and_unc_paths_fail_closed_without_traffic() {
+    assert_unrepresentable_paths_send_nothing(vec![
+        PathBuf::from(r"C:\outside\file.txt"),
+        PathBuf::from(r"\\server\share\file.txt"),
+    ])
+    .await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn consent_native_windows_drive_path_is_denied_without_sending_a_request() {
+    {
+        let _lock = CONSENT_TEST_LOCK.lock().await;
+        let f = fixture(FakeCingulate::up());
+        let drive = f.head_root.join("shared.txt");
+        assert!(drive.is_absolute());
+        assert!(!drive.to_string_lossy().starts_with('/'));
+        let reply = f.read(&f.worker, &drive, 81).await;
+        assert_eq!(code(&reply), "access_not_placed", "{reply}");
+        assert_eq!(
+            reply["structuredContent"]["reason"],
+            "consent_path_unrepresentable"
+        );
+        assert!(f.fake.calls("consent.request").is_empty());
+        assert!(f.fake.calls("consent.await").is_empty());
+        assert!(f.asks().is_empty());
+        assert!(f.worker_grants().is_empty());
+    }
+    // UNC coverage enters the same guard without touching a network share.
+    assert_unrepresentable_paths_send_nothing(vec![PathBuf::from(r"\\server\share\file.txt")])
+        .await;
 }

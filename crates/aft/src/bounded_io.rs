@@ -161,12 +161,12 @@ pub(crate) fn probe_access(req_id: &str, path: &Path) -> Result<(), Response> {
     let result = probe_target(path);
     match result {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if missing_probe_target(&error, path, cfg!(windows)) => {
             let mut parent = path.parent();
             while let Some(folder) = parent {
                 match probe_directory(folder, None) {
                     Ok(()) => return Ok(()),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Err(error) if missing_probe_target(&error, folder, cfg!(windows)) => {
                         parent = folder.parent()
                     }
                     Err(error) => return Err(access_error(req_id, folder, error)),
@@ -176,6 +176,19 @@ pub(crate) fn probe_access(req_id: &str, path: &Path) -> Result<(), Response> {
         }
         Err(error) => Err(access_error(req_id, path, error)),
     }
+}
+
+fn missing_probe_target(error: &io::Error, path: &Path, windows: bool) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        // Win32 rejects a literal glob with ERROR_INVALID_NAME (123). Probe its
+        // existing ancestor; the handler expands and validates concrete files.
+        // Access-denied errors and ordinary invalid names still fail closed.
+        || (windows
+            && error.raw_os_error() == Some(123)
+            && path.components().any(|component| {
+                matches!(component, std::path::Component::Normal(name)
+                    if name.to_string_lossy().contains(['*', '?', '[', ']', '{', '}']))
+            }))
 }
 
 fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
@@ -1014,5 +1027,33 @@ mod modes_macos_tests {
             .expect("the released helper finishes its read-only probe");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "before");
         assert!(!response.success);
+    }
+}
+
+#[cfg(test)]
+mod probe_target_tests {
+    use super::*;
+
+    #[test]
+    fn windows_invalid_glob_name_probes_ancestors_but_access_denial_does_not() {
+        let invalid_name = io::Error::from_raw_os_error(123);
+        let glob = Path::new(r"C:\project\*.txt");
+        assert!(missing_probe_target(&invalid_name, glob, true));
+        assert!(!missing_probe_target(&invalid_name, glob, false));
+        assert!(!missing_probe_target(
+            &invalid_name,
+            Path::new(r"C:\project\file.txt"),
+            true
+        ));
+        assert!(!missing_probe_target(
+            &io::Error::from_raw_os_error(5),
+            glob,
+            true
+        ));
+        assert!(missing_probe_target(
+            &io::Error::new(io::ErrorKind::NotFound, "missing"),
+            glob,
+            true
+        ));
     }
 }

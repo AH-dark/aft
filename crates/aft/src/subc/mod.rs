@@ -3228,6 +3228,9 @@ async fn handle_bash_elicitation_reply(
                 pending.repeat,
                 pending.worker_session,
                 pending.worker_preset,
+                routes
+                    .get(&key.route)
+                    .is_some_and(access_grants::alfonso_worker),
                 routes.get(&key.route).is_some_and(|identity| {
                     identity.role == tool_provider::RouteRole::ToolProviderV1
                 }),
@@ -8935,6 +8938,7 @@ async fn handle_tool_call(
             repeat,
             role.is_worker(),
             worker_preset,
+            access_grants::alfonso_worker(&identity),
             identity.role == tool_provider::RouteRole::ToolProviderV1,
             remote_policy::source(&identity, call.preset.as_deref()),
             phase_trace.received_at(),
