@@ -3156,24 +3156,17 @@ impl LspManager {
         self.send_due_rust_saves();
     }
 
+    /// Whether any client carries a raw note, including notes hidden by text rendering.
+    pub fn has_runtime_notes(&self) -> bool {
+        self.clients
+            .values()
+            .any(|client| client.runtime_note.is_some())
+    }
+
     /// Runtime notes (the SDK a server started with) for the given servers
     /// only, so an inspect scoped to Rust files does not repeat a TypeScript
     /// note from a server started for some other request.
-    pub fn runtime_notes_for(
-        &self,
-        server_keys: impl FnOnce() -> HashSet<ServerKey>,
-    ) -> Vec<String> {
-        // Scope discovery can walk every file and tsconfig. It cannot select a
-        // note when no running client has one; check under the same manager
-        // lock used to select the notes so a concurrent start cannot be missed.
-        if self
-            .clients
-            .values()
-            .all(|client| client.runtime_note.is_none())
-        {
-            return Vec::new();
-        }
-        let server_keys = server_keys();
+    pub fn runtime_notes_for(&self, server_keys: &HashSet<ServerKey>) -> Vec<String> {
         let mut notes: Vec<_> = self
             .clients
             .iter()
@@ -7650,14 +7643,12 @@ mod project_applicability_tests {
     use super::*;
 
     #[test]
-    fn scoped_runtime_notes_skip_discovery_without_notes() {
-        assert!(LspManager::new()
-            .runtime_notes_for(|| panic!("unneeded scope discovery"))
-            .is_empty());
-        let (_dir, manager, _config, _) = fixture(false, false);
-        assert!(manager
-            .runtime_notes_for(|| panic!("clients have no notes"))
-            .is_empty());
+    fn runtime_note_presence_reports_only_raw_client_notes() {
+        assert!(!LspManager::new().has_runtime_notes());
+        let (_dir, mut manager, _config, ts) = fixture(false, false);
+        assert!(!manager.has_runtime_notes());
+        manager.clients.get_mut(&ts).unwrap().runtime_note = Some("selected SDK".into());
+        assert!(manager.has_runtime_notes());
     }
 
     #[test]
@@ -7665,10 +7656,10 @@ mod project_applicability_tests {
         let (_dir, mut manager, _config, ts) = fixture(false, false);
         manager.clients.get_mut(&ts).unwrap().runtime_note = Some("selected SDK".into());
         assert_eq!(
-            manager.runtime_notes_for(|| HashSet::from([ts])),
+            manager.runtime_notes_for(&HashSet::from([ts])),
             vec!["selected SDK"]
         );
-        assert!(manager.runtime_notes_for(HashSet::new).is_empty());
+        assert!(manager.runtime_notes_for(&HashSet::new()).is_empty());
     }
 
     fn fixture(yaml_enabled: bool, go: bool) -> (tempfile::TempDir, LspManager, Config, ServerKey) {

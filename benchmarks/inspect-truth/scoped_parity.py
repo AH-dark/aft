@@ -137,23 +137,93 @@ def phases(log: Path) -> list[dict[str, float]]:
     return requests
 
 
+def producer_barrier_ready(graph: dict, response: dict, *, seed_only: bool = False) -> bool:
+    # A successful navigation answer comes only from a published Ready store.
+    # A selected scheduler refresh clears its demand; a subsequent blocking inspect
+    # must also have produced all five Tier-2 summaries, not pending/unknown rows.
+    if not (graph.get("success") is True
+            and graph.get("symbol") == "DataSource::initialize"
+            and graph.get("file") == "packages/typeorm/src/data-source/DataSource.ts"
+            and type(graph.get("scanned_files")) is int
+            and graph["scanned_files"] > 0):
+        return False
+    if response.get("success") is not True:
+        return False
+    state = response.get("scanner_state") or {}
+    if not seed_only and state.get("tier2_trigger_reason") not in ("pull", "configure_warm"):
+        return False
+    summaries = response.get("summary") or {}
+    for category in ("dead_code", "unused_exports", "duplicates", "cycles", "complexity"):
+        row = summaries.get(category) or {}
+        if (type(row.get("count")) is not int
+                or row.get("status") in ("pending", "unavailable", "not_requested")
+                or row.get("unavailable") is True or row.get("not_computed") is True
+                or row.get("building") is not None):
+            return False
+    return True
+
+
+def wait_for_producer_barrier(session, *, seed_only: bool = False, deadline_s: float = 600) -> dict:
+    deadline = time.monotonic() + deadline_s
+    observations = []
+    while time.monotonic() < deadline:
+        # These are real blocking analysis requests, not a timed sleep or a
+        # guess based on a null scheduler field. They also drain producer events.
+        response = session.inspect(truth.AFT_CATEGORIES)
+        if response.get("success") is not True:
+            raise RuntimeError(response)
+        graph = session.client.request(
+            "callers", timeout_s=1800,
+            file=str(session.repo / "packages/typeorm/src/data-source/DataSource.ts"),
+            symbol="initialize", depth=1)
+        if graph.get("success") is True:
+            response = session.inspect(truth.AFT_CATEGORIES)
+        elif graph.get("code") != "callgraph_building":
+            raise RuntimeError(f"callgraph barrier failed: {graph}")
+        observations.append({"graph": {key: graph.get(key) for key in ("success", "code", "symbol", "file", "scanned_files")},
+                             "scanner_state": response.get("scanner_state"),
+                             "counts": {key: row.get("count") for key, row in response.get("summary", {}).items()}})
+        if producer_barrier_ready(graph, response, seed_only=seed_only):
+            (session.storage / "producer-barrier.json").write_text(json.dumps(observations, indent=2) + "\n")
+            print(f"producer barrier: {session.storage.name}, seed={seed_only}, {len(observations)} observations, reason={response['scanner_state']['tier2_trigger_reason']}", flush=True)
+            return response
+    (session.storage / "producer-barrier.json").write_text(json.dumps(observations, indent=2) + "\n")
+    raise RuntimeError("producer barrier did not observe a published graph and completed scheduler refresh")
+
+
 def measure(binaries: dict[str, Path], corpus: Path, out: Path, runs: int) -> dict:
-    sessions, records = {}, []
+    sessions, records, barriers = {}, [], {}
     configs = out / "user.jsonc"
     configs.write_text("{}\n")
     disabled = out / "disabled.jsonc"
     disabled.write_text(json.dumps(truth.COLLECTION_USER_CONFIG))
     try:
         for name, binary in binaries.items():
-            session = truth.AftSession(binary, corpus, out / name)
+            storage = out / name
+            seed = truth.AftSession(binary, corpus, storage)
+            configured = seed.configure(disabled)
+            if not configured.get("success"):
+                raise RuntimeError(configured)
+            try:
+                wait_for_producer_barrier(seed, seed_only=True)
+            finally:
+                seed.close()
+            # Restart from the same published stores. Pending cold-producer
+            # events belong to the seed process, not to the measured session.
+            for path in [storage / "aft-stderr.log", storage / "producer-barrier.json", *storage.glob("inspect-*.json")]:
+                if path.exists():
+                    path.rename(path.with_name("seed-" + path.name))
+            session = truth.AftSession(binary, corpus, storage)
             sessions[name] = session
             configured = session.configure(disabled)
             if not configured.get("success"):
                 raise RuntimeError(configured)
-            ready = truth.wait_until_ready(session, deadline_s=1800)
-            if truth.pending_categories(ready):
-                raise RuntimeError("corpus never became ready")
+            settled = wait_for_producer_barrier(session)
+            barriers[name] = settled["scanner_state"]["tier2_trigger_reason"]
             session.configure(configs)
+
+        if barriers["before"] != barriers["after"]:
+            raise RuntimeError(f"producer barriers reached different observable states: {barriers}")
 
         cases = [
             {"scope": ["packages"], "sections": ["dead_code"], "topK": 100},
@@ -206,7 +276,7 @@ def measure(binaries: dict[str, Path], corpus: Path, out: Path, runs: int) -> di
     for record in records:
         timing = phases(out / record["binary"] / "aft-stderr.log")
         record["phases"] = timing[record["inspect_index"]]
-    result = {"runs": records, "parity_cases": len(cases), "medians": {}}
+    result = {"runs": records, "parity_cases": len(cases), "medians": {}, "producer_barriers": barriers}
     for name in binaries:
         selected = [r for r in records if r["binary"] == name]
         result["medians"][name] = statistics.median(r["seconds"] for r in selected)
