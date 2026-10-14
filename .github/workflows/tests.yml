@@ -2,11 +2,10 @@ name: Tests
 
 # PR-time gate: runs Rust + plugin unit tests, Linux Docker e2e, and Windows e2e
 # before merge, including the queue's synthetic merge-group commit. Train
-# pushes remain enabled during migration. Tag pushes go through
-# `release.yml`, which does not rerun these tests: it builds and publishes only
-# after scripts/release-ci-gate.sh finds this workflow's green run for the
-# tagged commit, so the job names below are what that gate checks against
-# main's required status checks.
+# pushes remain enabled while landing moves from train pushes to queued PRs.
+# Tag pushes go through release.yml, which builds/publishes only after
+# release-ci-gate.sh finds a successful Tests main-push run for the exact tagged
+# commit and verifies every required job succeeded in that run.
 #
 # IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
 # locking, or platform-conditional code paths SHOULD touch the matching
@@ -34,9 +33,10 @@ on:
         required: false
         type: string
 
-# PR/branch updates supersede older runs. Queue candidates are independent,
-# SHA-scoped builds: one group must not cancel another group's required checks.
-# Main runs are also SHA-scoped so release-ci-gate can find exact landed-SHA proof.
+# Separate merge-queue candidates (each PR plus the PRs ahead of it) need
+# independent checks. A newer candidate must not cancel an earlier one's run.
+# Main runs are also commit-scoped: publication needs CI evidence for the exact
+# final commit being tagged, even if another commit lands while its tests run.
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ (github.event_name == 'merge_group' || github.ref == 'refs/heads/main') && github.sha || 'latest' }}
   cancel-in-progress: ${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' }}
@@ -51,7 +51,7 @@ jobs:
     name: Landing policy
     # The main branch must run Landing policy too: release publication requires
     # every required check to succeed on the exact final commit that landed.
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -66,8 +66,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/landing-policy.py --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"
-      - name: Governed-docs aggregate validator (separate integration placeholder)
-        run: echo "The read-only governed-docs aggregate validator is integrated separately here."
+      - name: Capture exact queue context for removal diagnostics
+        if: ${{ always() && github.event_name == 'merge_group' }}
+        run: |
+          python3 -c 'import json, os, pathlib; group=json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["merge_group"]; (pathlib.Path(os.environ["RUNNER_TEMP"])/"queue-context.json").write_text(json.dumps({key:group[key] for key in ("base_sha", "head_sha", "head_ref")}))'
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && github.event_name == 'merge_group' }}
+        with:
+          name: queue-context-${{ github.sha }}
+          path: ${{ runner.temp }}/queue-context.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Install governed-input validator dependencies
+        run: bun install --frozen-lockfile
+      - name: Build bridge dependency for workspace imports
+        run: bun run --cwd packages/aft-bridge build
+      - name: Governed-docs aggregate input validator
+        run: |
+          git fetch --no-tags origin refs/tags/v0.48.1:refs/tags/v0.48.1
+          node scripts/release-gate-v049.mjs --check-inputs
 
   # ---------------------------------------------------------------------------
   # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e),
@@ -87,13 +110,13 @@ jobs:
   # path). The tradeoff — runner minutes spent on e2e when unit fails — is
   # accepted for the wall-clock halving.
   #
-  # PR/train e2e builds use the `stage` cargo profile (optimized, no fat LTO):
+  # PR/queue/train e2e builds use the `stage` cargo profile (optimized, no fat LTO):
   # same test coverage, minutes less link time per lane.
   #
   # Pushes to main build the `release` profile instead, so the shipped fat-LTO
   # binary shape is e2e-tested on every commit that lands. A main run starts
-  # after main is already fast-forwarded, so it is off every critical path.
-  # Its cache does not serve release.yml: the release builds use their own
+  # after integration, so it is off the delivery landing path. Release tagging
+  # waits for its exact main run. Release builds use separate
   # cache keys.
   # ---------------------------------------------------------------------------
   e2e:
@@ -201,17 +224,15 @@ jobs:
           mkdir -p benchmarks/aft-search/.bench/search-quality
           exec > >(tee benchmarks/aft-search/.bench/search-quality/gate.log) 2>&1
           set -x
-          # Bootstrap arm: until B0 records the initial reference pair the
-          # ordinary evaluate cannot run (a missing reference is never
-          # downgraded to verify). Prove the pipeline end to end with the
-          # B0-guarded dry run instead and say so loudly; this arm disappears
-          # the moment real-query-baseline.json exists.
+          # Without an initial reference pair, ordinary evaluation cannot run.
+          # The existing dry-run bootstrap checks provisioning without silently
+          # downgrading evaluation to verify; it cannot authorize queue landing.
           if [ ! -f benchmarks/aft-search/real-query-baseline.json ]; then
             if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
               echo "::error title=search-quality-gate::queue_reference_missing: record the reference pair before enabling queue landing"
               exit 2
             fi
-            echo "::warning title=search-quality-gate bootstrap::reference pair absent; B0 has not recorded it yet - running record-reference --dry-run only"
+            echo "::warning title=search-quality-gate bootstrap::reference pair absent; running record-reference --dry-run only"
             scripts/telemetry/cost-gate.sh --search-quality --mode record-reference --dry-run
             exit 0
           fi

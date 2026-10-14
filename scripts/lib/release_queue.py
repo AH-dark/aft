@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+from importlib import import_module
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
-from land_pr import gh, log, save
-from landing_policy import ROOT, git
+landing = import_module("land_pr")
+policy = import_module("landing_policy")
+gh, log, save = landing.gh, landing.log, landing.save
+ROOT, git = policy.ROOT, policy.git
 
 
 def state_path(version: str) -> Path:
@@ -99,6 +103,19 @@ def publish(version: str, legacy: bool) -> str:
     subprocess.run([str(ROOT / "scripts/watch-ci.sh"), oid], env=env, stdout=sys.stderr, check=True)
     # A green run summary is not enough: this gate checks every required job.
     subprocess.run([str(ROOT / "scripts/release-ci-gate.sh"), oid], env=env, stdout=sys.stderr, check=True)
+    gate = ROOT / "scripts/release-gate-v049.mjs"
+    if gate.exists():
+        # The merge may include earlier queued PRs. Freeze publication records
+        # from that exact final tree, not just the original version-bump head.
+        git("checkout", "--detach", oid)
+        try:
+            with tempfile.TemporaryDirectory(prefix="aft-release-publication-") as directory:
+                subprocess.run(["node", str(gate), "--prepare", "--snapshot-dir", directory, "--candidate"],
+                               stdout=sys.stderr, check=True)
+                subprocess.run(["node", str(gate), "--snapshot-dir", directory, "--candidate"],
+                               stdout=sys.stderr, check=True)
+        finally:
+            git("checkout", state["branch"])
     tag = f"v{version}"
     remote = git("ls-remote", "--tags", "origin", f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}")
     remote_refs = {line.split()[1]: line.split()[0] for line in remote.splitlines()}

@@ -192,9 +192,6 @@ jobs:
           git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
           node scripts/release-gate-v049.mjs --check-inputs
 
-      - name: Publication surface preflight
-        run: node scripts/release-gate-v049.mjs
-
       - name: Cargo build (debug — needed by plugin e2e tests)
         run: cargo build -p agent-file-tools
 

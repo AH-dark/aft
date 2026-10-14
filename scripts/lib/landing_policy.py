@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from importlib import import_module
-import json
 from pathlib import Path
 import re
 import subprocess
@@ -71,10 +70,16 @@ def check_event(event: str, payload: dict) -> int:
                                       group["head_ref"], payload["repository"]["full_name"])
         return sum(check_commits(group["base_sha"], member["head"], member["branch"])
                    for member in members)
-    if event == "push" and payload["ref"] == "refs/heads/main":
-        base, head = payload["before"], payload["after"]
+    if event == "push":
+        head = payload["after"]
         if git("rev-parse", "HEAD") != head:
-            raise ValueError("main identity checkout does not match the push SHA")
+            raise ValueError("identity checkout does not match the push SHA")
+        if payload["ref"] != "refs/heads/main":
+            # Keep legacy train validation during migration. A branch's first
+            # push has an all-zero before SHA, so classify its main-based range.
+            base = git("merge-base", "origin/main", head)
+            return check_commits(base, head, payload["ref"].removeprefix("refs/heads/"))
+        base = payload["before"]
         commits = git("rev-list", "--first-parent", f"{base}..{head}").splitlines()
         if commits and all(len(git("show", "-s", "--format=%P", sha).split()) == 2 for sha in commits):
             members = queue.queue_members(base, head, None, payload["repository"]["full_name"])

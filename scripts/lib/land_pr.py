@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 from importlib import import_module
+import io
 import json
 import os
 from pathlib import Path
@@ -13,8 +14,13 @@ import subprocess
 import sys
 import time
 from urllib.parse import quote
+import zipfile
 
-from landing_policy import AGENT_ATTRIBUTION_POLICY, ROOT, check_commits, git
+policy = import_module("landing_policy")
+AGENT_ATTRIBUTION_POLICY = policy.AGENT_ATTRIBUTION_POLICY
+ROOT = policy.ROOT
+check_commits = policy.check_commits
+git = policy.git
 
 
 def log(text: str) -> None:
@@ -63,10 +69,48 @@ def stamp(value: str) -> datetime:
 
 
 
-def workflow_runs(repo: str, head: str) -> list[dict]:
-    response = json.loads(gh("api", "--paginate", "--slurp",
-                            f"repos/{repo}/actions/workflows/tests.yml/runs?event=merge_group&head_sha={head}&per_page=100"))
+def workflow_runs(repo: str, head: str, since: str | None = None) -> list[dict]:
+    endpoint = f"repos/{repo}/actions/workflows/tests.yml/runs?event=merge_group&per_page=100"
+    if head:
+        endpoint += f"&head_sha={quote(head, safe='')}"
+    if since:
+        endpoint += "&created=" + quote(">=" + stamp(since).strftime("%Y-%m-%dT%H:%M:%SZ"), safe="")
+    response = json.loads(gh("api", "--paginate", "--slurp", endpoint))
     return [run for page in response for run in page["workflow_runs"]]
+
+
+def diagnostic_context(repo: str, run: dict, member_head: str) -> bool:
+    response = json.loads(gh("api", "--paginate", "--slurp",
+                            f"repos/{repo}/actions/runs/{run['id']}/artifacts?per_page=100"))
+    artifacts = [artifact for page in response for artifact in page["artifacts"]
+                 if artifact["name"] == f"queue-context-{run['head_sha']}" and not artifact["expired"]]
+    if len(artifacts) != 1:
+        return False
+    env = {key: value for key, value in os.environ.items() if key != "GH_SHIM_BYPASS"}
+    archive = subprocess.check_output(
+        ["gh", "api", f"repos/{repo}/actions/artifacts/{artifacts[0]['id']}/zip"], env=env,
+    )
+    with zipfile.ZipFile(io.BytesIO(archive)) as data:
+        if data.getinfo("queue-context.json").file_size > 4096:
+            raise ValueError("oversized queue diagnostic context")
+        context = json.loads(data.read("queue-context.json"))
+    base, head = context["base_sha"], context["head_sha"]
+    if (head != run["head_sha"] or re.fullmatch(r"[0-9a-f]{40}", head) is None
+            or re.fullmatch(r"[0-9a-f]{40}", base) is None
+            or not context["head_ref"].removeprefix("refs/heads/").startswith("gh-readonly-queue/main/")):
+        return False
+    cursor, found = head, False
+    # Validate the full event-pinned prefix, not arbitrary main history that
+    # could contain the same PR head from an earlier admission.
+    for _ in range(100):
+        if cursor == base:
+            return found
+        parents = api(f"repos/{repo}/git/commits/{cursor}")["parents"]
+        if len(parents) != 2:
+            return False
+        found = found or parents[1]["sha"] == member_head
+        cursor = parents[0]["sha"]
+    return cursor == base and found
 
 
 def report_removed(repo: str, state: dict, removal: dict | None) -> None:
@@ -82,21 +126,29 @@ def report_removed(repo: str, state: dict, removal: dict | None) -> None:
                 heads.append(candidate)
                 break
             cursor = parents[0]["sha"]
+    runs = {run["id"]: run for head in heads for run in workflow_runs(repo, head)
+            if run["head_sha"] == head}
+    # A short-lived entry may be missed, and its headCommit need not be the
+    # Actions group SHA. Discover recent candidates only with event metadata
+    # plus merge-parent proof; a branch-name or timestamp match alone is unsafe.
+    for run in workflow_runs(repo, "", state["admitted_at"]):
+        if (run["event"] == "merge_group" and stamp(run["created_at"]) >= stamp(state["admitted_at"])
+                and run["conclusion"] in {"failure", "timed_out", "cancelled"}
+                and run["id"] not in runs and diagnostic_context(repo, run, state["head"])):
+            runs[run["id"]] = run
     found = False
-    for head in heads:
-        for run in workflow_runs(repo, head):
-            if (run["head_sha"] != head or run["event"] != "merge_group"
-                    or stamp(run["created_at"]) < stamp(state["admitted_at"])
-                    or run["conclusion"] not in {"failure", "timed_out", "cancelled"}):
-                continue
-            log(f"failing group {head}: {run['html_url']} ({run['conclusion']})")
-            jobs = pages(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")
-            bad = [job for job in jobs if job["conclusion"] in {"failure", "timed_out", "cancelled"}]
-            for job in bad:
-                log(f"  {job['name']}: {job['conclusion']}")
-            if not bad:
-                log("  no failing job was reported; inspect missing checks or queue timeout")
-            found = True
+    for run in runs.values():
+        if (run["event"] != "merge_group" or stamp(run["created_at"]) < stamp(state["admitted_at"])
+                or run["conclusion"] not in {"failure", "timed_out", "cancelled"}):
+            continue
+        log(f"failing group {run['head_sha']}: {run['html_url']} ({run['conclusion']})")
+        jobs = pages(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")
+        bad = [job for job in jobs if job["conclusion"] in {"failure", "timed_out", "cancelled"}]
+        for job in bad:
+            log(f"  {job['name']}: {job['conclusion']}")
+        if not bad:
+            log("  no failing job was reported; inspect missing checks or queue timeout")
+        found = True
     if not found:
         log("removed from queue; exact failing group/run could not be established (no stale run attributed)")
 

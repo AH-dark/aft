@@ -18,7 +18,7 @@ OWNER = "94532+ualtinok@users.noreply.github.com"
 COAUTHOR = "Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>"
 
 FAKE_GH = r'''
-import datetime, json, os, pathlib, subprocess, sys
+import datetime, io, json, os, pathlib, subprocess, sys, zipfile
 a = sys.argv[1:]
 p = pathlib.Path(os.environ['PR_TEST_STATE'])
 s = json.loads(p.read_text())
@@ -88,9 +88,9 @@ if 'graphql' in a:
              'headRefOid': 'f'*40 if s.get('wrong_head') else head(),
              'isMergeQueueEnabled': s.get('queue', True), 'isInMergeQueue': bool(queued),
              'autoMergeRequest': None, 'mergeCommit': {'oid': s.get('merge_oid')} if s.get('merged') else None,
-             'mergeQueueEntry': {'headCommit': {'oid': s['group']}, 'enqueuedAt': now(), 'state': 'AWAITING_CHECKS'} if queued else None,
+             'mergeQueueEntry': {'headCommit': {'oid': head() if s.get('raw_entry_head') else s['group']}, 'enqueuedAt': now(), 'state': 'AWAITING_CHECKS'} if queued else None,
              'timelineItems': {'nodes': [{'createdAt': now(), 'reason': 'required check failed',
-                                         'beforeCommit': {'oid': s['group']}}] if removed else []}}
+                                         'beforeCommit': {'oid': head() if s.get('raw_entry_head') else s['group']}}] if removed else []}}
     if s.get('admitted'): s['polls'] = s.get('polls', 0)+1; persist()
     answer({'data': {'repository': {'pullRequest': value}}})
 endpoint = next(x for x in a[1:] if x.startswith('repos/'))
@@ -104,12 +104,21 @@ if endpoint.endswith('/reviews'): answer([])
 if '/commits/' in endpoint and '/git/commits/' not in endpoint:
     answer({'commit': {'committer': {'date': now() if s.get('recent') else '2000-01-01T00:00:00Z'}}})
 if '/git/commits/' in endpoint:
-    answer({'parents': [{'sha': x} for x in g('show', '-s', '--format=%P', endpoint.split('/')[-1]).split()]})
+    answer({'parents': [{'sha': x} for x in g('--git-dir', s['origin'], 'show', '-s', '--format=%P', endpoint.split('/')[-1]).split()]})
 if '/actions/workflows/' in endpoint:
     run = {'id': 42, 'head_sha': s['group'], 'event': 'merge_group', 'conclusion': 'failure',
            'created_at': '2000-01-01T00:00:00Z' if s.get('stale_run') else now(),
            'html_url': 'https://github.com/example/repo/actions/runs/42'}
     answer([{'workflow_runs': [run]}])
+if '/actions/runs/42/artifacts' in endpoint:
+    answer([{'artifacts': [{'id': 123, 'name': 'queue-context-'+s['group'], 'expired': False}]}])
+if '/actions/artifacts/123/zip' in endpoint:
+    base = g('--git-dir', s['origin'], 'show', '-s', '--format=%P', s['group']).split()[0]
+    record = {'base_sha': base, 'head_sha': 'f'*40 if s.get('wrong_context') else s['group'],
+              'head_ref': 'refs/heads/gh-readonly-queue/main/pr-7-fixture'}
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, 'w') as archive: archive.writestr('queue-context.json', json.dumps(record))
+    sys.stdout.buffer.write(stream.getvalue()); sys.exit(0)
 if '/actions/runs/42/jobs' in endpoint:
     answer([[{'name': 'Unit / Unit tests (Linux)', 'conclusion': 'failure'}]])
 raise SystemExit('unhandled fake endpoint: '+endpoint)
@@ -145,6 +154,7 @@ class PRFixture(unittest.TestCase):
         watch = self.repo / "scripts/watch-ci.sh"
         watch.write_text('#!/usr/bin/env bash\nset -euo pipefail\n[[ "$WATCH_CI_EVENT" == push && "$WATCH_CI_BRANCH" == main ]]\nprintf "%s\\n" "$1" > "$(dirname "$PR_TEST_STATE")/watched-oid"\n')
         watch.chmod(0o755)
+        (self.repo / "scripts/release-gate-v049.mjs").write_text("// Fixture publication gate driven by the fake node executable.\n")
         self.git("init", "-qb", "main")
         self.git("config", "user.name", "ualtinok")
         self.git("config", "user.email", OWNER)
@@ -176,6 +186,22 @@ class PRFixture(unittest.TestCase):
         executable = bin_dir / "gh"
         executable.write_text(f"#!{sys.executable}\n" + FAKE_GH)
         executable.chmod(0o755)
+        node = bin_dir / "node"
+        node.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, pathlib, subprocess, sys
+args = sys.argv[1:]
+state = pathlib.Path(os.environ['PR_TEST_STATE'])
+head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+with state.with_suffix('.calls').open('a') as f:
+    f.write(json.dumps({'args': ['node', *args], 'source_oid': head}) + '\n')
+folder = pathlib.Path(args[args.index('--snapshot-dir')+1])
+record = folder / 'snapshot.json'
+if '--prepare' in args:
+    record.write_text(json.dumps({'source_oid': head}))
+else:
+    assert json.loads(record.read_text())['source_oid'] == head
+''')
+        node.chmod(0o755)
         self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
 
     def git(self, *args: str) -> str:
@@ -279,12 +305,47 @@ class DeliveryTests(PRFixture):
         self.assertEqual(created[0]["bypass"], "")
         self.assertTrue((self.repo / "benchmarks/aft-search/slice-descriptors/land-delivery.json").exists())
 
+    def test_existing_open_pr_is_updated_without_duplicate_creation(self) -> None:
+        self.write_state(exists=True)
+        result = self.run_script("land-pr.sh", "delivery", "--title", "accepted revision")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call["args"][:2] == ["pr", "create"] for call in self.calls()))
+        self.assertTrue(any(call["args"][:2] == ["pr", "edit"] for call in self.calls()))
+
+    def test_delivery_remote_head_change_refuses_stale_admission(self) -> None:
+        self.write_state(wrong_head=True)
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("remote PR head does not match", result.stderr)
+        self.assertEqual(self.merges(), [])
+
+    def test_unattributed_delivery_is_refused_before_push_or_pr_creation(self) -> None:
+        self.git("commit", "--allow-empty", "-qm", "manual without attribution")
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing alfonso-aft", result.stderr)
+        self.assertFalse(any(call["args"][:2] == ["pr", "create"] for call in self.calls()))
+
     def test_queue_removal_reports_exact_run_and_failing_job(self) -> None:
         self.write_state(remove=True)
         result = self.run_script("land-pr.sh", "delivery")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("actions/runs/42", result.stderr)
         self.assertIn("Unit / Unit tests (Linux): failure", result.stderr)
+
+    def test_removal_finds_group_from_artifact_when_entry_head_is_original(self) -> None:
+        self.write_state(remove=True, raw_entry_head=True)
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("actions/runs/42", result.stderr)
+        self.assertIn("Unit / Unit tests (Linux): failure", result.stderr)
+
+    def test_wrong_group_context_is_not_attributed_to_removed_pr(self) -> None:
+        self.write_state(remove=True, raw_entry_head=True, wrong_context=True)
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("actions/runs/42", result.stderr)
+        self.assertIn("exact failing group/run could not be established", result.stderr)
 
     def test_stale_failed_group_is_not_attributed_to_new_admission(self) -> None:
         self.write_state(remove=True, stale_run=True)
@@ -316,6 +377,10 @@ class ReleaseQueueTests(PRFixture):
         final = self.git("rev-list", "-n", "1", "v1.0.1")
         self.assertNotEqual(final, source)
         self.assertEqual(final, self.git("rev-parse", "origin/main"))
+        publication = [call for call in self.calls() if call["args"][0] == "node"]
+        self.assertEqual(len(publication), 2)
+        self.assertTrue(all(call["source_oid"] == final for call in publication))
+        self.assertIn("--prepare", publication[0]["args"])
         again = self.run_script("release.sh", "1.0.1")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertEqual(len([call for call in self.calls() if call["args"][:2] == ["pr", "create"]]), 1)

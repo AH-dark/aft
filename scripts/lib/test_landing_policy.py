@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Identity guards inspect real commits, with branch-specific attribution."""
 
+from __future__ import annotations
+
 import json
+from importlib import import_module
 import os
 from pathlib import Path
 import subprocess
@@ -88,6 +91,40 @@ class LandingIdentityTests(unittest.TestCase):
     def test_trailer_mentioned_in_body_is_not_attribution(self) -> None:
         self.commit("delivery\n\n" + COAUTHOR + "\n\nNot a trailer footer.")
         self.assertEqual(self.check("land/body").returncode, 1)
+
+    def group_check(self, agent: bool) -> subprocess.CompletedProcess:
+        fixture = import_module("test_merge_queue_workflow").MergeQueueDescriptorTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.git("config", "user.name", "ualtinok")
+        fixture.git("config", "user.email", OWNER)
+        fixture.member(1)
+        original = next(iter(fixture.prs))
+        if agent:
+            fixture.prs[original][0]["head"]["ref"] = "land/member-1"
+        # Deliberately private synthetic metadata must not be mistaken for an
+        # original PR commit's identity. Original member heads remain public.
+        fixture.git("config", "user.email", "synthetic@private.invalid")
+        fixture.git("-c", "core.hooksPath=/dev/null", "commit", "--amend", "--no-edit", "--author", "GitHub <synthetic@private.invalid>", "-q")
+        (fixture.repo / ".fixture-prs.json").write_text(json.dumps(fixture.prs))
+        event = fixture.repo / "policy-event.json"
+        event.write_text(json.dumps({"repository": {"full_name": "cortexkit/aft"},
+                         "merge_group": {"base_sha": fixture.base, "head_sha": fixture.git("rev-parse", "HEAD"),
+                         "head_ref": "refs/heads/gh-readonly-queue/main/pr-1-fixture"}}))
+        return subprocess.run([sys.executable, str(ROOT / "scripts/landing-policy.py"),
+                               "--event", "merge_group", "--event-path", str(event)],
+                              cwd=fixture.repo, env=fixture.env, capture_output=True, text=True)
+
+    def test_group_synthetic_author_is_excluded_from_original_identity_policy(self) -> None:
+        result = self.group_check(agent=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2 original commits checked", result.stdout)
+
+    def test_group_member_land_branch_still_requires_original_trailers(self) -> None:
+        result = self.group_check(agent=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("missing alfonso-aft", result.stderr)
+        self.assertNotIn("email must", result.stderr)
 
     def test_pr_event_checks_original_head_not_synthetic_merge(self) -> None:
         self.commit("delivery\n\n" + COAUTHOR)

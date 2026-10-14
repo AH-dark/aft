@@ -2,13 +2,17 @@
 """Check original commit identities without changing the checkout or messages."""
 
 import argparse
+from importlib import import_module
 import json
 from pathlib import Path
 import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
-from landing_policy import AGENT_ATTRIBUTION_POLICY, check_commits, check_event
+policy = import_module("landing_policy")
+AGENT_ATTRIBUTION_POLICY = policy.AGENT_ATTRIBUTION_POLICY
+check_commits = policy.check_commits
+check_event = policy.check_event
 
 
 def main() -> int:

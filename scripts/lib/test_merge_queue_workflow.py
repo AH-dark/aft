@@ -65,6 +65,20 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             "${{ github.ref == 'refs/heads/main' && 'release' || 'stage' }}",
         )
 
+    def test_landing_policy_reports_original_commits_on_pr_group_and_main(self) -> None:
+        job = self.workflow["jobs"]["landing-policy"]
+        self.assertEqual(job["name"], "Landing policy")
+        self.assertEqual(job["if"], "${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push' }}")
+        self.assertEqual(job["permissions"], {"contents": "read", "pull-requests": "read"})
+        checkout = job["steps"][0]
+        self.assertEqual(checkout["with"]["fetch-depth"], "0")
+        self.assertEqual(checkout["with"]["ref"], "${{ github.event.pull_request.head.sha || github.sha }}")
+        identity = next(step for step in job["steps"] if step.get("name") == "Original PR commit identity and agent attribution")
+        self.assertIn("scripts/landing-policy.py", identity["run"])
+        aggregate = next(step for step in job["steps"] if step.get("name") == "Governed-docs aggregate input validator")
+        self.assertIn("node scripts/release-gate-v049.mjs --check-inputs", aggregate["run"])
+        self.assertNotIn("--prepare", aggregate["run"])
+
     def test_search_gate_pins_queue_base_head_and_explicit_descriptor(self) -> None:
         gate = self.workflow["jobs"]["search-quality-gate"]
         self.assertEqual(gate["if"], "${{ !cancelled() }}")
@@ -239,12 +253,16 @@ class MergeQueueDescriptorTests(unittest.TestCase):
         path = self.member(1)
         self.git("checkout", "-qb", "train/member-2", self.base)
         self.commit_file(path, json.dumps({"slice_class": "ranking"}))
+        pr_head = self.git("rev-parse", "HEAD")
+        self.prs[pr_head] = [{"number": 2, "head": {"sha": pr_head, "ref": "train/member-2"},
+                             "base": {"ref": "main", "repo": {"full_name": "cortexkit/aft"}}}]
         self.git("checkout", "-q", "queue")
         self.git("-c", "core.hooksPath=/dev/null", "merge", "--no-ff", "-s", "ours", "-qm", "synthetic merge", "train/member-2")
         self.commit_file(path, json.dumps({"slice_class": "ranking"}))
         # Overwrite within a merge commit so topology remains a valid queue prefix.
         self.git("reset", "--soft", "HEAD~1")
         self.git("-c", "core.hooksPath=/dev/null", "commit", "--amend", "--no-edit", "-q")
+        self.tail = 2
         result = self.select()
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("queue_descriptor_overwritten", result.stderr)

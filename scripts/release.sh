@@ -43,7 +43,6 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?
 fi
 
 TAG="v$VERSION"
-CURRENT_HEAD=$(git rev-parse HEAD)
 RESUME_RELEASE=0
 
 RELEASE_STATE=$(git rev-parse --git-path "aft-release/$TAG.json")
