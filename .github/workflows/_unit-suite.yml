@@ -611,7 +611,9 @@ jobs:
           cache-on-failure: true
 
       - name: Build nextest archive (macOS lib tests)
-        run: cargo nextest archive --workspace -E 'kind(lib)' --archive-file "$MACOS_LIBTEST_ARCHIVE"
+        # The selected integration probe makes Cargo build the real aft CLI.
+        # Its tests are filtered out; only the library bucket enters this archive.
+        run: cargo nextest archive --workspace --lib --test sandbox_launch_probe -E 'kind(lib)' --archive-file "$MACOS_LIBTEST_ARCHIVE"
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ runner.temp }}/macos-libtest-nextest.tar.zst
 
@@ -668,7 +670,9 @@ jobs:
           cache-on-failure: true
 
       - name: Build nextest archive (macOS bin tests)
-        run: cargo nextest archive --workspace -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
+        # Keep the real CLI alongside the binary test harness without compiling
+        # the unrelated library harnesses and integration suite.
+        run: cargo nextest archive --workspace --bins --test sandbox_launch_probe -E 'kind(bin)' --archive-file "$MACOS_BIN_ARCHIVE"
         env:
           MACOS_BIN_ARCHIVE: ${{ runner.temp }}/macos-bin-nextest.tar.zst
 

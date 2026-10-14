@@ -58,6 +58,22 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class CISpeedWorkflowTests(unittest.TestCase):
+    def test_release_binary_cache_requires_exact_commit_and_compiler(self) -> None:
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/tests.yml"
+        workflow = workflow_gates.parse_workflow(str(path))
+        producer = workflow["jobs"]["search-quality-binary"]
+        caches = [step for step in producer["steps"] if step.get("id") == "release-binary"]
+        self.assertEqual(len(caches), 1)
+        cache = caches[0]
+        self.assertEqual(cache["uses"], "actions/cache@v4")
+        self.assertEqual(cache["with"]["path"], "target/release/aft")
+        self.assertIn("${{ github.sha }}", cache["with"]["key"])
+        self.assertIn("${{ steps.rust.outputs.cachekey }}", cache["with"]["key"])
+        self.assertNotIn("restore-keys", cache["with"])
+        build = next(step for step in producer["steps"] if step.get("name") == "Build shared release AFT")
+        self.assertIn("release-binary.outputs.cache-hit", build["if"])
+        self.assertEqual(build["run"], "cargo build --release --locked -p agent-file-tools --bin aft")
+
     def test_direct_ci_storm_nextest_run_keeps_all_failures(self) -> None:
         self.assertIn("cargo nextest run --no-fail-fast", workflow_job("unit-linux-storm"))
 
@@ -100,6 +116,14 @@ class CISpeedWorkflowTests(unittest.TestCase):
 
 
 class MacOSUnitWorkflowTests(unittest.TestCase):
+    def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
+        lib = workflow_job("unit-macos-libtest-archive")
+        binary = workflow_job("unit-macos-bin-archive")
+        self.assertIn("--workspace --lib --test sandbox_launch_probe", lib)
+        self.assertIn("--workspace --bins --test sandbox_launch_probe", binary)
+        self.assertIn("-E 'kind(lib)'", lib)
+        self.assertIn("-E 'kind(bin)'", binary)
+
     def test_required_macos_check_aggregates_every_lane(self) -> None:
         summary = workflow_job("unit-macos")
         expected_lanes = {
