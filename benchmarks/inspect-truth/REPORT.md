@@ -47,6 +47,16 @@ the [slice](slices/own-repo-close.md#full-gate-baseline-comparison-and-verificat
 records exact counts and the intentionally upgraded contribution/producer
 goldens. No unrelated baseline failure or timing optimization is bundled.
 
+The subsequent [Linux TypeORM phase profile](slices/typeorm-profile.md) attributes
+the common cost to whole-project contribution rollups performed again for scoped
+cache reads (5.60s mean across five categories). The repeatable enabled-config
+increment is about 0.50s in selecting scope-relevant language-server runtime
+notes, not a diagnostics sweep. The earlier 1.5s median gap is not a stable LSP
+surcharge: repeat runs fluctuate and one enabled control falls rather than
+rises. Full reference/probe reply bodies match after removing only request ID
+and the last-run timestamp. No safe, byte-identical shortcut was proved, so this
+follow-up reports the breakdown without changing runtime behavior.
+
 ## Final upgrade-and-report rerun
 
 This accuracy campaign compares AFT (Agent File Tools) with language-specific
