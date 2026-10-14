@@ -1364,6 +1364,11 @@ pub(crate) fn main() -> io::Result<()> {
                         std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref(),
                         Some("publish_then_quiescent" | "empty_then_quiescent")
                     ) {
+                        if let Some(release) = std::env::var_os("AFT_FAKE_LSP_QUIESCENCE_RELEASE_FILE") {
+                            while !std::path::Path::new(&release).exists() {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                        }
                         write_notification(
                             &mut writer,
                             &Notification::new(

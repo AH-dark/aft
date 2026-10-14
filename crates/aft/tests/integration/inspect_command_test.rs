@@ -5979,11 +5979,42 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
     let pre_opened = write_file(&root, "src/old.rs", "pub fn old() {}\n");
     let cold = write_file(&root, "src/cold.rs", "pub fn cold() {}\n");
     let ctx = configured_context(&root);
+    let ready_release = root.join("release-initial-quiescence");
+    let _ready_cleanup = super::helpers::ReleaseOnDrop::new(&ready_release);
     configure_fake_rust_lsp(&ctx);
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "publish_then_quiescent");
+    ctx.lsp().set_extra_env(
+        "AFT_FAKE_LSP_QUIESCENCE_RELEASE_FILE",
+        ready_release.to_str().unwrap(),
+    );
     open_with_lsp(&ctx, &pre_opened, "pub fn old() {}\n");
     ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
-    let before = ctx.status_bar_count_values();
+    assert!(ctx.lsp().has_diagnostic_report_for_file(&pre_opened));
+    assert!(
+        ctx.status_bar_count_values().errors.is_none(),
+        "the fake must hold the initial report provisional until the readiness wait"
+    );
+    let wait_for_before = || {
+        // `open_with_lsp` waits for a stored diagnostic publication, which can
+        // still be provisional while the server is warming. Allow the fake to
+        // announce readiness, then wait for a non-provisional report and keep
+        // the first bar snapshot with a known error count. A later fresh read
+        // could hit the manager-contention fallback again.
+        std::fs::write(&ready_release, "ready\n").unwrap();
+        wait_for_lsp_report_state(&ctx, &pre_opened, false);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let before = ctx.status_bar_count_values();
+            if before.errors.is_some() {
+                break before;
+            }
+            assert!(Instant::now() < deadline, "project bar never acquired a known error count after the authoritative report for {pre_opened:?}: {before:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let before = wait_for_before();
     assert!(before.errors.is_some());
     assert!(!ctx.lsp().has_diagnostic_report_for_file(&cold));
     let response = handle_inspect_tool_call(
