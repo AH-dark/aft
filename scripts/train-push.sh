@@ -428,13 +428,12 @@ watch_name="${train_name//\//-}"
 watch_heartbeat="$git_common_dir/train-push-$watch_name.watch"
 mkdir -p "$train_lock_dir" "$train_name_lock_dir" 2>/dev/null || true
 
-# ACQUIRE BEFORE ANY NETWORK WORK, AND ACQUIRE ATOMICALLY. A scan-then-write
-# guard with a `git ls-remote` between the scan and the write admitted two
-# trains started together: the window is a network round trip, and "background
-# one train, start another" lands inside it by construction (BROCA's audit
-# found it in the guard written to fix an ordering bug; 98b68a85 -> d588cb6c).
-# `mkdir` is the POSIX atomic primitive: EEXIST if it exists, so of N racers
-# exactly one wins and there is no check-then-act to lose.
+# ACQUIRE BEFORE ANY NETWORK WORK. The lock directories hold owner files, but
+# `mkdir` only prepares the directory: some shared filesystems let two clients
+# both report success for the same new directory. The owner file itself is
+# claimed with noclobber, whose exclusive create allows exactly one train in.
+# Acquiring both locks before the ref scan prevents two trains from racing the
+# resolve-HEAD-to-push window; a remote ref alone cannot represent a live train.
 #
 # The owner file is written after the directory exists, leaving a two-syscall
 # window where the lock is held by someone who has not said who they are. An
@@ -449,14 +448,32 @@ train_lock_attempts=0
 train_lock_process_start() {
   ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true
 }
+# `mkdir` is not reliably exclusive on every shared filesystem. The owner file
+# uses noclobber's O_EXCL create so only one process can claim a lock directory.
+train_lock_claim_file() {
+  local train_lock_claim_path="$1"
+  shift
+  (
+    set -o noclobber
+    printf '%s\n' "$@" > "$train_lock_claim_path"
+  ) 2>/dev/null
+}
 # Computed before taking the lock so the owner write right after mkdir stays a
 # single write, keeping the window where the lock has no readable owner short.
 train_lock_my_start="$(train_lock_process_start "$$")"
 for train_lock_held in "$train_lock_dir/held" "$train_name_lock_dir/held"; do
 train_lock_attempts=0
 while true; do
+  train_lock_held_created=0
   if mkdir "$train_lock_held" 2>/dev/null; then
-    printf '%s %s\n%s\n' "$$" "$train_name" "$train_lock_my_start" > "$train_lock_held/owner"
+    train_lock_held_created=1
+  fi
+  if [ -n "${TRAIN_PUSH_TEST_LOCK_CREATE_HOOK:-}" ] &&
+    [ "$train_lock_held" = "$train_lock_dir/held" ]; then
+    "$TRAIN_PUSH_TEST_LOCK_CREATE_HOOK" "$train_lock_held" "$train_name"
+  fi
+  if [ "$train_lock_held_created" = 1 ] &&
+    train_lock_claim_file "$train_lock_held/owner" "$$ $train_name" "$train_lock_my_start"; then
     break
   fi
 
@@ -488,26 +505,33 @@ while true; do
     refuse "a train is already running on this machine; wait for it"
   fi
 
-  # Stale owner. Recovery is serialized by a second mkdir lock, `reap`. A
-  # rename alone was not enough: two trains reading the same stale owner both
-  # renamed `held`, and the second rename took the first one's FRESH lock
+  # Stale owner. Recovery is serialized by a second exclusive owner-file claim,
+  # `reap`. A rename alone was not enough: two trains reading the same stale owner
+  # both renamed `held`, and the second rename took the first one's FRESH lock
   # (created by its mkdir after its own rename), so both trains proceeded.
-  # Inside `reap`, `held` cannot change hands: a fresh mkdir fails while it
-  # exists and every other remover is waiting on `reap`. So re-reading the
-  # owner there and finding the same stale record proves the removal is safe.
+  # While the reaper owner file exists, no other remover can claim `reap`; the
+  # holder re-reads the `held` owner and removes it only if it still matches.
   # Both resources have their own recovery mutex. The name lock is shared
   # across worktrees, so its reaper must be shared across worktrees too.
   train_lock_reap="${train_lock_held%/held}/reap"
   if [ -n "${TRAIN_PUSH_TEST_LOCK_RACE_HOOK:-}" ]; then
     "$TRAIN_PUSH_TEST_LOCK_RACE_HOOK"
   fi
-  if mkdir "$train_lock_reap" 2>/dev/null; then
-    printf '%s\n%s\n' "$$" "$train_lock_my_start" > "$train_lock_reap/owner"
+  train_lock_reap_claimed=0
+  if mkdir "$train_lock_reap" 2>/dev/null &&
+    train_lock_claim_file "$train_lock_reap/owner" "$$" "$train_lock_my_start"; then
+    train_lock_reap_claimed=1
+  fi
+  if [ "$train_lock_reap_claimed" = 1 ]; then
     if [ "$(awk 'NR==1{print $1}' "$train_lock_held/owner" 2>/dev/null || true)" = "$owner_pid" ] &&
       [ "$(awk 'NR==2' "$train_lock_held/owner" 2>/dev/null || true)" = "$owner_start" ]; then
       rm -rf "$train_lock_held" 2>/dev/null || true
     fi
-    rm -rf "$train_lock_reap" 2>/dev/null || true
+    if [ "$(awk 'NR==1' "$train_lock_reap/owner" 2>/dev/null || true)" = "$$" ] &&
+      [ "$(awk 'NR==2' "$train_lock_reap/owner" 2>/dev/null || true)" = "$train_lock_my_start" ]; then
+      rm -f "$train_lock_reap/owner" 2>/dev/null || true
+      rmdir "$train_lock_reap" 2>/dev/null || true
+    fi
   else
     reaper_pid="$(awk 'NR==1' "$train_lock_reap/owner" 2>/dev/null || true)"
     reaper_start="$(awk 'NR==2' "$train_lock_reap/owner" 2>/dev/null || true)"

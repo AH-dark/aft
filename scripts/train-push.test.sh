@@ -1288,6 +1288,81 @@ test_gh_query_retry() {
   fi
 }
 
+test_race_lock() {
+  # Both racers rendezvous after attempting to create the lock directory and
+  # before the exclusive owner-file claim. This forces the interleaving that
+  # exposed non-exclusive directory creation; the slow ls-remote keeps the winner
+  # alive while the loser verifies that no train ref was pushed.
+  local dir real_git racer_a racer_b race_owner race_loser
+  dir="$(new_fixture race)"
+  add_train_commit "$dir/work" "race"
+  mkdir -p "$dir/fixturebin" "$dir/lock-barrier"
+  cat > "$dir/lock-create-hook.sh" <<'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$1" = "$TRAIN_PUSH_TEST_LOCK_PATH" ] || exit 0
+printf '%s\n' ready > "$TRAIN_PUSH_TEST_LOCK_BARRIER/$2"
+for _ in {1..500}; do
+  if [ -f "$TRAIN_PUSH_TEST_LOCK_BARRIER/racer-a" ] && [ -f "$TRAIN_PUSH_TEST_LOCK_BARRIER/racer-b" ]; then
+    exit 0
+  fi
+  sleep 0.01
+done
+printf 'lock race barrier timed out for %s\n' "$2" >&2
+exit 1
+HOOK
+  chmod +x "$dir/lock-create-hook.sh"
+  real_git="$(command -v git)"
+  printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "ls-remote" ] && sleep 0.5; done\nexec %s "$@"\n' "$real_git" > "$dir/fixturebin/git"
+  chmod +x "$dir/fixturebin/git"
+  (
+    cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
+      OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+      TRAIN_PUSH_TEST_LOCK_CREATE_HOOK="$dir/lock-create-hook.sh" \
+      TRAIN_PUSH_TEST_LOCK_PATH="$dir/work/.git/train-push-locks/held" \
+      TRAIN_PUSH_TEST_LOCK_BARRIER="$dir/lock-barrier" \
+      WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
+      "$TRAIN_PUSH" racer-a > "$dir/racer-a.out" 2>&1
+  ) &
+  racer_a=$!
+  (
+    cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
+      OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+      TRAIN_PUSH_TEST_LOCK_CREATE_HOOK="$dir/lock-create-hook.sh" \
+      TRAIN_PUSH_TEST_LOCK_PATH="$dir/work/.git/train-push-locks/held" \
+      TRAIN_PUSH_TEST_LOCK_BARRIER="$dir/lock-barrier" \
+      WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
+      "$TRAIN_PUSH" racer-b > "$dir/racer-b.out" 2>&1
+  ) &
+  racer_b=$!
+  wait "$racer_a" || true
+  wait "$racer_b" || true
+  race_owner="$(head -1 "$dir/work/.git/train-push-locks/held/owner" 2>/dev/null || true)"
+  case "$race_owner" in
+    *" racer-a") race_loser="racer-b" ;;
+    *" racer-b") race_loser="racer-a" ;;
+    *) race_loser="" ;;
+  esac
+  if [ -n "$race_loser" ]; then
+    if grep -Eq 'a train is already running|train lock is held with no readable owner' "$dir/$race_loser.out"; then
+      ok "the loser ($race_loser) was refused, not admitted"
+    else
+      fail "the loser ($race_loser) was admitted alongside the winner"
+      printf '%s\n' '--- racer-a output ---' >&2
+      printf '%s\n' "$(<"$dir/racer-a.out")" >&2
+      printf '%s\n' '--- racer-b output ---' >&2
+      printf '%s\n' "$(<"$dir/racer-b.out")" >&2
+    fi
+    if [ -z "$(origin_ref "$dir" "refs/heads/train/$race_loser")" ]; then
+      ok "the refused racer ($race_loser) pushed no train ref"
+    else
+      fail "the refused racer ($race_loser) pushed a train ref"
+    fi
+  else
+    fail "the lock owner is not a single racer: '$race_owner'"
+  fi
+}
+
 case "${TRAIN_PUSH_TEST_CASE:-}" in
   stack-base) test_stack_base_not_on_main ;;
   stack-red) test_stack_parent_red ;;
@@ -1306,11 +1381,16 @@ case "${TRAIN_PUSH_TEST_CASE:-}" in
   ci-conclusion) test_ci_conclusion_guard ;;
   skew-log-fallback) test_skew_log_query_fallback ;;
   gh-retry) test_gh_query_retry ;;
+  race-lock) test_race_lock ;;
   stacked) run_stack_tests ;;
 esac
-if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ]; then
+if [[ "${TRAIN_PUSH_TEST_CASE:-}" == stack* ]] || [[ "${TRAIN_PUSH_TEST_CASE:-}" == fetch-* ]] || [ "${TRAIN_PUSH_TEST_CASE:-}" = ci-conclusion ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = skew-log-fallback ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = gh-retry ] || [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
   [ "$failures" = 0 ] || exit 1
-  echo "train-push.test.sh: stacked cases passed ($checks checks)"
+  if [ "${TRAIN_PUSH_TEST_CASE:-}" = race-lock ]; then
+    echo "train-push.test.sh: race-lock case passed ($checks checks)"
+  else
+    echo "train-push.test.sh: stacked cases passed ($checks checks)"
+  fi
   exit 0
 fi
 run_stack_tests
@@ -2718,49 +2798,10 @@ run_train "$dir" leftover
 expect_rc 0 "a leftover ref with no live train proceeds"
 expect_out "git push origin --delete train/abandoned" "the leftover ref's delete is composed"
 expect_out "cannot race this train" "the run says why it proceeds"
-# test_two_trains_started_together_cannot_both_be_admitted: against a local bare
-# origin `ls-remote` is microseconds, so two processes never land in a window
-# that genuinely exists; a git shim that makes ls-remote take 0.5 s widens the
-# real race rather than inventing one. Exactly one name may own the lock and
-# the other must have been refused.
-dir="$(new_fixture race)"
-add_train_commit "$dir/work" "race"
-mkdir -p "$dir/fixturebin"
-real_git="$(command -v git)"
-printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "ls-remote" ] && sleep 0.5; done\nexec %s "$@"\n' "$real_git" > "$dir/fixturebin/git"
-chmod +x "$dir/fixturebin/git"
-(
-  cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
-    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
-    WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
-    "$TRAIN_PUSH" racer-a > "$dir/racer-a.out" 2>&1
-) &
-racer_a=$!
-(
-  cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
-    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
-    WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
-    "$TRAIN_PUSH" racer-b > "$dir/racer-b.out" 2>&1
-) &
-racer_b=$!
-wait "$racer_a" || true
-wait "$racer_b" || true
-race_owner="$(owner_line "$dir")"
-case "$race_owner" in
-  *" racer-a") race_loser="racer-b" ;;
-  *" racer-b") race_loser="racer-a" ;;
-  *) race_loser="" ;;
-esac
-if [ -n "$race_loser" ]; then
-  ok "exactly one racer owns the lock (${race_owner#* })"
-  if grep -q "a train is already running" "$dir/$race_loser.out"; then
-    ok "the loser ($race_loser) was refused, not admitted"
-  else
-    fail "the loser ($race_loser) was admitted alongside the winner"
-  fi
-else
-  fail "the lock owner is not a single racer: '$race_owner'"
-fi
+# test_two_trains_started_together_cannot_both_be_admitted: both racers meet at
+# the lock-claim barrier after attempting directory creation; a git shim slows
+# ls-remote so the winner remains active while the other proves it was refused.
+test_race_lock
 
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
