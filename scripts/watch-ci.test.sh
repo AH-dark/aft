@@ -289,6 +289,58 @@ else
   fail "repeated gh errors are bounded with the last error (rc=$WATCH_RC calls=$calls delays=$delays)"
 fi
 
+# Successful CLI calls can still return unusable text. Those replies must also
+# stop after four consecutive failures instead of backing off forever.
+reset_case
+for attempt in 1 2 3 4; do
+  response "$attempt" 'temporary response is not JSON'
+done
+run_watch 1 8
+calls="$(wc -l < "$STATE/calls" | tr -d ' ')"
+delays="$(tr '\n' ' ' < "$STATE/sleeps" | sed 's/ $//')"
+if [ "$WATCH_RC" -eq 5 ] && [ "$calls" -eq 4 ] && [ "$delays" = '1.000 2.000 4.000' ] &&
+  grep -q 'could not read run state after 4 attempts' "$TMP_ROOT/output"; then
+  ok 'repeated non-JSON replies stop after four attempts with a run-state diagnostic'
+else
+  fail "repeated non-JSON replies are bounded (rc=$WATCH_RC calls=$calls delays=$delays)"
+fi
+
+# JSON without a usable status is equally incomplete run state.
+reset_case
+for attempt in 1 2 3 4; do
+  response "$attempt" '{"message":"temporary status unavailable"}'
+done
+run_watch 1 8
+calls="$(wc -l < "$STATE/calls" | tr -d ' ')"
+delays="$(tr '\n' ' ' < "$STATE/sleeps" | sed 's/ $//')"
+if [ "$WATCH_RC" -eq 5 ] && [ "$calls" -eq 4 ] && [ "$delays" = '1.000 2.000 4.000' ] &&
+  grep -q 'could not read run state after 4 attempts' "$TMP_ROOT/output"; then
+  ok 'repeated JSON replies without status stop after four attempts'
+else
+  fail "JSON replies without status are bounded (rc=$WATCH_RC calls=$calls delays=$delays)"
+fi
+
+# A usable run response resets the malformed-reply counter before later errors.
+reset_case
+response 1 'temporary response is not JSON'
+response 2 'temporary response is not JSON'
+response 3 'temporary response is not JSON'
+response 4 '{"status":"in_progress","conclusion":null,"jobs":[],"url":""}'
+response 5 'temporary response is not JSON'
+response 6 'temporary response is not JSON'
+response 7 'temporary response is not JSON'
+response 8 "$completed_success"
+run_watch 1 8
+calls="$(wc -l < "$STATE/calls" | tr -d ' ')"
+delays="$(tr '\n' ' ' < "$STATE/sleeps" | sed 's/ $//')"
+if [ "$WATCH_RC" -eq 0 ] && [ "$calls" -eq 8 ] &&
+  [ "$delays" = '1.000 2.000 4.000 1 1.000 2.000 4.000' ] &&
+  grep -q 'CI_DONE run=42424242424 conclusion=success' "$TMP_ROOT/output"; then
+  ok 'a usable run response resets the malformed-reply attempt counter'
+else
+  fail "valid run state resets malformed-reply attempts (rc=$WATCH_RC calls=$calls delays=$delays)"
+fi
+
 # A completed payload with an unreadable job list fails closed even when the
 # run's conclusion is success.
 reset_case

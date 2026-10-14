@@ -89,6 +89,7 @@ GH_ERROR_FILE="$(mktemp "${TMPDIR:-/tmp}/watch-ci-gh-error.XXXXXX")" || {
 GH_ERROR_ATTEMPTS=0
 GH_ERROR_MAX_ATTEMPTS=4
 GH_LAST_ERROR=""
+RUN_STATE_ERROR_ATTEMPTS=0
 
 watcher_start_time() {
   ps -p "$$" -o lstart= 2>/dev/null | awk '{$1=$1; print}'
@@ -165,10 +166,16 @@ poll_delay_double() {
 
 POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
 
-# API errors do not mean a run is green or even complete. Retry on the normal
-# polling cadence, doubling the delay after each consecutive error; a valid
-# response resets it so a transient outage does not slow later observations.
+# Unusable run-state replies are not evidence that the run is still progressing.
+# Back off on transient payload problems, but stop before malformed data can keep
+# a train waiting forever.
 poll_error_wait() {
+  RUN_STATE_ERROR_ATTEMPTS=$((RUN_STATE_ERROR_ATTEMPTS + 1))
+  if [ "$RUN_STATE_ERROR_ATTEMPTS" -ge "$GH_ERROR_MAX_ATTEMPTS" ]; then
+    printf 'watch-ci: could not read run state after %s attempts: gh returned an unusable response\n' \
+      "$RUN_STATE_ERROR_ATTEMPTS" >&2
+    exit 5
+  fi
   watch_sleep "$POLL_DELAY"
   POLL_DELAY="$(poll_delay_double "$POLL_DELAY")"
 }
@@ -326,6 +333,8 @@ while true; do
       ;;
   esac
 
+  RUN_STATE_ERROR_ATTEMPTS=0
+
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
     echo "CI_EARLY_FAIL job='$NAME' run=$RID"
@@ -341,11 +350,21 @@ while true; do
           continue
         fi
         if ! STATUS=$(jq -er '.status | select(type == "string" and length > 0)' \
-          <<< "$RUN_VIEW" 2>/dev/null) ||
-          ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
+          <<< "$RUN_VIEW" 2>/dev/null); then
+          if run_not_found "$RUN_VIEW"; then
+            report_run_not_found "$RUN_VIEW"
+          fi
           poll_error_wait
           continue
         fi
+        if run_not_found "$STATUS"; then
+          report_run_not_found "$STATUS"
+        fi
+        if ! jq -e '(.jobs | type) == "array"' <<< "$RUN_VIEW" >/dev/null 2>&1; then
+          poll_error_wait
+          continue
+        fi
+        RUN_STATE_ERROR_ATTEMPTS=0
         POLL_DELAY="$(poll_delay_cap "$POLL_SLEEP")"
         [ "$STATUS" = "completed" ] && break
         watch_sleep "$POLL_SLEEP"
