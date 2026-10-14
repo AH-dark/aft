@@ -135,12 +135,38 @@ pub fn consumer_identity() -> Option<subc_client_rs::ConsumerIdentity> {
     })
 }
 
+#[derive(Default)]
+struct BuildDeclaration(OnceLock<ManifestProvenance>);
+
+impl BuildDeclaration {
+    fn initialize(&self, revision: Option<&str>) -> bool {
+        if self.0.get().is_some() {
+            return false;
+        }
+        self.0.set(build_facts(revision)).is_ok()
+    }
+
+    fn declared(&self) -> &ManifestProvenance {
+        self.0.get_or_init(|| build_facts(None))
+    }
+}
+
+static BUILD: BuildDeclaration = BuildDeclaration(OnceLock::new());
+
+/// Install the binary's compiled revision before any provenance is requested.
+/// The library deliberately has no compiled Git revision: embedding it would
+/// invalidate its compiler cache for every commit, even with identical source.
+/// Returns false if facts were already declared, including an unknown revision;
+/// startup cannot replace an identity that has already been reported.
+pub fn initialize_binary_build_revision(revision: Option<&str>) -> bool {
+    BUILD.initialize(revision)
+}
+
 /// Build facts are declared on every HELLO, even when no launch nonce was
 /// supplied. The protocol helper reports the version of the wire crate actually
 /// linked into AFT; the nonce source remains a separate runtime fact.
 pub fn provenance() -> Option<ManifestProvenance> {
-    static BUILD: OnceLock<ManifestProvenance> = OnceLock::new();
-    let declared = BUILD.get_or_init(|| build_facts(option_env!("AFT_BUILD_GIT_SHA")));
+    let declared = BUILD.declared();
     Some(
         declared
             .clone()
@@ -233,9 +259,10 @@ mod tests {
         let _none = install_for_tests(None);
         let assert_build_facts = |declared: &ManifestProvenance| {
             assert_eq!(declared.wire_crate_version.as_deref(), Some("0.31.0"));
-            let sha = declared.build_git_sha.as_deref().expect("build Git SHA");
-            assert_eq!(sha.len(), 40);
-            assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(
+                declared.build_git_sha, None,
+                "the library has no binary startup revision"
+            );
         };
         let declared = provenance().expect("provenance without a nonce");
         assert_build_facts(&declared);
@@ -247,6 +274,38 @@ mod tests {
             assert_eq!(declared.launch_nonce_source, Some(LaunchNonceSource::Env));
         }
         assert_eq!(current(), None, "the guard restores the previous capture");
+    }
+
+    #[test]
+    fn binary_build_revision_is_declared_once_without_changing_wire_facts() {
+        let declaration = BuildDeclaration::default();
+        let revision = "a".repeat(40);
+        assert!(declaration.initialize(Some(&revision)));
+        assert_eq!(
+            declaration.declared().build_git_sha.as_deref(),
+            Some(revision.as_str())
+        );
+        assert_eq!(
+            declaration.declared().wire_crate_version.as_deref(),
+            Some("0.31.0")
+        );
+        assert!(!declaration.initialize(Some(&"b".repeat(40))));
+        assert_eq!(
+            declaration.declared().build_git_sha.as_deref(),
+            Some(revision.as_str())
+        );
+    }
+
+    #[test]
+    fn unknown_build_revision_cannot_be_upgraded_after_provenance_is_reported() {
+        let declaration = BuildDeclaration::default();
+        assert_eq!(declaration.declared().build_git_sha, None);
+        assert!(!declaration.initialize(Some(&"a".repeat(40))));
+        assert_eq!(declaration.declared().build_git_sha, None);
+        assert_eq!(
+            declaration.declared().wire_crate_version.as_deref(),
+            Some("0.31.0")
+        );
     }
 
     /// Language servers, formatters, git and the ONNX Runtime probe are
