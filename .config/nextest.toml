@@ -56,11 +56,6 @@ retries = 1
 filter = 'binary(=aft) and test(/^graceful_shutdown_search_index_tests::/)'
 retries = 1
 
-# Flake observed 2026-08-26: semantic watcher invalidation batching.
-[[profile.gate.overrides]]
-filter = 'test(/^runtime_drain::tests::watcher_semantic_phase_batches_invalidation_into_one_retain_pass$/)'
-retries = 1
-
 # Explicit no-retry guard recorded 2026-08-26 for the storm latency family.
 # Storm tests assert production latency bounds. Keep this explicit zero-retry
 # guard even if a future named expression is widened; release uses the default

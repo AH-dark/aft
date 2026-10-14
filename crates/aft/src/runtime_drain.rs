@@ -51,6 +51,38 @@ thread_local! {
     static IGNORE_RULE_REFRESH_TEST_NOW: std::cell::Cell<Option<Instant>> = const {
         std::cell::Cell::new(None)
     };
+    static WATCHER_DRAIN_TEST_NOW: std::cell::Cell<Option<Instant>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn watcher_drain_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = WATCHER_DRAIN_TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+fn watcher_drain_elapsed(started: Instant) -> Duration {
+    watcher_drain_now().saturating_duration_since(started)
+}
+
+#[cfg(test)]
+struct WatcherDrainTestClock(Option<Instant>);
+
+#[cfg(test)]
+impl WatcherDrainTestClock {
+    fn freeze() -> Self {
+        Self(WATCHER_DRAIN_TEST_NOW.with(|clock| clock.replace(Some(Instant::now()))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for WatcherDrainTestClock {
+    fn drop(&mut self) {
+        WATCHER_DRAIN_TEST_NOW.with(|clock| clock.set(self.0));
+    }
 }
 
 #[cfg(test)]
@@ -2599,7 +2631,7 @@ fn apply_watcher_path_phase(
         }
         paths.push_back(path);
         *remaining -= 1;
-        if started.elapsed() >= budget {
+        if watcher_drain_elapsed(started) >= budget {
             return false;
         }
     }
@@ -3006,7 +3038,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
         }
         stage = next_watcher_apply_phase(stage);
         remaining = paths.len();
-        if started.elapsed() >= WATCHER_DRAIN_SLICE_BUDGET {
+        if watcher_drain_elapsed(started) >= WATCHER_DRAIN_SLICE_BUDGET {
             state.status_changed = status_changed;
             state.semantic_refresh_paths = semantic_refresh_paths;
             state.phase = WatcherDrainPhase::Apply {
@@ -3208,7 +3240,7 @@ fn rebuild_gitignore_for_drain(
 
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
     let _in_flight = ctx.watcher_drain_guard();
-    let started = Instant::now();
+    let started = watcher_drain_now();
     let configure_generation = ctx.configure_generation();
     let content_generation = ctx.configure_content_generation();
     let mut outcome = DrainBatchOutcome::default();
@@ -3351,7 +3383,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     break;
                 }
             }
-            if started.elapsed() >= WATCHER_DRAIN_SLICE_BUDGET {
+            if watcher_drain_elapsed(started) >= WATCHER_DRAIN_SLICE_BUDGET {
                 break;
             }
         }
@@ -3587,7 +3619,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     }
 
     if matches!(state.phase, WatcherDrainPhase::Apply { .. })
-        && started.elapsed() < WATCHER_DRAIN_SLICE_BUDGET
+        && watcher_drain_elapsed(started) < WATCHER_DRAIN_SLICE_BUDGET
     {
         apply_watcher_slice(ctx, &mut state, started);
     }
@@ -4337,6 +4369,9 @@ mod tests {
 
     #[test]
     fn watcher_semantic_phase_batches_invalidation_into_one_retain_pass() {
+        // This checks batching within one slice, not filesystem latency. Keep
+        // the slice clock fixed so a descheduled thread cannot split the batch.
+        let _clock = WatcherDrainTestClock::freeze();
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let files = (0..4)
@@ -4388,6 +4423,32 @@ mod tests {
         let index = index.as_ref().unwrap();
         assert_eq!(index.entry_count(), 0);
         assert_eq!(index.removal_retain_passes_for_test(), 1);
+    }
+
+    #[test]
+    fn watcher_path_phase_yields_when_injected_slice_clock_expires() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let started = watcher_drain_now();
+        let mut paths = VecDeque::from([PathBuf::from("first.rs"), PathBuf::from("second.rs")]);
+        let mut remaining = paths.len();
+        let mut applied = Vec::new();
+        let complete = apply_watcher_path_phase(
+            WatcherDrainApplyPhase::SemanticIndex,
+            &mut paths,
+            &mut remaining,
+            started,
+            WATCHER_DRAIN_SLICE_BUDGET,
+            |path| {
+                applied.push(path.to_path_buf());
+                WATCHER_DRAIN_TEST_NOW.with(|clock| {
+                    clock.set(Some(started + WATCHER_DRAIN_SLICE_BUDGET));
+                });
+            },
+        );
+        assert!(!complete);
+        assert_eq!(remaining, 1);
+        assert_eq!(applied, vec![PathBuf::from("first.rs")]);
+        assert_eq!(paths.front(), Some(&PathBuf::from("second.rs")));
     }
 
     /// A burst of watcher events for files whose bytes still match the index
