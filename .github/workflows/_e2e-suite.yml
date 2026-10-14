@@ -58,6 +58,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-workspace-crates: true
           shared-key: e2e-linux-${{ inputs.cargo_profile }}
           cache-on-failure: true
 
@@ -423,6 +424,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-workspace-crates: true
           shared-key: e2e-windows-${{ inputs.cargo_profile }}
           cache-on-failure: true
 
@@ -505,6 +507,7 @@ jobs:
       # artifacts without touching shims. See _unit-suite.yml unit-macos.
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-workspace-crates: true
           shared-key: e2e-macos-${{ inputs.cargo_profile }}
           cache-bin: false
           cache-on-failure: true

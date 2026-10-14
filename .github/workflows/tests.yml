@@ -125,6 +125,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.11
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-workspace-crates: true
           shared-key: search-quality-release
           cache-on-failure: true
       - name: Build shared release AFT
