@@ -636,6 +636,16 @@ pub(crate) fn reserved_refused_backend_for_test() -> (tokio::net::TcpSocket, std
     (socket, addr)
 }
 
+/// Reserve the normal test-server port while probing another unused loopback address.
+/// This keeps parallel listeners from claiming the port without relying on a
+/// non-listening socket to produce an immediate refusal on every operating system.
+#[cfg(test)]
+fn reserved_refused_embedding_backend_for_test() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+    let (reservation, reserved_addr) = reserved_refused_backend_for_test();
+    let refused_addr = std::net::SocketAddr::from(([127, 0, 0, 2], reserved_addr.port()));
+    (reservation, refused_addr)
+}
+
 fn begin_semantic_index_build(
     project_root: &Path,
 ) -> (
@@ -15174,10 +15184,23 @@ public class Greeter {
     }
 
     #[test]
+    fn refused_embedding_backend_fixture_keeps_its_port_reserved() {
+        let (_reservation, refused_addr) = reserved_refused_embedding_backend_for_test();
+        let competing_addr = std::net::SocketAddr::from(([127, 0, 0, 1], refused_addr.port()));
+        assert_eq!(
+            refused_addr.ip(),
+            std::net::Ipv4Addr::new(127, 0, 0, 2),
+            "the request must target the unused loopback address"
+        );
+        assert!(
+            TcpListener::bind(competing_addr).is_err(),
+            "a parallel embedding server must not be assigned the refused backend's port"
+        );
+    }
+
+    #[test]
     fn refused_connection_is_an_immediate_honest_transient_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve refused port");
-        let addr = listener.local_addr().expect("refused port address");
-        drop(listener);
+        let (_reservation, addr) = reserved_refused_embedding_backend_for_test();
         let config = SemanticBackendConfig {
             backend: SemanticBackend::OpenAiCompatible,
             model: "test-embedding".to_string(),
