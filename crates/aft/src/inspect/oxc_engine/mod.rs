@@ -28,7 +28,7 @@ pub use types::{
     ReExportKind, ResolverConfigInput, OXC_PROVENANCE,
 };
 
-pub(crate) const FACTS_FORMAT_VERSION: u32 = 5;
+pub(crate) const FACTS_FORMAT_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeOptions {

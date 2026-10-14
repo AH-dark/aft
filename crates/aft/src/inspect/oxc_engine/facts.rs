@@ -665,6 +665,17 @@ impl<'a> Visit<'a> for Extractor {
     fn visit_import_expression(&mut self, expr: &ImportExpression<'a>) {
         let source = match &expr.source {
             Expression::StringLiteral(lit) => Some(lit.value.to_string()),
+            // Cache-busting query/fragment interpolation changes the module
+            // instance, not the source file. Do not infer a path when the
+            // interpolation can change the pathname itself.
+            Expression::TemplateLiteral(template) => template.quasis.first().and_then(|part| {
+                let prefix = part.value.cooked.as_ref()?.as_str();
+                if template.expressions.is_empty() {
+                    Some(prefix.to_string())
+                } else {
+                    prefix.find(['?', '#']).map(|end| prefix[..end].to_string())
+                }
+            }),
             _ => None,
         };
         self.dynamic_imports.push(DynamicImportFact {

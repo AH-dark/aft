@@ -492,6 +492,38 @@ def collect_aft(corpus_root: Path, spec: Dict[str, Any], aft_bin: Path,
 
 def collect_aft_record(repo: Path, spec: Dict[str, Any], aft_bin: Path, out: Path,
                        diagnostics_sample: int, pin: str) -> Dict[str, Any]:
+    with measurement_exclusions(repo, spec):
+        record = _collect_aft_record(repo, spec, aft_bin, out, diagnostics_sample, pin)
+    record["measurement_exclusions"] = spec.get("measurement_exclusions", [])
+    return record
+
+
+@contextmanager
+def measurement_exclusions(repo: Path, spec: Dict[str, Any]):
+    """Temporarily exclude declared invalid fixtures from analysis, not scoring."""
+    exclusions = spec.get("measurement_exclusions", [])
+    if not exclusions:
+        yield
+        return
+    path = repo / ".aftignore"
+    if path.is_symlink():
+        raise ValueError(f"refusing to overwrite symlinked ignore file: {path}")
+    original = path.read_bytes() if path.exists() else None
+    try:
+        prefix = original or b""
+        if prefix and not prefix.endswith(b"\n"):
+            prefix += b"\n"
+        path.write_bytes(prefix + ("\n".join("/" + p for p in exclusions) + "\n").encode())
+        yield
+    finally:
+        if original is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(original)
+
+
+def _collect_aft_record(repo: Path, spec: Dict[str, Any], aft_bin: Path, out: Path,
+                        diagnostics_sample: int, pin: str) -> Dict[str, Any]:
     config_dir = repo / ".cortexkit"
     config_dir.mkdir(exist_ok=True)
     (config_dir / "aft.jsonc").write_text(json.dumps(AFT_PROJECT_CONFIG, indent=2) + "\n")

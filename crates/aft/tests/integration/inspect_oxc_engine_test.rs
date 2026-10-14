@@ -1242,6 +1242,34 @@ fn dynamic_usage_fixture(use_site: &str, expected: [LivenessVerdict; 3]) {
 }
 
 #[test]
+fn own_repo_query_suffix_template_imports_are_test_only_references() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/m.ts", "export function helper() {}\n"),
+        (
+            "src/__tests__/m.test.ts",
+            "let counter = 0; function fresh() { return import(`../m.ts?test=${counter++}`); }\n",
+        ),
+    ]);
+    for entry_reachability in [false, true] {
+        let result = analyze_with_options(
+            &root,
+            &paths,
+            AnalyzeOptions {
+                entry_reachability,
+                ..Default::default()
+            },
+        );
+        let row = verdict(&result, "src/m.ts", "helper");
+        assert_eq!(
+            row.test_only_reference_files,
+            vec!["src/__tests__/m.test.ts"],
+            "{row:?}"
+        );
+        assert!(row.has_references, "{row:?}");
+    }
+}
+
+#[test]
 fn ts_liveness_dynamic_statement_default_only() {
     dynamic_usage_fixture(
         "import('./m');",

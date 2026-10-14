@@ -30,7 +30,7 @@ use crate::parser::{detect_language, grammar_for, LangId};
 
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 6;
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 7;
 #[cfg(test)]
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
@@ -1514,8 +1514,26 @@ fn materialize_dead_code_contributions(
         .iter()
         .map(|(file, symbols)| (relative_path(project_root, file), symbols.clone()))
         .collect::<BTreeMap<_, _>>();
-    let (exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
+    let (mut exported_symbols_by_file, files_by_exported_symbol, default_export_symbols_by_file) =
         exported_symbol_indexes_from_contributions(project_root, snapshot, &parsed);
+    for contribution in &parsed {
+        if let Some(facts) = &contribution.rust_api {
+            exported_symbols_by_file
+                .entry(contribution.file.clone())
+                .or_default()
+                .extend(facts.initializers.iter().map(|init| init.name.clone()));
+        }
+    }
+    let rust_initializers = parsed
+        .iter()
+        .filter_map(|c| c.rust_api.as_ref().map(|facts| (c, facts)))
+        .flat_map(|(c, facts)| {
+            facts
+                .initializers
+                .iter()
+                .map(|init| (c.file.clone(), init.name.clone()))
+        })
+        .collect::<BTreeSet<_>>();
     let outbound_calls_by_caller_file =
         group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
     let initializers_by_file = snapshot
@@ -1536,6 +1554,11 @@ fn materialize_dead_code_contributions(
         .collect::<BTreeMap<_, _>>();
     let test_module_files = cfg_test_module_files(&parsed);
     let rust_public_items = rust_public_api_items(&parsed, public_api_files);
+    let rust_used_receivers = parsed
+        .iter()
+        .filter_map(|c| c.rust_api.as_ref())
+        .flat_map(|facts| facts.receiver_references.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let go_live_methods = go_interface_live_methods(&parsed);
     let rust_imports_by_file = parsed
         .iter()
@@ -1626,6 +1649,45 @@ fn materialize_dead_code_contributions(
                 &contribution.rust_imports,
                 &exported_symbols_by_file,
             ));
+            if let Some(facts) = &contribution.rust_api {
+                internal_calls.extend(
+                    resolve_macro_token_liveness_edges(
+                        project_root,
+                        &contribution.file,
+                        &facts.initializer_references,
+                        &contribution.rust_imports,
+                        &exported_symbols_by_file,
+                    )
+                    .into_iter()
+                    .filter(|call| {
+                        rust_initializers.contains(&(call.file.clone(), call.symbol.clone()))
+                    })
+                    .map(|mut call| {
+                        call.test_origin = Some(
+                            is_test_code_file(&contribution.file, &test_module_files)
+                                || contribution
+                                    .cfg_test_ranges
+                                    .iter()
+                                    .any(|range| range.contains(call.line)),
+                        );
+                        call
+                    }),
+                );
+                // The parser does not expose private statics as symbols, so
+                // their calls arrive with a top-level owner. Give each static
+                // its own node; only reading that static activates its body.
+                for call in &mut internal_calls {
+                    if call.caller_symbol == "<top-level>" {
+                        if let Some(init) = facts
+                            .initializers
+                            .iter()
+                            .find(|init| init.range.contains(call.line))
+                        {
+                            call.caller_symbol = init.name.clone();
+                        }
+                    }
+                }
+            }
             sort_dedup_internal_calls(&mut internal_calls);
 
             let dispatched_method_names = outbound_calls_for_file
@@ -1661,6 +1723,20 @@ fn materialize_dead_code_contributions(
             }
             if let Some(facts) = &contribution.rust_api {
                 for item in &facts.items {
+                    // A used private receiver can be invoked through a trait
+                    // (including a derived Default on a containing type). Its
+                    // impl body is live even without a public module path.
+                    if item.trait_name.is_some()
+                        && item.owner.as_ref().is_some_and(|owner| {
+                            rust_used_receivers.contains(owner.rsplit("::").next().unwrap_or(owner))
+                        })
+                    {
+                        if let (Some(owner), Some(trait_name)) = (&item.owner, &item.trait_name) {
+                            attribute_entry_points
+                                .insert(format!("{trait_name} for {owner}::{}", item.name));
+                            attribute_entry_points.insert(item.name.clone());
+                        }
+                    }
                     if rust_public_items
                         .get(&contribution.file)
                         .is_some_and(|items| items.contains(&(item.name.clone(), item.line)))
@@ -1915,6 +1991,17 @@ fn aggregate_materialized_dead_code_contributions(
             .cloned()
             .collect::<Vec<_>>();
         for (export, other_lines) in exports_deduplicated_by_node(&candidates) {
+            if test_code
+                || contribution
+                    .cfg_test_ranges
+                    .iter()
+                    .any(|range| range.contains(export.line))
+            {
+                *excluded_by_file
+                    .entry(contribution.file.clone())
+                    .or_default() += 1;
+                continue;
+            }
             if export_uses_oxc(export) {
                 match export.verdict.unwrap_or(LivenessVerdict::Unused) {
                     LivenessVerdict::Used => {
@@ -3542,7 +3629,10 @@ fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTes
             && rust_node_has_cfg_test_attribute(source, node)
         {
             ranges.push(RustCfgTestRange {
-                start_line: node.start_position().row as u32 + 1,
+                // Symbol ranges include preceding attributes, not just the fn
+                // token. Include them so declaration and call classification
+                // agree on a cfg-gated item's first line.
+                start_line: rust_item_start_line(node),
                 end_line: node.end_position().row as u32 + 1,
             });
         }
@@ -3560,6 +3650,20 @@ fn rust_cfg_test_ranges(source: &str, root: tree_sitter::Node) -> Vec<RustCfgTes
     ranges.sort_by_key(|range| (range.start_line, range.end_line));
     ranges.dedup();
     ranges
+}
+
+fn rust_item_start_line(node: tree_sitter::Node<'_>) -> u32 {
+    let mut first = node;
+    while let Some(previous) = first.prev_sibling() {
+        if !matches!(
+            previous.kind(),
+            "attribute_item" | "line_comment" | "block_comment"
+        ) {
+            break;
+        }
+        first = previous;
+    }
+    first.start_position().row as u32 + 1
 }
 
 /// Project-relative files of out-of-line modules declared under `#[cfg(test)]`
@@ -4344,9 +4448,21 @@ fn rust_module_entry_from_file(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RustApiFacts {
+    #[serde(default)]
+    receiver_references: BTreeSet<String>,
+    #[serde(default)]
+    initializers: Vec<RustInitializer>,
+    #[serde(default)]
+    initializer_references: Vec<MacroTokenRefContribution>,
     items: Vec<RustApiItem>,
     modules: Vec<RustApiModule>,
     uses: Vec<RustApiUse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RustInitializer {
+    name: String,
+    range: RustCfgTestRange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4386,6 +4502,54 @@ fn rust_unrestricted_pub(source: &str, node: tree_sitter::Node) -> bool {
 fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiFacts {
     let mut facts = RustApiFacts::default();
     rust_collect_api_facts(source, root, file, &[], &mut facts);
+    let mut owners = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let owner = match node.kind() {
+            "function_item" => rust_function_symbol_name(source, &node),
+            "static_item" | "const_item" => node.child_by_field_name("name").map(|name| {
+                macro_scoped_symbol(
+                    &rust_mod_scope_chain(&node, source),
+                    node_text(source, name),
+                )
+            }),
+            _ => None,
+        };
+        if let Some(owner) = owner {
+            owners.push((node.start_byte(), node.end_byte(), owner.clone()));
+            if matches!(node.kind(), "static_item" | "const_item") {
+                facts.initializers.push(RustInitializer {
+                    name: owner,
+                    range: RustCfgTestRange {
+                        start_line: rust_item_start_line(node),
+                        end_line: node.end_position().row as u32 + 1,
+                    },
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    facts.initializer_references = crate::calls::extract_rust_value_references(source, root)
+        .into_iter()
+        .map(|(full, name, line, start, end)| {
+            let mut path = rust_path_segments(&full);
+            path.pop();
+            let caller_symbol = owners
+                .iter()
+                .filter(|(a, b, _)| *a <= start && *b >= end)
+                .min_by_key(|(a, b, _)| b - a)
+                .map(|(_, _, name)| name.clone())
+                .unwrap_or_else(|| "<top-level>".into());
+            MacroTokenRefContribution {
+                caller_symbol,
+                name,
+                line,
+                path: macro_ref_path(path),
+                shape: "call".into(),
+            }
+        })
+        .collect();
     facts
 }
 
@@ -4400,6 +4564,13 @@ fn rust_collect_api_facts(
     for node in root.named_children(&mut cursor) {
         if rust_node_has_cfg_test_attribute(source, node) {
             continue;
+        }
+        // An impl header names its own receiver even when nothing uses it.
+        // Only references outside impls are evidence of a runtime receiver.
+        if !matches!(node.kind(), "impl_item" | "mod_item") {
+            facts
+                .receiver_references
+                .extend(extract_type_references(source, node, LangId::Rust));
         }
         let name = node
             .child_by_field_name("name")
@@ -7168,6 +7339,62 @@ mod tests {
             paths.clone(),
             snapshot(paths, exports, Vec::new()),
         ))
+    }
+
+    fn stored_rust_fixture_scan(files: &[(&str, &str)]) -> Value {
+        let (temp, root, paths) = canonical_fixture(files);
+        let store = crate::callgraph_store::CallGraphStore::open(
+            temp.path().join("callgraph-store"),
+            root.clone(),
+        )
+        .unwrap();
+        store.cold_build(&paths).unwrap();
+        let snapshot =
+            crate::callgraph_store::project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        scan(job(&root, paths, snapshot))
+    }
+
+    #[test]
+    fn own_repo_cfg_test_declarations_are_not_product_dead_code() {
+        let aggregate = stored_rust_fixture_scan(&[
+            ("Cargo.toml", "[package]\nname = 'demo'\nversion = '0.1.0'\n"),
+            ("src/lib.rs", "mod hidden;\n"),
+            ("src/hidden.rs", "#[cfg(test)]\npub(crate) fn test_gate() {}\n#[cfg(all(test, feature = \"hooks\"))]\npub(crate) fn test_probe() {}\npub(crate) fn planted_dead() {}\n"),
+        ]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/hidden.rs::planted_dead"],
+            "{aggregate:#}"
+        );
+        assert_eq!(aggregate["excluded_test_count"], 2, "{aggregate:#}");
+    }
+
+    #[test]
+    fn own_repo_private_default_impl_keeps_constructor_callback_chain_live() {
+        let aggregate = stored_rust_fixture_scan(&[
+            ("Cargo.toml", "[package]\nname = 'demo'\nversion = '0.1.0'\n"),
+            ("src/lib.rs", "mod hidden;\n#[derive(Default)]\npub struct Context { slot: hidden::Slot }\n"),
+            ("src/hidden.rs", "pub(crate) struct Slot;\nimpl Default for Slot { fn default() -> Self { Self::with_constructor(build_backend) } }\nimpl Slot { pub(crate) fn with_constructor(f: fn()) -> Self { f(); Slot } }\npub(crate) fn build_backend() { downstream(); }\npub(crate) fn downstream() {}\npub(crate) fn planted_dead() {}\n"),
+        ]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/hidden.rs::planted_dead"],
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn own_repo_static_receiver_and_index_uses_keep_initializers_live() {
+        let aggregate = stored_rust_fixture_scan(&[
+            ("Cargo.toml", "[package]\nname = 'demo'\nversion = '0.1.0'\n"),
+            ("src/lib.rs", "mod hidden;\npub fn run() { hidden::run(); }\n"),
+            ("src/hidden.rs", "use std::sync::LazyLock;\nstruct Env;\nimpl Env { pub(crate) const fn new() -> Self { Env } fn get(&self) {} }\nstatic ENV: Env = Env::new();\nstatic TOOLS: LazyLock<Vec<()>> = LazyLock::new(|| { build_tools(); vec![] });\nstatic DEAD: LazyLock<()> = LazyLock::new(planted_dead);\nfn build_tools() { remote_tool(); }\npub(crate) fn remote_tool() {}\npub(crate) fn run() { ENV.get(); let _ = &TOOLS[0]; }\npub(crate) fn planted_dead() {}\n"),
+        ]);
+        assert_eq!(
+            headline_symbols(&aggregate),
+            vec!["src/hidden.rs::planted_dead"],
+            "{aggregate:#}"
+        );
     }
 
     #[test]

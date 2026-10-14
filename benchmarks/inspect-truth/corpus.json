@@ -20,6 +20,13 @@
       "role": "library",
       "url": "https://github.com/typeorm/typeorm.git",
       "commit": "17e858da8d2becab1ca47826f670a4660da70142",
+      "measurement_exclusions": [
+        "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace-type-only.input.ts",
+        "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace-type-only.output.ts",
+        "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace.input.ts",
+        "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace.output.ts"
+      ],
+      "measurement_exclusion_reason": "Intentionally invalid ambient codemod input/output fixtures, outside the scoring domain; the same four paths were excluded on both sides of the historical TS-liveness comparison.",
       "languages": [{
         "language": "typescript",
         "install": ["corepack", "pnpm", "install", "--ignore-scripts", "--frozen-lockfile"],

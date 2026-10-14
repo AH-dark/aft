@@ -717,6 +717,10 @@ impl<'tree> RustValueWalk<'tree, '_> {
                 "let_declaration" if selected("value") => return true,
                 "assignment_expression" if selected("right") => return true,
                 "field_initializer" if selected("value") => return true,
+                // Reading a static through a receiver or index runs its lazy
+                // initializer. The member name itself is not a value use.
+                "field_expression" if selected("value") => return true,
+                "index_expression" => return true,
                 "shorthand_field_initializer" | "return_expression" | "break_expression" => {
                     return true
                 }
@@ -885,6 +889,8 @@ fn rust_path_is_value_position(node: &tree_sitter::Node<'_>) -> bool {
             "let_declaration" if is_selected_field("value") => return true,
             "assignment_expression" if is_selected_field("right") => return true,
             "field_initializer" if is_selected_field("value") => return true,
+            "field_expression" if is_selected_field("value") => return true,
+            "index_expression" => return true,
             "shorthand_field_initializer" => return true,
             "return_expression" | "break_expression" => return true,
             "parenthesized_expression"

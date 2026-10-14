@@ -64,6 +64,39 @@ class ScoreFixtureBase(unittest.TestCase):
 
 
 class ScoreFixtures(ScoreFixtureBase):
+    def test_typeorm_fixture_exclusions_are_applied_and_restored(self):
+        spec = next(s for s in harness.load_corpus()[1] if s["name"] == "typeorm")
+        repo = self.root / "source"
+        repo.mkdir()
+        ignore = repo / ".aftignore"
+        original = b"# existing project rules\nkeep-out/\n"
+        ignore.write_bytes(original)
+        expected = "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace.input.ts"
+        session = Mock()
+        def configured(*args):
+            self.assertIn(expected, ignore.read_text())
+            return {"success": True}
+        session.configure.side_effect = configured
+        with patch.object(harness, "tracked_files", return_value=[]), \
+             patch.object(harness, "AftSession", return_value=session), \
+             patch.object(harness, "wait_until_ready", return_value={"summary": {}}), \
+             patch.object(harness, "collect_category", return_value=[]):
+            record = harness.collect_aft_record(repo, spec, Path("aft"), self.after, 0, "pin")
+        self.assertEqual(ignore.read_bytes(), original)
+        self.assertEqual(len(record["measurement_exclusions"]), 4)
+
+    def test_typeorm_fixture_exclusions_restore_on_collection_error(self):
+        spec = next(s for s in harness.load_corpus()[1] if s["name"] == "typeorm")
+        repo = self.root / "source"
+        repo.mkdir()
+        session = Mock()
+        session.configure.side_effect = RuntimeError("collection failed")
+        with patch.object(harness, "tracked_files", return_value=[]), \
+             patch.object(harness, "AftSession", return_value=session):
+            with self.assertRaisesRegex(RuntimeError, "collection failed"):
+                harness.collect_aft_record(repo, spec, Path("aft"), self.after, 0, "pin")
+        self.assertFalse((repo / ".aftignore").exists())
+
     def test_judgment_before_only(self):
         self.output("before", [row()])
         self.judge()
