@@ -991,9 +991,9 @@ fn handle_inspect_payload(
     // TypeScript SDK note from a server started for another request does not
     // belong in an answer about Rust files.
     let runtime_notes = if scope_was_provided {
-        let producers =
-            scope_producer_keys(&snapshot, &scope, expected_producers, producer_failures);
-        ctx.lsp().runtime_notes_for(&producers)
+        ctx.lsp().runtime_notes_for(|| {
+            scope_producer_keys(&snapshot, &scope, expected_producers, producer_failures)
+        })
     } else {
         ctx.lsp().runtime_notes()
     };
