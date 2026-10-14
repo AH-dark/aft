@@ -857,10 +857,10 @@ for commit in commits:
         count += 1
 print(count)
 PY
-)" = 1 ] ||
-    fail "restack leaves exactly one fresh Align commit"
-  [ "$(cat "$dir/ci-state/align-calls" 2>/dev/null | wc -l | tr -d ' ')" = 1 ] ||
-    fail "restack runs governed-doc alignment exactly once"
+)" = 0 ] ||
+    fail "restack leaves no generated Align commits"
+  [ ! -f "$dir/ci-state/align-calls" ] ||
+    fail "restack never runs the obsolete governed-doc aligner"
   hand_subject="$(git -C "$dir/child" log -1 --format=%s HEAD -- manual.txt)"
   if [ -f "$dir/child/manual.txt" ] && [ "$hand_subject" = "Align governed publication manifests" ]; then
     ok "an exact-subject hand commit touching an ungoverned file is retained"
@@ -2530,24 +2530,23 @@ else
   ok "nothing was pushed after the preflight refused"
 fi
 
-# --- the governed-docs gate still runs where its script exists ------------
-# The existence check must not turn into a skip: with the audit script present
-# and failing, the train refuses. `bun` is the harness's exit-0 stub on PATH, so
-# this fixture shadows it with a failing one for the run.
+# --- the publication input gate still runs where its script exists --------
+# The existence check must not turn into a skip: a failing input gate refuses
+# the train before push. Shadow the harness's green node stub for this run.
 dir="$(new_fixture auditfails)"
 mkdir -p "$dir/work/scripts" "$dir/failbin"
-: > "$dir/work/scripts/audit-v049-agent-surface.ts"
-git -C "$dir/work" add scripts/audit-v049-agent-surface.ts
-git -C "$dir/work" commit -qm "carry the audit script"
+: > "$dir/work/scripts/release-gate-v049.mjs"
+git -C "$dir/work" add scripts/release-gate-v049.mjs
+git -C "$dir/work" commit -qm "carry the publication input gate"
 add_train_commit "$dir/work" "audited"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/failbin/bun"
-chmod +x "$dir/failbin/bun"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/failbin/node"
+chmod +x "$dir/failbin/node"
 saved_bin="$BIN_DIR"
 BIN_DIR="$dir/failbin:$saved_bin"
 run_train "$dir" audited
 BIN_DIR="$saved_bin"
-expect_rc 2 "a present, failing governed-surface audit refuses the train"
-expect_out "governed-surface audit failed" "the refusal names the gate"
+expect_rc 2 "a present, failing publication input gate refuses the train"
+expect_out "publication input check failed" "the refusal names the gate"
 
 # --- the gating workflow is a parameter, not this repository's filename ----
 # Lifts whose gate is ci.yml refused at "no .github/workflows/tests.yml" while

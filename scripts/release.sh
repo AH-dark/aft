@@ -231,82 +231,21 @@ bun run typecheck 2>&1 || { echo "Error: Typecheck failed"; exit 1; }
 echo "  cargo fmt --check..."
 cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fmt')"; exit 1; }
 
-# Publication-surface gates, run LOCALLY before the tag exists.
-#
-# These same gates run inside the release workflow's publish job, i.e. AFTER
-# the whole build matrix has already burned ~20 minutes. Any drift in the
-# governed manifests (a merged PR that touched a governed surface file, a host
-# version bump that moved the prefix capture, a manifest whose source_commit no
-# longer matches) fails there, which means a dead tag and a full re-cut. The
-# v0.49.0 release burned eight tag attempts on exactly this class before the
-# checks moved here.
-#
-# Prefer a gate dedicated to the current release line. The v0.49 gate is also
-# the shared surface-generation gate for later 0.x releases, matching the
-# release workflow's publish-time verification, so use it when no newer gate
-# script exists instead of silently skipping the preflight.
+# Validate publication inputs before spending time on the release suites.
+# Snapshots are disposable; only source and release policy belong in Git.
+# The final candidate snapshot is prepared after the version commit below.
 release_line="$(printf '%s' "$VERSION" | cut -d. -f1,2)"
 line_slug="v${release_line//./}"
 gate_script="scripts/release-gate-${line_slug}.mjs"
-audit_script="scripts/audit-${line_slug}-agent-surface.ts"
 if [[ ! -f "$gate_script" && -f "scripts/release-gate-v049.mjs" ]]; then
-  line_slug="v049"
   gate_script="scripts/release-gate-v049.mjs"
-  audit_script="scripts/audit-v049-agent-surface.ts"
 fi
 if [[ -f "$gate_script" ]]; then
-  echo "  agent surface audit..."
-  bun "$audit_script" >/dev/null 2>&1 || {
-    echo "Error: agent surface audit failed"
-    echo "  ↳ run: bun $audit_script"
-    echo "  ↳ if a governed surface changed on purpose, regenerate with"
-    echo "    --write-allowlist --write-prefix-capture --write-manifest"
+  echo "  publication inputs ($gate_script)..."
+  node "$gate_script" --check-inputs || {
+    echo "Error: publication inputs failed; fix the source, generated schema, policy, or reviewed vocabulary allowlist"
     exit 1
   }
-
-  echo "  publication gates ($gate_script)..."
-  node "$gate_script" >/dev/null 2>&1 || {
-    echo "Error: publication gates failed"
-    echo "  ↳ run: node $gate_script"
-    echo "  ↳ stale manifests regenerate via the audit script; the release"
-    echo "    manifest's source_commit must match the surface manifest's"
-    exit 1
-  }
-
-  # Validate the SAME gate shape the publish job runs. The flagless gate above
-  # skips activation-evidence validation, so a stale evidence file used to
-  # sail through preflight and refuse at npm publish (v0.52.1's first tag).
-  # Evidence goes stale whenever governed manifests are refreshed without
-  # restaging it; restage deterministically, then validate like the workflow.
-  evidence_file="docs/${line_slug}-release-evidence.json"
-  if [[ -f "$evidence_file" ]]; then
-    echo "  activation evidence (restage + candidate gate)..."
-    node "$gate_script" --stage --evidence-output "$evidence_file" >/dev/null 2>&1 || {
-      echo "Error: activation evidence restage failed"
-      echo "  ↳ run: node $gate_script --stage --evidence-output $evidence_file"
-      exit 1
-    }
-    evidence_source_commit="$(node -e '
-      const fs = require("node:fs");
-      const evidence = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      process.stdout.write(evidence.source_commit ?? "");
-    ' "$evidence_file")"
-    if [[ -z "$evidence_source_commit" ]]; then
-      echo "Error: activation evidence has no source commit"
-      exit 1
-    fi
-    echo "    ✓ evidence source commit: $evidence_source_commit"
-    if [[ -n "$(git status --porcelain -- "$evidence_file")" ]]; then
-      git add "$evidence_file"
-      git commit -q -m "Restage activation evidence for v${VERSION}"
-      echo "  ↳ evidence was stale; restaged and committed"
-    fi
-    node "$gate_script" --candidate --evidence "$evidence_file" >/dev/null 2>&1 || {
-      echo "Error: candidate gate with evidence failed (the publish job runs this exact shape)"
-      echo "  ↳ run: node $gate_script --candidate --evidence $evidence_file"
-      exit 1
-    }
-  fi
 fi
 
 # Slow checks AFTER the fast ones pass.
@@ -420,6 +359,18 @@ if git diff --cached --quiet; then
   echo "  (no changes — versions already at $VERSION)"
 else
   git commit -m "release: $TAG"
+fi
+
+# Freeze and validate the exact committed candidate before tagging. The publish
+# workflow independently prepares the same records from the tagged source and
+# retains them as an artifact; neither path commits branch-dependent digests.
+if [[ -f "$gate_script" ]]; then
+  (
+    snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/aft-release-publication.XXXXXX")"
+    trap 'rm -rf "$snapshot_dir"' EXIT
+    node "$gate_script" --prepare --snapshot-dir "$snapshot_dir" --candidate || exit 1
+    node "$gate_script" --snapshot-dir "$snapshot_dir" --candidate || exit 1
+  ) || { echo "Error: committed release candidate failed publication gates"; exit 1; }
 fi
 
 # Step 3: Tag

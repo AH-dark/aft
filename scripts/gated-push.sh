@@ -147,8 +147,7 @@ warm_macos_product_binary() {
 warm_macos_product_binary
 run_logged "gated-push: running gate: $*" "$@"
 
-run_logged "gated-push: governed-surface audit" bun scripts/audit-v049-agent-surface.ts
-run_logged "gated-push: release gate" node scripts/release-gate-v049.mjs
+run_logged "gated-push: publication inputs" node scripts/release-gate-v049.mjs --check-inputs
 
 # Keep main fmt-clean per push. Put the helpful remediation in the logged step
 # while preserving a nonzero status for drift.

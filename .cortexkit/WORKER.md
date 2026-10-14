@@ -48,5 +48,14 @@ New test files go under `src/__tests__/`. A guard fails the suite on any test fi
 - **Edit `ARCHITECTURE.md` or `STRUCTURE.md`** to log a change.
 
 ## Before you report
+- Publication source changes do not need generated docs or alignment commits.
+  Run `node scripts/release-gate-v049.mjs --check-inputs` after committing the
+  source (requires the `v0.48.1` tag and the built bridge). It prints six staged
+  transitions and `release gates passed`; it never runs a native build.
+  The reviewed legacy-vocabulary allowlist remains an input: update it explicitly
+  only when intentionally changing a reviewed occurrence, never in preflight.
+  Release snapshots are automatically prepared and validated by `release.sh`
+  and the publish workflow, outside Git. To validate a saved snapshot without
+  regenerating it: `node scripts/release-gate-v049.mjs --snapshot-dir <dir> --candidate`.
 - Show a failing test before the fix. Show a mutation check for each fix: revert the fix, name the test that fails and paste the failure, restore, and show `git diff --stat` empty.
 - If a gate could not run, say which one and why. Do not report it as passed.

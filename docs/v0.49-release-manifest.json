@@ -3,7 +3,6 @@
   "artifact_id": "ART-V049-S6-RELEASE-MANIFEST-001",
   "artifact_version": "0.49.0",
   "manifest_id": "MAN-V049-S6-RELEASE-001",
-  "source_commit": "1e2c0a1322befb53dec8de94ff1f7f20256b7e54",
   "source_surface_manifest": "docs/v0.49-agent-surface-manifest.json",
   "distribution_manifest": "MAN-V049-DISTRIBUTION-ARTIFACTS-001",
   "hash_rule": "Hash exact UTF-8 bytes and binary bytes; do not normalize newlines, reserialize JSON, or use test-only normalization.",
@@ -11,7 +10,7 @@
     "version": "0.49.0",
     "previous_version": "0.48.1",
     "version_source": "scripts/version-sync.mjs",
-    "source_tree_rule": "The governed source bytes must be present at source_commit before candidate version synchronization."
+    "source_tree_rule": "The governed source bytes and release policy must be committed at source_commit before candidate acceptance and tagging."
   },
   "independently_versioned_artifacts": [
     {
@@ -94,7 +93,7 @@
       "version": "0.49.0",
       "verification_only": true,
       "build": {
-        "command": "node scripts/release-gate-v049.mjs --candidate --evidence docs/v0.49-release-evidence.json",
+        "command": "node scripts/release-gate-v049.mjs --snapshot-dir <snapshot-dir> --candidate",
         "cwd": "."
       },
       "activation": "Release evidence validation"
@@ -209,7 +208,7 @@
   "gates": [
     {
       "id": "GATE-V049-ARTIFACT-BYTES",
-      "command": "node scripts/release-gate-v049.mjs --candidate",
+      "command": "node scripts/release-gate-v049.mjs --snapshot-dir <snapshot-dir> --candidate",
       "required_before": "candidate acceptance"
     },
     {
@@ -224,12 +223,12 @@
     },
     {
       "id": "GATE-V049-ACTIVATION",
-      "command": "node scripts/release-gate-v049.mjs --candidate --stage --evidence-output <release-evidence.json>",
+      "command": "node scripts/release-gate-v049.mjs --prepare --snapshot-dir <snapshot-dir> --candidate",
       "required_before": "candidate acceptance"
     },
     {
       "id": "GATE-V049-PLATFORMS",
-      "command": "node scripts/release-gate-v049.mjs --candidate --evidence docs/v0.49-release-evidence.json --require-platform-artifacts",
+      "command": "node scripts/release-gate-v049.mjs --snapshot-dir <snapshot-dir> --candidate --require-platform-artifacts",
       "required_before": "npm publication"
     }
   ],

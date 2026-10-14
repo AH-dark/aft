@@ -912,7 +912,7 @@ is_governed_align_commit() {
 
 restack_child() {
   local target target_name old_base="$parent_base" merges before="$head_sha"
-  local commit align_count=0 alignment_base alignment_head new_align_count
+  local commit align_count=0
   local align_tmp align_drop_file align_editor
   local -a align_drop_shas=()
   target_name="${parent_arg:-$parent_name}"
@@ -933,9 +933,6 @@ restack_child() {
       align_count=$((align_count + 1))
     fi
   done
-  if [ "$align_count" -gt 0 ] && [ ! -x "$REPO/scripts/align-governed-docs.sh" ]; then
-    refuse "restack found generated Align commit(s), but scripts/align-governed-docs.sh is unavailable"
-  fi
   say "restacking $train_name: replay only $old_base..$head_sha onto $target"
   if [ "$align_count" -gt 0 ]; then
     align_tmp="$(mktemp -d "${TMPDIR:-/tmp}/train-push-align.XXXXXX")"
@@ -974,23 +971,9 @@ EDITOR
     refuse "restack conflicted; rebase aborted (was $before); resolve by hand and repush"
   fi
   if [ "$align_count" -gt 0 ]; then
-    alignment_base="$(git -C "$REPO" rev-parse HEAD)"
-    say "regenerating governed docs after dropping $align_count generated Align commit(s)"
-    if ! (cd "$REPO" && scripts/align-governed-docs.sh); then
-      refuse "governed-doc alignment failed after restack; inspect the rebased tree before repushing"
-    fi
-    alignment_head="$(git -C "$REPO" rev-parse HEAD)"
-    if [ "$alignment_head" != "$alignment_base" ]; then
-      new_align_count=0
-      for commit in $(git -C "$REPO" rev-list --reverse "$alignment_base..$alignment_head"); do
-        is_governed_align_commit "$commit" ||
-          refuse "governed-doc alignment created an unexpected commit ($commit); inspect the rebased tree"
-        new_align_count=$((new_align_count + 1))
-      done
-      if [ "$new_align_count" -gt 1 ]; then
-        git -C "$REPO" reset --soft "$alignment_base"
-        git -C "$REPO" commit -qm "Align governed publication manifests"
-      fi
+    say "checking publication inputs after dropping $align_count obsolete generated Align commit(s)"
+    if ! (cd "$REPO" && node scripts/release-gate-v049.mjs --check-inputs); then
+      refuse "publication input check failed after restack; inspect the rebased tree before repushing"
     fi
   fi
   head_sha="$(git -C "$REPO" rev-parse HEAD)"
@@ -1480,19 +1463,13 @@ fi
 # file, so nothing here may assume this repository's layout: each preflight
 # runs only when its script exists, and the header line names which ones ran
 # so a repository with none is distinguishable from one whose block was
-# deleted. This repository's two are the governed-docs gates gated-push.sh
-# runs; both are read-only here (scripts/align-governed-docs.sh is the
-# writing half and stays the remedy, not something this script performs).
+# deleted. Publication inputs are checked in a disposable snapshot: no
+# generated document, alignment commit, or native release build is needed.
 preflights_ran=()
-if [ -f "$REPO/scripts/audit-v049-agent-surface.ts" ]; then
-  bun "$REPO/scripts/audit-v049-agent-surface.ts" \
-    || refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"
-  preflights_ran+=(governed-surface-audit)
-fi
 if [ -f "$REPO/scripts/release-gate-v049.mjs" ]; then
-  node "$REPO/scripts/release-gate-v049.mjs" \
-    || refuse "release gate failed — run scripts/align-governed-docs.sh"
-  preflights_ran+=(release-gate)
+  node "$REPO/scripts/release-gate-v049.mjs" --check-inputs \
+    || refuse "publication input check failed — fix the source, schema, policy, or reviewed vocabulary allowlist"
+  preflights_ran+=(publication-inputs)
 fi
 # A repository may add its own preflights beside this script without editing
 # it; the hook is sourced so it can call `refuse` and `say`.

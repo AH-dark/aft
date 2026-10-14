@@ -24,7 +24,8 @@ async function main() {
     "src",
     "hashline_edit_schemas.json",
   );
-  const checkOnly = process.argv.includes("--check");
+  const sourceOnly = process.argv.includes("--check-source-only");
+  const checkOnly = process.argv.includes("--check") || sourceOnly;
 
   const json = buildSubcToolSchemasJson();
   if (checkOnly) {
@@ -61,37 +62,38 @@ async function main() {
     await Bun.write(remotePath, remoteJson);
   }
 
-  // The generator is a tiny debug binary, so a compile cache buys nothing and
-  // the sccache wrapper configured in .cargo/config.toml has wedged this step
-  // twice (its client sleeps on the server socket, the check never returns).
-  // Run it with the wrapper off and a bound so a wedge fails the check loudly
-  // instead of parking the push.
-  const generator = Bun.spawn(
-    ["cargo", "run", "--quiet", "-p", "agent-file-tools", "--bin", "hashline-schema-artifact"],
-    {
-      cwd: repoRoot,
-      stdout: "pipe",
-      stderr: "inherit",
-      env: { ...process.env, CARGO_BUILD_RUSTC_WRAPPER: "", RUSTC_WRAPPER: "" },
-      timeout: 10 * 60 * 1000,
-      killSignal: "SIGKILL",
-    },
-  );
-  const hashlineJson = await new Response(generator.stdout).text();
-  if ((await generator.exited) !== 0) {
-    throw new Error(
-      "governed hashline edit schema generator failed (or exceeded its 10-minute bound)",
+  // --check-source-only avoids compiling the native library before a train
+  // push. The unit CI workflow and release gates still run the full --check.
+  // Disable sccache for that native check: its client has hung on the server
+  // socket here. A deadline turns that failure into an error, not a stuck push.
+  if (!sourceOnly) {
+    const generator = Bun.spawn(
+      ["cargo", "run", "--quiet", "-p", "agent-file-tools", "--bin", "hashline-schema-artifact"],
+      {
+        cwd: repoRoot,
+        stdout: "pipe",
+        stderr: "inherit",
+        env: { ...process.env, CARGO_BUILD_RUSTC_WRAPPER: "", RUSTC_WRAPPER: "" },
+        timeout: 10 * 60 * 1000,
+        killSignal: "SIGKILL",
+      },
     );
-  }
-  if (checkOnly) {
-    const existing = await Bun.file(hashlineOutputPath).text();
-    if (existing !== hashlineJson) {
+    const hashlineJson = await new Response(generator.stdout).text();
+    if ((await generator.exited) !== 0) {
       throw new Error(
-        `hashline edit schema byte drift detected at ${hashlineOutputPath}; run without --check to regenerate it`,
+        "governed hashline edit schema generator failed (or exceeded its 10-minute bound)",
       );
     }
-  } else {
-    await Bun.write(hashlineOutputPath, hashlineJson);
+    if (checkOnly) {
+      const existing = await Bun.file(hashlineOutputPath).text();
+      if (existing !== hashlineJson) {
+        throw new Error(
+          `hashline edit schema byte drift detected at ${hashlineOutputPath}; run without --check to regenerate it`,
+        );
+      }
+    } else {
+      await Bun.write(hashlineOutputPath, hashlineJson);
+    }
   }
 
   const count = Object.keys(JSON.parse(json) as Record<string, unknown>).length;
@@ -100,7 +102,9 @@ async function main() {
   );
   console.log(`✓ enabled-only subc bash schemas ${checkOnly ? "match" : "written"}: ${remotePath}`);
   console.log(
-    `✓ governed hashline edit schemas ${checkOnly ? "match" : "written"}: ${hashlineOutputPath}`,
+    sourceOnly
+      ? "→ governed hashline byte comparison deferred to the native CI/release gate"
+      : `✓ governed hashline edit schemas ${checkOnly ? "match" : "written"}: ${hashlineOutputPath}`,
   );
 }
 

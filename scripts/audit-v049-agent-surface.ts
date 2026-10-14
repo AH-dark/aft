@@ -8,15 +8,15 @@
  * compatibility plumbing available without allowing retired vocabulary into a
  * schema, description, prompt, guideline, README, or current tool reference.
  *
- * Usage:
- *   bun scripts/audit-v049-agent-surface.ts --write-allowlist --write-prefix-capture --write-manifest
+ * Examples (independent invocations):
+ *   bun scripts/audit-v049-agent-surface.ts --snapshot-dir /tmp/release-snapshot --write-prefix-capture --write-manifest
  *   bun scripts/audit-v049-agent-surface.ts
  */
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import { tool } from "../packages/opencode-plugin/node_modules/@opencode-ai/plugin/dist/index.js";
 import { buildOpenCodeToolMap } from "../packages/opencode-plugin/src/tool-registration.ts";
 import {
@@ -40,6 +40,14 @@ const PREFIX_CAPTURE_PATH = "docs/v0.49-agent-prefix-capture.json";
 const MANIFEST_PATH = "docs/v0.49-agent-surface-manifest.json";
 const SUBC_SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
 const LEGACY = ["filePath", "toFile"] as const;
+let snapshotDir: string | undefined;
+
+function artifactPath(path: string): string {
+  if (snapshotDir && (path === PREFIX_CAPTURE_PATH || path === MANIFEST_PATH)) {
+    return join(snapshotDir, path.split("/").at(-1)!);
+  }
+  return join(ROOT, path);
+}
 
 interface Surface {
   id: string;
@@ -398,7 +406,9 @@ function writeAllowlist(): Allowlist {
 }
 
 function loadAllowlist(): Allowlist {
-  if (!existsSync(join(ROOT, ALLOWLIST_PATH))) return writeAllowlist();
+  if (!existsSync(join(ROOT, ALLOWLIST_PATH))) {
+    throw new Error("reviewed legacy-vocabulary allowlist is required; --write-allowlist is an explicit authoring step");
+  }
   return JSON.parse(readFileSync(join(ROOT, ALLOWLIST_PATH), "utf8")) as Allowlist;
 }
 
@@ -512,7 +522,7 @@ function buildHints(harness: "opencode" | "pi", config: Record<string, unknown>,
 
 function hostVersion(command: string): { value: string | null; method: string } {
   try {
-    const value = execFileSync(command, ["--version"], { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const value = execFileSync(command, ["--version"], { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 }).trim();
     return { value: value || null, method: `${command} --version` };
   } catch {
     return { value: null, method: `${command} --version (not available in capture environment)` };
@@ -531,6 +541,9 @@ function productionCacheKey(harness: "opencode" | "pi"): { value: string | null;
 }
 
 function capturePrefixInput(commit: string): JsonObject {
+  // Host versions are diagnostic metadata, shared by all profiles of a host.
+  // Query each host once, with a deadline, so a source-only gate stays bounded.
+  const hostVersions = { opencode: hostVersion("opencode"), pi: hostVersion("pi") };
   const captures = profiles.map((profile) => {
     const config = profileConfigs[profile.id];
     const input = profile.harness === "opencode" ? captureOpenCode(config) : capturePi(config);
@@ -539,7 +552,7 @@ function capturePrefixInput(commit: string): JsonObject {
       capture_id: `PREFIX-${profile.id}`,
       profile_id: profile.id,
       harness: profile.harness,
-      host_version: hostVersion(profile.harness === "opencode" ? "opencode" : "pi"),
+      host_version: hostVersions[profile.harness],
       capture_method: profile.harness === "opencode"
         ? "production buildOpenCodeToolMap registration output plus system-transform workflow hint input"
         : "production registerPiToolSurface registration output plus before_agent_start workflow hint input",
@@ -622,7 +635,7 @@ function auditEmittedSurfaces(): void {
 }
 
 function exactArtifact(path: string): JsonObject {
-  const bytes = readFileSync(join(ROOT, path));
+  const bytes = readFileSync(artifactPath(path));
   return {
     path,
     encoding: "UTF-8",
@@ -633,7 +646,7 @@ function exactArtifact(path: string): JsonObject {
 
 function writePrefixCapture(commit: string): JsonObject {
   const capture = capturePrefixInput(commit);
-  writeFileSync(join(ROOT, PREFIX_CAPTURE_PATH), `${JSON.stringify(capture, null, 2)}\n`, "utf8");
+  writeFileSync(artifactPath(PREFIX_CAPTURE_PATH), `${JSON.stringify(capture, null, 2)}\n`, "utf8");
   return capture;
 }
 
@@ -674,7 +687,7 @@ function writeManifest(commit: string): void {
     source_commit: commit,
     ...exactArtifact("scripts/audit-v049-agent-surface.ts"),
   });
-  if (existsSync(join(ROOT, PREFIX_CAPTURE_PATH))) {
+  if (existsSync(artifactPath(PREFIX_CAPTURE_PATH))) {
     artifacts.push({
       id: "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
       path: PREFIX_CAPTURE_PATH,
@@ -695,11 +708,11 @@ function writeManifest(commit: string): void {
     "hash_rule": "Hash exact UTF-8 file bytes from the source commit; do not normalize newlines, reserialize JSON, or apply test-only normalization.",
     "artifacts": artifacts,
   };
-  writeFileSync(join(ROOT, MANIFEST_PATH), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  writeFileSync(artifactPath(MANIFEST_PATH), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 }
 
 function verifyManifest(): void {
-  const manifest = JSON.parse(readFileSync(join(ROOT, MANIFEST_PATH), "utf8")) as {
+  const manifest = JSON.parse(readFileSync(artifactPath(MANIFEST_PATH), "utf8")) as {
     source_commit: string;
     artifacts: Array<JsonObject & { path: string; source_commit: string; byte_length: number; sha256: string }>;
   };
@@ -715,19 +728,35 @@ function verifyManifest(): void {
 }
 
 function main(): void {
-  const args = new Set(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const args = new Set(argv);
+  const dirIndex = argv.indexOf("--snapshot-dir");
+  if (dirIndex !== -1) {
+    const value = argv[dirIndex + 1];
+    if (!value || value.startsWith("--")) throw new Error("--snapshot-dir requires a value");
+    snapshotDir = resolve(ROOT, value);
+    if (snapshotDir === join(ROOT, "docs") || snapshotDir.startsWith(`${join(ROOT, "docs")}${sep}`)) {
+      throw new Error("snapshots must not overwrite checked-in docs");
+    }
+  }
+  if ((args.has("--write-prefix-capture") || args.has("--write-manifest")) && !snapshotDir) {
+    throw new Error("generated publication records require --snapshot-dir; do not commit them");
+  }
+  if (snapshotDir && (args.has("--write-prefix-capture") || args.has("--write-manifest"))) {
+    mkdirSync(snapshotDir, { recursive: true });
+  }
   const commit = sourceCommit();
   const allowlist = args.has("--write-allowlist") ? writeAllowlist() : loadAllowlist();
   auditSourceOccurrences(allowlist);
   auditEmittedSurfaces();
   if (args.has("--write-prefix-capture")) writePrefixCapture(commit);
   if (args.has("--write-manifest")) writeManifest(commit);
-  if (existsSync(join(ROOT, PREFIX_CAPTURE_PATH))) {
+  if (snapshotDir && existsSync(artifactPath(PREFIX_CAPTURE_PATH))) {
     // The prefix capture embeds the OpenCode tool maps, which legitimately
     // carry the hoisted trio's host-display-contract `filePath`. Apply the
     // per-tool exemption to each captured tool map; `toFile` and non-trio
     // `filePath` stay prohibited.
-    const capture = JSON.parse(readFileSync(join(ROOT, PREFIX_CAPTURE_PATH), "utf8")) as {
+    const capture = JSON.parse(readFileSync(artifactPath(PREFIX_CAPTURE_PATH), "utf8")) as {
       captures?: Array<{ capture_id?: string; prefix_input?: { tools?: Record<string, unknown> } }>;
     };
     for (const entry of capture.captures ?? []) {
@@ -735,7 +764,7 @@ function main(): void {
       if (tools) assertNoLegacyToolMap(tools, `${PREFIX_CAPTURE_PATH} ${entry.capture_id ?? ""}`);
     }
   }
-  if (existsSync(join(ROOT, MANIFEST_PATH))) verifyManifest();
+  if (snapshotDir) verifyManifest();
   console.log(`v0.49 agent surface audit passed (${commit})`);
 }
 

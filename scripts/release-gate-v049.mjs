@@ -2,36 +2,39 @@
 /**
  * Validate the v0.49 artifact and activation release gates.
  *
- * The gate deliberately treats the checked S5 surface manifest as a byte
- * contract. A candidate may be built from a later commit, but its governed
- * source bytes must still be the exact bytes recorded at the manifest commit.
+ * The gate treats the prepared publication manifest as a byte contract for
+ * the planned release. It may be built from a later commit, but its governed
+ * source bytes must still be the exact bytes recorded at the candidate commit.
  * This prevents a release build from quietly accepting a steering or schema
- * edit that was never reviewed as part of the candidate.
+ * edit that was never committed as part of the candidate.
  *
- * Usage:
- *   node scripts/release-gate-v049.mjs --candidate
- *   node scripts/release-gate-v049.mjs --candidate --build --require-platform-artifacts
- *   node scripts/release-gate-v049.mjs --stage --evidence-output /tmp/v049-evidence.json
+ * Usage (run each line separately; prepare before validating saved records):
+ *   node scripts/release-gate-v049.mjs --check-inputs
+ *   node scripts/release-gate-v049.mjs --prepare --snapshot-dir /tmp/release-snapshot --candidate
+ *   node scripts/release-gate-v049.mjs --snapshot-dir /tmp/release-snapshot --candidate --require-platform-artifacts
  */
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const RELEASE_MANIFEST_PATH = "docs/v0.49-release-manifest.json";
 const SURFACE_MANIFEST_PATH = "docs/v0.49-agent-surface-manifest.json";
 const SOURCE_INVENTORY_PATH = "docs/v0.49-unified-tool-surface-inventory.json";
 const SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
-// The surface GENERATION label: manifests describe the v0.49.0 activation
-// surface lineage. v0.50 kept that surface byte-identical in default mode;
-// v0.51 advances it (blocking-fresh aft_inspect, status-bar retirement) and
-// the manifests regenerate against each governed commit, so the lineage
-// label stays 0.49.0 while the manifests themselves track the live surface.
-// Renaming the generation (docs/v0.49-* -> a new label) is deliberate
-// follow-up work, not a per-release edit.
+const EVIDENCE_PATH = "docs/v0.49-release-evidence.json";
+let snapshotDir;
+
+function recordPath(path) {
+  return join(snapshotDir, basename(path));
+}
+// The generation label identifies the publication/activation format introduced
+// in v0.49.0, not the current package version. Later releases keep that label;
+// disposable snapshots record their own source commit and current source bytes.
+// Changing the format and renaming docs/v0.49-* requires a deliberate migration.
 const TARGET_VERSION = "0.49.0";
 const PREVIOUS_VERSION = "0.48.1";
 // The version actually being released. Version-consistency checks compare
@@ -64,7 +67,7 @@ function fail(message) {
 
 function readJson(file) {
   try {
-    const absolute = file.startsWith("/") ? file : join(ROOT, file);
+    const absolute = isAbsolute(file) ? file : join(ROOT, file);
     return JSON.parse(readFileSync(absolute, "utf8"));
   } catch (error) {
     fail(`could not read ${file}: ${error instanceof Error ? error.message : String(error)}`);
@@ -111,6 +114,8 @@ function parseArgs(argv) {
     const arg = argv[index];
     if (
       arg === "--candidate" ||
+      arg === "--check-inputs" ||
+      arg === "--prepare" ||
       arg === "--build" ||
       arg === "--stage" ||
       arg === "--require-platform-artifacts" ||
@@ -120,7 +125,12 @@ function parseArgs(argv) {
       flags.add(arg);
       continue;
     }
-    if (arg === "--evidence" || arg === "--evidence-output" || arg === "--platform-assets-dir") {
+    if (
+      arg === "--snapshot-dir" ||
+      arg === "--evidence" ||
+      arg === "--evidence-output" ||
+      arg === "--platform-assets-dir"
+    ) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) fail(`${arg} requires a value`);
       values.set(arg, value);
@@ -133,8 +143,8 @@ function parseArgs(argv) {
 }
 
 function loadManifests() {
-  const release = readJson(RELEASE_MANIFEST_PATH);
-  const surface = readJson(SURFACE_MANIFEST_PATH);
+  const release = readJson(recordPath(RELEASE_MANIFEST_PATH));
+  const surface = readJson(recordPath(SURFACE_MANIFEST_PATH));
   const inventory = readJson(SOURCE_INVENTORY_PATH);
   const sourceInventory = readJson(surface.source_inventory);
   if (release.artifact_version !== TARGET_VERSION)
@@ -189,6 +199,18 @@ function checkGovernedBytes(release, surface, sourceInventory) {
     }
   }
   if (failures.length > 0) fail(`governed artifact byte gate failed:\n${failures.join("\n")}`);
+}
+
+function checkReleasePolicy(release) {
+  const policyBytes = sourceBytes(release.source_commit, RELEASE_MANIFEST_PATH);
+  if (!policyBytes || hash(policyBytes) !== exactFile(RELEASE_MANIFEST_PATH).sha256) {
+    fail("release policy differs from the manifest source commit");
+  }
+  assertEqual(
+    JSON.stringify(release),
+    JSON.stringify({ ...readJson(RELEASE_MANIFEST_PATH), source_commit: release.source_commit }),
+    "release snapshot policy",
+  );
 }
 
 function checkDistributionInventory(release, inventory) {
@@ -281,14 +303,42 @@ function run(command, args, cwd = ROOT) {
   execFileSync(command, args, { cwd, stdio: "inherit", env: process.env });
 }
 
-function checkGeneratedSubc(skip) {
+function checkGeneratedSubc(skip, sourceOnly) {
   if (skip) return;
-  run(BUN, ["packages/opencode-plugin/scripts/build-tool-schemas.ts", "--check"]);
+  run(BUN, [
+    "packages/opencode-plugin/scripts/build-tool-schemas.ts",
+    sourceOnly ? "--check-source-only" : "--check",
+  ]);
 }
 
 function checkSteering(skip) {
   if (skip) return;
-  run(BUN, ["scripts/audit-v049-agent-surface.ts"]);
+  run(BUN, ["scripts/audit-v049-agent-surface.ts", "--snapshot-dir", snapshotDir]);
+}
+
+function prepareSnapshot() {
+  mkdirSync(snapshotDir, { recursive: true });
+  if (
+    [
+      RELEASE_MANIFEST_PATH,
+      SURFACE_MANIFEST_PATH,
+      EVIDENCE_PATH,
+      "docs/v0.49-agent-prefix-capture.json",
+    ].some((path) => existsSync(recordPath(path)))
+  ) {
+    fail("snapshot directory already contains publication records; validate it without --prepare");
+  }
+  // The checked release manifest is policy, not a digest of a moving branch.
+  // Only disposable release records acquire a source commit and byte hashes.
+  const release = { ...readJson(RELEASE_MANIFEST_PATH), source_commit: git(["rev-parse", "HEAD"]) };
+  writeFileSync(recordPath(RELEASE_MANIFEST_PATH), `${JSON.stringify(release, null, 2)}\n`);
+  run(BUN, [
+    "scripts/audit-v049-agent-surface.ts",
+    "--snapshot-dir",
+    snapshotDir,
+    "--write-prefix-capture",
+    "--write-manifest",
+  ]);
 }
 
 function checkPlatformArtifacts(release, assetsDir) {
@@ -540,29 +590,58 @@ function validateEvidence(path, release, surface, sourceInventory) {
 
 function main() {
   const { flags, values } = parseArgs(process.argv.slice(2));
-  const { release, surface, inventory, sourceInventory } = loadManifests();
-  checkGovernedBytes(release, surface, sourceInventory);
-  checkDistributionInventory(release, inventory);
-  checkCandidateVersions(release, flags.has("--candidate"));
-  checkGeneratedSubc(flags.has("--skip-subc"));
-  checkSteering(flags.has("--skip-steering"));
-  if (flags.has("--build")) buildCandidate(release);
-  if (flags.has("--require-platform-artifacts"))
-    checkPlatformArtifacts(release, values.get("--platform-assets-dir"));
-  if (values.has("--evidence"))
-    validateEvidence(values.get("--evidence"), release, surface, sourceInventory);
-  if (flags.has("--stage")) {
-    const evidence = stageTransitions(
-      release,
-      surface,
-      sourceInventory,
-      values.get("--evidence-output"),
-    );
-    console.log(
-      `✓ staged and validated ${evidence.transitions.length} v0.49 activation transitions`,
-    );
+  if (
+    flags.has("--check-inputs") &&
+    (values.size > 0 ||
+      [...flags].some((flag) => flag !== "--check-inputs" && flag !== "--candidate"))
+  ) {
+    fail("--check-inputs is a read-only source check, not a build or release snapshot command");
   }
-  console.log(`✓ v0.49 release gates passed (${release.source_commit})`);
+  if (!flags.has("--check-inputs") && !values.has("--snapshot-dir")) {
+    fail("use --check-inputs for trains, or --snapshot-dir for release records");
+  }
+  snapshotDir = flags.has("--check-inputs")
+    ? mkdtempSync(join(tmpdir(), "aft-publication-inputs-"))
+    : resolve(ROOT, values.get("--snapshot-dir"));
+  if (snapshotDir === join(ROOT, "docs") || snapshotDir.startsWith(`${join(ROOT, "docs")}${sep}`)) {
+    fail("snapshots must not overwrite checked-in docs");
+  }
+  const evidencePath =
+    values.get("--evidence") ?? values.get("--evidence-output") ?? recordPath(EVIDENCE_PATH);
+  if (
+    values.has("--evidence-output") &&
+    !resolve(ROOT, values.get("--evidence-output")).startsWith(`${snapshotDir}${sep}`)
+  ) {
+    fail("--evidence-output must stay inside the snapshot directory");
+  }
+  try {
+    if (flags.has("--check-inputs") || flags.has("--prepare")) prepareSnapshot();
+    const { release, surface, inventory, sourceInventory } = loadManifests();
+    checkGovernedBytes(release, surface, sourceInventory);
+    checkReleasePolicy(release);
+    checkDistributionInventory(release, inventory);
+    checkCandidateVersions(release, flags.has("--candidate"));
+    checkGeneratedSubc(flags.has("--skip-subc"), flags.has("--check-inputs"));
+    checkSteering(flags.has("--skip-steering"));
+    if (flags.has("--build")) buildCandidate(release);
+    if (flags.has("--require-platform-artifacts"))
+      checkPlatformArtifacts(release, values.get("--platform-assets-dir"));
+    if (flags.has("--stage") || flags.has("--prepare") || flags.has("--check-inputs")) {
+      const evidence = stageTransitions(
+        release,
+        surface,
+        sourceInventory,
+        values.get("--evidence-output") ?? recordPath(EVIDENCE_PATH),
+      );
+      console.log(
+        `✓ staged and validated ${evidence.transitions.length} v0.49 activation transitions`,
+      );
+    }
+    validateEvidence(evidencePath, release, surface, sourceInventory);
+    console.log(`✓ v0.49 release gates passed (${release.source_commit})`);
+  } finally {
+    if (flags.has("--check-inputs")) rmSync(snapshotDir, { recursive: true, force: true });
+  }
 }
 
 main();

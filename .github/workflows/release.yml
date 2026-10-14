@@ -556,8 +556,18 @@ jobs:
       - name: Fetch final v0.48.1 activation baseline
         run: git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
 
+      - name: Prepare publication records from the tagged candidate
+        run: node scripts/release-gate-v049.mjs --prepare --snapshot-dir "${{ runner.temp }}/governed-publication" --candidate
+
       - name: Verify v0.49 artifact and release gates
-        run: node scripts/release-gate-v049.mjs --candidate --evidence docs/v0.49-release-evidence.json --require-platform-artifacts
+        run: node scripts/release-gate-v049.mjs --snapshot-dir "${{ runner.temp }}/governed-publication" --candidate --require-platform-artifacts
+
+      - name: Retain governed publication records
+        uses: actions/upload-artifact@v4
+        with:
+          name: governed-publication-${{ github.ref_name }}
+          path: ${{ runner.temp }}/governed-publication/*.json
+          if-no-files-found: error
 
       # Uses npm Trusted Publishing (OIDC) — configured per-package on npmjs.com
       - name: Publish platform packages

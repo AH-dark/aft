@@ -165,32 +165,23 @@ jobs:
       - name: Bun typecheck
         run: bun run typecheck
 
-      # Governed publication surfaces (tool schemas, descriptions, workflow
-      # hints) are byte-pinned in docs/ manifests that live OUTSIDE the normal
-      # code-change workflow, so a merge touching a governed file leaves them
-      # stale silently. Unchecked, that drift only surfaces inside the release
-      # workflow's publish job — after the full test and build matrices have
-      # run — costing a dead tag and a re-cut. Checking it here fails the merge
-      # that caused the drift, next to the change that explains it.
-      #
-      # Linux-only: the audit reads source bytes and builds tool maps in-process,
-      # so it is platform-independent and does not need repeating per OS.
-      - name: Agent surface audit (governed manifest drift)
+      # Validate current source and activation evidence without committing
+      # branch-dependent digests. This source-only gate never builds Cargo.
+      - name: Publication input gate
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          audits=(scripts/audit-v[0-9]*-agent-surface.ts)
-          if [ ${#audits[@]} -eq 0 ]; then
-            echo "no versioned agent-surface audit present; skipping"
-            exit 0
-          fi
-          for audit in "${audits[@]}"; do
-            echo "→ bun $audit"
-            bun "$audit"
-          done
+          git fetch --force origin refs/tags/v0.48.1:refs/tags/v0.48.1
+          node scripts/release-gate-v049.mjs --check-inputs
 
       - name: Cargo build (debug — needed by plugin e2e tests)
         run: cargo build -p agent-file-tools
+
+      # release-gate --check-inputs validates JS artifacts without Cargo.
+      # This full check also compares the committed hashline schema to its Rust
+      # generator, preventing stale native schemas from landing on main while
+      # reusing the debug generator already built with the test binaries.
+      - name: Native generated-schema byte gate
+        run: bun packages/opencode-plugin/scripts/build-tool-schemas.ts --check
 
       - name: Rust test gate (unit on libtest, integration on nextest, watcher isolated)
         run: ./scripts/rust-test-gate.sh
