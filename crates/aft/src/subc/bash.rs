@@ -3577,22 +3577,6 @@ mod grant_path_tests {
         assert!(!dir.path().join("started-command").exists());
     }
 
-    /// The starting-record delay the boundary test is sweeping. Only that
-    /// test reads it, one call at a time.
-    #[cfg(unix)]
-    static BOUNDARY_STARTING_DELAY_MS: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-
-    #[cfg(unix)]
-    fn boundary_starting_delay_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
-        let delay = BOUNDARY_STARTING_DELAY_MS.load(Ordering::SeqCst);
-        with_task_io_fault(
-            TaskIoFault::StartingDelay(Duration::from_millis(delay)),
-            || running_bash_stub(req, ctx),
-        )
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_deadline_during_control_file_write_says_not_started_and_never_starts() {
@@ -3667,46 +3651,80 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_deadline_at_the_commit_boundary_is_never_ambiguous() {
-        // Sweep the starting-record delay across the 200 ms budget so the
-        // commit lands just before, at, or just after the deadline. Which
-        // side wins is timing; that the reply matches what happened is not.
-        for delay_ms in [140u64, 170, 185, 200, 215, 230, 260] {
-            BOUNDARY_STARTING_DELAY_MS.store(delay_ms, Ordering::SeqCst);
-            let mut call = startup_call(
-                boundary_starting_delay_stub,
+        use crate::bash_background::{
+            with_spawn_commit_time_for_test, with_spawn_receipt, SpawnReceipt,
+        };
+
+        // Drive the real spawn path at exact clock positions, then settle its
+        // receipt as the subc reply timer does. A delay sweep can miss the
+        // commit-side refusal entirely when the timer wins every late case.
+        for offset in [-1i32, 0, 1] {
+            let (dir, root) = super::super::test_support::test_root("bash-commit-boundary");
+            let ctx = super::super::test_support::test_ctx();
+            ctx.update_config(|config| {
+                config.project_root = Some(root.as_path().into());
+                config.storage_dir = Some(dir.path().join("storage"));
+                config.sandbox.enabled = false;
+            });
+            let (_tx, rx) = mpsc::channel(1);
+            let call = StartupCall { dir, ctx, rx };
+            let deadline = Instant::now();
+            let now = match offset {
+                -1 => deadline - Duration::from_nanos(1),
+                0 => deadline,
+                _ => deadline + Duration::from_nanos(1),
+            };
+            let receipt = Arc::new(SpawnReceipt::new(deadline));
+            let response = with_spawn_receipt(receipt.clone(), || {
+                with_spawn_commit_time_for_test(now, || {
+                    running_bash_stub(
+                        RawRequest {
+                            id: "deadline-call".into(),
+                            command: "bash".into(),
+                            lsp_hints: None,
+                            session_id: Some("deadline-session".into()),
+                            params: json!({"command": "printf ran > started-command", "timeout": 60000}),
+                        },
+                        &call.ctx,
+                    )
+                })
+            });
+            assert_eq!(
+                response.success,
+                offset < 0,
+                "offset {offset}: {response:?}"
+            );
+            let deadline_response = startup_deadline_response(
+                "deadline-call",
+                &receipt.expire(),
                 200,
-                "printf ran > started-command",
-                Instant::now(),
+                None,
                 false,
                 false,
+                false,
+                &Executor::new(),
+                &root,
+                true,
             );
-            let done = first_reply(&mut call, Duration::from_millis(1500)).await;
-            let response = done.response_for_test();
-            eprintln!(
-                "commit-boundary delay {delay_ms} ms: {}",
-                if response.success {
-                    "handed off"
-                } else {
-                    "refused"
-                }
-            );
-            if response.success {
+            assert_eq!(deadline_response.success, response.success);
+            if offset < 0 {
                 let task_id = response.data["task_id"]
                     .as_str()
-                    .unwrap_or_else(|| panic!("delay {delay_ms}: success without a task id"))
+                    .expect("commit before deadline must return a task id")
                     .to_string();
+                assert_eq!(deadline_response.data["task_id"], task_id);
                 assert_eq!(
                     wait_for_terminal(&call.ctx, &task_id).await,
                     crate::bash_background::BgTaskStatus::Completed,
-                    "delay {delay_ms}"
+                    "offset {offset}"
                 );
                 assert!(
                     call.dir.path().join("started-command").exists(),
-                    "delay {delay_ms}: handed-off task must have run"
+                    "handed-off task must have run"
                 );
             } else {
                 assert_not_started_refusal(&response);
-                tokio::time::sleep(Duration::from_millis(delay_ms + 400)).await;
+                assert_not_started_refusal(&deadline_response);
                 assert_never_started(&call);
             }
         }

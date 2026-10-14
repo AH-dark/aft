@@ -105,15 +105,19 @@ impl SpawnReceipt {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !matches!(*state, SpawnReceiptState::Pending)
-            || std::time::Instant::now() >= self.deadline
-        {
+        let now = std::time::Instant::now();
+        #[cfg(test)]
+        let now = SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.get().unwrap_or(now));
+        if !matches!(*state, SpawnReceiptState::Pending) || now >= self.deadline {
             // A second commit on one receipt is a bug; refusing it keeps an
             // earlier commit's answer intact instead of overwriting it.
             if matches!(*state, SpawnReceiptState::Pending) {
                 *state = SpawnReceiptState::Refused;
             }
-            return Err("bash startup deadline expired before process creation".into());
+            return Err(
+                "bash startup deadline expired before process creation; command was not started"
+                    .into(),
+            );
         }
         *state = committed;
         Ok(())
@@ -146,6 +150,29 @@ fn spawn_receipt_committed() -> bool {
 
 thread_local! {
     static CURRENT_SPAWN_RECEIPT: std::cell::RefCell<Option<std::sync::Arc<SpawnReceipt>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static SPAWN_COMMIT_TIME_FOR_TEST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Overrides only the receipt's clock on this thread, leaving other startups
+/// and the real process/persistence path untouched.
+#[cfg(all(test, unix))]
+pub(crate) fn with_spawn_commit_time_for_test<T>(
+    now: std::time::Instant,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::time::Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.set(self.0));
+        }
+    }
+    let previous = SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.replace(Some(now)));
+    let _restore = Restore(previous);
+    run()
 }
 
 pub(crate) fn with_spawn_receipt<T>(
