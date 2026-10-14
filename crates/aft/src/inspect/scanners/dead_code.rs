@@ -1991,8 +1991,8 @@ fn aggregate_materialized_dead_code_contributions(
             .cloned()
             .collect::<Vec<_>>();
         for (export, other_lines) in exports_deduplicated_by_node(&candidates) {
-            if test_code
-                || contribution
+            if !test_code
+                && contribution
                     .cfg_test_ranges
                     .iter()
                     .any(|range| range.contains(export.line))
@@ -7367,6 +7367,31 @@ mod tests {
             "{aggregate:#}"
         );
         assert_eq!(aggregate["excluded_test_count"], 2, "{aggregate:#}");
+    }
+
+    #[test]
+    fn used_test_file_exports_are_not_tallied_as_excluded_dead_findings() {
+        let (_temp, root, _) = canonical_fixture(&[("tests/helper.rs", "pub fn called() {}\n")]);
+        let contribution = dispatch_contribution("tests/helper.rs", &[("called", "function")]);
+        let reachable = [("tests/helper.rs".to_string(), "called".to_string())]
+            .into_iter()
+            .collect();
+        let aggregate = aggregate_materialized_dead_code_contributions(
+            &root,
+            std::slice::from_ref(&contribution),
+            std::slice::from_ref(&contribution),
+            &BTreeSet::new(),
+            &crate::inspect::entry_points::resolve_project_roles(&root),
+            None,
+            1,
+            &reachable,
+            &reachable,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            aggregate["excluded_test_count"], 0,
+            "a used test export is not a withheld dead finding: {aggregate:#}"
+        );
     }
 
     #[test]
