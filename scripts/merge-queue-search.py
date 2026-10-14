@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Resolve queue members from merge parents and retain per-PR search contracts.
+
+The prototype supports the queue's merge method only. Unknown topology or PR
+association is an input fault, not permission to guess which descriptor applies.
+"""
+
+from __future__ import annotations
+
+import argparse
+from importlib import import_module
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "benchmarks/aft-search"))
+quality = import_module("search_quality")
+quality_lib = import_module("search_quality_lib")
+descriptor_labels = quality.descriptor_labels
+InputFault = quality_lib.InputFault
+resolve_descriptor = quality_lib.resolve_descriptor
+
+
+def git(*args: str) -> str:
+    result = subprocess.run(["git", *args], text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise InputFault(f"unresolvable_queue_diff:{result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def paths(base: str, head: str) -> list[str]:
+    return git("diff", "--name-only", "--no-renames", f"{base}...{head}").splitlines()
+
+
+def member_pr(repository: str, head: str) -> dict:
+    result = subprocess.run(
+        ["gh", "api", "--paginate", "--slurp",
+         f"repos/{repository}/commits/{head}/pulls?per_page=100"],
+        text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        raise InputFault(f"queue_pr_lookup_failed:{head}:{result.stderr.strip()}")
+    pages = json.loads(result.stdout)
+    matches = [
+        pr for page in pages for pr in page
+        if pr["head"]["sha"] == head and pr["base"]["ref"] == "main"
+        and pr["base"]["repo"]["full_name"] == repository
+    ]
+    if len(matches) != 1:
+        raise InputFault(f"ambiguous_queue_member:{head}:matches={len(matches)}")
+    return matches[0]
+
+
+def member_descriptor(head: str, branch: str, group_head: str) -> tuple[str, dict]:
+    git("check-ref-format", "--branch", branch)
+    candidates = []
+    for label in descriptor_labels(branch):
+        path = f"benchmarks/aft-search/slice-descriptors/{label}.json"
+        exists = subprocess.run(
+            ["git", "cat-file", "-e", f"{head}:{path}"],
+            capture_output=True, check=False,
+        )
+        if exists.returncode == 0:
+            candidates.append(path)
+    if len(candidates) != 1:
+        raise InputFault(f"queue_member_descriptor:{branch}:matches={len(candidates)}")
+    path = candidates[0]
+    descriptor = json.loads(git("show", f"{head}:{path}"))
+    if not isinstance(descriptor, dict):
+        raise InputFault(f"malformed_queue_descriptor:{path}")
+    # A later PR must not replace an earlier PR's descriptor at the same path.
+    if descriptor != json.loads(git("show", f"{group_head}:{path}")):
+        raise InputFault(f"queue_descriptor_overwritten:{path}")
+    return path, descriptor
+
+
+def plan(base: str, head: str, head_ref: str, repository: str) -> dict:
+    for sha in (base, head):
+        if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+            raise InputFault("queue_requires_full_base_and_head_shas")
+    if git("rev-parse", "HEAD") != head:
+        raise InputFault("queue_checkout_head_mismatch")
+    if git("merge-base", base, head) != base:
+        raise InputFault("queue_base_not_ancestor")
+    tail = re.fullmatch(r"(?:refs/heads/)?gh-readonly-queue/main/pr-(\d+)-.+", head_ref)
+    if tail is None:
+        raise InputFault(f"unknown_queue_ref:{head_ref}")
+    members = []
+    descriptors = {}
+    previous = base
+    for commit in git("rev-list", "--first-parent", "--reverse", f"{base}..{head}").splitlines():
+        parents = git("show", "-s", "--format=%P", commit).split()
+        # Only synthetic two-parent merges can identify each PR head exactly.
+        # Squash/rebase commits lack that binding and require another adapter.
+        if len(parents) != 2 or parents[0] != previous:
+            raise InputFault(f"unsupported_queue_topology:{commit}")
+        pr = member_pr(repository, parents[1])
+        if any(member["number"] == pr["number"] for member in members):
+            raise InputFault(f"duplicate_queue_member:{pr['number']}")
+        branch = pr["head"]["ref"]
+        path, descriptor = member_descriptor(parents[1], branch, head)
+        member_base = git("merge-base", base, parents[1])
+        resolved, missing = resolve_descriptor(descriptor, paths(member_base, parents[1]))
+        if missing:
+            raise InputFault(f"missing_queue_descriptor:{pr['number']}")
+        members.append({"number": pr["number"], "branch": branch, "head": parents[1],
+                        "descriptor": path, "slice_class": resolved["slice_class"]})
+        descriptors[path] = descriptor
+        previous = commit
+    if not members or members[-1]["number"] != int(tail[1]):
+        raise InputFault("queue_ref_member_mismatch")
+    ranking = [member for member in members if member["slice_class"] == "ranking"]
+    if len(ranking) > 1:
+        raise InputFault("multiple_ranking_queue_members:land these ranking PRs separately")
+    # Keep the single ranking PR's targeted_mechanism and optional exemptions
+    # unchanged when evaluating the combined tree. Other descriptors have been
+    # validated against their own PR diffs as non_ranking or engine_unwired.
+    # Without a ranking PR, evaluate each applicable descriptor separately so
+    # one PR's expectations cannot silently replace another's.
+    selected = ranking or [member for member in members if member["slice_class"] == "engine_unwired"] or members
+    evaluations = list(dict.fromkeys(member["descriptor"] for member in selected))
+    group_paths = paths(base, head)
+    for path in evaluations:
+        resolve_descriptor(descriptors[path], group_paths)
+    return {"base": base, "head": head, "members": members, "evaluations": evaluations}
+
+
+def evaluate(candidate: dict, mode: str) -> None:
+    descriptors = candidate["evaluations"]
+    common = ["--mode", mode, "--base-ref", candidate["base"], "--head", candidate["head"]]
+    first = [str(ROOT / "scripts/telemetry/cost-gate.sh"), "--search-quality", *common]
+    if mode == "evaluate":
+        first.extend(["--descriptor", descriptors[0]])
+    subprocess.run(first, check=True)
+    if mode == "evaluate":
+        # The score measures the combined queue tree. Compare that same score
+        # under each remaining descriptor instead of replaying the corpus; the
+        # descriptors may require different search-result comparisons.
+        for descriptor in descriptors[1:]:
+            subprocess.run(
+                [sys.executable, str(ROOT / "benchmarks/aft-search/search_quality.py"),
+                 *common, "--descriptor", descriptor, "--score",
+                 str(ROOT / "benchmarks/aft-search/.bench/search-quality/score.json")],
+                check=True,
+            )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", required=True)
+    parser.add_argument("--head", required=True)
+    parser.add_argument("--head-ref", required=True)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--mode", choices=("evaluate", "verify"), default="evaluate")
+    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--plan-output", type=Path)
+    args = parser.parse_args()
+    try:
+        candidate = plan(args.base, args.head, args.head_ref, args.repository)
+        text = json.dumps(candidate, sort_keys=True)
+        print(f"merge_queue_search_plan:{text}", flush=True)
+        if args.plan_output:
+            args.plan_output.write_text(text + "\n")
+        if not args.plan_only:
+            evaluate(candidate, args.mode)
+        return 0
+    except subprocess.CalledProcessError as error:
+        return error.returncode
+    except (InputFault, OSError, ValueError, KeyError, TypeError) as error:
+        print(f"merge_queue_search_input_fault:{error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

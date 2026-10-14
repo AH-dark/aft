@@ -1,8 +1,8 @@
 name: Tests
 
 # PR-time gate: runs Rust + plugin unit tests, Linux Docker e2e, and Windows e2e
-# before merge. Train pushes run it too, and scripts/train-push.sh lands a
-# commit on main only when this run is green. Tag pushes go through
+# before merge, including the queue's synthetic merge-group commit. Train
+# pushes remain enabled during migration. Tag pushes go through
 # `release.yml`, which does not rerun these tests: it builds and publishes only
 # after scripts/release-ci-gate.sh finds this workflow's green run for the
 # tagged commit, so the job names below are what that gate checks against
@@ -12,40 +12,16 @@ name: Tests
 # locking, or platform-conditional code paths SHOULD touch the matching
 # integration test or e2e scenario in `_e2e-suite.yml`. The Linux harness has
 # caught real regressions before; the Windows e2e is here to extend that
-# coverage to issue-#26-class Windows-specific bugs (bash timeouts, lock
+# coverage to Windows-specific process and filesystem bugs (bash timeouts, lock
 # recovery, path separators).
 
 on:
   pull_request:
-    paths:
-      - "crates/**"
-      - "packages/**"
-      - "tests/**"
-      - "scripts/**"
-      - "benchmarks/aft-search/**"
-      - "docs/**"
-      - "ARCHITECTURE.md"
-      - "STRUCTURE.md"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "package.json"
-      - "bun.lock"
-      - ".github/opencode-version.txt"
-      - ".github/workflows/tests.yml"
-      - ".github/workflows/release.yml"
-      - ".github/workflows/_unit-suite.yml"
-      - ".github/workflows/_e2e-suite.yml"
-      - ".github/workflows/bump-opencode.yml"
-      - ".github/workflows/discord-release.yml"
-  # No paths filter on push, deliberately. `train/**` branches are the push
-  # gate: scripts/train-push.sh pushes a train here, waits for THIS run, and
-  # fast-forwards main only when it concludes success. A paths filter would
-  # skip the run for a train that happens to touch only unlisted files (a
-  # docs-only or workflow-only train is still a train), and a skipped run is
-  # not a green run - the watcher would wait for a run that never appears and
-  # the train could never land. GitHub applies one paths filter to the whole
-  # push event, so main gives up its filter to keep trains unconditional; the
-  # pull_request filter above is unchanged.
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+  # Required checks must report even for docs-only or otherwise unlisted files.
+  # Keep the legacy train push trigger until repository administrators enable the queue.
   push:
     branches:
       - main
@@ -58,11 +34,12 @@ on:
         required: false
         type: string
 
-# Cancel in-flight runs for the same PR/branch when a new commit arrives.
-# Saves CI minutes and surfaces the latest result faster.
+# PR/branch updates supersede older runs. Queue candidates are independent,
+# SHA-scoped builds: one group must not cancel another group's required checks.
+# Main runs are also SHA-scoped so release-ci-gate can find exact landed-SHA proof.
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ (github.event_name == 'merge_group' || github.ref == 'refs/heads/main') && github.sha || 'latest' }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' }}
 
 env:
   # Keep the compiler cache server alive between build steps so its final
@@ -143,6 +120,10 @@ jobs:
     needs: search-quality-binary
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -181,6 +162,12 @@ jobs:
           python3 benchmarks/aft-search/provision_evidence.py
       - name: Evaluate committed search-quality reference
         env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          QUEUE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          QUEUE_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          QUALITY_BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
           AFT_SEARCH_NETWORK_POLICY: loopback-only
           AFT_SEARCH_CACHE_DIR: ${{ runner.temp }}/empty-aft-search-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
@@ -198,17 +185,27 @@ jobs:
           # B0-guarded dry run instead and say so loudly; this arm disappears
           # the moment real-query-baseline.json exists.
           if [ ! -f benchmarks/aft-search/real-query-baseline.json ]; then
+            if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+              echo "::error title=search-quality-gate::queue_reference_missing: record the reference pair before enabling queue landing"
+              exit 2
+            fi
             echo "::warning title=search-quality-gate bootstrap::reference pair absent; B0 has not recorded it yet - running record-reference --dry-run only"
             scripts/telemetry/cost-gate.sh --search-quality --mode record-reference --dry-run
             exit 0
           fi
-          # The diff base is the merge-base with main: on a pull request that is
-          # the base branch's tip; on a branch push (train branches, first push of
-          # a new branch where event.before is all zeros) it is main itself.
-          # A base that cannot be resolved is a gate fault by rule (R43), so it
-          # must never be the null sha.
-          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
+          # Queue candidates use their pinned event base. PRs use the event's
+          # base branch SHA; ordinary pushes resolve a merge-base with main.
+          # An unresolved base is an input fault, never an all-zero SHA.
+          if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+            # Main may advance during a speculative build. The event's base and
+            # head, not today's main tip, define the candidate being checked.
+            if [[ ! "$QUEUE_BASE_SHA" =~ ^[0-9a-f]{40}$ || "$QUEUE_HEAD_SHA" != "$GITHUB_SHA" ]]; then
+              echo "::error title=search-quality-gate::invalid pinned merge-group base/head"
+              exit 2
+            fi
+            base="$QUEUE_BASE_SHA"
+          elif [ -n "$PR_BASE_SHA" ]; then
+            base="$PR_BASE_SHA"
           else
             # actions/checkout fetches only the pushed ref, and a refspec-less
             # `git fetch origin main` writes FETCH_HEAD WITHOUT creating
@@ -235,7 +232,7 @@ jobs:
           # earlier rounds unreadable. Capture both streams and report them.
           mkdir -p benchmarks/aft-search/.bench/search-quality
           set +e
-          mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "${{ github.sha }}" 2>benchmarks/aft-search/.bench/search-quality/mode.err)"
+          mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "$GITHUB_SHA" 2>benchmarks/aft-search/.bench/search-quality/mode.err)"
           mode_status=$?
           set -e
           echo "search-quality-gate: base=$base head=${{ github.sha }} mode='$mode' selector_exit=$mode_status"
@@ -248,8 +245,16 @@ jobs:
           # failed step's log is not always retrievable afterwards. Keep it on
           # disk so the upload below carries it whatever the outcome.
           set -o pipefail
-          scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" --head "${{ github.sha }}" 2>&1 \
-            | tee benchmarks/aft-search/.bench/search-quality/gate.log
+          if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+            python3 scripts/merge-queue-search.py --base "$base" --head "$GITHUB_SHA" \
+              --head-ref "$QUEUE_HEAD_REF" --repository "$GITHUB_REPOSITORY" --mode "$mode" \
+              --plan-output benchmarks/aft-search/.bench/search-quality/queue-plan.json 2>&1 \
+              | tee benchmarks/aft-search/.bench/search-quality/gate.log
+          else
+            scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" \
+              --head "$GITHUB_SHA" --branch "$QUALITY_BRANCH" 2>&1 \
+              | tee benchmarks/aft-search/.bench/search-quality/gate.log
+          fi
       - name: Upload search-quality score and behavior diff
         if: always()
         uses: actions/upload-artifact@v4
@@ -259,5 +264,6 @@ jobs:
             benchmarks/aft-search/.bench/search-quality/score.json
             benchmarks/aft-search/.bench/search-quality/score.diff.txt
             benchmarks/aft-search/.bench/search-quality/gate.log
+            benchmarks/aft-search/.bench/search-quality/queue-plan.json
           if-no-files-found: warn
           retention-days: 14
