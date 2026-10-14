@@ -88,6 +88,13 @@ fn main() {
         aft::launch_nonce::capture_at_startup();
     }
 
+    // Only the binary embeds the per-commit revision. Declare it before CLI
+    // dispatch or the subc HELLO can request the library's build provenance.
+    assert!(
+        aft::launch_nonce::initialize_binary_build_revision(option_env!("AFT_BUILD_GIT_SHA")),
+        "build provenance was already declared before binary startup"
+    );
+
     // Record ORT_DYLIB_PATH as the spawner passed it, before anything in this
     // process can export its own value: only a spawn-time value is an operator
     // override of the ONNX Runtime library pin.

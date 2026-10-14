@@ -160,6 +160,7 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
             "HELLO must carry the nonce from the pipe, not the environment copy"
         );
         let manifest = serde_json::to_value(&hello.manifest).expect("manifest json");
+        eprintln!("captured module provenance: {}", manifest["provenance"]);
         assert_eq!(
             manifest["provenance"]["launch_nonce_source"],
             json!("fd"),
@@ -176,6 +177,16 @@ fn subc_module_reads_the_pipe_nonce_and_no_child_inherits_it() {
                 .expect("HELLO build Git SHA")
                 .len(),
             40
+        );
+        let git = std::process::Command::new("git")
+            .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+            .output()
+            .expect("checkout build revision");
+        assert!(git.status.success(), "checkout revision must be available");
+        assert_eq!(
+            manifest["provenance"]["build_git_sha"].as_str(),
+            Some(String::from_utf8_lossy(&git.stdout).trim()),
+            "HELLO must carry the exact compiled checkout revision"
         );
 
         bind_route(&mut stream, project.path()).await;

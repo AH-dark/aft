@@ -129,6 +129,8 @@ jobs:
           cache-on-failure: true
       - name: Build shared release AFT
         run: cargo build --release --locked -p agent-file-tools --bin aft
+        env:
+          RUSTC_WRAPPER: ${{ github.workspace }}/scripts/ci-rustc-cache.py
       - uses: actions/upload-artifact@v4
         with:
           name: search-quality-aft-${{ github.sha }}

@@ -58,6 +58,19 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class CISpeedWorkflowTests(unittest.TestCase):
+    def test_library_does_not_embed_per_commit_build_script_environment(self) -> None:
+        root = Path(__file__).resolve().parents[2] / "crates/aft"
+        emitted = set(re.findall(r"cargo:rustc-env=([A-Z0-9_]+)=", (root / "build.rs").read_text()))
+        self.assertIn("AFT_BUILD_GIT_SHA", emitted)
+        violations = []
+        for source in (root / "src").rglob("*.rs"):
+            if source == root / "src/main.rs":
+                continue
+            for name in emitted:
+                if re.search(rf'(?:option_env|env)\s*!\s*\(\s*"{re.escape(name)}"', source.read_text()):
+                    violations.append(f"{source.relative_to(root)}: {name}")
+        self.assertEqual(violations, [], "per-commit build data belongs in the binary, not the library")
+
     def test_test_builds_keep_symbolication_without_full_debug_types(self) -> None:
         workflow = workflow_gates.parse_workflow(str(
             Path(__file__).resolve().parents[2] / ".github/workflows/_unit-suite.yml",

@@ -68,7 +68,10 @@ and optimization/linking cost.
 ## Baseline job medians
 
 Queue is in seconds; all other columns are minutes. Summary jobs keep their
-original names and fail-closed dependency checks.
+original names and dependency checks that require every constituent lane to
+succeed; a failed or cancelled dependency fails the summary too. The
+Compile+test column is for mixed compile-and-execute shell gates, separate
+from steps that only build or only run tests.
 
 | Job | Queue s | Execution min | Setup/other min | Compile min | Test min | Compile+test min |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -162,7 +165,9 @@ original names and fail-closed dependency checks.
   `36c7d430e8d38aa6891bb5cd46f16d00f2ac3a22`, branch
   `ci-speed/workspace-bg2b4afa`, run
   [38544407835](https://github.com/cortexkit/aft/actions/runs/38544407835).
-  Eleven dominant producers enable `cache-workspace-crates: true`.
+  The search-quality producer, all three E2E producers, Linux unit/integration/
+  storm producers, three macOS archive producers and the Windows archive
+  producer enable `cache-workspace-crates: true` (eleven jobs).
   Integration/libtest/bin archive producers use distinct keys so the first
   producer to finish cannot freeze a cache containing only its own inventory.
   macOS continues excluding `~/.cargo/bin`: restoring cached cargo/rustup
@@ -237,3 +242,80 @@ stats alone. The default cache budget is approximately 10 GB, so retaining
 large per-job copies across sibling measurement/train branches risks evicting
 useful default-branch and compiler entries. C deliberately does not keep B's
 broad workspace-cache settings.
+
+### B's additional failures and artifact provenance
+
+B's first-attempt macOS libtest archive log says **`No cache found.`**, then
+`Compiling agent-file-tools` and `Finished test ... in 23m 33s`. The serial
+panic/backtrace probe passed. Its shard consumers downloaded this freshly
+built archive. Rust source, Cargo manifests/lockfile and `.cargo` inputs are
+identical between A and B. Thus a restored stale **workspace** library or
+build-script output cannot explain these failures in B's first attempt:
+the workspace cache was a miss before the archive build.
+
+- `exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run`
+  failed at `crates/aft/src/bash_background/remote_tests.rs:1875` with
+  `left: []`, `right: [120]`. The test waits for `counter.exists()` at
+  lines 1868–1874, then immediately reads bytes. A shell's file creation can
+  precede its `printf x` write, matching the observed empty-file race. This
+  is runtime synchronization, not a generated/cached workspace input.
+- `root_without_a_project_watcher_watches_its_config_files_itself` failed
+  after 11.046 seconds with `no reload was requested by the watch` at
+  `crates/aft/src/config_live_tests.rs:602`. It writes a temporary runtime
+  config and waits up to 10 seconds for a watch event; the exact reason the
+  event was absent on that runner is not established. It does not directly
+  consume a cached build artifact.
+
+These are suspected runtime flakes, not silently fixed, retried away or
+removed. Failed shards stopped early (136/2064 and 939/2111 libtests ran),
+so their reduced durations are **not** speedup evidence for full inventories.
+`scope_revocation_live_new_epoch_holds_group` also failed in the Linux and
+macOS gates of control run 38543321218 and recent baseline runs; its separate
+main fix is outside this change. These existing failures keep the full
+workflow red even where the cache/compile changes are independently verified.
+
+### D: binary-owned per-commit provenance
+
+`crates/aft/build.rs` deliberately watches Git refs and emits the exact
+checkout SHA. Previously `launch_nonce.rs` consumed that value with
+`option_env!` inside the large library, making even a workflow-only commit a
+new library compiler-cache input. D moves the macro use to `main.rs`, which
+hands the validated revision to a set-once library declaration before CLI
+handling or HELLO. The build script and package layout are unchanged.
+
+An embedder/test process that never runs binary startup reports no SHA, as a
+build without the emitted env would; an already reported unknown identity
+cannot later be upgraded. The shipped binary still reports the actual SHA.
+The existing unit test's assertion of a compiled library SHA is intentionally
+changed to the new unknown-without-startup contract, and is defended by new
+set-once/unknown tests plus the real-binary HELLO test's stronger exact-SHA
+assertion. All nonce source/value checks and child-environment scrubbing are
+retained.
+
+Before/after binaries built at the **same HEAD**
+`907a7092cfb4b68a6e9b4f2d108f0f48879c4cd3` both emitted:
+
+```text
+aft 0.59.0
+{"build_git_sha":"907a7092cfb4b68a6e9b4f2d108f0f48879c4cd3","wire_crate_version":"0.31.0","launch_nonce_source":"fd"}
+```
+
+The same real-binary test asserted the fixed pipe nonce rather than the
+conflicting environment nonce, and clean foreground/background/PTY children,
+in both builds. Neutralizing binary revision initialization made that exact
+test fail with `HELLO build Git SHA`; restoring it passed. A source fence
+finds any library `env!`/`option_env!` read of an emitted build-script value,
+and is now run early in the existing Linux unit job. Reintroducing the Git
+macro in the library made only that fence test fail.
+
+This is **sccache reuse**, not a claim of Cargo `Fresh`: Cargo still invokes
+rustc after the package's Git-sensitive build script runs. A small Cargo 1.99
+probe demonstrated that merely moving macro consumption does not suppress
+that Cargo invocation. Library dep-info and cache-decision logs from two
+commits with identical Rust source must establish the actual cache hit; the
+search-quality producer reports per-library before/after sccache integer
+counters in its ordinary job log for this measurement. Raw compiler debug
+logs/environments are not published, because they may contain cache-service
+credentials. None of the ranking/routing source paths registered in
+`benchmarks/aft-search/search_quality_lib.py:RANKING_FENCE_PREFIXES` is edited;
+this experiment changes compilation/provenance, not query ranking policy.

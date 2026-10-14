@@ -144,6 +144,11 @@ jobs:
       - name: Bun lint
         run: bun run lint
 
+      - name: CI workflow and compiler-cache invariant guards
+        run: |
+          python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
+
 
       # The publish job refuses a package.json shape this validator rejects,
       # and a shape change lands on main days before anyone tags. Running it
