@@ -743,9 +743,19 @@ async fn worker_jail_spawns_with_dangling_socket_deny() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn worker_jail_commits_and_deletes_packed_ref_without_errors() {
+async fn worker_jail_commits_and_deletes_packed_ref_preserving_config() {
     let mut jail = Jail::start().await;
     git(&jail.main, &["branch", "packed-delete", "work"]);
+    // Give branch deletion a real config section to remove if writes become
+    // possible, so the unchanged-bytes assertion also detects weakened policy.
+    git(
+        &jail.main,
+        &[
+            "config",
+            "branch.packed-delete.description",
+            "protected branch config",
+        ],
+    );
     git(&jail.main, &["pack-refs", "--all"]);
     let common = jail.main.join(".git");
     let packed = std::fs::read_to_string(common.join("packed-refs")).unwrap();
@@ -761,15 +771,40 @@ async fn worker_jail_commits_and_deletes_packed_ref_without_errors() {
     assert!(!committed.contains("error:"), "{committed}");
     assert!(!committed.contains("fatal:"), "{committed}");
     assert!(git(&jail.main, &["log", "-1", "--format=%s", "work"]).contains("packed-probe"));
+    let config = common.join("config");
+    let config_before = std::fs::read(&config).unwrap();
     let deleted = jail
-        .bash(&format!(
-            "cd {} && git branch -D packed-delete && echo PACKED_DELETE_$((1+1))",
-            quote(&jail.worktree),
-        ))
+        .tool_reply(
+            "bash",
+            json!({
+                "command": format!(
+                    "cd {} && git branch -D packed-delete && echo PACKED_DELETE_$((1+1))",
+                    quote(&jail.worktree),
+                ),
+                "timeout": 300_000,
+            }),
+        )
         .await;
-    assert!(deleted.contains("PACKED_DELETE_2"), "{deleted}");
-    assert!(!deleted.contains("error:"), "{deleted}");
-    assert!(!deleted.contains("fatal:"), "{deleted}");
+    let result = &deleted["structuredContent"];
+    assert_eq!(result["success"].as_bool(), Some(true), "{deleted}");
+    assert_eq!(result["status"].as_str(), Some("completed"), "{deleted}");
+    assert_eq!(result["exit_code"].as_i64(), Some(0), "{deleted}");
+    let output = result["output"].as_str().expect("completed bash output");
+    assert!(
+        output.lines().any(|line| line.trim() == "PACKED_DELETE_2"),
+        "{deleted}"
+    );
+    // Git deletes the ref before trying to remove its branch config section.
+    // Shared config stays read-only so a worker cannot redirect core.hooksPath
+    // and bypass hooks; tolerate only that exact lock error/warning pair.
+    packed_ref_delete_diagnostics(output, &config)
+        .unwrap_or_else(|error| panic!("{error}\n{deleted}"));
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        config_before,
+        "shared config changed during deletion"
+    );
+    assert!(!common.join("refs/heads/packed-delete").exists());
     let absent = Command::new("git")
         .current_dir(&jail.main)
         .args([
@@ -784,6 +819,111 @@ async fn worker_jail_commits_and_deletes_packed_ref_without_errors() {
     let packed = std::fs::read_to_string(common.join("packed-refs")).unwrap();
     assert!(!packed.contains(" refs/heads/packed-delete\n"));
     assert!(!common.join("packed-refs.lock").exists());
+    assert!(!common.join("packed-refs.new").exists());
+}
+
+fn packed_ref_delete_diagnostics(output: &str, config: &Path) -> Result<(), String> {
+    let expected_error = format!("error: could not lock config file {}", config.display());
+    let expected_warning = "warning: update of config-file failed";
+    let mut errors = 0;
+    let mut warnings = 0;
+    for line in output.lines().map(str::trim) {
+        if line == expected_error {
+            errors += 1;
+        } else if line == expected_warning {
+            warnings += 1;
+        } else if line.contains("error:") || line.contains("fatal:") || line.contains("warning:") {
+            return Err(format!("unexpected branch-delete diagnostic: {line}"));
+        }
+    }
+    if errors != warnings || errors > 1 {
+        return Err(format!("expected no diagnostics or one config-lock error/warning pair, got {errors} errors and {warnings} warnings"));
+    }
+    Ok(())
+}
+
+#[test]
+fn packed_ref_delete_diagnostics_accepts_only_the_config_lock_pair_or_no_diagnostics() {
+    let config = Path::new("/fixture/main/.git/config");
+    assert!(packed_ref_delete_diagnostics(
+        "Deleted branch packed-delete\nPACKED_DELETE_2\n",
+        config
+    )
+    .is_ok());
+    let output = format!("Deleted branch packed-delete\nerror: could not lock config file {}\nwarning: update of config-file failed\nPACKED_DELETE_2\n", config.display());
+    assert!(packed_ref_delete_diagnostics(&output, config).is_ok());
+}
+
+#[test]
+fn packed_ref_delete_diagnostics_rejects_other_errors_and_incomplete_pairs() {
+    let config = Path::new("/fixture/main/.git/config");
+    let error = format!("error: could not lock config file {}", config.display());
+    let warning = "warning: update of config-file failed";
+    let pair = format!("{error}\n{warning}\n");
+    for output in [
+        error.clone(),
+        warning.to_string(),
+        format!("{pair}{pair}"),
+        format!("{pair}error: unable to create file /fixture/main/.git/packed-refs.new: Operation not permitted\n"),
+        format!("{pair}fatal: failed to delete packed ref\n"),
+        format!("{pair}warning: another warning\n"),
+        format!("{error}: Operation not permitted\n{warning}\n"),
+        format!("error: could not lock config file /other/.git/config\n{warning}\n"),
+    ] {
+        assert!(packed_ref_delete_diagnostics(&output, config).is_err(), "unexpected diagnostics were accepted: {output}");
+    }
+}
+
+#[test]
+fn packed_ref_delete_writable_config_control_removes_seeded_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let main = base.join("main");
+    let worktree = base.join("worktree");
+    std::fs::create_dir(&main).unwrap();
+    git(&main, &["init", "--quiet"]);
+    git(
+        &main,
+        &["commit", "--allow-empty", "--quiet", "-m", "fixture"],
+    );
+    git(&main, &["branch", "packed-delete", "HEAD"]);
+    git(
+        &main,
+        &[
+            "config",
+            "branch.packed-delete.description",
+            "protected branch config",
+        ],
+    );
+    git(&main, &["pack-refs", "--all"]);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let common = main.join(".git");
+    let config_before = std::fs::read(common.join("config")).unwrap();
+    assert!(std::fs::read_to_string(common.join("packed-refs"))
+        .unwrap()
+        .contains(" refs/heads/packed-delete\n"));
+    assert!(!common.join("refs/heads/packed-delete").exists());
+    git(&worktree, &["branch", "-D", "packed-delete"]);
+    let config_after = std::fs::read(common.join("config")).unwrap();
+    assert_ne!(
+        config_after, config_before,
+        "writable config control must change the protected bytes"
+    );
+    assert!(!String::from_utf8(config_after)
+        .unwrap()
+        .contains("[branch \"packed-delete\"]"));
+    assert!(!std::fs::read_to_string(common.join("packed-refs"))
+        .unwrap()
+        .contains(" refs/heads/packed-delete\n"));
 }
 
 fn native_available() -> bool {
