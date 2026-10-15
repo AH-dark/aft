@@ -706,6 +706,7 @@ mod a03_tests {
             edit::A03_LINE_INDEX_PASSES.with(|counter| counter.set(0));
             let response = resolve_edit(
                 &source,
+                &edit::LineOffsets::new(&source),
                 &serde_json::json!({"match": "TARGET", "replacement": "x"}),
                 0,
                 "a03",
@@ -782,6 +783,7 @@ mod a03_tests {
         assert!(response.success, "{:?}", response);
         let mut frozen = resolve_edit(
             source,
+            &edit::LineOffsets::new(source),
             &serde_json::json!({"match": "TARGET\nNEXT", "replacement": "é"}),
             0,
             "golden",

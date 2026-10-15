@@ -260,6 +260,34 @@ mod audit_regressions {
     use super::*;
 
     #[test]
+    fn binary_write_reuses_observed_backup_and_restores_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.txt");
+        let original = [0xff, 0xfe, b'\n'];
+        std::fs::write(&path, original).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        crate::backup::reset_capture_read_count(&path);
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "binary-undo", "command": "write", "file": path, "content": "after"
+        }))
+        .unwrap();
+        let response = handle_write(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        assert_eq!(crate::backup::capture_read_count(&path), 1);
+        let mut store = ctx.backup().lock();
+        let history = store.history(request.session(), &path);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content_bytes.as_ref(), original);
+        store.record_post_mutation_states();
+        store.restore_last_operation(request.session()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
     fn binary_write_of_empty_content_is_not_a_noop() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("binary.txt");
