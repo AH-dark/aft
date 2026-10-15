@@ -9,7 +9,6 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
             project_root: Some(root.as_path().into()),
             storage_dir: Some(dir.path().join("storage")),
             sandbox: crate::config::SandboxConfig {
-                enabled: false,
                 ..Default::default()
             },
             ..Default::default()
@@ -118,7 +117,6 @@ fn cancel_test_context(root: &ProjectRootId, storage: &Path) -> Arc<AppContext> 
             project_root: Some(root.as_path().into()),
             storage_dir: Some(storage.into()),
             sandbox: crate::config::SandboxConfig {
-                enabled: false,
                 ..Default::default()
             },
             ..Default::default()
@@ -371,7 +369,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.as_path().into());
     config.storage_dir = Some(dir.path().join("storage"));
-    config.sandbox.enabled = false;
+    config.sandbox.profile.head = crate::config::SandboxMode::Off;
     config.bash.worker_wait_max_ms = 1_000;
     let ctx = Arc::new(AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),

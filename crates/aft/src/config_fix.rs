@@ -152,6 +152,18 @@ fn migrate_block(
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let label = block_label(prefix);
+    if let Some(profile) = translated
+        .get("sandbox")
+        .and_then(|sandbox| sandbox.get("profile"))
+    {
+        if raw
+            .get("sandbox")
+            .and_then(|sandbox| sandbox.get("profile"))
+            != Some(profile)
+        {
+            doc.set(&path_of(prefix, &["sandbox", "profile"]), profile)?;
+        }
+    }
 
     // Registration: materialize the translated list when it differs from
     // what the block spells out (aliases canonicalized, generated disables).

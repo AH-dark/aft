@@ -844,7 +844,13 @@ pub(crate) fn spawn(
         let worktree_root = project_root.as_deref().unwrap_or(&workdir);
         crate::agent_child_env::inject_worker_test_threads(worktree_root, &mut env);
     }
-    crate::sandbox_spawn::apply_worker_jail_environment(&mut env);
+    crate::sandbox_spawn::apply_worker_jail_environment(
+        &mut env,
+        crate::sandbox_spawn::effective_sandbox_mode(
+            ctx,
+            &crate::sandbox_spawn::current_authenticated_principal(),
+        ),
+    );
     #[cfg(target_os = "linux")]
     if !pty && config.bash.linux_scope {
         env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
@@ -876,7 +882,7 @@ pub(crate) fn spawn(
                     request_id,
                     "sandbox_unavailable",
                     format!(
-                        "native sandbox failed to create the task artifact directory: {error}; set sandbox.enabled=false to disable native sandboxing"
+                        "native sandbox failed to create the task artifact directory: {error}; select sandbox.profile off to disable native sandboxing"
                     ),
                 );
             }
@@ -1073,7 +1079,7 @@ pub(crate) fn spawn(
                     request_id,
                     "sandbox_unavailable",
                     format!(
-                        "native sandbox failed before command execution: {message}; set sandbox.enabled=false to disable native sandboxing"
+                        "native sandbox failed before command execution: {message}; select sandbox.profile off to disable native sandboxing"
                     ),
                 )
             } else {

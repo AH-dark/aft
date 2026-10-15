@@ -256,7 +256,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     #[cfg(not(unix))]
     let host_escalation: Option<crate::sandbox_spawn::HostEscalationAttempt> = None;
     #[cfg(unix)]
-    if host_requested && ctx.config().sandbox.enabled {
+    if host_requested && crate::sandbox_spawn::sandbox_required(ctx) {
         let configured_root = ctx
             .config()
             .project_root
@@ -337,8 +337,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     }
-    let native_report_only =
-        crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal) && host_escalation.is_none();
+    // Untrusted routes keep the shell permission asks even though strict now
+    // confines them. An off-profile worker uses the launcher only for its
+    // environment and temp directory, not as a replacement for those asks.
+    let native_report_only = crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal)
+        && crate::sandbox_spawn::effective_sandbox_mode(ctx, &principal)
+            != crate::config::SandboxMode::Off
+        && !crate::sandbox_spawn::principal_requires_strict(&principal)
+        && host_escalation.is_none();
     // The bash scanner parses POSIX grammar and must not treat PowerShell
     // syntax as understood. PowerShell therefore takes an explicit, per-command
     // approval path instead of a potentially unsafe rewrite or auto-allow.
@@ -626,7 +632,7 @@ mod tests {
             config.storage_dir = Some(storage.path().into());
             config.remote_exec.enabled = enabled;
             config.bash.runon_enabled = true;
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
             let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
             let marker = root.path().join("must-not-run-locally");
             let req = RawRequest {
@@ -1682,7 +1688,9 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let ctx = spawn_test_context(project.path(), storage.path());
-        ctx.update_config(|config| config.sandbox.enabled = true);
+        ctx.update_config(|config| {
+            config.sandbox.profile.head = crate::config::SandboxMode::Strict
+        });
         crate::sandbox_spawn::install_sandbox_spawn_test_seam(project.path().to_path_buf());
         let mut request = spawn_test_request("host-ask", "printf 'exact  value'", false);
         request.params["params"]["sandbox"] = json!("host");
@@ -1863,7 +1871,7 @@ mod tests {
         std::fs::write(&file, "must-not-be-read").unwrap();
         let ctx = spawn_test_context(project.path(), storage.path());
         ctx.update_config(|config| {
-            config.sandbox.enabled = true;
+            config.sandbox.profile.head = crate::config::SandboxMode::Strict;
             config.experimental_bash_rewrite = true;
         });
         install_sandbox_spawn_test_seam(project.path().to_path_buf());
@@ -1881,7 +1889,7 @@ mod tests {
         assert_eq!(response.data["code"], "sandbox_unavailable");
         assert_eq!(
             response.data["message"],
-            "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
         );
         assert!(observations.is_empty(), "no child spawn may be resolved");
     }
@@ -2103,7 +2111,7 @@ exec "$@"
         let storage = tempfile::tempdir().unwrap();
         let ctx = spawn_test_context(project.path(), storage.path());
         ctx.update_config(|config| {
-            config.sandbox.enabled = true;
+            config.sandbox.profile.head = crate::config::SandboxMode::Strict;
             config.bash_permissions = true;
         });
         install_sandbox_spawn_test_seam(project.path().to_path_buf());

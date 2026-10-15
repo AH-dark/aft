@@ -327,6 +327,9 @@ fn write_failure_fd(fd: RawFd) -> std::io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
+    if profile.mode == aft::config::SandboxMode::Off {
+        return Ok(());
+    }
     seatbelt::apply(profile).map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to apply Seatbelt profile: {error}"))
     })
@@ -334,6 +337,9 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
 
 #[cfg(target_os = "linux")]
 fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
+    if profile.mode == aft::config::SandboxMode::Off {
+        return Ok(());
+    }
     let applied = landlock_backend::apply(profile).map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to apply Landlock ruleset: {error}"))
     })?;
@@ -343,6 +349,26 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
 
 #[cfg(target_os = "linux")]
 fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::AppliedLandlock) {
+    if profile.mode == aft::config::SandboxMode::Relaxed {
+        let mut denies = Vec::new();
+        for path in profile.read_deny.iter().chain(&profile.data_policy.deny) {
+            denies.push(format!("read:{}", path.display()));
+        }
+        for path in profile
+            .write_deny
+            .iter()
+            .chain(&profile.write_deny_nested)
+            .chain(&profile.data_policy.deny)
+        {
+            denies.push(format!("write:{}", path.display()));
+        }
+        for path in &profile.deny_prefixes {
+            denies.push(format!("read:{}*", path.display()));
+            denies.push(format!("write:{}*", path.display()));
+        }
+        eprintln!("sandbox-launch: profile=relaxed unenforced=[{}] (Landlock cannot subtract denies from default-allow root grants)", denies.join(","));
+        return;
+    }
     let write_roots = profile.write_allow_roots();
     let mut unenforced = Vec::new();
     if profile

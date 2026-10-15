@@ -52,7 +52,7 @@ fn context_with_switch(
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
     config.experimental_bash_background = true;
-    config.sandbox.enabled = false;
+    config.sandbox.profile.head = crate::config::SandboxMode::Off;
     config.remote_exec.enabled = enabled;
     config.bash.runon_enabled = runon_enabled;
     config.semantic.subc_connection_file = connection;
@@ -1079,7 +1079,7 @@ fn worker_catalog_offers_runon_only_with_an_enabled_frozen_plan() {
     let mut off = crate::config::Config::default();
     off.project_root = Some(root.path().into());
     off.storage_dir = Some(storage.path().into());
-    off.sandbox.enabled = false;
+    off.sandbox.profile.head = crate::config::SandboxMode::Off;
     off.remote_exec.project_off = true;
     let off_ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), off);
     off_ctx.set_db(Arc::new(StdMutex::new(

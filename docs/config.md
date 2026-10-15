@@ -417,10 +417,10 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "max_file_size": 67108864
   },
 
-  // Native sandbox for first-party bash and PTY commands. Default: false.
+  // Shell profiles by role; untrusted routes always use strict.
   "sandbox": {
-    "enabled": false,
-    // Additional writable roots. User config only.
+    "profile": { "worker": "relaxed", "head": "off" },
+    // Additional strict-profile writable roots. User config only.
     "write_allow": [],
     // Additional paths to hide from sandboxed commands.
     "read_deny": []
@@ -565,42 +565,66 @@ Both keys are honored only in user config. A project config may set `remote_exec
 
 ## Native command sandbox
 
-Set `sandbox.enabled` to route first-party bash and PTY commands through Seatbelt on macOS or Landlock on Linux. Unsupported platforms, unavailable kernels, Landlock ABIs below V3, invalid profiles, and policies that cannot preserve the credential floor fail closed with a structured `sandbox_unavailable` response. Sandboxed commands receive a private task temporary directory through `TMPDIR`, `TMP`, and `TEMP`; Linux does not grant the shared `/tmp` tree.
+`sandbox.profile` selects a shell profile by authenticated session role. Put user choices in `~/.config/cortexkit/aft.jsonc` (or the absolute XDG config location):
 
-The mandatory credential floor is `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.azure`, `~/.config/gcloud`, and `~/.config/cortexkit`. Linux canonicalizes these paths and constructs a read allowlist that omits them. A writable project, cache, temporary directory, or `write_allow` path that overlaps this floor is refused because Landlock cannot subtract write rights. Ordinary `read_deny` paths inside writable roots are supported: writes remain allowed while read grants are split around the denied path.
+```jsonc
+{
+  "sandbox": {
+    "profile": { "worker": "relaxed", "head": "off" }
+  }
+}
+```
 
-The floor also denies CortexKit's data and state trees (`~/.local/share/cortexkit/` and `~/.local/state/cortexkit/`, plus absolute XDG data/state locations and AFT's resolved storage). The daemon connection file is separately denied wherever the trusted `subc.connection_file` resolves, including outside those trees; `~` and relative settings resolve against HOME. Environment-selected connection files and the default runtime/production connection paths are denied too. These paths hold daemon authentication and other agents' snapshots, output, and undo history, not just the current project's data.
+These are the defaults. Stamped Alfonso workers use `worker`; heads, unstamped routes, standalone invocations and default sessions use `head`. Untrusted binds, including `mcp:*` and unverified principals, always use `strict`, even when both configured roles are `off`. A project may only harden a role (`off` < `relaxed` < `strict`), never loosen the user's choice. Project `read_deny` entries accumulate; `write_allow` is user-only and adds grants to `strict`, not exceptions to `relaxed`'s fixed denies. Live changes apply to new commands; running tasks keep their original profile.
 
-Only the session's project roots and the current task's private temporary directory get read/write exceptions within private trees. Other worktrees, tasks, modules, and state remain hidden. The active `gh` shim directory and its resolved executable, and the active content-keyed managed Git hooks directory, get read/execute access but never write access. Seatbelt excludes these narrow exceptions from the tree denies and allows only ancestor metadata needed for path traversal. Landlock omits the private trees from ordinary read grants and reintroduces the exact exceptions; it does not grant their parents. If a Linux writable grant encompasses a private tree, crosses the connection-file deny, or would make managed executables writable, setup fails closed with `sandbox_unavailable` explaining the overlap. This restructures the allow set rather than attempting an unsupported nested Landlock deny.
+- **`off`** installs no OS sandbox. AFT's file-tool permission asks still apply. Governed `gh`, Git co-author hooks and credential stripping are independent of the OS policy; Unix worker launches retain the short private task temporary directory even with this profile.
+- **`relaxed`** is allow-by-default on macOS, with the fixed denies below. Caches, `~/Library` outside protected paths, `/tmp`, `/var/folders`, Mach services, network access, browsers, Xcode and Unix sockets remain available. Shared compile servers such as sccache and configured rustc wrappers are allowed.
+- **`strict`** retains the existing native jail: writes are limited to the project, private task temp, configured write grants and build caches. Stamped workers additionally get narrowly scoped shared Git metadata and operator-configured build-target grants. Their sccache channels and rustc wrappers remain blocked because a compile server could write outside that jail. Strict's existing secret floor, socket denies and platform limitations are unchanged.
 
-Background stdout/stderr and exit markers use descriptors opened before confinement. Native launches already disable path-based pipeline-status capture, so the shell needs no path grant to the capture files or the whole `io/` directory. Only the private temporary directory beneath `io/` is readable/writable. Linux also retains the existing exact read grants for the daemon-verified command, wrapper, and environment payload files, never their control-directory parent. `gh --status` still executes through the shim, but reports unavailable private state rather than receiving a state-directory exception.
+Sandboxed commands receive `/private/tmp/aft-w/<hex>` on macOS (`/tmp/aft-w/<hex>` on Linux) through `TMPDIR`, `TMP` and `TEMP`. The AFT-managed `gh` shim (the command wrapper that routes GitHub operations through AFT's permission checks) stays first on the command PATH, Git co-author hooks still run, and child environments do not inherit daemon credentials.
 
-| Protection | macOS Seatbelt | Linux Landlock |
-| --- | --- | --- |
-| Credential floor reads and writes | Denied | Denied by omission; overlapping writable roots are refused |
-| CortexKit data/state and daemon connection file | Denied except exact project/task temp and read-only managed executables | Denied by omission with the same exact exceptions; unrepresentable writable overlaps are refused |
-| Project, cache, and private task-temp access | Read/write | Read/write |
-| Other existing HOME children | Readable; HOME remains unwritable | Readable only when present at launch; new children are denied until the next launch |
-| System files | Readable; unwritable | Curated read-only roots; `/proc` is readable, `/sys` is limited, `/run/user`, `/var/run`, `/dev/shm`, `/dev/kmsg`, and shared `/tmp` are omitted |
-| Git metadata | Writable so `git add` and `git commit` work | Writable inside project roots |
-| Resolved Git hooks, including linked-worktree and `core.hooksPath` locations | Read/write denied after the project allow rule | Read denied; writes inside a writable project remain allowed |
-| Nested `.cortexkit` writes | Denied | Not enforceable inside a writable project |
-| Unix-domain socket connections such as Docker and SSH agent sockets | Denied by path | Not mediated; connections remain allowed |
-| TCP, UDP, DNS, and raw sockets | Open | Open |
-| Unsupported native platform | `sandbox_unavailable` | `sandbox_unavailable` |
+**macOS setuid limitation:** Seatbelt refuses to execute setuid tools, including `/bin/ps` and `top`, even with an allow-default profile. `pgrep` and `pkill` work in sandboxed shells. Select `off` when a command genuinely needs `ps`; AFT does not add an unsandboxed-exec exception or copy platform binaries to evade this restriction.
 
-On Linux, the existing repository-hook read denial requires granting project reads per child present at launch, rather than granting the complete project root. Within one sandboxed command, files newly created at the project root after launch cannot be read, even though they can be written. A subsequent command recomputes the read grants and can read those files. This is a pre-existing Landlock limitation of the nested `.git/hooks` read deny, not a denial of the session's worktree by the CortexKit data floor. macOS does not have this limitation.
+### Relaxed deny list (macOS)
 
-### Linux guarantee boundary
+Read and write protection covers:
 
-The Linux guarantee applies to canonical paths without pre-existing aliases into a granted tree. Granted project, cache, task, and system trees are treated as trusted content. The following limitations are deliberate and surfaced honestly:
+- `~/.ssh`, `~/.gnupg`, `~/Library/Keychains`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, `~/.config/gh`, `~/.netrc`, `~/.docker/config.json`, `~/.npmrc`, `~/.pypirc` and `~/.cargo/credentials*` (including future filename suffixes).
+- CortexKit config, data and state: `~/.config/cortexkit`, `~/.local/share/cortexkit`, `~/.local/state/cortexkit`, their absolute XDG equivalents, AFT's resolved storage and the session store. This includes other agents' private stores. Daemon connection files selected through trusted configuration, `SUBC_CONNECTION_FILE`, `XDG_RUNTIME_DIR/subc-connection.json` and the production runtime path are protected even outside those trees. User `sandbox.read_deny` paths are protected as well.
 
-- Landlock rules are additive, so nested write-denies under a writable project cannot protect `.git/hooks` or `.cortexkit`. The launcher handles and grants `REFER` only with writable-root rules, which keeps normal in-project renames working and rejects creation of a hard link that would widen access to a denied secret. A pre-existing hard link inside a granted tree remains readable or writable through that alias.
-- Landlock does not mediate `AF_UNIX` connects. Docker sockets, `SSH_AUTH_SOCK`, and other pathname Unix sockets can still be reached when normal filesystem permissions allow it.
-- Pre-existing bind mounts, case-insensitive filesystem aliases, and overlayfs aliases can expose an object through a granted path. These alias classes are outside the canonical-path guarantee.
-- `/proc` is granted wholesale for process and toolchain compatibility. With Yama `ptrace_scope=0`, another same-UID process may expose `/proc/<pid>/environ`, `maps`, or `mem`. Missing, unreadable, or unparseable Yama configuration is treated conservatively as exposed and produces a warning. Yama does not cover every `/proc` surface.
+Private-store read exceptions are the checkout pool (so sibling checkout reads work), the current checkout and task I/O/temp, placed CortexKit binaries (`~/.local/share/cortexkit/bin` and the XDG equivalent), and the exact shim executable, `<storage>/shims`, content-keyed Git hook directory, and Git-resolved metadata/hook paths. AFT storage defaults to `<XDG_DATA_HOME>/cortexkit/aft` or `~/.local/share/cortexkit/aft`; [storage overrides](#storage-root-environment-override) can relocate it. The session store is the task directory under `<storage>/bash-tasks/<session-hash>`. These exceptions do not expose other agents' stores.
 
-Compared with Codex's default sandbox, AFT is stricter about credential reads: Codex workspace-write can read the host filesystem, including HOME secrets. Codex is stricter about network access and repository metadata: its default disables network access and keeps `.git` read-only, while AFT deliberately leaves the network open and permits Git metadata writes. Neither posture should be described as uniformly stricter.
+Additional write denies cover:
+
+- `~/Work` and the Alfonso worktree pool, except the current checkout and the narrow shared Git object/ref/log/packed-ref grants needed for commits and branch deletion. Registered main and sibling worktrees outside those trees are also protected. This is a known-checkout boundary: a previously unknown, unrelated checkout outside these locations is not discovered by a filesystem-wide scan.
+- CortexKit config/data/state and AFT storage, except the current checkout and the current task's AFT-owned I/O/temp/scratch. Managed shim and hook executables remain immutable.
+- `~/.zshrc`, `~/.zprofile`, `~/.bashrc`, `~/.profile`, `~/.gitconfig`, `~/.config/git` and `~/Library/LaunchAgents`.
+- The repository's Git `config`, linked `config.worktree`, default and effective hooks directories, core's hook stubs, and the resolved `mason.originalHooksPath` target. Git binding files and executable project policy (`.cortexkit/aft.jsonc`, `.cortexkit/aft/filters`) remain protected too.
+
+Deny targets are re-canonicalized at launch, including missing/dangling targets; relaxed also retains alias paths and matches ASCII case aliases for protected names on case-insensitive volumes. Write protection includes replacing enclosing governance directories, not just overwriting their files.
+
+### Linux and Windows guarantee boundary
+
+**Linux `relaxed` does not enforce these denies.** Landlock grants are additive: root-wide read/write grants cannot subtract a credential, sibling checkout, config file or hooks subtree. To preserve default-allow semantics, relaxed grants broad access and prints every unenforced read and write deny by path, including the `~/.cargo/credentials*` filename prefix, in `sandbox-launch: profile=relaxed unenforced=[...]`. It must not be treated as a secret or write boundary on Linux. No extra sandbox dependency is installed.
+
+Linux `strict` retains the existing Landlock allowlist and requires ABI V3 or newer. Invalid profiles, unavailable kernels and writable grants that overlap mandatory credential/private-store denies fail closed with `sandbox_unavailable`: Landlock cannot subtract those secrets from a writable parent. The strict guarantee applies to canonical paths without pre-existing aliases into a granted tree:
+
+- Nested write denies inside writable roots cannot protect `.git/hooks`, `config.worktree` or `.cortexkit`; each limitation is reported. `REFER` is granted only with writable roots to prevent newly created hard links from widening access. Pre-existing hard links, bind mounts, case-insensitive/overlay aliases and pre-opened descriptors remain outside this guarantee.
+- Unix-domain socket connects are not mediated. TCP/DNS remain open; strict's default/operator-selected sccache loopback ports are reported as unenforced because blocking only those destinations would require restricting all other ports too.
+- Project reads may be split around nested denies using children present at launch. Newly created root-level files may remain unreadable until the next command recomputes grants. Shared `/tmp` and sensitive runtime trees are not granted by strict.
+- `/proc` is readable for tooling. With Yama `ptrace_scope=0`, another same-UID process can expose environment or memory; missing/unreadable Yama configuration produces a conservative exposure warning.
+
+Windows has no OS sandbox backend. Profiles still resolve; selecting `relaxed` or `strict` refuses execution with `sandbox_unavailable` and names the profile as **not enforced on Windows**. `off` runs without an OS sandbox.
+
+### Retired `sandbox.enabled`
+
+Loading translates this retired key in memory, and `doctor --fix` uses the same translation while preserving JSONC comments and unrelated keys. User config can be automatically migrated with a backup; shared project config is not rewritten automatically.
+
+- `true` becomes `{ "worker": "strict", "head": "strict" }`.
+- `false` (or an absent key) uses the new defaults, `{ "worker": "relaxed", "head": "off" }`.
+- Explicit `sandbox.profile` role values take precedence over the legacy boolean.
+
+Heads previously ran without an OS sandbox unless `sandbox.enabled: true` was set. Thus default head `off` preserves default head behavior, while the translation preserves confinement for explicit `true`. The old boolean never controlled the forced stamped-worker jail; explicit `false` does **not** pin workers to strict after this cutover.
 
 ## Config schema migration
 

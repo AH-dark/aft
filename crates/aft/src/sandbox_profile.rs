@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-pub const SANDBOX_PROFILE_VERSION: u32 = 5;
+pub const SANDBOX_PROFILE_VERSION: u32 = 6;
 
 /// Private stores with narrowly scoped exceptions. These exceptions apply only
 /// to these trees, never to the credential floor or user-supplied read denies.
@@ -21,13 +21,22 @@ pub struct SandboxDataPolicy {
 }
 
 impl SandboxDataPolicy {
-    fn canonicalize(self, exact_files: &[PathBuf]) -> Result<Self, SandboxProfileError> {
+    fn canonicalize(
+        self,
+        exact_files: &[PathBuf],
+        preserve_aliases: bool,
+    ) -> Result<Self, SandboxProfileError> {
         for path in &self.read_metadata_allow {
             validate_absolute(path, "data_policy.read_metadata_allow")?;
             validate_normalized(path, "data_policy.read_metadata_allow")?;
         }
         Ok(Self {
-            deny: canonicalize_optional_paths(self.deny, "data_policy.deny", &mut HashMap::new())?,
+            deny: canonicalize_denies(
+                self.deny,
+                "data_policy.deny",
+                &mut HashMap::new(),
+                preserve_aliases,
+            )?,
             read_allow: canonicalize_data_allows(
                 self.read_allow,
                 exact_files,
@@ -81,6 +90,12 @@ impl SandboxDataPolicy {
 pub struct SandboxProfile {
     pub v: u32,
     #[serde(default)]
+    pub mode: crate::config::SandboxMode,
+    /// Deny reads and writes to credential filenames starting with these paths
+    /// (for example ~/.cargo/credentials.toml), including future suffixes.
+    #[serde(default)]
+    pub deny_prefixes: Vec<PathBuf>,
+    #[serde(default)]
     pub data_policy: SandboxDataPolicy,
     pub writable_roots: Vec<PathBuf>,
     /// Single files that may be written or created, without making their
@@ -132,6 +147,8 @@ impl SandboxProfile {
         let mut deny_paths = HashMap::new();
         Ok(Self {
             v: SANDBOX_PROFILE_VERSION,
+            mode: crate::config::SandboxMode::Strict,
+            deny_prefixes: Vec::new(),
             data_policy: SandboxDataPolicy::default(),
             writable_roots: canonicalize_required_dirs(writable_roots, "writable_roots")?,
             writable_files: Vec::new(),
@@ -166,27 +183,44 @@ impl SandboxProfile {
         }
 
         let mut deny_paths = HashMap::new();
+        let preserve_aliases = self.mode == crate::config::SandboxMode::Relaxed;
         let writable_files = canonicalize_files(self.writable_files, "writable_files")?;
         let (read_allow, read_allow_listed) =
             canonicalize_read_grants(self.read_allow, self.read_allow_listed, &writable_files)?;
         Ok(Self {
             v: self.v,
-            data_policy: self.data_policy.canonicalize(&writable_files)?,
+            mode: self.mode,
+            deny_prefixes: canonicalize_denies(
+                self.deny_prefixes,
+                "deny_prefixes",
+                &mut deny_paths,
+                preserve_aliases,
+            )?,
+            data_policy: self
+                .data_policy
+                .canonicalize(&writable_files, preserve_aliases)?,
             writable_roots: canonicalize_required_dirs(self.writable_roots, "writable_roots")?,
             writable_files,
-            write_deny: canonicalize_optional_paths(
+            write_deny: canonicalize_denies(
                 self.write_deny,
                 "write_deny",
                 &mut deny_paths,
+                preserve_aliases,
             )?,
-            write_deny_nested: canonicalize_optional_paths(
+            write_deny_nested: canonicalize_denies(
                 self.write_deny_nested,
                 "write_deny_nested",
                 &mut deny_paths,
+                preserve_aliases,
             )?,
             read_allow,
             read_allow_listed,
-            read_deny: canonicalize_optional_paths(self.read_deny, "read_deny", &mut deny_paths)?,
+            read_deny: canonicalize_denies(
+                self.read_deny,
+                "read_deny",
+                &mut deny_paths,
+                preserve_aliases,
+            )?,
             socket_deny: canonicalize_optional_paths(
                 self.socket_deny,
                 "socket_deny",
@@ -399,6 +433,26 @@ fn canonicalize_read_grants(
     canonical_listed.dedup();
     canonical_listed.retain(|path| !required.contains(path));
     Ok((canonical, canonical_listed))
+}
+
+fn canonicalize_denies(
+    paths: Vec<PathBuf>,
+    field: &str,
+    resolved: &mut HashMap<PathBuf, PathBuf>,
+    preserve_aliases: bool,
+) -> Result<Vec<PathBuf>, SandboxProfileError> {
+    let mut canonical = canonicalize_optional_paths(paths.clone(), field, resolved)?;
+    if preserve_aliases {
+        // Protect the alias as well as its target: replacing a config symlink
+        // must not replace an immutable file with worker-controlled contents.
+        for path in paths {
+            validate_normalized(&path, field)?;
+            canonical.push(path);
+        }
+        canonical.sort_unstable();
+        canonical.dedup();
+    }
+    Ok(canonical)
 }
 
 fn canonicalize_optional_paths(
@@ -706,11 +760,11 @@ mod tests {
             write_allow: vec![lock.clone()],
             read_metadata_allow: Vec::new(),
         }
-        .canonicalize(&[])
+        .canonicalize(&[], false)
         .unwrap();
         let transferred: SandboxDataPolicy =
             serde_json::from_slice(&serde_json::to_vec(&policy).unwrap()).unwrap();
-        let transferred = transferred.canonicalize(&[]).unwrap();
+        let transferred = transferred.canonicalize(&[], false).unwrap();
         assert_eq!(transferred, policy);
         assert!(policy
             .validate_grants([lock.as_path()], &policy.write_allow, &[])
@@ -1198,7 +1252,7 @@ mod tests {
             .expect_err("new launcher must reject a v1 profile");
         assert!(error
             .to_string()
-            .contains("unsupported sandbox profile version 1; expected 5"));
+            .contains("unsupported sandbox profile version 1; expected 6"));
 
         let current = SandboxProfile::build(
             vec![root.clone()],
@@ -1217,12 +1271,12 @@ mod tests {
             .canonicalize_for_launch()
             .unwrap_err()
             .to_string()
-            .contains("unsupported sandbox profile version 4; expected 5"));
+            .contains("unsupported sandbox profile version 4; expected 6"));
         let error = serde_json::from_value::<LegacyProfile>(
             serde_json::to_value(current).expect("serialize current profile"),
         )
         .expect_err("v1 launcher shape must reject the current profile fields");
-        assert!(error.to_string().contains("unknown field `data_policy`"));
+        assert!(error.to_string().contains("unknown field `mode`"));
     }
 
     #[test]
@@ -1231,6 +1285,8 @@ mod tests {
         let root = root.path().canonicalize().expect("canonical root");
         let profile = SandboxProfile {
             v: SANDBOX_PROFILE_VERSION,
+            mode: crate::config::SandboxMode::Strict,
+            deny_prefixes: Vec::new(),
             data_policy: SandboxDataPolicy::default(),
             writable_roots: vec![root.clone()],
             writable_files: Vec::new(),
@@ -1251,5 +1307,33 @@ mod tests {
         assert_eq!(profile.write_deny_nested, vec![root.join("missing-nested")]);
         assert_eq!(profile.read_deny, vec![root.join("missing-secret")]);
         assert_eq!(profile.socket_deny, vec![root.join("missing.sock")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relaxed_denies_retain_symlink_identity_and_resolved_target() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let target = root.join("operator-config");
+        let alias = root.join("config");
+        std::fs::write(&target, "operator").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![root.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            root,
+        )
+        .unwrap();
+        profile.mode = crate::config::SandboxMode::Relaxed;
+        profile.write_deny.push(alias.clone());
+        let profile = profile.canonicalize_for_launch().unwrap();
+        assert!(profile.write_deny.contains(&alias));
+        assert!(profile.write_deny.contains(&target));
+        assert_eq!(profile.clone().canonicalize_for_launch().unwrap(), profile);
     }
 }

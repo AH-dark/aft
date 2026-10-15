@@ -18547,7 +18547,7 @@ mod tests {
         assert!(!only_lsp_process_state_changed(&previous, &semantic));
 
         let mut sandbox = previous.clone();
-        sandbox.sandbox.enabled = true;
+        sandbox.sandbox.profile.head = crate::config::SandboxMode::Strict;
         sandbox.lsp_paths_extra.push(PathBuf::from("/cache/lsp"));
         assert!(!only_lsp_process_state_changed(&previous, &sandbox));
 

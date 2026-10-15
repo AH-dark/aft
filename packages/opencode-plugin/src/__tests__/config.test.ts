@@ -483,10 +483,35 @@ describe("loadAftConfig", () => {
       base_url: "http://localhost:11434",
       api_key_env: "USER_KEY",
     });
-    expect(config.sandbox).toEqual({ enabled: true, write_allow: ["/tmp/user-write"] });
+    expect(config.sandbox).toEqual({
+      profile: { worker: "strict", head: "strict" },
+      write_allow: ["/tmp/user-write"],
+    });
     expect(result.stderr).toContain(
-      "Ignoring restrict_to_project_root, sandbox.enabled, sandbox.write_allow, subc",
+      "Ignoring restrict_to_project_root, sandbox.profile.worker, sandbox.profile.head, sandbox.write_allow, subc",
     );
+  });
+
+  test("sandbox profiles harden by role without replacing the other user role", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        sandbox: { profile: { worker: "strict" } },
+        harnesses: { opencode: { sandbox: { profile: { head: "relaxed" } } } },
+      }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ sandbox: { profile: { worker: "off", head: "strict" } } }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).sandbox.profile).toEqual({ worker: "strict", head: "strict" });
+    expect(result.stderr).toContain("sandbox.profile.worker");
+    expect(result.stderr).not.toContain("Ignoring sandbox.profile.head");
   });
 
   test("git.co_author uses ordinary project-over-user precedence", () => {

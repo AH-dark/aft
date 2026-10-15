@@ -15,7 +15,10 @@
   },
   "restrict_to_project_root": true,
   "sandbox": {
-    "enabled": true,
+    "profile": {
+      "head": "strict",
+      "worker": "strict"
+    },
     "write_allow": [
       "/tmp/aft-user-write"
     ]

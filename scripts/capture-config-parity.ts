@@ -423,6 +423,30 @@ const CASES: ParityCase[] = [
       },
     },
   },
+  ...(["opencode", "pi"] as const).flatMap((harness) => [
+    {
+      name: `sandbox_profiles_project_loosen_${harness}`,
+      harness,
+      user: { sandbox: { profile: { worker: "strict", head: "relaxed" } } },
+      project: { sandbox: { profile: { worker: "off", head: "off" } } },
+    },
+    {
+      name: `sandbox_profiles_project_harden_${harness}`,
+      harness,
+      user: { sandbox: { profile: { worker: "off", head: "off" } } },
+      project: { sandbox: { profile: { worker: "strict", head: "relaxed" } } },
+    },
+    {
+      name: `sandbox_profiles_user_harness_partial_${harness}`,
+      harness,
+      user: { sandbox: { profile: { worker: "strict" } }, harnesses: { [harness]: { sandbox: { profile: { head: "relaxed" } } } } },
+    },
+    {
+      name: `sandbox_profiles_legacy_false_canonical_${harness}`,
+      harness,
+      user: { sandbox: { enabled: false, profile: { worker: "strict" } } },
+    },
+  ]),
   {
     name: "sandbox_project_deny_only",
     user: {

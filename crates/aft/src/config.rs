@@ -654,15 +654,63 @@ impl Config {
     }
 }
 
+/// Ordered from least to most restrictive for project-tier hardening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxMode {
+    Off,
+    Relaxed,
+    Strict,
+}
+
+impl Default for SandboxMode {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+impl std::fmt::Display for SandboxMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Relaxed => "relaxed",
+            Self::Strict => "strict",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxRoles {
+    pub worker: SandboxMode,
+    pub head: SandboxMode,
+}
+
+impl Default for SandboxRoles {
+    fn default() -> Self {
+        Self {
+            worker: SandboxMode::Relaxed,
+            head: SandboxMode::Off,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SandboxConfig {
-    /// Route first-party bash commands through the native platform sandbox.
-    pub enabled: bool,
+    /// An authenticated Alfonso worker stamp selects worker; heads, standalone
+    /// commands and unstamped first-party routes select head.
+    pub profile: SandboxRoles,
     /// User-approved writable roots in addition to projects, task artifacts, and caches.
     pub write_allow: Vec<PathBuf>,
     /// Extra paths that native backends should deny reading.
     pub read_deny: Vec<PathBuf>,
+}
+
+impl SandboxConfig {
+    pub fn head_enabled(&self) -> bool {
+        self.profile.head != SandboxMode::Off
+    }
 }
 
 /// Whether bash calls may ask to run on the remote build server (`runon`).

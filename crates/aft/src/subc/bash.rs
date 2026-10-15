@@ -2493,7 +2493,7 @@ mod grant_path_tests {
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());
             config.storage_dir = Some(dir.path().join("storage"));
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let marker = dir.path().join("started");
         let release = dir.path().join("release");
@@ -3193,7 +3193,7 @@ mod grant_path_tests {
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());
             config.bash.runon_enabled = true;
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
@@ -3622,7 +3622,7 @@ mod grant_path_tests {
             config.foreground_wait_window_ms = window;
             config.project_root = Some(root.as_path().into());
             config.storage_dir = Some(dir.path().join("storage"));
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
             config.experimental_bash_rewrite = rewrite;
         });
         let executor = Arc::new(Executor::new());
@@ -3741,7 +3741,7 @@ mod grant_path_tests {
             ctx.update_config(|config| {
                 config.foreground_wait_window_ms = 500;
                 config.project_root = Some(root.as_path().into());
-                config.sandbox.enabled = false;
+                config.sandbox.profile.head = crate::config::SandboxMode::Off;
             });
             let executor = Arc::new(Executor::new());
             executor.register_actor(root.clone(), ctx);
@@ -3777,7 +3777,7 @@ mod grant_path_tests {
         ctx.update_config(|config| {
             config.foreground_wait_window_ms = 100;
             config.project_root = Some(root.as_path().into());
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx);
@@ -3809,7 +3809,7 @@ mod grant_path_tests {
             config.foreground_wait_window_ms = 100;
             config.bash.worker_wait_max_ms = 500;
             config.project_root = Some(root.as_path().into());
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
@@ -3849,7 +3849,7 @@ mod grant_path_tests {
             config.foreground_wait_window_ms = 100;
             config.bash.worker_wait_max_ms = 20_000;
             config.project_root = Some(root.as_path().into());
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx);
@@ -3884,7 +3884,7 @@ mod grant_path_tests {
             config.foreground_wait_window_ms = 100;
             config.bash.worker_wait_max_ms = 20_000;
             config.project_root = Some(root.as_path().into());
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx);
@@ -3978,7 +3978,7 @@ mod grant_path_tests {
             ctx.update_config(|config| {
                 config.project_root = Some(root.as_path().into());
                 config.storage_dir = Some(dir.path().join("storage"));
-                config.sandbox.enabled = false;
+                config.sandbox.profile.head = crate::config::SandboxMode::Off;
             });
             let (_tx, rx) = mpsc::channel(1);
             let call = StartupCall { dir, ctx, rx };
@@ -4247,7 +4247,7 @@ mod grant_path_tests {
             config.foreground_wait_window_ms = 2000;
             config.project_root = Some(root.as_path().into());
             config.storage_dir = Some(dir.path().join("storage"));
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
@@ -4310,7 +4310,7 @@ mod grant_path_tests {
             config.foreground_wait_window_ms = 2000;
             config.project_root = Some(root.as_path().into());
             config.storage_dir = Some(dir.path().join("storage"));
-            config.sandbox.enabled = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
         });
         let arguments = json!({"command":"sleep 60", "timeout":60000});
         let call = crate::response_finalize::repeat_breaker::RepeatCall::new("bash", &arguments);

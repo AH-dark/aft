@@ -365,8 +365,13 @@ const BashFeaturesSchema = z.object({
 const BashConfigSchema = z.union([z.boolean(), BashFeaturesSchema]);
 
 const SandboxConfigSchema = z.object({
-  /** Enable native containment for first-party bash and PTY processes. Default: false. */
-  enabled: z.boolean().optional(),
+  /** Project overrides may only harden a role's user-selected profile. */
+  profile: z
+    .object({
+      worker: z.enum(["off", "relaxed", "strict"]).optional(),
+      head: z.enum(["off", "relaxed", "strict"]).optional(),
+    })
+    .optional(),
   /** Additional absolute directories where sandboxed commands may write. User config only. */
   // (write_allow weakens confinement, so it never merges from project tier.)
   write_allow: z.array(z.string()).optional(),
@@ -761,6 +766,11 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const indexes = mergeIndexes(base.indexes, override.indexes, !trusted);
   if (indexes === undefined) delete merged.indexes;
   else merged.indexes = indexes;
+  merged.sandbox = mergeSandboxConfig(base.sandbox, override.sandbox, trusted);
+  if (!trusted && override.sandbox?.write_allow !== undefined) {
+    // Retain the attempted grant until the project-tier warning names it.
+    merged.sandbox = { ...merged.sandbox, write_allow: override.sandbox.write_allow };
+  }
   return merged;
 }
 
@@ -1582,18 +1592,32 @@ function mergeRemoteExecConfig(
   return { ...base, enabled: false, project_off: true };
 }
 
-/** Merge sandbox settings while allowing project tiers to add only read denies or enable containment. */
+/** Projects may add unreadable paths and choose stricter shell profiles, never loosen the user's restrictions. */
 function mergeSandboxConfig(
   base: AftConfig["sandbox"],
   project: AftConfig["sandbox"],
+  trusted = false,
 ): AftConfig["sandbox"] {
-  const readDeny = [...new Set([...(base?.read_deny ?? []), ...(project?.read_deny ?? [])])];
+  if (base === undefined && project === undefined) return undefined;
+  const order = { off: 0, relaxed: 1, strict: 2 };
+  const profile = {
+    worker: base?.profile?.worker ?? "relaxed",
+    head: base?.profile?.head ?? "off",
+  } as const;
+  const next = { ...profile };
+  for (const role of ["worker", "head"] as const) {
+    const requested = project?.profile?.[role];
+    if (requested !== undefined && (trusted || order[requested] >= order[profile[role]]))
+      next[role] = requested;
+  }
+  const readDeny = trusted
+    ? (project?.read_deny ?? base?.read_deny ?? [])
+    : [...new Set([...(base?.read_deny ?? []), ...(project?.read_deny ?? [])])];
   const merged = {
     ...base,
+    ...(trusted ? project : {}),
+    profile: next,
     ...(readDeny.length > 0 ? { read_deny: readDeny } : {}),
-    // A project may ENABLE the sandbox for itself (hardening is one-way);
-    // project enabled:false can never switch off what the user turned on.
-    ...(project?.enabled === true ? { enabled: true } : {}),
   };
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
@@ -1738,7 +1762,7 @@ function mergePiConfig(base?: PiConfig, override?: PiConfig): PiConfig | undefin
   return { ...base, ...override };
 }
 
-function getStrippedTopLevelKeys(override: AftConfig): string[] {
+function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[] {
   const stripped: string[] = [];
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
@@ -1747,9 +1771,13 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.backup?.enabled !== undefined || override.backup?.max_depth !== undefined)
     stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");
-  // enabled:true is an accepted project-tier hardening opt-in; only the
-  // weakening direction (enabled:false) is stripped as user-only.
-  if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
+  const order = { off: 0, relaxed: 1, strict: 2 };
+  for (const role of ["worker", "head"] as const) {
+    const requested = override.sandbox?.profile?.[role];
+    const floor = base.sandbox?.profile?.[role] ?? (role === "worker" ? "relaxed" : "off");
+    if (requested !== undefined && order[requested] < order[floor])
+      stripped.push(`sandbox.profile.${role}`);
+  }
   if (typeof override.bash === "object" && override.bash.disclaim_privacy === false)
     stripped.push("bash.disclaim_privacy");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
@@ -2007,7 +2035,7 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
         `Ignoring ${strippedLspKeys.join(", ")} from project config ${projectConfigPath} (security: these LSP settings only honor user-level config)`,
       );
     }
-    const strippedTopLevelKeys = getStrippedTopLevelKeys(projectConfig);
+    const strippedTopLevelKeys = getStrippedTopLevelKeys(projectConfig, config);
     if (strippedTopLevelKeys.length > 0) {
       warn(
         `Ignoring ${strippedTopLevelKeys.join(", ")} from project config ${projectConfigPath} (security: these settings only honor user-level config — a project should not weaken security boundaries for the user)`,

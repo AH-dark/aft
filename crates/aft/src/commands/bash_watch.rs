@@ -703,7 +703,6 @@ mod tests {
                 harness: Some(Harness::Opencode),
                 experimental_bash_background: true,
                 sandbox: crate::config::SandboxConfig {
-                    enabled: false,
                     ..Default::default()
                 },
                 ..Config::default()

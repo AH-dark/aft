@@ -1264,7 +1264,12 @@ fn jail_context(root: &Path, sandbox: bool) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.to_path_buf());
     config.storage_dir = Some(root.join(".store"));
-    config.sandbox.enabled = sandbox;
+    config.sandbox.profile.worker = crate::config::SandboxMode::Strict;
+    config.sandbox.profile.head = if sandbox {
+        crate::config::SandboxMode::Strict
+    } else {
+        crate::config::SandboxMode::Off
+    };
     AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
@@ -1301,7 +1306,7 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
         SpawnPlan::Unsandboxed
     ));
     with_worker_jail(true, || {
-        // The jail forces the native sandbox even with sandbox.enabled off;
+        // The strict worker profile is independent of the head profile;
         // where it cannot be built the shell is refused by name.
         let native = resolve(RequestedSandboxTier::Native);
         assert!(

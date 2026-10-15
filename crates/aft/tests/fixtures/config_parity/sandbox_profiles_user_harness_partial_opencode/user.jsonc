@@ -1,0 +1,16 @@
+{
+  "sandbox": {
+    "profile": {
+      "worker": "strict"
+    }
+  },
+  "harnesses": {
+    "opencode": {
+      "sandbox": {
+        "profile": {
+          "head": "relaxed"
+        }
+      }
+    }
+  }
+}

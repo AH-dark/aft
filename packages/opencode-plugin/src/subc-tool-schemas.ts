@@ -83,7 +83,7 @@ export type SubcBareToolName = (typeof BARE_TOOL_ORDER)[number];
  * per-directory plugin surface it is ONE contract for every project a subc
  * consumer may bind. Config-gated arguments therefore have to be declared here
  * whenever the runtime honours them in any project, or a consumer working in a
- * project that does enable the feature could never see it. `sandbox.enabled` is
+ * project that does enable the feature could never see it. `sandbox.profile.head` is
  * exactly that case: it is project-settable one-way hardening, and the subc
  * bash path reads a passed `sandbox` argument regardless of this manifest.
  * Remote execution is different: the default artifacts omit it, and a
@@ -100,7 +100,7 @@ export function makeSubcSchemaStubCtx(): PluginContext {
     client: { lsp: {}, find: {} } as PluginContext["client"],
     config: {
       disabled_tools: [],
-      sandbox: { enabled: true },
+      sandbox: { profile: { head: "strict" } },
     } as PluginContext["config"],
     storageDir: "/tmp/aft-subc-schema",
   };

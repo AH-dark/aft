@@ -24,6 +24,12 @@ pub(super) struct AppliedLandlock {
 }
 
 pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
+    if profile.mode == aft::config::SandboxMode::Relaxed {
+        // Landlock cannot subtract protected paths from a root-wide grant.
+        // Grant reads and writes beneath /, then list each unenforced path on
+        // stderr in emit_linux_warning; relaxed is not a Linux access boundary.
+        return probe();
+    }
     // Recheck after launcher canonicalization: a changed symlink must not turn
     // the configured connection-file deny into an additive Landlock grant.
     for (grants, denies) in [

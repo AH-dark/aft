@@ -62,6 +62,27 @@ describe("feature-config policy", () => {
     }
   });
 
+  test("sandbox profile cutover maps enabled by role and canonical leaves win", () => {
+    for (const enabled of [true, false]) {
+      const document: Record<string, unknown> = { sandbox: { enabled } };
+      const translated = translateConfigDocument(document, "user");
+      expect(document.sandbox).toEqual({
+        profile: enabled
+          ? { worker: "strict", head: "strict" }
+          : { worker: "relaxed", head: "off" },
+      });
+      expect(translated.retiredKeys).toContain("sandbox.enabled");
+    }
+    const document: Record<string, unknown> = {
+      sandbox: { enabled: true, profile: { head: "off" } },
+      harnesses: { pi: { sandbox: { enabled: false, profile: { worker: "strict" } } } },
+    };
+    translateConfigDocument(document, "user");
+    expect(document.sandbox).toEqual({ profile: { worker: "strict", head: "off" } });
+    expect((document.harnesses as Record<string, unknown>).pi).toEqual({
+      sandbox: { profile: { worker: "strict", head: "off" } },
+    });
+  });
   test("experimental aliases preserve opt-in defaults and canonical precedence in both tiers", () => {
     for (const tier of ["user", "project"] as const) {
       for (const [key, expected] of [

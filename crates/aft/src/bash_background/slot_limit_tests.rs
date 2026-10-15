@@ -21,7 +21,7 @@ fn context(project: &Path, storage: &Path) -> AppContext {
         max_background_bash_tasks: MAX,
         ..crate::config::Config::default()
     };
-    config.sandbox.enabled = false;
+    config.sandbox.profile.head = crate::config::SandboxMode::Off;
     AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 

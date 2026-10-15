@@ -663,9 +663,13 @@ fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'stati
         candidate.url_fetch_allow_private = false;
         held.push("url_fetch_allow_private");
     }
-    if floor.sandbox.enabled && !candidate.sandbox.enabled {
-        candidate.sandbox.enabled = true;
-        held.push("sandbox.enabled");
+    if candidate.sandbox.profile.worker < floor.sandbox.profile.worker {
+        candidate.sandbox.profile.worker = floor.sandbox.profile.worker;
+        held.push("sandbox.profile.worker");
+    }
+    if candidate.sandbox.profile.head < floor.sandbox.profile.head {
+        candidate.sandbox.profile.head = floor.sandbox.profile.head;
+        held.push("sandbox.profile.head");
     }
     if floor.bash.disclaim_privacy && !candidate.bash.disclaim_privacy {
         candidate.bash.disclaim_privacy = true;
@@ -873,7 +877,8 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("backup.max_depth", backup.max_depth);
     live!("backup.max_file_size", backup.max_file_size);
     // Sandbox: every spawn reads the snapshot its request pinned.
-    live!("sandbox.enabled", sandbox.enabled);
+    live!("sandbox.profile.worker", sandbox.profile.worker);
+    live!("sandbox.profile.head", sandbox.profile.head);
     live!("sandbox.write_allow", sandbox.write_allow);
     live!("sandbox.read_deny", sandbox.read_deny);
     // Bash runtime.
@@ -1018,7 +1023,7 @@ fn classification_is_exhaustive(config: &Config) {
         powershell_tool: _,
     } = bash;
     let crate::config::SandboxConfig {
-        enabled: _,
+        profile: _,
         write_allow: _,
         read_deny: _,
     } = sandbox;

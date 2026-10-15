@@ -13,6 +13,7 @@
   "retired_key_handling": "Never rejected. Every load translates retired keys in memory into their current equivalents; the user file is rewritten automatically (doctor --fix migration, with a backup), a project file only gets a notice.",
   "comparison": "major/minor only; patch ignored",
   "paths": {
+    "sandbox.enabled": "sandbox.profile",
     "tool_surface": "disabled_tools",
     "hoist_builtin_tools": "disabled_tools",
     "enabled": "disabled_tools",

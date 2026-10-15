@@ -1,0 +1,8 @@
+{
+  "sandbox": {
+    "profile": {
+      "worker": "off",
+      "head": "off"
+    }
+  }
+}

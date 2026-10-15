@@ -2684,7 +2684,6 @@ fn restarted_context_with_runon(dir: &Path, enabled: bool) -> crate::context::Ap
                 ..Default::default()
             },
             sandbox: crate::config::SandboxConfig {
-                enabled: false,
                 ..Default::default()
             },
             ..Default::default()
@@ -3864,7 +3863,7 @@ async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
         project_root: Some(dir.path().into()),
         ..Default::default()
     };
-    project_off.sandbox.enabled = false;
+    project_off.sandbox.profile.head = crate::config::SandboxMode::Off;
     project_off.remote_exec.project_off = true;
     project_off.bash.runon_enabled = true;
     let project_off_ctx = crate::context::AppContext::new(

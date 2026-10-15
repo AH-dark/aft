@@ -107,6 +107,7 @@ function removedOpencodeKeyErrors(value: Record<string, unknown>): string[] {
 
 /** Retired config paths and their replacement. */
 export const RETIRED_PATHS: ReadonlyArray<readonly [string, string]> = [
+  ["sandbox.enabled", "sandbox.profile"],
   ["tool_surface", "disabled_tools"],
   ["hoist_builtin_tools", "disabled_tools"],
   ["enabled", "disabled_tools"],
@@ -432,6 +433,33 @@ function translateBlock(
   translateGithubAliases(map, prefix, out);
   translateInspectLspPaths(map, prefix, out);
   translateExperimentalPaths(map, prefix, out);
+  if (isRecord(map.sandbox) && Object.hasOwn(map.sandbox, "enabled")) {
+    const sandbox = map.sandbox;
+    const enabled = sandbox.enabled;
+    delete sandbox.enabled;
+    recordRetired(out, prefix, "sandbox.enabled");
+    if (typeof enabled === "boolean") {
+      if (sandbox.profile === undefined) sandbox.profile = {};
+      if (isRecord(sandbox.profile)) {
+        const modes = { worker: enabled ? "strict" : "relaxed", head: enabled ? "strict" : "off" };
+        for (const role of ["worker", "head"] as const) {
+          if (sandbox.profile[role] !== undefined && sandbox.profile[role] !== modes[role]) {
+            superseded(
+              out,
+              `${prefix}sandbox.enabled`,
+              `sandbox.profile.${role} takes precedence over sandbox.enabled`,
+            );
+          }
+          sandbox.profile[role] ??= modes[role];
+        }
+      }
+    } else
+      out.warnings.push({
+        code: "invalid_legacy_config",
+        key: `${prefix}sandbox.enabled`,
+        message: "Ignoring non-boolean sandbox.enabled; use sandbox.profile",
+      });
+  }
 
   let explicitList: string[] | undefined;
   const rawList = map.disabled_tools;

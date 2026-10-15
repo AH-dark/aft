@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::CommandBuilder;
 
+use crate::config::SandboxMode;
 use crate::context::AppContext;
 use crate::sandbox_profile::SandboxProfile;
 
@@ -639,14 +640,8 @@ impl Drop for WorkerJailScope {
     }
 }
 
-/// Run a stamped Alfonso worker's shell dispatch inside the worktree jail.
-///
-/// While `jailed` is true, a shell runs under the native sandbox whatever the
-/// user's `sandbox.enabled` says, with writes confined to the route's roots
-/// (plus `write_allow`, approved directory grants, caches and the task temp
-/// dir). Where the sandbox cannot be enforced the command is refused with
-/// `sandbox_unavailable`; it never runs unconfined. Heads and standalone
-/// sessions keep the configured behaviour.
+/// Select the worker shell profile after the route's Alfonso worker stamp
+/// has been authenticated; the flag is scoped to this request's dispatch.
 pub(crate) fn with_worker_jail<R>(jailed: bool, run: impl FnOnce() -> R) -> R {
     let previous = WORKER_JAIL.with(|slot| slot.replace(jailed));
     let _scope = WorkerJailScope(previous);
@@ -658,9 +653,31 @@ pub(crate) fn worker_jail_active() -> bool {
     WORKER_JAIL.with(std::cell::Cell::get)
 }
 
-/// The configured sandbox switch, forced on for a jailed worker.
+pub(crate) fn effective_sandbox_mode(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+) -> SandboxMode {
+    if principal_requires_strict(principal) {
+        return SandboxMode::Strict;
+    }
+    let profiles = &ctx.config().sandbox.profile;
+    if worker_jail_active() {
+        profiles.worker
+    } else {
+        profiles.head
+    }
+}
+
+pub(crate) fn principal_requires_strict(principal: &AuthenticatedPrincipal) -> bool {
+    !principal_is_first_party(principal)
+        || matches!(principal, AuthenticatedPrincipal::RouteBind { harness, principal_id, .. }
+        if harness.starts_with("mcp:") || principal_id.as_deref().is_none_or(|id| id == "unverified"))
+}
+
+/// Resolve the role and authenticated principal before choosing the launcher.
 pub(crate) fn sandbox_required(ctx: &AppContext) -> bool {
-    ctx.config().sandbox.enabled || worker_jail_active()
+    effective_sandbox_mode(ctx, &current_authenticated_principal()) != SandboxMode::Off
+        || (cfg!(unix) && worker_jail_active())
 }
 
 fn worker_jail_refusal(reason: &str) -> SpawnPlan {
@@ -1238,29 +1255,34 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// Returns true on Unix when native sandboxing is enabled for a first-party caller.
+/// Whether this Unix request must use the native launcher. Off-profile workers
+/// also use it to preserve their private temp directory and stripped environment,
+/// but install no OS policy.
 ///
-/// Process spawning and in-process bash rewriting both use this check so the
-/// command executes through the configured sandbox instead of being rewritten
-/// to run inside the unsandboxed AFT process.
+/// Process spawning and in-process bash rewriting share this check so neither
+/// confinement nor the worker environment can be bypassed by a rewrite.
 pub(crate) fn native_sandbox_enforced(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> bool {
-    cfg!(unix) && sandbox_required(ctx) && principal_is_first_party(principal)
+    cfg!(unix)
+        && (effective_sandbox_mode(ctx, principal) != SandboxMode::Off || worker_jail_active())
 }
 
 pub(crate) fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<SpawnPlan> {
+    unsupported_profile_sandbox_refusal(effective_sandbox_mode(
+        ctx,
+        &current_authenticated_principal(),
+    ))
+}
+
+fn unsupported_profile_sandbox_refusal(mode: SandboxMode) -> Option<SpawnPlan> {
     if cfg!(unix) {
         return None;
     }
-    if worker_jail_active() {
-        return Some(worker_jail_refusal("this platform has no native sandbox"));
-    }
-    ctx.config().sandbox.enabled.then(|| SpawnPlan::Refused {
+    (mode != SandboxMode::Off).then(|| SpawnPlan::Refused {
         code: "sandbox_unavailable",
-        message: "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
-            .to_string(),
+        message: format!("sandbox profile {mode} is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"),
         mismatch_class: None,
     })
 }
@@ -1290,11 +1312,19 @@ pub fn resolve_sandbox_spawn(
 
     // An enabled policy must never degrade into an ordinary child merely
     // because this build has no kernel sandbox backend.
-    if let Some(refusal) = unsupported_platform_sandbox_refusal(ctx) {
+    let mode = effective_sandbox_mode(ctx, principal);
+    if let Some(refusal) = unsupported_profile_sandbox_refusal(mode) {
         return refusal;
     }
+    if requested_tier == RequestedSandboxTier::Host && principal_requires_strict(principal) {
+        return SpawnPlan::Refused {
+            code: "sandbox_escalation_denied",
+            message: "sandbox host escalation is unavailable to untrusted principals".to_string(),
+            mismatch_class: Some("wrong_principal"),
+        };
+    }
 
-    if worker_jail_active() {
+    if mode != SandboxMode::Off && (worker_jail_active() || !principal_is_first_party(principal)) {
         // A jailed worker never runs unconfined: neither an unsandboxed tier
         // nor a host escalation, nor a principal the native launcher refuses.
         if requested_tier != RequestedSandboxTier::Native {
@@ -1305,8 +1335,13 @@ pub fn resolve_sandbox_spawn(
         }
     }
 
-    if requested_tier == RequestedSandboxTier::Disabled || !sandbox_required(ctx) {
+    // An off-profile worker still uses the launcher for its private temp and
+    // credential-stripped environment; the launcher installs no OS policy.
+    if mode == SandboxMode::Off && (!cfg!(unix) || !worker_jail_active()) {
         return SpawnPlan::Unsandboxed;
+    }
+    if requested_tier == RequestedSandboxTier::Disabled && mode != SandboxMode::Off {
+        return worker_jail_refusal("the command asked to disable the configured sandbox profile");
     }
 
     if requested_tier == RequestedSandboxTier::Host {
@@ -1345,10 +1380,6 @@ pub fn resolve_sandbox_spawn(
             let _ = (ctx, task_kind, task_bundle_dir, host_escalation);
             unreachable!("unsupported platforms return before host-tier resolution");
         }
-    }
-
-    if !native_sandbox_enforced(ctx, principal) {
-        return SpawnPlan::Unsandboxed;
     }
 
     #[cfg(windows)]
@@ -1421,7 +1452,7 @@ fn sandbox_setup_refusal(
         }
     };
     let message = format!(
-        "sandbox setup for {} failed: {cause}; set sandbox.enabled=false to disable native sandboxing",
+        "sandbox setup for {} failed: {cause}; select sandbox.profile off to disable native sandboxing",
         root.display()
     );
     crate::slog_warn!("{message}; root={} session={session}", root.display());
@@ -1508,12 +1539,47 @@ fn build_native_profile(
         .map_err(|error| format!("failed to canonicalize task io directory: {error}"))?;
     let session_store = session_store_for_task_io(&task_io_dir)?;
 
+    if effective_sandbox_mode(ctx, principal) == SandboxMode::Off {
+        let temp = create_task_temp_dir(&task_io_dir)?;
+        let result = SandboxProfile::build(
+            project_roots,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp.clone(),
+        );
+        return match result {
+            Ok(mut profile) => {
+                profile.mode = SandboxMode::Off;
+                Ok(profile)
+            }
+            Err(error) => {
+                let _ = cleanup_task_temp_dir(&temp);
+                Err(error.to_string())
+            }
+        };
+    }
+
     let git_policies = project_roots
         .iter()
         .map(|root| resolve_git_policy(root))
         .collect::<Result<Vec<_>, _>>()?;
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
+        if effective_sandbox_mode(ctx, principal) == SandboxMode::Relaxed {
+            return build_relaxed_profile(
+                ctx,
+                &home,
+                &project_roots,
+                &git_policies,
+                &session_store,
+                &task_io_dir,
+                &temp_dir,
+            );
+        }
         let mut policy = ctx.access_policy("").map_err(|response| {
             response.data["message"]
                 .as_str()
@@ -1729,29 +1795,249 @@ fn build_native_profile(
     result
 }
 
-/// Adjust the governed child environment for a jailed worker shell. The caller
-/// has already added managed Git and GitHub command settings to the request
-/// environment.
-///
-/// - `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER` are set empty, which makes
-///   cargo ignore any `build.rustc-wrapper` from its configuration. A wrapper
-///   such as sccache hands compiles to a server that runs outside the sandbox
-///   and writes outputs wherever it is told, so it must not run for a jailed
-///   build. Jailed local builds get slower; workers build with runon.
-/// - `CARGO_HOME` and `RUSTUP_HOME`, when the daemon has them, so cargo and
-///   rustup in the shell use the homes whose caches the jail grants instead of
-///   the defaults under HOME. Other daemon variables are inherited only through
-///   the sandbox's base-environment allowlist.
-/// - All `SCCACHE_*` settings are removed, including server port/UDS and startup
-///   notification channels. Storage endpoints are not compile-server addresses,
-///   but are removed too so future sccache channels cannot bypass this scrub.
-pub(crate) fn apply_worker_jail_environment(environment: &mut HashMap<String, String>) {
-    if !worker_jail_active() {
+/// Build relaxed's protected-path list without predicting the caches, sockets
+/// or services a build will need. Each backend reports which denies it enforces.
+#[cfg(unix)]
+fn build_relaxed_profile(
+    ctx: &AppContext,
+    home: &Path,
+    roots: &[PathBuf],
+    git_policies: &[GitPolicy],
+    session_store: &Path,
+    task_io: &Path,
+    temp: &Path,
+) -> Result<SandboxProfile, String> {
+    let policy = ctx
+        .access_policy("")
+        .map_err(|error| error.data.to_string())?;
+    let mut read_deny = policy.absolute_floor.clone();
+    read_deny.extend(
+        [
+            ".ssh",
+            ".gnupg",
+            "Library/Keychains",
+            ".aws",
+            ".config/gcloud",
+            ".azure",
+            ".config/gh",
+            ".netrc",
+            ".docker/config.json",
+            ".npmrc",
+            ".pypirc",
+        ]
+        .map(|path| home.join(path)),
+    );
+    let mut write_deny = read_deny.clone();
+    write_deny.extend(
+        [
+            ".zshrc",
+            ".zprofile",
+            ".bashrc",
+            ".profile",
+            ".gitconfig",
+            ".config/git",
+            "Library/LaunchAgents",
+        ]
+        .map(|path| home.join(path)),
+    );
+    let mut stores = policy.private_stores.clone();
+    stores.deny.push(session_store.to_path_buf());
+    stores.deny.push(home.join(".config/cortexkit"));
+    stores.deny.extend([
+        home.join(".local/share/cortexkit"),
+        home.join(".local/state/cortexkit"),
+        ctx.storage_dir(),
+    ]);
+    for base in [
+        absolute_env_path("XDG_DATA_HOME"),
+        absolute_env_path("XDG_STATE_HOME"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        stores.deny.push(base.join("cortexkit"));
+    }
+    if let Some(config) = absolute_env_path("XDG_CONFIG_HOME") {
+        stores.deny.push(config.join("cortexkit"));
+    }
+    stores.read_allow = roots.to_vec();
+    stores.write_allow = roots.to_vec();
+    for data in [
+        Some(home.join(".local/share")),
+        absolute_env_path("XDG_DATA_HOME"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        stores
+            .read_allow
+            .push(data.join("cortexkit/alfonso/worktrees"));
+        stores.read_allow.push(data.join("cortexkit/bin"));
+    }
+    stores
+        .read_allow
+        .extend([temp.to_path_buf(), task_io.to_path_buf()]);
+    stores
+        .write_allow
+        .extend([temp.to_path_buf(), task_io.to_path_buf()]);
+    let mut writable = roots.to_vec();
+    writable.extend(linked_git_grants(git_policies));
+    let files = linked_git_file_grants(git_policies);
+    stores.write_allow.extend(writable.iter().cloned());
+    stores.write_allow.extend(files.iter().cloned());
+    let mut checkout_denies = vec![home.join("Work")];
+    for (root, git) in roots.iter().zip(git_policies) {
+        if git.read_roots.is_empty() {
+            write_deny.extend(
+                ["config", "config.worktree", "hooks"].map(|name| root.join(".git").join(name)),
+            );
+        }
+        for dir in &git.read_roots {
+            // Config and hooks remain immutable even in the worker's own .git.
+            write_deny.push(dir.join("config"));
+            write_deny.push(dir.join("config.worktree"));
+            write_deny.push(dir.join("hooks"));
+        }
+        write_deny.extend(git.hooks.iter().cloned());
+        write_deny.extend(
+            git.configured_paths
+                .iter()
+                .filter(|(key, _)| key != "core.excludesFile")
+                .map(|(_, path)| path.clone()),
+        );
+        stores.read_allow.extend(git.read_roots.iter().cloned());
+        stores.read_allow.extend(git.hooks.iter().cloned());
+        stores
+            .read_allow
+            .extend(git.configured_paths.iter().map(|(_, path)| path.clone()));
+        stores
+            .read_metadata_allow
+            .extend(git.metadata_allow.iter().cloned());
+        for key in ["core.hooksPath", "mason.originalHooksPath"] {
+            if !git
+                .configured_paths
+                .iter()
+                .any(|(existing, _)| existing == key)
+            {
+                let mut metadata = Vec::new();
+                if let Some((_, path)) = configured_git_path(root, key, &mut metadata)? {
+                    write_deny.push(path.clone());
+                    if path.is_dir() {
+                        stores.read_allow.push(path);
+                    }
+                    stores.read_metadata_allow.extend(metadata);
+                }
+            }
+        }
+        if let Some((git_dir, _)) = &git.linked {
+            write_deny.push(root.join(".git"));
+            write_deny.extend(["commondir", "gitdir"].map(|name| git_dir.join(name)));
+        }
+        write_deny.extend([
+            root.join(".cortexkit/aft.jsonc"),
+            root.join(".cortexkit/aft/filters"),
+        ]);
+        let listing = git_policy_output(root, &["worktree", "list", "--porcelain", "-z"])
+            .map_err(|error| format!("cannot enumerate sibling checkouts: {error}"))?;
+        if listing.status.success() {
+            for field in listing.stdout.split(|byte| *byte == 0) {
+                if let Some(path) = field.strip_prefix(b"worktree ") {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = PathBuf::from(OsStr::from_bytes(path));
+                    if !roots.contains(&path) {
+                        checkout_denies.push(path);
+                    }
+                }
+            }
+        } else if !git.read_roots.is_empty() {
+            return Err(format!(
+                "cannot enumerate sibling checkouts: {}",
+                String::from_utf8_lossy(&listing.stderr)
+            ));
+        }
+    }
+    let storage = ctx.storage_dir();
+    for path in [
+        storage.join(crate::agent_child_env::SHIMS_DIR_NAME),
+        crate::agent_child_env::managed_git_hooks_dir(&storage),
+    ] {
+        if path.exists() {
+            stores.read_allow.push(path.clone());
+        }
+        write_deny.push(path);
+    }
+    if let Ok(binary) = crate::agent_child_env::shim_binary(&ctx.config()) {
+        if binary.exists() {
+            stores.read_allow.push(binary.clone());
+        }
+        write_deny.push(binary);
+    }
+    stores.read_allow.retain(|path| path.exists());
+    let mut profile = SandboxProfile {
+        v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+        mode: SandboxMode::Relaxed,
+        deny_prefixes: Vec::new(),
+        data_policy: stores,
+        writable_roots: writable,
+        writable_files: files,
+        write_deny,
+        write_deny_nested: checkout_denies,
+        read_allow: Vec::new(),
+        read_allow_listed: Vec::new(),
+        read_deny,
+        socket_deny: Vec::new(),
+        loopback_tcp_connect_deny: Vec::new(),
+        cache_roots: Vec::new(),
+        temp_dir: temp.to_path_buf(),
+    };
+    profile.deny_prefixes.push(home.join(".cargo/credentials"));
+    // Resolve existing prefix matches too: a credentials file can itself be a
+    // symlink to a secret outside CARGO_HOME.
+    if let Ok(entries) = std::fs::read_dir(home.join(".cargo")) {
+        for entry in entries.flatten().filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .starts_with("credentials")
+        }) {
+            profile.read_deny.push(entry.path());
+            profile.write_deny.push(entry.path());
+        }
+    }
+    profile
+        .canonicalize_for_launch()
+        .map_err(|error| error.to_string())
+}
+
+/// Prepare the shell environment after injecting managed Git/GitHub settings.
+/// Strict workers clear rustc wrappers and SCCACHE_* channels: an external compile
+/// server could write outside its client's write-limited jail. Relaxed and off
+/// preserve compile-server addressing settings, not remote-cache credentials.
+/// Relaxed shells and all workers keep the operator's CARGO_HOME/RUSTUP_HOME;
+/// credential stripping happens separately in sandboxed_child_environment.
+pub(crate) fn apply_worker_jail_environment(
+    environment: &mut HashMap<String, String>,
+    mode: SandboxMode,
+) {
+    if !worker_jail_active() && mode != SandboxMode::Relaxed {
         return;
     }
-    environment.retain(|key, _| !key.starts_with("SCCACHE_"));
-    for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
-        environment.insert(key.to_string(), String::new());
+    if mode == SandboxMode::Strict {
+        environment.retain(|key, _| !key.starts_with("SCCACHE_"));
+        for key in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
+            environment.insert(key.to_string(), String::new());
+        }
+    } else {
+        for (key, value) in std::env::vars_os() {
+            if let (Some(key), Some(value)) = (key.to_str(), value.to_str()) {
+                if relaxed_compile_environment_key(key) {
+                    environment
+                        .entry(key.to_string())
+                        .or_insert_with(|| value.to_string());
+                }
+            }
+        }
     }
     #[cfg(unix)]
     for key in ["CARGO_HOME", "RUSTUP_HOME"] {
@@ -1761,6 +2047,17 @@ pub(crate) fn apply_worker_jail_environment(environment: &mut HashMap<String, St
             }
         }
     }
+}
+
+fn relaxed_compile_environment_key(key: &str) -> bool {
+    matches!(
+        key,
+        "SCCACHE_SERVER_PORT"
+            | "SCCACHE_SERVER_UDS"
+            | "SCCACHE_DIR"
+            | "RUSTC_WRAPPER"
+            | "CARGO_BUILD_RUSTC_WRAPPER"
+    )
 }
 
 #[cfg(unix)]
@@ -5108,12 +5405,101 @@ mod policy_tests {
             crate::config::Config {
                 project_root: Some(project_root),
                 sandbox: crate::config::SandboxConfig {
-                    enabled: true,
+                    profile: crate::config::SandboxRoles {
+                        head: SandboxMode::Strict,
+                        worker: SandboxMode::Strict,
+                    },
                     ..crate::config::SandboxConfig::default()
                 },
                 ..crate::config::Config::default()
             },
         )
+    }
+
+    #[test]
+    fn sandbox_profile_roles_and_unverified_routes_resolve_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path().to_path_buf());
+        ctx.update_config(|config| config.sandbox = crate::config::SandboxConfig::default());
+        assert_eq!(
+            effective_sandbox_mode(&ctx, &AuthenticatedPrincipal::FirstParty),
+            SandboxMode::Off
+        );
+        with_worker_jail(true, || {
+            assert_eq!(
+                effective_sandbox_mode(&ctx, &AuthenticatedPrincipal::FirstParty),
+                SandboxMode::Relaxed
+            )
+        });
+        ctx.update_config(|config| config.sandbox.profile.worker = SandboxMode::Off);
+        with_worker_jail(true, || {
+            assert_eq!(
+                effective_sandbox_mode(&ctx, &AuthenticatedPrincipal::FirstParty),
+                SandboxMode::Off
+            )
+        });
+        for (trust, harness, principal_id) in [
+            (PrincipalTrust::Untrusted, "runner", Some("direct")),
+            (PrincipalTrust::FirstParty, "mcp:test", Some("direct")),
+            (PrincipalTrust::FirstParty, "runner", Some("unverified")),
+            (PrincipalTrust::FirstParty, "runner", None),
+        ] {
+            let principal = AuthenticatedPrincipal::RouteBind {
+                trust,
+                route_channel: 7,
+                route_epoch: 1,
+                project_root: dir.path().to_path_buf(),
+                harness: harness.into(),
+                session_id: "role-test".into(),
+                principal_id: principal_id.map(str::to_string),
+            };
+            assert_eq!(
+                effective_sandbox_mode(&ctx, &principal),
+                SandboxMode::Strict,
+                "{principal:?}"
+            );
+            with_worker_jail(true, || {
+                assert_eq!(
+                    effective_sandbox_mode(&ctx, &principal),
+                    SandboxMode::Strict
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn relaxed_worker_environment_preserves_compile_server_settings() {
+        let mut environment = HashMap::from([
+            ("SCCACHE_SERVER_PORT".into(), "4321".into()),
+            ("RUSTC_WRAPPER".into(), "/operator/sccache".into()),
+        ]);
+        with_worker_jail(true, || {
+            apply_worker_jail_environment(&mut environment, SandboxMode::Relaxed)
+        });
+        assert_eq!(environment["SCCACHE_SERVER_PORT"], "4321");
+        assert_eq!(environment["RUSTC_WRAPPER"], "/operator/sccache");
+    }
+
+    #[test]
+    fn relaxed_compile_server_inheritance_excludes_cache_credentials() {
+        for key in [
+            "SCCACHE_SERVER_PORT",
+            "SCCACHE_SERVER_UDS",
+            "SCCACHE_DIR",
+            "RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+        ] {
+            assert!(relaxed_compile_environment_key(key), "{key}");
+        }
+        for key in [
+            "SCCACHE_REDIS_PASSWORD",
+            "SCCACHE_GCS_OAUTH_TOKEN",
+            "SCCACHE_AZURE_CONNECTION_STRING",
+            "AWS_SECRET_ACCESS_KEY",
+            "SUBC_CONNECTION_FILE",
+        ] {
+            assert!(!relaxed_compile_environment_key(key), "{key}");
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -5282,9 +5668,13 @@ mod policy_tests {
             .map(|key| (key.to_string(), "operator-value".to_string()))
             .collect::<HashMap<_, _>>();
         let mut environment = original.clone();
-        with_worker_jail(false, || apply_worker_jail_environment(&mut environment));
+        with_worker_jail(false, || {
+            apply_worker_jail_environment(&mut environment, SandboxMode::Strict)
+        });
         assert_eq!(environment, original);
-        with_worker_jail(true, || apply_worker_jail_environment(&mut environment));
+        with_worker_jail(true, || {
+            apply_worker_jail_environment(&mut environment, SandboxMode::Strict)
+        });
         for key in keys {
             assert!(
                 !environment.contains_key(key),
@@ -5298,10 +5688,12 @@ mod policy_tests {
     #[test]
     fn worker_jail_environment_disables_rustc_wrappers_only_when_jailed() {
         let mut free = HashMap::new();
-        apply_worker_jail_environment(&mut free);
+        apply_worker_jail_environment(&mut free, SandboxMode::Strict);
         assert!(free.is_empty());
         let mut jailed = HashMap::from([("RUSTC_WRAPPER".to_string(), "sccache".to_string())]);
-        with_worker_jail(true, || apply_worker_jail_environment(&mut jailed));
+        with_worker_jail(true, || {
+            apply_worker_jail_environment(&mut jailed, SandboxMode::Strict)
+        });
         assert_eq!(jailed["RUSTC_WRAPPER"], "");
         assert_eq!(jailed["CARGO_BUILD_RUSTC_WRAPPER"], "");
     }
@@ -5506,7 +5898,7 @@ mod policy_tests {
             "sandbox setup for {} failed: failed to query core.hooksPath: Bad file descriptor (os error 9)",
             project.path().display()
         )));
-        assert!(message.ends_with("set sandbox.enabled=false to disable native sandboxing"));
+        assert!(message.ends_with("select sandbox.profile off to disable native sandboxing"));
     }
 
     #[cfg(unix)]
@@ -5543,7 +5935,7 @@ mod policy_tests {
         );
         sandboxed.cleanup_unspawned();
 
-        ctx.update_config(|config| config.sandbox.enabled = false);
+        ctx.update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
         assert!(!native_sandbox_enforced(&ctx, &principal));
         assert!(crate::bash_rewrite::try_rewrite(&command, None, &ctx, &principal).is_some());
         assert_eq!(
@@ -5560,9 +5952,13 @@ mod policy_tests {
     }
 
     #[test]
-    fn untrusted_principal_never_enters_the_native_launcher() {
+    fn untrusted_principal_forces_strict_even_when_profiles_are_off() {
         let project = tempfile::tempdir().unwrap();
         let ctx = context(project.path().to_path_buf());
+        ctx.update_config(|config| {
+            config.sandbox.profile.worker = SandboxMode::Off;
+            config.sandbox.profile.head = SandboxMode::Off;
+        });
         let principal = AuthenticatedPrincipal::RouteBind {
             trust: PrincipalTrust::Untrusted,
             route_channel: 7,
@@ -5581,18 +5977,14 @@ mod policy_tests {
             project.path(),
             None,
         );
-        // The invariant is that an untrusted principal never receives a native
-        // Launcher plan. On Unix that surfaces as a downgrade to Unsandboxed
-        // (the untrusted principal fails the first-party enforcement check); on
-        // platforms without a kernel backend the enabled policy fails closed
-        // with a platform refusal before the trust check is reached. Both honor
-        // the invariant, so assert the exact non-Launcher outcome per platform.
-        #[cfg(unix)]
-        assert_eq!(plan, SpawnPlan::Unsandboxed);
-        #[cfg(not(unix))]
+        assert_eq!(
+            effective_sandbox_mode(&ctx, &principal),
+            SandboxMode::Strict
+        );
         assert!(
-            matches!(&plan, SpawnPlan::Refused { code, .. } if *code == "sandbox_unavailable"),
-            "untrusted principal must never reach the native launcher; got {plan:?}"
+            matches!(&plan, SpawnPlan::Launcher { profile, .. } if profile.mode == SandboxMode::Strict)
+                || plan.refusal_code() == Some("sandbox_unavailable"),
+            "untrusted principal must be confined or refused, never downgraded: {plan:?}"
         );
     }
 
@@ -6259,7 +6651,7 @@ mod policy_tests {
         assert_eq!(
             plan.refusal_message(),
             Some(
-                "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
+                "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
             )
         );
     }
@@ -6281,7 +6673,7 @@ mod policy_tests {
         assert_eq!(
             plan.refusal_message(),
             Some(
-                "sandbox is not supported on this platform; disable sandbox.enabled or run on macOS/Linux"
+                "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
             )
         );
     }
@@ -6448,6 +6840,8 @@ mod read_allow_tests {
         let connection = PathBuf::from("/home/alice/daemon/connection.json");
         let profile = SandboxProfile {
             v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+            mode: crate::config::SandboxMode::Strict,
+            deny_prefixes: Vec::new(),
             data_policy: crate::sandbox_profile::SandboxDataPolicy {
                 deny: vec![
                     data.into(),
