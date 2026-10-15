@@ -12,16 +12,24 @@ fn fixture() -> (tempfile::TempDir, SqliteClosure, Manifest) {
     };
     fs::write(&closure.trigram, []).unwrap();
     for path in [&closure.semantic, &closure.callgraph] {
-        let conn = Connection::open(path).unwrap();
+        let mut conn = Connection::open(path).unwrap();
         conn.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB); CREATE INDEX blob_membership ON blob_payloads(full_key)")
             .unwrap();
+        // These tests measure read-side connection reuse, not write durability. Batch
+        // setup so Windows does not flush a separate SQLite transaction for every row.
+        let tx = conn.transaction().unwrap();
         for key in 0..600u16 {
-            conn.execute(
+            assert!(
+                !tx.is_autocommit(),
+                "closure fixture inserts must share a transaction, not flush every row"
+            );
+            tx.execute(
                 "INSERT INTO blob_payloads VALUES(?1, X'')",
                 [decode_hex(&format!("{key:064x}")).unwrap()],
             )
             .unwrap();
         }
+        tx.commit().unwrap();
     }
     let manifest = Manifest::new((0..600u16).map(|key| {
         (
