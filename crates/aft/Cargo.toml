@@ -83,7 +83,7 @@ path = "tests/daemon_malloc_small_growth_repro.rs"
 
 [lints.rust]
 # The ignored navigation profile is enabled explicitly for manual measurements.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
 
 [features]
 # Explicit opt-in for cross-process timing controls used by integration tests.

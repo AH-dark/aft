@@ -7,6 +7,9 @@ publish = false
 [[bin]]
 name = "fake-lsp-server"
 path = "src/main.rs"
+# The shared LSP sources this helper includes carry their own unit tests,
+# which already run in the agent-file-tools suite; don't run them twice.
+test = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

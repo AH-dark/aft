@@ -8,13 +8,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-const SOURCES: &[&[u8]] = &[
-    include_bytes!("../../../../Cargo.toml"),
-    include_bytes!("../../../../crates/aft-fake-lsp/Cargo.toml"),
-    include_bytes!("../../../../crates/aft-fake-lsp/src/main.rs"),
-    include_bytes!("../lsp/fake_server.rs"),
-    include_bytes!("../../src/lsp/jsonrpc.rs"),
-    include_bytes!("../../src/lsp/transport.rs"),
+/// Files the helper build reads, relative to the workspace root. The cache key
+/// hashes these files as they are on disk when the build runs, so a cached
+/// helper always matches the sources it was built from.
+const SOURCES: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates/aft-fake-lsp/Cargo.toml",
+    "crates/aft-fake-lsp/build.rs",
+    "crates/aft-fake-lsp/src/main.rs",
+    "crates/aft/tests/lsp/fake_server.rs",
+    "crates/aft/src/lsp/jsonrpc.rs",
+    "crates/aft/src/lsp/transport.rs",
 ];
 
 pub fn fake_server_binary() -> PathBuf {
@@ -24,11 +29,33 @@ pub fn fake_server_binary() -> PathBuf {
         .clone()
 }
 
+/// The checkout the tests run against. Cargo and nextest set
+/// `CARGO_MANIFEST_DIR` when a test runs, and nextest points it at the
+/// remapped checkout when an archive is extracted elsewhere, so the runtime
+/// value is preferred over the path baked in at compile time.
+fn workspace_root() -> PathBuf {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    manifest_dir.join("../..")
+}
+
 #[allow(dead_code)]
 pub(crate) fn build_in(root: &Path) -> PathBuf {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let lockfile = std::fs::read(workspace.join("Cargo.lock"))
-        .expect("workspace Cargo.lock is required for helper cache identity");
+    let workspace = workspace_root();
+    let sources: Vec<Vec<u8>> = SOURCES
+        .iter()
+        .map(|relative| {
+            let path = workspace.join(relative);
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!(
+                    "the fake LSP helper builds from the source checkout; {} is unreadable ({error}). \
+                     Run tests from a checkout, or extract nextest archives with --workspace-remap",
+                    path.display()
+                )
+            })
+        })
+        .collect();
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let version = Command::new(&rustc)
         .arg("-vV")
@@ -40,9 +67,11 @@ pub(crate) fn build_in(root: &Path) -> PathBuf {
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .expect("rustc host target");
-    let mut sources = SOURCES.to_vec();
-    sources.push(&lockfile);
-    let key = binary_cache::key(&sources, &version, target);
+    let key = binary_cache::key(
+        &sources.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        &version,
+        target,
+    );
     binary_cache::install(root, &key, target, |pending| {
         eprintln!("Building shared AFT test helper fake-lsp-server ({key})");
         // An isolated target directory avoids taking the test runner's Cargo
