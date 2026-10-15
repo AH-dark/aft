@@ -897,11 +897,20 @@ test_stack_chain() {
   if wait_stack_push "$dir" grandchild; then complete_stack_ci "$dir" grandchild success; fi
   complete_stack_ci "$dir" child success
   # Green descendants cannot land while their parent is running. Wait until
-  # the child has actually reached the landing guard (not just the CI watch).
-  for _ in $(seq 1 100); do
-    grep -q 'headBranch=="train/parent"' "$dir/ci-state/gh-calls" && break
+  # the child has actually reached the landing guard (not just the CI watch)
+  # before letting the parent finish; otherwise the parent can land first and
+  # the child never reports its wait. The deadline only guards against a hang.
+  reached_guard=0
+  for _ in $(seq 1 3000); do
+    if grep -q 'headBranch=="train/parent"' "$dir/ci-state/gh-calls"; then
+      reached_guard=1
+      break
+    fi
     sleep 0.02
   done
+  if [ "$reached_guard" -ne 1 ]; then
+    fail "stacked child reached the parent landing guard within 60 s"
+  fi
   if [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ] &&
     kill -0 "$p1" && kill -0 "$p2" && kill -0 "$p3"; then
     ok "stacked child waits while parent CI runs; all three CI runs started in parallel"
