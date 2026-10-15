@@ -19,19 +19,125 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "@cortexkit/aft-bridge";
+import { execFileSync, spawnSync } from "@cortexkit/aft-bridge";
 import {
   _extractArchiveSafelyForTesting as extractArchiveSafely,
   _precheckArchiveSizeForTesting as precheckArchiveSize,
+  _runArchiveToolForTesting as runArchiveTool,
   validateExtraction,
 } from "../lsp-github-install.js";
 
 const tempRoots = new Set<string>();
 
+function createTarFixture(archivePath: string, source: string): void {
+  execFileSync("tar", ["-czf", archivePath, "-C", source, "bin"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 1_000,
+    killSignal: "SIGKILL",
+  });
+}
+
+async function withinTestDeadline<T>(operation: Promise<T>): Promise<T> {
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        deadline = setTimeout(
+          () => reject(new Error("archive operation exceeded 1000 ms test deadline")),
+          1_000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
 function createStagingFixture(): string {
   const root = mkdtempSync(join(tmpdir(), "aft-pi-extract-tests-"));
   tempRoots.add(root);
   return root;
+}
+
+async function withArchiveDiagnostics(operation: () => Promise<void>): Promise<void> {
+  const original = childProcess.execFile;
+  const events: string[] = [];
+  const children = new Set<childProcess.ChildProcess>();
+  const started = performance.now();
+  const record = (event: string): void => {
+    events.push(`${Math.round(performance.now() - started)}ms ${event}`);
+  };
+  const report = (): void => {
+    console.error("Archive child lifecycle:", events.join("\n"));
+    for (const child of children) {
+      console.error({
+        pid: child.pid,
+        exitCode: child.exitCode,
+        stdinClosed: child.stdin?.writableEnded,
+        stdoutEnded: child.stdout?.readableEnded,
+        stderrEnded: child.stderr?.readableEnded,
+      });
+    }
+  };
+  const toolMock = spyOn(childProcess, "execFile").mockImplementation(((
+    command: string,
+    args: string[],
+    options: childProcess.ExecFileOptionsWithStringEncoding,
+    callback: (
+      error: childProcess.ExecFileException | null,
+      stdout: string,
+      stderr: string,
+    ) => void,
+  ) => {
+    const label = `${command} ${args[0]}`;
+    record(`${label} called`);
+    let finished = false;
+    const complete = (
+      error: childProcess.ExecFileException | null,
+      stdout: string,
+      stderr: string,
+    ): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(deadline);
+      record(`${label} callback${error ? `: ${error.message}` : ""}`);
+      callback(error, stdout, stderr);
+    };
+    // Fail the owning test even if native child close/callback delivery stalls.
+    const deadline = setTimeout(() => {
+      report();
+      complete(new Error(`${label} test child timed out after 1000 ms`), "", "");
+      child.kill("SIGKILL");
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    }, 1_000);
+    const child = original(
+      command,
+      args,
+      { ...options, timeout: 1_000, killSignal: "SIGKILL" },
+      complete,
+    );
+    children.add(child);
+    child.once("spawn", () => record(`${label} spawn pid=${child.pid}`));
+    child.stdout?.once("end", () => record(`${label} stdout end`));
+    child.stderr?.once("end", () => record(`${label} stderr end`));
+    child.once("exit", (code, signal) => record(`${label} exit ${code}/${signal}`));
+    child.once("close", (code, signal) => {
+      record(`${label} close ${code}/${signal}`);
+      children.delete(child);
+    });
+    return child;
+  }) as typeof childProcess.execFile);
+  try {
+    await operation();
+  } catch (error) {
+    report();
+    throw error;
+  } finally {
+    toolMock.mockRestore();
+  }
 }
 
 afterEach(() => {
@@ -45,9 +151,9 @@ describe("precheckArchiveSize", () => {
     const archivePath = join(root, "bomb.zip");
     writeFakeZipWithUncompressedSize(archivePath, 1024 * 1024 * 1024 + 1);
 
-    await expect(precheckArchiveSize(archivePath, "zip")).rejects.toThrow(
-      /archive uncompressed size/,
-    );
+    await expect(
+      withArchiveDiagnostics(() => precheckArchiveSize(archivePath, "zip")),
+    ).rejects.toThrow(/archive uncompressed size/);
   });
 });
 
@@ -61,7 +167,7 @@ describe("extractArchiveSafely", () => {
     mkdirSync(join(source, "bin"), { recursive: true });
     writeFileSync(join(source, "bin", "server"), "binary");
     const archivePath = join(root, "server.tar.gz");
-    execFileSync("tar", ["-czf", archivePath, "-C", source, "bin"]);
+    createTarFixture(archivePath, source);
     const dest = join(root, "extract");
 
     type PendingTool = { command: string; args: string[]; complete: () => void };
@@ -108,7 +214,9 @@ describe("extractArchiveSafely", () => {
       return {} as childProcess.ChildProcess;
     }) as typeof childProcess.execFile);
     let settled = false;
-    const extraction = extractArchiveSafely(archivePath, dest, "tar.gz").finally(() => {
+    const extraction = withinTestDeadline(
+      extractArchiveSafely(archivePath, dest, "tar.gz"),
+    ).finally(() => {
       settled = true;
     });
     const finished = extraction.then(() => null);
@@ -134,17 +242,170 @@ describe("extractArchiveSafely", () => {
     expect(readFileSync(join(dest, "bin", "server"), "utf8")).toBe("binary");
   });
 
+  test("extracts a valid archive with the real asynchronous tools", async () => {
+    const root = createStagingFixture();
+    const source = join(root, "source");
+    mkdirSync(join(source, "bin"), { recursive: true });
+    writeFileSync(join(source, "bin", "server"), "binary");
+    const archivePath = join(root, "server.tar.gz");
+    createTarFixture(archivePath, source);
+    const dest = join(root, "extract");
+
+    await withArchiveDiagnostics(() => extractArchiveSafely(archivePath, dest, "tar.gz"));
+
+    expect(readFileSync(join(dest, "bin", "server"), "utf8")).toBe("binary");
+  });
+
   test("a failed extraction leaves no staging directory behind", async () => {
     const root = createStagingFixture();
     const archivePath = join(root, "broken.tar.gz");
     writeFileSync(archivePath, "not an archive");
     const dest = join(root, "extract");
 
-    await expect(extractArchiveSafely(archivePath, dest, "tar.gz")).rejects.toThrow();
+    await expect(
+      withArchiveDiagnostics(() => extractArchiveSafely(archivePath, dest, "tar.gz")),
+    ).rejects.toThrow();
     expect(existsSync(dest)).toBe(false);
     const leftovers = readdirSync(root).filter((entry) => entry.startsWith("extract.staging-"));
     expect(leftovers).toEqual([]);
   });
+});
+
+describe("archive tool deadlines", () => {
+  test.each([
+    "tar.gz",
+    "tar.xz",
+    "zip",
+  ])("bounds every %s list and extraction command", async (archiveType) => {
+    const calls: { args: string[]; options: childProcess.ExecFileOptionsWithStringEncoding }[] = [];
+    const end = () => {};
+    const child = { stdin: { end } } as unknown as childProcess.ChildProcess;
+    const toolMock = spyOn(childProcess, "execFile").mockImplementation(((
+      _command: string,
+      args: string[],
+      options: childProcess.ExecFileOptionsWithStringEncoding,
+      callback: (error: null, stdout: string, stderr: string) => void,
+    ) => {
+      calls.push({ args, options });
+      callback(null, "", "");
+      return child;
+    }) as typeof childProcess.execFile);
+    const stdin = spyOn(child.stdin!, "end");
+    const root = createStagingFixture();
+    try {
+      await extractArchiveSafely(join(root, "archive"), join(root, "extract"), archiveType);
+      expect(calls.map(({ options }) => options.timeout)).toEqual([30_000, 30_000, 180_000]);
+      expect(calls.every(({ options }) => options.killSignal === "SIGKILL")).toBe(true);
+      expect(stdin).toHaveBeenCalledTimes(3);
+    } finally {
+      toolMock.mockRestore();
+    }
+  });
+
+  test("kills a real archive child at its deadline", async () => {
+    await expect(
+      withinTestDeadline(
+        runArchiveTool(process.execPath, ["-e", "setInterval(() => {}, 1000)"], 30),
+      ),
+    ).rejects.toThrow(/timed out after 30 ms/);
+  });
+
+  test("the real-tool test watchdog reports a stalled child", async () => {
+    await expect(
+      withArchiveDiagnostics(async () => {
+        await runArchiveTool(process.execPath, ["-e", "setInterval(() => {}, 1000)"], 30_000);
+      }),
+    ).rejects.toThrow(/test child timed out after 1000 ms/);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a hung tar fixture fails by name before the runner deadline",
+    () => {
+      const root = createStagingFixture();
+      const pidFile = join(root, "tar.pid");
+      writeFileSync(join(root, "tar"), '#!/bin/sh\necho $$ > "$AFT_HANG_PID"\nexec sleep 60\n', {
+        mode: 0o755,
+      });
+      try {
+        // A separate runner is essential: Bun cannot time out a synchronous fixture.
+        const result = spawnSync(
+          process.execPath,
+          [
+            "test",
+            import.meta.path,
+            "--timeout",
+            "5000",
+            "-t",
+            "extracts without blocking the event loop",
+          ],
+          {
+            env: { ...process.env, PATH: `${root}:${process.env.PATH}`, AFT_HANG_PID: pidFile },
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 3_000,
+            killSignal: "SIGKILL",
+          },
+        );
+        expect(
+          result.error,
+          "the fixture must fail itself, not hang until the outer runner is killed",
+        ).toBeUndefined();
+        expect(existsSync(pidFile), "the fake tar must actually run").toBe(true);
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain(
+          "(fail) extractArchiveSafely > extracts without blocking the event loop",
+        );
+        expect(result.stderr).toMatch(/ETIMEDOUT|timed out/);
+      } finally {
+        if (existsSync(pidFile)) {
+          try {
+            process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+          } catch {
+            /* The fixture deadline may already have killed tar. */
+          }
+        }
+      }
+    },
+  );
+
+  test("rejects when child exit never delivers pipe EOF", async () => {
+    const child = {
+      kill: () => true,
+      stdin: { end: () => {}, destroy: () => {} },
+      stdout: { destroy: () => {} },
+      stderr: { destroy: () => {} },
+    };
+    const kill = spyOn(child, "kill");
+    const stdout = spyOn(child.stdout, "destroy");
+    const stderr = spyOn(child.stderr, "destroy");
+    // Model an exited child whose inherited output descriptors never close.
+    const toolMock = spyOn(childProcess, "execFile").mockReturnValue(
+      child as unknown as childProcess.ChildProcess,
+    );
+    try {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await expect(
+          Promise.race([
+            runArchiveTool("tar", ["-tf", "held-pipe.tar"], 30),
+            new Promise<string>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error("archive promise still pending after 200 ms")),
+                200,
+              );
+            }),
+          ]),
+        ).rejects.toThrow(/tar.*-tf.*timed out.*30/);
+      } finally {
+        clearTimeout(timer);
+      }
+      expect(kill).toHaveBeenCalledWith("SIGKILL");
+      expect(stdout).toHaveBeenCalled();
+      expect(stderr).toHaveBeenCalled();
+    } finally {
+      toolMock.mockRestore();
+    }
+  }, 500);
 });
 
 function writeFakeZipWithUncompressedSize(path: string, uncompressedSize: number): void {

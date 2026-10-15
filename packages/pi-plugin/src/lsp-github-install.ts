@@ -836,22 +836,42 @@ function assertArchiveEntryPath(entry: string): void {
   }
 }
 
+const ARCHIVE_LIST_TIMEOUT_MS = 30_000;
+
 /**
  * Run an archive tool without blocking the host's event loop. Listing and
  * extracting a large LSP archive can take minutes (the extract timeout is
  * 180 s); a synchronous call froze every other plugin hook for that long.
  */
-function runArchiveTool(command: string, args: string[], timeout?: number): Promise<string> {
+function runArchiveTool(command: string, args: string[], timeout: number): Promise<string> {
   return new Promise((resolvePromise, reject) => {
-    execFile(
-      command,
-      args,
-      { encoding: "utf8", ...(timeout !== undefined ? { timeout } : {}) },
-      (err, stdout) => {
-        if (err) reject(err);
-        else resolvePromise(stdout);
-      },
-    );
+    let child: ReturnType<typeof execFile> | undefined;
+    // execFile's callback waits for pipe EOF, even after the direct child exits.
+    // An inherited descriptor must not keep the install promise alive forever.
+    const deadline = setTimeout(() => {
+      reject(new Error(`${command} ${args[0]} timed out after ${timeout} ms`));
+      child?.kill("SIGKILL");
+      child?.stdin?.destroy();
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+    }, timeout);
+    try {
+      child = execFile(
+        command,
+        args,
+        { encoding: "utf8", timeout, killSignal: "SIGKILL" },
+        (err, stdout) => {
+          clearTimeout(deadline);
+          if (err) reject(err);
+          else resolvePromise(stdout);
+        },
+      );
+      // Archive tools use explicit file arguments; none should wait for input.
+      child.stdin?.end();
+    } catch (error) {
+      clearTimeout(deadline);
+      reject(error);
+    }
   });
 }
 
@@ -868,7 +888,7 @@ async function runTarExtraction(args: string[], timeout: number): Promise<void> 
 
 async function precheckWithTar(archivePath: string, command: string): Promise<number> {
   let totalBytes = 0;
-  const verbose = await runArchiveTool(command, ["-tvf", archivePath]);
+  const verbose = await runArchiveTool(command, ["-tvf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
   for (const line of verbose.split("\n")) {
     // Both bsdtar and GNU tar render hardlinks with a leading `h` type marker.
     // Reject them before extraction because the extracted inode cannot reveal
@@ -885,7 +905,7 @@ async function precheckWithTar(archivePath: string, command: string): Promise<nu
     }
   }
 
-  const names = await runArchiveTool(command, ["-tf", archivePath]);
+  const names = await runArchiveTool(command, ["-tf", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
   for (const entry of names.split("\n")) {
     if (entry.length > 0) assertArchiveEntryPath(entry);
   }
@@ -899,10 +919,10 @@ export async function precheckArchiveContents(
 ): Promise<void> {
   let totalBytes = 0;
   if (archiveType === "zip" && zipListingMode === "platform" && process.platform !== "win32") {
-    const out = await runArchiveTool("unzip", ["-l", archivePath]);
+    const out = await runArchiveTool("unzip", ["-l", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
     const match = out.match(/^\s*(\d+)\s+\d+\s+files?\s*$/m);
     if (match) totalBytes = Number.parseInt(match[1] ?? "0", 10);
-    const names = await runArchiveTool("unzip", ["-Z1", archivePath]);
+    const names = await runArchiveTool("unzip", ["-Z1", archivePath], ARCHIVE_LIST_TIMEOUT_MS);
     for (const entry of names.split("\n")) {
       if (entry.length > 0) assertArchiveEntryPath(entry);
     }
@@ -1505,4 +1525,5 @@ export {
   type GithubServerSpec,
   type Platform,
   precheckArchiveContents as _precheckArchiveSizeForTesting,
+  runArchiveTool as _runArchiveToolForTesting,
 };
