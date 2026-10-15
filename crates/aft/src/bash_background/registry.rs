@@ -3376,6 +3376,14 @@ impl BgTaskRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(task_id.clone());
+        // Scope discovery and revocation enumerate the watchdog map. Publish
+        // there before releasing the wrapper so a close cannot miss a command
+        // that has already started but whose spawn dispatch has not returned.
+        self.inner
+            .watchdog_tasks
+            .lock()
+            .map_err(|_| "background watchdog lock poisoned")?
+            .insert(task_id.clone(), Arc::clone(&task));
         // Admission is now represented by the registered task, not this lock.
         // A kill while startup is paused must let another background call start.
         drop(_admission);
@@ -3439,12 +3447,6 @@ impl BgTaskRegistry {
                 }
             }
         }
-        self.inner
-            .watchdog_tasks
-            .lock()
-            .map_err(|_| "background watchdog lock poisoned")?
-            .insert(task_id.clone(), task);
-
         Ok(task_id)
     }
 

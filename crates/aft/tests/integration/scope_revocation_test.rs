@@ -521,6 +521,17 @@ async fn wait_dead(pid: u32) {
 
 #[cfg(unix)]
 struct ChildCleanup(u32);
+
+#[cfg(all(unix, feature = "test-timing-hooks"))]
+struct GateCleanup(std::path::PathBuf);
+
+#[cfg(all(unix, feature = "test-timing-hooks"))]
+impl Drop for GateCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[cfg(unix)]
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
@@ -579,7 +590,14 @@ fn close_case(name: &'static str, case: CloseCase) {
             // The bridge fixture serializes environment changes; production
             // builds ignore these knobs and retain their 10 s / 60 s bounds.
             #[cfg(feature = "test-timing-hooks")]
-            let _poll = set_test_env("AFT_TEST_SCOPE_POLL_MS", "500");
+            let _poll = set_test_env(
+                "AFT_TEST_SCOPE_POLL_MS",
+                if matches!(case, CloseCase::NonRun) {
+                    "60000"
+                } else {
+                    "500"
+                },
+            );
             #[cfg(feature = "test-timing-hooks")]
             let _timeout = set_test_env(
                 "AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS",
@@ -607,6 +625,21 @@ fn close_case(name: &'static str, case: CloseCase) {
                     sampled.to_str().unwrap(),
                 );
                 Some((gate, sampled, gate_env, sampled_env))
+            } else {
+                None
+            };
+            #[cfg(feature = "test-timing-hooks")]
+            let classic_startup = if matches!(case, CloseCase::NonRun) {
+                let gate = daemon.root1.join("after-create.gate");
+                let sampled = daemon.root1.join("goodbye-sampled");
+                std::fs::write(&gate, "hold").unwrap();
+                let gate_env =
+                    set_test_env("AFT_TEST_BASH_AFTER_CREATE_GATE", gate.to_str().unwrap());
+                let sampled_env = set_test_env(
+                    "AFT_TEST_SCOPE_GOODBYE_SAMPLED_FILE",
+                    sampled.to_str().unwrap(),
+                );
+                Some((GateCleanup(gate), sampled, gate_env, sampled_env))
             } else {
                 None
             };
@@ -652,6 +685,12 @@ fn close_case(name: &'static str, case: CloseCase) {
                 );
                 std::fs::remove_file(gate).unwrap();
             }
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some((gate, _, _, _)) = &classic_startup {
+                // This checkpoint follows bootstrap release, so observing the
+                // command's PID is safe even while spawn dispatch is paused.
+                wait_test_marker(&gate.0.with_extension("held")).await;
+            }
             let pid = child_pid(&pid_path).await;
             let _cleanup = ChildCleanup(pid);
             assert!(
@@ -672,6 +711,15 @@ fn close_case(name: &'static str, case: CloseCase) {
                 1
             };
             send_route_goodbye(&mut daemon.stream, first_close, 200).await;
+            #[cfg(feature = "test-timing-hooks")]
+            if let Some((gate, sampled, _, _)) = &classic_startup {
+                // Goodbye must see the started command before spawn dispatch
+                // returns; the regular 60 s poll cannot rescue a missed close.
+                wait_test_marker(sampled).await;
+                assert_eq!(std::fs::read_to_string(sampled).unwrap(), "1");
+                // Revocation runs on the same actor as spawn dispatch.
+                std::fs::remove_file(&gate.0).unwrap();
+            }
             #[cfg(feature = "test-timing-hooks")]
             if let Some((_, sampled, _, _)) = &registration {
                 wait_test_marker(sampled).await;
