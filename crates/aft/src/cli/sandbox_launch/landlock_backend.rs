@@ -61,6 +61,7 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
         .validate_grants(
             profile.read_allow.iter().map(PathBuf::as_path),
             &profile.data_policy.read_allow,
+            &profile.writable_files,
         )
         .map_err(|error| error.to_string())?;
     profile
@@ -71,6 +72,7 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
                 .into_iter()
                 .chain(profile.writable_files.iter().map(PathBuf::as_path)),
             &profile.data_policy.write_allow,
+            &profile.writable_files,
         )
         .map_err(|error| error.to_string())?;
     let yama_same_uid_exposed = yama_same_uid_exposed();

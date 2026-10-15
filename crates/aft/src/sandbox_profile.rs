@@ -21,15 +21,23 @@ pub struct SandboxDataPolicy {
 }
 
 impl SandboxDataPolicy {
-    fn canonicalize(self) -> Result<Self, SandboxProfileError> {
+    fn canonicalize(self, exact_files: &[PathBuf]) -> Result<Self, SandboxProfileError> {
         for path in &self.read_metadata_allow {
             validate_absolute(path, "data_policy.read_metadata_allow")?;
             validate_normalized(path, "data_policy.read_metadata_allow")?;
         }
         Ok(Self {
             deny: canonicalize_optional_paths(self.deny, "data_policy.deny", &mut HashMap::new())?,
-            read_allow: canonicalize_required_paths(self.read_allow, "data_policy.read_allow")?,
-            write_allow: canonicalize_required_paths(self.write_allow, "data_policy.write_allow")?,
+            read_allow: canonicalize_data_allows(
+                self.read_allow,
+                exact_files,
+                "data_policy.read_allow",
+            )?,
+            write_allow: canonicalize_data_allows(
+                self.write_allow,
+                exact_files,
+                "data_policy.write_allow",
+            )?,
             read_metadata_allow: self.read_metadata_allow,
         })
     }
@@ -40,12 +48,19 @@ impl SandboxDataPolicy {
         &self,
         grants: impl IntoIterator<Item = &'a Path>,
         exceptions: &[PathBuf],
+        exact_files: &[PathBuf],
     ) -> Result<(), SandboxProfileError> {
         for grant in grants {
             for deny in &self.deny {
                 if (grant.starts_with(deny) || deny.starts_with(grant))
                     && !exceptions.iter().any(|allow| {
-                        grant.starts_with(allow) && allow.starts_with(deny) && allow != deny
+                        allow.starts_with(deny)
+                            && allow != deny
+                            && if exact_files.contains(allow) {
+                                grant == allow
+                            } else {
+                                grant.starts_with(allow)
+                            }
                     })
                 {
                     return Err(SandboxProfileError::new(format!(
@@ -139,8 +154,9 @@ impl SandboxProfile {
     /// Revalidate an inherited profile and canonicalize it in the launcher.
     ///
     /// Missing deny targets remain enforceable by resolving their nearest
-    /// existing ancestor. Explicit read grants and every path that grants write
-    /// access must exist; vanished directory-inventory read grants are omitted.
+    /// existing ancestor. Directory grants and ordinary explicit read grants must
+    /// exist; exact files need only their parent. Missing inventory and exact-file
+    /// read grants are omitted on backends that require existing files.
     pub fn canonicalize_for_launch(self) -> Result<Self, SandboxProfileError> {
         if self.v != SANDBOX_PROFILE_VERSION {
             return Err(SandboxProfileError::new(format!(
@@ -150,13 +166,14 @@ impl SandboxProfile {
         }
 
         let mut deny_paths = HashMap::new();
+        let writable_files = canonicalize_files(self.writable_files, "writable_files")?;
         let (read_allow, read_allow_listed) =
-            canonicalize_read_grants(self.read_allow, self.read_allow_listed)?;
+            canonicalize_read_grants(self.read_allow, self.read_allow_listed, &writable_files)?;
         Ok(Self {
             v: self.v,
-            data_policy: self.data_policy.canonicalize()?,
+            data_policy: self.data_policy.canonicalize(&writable_files)?,
             writable_roots: canonicalize_required_dirs(self.writable_roots, "writable_roots")?,
-            writable_files: canonicalize_files(self.writable_files, "writable_files")?,
+            writable_files,
             write_deny: canonicalize_optional_paths(
                 self.write_deny,
                 "write_deny",
@@ -295,9 +312,47 @@ fn canonicalize_required_paths(
     Ok(canonical)
 }
 
+/// Exact-file exceptions share the writable-file provenance, so a transient Git
+/// lock never becomes a required path or resolves through its final symlink.
+fn canonicalize_data_allows(
+    paths: Vec<PathBuf>,
+    exact_files: &[PathBuf],
+    field: &str,
+) -> Result<Vec<PathBuf>, SandboxProfileError> {
+    let mut canonical = Vec::new();
+    let mut required = Vec::new();
+    for path in paths {
+        if let Some(file) = canonicalize_exact_file(&path, exact_files, field)? {
+            canonical.push(file);
+        } else {
+            required.push(path);
+        }
+    }
+    canonical.extend(canonicalize_required_paths(required, field)?);
+    canonical.sort_unstable();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn canonicalize_exact_file(
+    path: &Path,
+    exact_files: &[PathBuf],
+    field: &str,
+) -> Result<Option<PathBuf>, SandboxProfileError> {
+    if !exact_files
+        .iter()
+        .any(|file| file.file_name() == path.file_name())
+    {
+        return Ok(None);
+    }
+    let mut files = canonicalize_files(vec![path.to_path_buf()], field)?;
+    Ok(files.pop().filter(|file| exact_files.contains(file)))
+}
+
 fn canonicalize_read_grants(
     paths: Vec<PathBuf>,
     listed: Vec<PathBuf>,
+    exact_files: &[PathBuf],
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), SandboxProfileError> {
     let inventory = listed.into_iter().collect::<BTreeSet<_>>();
     let path_set = paths.iter().collect::<BTreeSet<_>>();
@@ -311,6 +366,13 @@ fn canonicalize_read_grants(
     let mut required = BTreeSet::new();
     for path in paths {
         validate_absolute(&path, "read_allow")?;
+        if let Some(resolved) = canonicalize_exact_file(&path, exact_files, "read_allow")? {
+            if resolved.is_file() {
+                canonical_listed.push(resolved.clone());
+                canonical.push(resolved);
+            }
+            continue;
+        }
         let from_listing = inventory.contains(&path);
         let resolved = match canonicalize_path(&path) {
             Ok(resolved) => resolved,
@@ -520,6 +582,118 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_file_exceptions_survive_disappearing_locks_without_widening() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let common = root.join("main/.git");
+        std::fs::create_dir_all(&common).unwrap();
+        let files =
+            ["packed-refs", "packed-refs.lock", "packed-refs.new"].map(|name| common.join(name));
+        let mut profile = SandboxProfile::build(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            root.clone(),
+        )
+        .unwrap();
+        profile.writable_files = files.to_vec();
+        profile.data_policy = SandboxDataPolicy {
+            deny: vec![common.clone()],
+            read_allow: files.to_vec(),
+            write_allow: files.to_vec(),
+            read_metadata_allow: Vec::new(),
+        };
+        // None of Git's optional files needs to exist at initial profile build.
+        let mut profile = profile.canonicalize_for_launch().unwrap();
+        for file in &files {
+            std::fs::write(file, "temporary Git state").unwrap();
+        }
+        profile.read_allow = files.to_vec();
+        let profile = profile.canonicalize_for_launch().unwrap();
+        let bytes = serde_json::to_vec(&profile).unwrap();
+        for file in &files {
+            std::fs::remove_file(file).unwrap();
+        }
+        // A lock present at build can be gone when the launcher receives it.
+        let transferred: SandboxProfile = serde_json::from_slice(&bytes).unwrap();
+        let profile = transferred.canonicalize_for_launch().unwrap();
+        assert!(profile.read_allow.is_empty());
+        assert_eq!(profile.writable_files.len(), 3);
+        for allows in [
+            &profile.data_policy.read_allow,
+            &profile.data_policy.write_allow,
+        ] {
+            for file in &files {
+                assert!(allows.contains(file));
+                profile
+                    .data_policy
+                    .validate_grants([file.as_path()], allows, &profile.writable_files)
+                    .unwrap();
+            }
+            for path in [
+                common.clone(),
+                common.join("config"),
+                common.join("hooks/post-commit"),
+                common.join("worktrees/sibling"),
+                common.join("packed-refs.other"),
+                common.join("packed-refs.lock/child"),
+                common.join("packed-refs.new/child"),
+            ] {
+                assert!(
+                    profile
+                        .data_policy
+                        .validate_grants([path.as_path()], allows, &profile.writable_files,)
+                        .is_err(),
+                    "unexpected private-store grant: {path:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_file_exceptions_resolve_parent_aliases_but_not_final_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let common = root.join("common");
+        let alias = root.join("alias");
+        std::fs::create_dir(&common).unwrap();
+        symlink(&common, &alias).unwrap();
+        let target = root.join("config");
+        std::fs::write(&target, "protected").unwrap();
+        symlink(&target, common.join("packed-refs.lock")).unwrap();
+        let file = alias.join("packed-refs.lock");
+        let mut profile = SandboxProfile::build(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            root.clone(),
+        )
+        .unwrap();
+        profile.writable_files = vec![common.join("packed-refs.lock")];
+        profile.read_allow = vec![file.clone()];
+        profile.data_policy = SandboxDataPolicy {
+            read_allow: vec![file.clone()],
+            write_allow: vec![file],
+            ..Default::default()
+        };
+        let profile = profile.canonicalize_for_launch().unwrap();
+        assert_eq!(profile.data_policy.read_allow, profile.writable_files);
+        assert_eq!(profile.data_policy.write_allow, profile.writable_files);
+        assert_eq!(profile.read_allow, profile.writable_files);
+        assert!(!profile.data_policy.read_allow.contains(&target));
+    }
+
+    #[test]
     fn private_store_lock_exception_stays_a_single_file_after_transfer() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().canonicalize().unwrap().join("store");
@@ -532,18 +706,18 @@ mod tests {
             write_allow: vec![lock.clone()],
             read_metadata_allow: Vec::new(),
         }
-        .canonicalize()
+        .canonicalize(&[])
         .unwrap();
         let transferred: SandboxDataPolicy =
             serde_json::from_slice(&serde_json::to_vec(&policy).unwrap()).unwrap();
-        let transferred = transferred.canonicalize().unwrap();
+        let transferred = transferred.canonicalize(&[]).unwrap();
         assert_eq!(transferred, policy);
         assert!(policy
-            .validate_grants([lock.as_path()], &policy.write_allow)
+            .validate_grants([lock.as_path()], &policy.write_allow, &[])
             .is_ok());
         for path in [&store, &store.join("other.lock")] {
             assert!(policy
-                .validate_grants([path.as_path()], &policy.write_allow)
+                .validate_grants([path.as_path()], &policy.write_allow, &[])
                 .is_err());
         }
     }
@@ -563,14 +737,14 @@ mod tests {
         };
         for allowed in [&own, &io, &own.join("new-file"), &io.join("temp")] {
             policy
-                .validate_grants([allowed.as_path()], &policy.read_allow)
+                .validate_grants([allowed.as_path()], &policy.read_allow, &[])
                 .unwrap();
             policy
-                .validate_grants([allowed.as_path()], &policy.write_allow)
+                .validate_grants([allowed.as_path()], &policy.write_allow, &[])
                 .unwrap();
         }
         policy
-            .validate_grants([hooks.as_path()], &policy.read_allow)
+            .validate_grants([hooks.as_path()], &policy.read_allow, &[])
             .unwrap();
         for denied in [
             store.clone(),
@@ -581,7 +755,7 @@ mod tests {
         ] {
             assert!(
                 policy
-                    .validate_grants([denied.as_path()], &policy.write_allow)
+                    .validate_grants([denied.as_path()], &policy.write_allow, &[])
                     .is_err(),
                 "{}",
                 denied.display()
@@ -589,7 +763,7 @@ mod tests {
         }
         assert!(
             policy
-                .validate_grants([store.as_path()], &[store.clone()])
+                .validate_grants([store.as_path()], &[store.clone()], &[])
                 .is_err(),
             "a whole-store exception must fail closed"
         );
@@ -973,9 +1147,12 @@ mod tests {
         let alias = root.join("listed-alias");
         std::fs::write(&explicit, "required").unwrap();
         std::os::unix::fs::symlink(&explicit, &alias).unwrap();
-        let (paths, listed) =
-            canonicalize_read_grants(vec![explicit.clone(), alias.clone()], vec![alias.clone()])
-                .unwrap();
+        let (paths, listed) = canonicalize_read_grants(
+            vec![explicit.clone(), alias.clone()],
+            vec![alias.clone()],
+            &[],
+        )
+        .unwrap();
         assert_eq!(paths, vec![explicit]);
         assert!(
             listed.is_empty(),
@@ -983,7 +1160,7 @@ mod tests {
         );
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink(&alias, &alias).unwrap();
-        assert!(canonicalize_read_grants(vec![alias.clone()], vec![alias]).is_err());
+        assert!(canonicalize_read_grants(vec![alias.clone()], vec![alias], &[]).is_err());
     }
 
     #[test]

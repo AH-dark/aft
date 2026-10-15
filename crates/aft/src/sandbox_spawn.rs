@@ -1653,11 +1653,11 @@ fn build_native_profile(
             policy
                 .private_stores
                 .read_allow
-                .extend(jail.files.iter().filter(|path| path.exists()).cloned());
+                .extend(jail.files.iter().cloned());
             policy
                 .private_stores
                 .write_allow
-                .extend(jail.files.iter().filter(|path| path.exists()).cloned());
+                .extend(jail.files.iter().cloned());
             shell_write_deny.extend(jail.read_only.iter().cloned());
             cache_roots.extend(jail.caches.iter().cloned());
             cache_roots.sort_unstable();
@@ -2958,6 +2958,7 @@ fn compute_linux_profile(
         .validate_grants(
             profile.write_allow_roots(),
             &profile.data_policy.write_allow,
+            &profile.writable_files,
         )
         .map_err(|error| error.to_string())?;
 
@@ -3013,6 +3014,7 @@ fn compute_linux_profile(
         .data_policy
         .read_allow
         .iter()
+        .filter(|path| !profile.writable_files.contains(path) || path.is_file())
         .map(|path| IntendedReadGrant {
             path: path.clone(),
             force_children: false,
@@ -3047,6 +3049,7 @@ fn compute_linux_profile(
         .validate_grants(
             grants.iter().map(PathBuf::as_path),
             &profile.data_policy.read_allow,
+            &profile.writable_files,
         )
         .map_err(|error| error.to_string())?;
     profile.read_allow = grants;
@@ -3096,6 +3099,7 @@ fn add_linux_payload_read_grants(
         .validate_grants(
             final_read_allow.iter().map(PathBuf::as_path),
             &profile.data_policy.read_allow,
+            &profile.writable_files,
         )
         .map_err(|error| error.to_string())?;
     assert!(
@@ -5405,6 +5409,26 @@ mod policy_tests {
             let refused = common.join(name);
             assert!(!grants.files.contains(&refused));
             assert!(!grants.roots.iter().any(|root| refused.starts_with(root)));
+        }
+
+        // A lock can disappear between collecting private-store exceptions and
+        // canonicalizing the profile, or before the launcher revalidates it.
+        let mut policy = policy;
+        policy.private_stores.read_allow.extend(files.clone());
+        policy.private_stores.write_allow.extend(files.clone());
+        let mut profile = policy
+            .compile_shell(home.clone(), Vec::new(), Vec::new())
+            .unwrap();
+        profile.writable_roots.extend(grants.roots);
+        profile.writable_files = grants.files;
+        let profile = profile.canonicalize_for_launch().unwrap();
+        let transferred: SandboxProfile =
+            serde_json::from_slice(&serde_json::to_vec(&profile).unwrap()).unwrap();
+        assert_eq!(transferred.canonicalize_for_launch().unwrap(), profile);
+        for file in &files {
+            assert!(profile.writable_files.contains(file));
+            assert!(profile.data_policy.read_allow.contains(file));
+            assert!(profile.data_policy.write_allow.contains(file));
         }
     }
 

@@ -111,6 +111,10 @@ impl Jail {
     }
 
     async fn start_with_sccache(port: Option<u16>, uds: Option<&Path>) -> Self {
+        Self::start_with_options(port, uds, true).await
+    }
+
+    async fn start_with_options(port: Option<u16>, uds: Option<&Path>, pack_refs: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let home = base.join("home");
@@ -203,7 +207,9 @@ impl Jail {
             &main,
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
-        git(&main, &["pack-refs", "--all"]);
+        if pack_refs {
+            git(&main, &["pack-refs", "--all"]);
+        }
 
         // Co-author attribution on, so AFT's managed Git hooks are in play.
         std::fs::create_dir_all(xdg.join("config/cortexkit")).unwrap();
@@ -739,6 +745,21 @@ async fn worker_jail_spawns_with_dangling_socket_deny() {
     let reply = jail.bash("echo DANGLING_SOCKET_$((1+1))").await;
     assert!(reply.contains("DANGLING_SOCKET_2"), "{reply}");
     assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn worker_jail_shell_runs_without_any_packed_refs_files() {
+    let mut jail = Jail::start_with_options(None, None, false).await;
+    let common = jail.main.join(".git");
+    for name in ["packed-refs", "packed-refs.lock", "packed-refs.new"] {
+        assert!(!common.join(name).exists());
+    }
+    let output = jail.bash("printf 'ABSENT_REFS_%s\\n' $((1+1))").await;
+    assert!(
+        output.lines().any(|line| line.trim() == "ABSENT_REFS_2"),
+        "{output}"
+    );
+    assert!(!output.contains("sandbox_unavailable"), "{output}");
 }
 
 #[cfg(target_os = "macos")]

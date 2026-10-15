@@ -71,12 +71,14 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
         "file-write*",
         &profile.data_policy.deny,
         &profile.data_policy.write_allow,
+        &profile.writable_files,
     )?;
     render_data_denies(
         &mut source,
         "file-read*",
         &profile.data_policy.deny,
         &profile.data_policy.read_allow,
+        &profile.writable_files,
     )?;
     // Git resolves the cwd by statting each ancestor. Permit metadata on the
     // exact exception's ancestor chain, not directory contents or sibling data.
@@ -132,6 +134,7 @@ fn render_data_denies(
     operation: &str,
     denies: &[std::path::PathBuf],
     allows: &[std::path::PathBuf],
+    exact_files: &[std::path::PathBuf],
 ) -> Result<(), String> {
     for deny in denies {
         // Exclude only strict descendants. An enclosing project or write_allow
@@ -146,7 +149,11 @@ fn render_data_denies(
         {
             source.push_str(&format!(
                 " (require-not ({} \"{}\"))",
-                read_path_filter(allow),
+                if exact_files.contains(allow) {
+                    "literal"
+                } else {
+                    read_path_filter(allow)
+                },
                 escape_path(allow)?
             ));
         }
@@ -188,6 +195,39 @@ fn escape_path(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_exact_file_carve_outs_are_literal_even_when_not_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path().join("common");
+        std::fs::create_dir(&common).unwrap();
+        let files =
+            ["packed-refs", "packed-refs.lock", "packed-refs.new"].map(|name| common.join(name));
+        let target = dir.path().join("config");
+        std::fs::write(&target, "protected").unwrap();
+        std::fs::create_dir(&files[1]).unwrap();
+        std::os::unix::fs::symlink(&target, &files[2]).unwrap();
+        for operation in ["file-read*", "file-write*"] {
+            let mut source = String::new();
+            render_data_denies(&mut source, operation, &[common.clone()], &files, &files).unwrap();
+            let exceptions = files
+                .iter()
+                .map(|file| {
+                    format!(
+                        " (require-not (literal \"{}\"))",
+                        escape_path(file).unwrap()
+                    )
+                })
+                .collect::<String>();
+            assert_eq!(
+                source,
+                format!(
+                    "(deny {operation} (require-all (subpath \"{}\"){exceptions}))\n",
+                    escape_path(&common).unwrap(),
+                )
+            );
+        }
+    }
 
     #[test]
     fn write_denies_follow_write_allows() {
