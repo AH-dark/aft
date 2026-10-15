@@ -1,6 +1,5 @@
 # Notes for the next release
 
-- Unix piped shells now save their PID before executing user commands. If AFT dies before allowing the waiting wrapper to start the command, recovery reports Failed/"spawn aborted" without a command exit code. On rollback the task remains failed; an older AFT version may show only its task id for a Starting record (as before this release), or `[exit code: -2147483648]` if the record had advanced past Starting.
 - Bash compression: command lists with top-level separators (`cargo test && cargo clippy`, `git add . ; git commit`) now use generic compression instead of the head command's specialized compressor. Previously the specialized compressor silently deleted every later command's output from the response on success — 26.65% of real bash traffic (7-day sample) was affected. Chained commands are now more verbose but complete.
 - aft_outline / aft_zoom: signature lines no longer carry the redundant visibility/kind prefix (`E fn `) — the signature text itself is the information. A minimal `E` marker remains only where exported-ness is not visible in the signature (e.g. TypeScript export lists, Go uppercase exports). ~5.5% mean output reduction on outline, compounding on zoom menus.
 - apply_patch: updates no longer eat one terminal newline from files ending with two or more.
