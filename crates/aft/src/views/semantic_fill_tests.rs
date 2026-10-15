@@ -44,6 +44,8 @@ fn semantic_fill_has_no_derived_writes_or_checkpoint_and_reader_uses_owner() {
     assert!(initial.published);
     assert_eq!(initial.pending_paths, BTreeSet::from([b"lib.rs".to_vec()]));
     let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+    // The initial publish owns a deferred checkpoint; settle it before reopening its database.
+    crate::views::wait_for_derived_checkpoint_for_test(view.view_dir());
     let owner_path = view
         .derived_path(initial.generation.as_deref().unwrap())
         .unwrap();
