@@ -193,6 +193,39 @@ pub fn try_acquire_once(path: &Path) -> Result<LockGuard, AcquireError> {
     try_acquire(path, Duration::ZERO)
 }
 
+/// True when no authoritative live owner blocks acquisition; unreadable or
+/// malformed metadata is an error, not evidence that the lease is available.
+/// This never takes or reclaims a lock. A subsequent acquisition must still
+/// verify ownership because another writer can arrive after this observation.
+pub(crate) fn lock_is_available(path: &Path) -> io::Result<bool> {
+    match read_lock_metadata(path) {
+        Ok(metadata) => Ok(!metadata_blocks_acquisition(
+            &metadata,
+            &current_hostname(),
+            LockConfig::default(),
+            now_ms(),
+        )),
+        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(ReadLockError::Io(error)) => Err(error),
+        Err(ReadLockError::Malformed(error)) => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, error))
+        }
+    }
+}
+
+fn metadata_blocks_acquisition(
+    metadata: &LockMetadata,
+    hostname: &str,
+    config: LockConfig,
+    now: u64,
+) -> bool {
+    if metadata.hostname != hostname {
+        now.saturating_sub(metadata.heartbeat_at_ms) <= config.cross_host_stale_heartbeat_ms()
+    } else {
+        lock_owner_is_alive(metadata)
+    }
+}
+
 pub struct LockGuard {
     path: PathBuf,
     metadata: LockMetadata,
@@ -405,7 +438,7 @@ fn acquire_with_config(
         if metadata.hostname != hostname {
             dead_reclaim_blocked_attempts = 0;
             let cross_host_stale_ms = config.cross_host_stale_heartbeat_ms();
-            if since_heartbeat > cross_host_stale_ms {
+            if !metadata_blocks_acquisition(&metadata, &hostname, config, now) {
                 match reclaim_lock_file(path, &metadata)? {
                     ReclaimResult::Removed => {
                         slog_warn!(
@@ -431,7 +464,7 @@ fn acquire_with_config(
             continue;
         }
 
-        if !lock_owner_is_alive(&metadata) {
+        if !metadata_blocks_acquisition(&metadata, &hostname, config, now) {
             match reclaim_lock_file(path, &metadata)? {
                 ReclaimResult::Removed => {
                     slog_warn!(
@@ -2600,6 +2633,65 @@ mod tests {
         assert_eq!(read_lock_metadata(&path).expect("read lock"), metadata);
 
         remove_lock_file(&path).expect("cleanup synthetic lock");
+    }
+
+    #[test]
+    fn availability_probe_preserves_a_live_owner_with_stale_heartbeat() {
+        let (_dir, path) = test_lock_path();
+        let mut metadata = current_process_metadata();
+        metadata.heartbeat_at_ms = 0;
+        write_synthetic_lock(&path, &metadata);
+        let original = fs::read(&path).unwrap();
+        assert!(!lock_is_available(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn availability_probe_observes_dead_and_missing_owners_without_reclaiming() {
+        let (_dir, path) = test_lock_path();
+        assert!(lock_is_available(&path).unwrap());
+        assert!(!path.exists());
+        let metadata = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &metadata);
+        let original = fs::read(&path).unwrap();
+        assert!(lock_is_available(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn availability_probe_uses_extended_cross_host_heartbeat_policy() {
+        let (_dir, path) = test_lock_path();
+        let mut metadata = synthetic_metadata(
+            999_999_999,
+            format!("other-{}", current_hostname()),
+            now_ms(),
+        );
+        write_synthetic_lock(&path, &metadata);
+        assert!(
+            !lock_is_available(&path).unwrap(),
+            "a local PID probe cannot attest a remote owner"
+        );
+        metadata.heartbeat_at_ms = now_ms().saturating_sub(STALE_HEARTBEAT_MS * 2);
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert!(
+            !lock_is_available(&path).unwrap(),
+            "cross-host reclamation needs the extended threshold"
+        );
+        metadata.heartbeat_at_ms = now_ms().saturating_sub(STALE_HEARTBEAT_MS * 5 + 1_000);
+        fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert!(lock_is_available(&path).unwrap());
+        assert_eq!(read_lock_metadata(&path).unwrap(), metadata);
+    }
+
+    #[test]
+    fn availability_probe_does_not_treat_malformed_metadata_as_available() {
+        let (_dir, path) = test_lock_path();
+        fs::write(&path, b"not-json").unwrap();
+        assert_eq!(
+            lock_is_available(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"not-json");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
