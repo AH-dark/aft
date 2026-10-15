@@ -278,12 +278,24 @@ fn macos_argv0(pid: u32) -> Option<String> {
 /// children. Exit/failure markers belong only to the outer wrapper. Windows
 /// shells have no portable per-segment status equivalent.
 #[cfg(unix)]
+// POSIX command exits cannot produce this signed marker. Windows uses the full
+// 32-bit exit range, so neither this gate nor its marker interpretation is used there.
+pub(crate) const BOOTSTRAP_ABORTED_MARKER: i32 = i32::MIN;
+
+#[cfg(unix)]
 pub(crate) const PAYLOAD_WRAPPER: &[u8] = br#"#!/bin/sh
 shell=$1
 command=$2
 exit_fd=$3
 pipeline_status_path=$4
 pipeline_shell=$5
+if [ "${6-}" = "wait-for-identity" ]; then
+  if ! IFS= read -r __aft_start || [ "$__aft_start" != "run" ]; then
+    printf '%s' '-2147483648' >&"$exit_fd"
+    exit 125
+  fi
+  exec </dev/null
+fi
 case "$pipeline_status_path:$pipeline_shell" in
   ?*:bash)
     "$shell" -c "__aft_pipeline_status=\$1
@@ -538,6 +550,57 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn payload_bootstrap_eof_and_wrong_release_never_execute_command() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::process::{Command, Stdio};
+        for release in [None, Some(b"not-run\n".as_slice())] {
+            let temp = tempfile::tempdir().unwrap();
+            let exit_path = temp.path().join("exit");
+            let exit = std::fs::File::create(&exit_path).unwrap();
+            let failure = std::fs::File::create(temp.path().join("failure")).unwrap();
+            let marker = temp.path().join("must-not-run");
+            let payload = format!("printf ran > '{}'", marker.display());
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    std::str::from_utf8(PAYLOAD_WRAPPER).unwrap(),
+                    "aft-payload-wrapper",
+                    "/bin/sh",
+                    &payload,
+                    "3",
+                    "",
+                    "",
+                    "wait-for-identity",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            crate::sandbox_spawn::apply_marker_fd_allowlist(
+                &mut command,
+                exit.as_raw_fd(),
+                failure.as_raw_fd(),
+            )
+            .unwrap();
+            let mut child = command.spawn().unwrap();
+            let mut input = child.stdin.take().unwrap();
+            if let Some(release) = release {
+                input.write_all(release).unwrap();
+            }
+            drop(input);
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.code(), Some(125));
+            assert!(
+                !marker.exists(),
+                "bootstrap must not run user code without release"
+            );
+            assert_eq!(std::fs::read_to_string(exit_path).unwrap(), "-2147483648");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn payload_wrapper_keeps_control_fds_out_of_user_commands() {
         use std::os::fd::AsRawFd;
         use std::process::Command;
@@ -560,7 +623,7 @@ mod tests {
                 let probe = temp.path().join("probe");
                 // A redirection probe would create Bash's own saved stderr fd
                 // and falsely report it as an inherited control descriptor.
-                std::fs::write(&probe, "#!/bin/bash\nif [ ! -e /dev/fd/1 ] || [ ! -e /dev/fd/2 ]; then\n  echo 'descriptor lookup cannot see open stdio' >&2\n  exit 43\nfi\nfor fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if [ -e \"/dev/fd/$fd\" ]; then\n    echo \"leaked control fd $fd\" >&2\n    exit 42\n  fi\ndone\nprintf clean\n").unwrap();
+                std::fs::write(&probe, "#!/bin/bash\nif [ ! -c /dev/fd/0 ] || IFS= read -r input; then\n  echo 'command stdin was not restored to /dev/null' >&2\n  exit 44\nfi\nif [ ! -e /dev/fd/1 ] || [ ! -e /dev/fd/2 ]; then\n  echo 'descriptor lookup cannot see open stdio' >&2\n  exit 43\nfi\nfor fd in 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do\n  if [ -e \"/dev/fd/$fd\" ]; then\n    echo \"leaked control fd $fd\" >&2\n    exit 42\n  fi\ndone\nprintf clean\n").unwrap();
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
                 let payload = if pipeline {
@@ -582,6 +645,7 @@ mod tests {
                         ""
                     },
                     kind,
+                    "wait-for-identity",
                 ]);
                 crate::sandbox_spawn::apply_marker_fd_allowlist(
                     &mut command,
@@ -589,7 +653,15 @@ mod tests {
                     failure.as_raw_fd(),
                 )
                 .unwrap();
-                let output = command.output().unwrap();
+                use std::io::Write;
+                use std::process::Stdio;
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = command.spawn().unwrap();
+                child.stdin.take().unwrap().write_all(b"run\n").unwrap();
+                let output = child.wait_with_output().unwrap();
                 assert!(
                     output.status.success(),
                     "{shell} pipeline={pipeline}: {}",

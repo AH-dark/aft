@@ -281,7 +281,7 @@ fn pipes_unaffected_by_pty_changes() {
     let task_id = registry
         .spawn(
             aft::sandbox_spawn::SpawnPlan::Unsandboxed,
-            "printf pipe-ok",
+            "test -c /dev/stdin && ! IFS= read -r ignored && printf pipe-ok",
             SESSION.to_string(),
             project.path().to_path_buf(),
             Default::default(),
@@ -532,7 +532,15 @@ fn read_pty_until(path: &std::path::Path, needle: &str, timeout: Duration) -> St
 fn pty_write_to_cat() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
-    let registry = registry();
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        aft::config::Config {
+            project_root: Some(project.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let registry = ctx.bash_background();
     let task_id = spawn_pty_task(
         &registry,
         storage.path(),
@@ -542,14 +550,74 @@ fn pty_write_to_cat() {
     );
     let paths = spawned_paths(storage.path(), &task_id);
 
-    assert_eq!(
-        registry.write_pty(&task_id, SESSION, b"hello\n").unwrap(),
-        6
-    );
+    let request = aft::protocol::RawRequest {
+        id: "write-cat".into(),
+        command: "bash_write".into(),
+        lsp_hints: None,
+        session_id: Some(SESSION.into()),
+        params: serde_json::json!({"task_id":task_id,"input":"hello\n"}),
+    };
+    let response = aft::commands::bash_write::handle(&request, &ctx);
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["bytes_written"], 6);
     let output = read_pty_until(&paths.pty, "hello", Duration::from_secs(2));
     assert!(output.contains("hello"));
     registry.kill(&task_id, SESSION).unwrap();
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_interactive_shell_keeps_terminal_stdin() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        aft::config::Config {
+            project_root: Some(project.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let registry = ctx.bash_background();
+    let task_id = spawn_pty_task(
+        registry,
+        storage.path(),
+        project.path(),
+        "test -t 0 && printf 'tty-%s\\n' present; /bin/bash --noprofile --norc -i",
+        Duration::from_secs(30),
+    );
+    let paths = spawned_paths(storage.path(), &task_id);
+    read_pty_until(&paths.pty, "tty-present", Duration::from_secs(2));
+    let request = aft::protocol::RawRequest {
+        id: "interactive-input".into(),
+        command: "bash_write".into(),
+        lsp_hints: None,
+        session_id: Some(SESSION.into()),
+        params: serde_json::json!({"task_id":task_id,"input":"printf 'interactive-%s\\n' ok\nexit\n"}),
+    };
+    let response = aft::commands::bash_write::handle(&request, &ctx);
+    assert!(response.success, "{response:?}");
+    // The output token is not present verbatim in the echoed input command.
+    read_pty_until(&paths.pty, "interactive-ok", Duration::from_secs(2));
+    wait_for_status(registry, &task_id, BgTaskStatus::Completed);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_piped_stdin_remains_eof_without_bootstrap_gate() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = registry.spawn(aft::sandbox_spawn::SpawnPlan::Unsandboxed,
+        "if ([Console]::OpenStandardInput().ReadByte() -ne -1) { exit 42 }; [Console]::Write('stdin-eof')",
+        SESSION.into(), project.path().to_path_buf(), Default::default(),
+        aft::bash_background::HardKill::After(Duration::from_secs(30)), storage.path().to_path_buf(), 10, true, false, Some(project.path().to_path_buf())).unwrap();
+    let snapshot = wait_for_status(&registry, &task_id, BgTaskStatus::Completed);
+    assert!(
+        snapshot.output_preview.contains("stdin-eof"),
+        "{snapshot:?}"
+    );
 }
 
 #[cfg(windows)]

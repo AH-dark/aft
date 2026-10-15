@@ -375,6 +375,10 @@ fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, Harn
             "AFT_TEST_RECOVERED_STDOUT_READ_FAILURE_FILE",
             root.join("recovered-stdout-read-failure"),
         )
+        .env(
+            "AFT_TEST_BASH_AFTER_CREATE_GATE",
+            root.join("after-create-gate"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
@@ -1670,6 +1674,16 @@ async fn s1_unarmed_shell_commits_both_held_states_and_replays_before_injections
 
 #[tokio::test]
 async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
+    restart_recovers_shell_once(false).await;
+}
+
+#[cfg(all(unix, feature = "test-timing-hooks"))]
+#[tokio::test]
+async fn s1_restart_recovers_child_created_before_running_record() {
+    restart_recovers_shell_once(true).await;
+}
+
+async fn restart_recovers_shell_once(hold_running_record: bool) {
     use aft::db::call_ledger::{self as ledger, Key, ScopeIdentity, State};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
@@ -1687,8 +1701,26 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
     .await;
     let started = root.join("project/started");
     let finished = root.join("project/finished");
+    let release = root.join("project/release-recovered-output");
+    struct ReleaseOutput(PathBuf);
+    impl Drop for ReleaseOutput {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"release");
+        }
+    }
+    let _release_on_failure = ReleaseOutput(release.clone());
+    let gate = root.join("after-create-gate");
+    let wait = if hold_running_record {
+        std::fs::write(&gate, b"hold").unwrap();
+        format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done",
+            release.display().to_string().replace('\'', "'\\''")
+        )
+    } else {
+        "sleep 2".to_string()
+    };
     let command = format!(
-        "{}; sleep 2; printf recovered-output; {}",
+        "{}; {wait}; printf recovered-output; {}",
         marker_command(&started),
         marker_command(&finished)
     );
@@ -1732,6 +1764,23 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
     })
     .await
     .unwrap();
+    let checkpoint = if hold_running_record {
+        wait_for_file(&gate.with_extension("held")).await;
+        let checkpoint: Value =
+            serde_json::from_slice(&std::fs::read(gate.with_extension("held")).unwrap()).unwrap();
+        let metadata: Value = serde_json::from_slice(
+            &std::fs::read(checkpoint["metadata_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["status"], "starting");
+        assert!(aft::bash_background::process::is_process_alive(
+            checkpoint["child_pid"].as_u64().unwrap() as u32
+        ));
+        eprintln!("live child before parent kill: {checkpoint}; persisted task: {metadata}");
+        Some(checkpoint)
+    } else {
+        None
+    };
     drop(wire);
     drop(process);
     let path = ledger_database(&root);
@@ -1765,7 +1814,36 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
     drop(conn);
     let process = Subject::head().restart(&root).await.unwrap();
     let route = Subject::head().route(&process, &stamp).await.unwrap();
-    let response = route.raw(body, false).await;
+    let response = if let Some(checkpoint) = checkpoint {
+        let task_path = Path::new(checkpoint["metadata_path"].as_str().unwrap());
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let metadata: Value =
+                    serde_json::from_slice(&std::fs::read(task_path).unwrap()).unwrap();
+                if metadata["status"] != "starting" {
+                    break metadata;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("created child was not recovered");
+        assert!(
+            aft::bash_background::process::is_process_alive(
+                checkpoint["child_pid"].as_u64().unwrap() as u32
+            ),
+            "detached child died with the old parent"
+        );
+        assert_eq!(
+            recovered["status"], "running",
+            "live child must remain running across restart: {recovered}"
+        );
+        let mut replay = route.start(body).await;
+        std::fs::write(&release, b"release").unwrap();
+        replay.terminal(Duration::from_secs(30)).await
+    } else {
+        route.raw(body, false).await
+    };
     assert_eq!(response.header.ty, FrameType::Response);
     assert_eq!(response_json(&response)["isError"], false);
     assert!(

@@ -3234,7 +3234,7 @@ impl BgTaskRegistry {
             return Err(error);
         }
         self.dual_write_task(&paths, &metadata);
-        let child = match spawn_detached_child(
+        let mut child = match spawn_detached_child(
             &spawn_plan,
             command,
             shell,
@@ -3263,6 +3263,46 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        // The wrapper cannot execute the command until its identity is durable.
+        // Keep Starting here so a failed later Running write still leaves a
+        // recoverable PID checkpoint in the existing record format.
+        metadata.child_pid = Some(child_pid);
+        metadata.pgid = Some(child_pid as i32);
+        if let Err(error) = self.persist_task(&paths, &metadata) {
+            drop(child.stdin.take());
+            let _ = child.wait();
+            metadata.mark_terminal(
+                BgTaskStatus::Failed,
+                None,
+                Some("spawn aborted".to_string()),
+            );
+            let _ = self.persist_task(&paths, &metadata);
+            return Err(format!(
+                "failed to persist background task metadata: {error}"
+            ));
+        }
+        if let Some(mut release) = child.stdin.take() {
+            if let Err(error) = release.write_all(b"run\n") {
+                crate::slog_warn!("background task {task_id} bootstrap release failed: {error}");
+            }
+        }
+        #[cfg(feature = "test-timing-hooks")]
+        if let Some(gate) = std::env::var_os("AFT_TEST_BASH_AFTER_CREATE_GATE") {
+            let gate = PathBuf::from(gate);
+            if gate.exists() {
+                std::fs::write(
+                    gate.with_extension("held"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "task_id": task_id, "child_pid": child_pid, "metadata_path": paths.json,
+                    }))
+                    .unwrap(),
+                )
+                .expect("publish child-created recovery checkpoint");
+                while gate.exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
         log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
         metadata.mark_running(child_pid, child_pid as i32);
         if crate::privacy_spawn::requested(&env) {
@@ -4476,6 +4516,10 @@ impl BgTaskRegistry {
                     if disk.remote.is_some()
                         || disk.local_fallback_started
                         || metadata.remote.is_some()
+                        || (metadata.status == BgTaskStatus::Starting
+                            && disk.started_at == metadata.started_at
+                            && disk.harness == metadata.harness
+                            && (disk.child_pid.is_some() || disk.pgid.is_some()))
                     {
                         metadata = disk;
                     }
@@ -4577,11 +4621,22 @@ impl BgTaskRegistry {
         match metadata.status {
             BgTaskStatus::Starting => {
                 let completion_was_delivered = metadata.completion_delivered;
-                metadata.mark_terminal(
-                    BgTaskStatus::Failed,
-                    None,
-                    Some("spawn aborted".to_string()),
-                );
+                if let Ok(Some(marker)) = read_exit_marker(&paths) {
+                    metadata = terminal_metadata_from_marker(metadata, marker, None);
+                } else if Self::persisted_task_process_is_alive(&metadata) {
+                    crate::slog_info!("background task {} replay Starting -> Running: durable child identity child_pid={:?} pgid={:?}", metadata.task_id, metadata.child_pid, metadata.pgid);
+                    metadata.status = BgTaskStatus::Running;
+                } else if metadata.child_pid.is_some() || metadata.pgid.is_some() {
+                    let reason = restart_fate_unknown_reason(&metadata, &paths);
+                    metadata.mark_terminal(BgTaskStatus::FateUnknown, None, Some(reason));
+                } else {
+                    crate::slog_warn!("background task {} replay Starting -> Failed: spawn aborted; no child identity was released", metadata.task_id);
+                    metadata.mark_terminal(
+                        BgTaskStatus::Failed,
+                        None,
+                        Some("spawn aborted".to_string()),
+                    );
+                }
                 metadata.completion_delivered |= completion_was_delivered;
                 let _ = self.persist_task(&paths, &metadata);
                 self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
@@ -10649,6 +10704,15 @@ fn terminal_metadata_from_marker(
 ) -> PersistedTask {
     match marker {
         ExitMarker::Code(code) => {
+            #[cfg(unix)]
+            if metadata.mode == BgMode::Pipes && code == super::process::BOOTSTRAP_ABORTED_MARKER {
+                metadata.mark_terminal(
+                    BgTaskStatus::Failed,
+                    None,
+                    Some("spawn aborted".to_string()),
+                );
+                return metadata;
+            }
             let status = if code == 0 {
                 BgTaskStatus::Completed
             } else {
@@ -10861,6 +10925,7 @@ fn spawn_detached_child(
             OsString::from(crate::sandbox_spawn::CHILD_EXIT_FD.to_string()),
             pipeline_status_path,
             OsString::from(pipeline_shell),
+            OsString::from("wait-for-identity"),
         ];
         #[cfg(target_os = "linux")]
         let (executable, args) = if linux_scope {
@@ -10900,7 +10965,7 @@ fn spawn_detached_child(
         )?;
         child_command
             .current_dir(workdir)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         crate::agent_child_env::apply_to_command(&mut child_command, env);
@@ -12427,6 +12492,29 @@ mod tests {
         let preview = &completions[0].output_preview;
         assert!(preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
         assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bootstrap_abort_marker_is_never_started_without_command_exit_code() {
+        let metadata = PersistedTask::starting(
+            random_slug(),
+            "session".into(),
+            "unused".into(),
+            PathBuf::from("/tmp"),
+            None,
+            None,
+            false,
+            false,
+        );
+        let terminal = terminal_metadata_from_marker(
+            metadata,
+            ExitMarker::Code(super::super::process::BOOTSTRAP_ABORTED_MARKER),
+            None,
+        );
+        assert_eq!(terminal.status, BgTaskStatus::Failed);
+        assert_eq!(terminal.status_reason.as_deref(), Some("spawn aborted"));
+        assert_eq!(terminal.exit_code, None);
     }
 
     #[test]
