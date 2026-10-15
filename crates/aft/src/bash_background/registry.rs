@@ -772,6 +772,16 @@ pub(crate) struct RegistryInner {
     #[cfg(unix)]
     db_schema_hints: AtomicBool,
     background_admission: Mutex<()>,
+    #[cfg(all(test, unix))]
+    before_bootstrap_release: Mutex<
+        Option<(
+            std::sync::mpsc::Sender<String>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    before_promotion_commit:
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     /// Session owners of output files recovered from task records on disk.
     /// Directory handles prevent cached permissions from following a replaced I/O directory.
@@ -1173,6 +1183,10 @@ impl BgTaskRegistry {
                 #[cfg(unix)]
                 db_schema_hints: AtomicBool::new(true),
                 background_admission: Mutex::new(()),
+                #[cfg(all(test, unix))]
+                before_bootstrap_release: Mutex::new(None),
+                #[cfg(test)]
+                before_promotion_commit: Mutex::new(None),
                 tasks: Mutex::new(HashMap::new()),
                 persisted_artifact_owners: Mutex::new(HashMap::new()),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
@@ -3282,39 +3296,9 @@ impl BgTaskRegistry {
                 "failed to persist background task metadata: {error}"
             ));
         }
-        if let Some(mut release) = child.stdin.take() {
-            if let Err(error) = release.write_all(b"run\n") {
-                crate::slog_warn!("background task {task_id} bootstrap release failed: {error}");
-            }
-        }
-        #[cfg(feature = "test-timing-hooks")]
-        if let Some(gate) = std::env::var_os("AFT_TEST_BASH_AFTER_CREATE_GATE") {
-            let gate = PathBuf::from(gate);
-            if gate.exists() {
-                std::fs::write(
-                    gate.with_extension("held"),
-                    serde_json::to_vec(&serde_json::json!({
-                        "task_id": task_id, "child_pid": child_pid, "metadata_path": paths.json,
-                    }))
-                    .unwrap(),
-                )
-                .expect("publish child-created recovery checkpoint");
-                while gate.exists() {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-        log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
         metadata.mark_running(child_pid, child_pid as i32);
         if crate::privacy_spawn::requested(&env) {
             crate::privacy_spawn::note_session(&session_id);
-        }
-        // The process exists now. A full disk must not orphan it by returning
-        // before registration; its starting record already exists on disk.
-        if let Err(error) = self.persist_task(&paths, &metadata) {
-            crate::slog_warn!(
-                "running bash task {task_id} persistence failed; retaining live task: {error}"
-            );
         }
 
         let task = Arc::new(BgTask {
@@ -3369,8 +3353,8 @@ impl BgTaskRegistry {
         }
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(&task);
-        // The command may already have run while its task is not yet visible
-        // in the registry. Tests hold that gap to check startup barriers.
+        // Hold visibility while the wrapper is still gated; command execution
+        // cannot precede an addressable task and its background-slot reservation.
         #[cfg(feature = "test-timing-hooks")]
         if let Some(gate) = std::env::var_os("AFT_TEST_BASH_REGISTRATION_GATE") {
             let gate = PathBuf::from(gate);
@@ -3392,6 +3376,69 @@ impl BgTaskRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(task_id.clone());
+        // Admission is now represented by the registered task, not this lock.
+        // A kill while startup is paused must let another background call start.
+        drop(_admission);
+        #[cfg(test)]
+        self.wait_before_bootstrap_release_for_test(&task_id);
+        let released = {
+            let mut state = task
+                .lock_state()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if state.metadata.status.is_terminal() || state.kill_in_flight {
+                false
+            } else if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
+                if let Some(mut release) = child.stdin.take() {
+                    if let Err(error) = release.write_all(b"run\n") {
+                        crate::slog_warn!(
+                            "background task {task_id} bootstrap release failed: {error}"
+                        );
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(feature = "test-timing-hooks")]
+        if released {
+            if let Some(gate) = std::env::var_os("AFT_TEST_BASH_AFTER_CREATE_GATE") {
+                let gate = PathBuf::from(gate);
+                if gate.exists() {
+                    std::fs::write(
+                        gate.with_extension("held"),
+                        serde_json::to_vec(&serde_json::json!({
+                            "task_id": task_id, "child_pid": child_pid, "metadata_path": paths.json,
+                        }))
+                        .unwrap(),
+                    )
+                    .expect("publish child-created recovery checkpoint");
+                    while gate.exists() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        if released {
+            log_bash_spawn(
+                &task_id,
+                child_pid,
+                &task.session_id,
+                &spawn_log_root,
+                command,
+            );
+            let mut db = DeferredDbWrites::new(self, &task);
+            let state = task
+                .lock_state()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            // A concurrent kill owns its terminal state; never publish Running
+            // over it when the spawner resumes after the gate was released.
+            if !state.metadata.status.is_terminal() && !state.kill_in_flight {
+                if let Err(error) = self.persist_task_locked(&task, &state.metadata, &mut db) {
+                    crate::slog_warn!("running bash task {task_id} persistence failed; retaining live task: {error}");
+                }
+            }
+        }
         self.inner
             .watchdog_tasks
             .lock()
@@ -6075,6 +6122,23 @@ impl BgTaskRegistry {
         // it is already running, and refusing or killing it would lose its
         // work (see `TaskSlot::Foreground`).
         let terminal_after_promote = {
+            // Order the slot claim with background admission. A launch that
+            // checks capacity after promotion must count this task, even if
+            // persisting the promotion temporarily stalls.
+            let _admission = self
+                .inner
+                .background_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            if let Some((arrived, release)) =
+                self.inner.before_promotion_commit.lock().unwrap().take()
+            {
+                arrived.send(()).unwrap();
+                release
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("promotion commit test controller");
+            }
             let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
                 .lock_state()
@@ -9173,6 +9237,17 @@ impl BgTaskRegistry {
             .unwrap_or_default()
     }
 
+    #[cfg(all(test, unix))]
+    fn wait_before_bootstrap_release_for_test(&self, task_id: &str) {
+        let gate = self.inner.before_bootstrap_release.lock().unwrap().take();
+        if let Some((arrived, release)) = gate {
+            arrived.send(task_id.to_string()).unwrap();
+            release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("bootstrap release test controller");
+        }
+    }
+
     fn start_watchdog(&self) {
         if !self.inner.watchdog_started.swap(true, Ordering::SeqCst) {
             super::watchdog::start(self.clone());
@@ -11478,6 +11553,33 @@ mod tests {
     }
 
     #[test]
+    fn promotion_reserves_background_slot_before_releasing_admission() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *registry.inner.before_promotion_commit.lock().unwrap() = Some((arrived_tx, release_rx));
+        let promoting = registry.clone();
+        let id = task.task_id.clone();
+        let worker = std::thread::spawn(move || promoting.promote(&id, "session"));
+        arrived_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("promotion reached commit checkpoint");
+        let admission_held = registry.inner.background_admission.try_lock().is_err();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(
+            admission_held,
+            "promotion must serialize its slot claim with admission"
+        );
+        let refusal = registry
+            .check_background_slot(super::super::TaskSlot::Background { max: 1 }, "session")
+            .expect_err("successful promotion must hold the slot");
+        assert!(refusal.contains(&task.task_id), "{refusal}");
+    }
+
+    #[test]
     fn lifecycle_terminal_promotion_enables_completion_delivery() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
@@ -12512,6 +12614,84 @@ mod tests {
         let preview = &completions[0].output_preview;
         assert!(preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
         assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn kill_gated_local_task_frees_slot_without_running_command() {
+        struct Release(std::sync::mpsc::Sender<()>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-run");
+        let registry = BgTaskRegistry::default();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *registry.inner.before_bootstrap_release.lock().unwrap() = Some((arrived_tx, release_rx));
+        let release = Release(release_tx);
+        let spawning = registry.clone();
+        let project = dir.path().to_path_buf();
+        let command = format!("printf ran > '{}'", marker.display());
+        let worker = std::thread::spawn(move || {
+            spawning.spawn(
+                SpawnPlan::Unsandboxed,
+                &command,
+                "session".into(),
+                project.clone(),
+                HashMap::new(),
+                super::super::HardKill::After(Duration::from_secs(30)),
+                project.clone(),
+                1,
+                false,
+                false,
+                Some(project),
+            )
+        });
+        let id = arrived_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("child reached bootstrap checkpoint");
+        assert!(!marker.exists());
+        let refusal = registry
+            .check_background_slot(super::super::TaskSlot::Background { max: 1 }, "session")
+            .expect_err("gated task must reserve its background slot before running");
+        assert!(refusal.contains(&id), "{refusal}");
+        let killed = registry
+            .kill(&id, "session")
+            .expect("gated task must already be killable");
+        assert_eq!(killed.info.status, BgTaskStatus::Killed);
+        registry
+            .check_background_slot(super::super::TaskSlot::Background { max: 1 }, "session")
+            .expect("kill releases background slot synchronously");
+        assert!(
+            registry.inner.background_admission.try_lock().is_ok(),
+            "killed spawn must not retain admission lock"
+        );
+        assert!(!marker.exists(), "killed gated command executed");
+        let replacement = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "sleep 30 # replacement-slot-holder",
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                super::super::HardKill::After(Duration::from_secs(30)),
+                dir.path().into(),
+                1,
+                false,
+                false,
+                Some(dir.path().into()),
+            )
+            .expect("replacement starts before killed spawner resumes");
+        registry.kill(&replacement, "session").unwrap();
+        drop(release);
+        assert_eq!(worker.join().unwrap().unwrap(), id);
+        assert!(
+            !marker.exists(),
+            "late gate release executed killed command"
+        );
     }
 
     #[test]

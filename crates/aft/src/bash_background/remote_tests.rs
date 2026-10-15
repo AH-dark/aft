@@ -335,18 +335,18 @@ async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
     assert!(refusal.contains(&local), "{refusal}");
     assert!(refusal.contains("local-slot-holder"), "{refusal}");
     let foreground = remote_spawn(TaskSlot::Foreground).unwrap();
-    registry.kill(&local, "session").unwrap();
-    registry
-        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
-        .expect("a waiting remote foreground command holds no slot");
-    registry.promote(&foreground, "session").unwrap();
-    let refusal = registry
-        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
-        .unwrap_err();
-    assert!(refusal.contains(&foreground), "{refusal}");
-    assert!(refusal.contains("remote-slot-proof"), "{refusal}");
-    // Wait for executor acceptance before cancellation, and leave the async
-    // test runtime free to serve the fake executor's cancel response.
+    // The fake executor runs on this thread's Tokio runtime. Keep it serving
+    // the foreground worker's handshake while the local process group exits.
+    let (kill_reached, release_kill) = install_kill_signal_gate_for_test(&local);
+    let killing = registry.clone();
+    let local_kill = tokio::task::spawn_blocking(move || killing.kill(&local, "session").unwrap());
+    tokio::task::spawn_blocking(move || {
+        kill_reached
+            .recv_timeout(Duration::from_secs(3))
+            .expect("local kill reached signal checkpoint");
+    })
+    .await
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if registry
@@ -368,7 +368,22 @@ async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
         }
     })
     .await
-    .expect("fake executor must accept the foreground command");
+    .expect("fake executor must accept the foreground command while local kill is held");
+    release_kill.send(()).unwrap();
+    local_kill.await.unwrap();
+    registry
+        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
+        .expect("a waiting remote foreground command holds no slot");
+    registry.promote(&foreground, "session").unwrap();
+    let refusal = registry
+        .check_background_slot(TaskSlot::Background { max: 1 }, "session")
+        .expect_err(&format!(
+            "promoted task holds no slot: {:?}",
+            registry.task(&foreground).map(|task| task.snapshot(0))
+        ));
+    assert!(refusal.contains(&foreground), "{refusal}");
+    assert!(refusal.contains("remote-slot-proof"), "{refusal}");
+    // Keep the runtime free to serve the fake executor's cancel response too.
     let killing = registry.clone();
     let kill_task = foreground.clone();
     tokio::task::spawn_blocking(move || killing.kill(&kill_task, "session").unwrap())
