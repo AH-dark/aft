@@ -182,7 +182,8 @@ impl From<serde_json::Error> for InspectCacheError {
 /// add a Tier-2 category, so unchanged contribution sets need a new roll-up.
 /// v34: Rust macro-token calls and declared-module edges change dead-code
 /// reachability and test-only verdicts for unchanged contribution sets.
-pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 35;
+// Compact Go initializer groups participate in the incremental graph hashes.
+pub(crate) const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = 36;
 
 #[derive(Debug, Clone)]
 pub struct ContributionRecord {
@@ -3037,7 +3038,7 @@ mod tests {
             decoded.contribution["exports"][0]["is_type_like"].as_bool(),
             Some(true)
         );
-        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 35);
+        assert_eq!(TIER2_CONTRIBUTION_CACHE_VERSION, 36);
     }
 
     #[test]

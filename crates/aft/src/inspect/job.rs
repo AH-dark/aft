@@ -487,8 +487,68 @@ pub struct CallgraphSnapshot {
     pub files: Vec<PathBuf>,
     pub exported_symbols: Vec<CallgraphExport>,
     pub outbound_calls: Vec<CallgraphOutboundCall>,
+    pub go_initializers: Vec<GoInitializerGroup>,
     pub entry_points: BTreeSet<PathBuf>,
     pub entry_point_symbols: BTreeMap<PathBuf, BTreeSet<String>>,
+}
+
+/// All confirmed callers in one Go file initialize the same package set.
+/// Keep the two sides separately instead of allocating their Cartesian product.
+#[derive(Debug, Clone, Default)]
+pub struct GoInitializerGroup {
+    pub caller_file: PathBuf,
+    pub callers: Vec<String>,
+    pub targets: Vec<(Arc<PathBuf>, Arc<str>)>,
+}
+
+impl GoInitializerGroup {
+    pub fn edge_count(&self) -> usize {
+        self.callers.len() * self.targets.len()
+            - self
+                .callers
+                .iter()
+                .map(|caller| {
+                    self.targets
+                        .iter()
+                        .filter(|(file, symbol)| {
+                            file.as_ref() == &self.caller_file && symbol.as_ref() == caller
+                        })
+                        .count()
+                })
+                .sum::<usize>()
+    }
+
+    pub fn calls(&self) -> impl Iterator<Item = CallgraphOutboundCall> + '_ {
+        self.callers.iter().flat_map(move |caller| {
+            self.targets.iter().filter_map(move |(file, symbol)| {
+                if file.as_ref() == &self.caller_file && symbol.as_ref() == caller {
+                    return None;
+                }
+                Some(CallgraphOutboundCall {
+                    caller_file: self.caller_file.clone(),
+                    caller_symbol: caller.clone(),
+                    target: format!("{}::{symbol}", file.display()),
+                    line: 1,
+                    provenance: "go_package_initializer".to_string(),
+                })
+            })
+        })
+    }
+}
+
+impl CallgraphSnapshot {
+    /// Recreate the legacy edge sequence for byte-for-byte comparisons. The
+    /// scanner retains initializer groups instead to avoid quadratic storage.
+    pub fn expanded_outbound_calls(&self) -> Vec<CallgraphOutboundCall> {
+        let mut calls = self.outbound_calls.clone();
+        calls.extend(
+            self.go_initializers
+                .iter()
+                .flat_map(GoInitializerGroup::calls),
+        );
+        calls.sort_by(|a, b| a.caller_file.as_os_str().cmp(b.caller_file.as_os_str()));
+        calls
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

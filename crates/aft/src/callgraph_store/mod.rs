@@ -25433,6 +25433,14 @@ edition = "2021"
 
     fn callgraph_fixture_scan(root: &Path, snapshot: CallgraphSnapshot) -> serde_json::Value {
         use crate::inspect::job::{InspectCategory, InspectJob, JobKey};
+        let expanded = if snapshot.go_initializers.is_empty() {
+            None
+        } else {
+            let mut expanded = snapshot.clone();
+            expanded.outbound_calls = snapshot.expanded_outbound_calls();
+            expanded.go_initializers.clear();
+            Some(callgraph_fixture_scan(root, expanded))
+        };
         let job = InspectJob {
             job_id: 1,
             key: JobKey::for_project_category(InspectCategory::DeadCode),
@@ -25449,10 +25457,18 @@ edition = "2021"
             callgraph_writer: true,
             callgraph_snapshot: Some(Arc::new(snapshot)),
         };
-        crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+        let aggregate = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
             .outcome
             .unwrap()
-            .aggregate
+            .aggregate;
+        if let Some(expanded) = expanded {
+            assert_eq!(
+                serde_json::to_vec(&aggregate).unwrap(),
+                serde_json::to_vec(&expanded).unwrap(),
+                "compact initializer reachability must preserve every aggregate byte"
+            );
+        }
+        aggregate
     }
 
     fn callgraph_fixture_has(payload: &serde_json::Value, key: &str, symbol: &str) -> bool {
@@ -26236,7 +26252,7 @@ edition = "2021"
                 drop(conn);
                 let go_type = if imported { "Sortable" } else { "sortable" };
                 for snapshot in [&legacy, &view] {
-                    assert!(!snapshot.outbound_calls.iter().any(|call| call.caller_file.ends_with(method_file)
+                    assert!(!snapshot.expanded_outbound_calls().iter().any(|call| call.caller_file.ends_with(method_file)
                     && call.caller_symbol == "Less" && call.provenance == "go_package_initializer"),
                     "fabricating Less -> package-init creates a dispatch-root key for an unrelated plain function");
                     assert!(
@@ -26365,7 +26381,7 @@ edition = "2021"
             let (_, snapshot) = go_fixture_store(root, &[main.clone(), cmd.clone()]);
             assert!(
                 snapshot
-                    .outbound_calls
+                    .expanded_outbound_calls()
                     .windows(2)
                     .all(|pair| pair[0].caller_file <= pair[1].caller_file),
                 "package initialization edges must preserve main's final caller-path grouping"
@@ -26388,7 +26404,7 @@ edition = "2021"
             let viewed_snapshot = callgraph_fixture_view(root, &[main, cmd, root.join("go.mod")]);
             assert!(
                 viewed_snapshot
-                    .outbound_calls
+                    .expanded_outbound_calls()
                     .windows(2)
                     .all(|pair| pair[0].caller_file <= pair[1].caller_file),
                 "view package initialization edges must preserve main's caller-path grouping"

@@ -9399,12 +9399,13 @@ mod tests {
         let dead_code = |store: &crate::callgraph_store::ReadonlyCallGraphStore| {
             let (_, snapshot, _, _) =
                 crate::callgraph_store::project_dead_code_snapshot_from_view(store).unwrap();
+            let outbound_calls = snapshot.expanded_outbound_calls();
             format!(
                 "{:?}",
                 (
                     snapshot.files,
                     snapshot.exported_symbols,
-                    snapshot.outbound_calls,
+                    outbound_calls,
                     snapshot.entry_points,
                     snapshot.entry_point_symbols
                 )

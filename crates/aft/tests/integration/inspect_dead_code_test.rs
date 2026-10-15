@@ -68,6 +68,7 @@ fn snapshot(
         files,
         exported_symbols,
         outbound_calls,
+        go_initializers: Vec::new(),
         entry_points: entry_points.into_iter().collect::<BTreeSet<_>>(),
         entry_point_symbols: BTreeMap::new(),
     }

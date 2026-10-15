@@ -939,7 +939,7 @@ impl ComparableProjection {
                 })
                 .collect(),
             outbound_calls: snapshot
-                .outbound_calls
+                .expanded_outbound_calls()
                 .iter()
                 .map(|call| ComparableOutboundCall {
                     caller_file: path_text(&call.caller_file),

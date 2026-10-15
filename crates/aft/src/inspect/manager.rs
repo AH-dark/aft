@@ -2251,6 +2251,7 @@ impl InspectManager {
         snapshot: Arc<CallgraphSnapshot>,
     ) {
         let estimated_bytes = estimate_callgraph_snapshot_bytes(snapshot.as_ref());
+        crate::slog_info!("projection memory: ordinary={} initializer={} initializer_groups={} initializer_targets={} owned_bytes={}", snapshot.outbound_calls.len(), snapshot.go_initializers.iter().map(|g| g.edge_count()).sum::<usize>(), snapshot.go_initializers.len(), snapshot.go_initializers.iter().map(|g| g.targets.len()).sum::<usize>(), estimated_bytes);
         let root = identity.project_root.clone();
         if let Ok(mut cached) = self.callgraph_projection.lock() {
             let previous = cached.take();
@@ -5053,7 +5054,7 @@ fn build_view_callgraph_snapshot(
     }
     crate::slog_info!(
         "perf tier2_callgraph_snapshot: source=view files={} exports={} edges={} entry_points={} ms={}",
-        snapshot.files.len(), snapshot.exported_symbols.len(), snapshot.outbound_calls.len(), snapshot.entry_points.len(), started.elapsed().as_millis()
+        snapshot.files.len(), snapshot.exported_symbols.len(), snapshot.outbound_calls.len() + snapshot.go_initializers.iter().map(|g| g.edge_count()).sum::<usize>(), snapshot.entry_points.len(), started.elapsed().as_millis()
     );
     Some((snapshot, verdict, cost))
 }
@@ -5359,7 +5360,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             "perf tier2_callgraph_snapshot: source=callgraph_store files={} exports={} edges={} entry_points={} ms={}",
             snapshot.files.len(),
             snapshot.exported_symbols.len(),
-            snapshot.outbound_calls.len(),
+            snapshot.outbound_calls.len() + snapshot.go_initializers.iter().map(|g| g.edge_count()).sum::<usize>(),
             snapshot.entry_points.len(),
             started.elapsed().as_millis()
         );
@@ -5375,6 +5376,30 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
 }
 
 fn estimate_callgraph_snapshot_bytes(snapshot: &CallgraphSnapshot) -> u64 {
+    let mut interned_files = BTreeSet::new();
+    let mut interned_symbols = BTreeSet::new();
+    let mut initializers = 0u64;
+    for group in &snapshot.go_initializers {
+        initializers += std::mem::size_of_val(group) as u64
+            + crate::memory::path_bytes(&group.caller_file)
+            + (group.callers.capacity() * std::mem::size_of::<String>()) as u64
+            + group
+                .callers
+                .iter()
+                .map(|s| s.capacity() as u64)
+                .sum::<u64>()
+            + (group.targets.capacity() * std::mem::size_of::<(Arc<PathBuf>, Arc<str>)>()) as u64;
+        for (file, symbol) in &group.targets {
+            if interned_files.insert(Arc::as_ptr(file) as usize) {
+                initializers += std::mem::size_of::<PathBuf>() as u64
+                    + 2 * std::mem::size_of::<usize>() as u64
+                    + crate::memory::path_bytes(file);
+            }
+            if interned_symbols.insert(Arc::as_ptr(symbol) as *const u8 as usize) {
+                initializers += symbol.len() as u64 + 2 * std::mem::size_of::<usize>() as u64;
+            }
+        }
+    }
     let files = snapshot.files.iter().fold(0u64, |bytes, path| {
         bytes
             .saturating_add(std::mem::size_of::<PathBuf>() as u64)
@@ -5390,14 +5415,17 @@ fn estimate_callgraph_snapshot_bytes(snapshot: &CallgraphSnapshot) -> u64 {
                 .saturating_add(crate::memory::usize_to_u64(export.symbol.len()))
                 .saturating_add(crate::memory::usize_to_u64(export.kind.len()))
         });
-    let calls = snapshot.outbound_calls.iter().fold(0u64, |bytes, call| {
-        bytes
-            .saturating_add(std::mem::size_of::<super::job::CallgraphOutboundCall>() as u64)
-            .saturating_add(crate::memory::path_bytes(&call.caller_file))
-            .saturating_add(crate::memory::usize_to_u64(call.caller_symbol.len()))
-            .saturating_add(crate::memory::usize_to_u64(call.target.len()))
-            .saturating_add(crate::memory::usize_to_u64(call.provenance.len()))
-    });
+    let calls = snapshot
+        .outbound_calls
+        .iter()
+        .fold(initializers, |bytes, call| {
+            bytes
+                .saturating_add(std::mem::size_of::<super::job::CallgraphOutboundCall>() as u64)
+                .saturating_add(crate::memory::path_bytes(&call.caller_file))
+                .saturating_add(crate::memory::usize_to_u64(call.caller_symbol.len()))
+                .saturating_add(crate::memory::usize_to_u64(call.target.len()))
+                .saturating_add(crate::memory::usize_to_u64(call.provenance.len()))
+        });
     let entry_points = snapshot.entry_points.iter().fold(0u64, |bytes, path| {
         bytes
             .saturating_add(std::mem::size_of::<PathBuf>() as u64)
@@ -9763,6 +9791,19 @@ mod dead_code_projection_tests {
             setup_projection_body_only,
             edit_projection_body_only,
         );
+        run_projection_scenario(
+            "Go initializer target edit",
+            |root| {
+                write_file(&root.join("go.mod"), "module example.com/app\n");
+                write_file(&root.join("main.go"), "package main\nimport _ \"example.com/app/lib\"\nfunc main() { control() }\nfunc control() {}\n");
+                write_file(&root.join("lib/lib.go"), "package lib\nvar Boot = Used()\nfunc Used() int { return 1 }\nfunc Spare() int { return 2 }\n");
+            },
+            |root| {
+                let file = root.join("lib/lib.go");
+                write_file(&file, "package lib\nvar Changed = Spare()\nfunc Used() int { return 1 }\nfunc Spare() int { return 2 }\n");
+                vec![file]
+            },
+        );
     }
 
     #[test]
@@ -10439,7 +10480,7 @@ pub fn unrelated() -> u32 { 2 }
                 })
                 .collect(),
             outbound_calls: snapshot
-                .outbound_calls
+                .expanded_outbound_calls()
                 .iter()
                 .map(|call| {
                     (
@@ -10841,6 +10882,7 @@ export function main() { foo(); }
             files: Vec::new(),
             exported_symbols: Vec::new(),
             outbound_calls: Vec::new(),
+            go_initializers: Vec::new(),
             entry_points: BTreeSet::new(),
             entry_point_symbols: BTreeMap::new(),
         });
@@ -10892,6 +10934,7 @@ export function main() { foo(); }
                     files: Vec::new(),
                     exported_symbols: Vec::new(),
                     outbound_calls: Vec::new(),
+                    go_initializers: Vec::new(),
                     entry_points: BTreeSet::new(),
                     entry_point_symbols: BTreeMap::new(),
                 }),
@@ -10984,6 +11027,7 @@ export function main() { foo(); }
                 files: Vec::new(),
                 exported_symbols: Vec::new(),
                 outbound_calls: Vec::new(),
+                go_initializers: Vec::new(),
                 entry_points: BTreeSet::new(),
                 entry_point_symbols: BTreeMap::new(),
             }),

@@ -342,6 +342,9 @@ fn project_snapshot(
         outbound_calls,
         entry_points,
         entry_point_symbols,
+        // Package targets can change in a file whose callers did not. Rebuild
+        // these small groups for both full and spliced ordinary-call snapshots.
+        go_initializers: go_initializer_groups(&tx, &mut paths, None)?,
     };
     let projection_elapsed = projection_started.elapsed();
     tx.commit()?;
@@ -831,29 +834,32 @@ fn outbound_calls_query(
             ref_id: row.get(12)?,
         })
     })?;
-    let mut rows: Vec<OutboundRow> = Vec::new();
+    // Convert each SQL row immediately. Only compact ordering keys accompany
+    // the output; the string-rich SQL rows never coexist with a second vector.
+    let mut ordering_names = BTreeSet::<std::sync::Arc<str>>::new();
+    let mut intern = |name: &str| {
+        if let Some(value) = ordering_names.get(name) {
+            return value.clone();
+        }
+        let value: std::sync::Arc<str> = name.into();
+        ordering_names.insert(value.clone());
+        value
+    };
+    let mut calls = Vec::new();
+    let mut stale_caller_nodes = 0usize;
+    let mut row_count = 0;
     for row in mapped_rows {
         ensure_projection_not_cancelled()?;
-        rows.push(row?);
-    }
-    record_outbound_rows(rows.len());
-    // SQLite otherwise materializes this 300k+-row ordering in a temporary
-    // B-tree. Sorting the already-required projection rows in memory preserves
-    // its BINARY/NULL-first order without turning a read-only snapshot into
-    // roughly 100 MB of physical temporary-file writes.
-    rows.sort_by(|left, right| {
-        left.caller_file
-            .cmp(&right.caller_file)
-            .then_with(|| left.caller_symbol.cmp(&right.caller_symbol))
-            .then_with(|| left.line.cmp(&right.line))
-            .then_with(|| left.byte_start.cmp(&right.byte_start))
-            .then_with(|| left.byte_end.cmp(&right.byte_end))
-            .then_with(|| left.ref_id.cmp(&right.ref_id))
-    });
-
-    let mut calls = Vec::with_capacity(rows.len());
-    let mut stale_caller_nodes = 0usize;
-    for row in rows {
+        let row = row?;
+        row_count += 1;
+        let key = (
+            intern(&row.caller_file),
+            row.caller_symbol.as_deref().map(&mut intern),
+            row.line,
+            row.byte_start,
+            row.byte_end,
+            row.ref_id.clone(),
+        );
         // An unresolved value reference is usually a bare identifier that
         // merely shares a function's name, so it is dropped. A path-qualified
         // one (`.map(Type::method)`, `.then(module::f)`) does name a function;
@@ -906,38 +912,46 @@ fn outbound_calls_query(
             target.push_str(row.full_ref.as_deref().unwrap_or_default());
         }
 
-        calls.push(CallgraphOutboundCall {
-            caller_file,
-            caller_symbol,
-            target,
-            line: row.line,
-            // `value_ref` promises a resolved function reference; an unresolved
-            // path is only a candidate the scanner may still link.
-            provenance: if unresolved_value_path {
-                UNRESOLVED_VALUE_PATH_PROVENANCE.to_string()
-            } else {
-                row.provenance
+        calls.push((
+            key,
+            CallgraphOutboundCall {
+                caller_file,
+                caller_symbol,
+                target,
+                line: row.line,
+                // `value_ref` promises a resolved function reference; an unresolved
+                // path is only a candidate the scanner may still link.
+                provenance: if unresolved_value_path {
+                    UNRESOLVED_VALUE_PATH_PROVENANCE.to_string()
+                } else {
+                    row.provenance
+                },
             },
-        });
+        ));
     }
+    record_outbound_rows(row_count);
     if stale_caller_nodes > 0 {
         crate::slog_info!(
             "dead_code projection: {} refs had stale caller nodes (fell back to <top-level>)",
             stale_caller_nodes
         );
     }
-    calls.extend(go_initializer_edges(conn, paths, file)?);
+    // Sort by the query's byte-ordered file/symbol keys (NULL symbols first),
+    // then source position and ref ID. Sorting in Rust avoids SQLite spilling
+    // a temporary ordering B-tree to disk for a read-only projection.
+    calls.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut calls: Vec<_> = calls.into_iter().map(|(_, call)| call).collect();
     calls.sort_by(|left, right| {
         projection_path_key(&left.caller_file).cmp(projection_path_key(&right.caller_file))
     });
     Ok(calls)
 }
 
-fn go_initializer_edges(
+fn go_initializer_groups(
     conn: &Connection,
     paths: &mut SnapshotPathResolver<'_>,
     file: Option<&str>,
-) -> Result<Vec<CallgraphOutboundCall>> {
+) -> Result<Vec<crate::inspect::job::GoInitializerGroup>> {
     let mut files = conn.prepare("SELECT path FROM files WHERE lang='go'")?;
     let mut packages: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     for path in files.query_map([], |row| row.get::<_, String>(0))? {
@@ -964,9 +978,12 @@ fn go_initializer_edges(
     let mut vars = conn.prepare("SELECT scoped_name FROM nodes WHERE file_path=?1 AND (kind='variable' OR scoped_name='<go-package-init>' OR (kind='function' AND scoped_name='init'))")?;
     let mut imports = conn.prepare("SELECT DISTINCT target_file FROM refs WHERE caller_file=?1 AND kind='import' AND target_file IS NOT NULL AND status='resolved'")?;
     let mut targets_by_file = BTreeMap::new();
-    let mut calls = Vec::new();
+    let mut groups: BTreeMap<String, crate::inspect::job::GoInitializerGroup> = BTreeMap::new();
+    let mut interned_files = BTreeMap::<String, std::sync::Arc<PathBuf>>::new();
+    let mut interned_symbols = BTreeMap::<String, std::sync::Arc<str>>::new();
     for (caller_file, caller_symbol) in callers {
-        if !targets_by_file.contains_key(&caller_file) {
+        ensure_projection_not_cancelled()?;
+        if !groups.contains_key(&caller_file) {
             let mut dirs = vec![Path::new(&caller_file)
                 .parent()
                 .unwrap_or(Path::new(""))
@@ -990,7 +1007,16 @@ fn go_initializer_edges(
                     continue;
                 }
                 for symbol in vars.query_map([&target_file], |row| row.get::<_, String>(0))? {
-                    targets.push((target_file.clone(), symbol?));
+                    let symbol = symbol?;
+                    let file = interned_files
+                        .entry(target_file.clone())
+                        .or_insert_with(|| std::sync::Arc::new(paths.resolve(target_file)))
+                        .clone();
+                    let symbol = interned_symbols
+                        .entry(symbol.clone())
+                        .or_insert_with(|| std::sync::Arc::from(symbol))
+                        .clone();
+                    targets.push((file, symbol));
                 }
             }
             targets_by_file.insert(caller_file.clone(), targets);
@@ -998,20 +1024,17 @@ fn go_initializer_edges(
         // A reached Go file initializes its entire package and every imported
         // package, including blank imports. Edges, rather than unconditional
         // roots, leave packages imported only by dead code unreachable.
-        for (target_file, target_symbol) in &targets_by_file[&caller_file] {
-            if target_file == &caller_file && target_symbol == &caller_symbol {
-                continue;
-            }
-            calls.push(CallgraphOutboundCall {
+        groups
+            .entry(caller_file.clone())
+            .or_insert_with(|| crate::inspect::job::GoInitializerGroup {
                 caller_file: paths.resolve(&caller_file),
-                caller_symbol: caller_symbol.clone(),
-                target: format!("{}::{target_symbol}", paths.resolve(target_file).display()),
-                line: 1,
-                provenance: "go_package_initializer".to_string(),
-            });
-        }
+                callers: Vec::new(),
+                targets: targets_by_file.remove(&caller_file).unwrap_or_default(),
+            })
+            .callers
+            .push(caller_symbol);
     }
-    Ok(calls)
+    Ok(groups.into_values().collect())
 }
 
 fn entry_points_for_files(project_root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf> {
@@ -1162,6 +1185,55 @@ mod tests {
     use std::fs;
 
     fn assert_send<T: Send>() {}
+
+    #[test]
+    fn go_initializer_projection_does_not_materialize_cartesian_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = root.join("main.go");
+        let mut text = String::from("package main\nfunc helper() {}\nfunc main() { f0() }\n");
+        for i in 0..40 {
+            text.push_str(&format!("var V{i} = helper\nfunc f{i}() {{ helper() }}\n"));
+        }
+        fs::write(&source, &text).unwrap();
+        let store = CallGraphStore::open(root.join(".store"), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        let (revision, snapshot, _) =
+            project_dead_code_snapshot_incremental(store.sqlite_path(), None).unwrap();
+        assert_eq!(snapshot.outbound_calls.iter().filter(|c| c.provenance == "go_package_initializer").count(), 0,
+            "initializer reachability must store caller and target sets, not their Cartesian product");
+        assert_eq!(
+            snapshot
+                .expanded_outbound_calls()
+                .iter()
+                .filter(|c| c.provenance == "go_package_initializer")
+                .count(),
+            3321
+        );
+        let group = &snapshot.go_initializers[0];
+        assert!(
+            std::sync::Arc::ptr_eq(&group.targets[0].0, &group.targets[1].0),
+            "target paths are interned"
+        );
+
+        fs::write(
+            &source,
+            text.replace("var V0 = helper", "var Changed = helper"),
+        )
+        .unwrap();
+        store.refresh_files(std::slice::from_ref(&source)).unwrap();
+        let (_, spliced, verdict) = project_dead_code_snapshot_incremental(
+            store.sqlite_path(),
+            Some((revision.unwrap(), &snapshot)),
+        )
+        .unwrap();
+        assert_eq!(verdict.kind, ProjectionKind::Spliced);
+        let cold = project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&spliced.expanded_outbound_calls()).unwrap(),
+            serde_json::to_vec(&cold.expanded_outbound_calls()).unwrap()
+        );
+    }
 
     #[test]
     fn splice_matches_stored_path_order_for_dotted_and_nested_files() {

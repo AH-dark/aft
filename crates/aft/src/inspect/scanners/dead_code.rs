@@ -41,6 +41,49 @@ const RUST_MACRO_REF_SHAPE_STRUCT: &str = "struct";
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
 
 type ExportNode = (String, String);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct GraphTargets {
+    ordinary: BTreeSet<ExportNode>,
+    // Every confirmed caller in one file shares the same initializer targets.
+    initializers: Option<Arc<BTreeSet<ExportNode>>>,
+    // Synthetic initializer edges exclude self-calls; ordinary self-calls stay.
+    source: Option<ExportNode>,
+}
+
+impl GraphTargets {
+    fn insert(&mut self, node: ExportNode) -> bool {
+        self.ordinary.insert(node)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ExportNode> {
+        self.ordinary.iter().chain(
+            self.initializers
+                .iter()
+                .flat_map(|targets| targets.iter())
+                .filter(|target| {
+                    self.source.as_ref() != Some(*target) && !self.ordinary.contains(*target)
+                }),
+        )
+    }
+}
+
+impl<'a> IntoIterator for &'a GraphTargets {
+    type Item = &'a ExportNode;
+    type IntoIter = Box<dyn Iterator<Item = &'a ExportNode> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+type GraphEdges = BTreeMap<ExportNode, GraphTargets>;
+
+#[derive(Debug, Clone)]
+struct GoInitializerContribution {
+    callers: Vec<String>,
+    targets: Arc<BTreeSet<ExportNode>>,
+    test_origin: bool,
+}
 struct OutboundCallsByCallerFile<'a> {
     by_file: BTreeMap<String, Vec<&'a CallgraphOutboundCall>>,
     canonicalization_attempts: usize,
@@ -67,6 +110,7 @@ pub(crate) struct DeadCodeRollupState {
     materialized: Arc<Vec<DeadCodeContribution>>,
     contribution_hashes: BTreeMap<String, String>,
     callgraph_hashes: BTreeMap<String, String>,
+    initializer_files: BTreeSet<String>,
     public_api_files: BTreeSet<String>,
     roles_fingerprint: String,
     fragments: BTreeMap<String, DeadCodeFileFragment>,
@@ -102,7 +146,7 @@ impl DeadCodeFileFragment {
 
 #[derive(Debug, Clone)]
 struct ReachabilityState {
-    edges: BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+    edges: GraphEdges,
     imported_by_file: BTreeMap<String, BTreeSet<ExportNode>>,
     namespace_by_file: BTreeMap<String, BTreeSet<ExportNode>>,
     roots: BTreeSet<ExportNode>,
@@ -862,6 +906,7 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         snapshot,
         previous.map(|state| &state.callgraph_hashes),
         changed_files,
+        previous.map(|state| &state.initializer_files),
     );
     let roles_fingerprint = format!("{roles:?}");
     let changed_graph_files = previous
@@ -944,6 +989,7 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
     ));
     let all_edges = edges_by_source(materialized.as_ref(), false);
     let production_edges = edges_by_source(materialized.as_ref(), true);
+    crate::slog_info!("scanner memory: ordinary_calls={} initializer_groups={} initializer_targets={} graph_payload_bytes={}", materialized.iter().map(|c| c.internal_calls.len()).sum::<usize>(), materialized.iter().filter(|c| c.go_initializers.is_some()).count(), materialized.iter().filter_map(|c| c.go_initializers.as_ref()).map(|g| g.targets.len()).sum::<usize>(), scanner_graph_payload_bytes(&all_edges, &production_edges));
     let dispatched_method_names =
         collect_dispatched_method_names_by_language(materialized.as_ref());
     let (all, all_incremental) = build_reachability_state(
@@ -1031,6 +1077,11 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
             materialized,
             contribution_hashes,
             callgraph_hashes,
+            initializer_files: snapshot
+                .go_initializers
+                .iter()
+                .map(|group| relative_path(project_root, &group.caller_file))
+                .collect(),
             public_api_files: public_api_files.clone(),
             roles_fingerprint,
             fragments,
@@ -1151,9 +1202,10 @@ fn callgraph_hashes(
     snapshot: &CallgraphSnapshot,
     previous: Option<&BTreeMap<String, String>>,
     changed_files: &BTreeSet<String>,
+    previous_initializer_files: Option<&BTreeSet<String>>,
 ) -> BTreeMap<String, String> {
     let mut hashes = previous.cloned().unwrap_or_default();
-    let files = if previous.is_some() {
+    let mut files = if previous.is_some() {
         for file in changed_files {
             hashes.remove(file);
         }
@@ -1165,6 +1217,18 @@ fn callgraph_hashes(
             .map(|call| relative_path(project_root, &call.caller_file))
             .collect()
     };
+    // A package's variables can change without changing the files that import
+    // it. Rehash compact initializer groups even on an incremental scan.
+    files.extend(
+        snapshot
+            .go_initializers
+            .iter()
+            .map(|group| relative_path(project_root, &group.caller_file)),
+    );
+    files.extend(previous_initializer_files.into_iter().flatten().cloned());
+    for file in &files {
+        hashes.remove(file);
+    }
     let absolute_files = files
         .iter()
         .map(|file| (project_root.join(file), file))
@@ -1180,6 +1244,22 @@ fn callgraph_hashes(
         hasher.update(call.target.as_bytes());
         hasher.update(&call.line.to_le_bytes());
         hasher.update(call.provenance.as_bytes());
+    }
+    for group in &snapshot.go_initializers {
+        let file = relative_path(project_root, &group.caller_file);
+        let hasher = hashers.entry(file).or_default();
+        hasher.update(b"go_package_initializer\0");
+        for caller in &group.callers {
+            hasher.update(caller.as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.update(&[0]);
+        for (file, symbol) in &group.targets {
+            hasher.update(file.to_string_lossy().as_bytes());
+            hasher.update(&[0]);
+            hasher.update(symbol.as_bytes());
+            hasher.update(&[0]);
+        }
     }
     hashes.extend(
         hashers
@@ -1438,6 +1518,11 @@ fn materialize_dead_code_contributions(
         exported_symbol_indexes_from_contributions(project_root, snapshot, &parsed);
     let outbound_calls_by_caller_file =
         group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
+    let initializers_by_file = snapshot
+        .go_initializers
+        .iter()
+        .map(|group| (relative_path(project_root, &group.caller_file), group))
+        .collect::<BTreeMap<_, _>>();
     let full_materialization = previous.is_none() || affected_files.len() >= parsed.len();
     let oxc_by_file = if full_materialization {
         oxc_verdicts_by_file(project_root, snapshot, &parsed, public_api_files)
@@ -1603,7 +1688,7 @@ fn materialize_dead_code_contributions(
                     }
                 }
             }
-            let liveness_roots = liveness_roots_for_file(
+            let mut liveness_roots = liveness_roots_for_file(
                 &contribution.file,
                 &exports,
                 &internal_calls,
@@ -1613,6 +1698,42 @@ fn materialize_dead_code_contributions(
                 language_for_file(&contribution.file) != "rust"
                     && public_api_files.contains(&contribution.file),
             );
+            contribution.go_initializers =
+                initializers_by_file.get(&contribution.file).map(|group| {
+                    GoInitializerContribution {
+                        callers: group.callers.clone(),
+                        targets: Arc::new(
+                            group
+                                .targets
+                                .iter()
+                                .map(|(file, symbol)| {
+                                    (relative_path(project_root, file), symbol.to_string())
+                                })
+                                .collect(),
+                        ),
+                        test_origin: is_test_code_file(&contribution.file, &test_module_files),
+                    }
+                });
+            if liveness_root_files.contains(&contribution.file)
+                && !executable_root_exports_by_file.contains_key(&contribution.file)
+            {
+                if let Some(group) = &contribution.go_initializers {
+                    liveness_roots.extend(
+                        group
+                            .callers
+                            .iter()
+                            .filter(|caller| {
+                                is_explicit_liveness_symbol(&contribution.file, caller)
+                                    && group.targets.iter().any(|target| {
+                                        target != &(contribution.file.clone(), (*caller).clone())
+                                    })
+                            })
+                            .cloned(),
+                    );
+                    liveness_roots.sort();
+                    liveness_roots.dedup();
+                }
+            }
             for export in &mut exports {
                 export.is_entry_point = liveness_roots.contains(&export.symbol);
             }
@@ -2079,8 +2200,8 @@ fn dead_code_honesty_fields(
 fn edges_by_source(
     contributions: &[DeadCodeContribution],
     exclude_test_origins: bool,
-) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
-    let mut edges: BTreeMap<ExportNode, BTreeSet<ExportNode>> = BTreeMap::new();
+) -> GraphEdges {
+    let mut edges = GraphEdges::new();
 
     for contribution in contributions {
         for call in &contribution.internal_calls {
@@ -2101,9 +2222,51 @@ fn edges_by_source(
             let source = (contribution.file.clone(), call.caller_symbol.clone());
             edges.entry(source).or_default().insert(target);
         }
+        if let Some(group) = &contribution.go_initializers {
+            if exclude_test_origins && group.test_origin {
+                continue;
+            }
+            for caller in &group.callers {
+                let source = (contribution.file.clone(), caller.clone());
+                if caller.is_empty()
+                    || group.targets.is_empty()
+                    || (group.targets.len() == 1 && group.targets.contains(&source))
+                {
+                    continue;
+                }
+                let targets = edges.entry(source.clone()).or_default();
+                targets.source = Some(source);
+                targets.initializers = Some(Arc::clone(&group.targets));
+            }
+        }
     }
 
     edges
+}
+
+// Payload bytes exclude B-tree nodes and allocator bookkeeping, and count each
+// shared initializer target set once across the two reachability graphs.
+fn scanner_graph_payload_bytes(all: &GraphEdges, production: &GraphEdges) -> usize {
+    let node_bytes = |node: &ExportNode| {
+        std::mem::size_of::<ExportNode>() + node.0.capacity() + node.1.capacity()
+    };
+    let mut shared = BTreeSet::new();
+    let mut bytes = 0;
+    for edges in [all, production] {
+        for (source, targets) in edges {
+            bytes += node_bytes(source) + std::mem::size_of::<GraphTargets>();
+            bytes += targets.ordinary.iter().map(&node_bytes).sum::<usize>();
+            if let Some(source) = &targets.source {
+                bytes += node_bytes(source);
+            }
+            if let Some(targets) = &targets.initializers {
+                if shared.insert(Arc::as_ptr(targets) as usize) {
+                    bytes += targets.iter().map(&node_bytes).sum::<usize>();
+                }
+            }
+        }
+    }
+    bytes
 }
 
 fn test_only_callers_by_target(
@@ -2111,10 +2274,11 @@ fn test_only_callers_by_target(
 ) -> BTreeMap<ExportNode, Vec<String>> {
     let test_files = cfg_test_module_files(contributions);
     let edges = edges_by_source(contributions, false);
-    let mut origins = BTreeMap::<ExportNode, BTreeSet<String>>::new();
+    let mut origins = BTreeMap::<ExportNode, BTreeSet<usize>>::new();
+    let mut origin_ids = BTreeMap::<String, usize>::new();
     let mut frontier = VecDeque::new();
     for contribution in contributions {
-        for call in &contribution.internal_calls {
+        for call in contribution.calls() {
             if call.test_origin == Some(true) {
                 let origin = if is_test_code_file(&contribution.file, &test_files) {
                     contribution.file.clone()
@@ -2127,6 +2291,8 @@ fn test_only_callers_by_target(
                 } else {
                     continue;
                 };
+                let next_id = origin_ids.len();
+                let origin = *origin_ids.entry(origin).or_insert(next_id);
                 let target = (call.file.clone(), call.symbol.clone());
                 if origins.entry(target.clone()).or_default().insert(origin) {
                     frontier.push_back(target);
@@ -2145,9 +2311,19 @@ fn test_only_callers_by_target(
             }
         }
     }
+    crate::slog_info!(
+        "scanner origins: nodes={} labels={} label_payload_bytes={}",
+        origins.len(),
+        origins.values().map(BTreeSet::len).sum::<usize>(),
+        origins
+            .values()
+            .map(|labels| labels.len() * std::mem::size_of::<usize>())
+            .sum::<usize>()
+            + origin_ids.keys().map(String::capacity).sum::<usize>()
+    );
     let mut production = BTreeSet::new();
     for contribution in contributions {
-        for call in &contribution.internal_calls {
+        for call in contribution.calls() {
             if call.test_origin == Some(false)
                 && !origins.contains_key(&(contribution.file.clone(), call.caller_symbol.clone()))
             {
@@ -2165,10 +2341,21 @@ fn test_only_callers_by_target(
             }
         }
     }
+    let mut origin_names = vec![String::new(); origin_ids.len()];
+    for (name, id) in origin_ids {
+        origin_names[id] = name;
+    }
     origins
         .into_iter()
         .filter(|(node, _)| !production.contains(node))
-        .map(|(node, files)| (node, files.into_iter().collect()))
+        .map(|(node, files)| {
+            let mut names = files
+                .into_iter()
+                .map(|id| origin_names[id].clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            (node, names)
+        })
         .collect()
 }
 
@@ -2205,7 +2392,7 @@ fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTre
 
 fn build_reachability_state(
     contributions: &[DeadCodeContribution],
-    edges: BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+    edges: GraphEdges,
     dispatched_method_names: &MethodNamesByLanguage,
     previous: Option<&ReachabilityState>,
     changed_files: &BTreeSet<String>,
@@ -2226,7 +2413,7 @@ fn build_reachability_state(
 
 fn reachability_inputs(
     contributions: &[DeadCodeContribution],
-    edges: BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+    edges: GraphEdges,
     dispatched_method_names: &MethodNamesByLanguage,
 ) -> ReachabilityState {
     let mut roots = BTreeSet::new();
@@ -5849,6 +6036,8 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 #[derive(Debug, Clone, Deserialize)]
 struct DeadCodeContribution {
+    #[serde(skip)]
+    go_initializers: Option<GoInitializerContribution>,
     file: String,
     #[serde(default)]
     rust_api: Option<RustApiFacts>,
@@ -6000,6 +6189,30 @@ struct InternalCallContribution {
     test_origin: Option<bool>,
 }
 
+impl DeadCodeContribution {
+    fn calls(&self) -> impl Iterator<Item = InternalCallContribution> + '_ {
+        self.internal_calls
+            .iter()
+            .cloned()
+            .chain(self.go_initializers.iter().flat_map(move |group| {
+                group.callers.iter().flat_map(move |caller| {
+                    group.targets.iter().filter_map(move |(file, symbol)| {
+                        if file == &self.file && symbol == caller {
+                            return None;
+                        }
+                        Some(InternalCallContribution {
+                            caller_symbol: caller.clone(),
+                            file: file.clone(),
+                            symbol: symbol.clone(),
+                            line: 1,
+                            test_origin: Some(group.test_origin),
+                        })
+                    })
+                })
+            }))
+    }
+}
+
 impl From<InternalCall> for InternalCallContribution {
     fn from(call: InternalCall) -> Self {
         Self {
@@ -6078,7 +6291,7 @@ mod tests {
     }
 
     fn reachability_fixture(edges: &[(&str, &str)], roots: &[&str]) -> ReachabilityState {
-        let mut by_source = BTreeMap::<ExportNode, BTreeSet<ExportNode>>::new();
+        let mut by_source = GraphEdges::new();
         for (source, target) in edges {
             by_source
                 .entry(("graph.ts".to_string(), (*source).to_string()))
@@ -6131,13 +6344,19 @@ mod tests {
 
     /// One edge per source, all pointing at the same target: only the source
     /// side of an edge decides whether it is a dispatch root.
-    fn dispatch_edges(sources: &[(&str, &str)]) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
+    fn dispatch_edges(sources: &[(&str, &str)]) -> GraphEdges {
         sources
             .iter()
             .map(|(file, symbol)| {
                 (
                     ((*file).to_string(), (*symbol).to_string()),
-                    BTreeSet::from([("src/target.ts".to_string(), "target".to_string())]),
+                    GraphTargets {
+                        ordinary: BTreeSet::from([(
+                            "src/target.ts".to_string(),
+                            "target".to_string(),
+                        )]),
+                        ..GraphTargets::default()
+                    },
                 )
             })
             .collect()
@@ -6328,6 +6547,203 @@ mod tests {
         );
         assert_eq!(incremental, full);
         assert!(!aggregate_has_item(&incremental, "dead.rs", "planted_dead"));
+    }
+
+    #[test]
+    fn compact_initializers_rehash_unchanged_callers_and_match_expanded_rollup() {
+        let (_temp, root, files) = fixture_project(&[
+            ("main.go", "package main\nfunc main() {}\n"),
+            (
+                "lib/lib.go",
+                "package lib\nfunc Alive() {}\nfunc Dead() {}\n",
+            ),
+        ]);
+        let mut snapshot = snapshot_with_entry_points(
+            files.clone(),
+            vec![
+                export(&root, "lib/lib.go", "Alive", "function"),
+                export(&root, "lib/lib.go", "Dead", "function"),
+            ],
+            Vec::new(),
+            [root.join("main.go")].into_iter().collect(),
+        );
+        snapshot
+            .go_initializers
+            .push(crate::inspect::job::GoInitializerGroup {
+                caller_file: root.join("main.go"),
+                callers: vec!["main".into()],
+                targets: vec![(Arc::new(root.join("lib/lib.go")), Arc::from("Alive"))],
+            });
+        let contributions = run_dead_code_scan(&job(&root, files, snapshot.clone()))
+            .outcome
+            .unwrap()
+            .contributions;
+        let roles = crate::inspect::entry_points::ProjectRoles::default();
+        let public = BTreeSet::new();
+        let (initial, state, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            None,
+            None,
+            &BTreeSet::new(),
+        );
+        assert!(!aggregate_has_item(&initial, "lib/lib.go", "Alive"));
+        assert!(aggregate_has_item(&initial, "lib/lib.go", "Dead"));
+
+        snapshot.go_initializers[0].targets[0].1 = Arc::from("Dead");
+        let changed = ["unrelated.txt".to_string()].into_iter().collect();
+        let (incremental, next_state, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            None,
+            Some(&state),
+            &changed,
+        );
+        let (full, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            None,
+            None,
+            &BTreeSet::new(),
+        );
+        let mut expanded = snapshot.clone();
+        expanded.outbound_calls = snapshot.expanded_outbound_calls();
+        expanded.go_initializers.clear();
+        let (legacy, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &expanded,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            None,
+            None,
+            &BTreeSet::new(),
+        );
+        assert!(aggregate_has_item(&incremental, "lib/lib.go", "Alive"));
+        assert!(!aggregate_has_item(&incremental, "lib/lib.go", "Dead"));
+        assert_eq!(
+            serde_json::to_vec(&incremental).unwrap(),
+            serde_json::to_vec(&full).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&full).unwrap(),
+            serde_json::to_vec(&legacy).unwrap()
+        );
+        snapshot.go_initializers.clear();
+        let (removed, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            None,
+            Some(&next_state),
+            &changed,
+        );
+        let (removed_full, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            None,
+            None,
+            &BTreeSet::new(),
+        );
+        assert!(aggregate_has_item(&removed, "lib/lib.go", "Alive"));
+        assert!(aggregate_has_item(&removed, "lib/lib.go", "Dead"));
+        assert_eq!(removed, removed_full);
+    }
+
+    #[test]
+    fn compact_initializer_graph_shares_targets_and_preserves_ordinary_self_calls() {
+        let node = |symbol: &str| ("main.go".to_string(), symbol.to_string());
+        let targets = Arc::new(BTreeSet::from([node("A"), node("B")]));
+        let mut contribution = serde_json::from_value::<DeadCodeContribution>(json!({
+            "file": "main.go", "exports": [], "internal_calls": [{
+                "caller_symbol": "A", "file": "main.go", "symbol": "A",
+                "line": 3, "test_origin": false,
+            }]
+        }))
+        .unwrap();
+        contribution.go_initializers = Some(GoInitializerContribution {
+            callers: vec!["A".into(), "B".into()],
+            targets: Arc::clone(&targets),
+            test_origin: false,
+        });
+        let edges = edges_by_source(std::slice::from_ref(&contribution), false);
+        for caller in ["A", "B"] {
+            assert!(Arc::ptr_eq(
+                edges[&node(caller)].initializers.as_ref().unwrap(),
+                &targets
+            ));
+        }
+        assert_eq!(edges[&node("A")].ordinary, BTreeSet::from([node("A")]));
+        assert!(edges[&node("B")].ordinary.is_empty());
+        assert_eq!(
+            edges[&node("A")].iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([node("A"), node("B")])
+        );
+        assert_eq!(
+            edges[&node("B")].iter().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([node("A")])
+        );
+
+        // A synthetic self-call alone must not create a dispatch-root key, but
+        // excluding it must not erase an ordinary self-call on the same source.
+        contribution.go_initializers.as_mut().unwrap().targets =
+            Arc::new(BTreeSet::from([node("A")]));
+        let edges = edges_by_source(std::slice::from_ref(&contribution), false);
+        assert_eq!(
+            edges[&node("A")].iter().collect::<Vec<_>>(),
+            vec![&node("A")]
+        );
+        contribution.internal_calls.clear();
+        let edges = edges_by_source(&[contribution], false);
+        assert!(!edges.contains_key(&node("A")));
+        assert!(edges.contains_key(&node("B")));
+    }
+
+    #[test]
+    fn interned_test_origins_preserve_distinct_sorted_transitive_labels() {
+        let facts = |file: &str, caller: &str, target: &str, symbol: &str, test_origin: bool| {
+            serde_json::from_value::<DeadCodeContribution>(json!({
+                "file": file, "exports": [], "internal_calls": [{
+                    "caller_symbol": caller, "file": target, "symbol": symbol,
+                    "line": 1, "test_origin": test_origin,
+                }]
+            }))
+            .unwrap()
+        };
+        let contributions = vec![
+            facts("z_test.go", "TestZ", "helper.go", "relay", true),
+            facts("a_test.go", "TestA", "helper.go", "relay", true),
+            facts("helper.go", "relay", "product.go", "Live", false),
+        ];
+        let origins = test_only_callers_by_target(&contributions);
+        assert_eq!(
+            origins[&("product.go".into(), "Live".into())],
+            vec!["a_test.go", "z_test.go"]
+        );
+        assert_eq!(
+            origins[&("helper.go".into(), "relay".into())],
+            vec!["a_test.go", "z_test.go"]
+        );
     }
 
     #[test]
@@ -6579,6 +6995,7 @@ mod tests {
             files,
             exported_symbols,
             outbound_calls,
+            go_initializers: Vec::new(),
             entry_points,
             entry_point_symbols: BTreeMap::new(),
         }
