@@ -579,12 +579,19 @@ impl DaemonControl {
             .acquire()
             .await
             .map_err(|_| ControlError::ConnectionClosed)?;
+        let body = ModuleControlRequestFromModule::ScopeDescribe {
+            owner: stamp.owner.clone(),
+            scope_ref: stamp.scope_ref.clone(),
+        };
+        #[cfg(feature = "test-timing-hooks")]
+        if let Some(directory) = std::env::var_os("AFT_TEST_SCOPE_DESCRIBE_CLOCK_DIR") {
+            return self
+                .describe_with_test_clock(&body, std::path::Path::new(&directory))
+                .await;
+        }
         tokio::time::timeout(
             super::scope_describe::describe_timeout(),
-            self.request(&ModuleControlRequestFromModule::ScopeDescribe {
-                owner: stamp.owner.clone(),
-                scope_ref: stamp.scope_ref.clone(),
-            }),
+            self.request(&body),
         )
         .await
         .map_err(|_| ControlError::Timeout)?
@@ -594,9 +601,25 @@ impl DaemonControl {
         &self,
         body: &ModuleControlRequestFromModule,
     ) -> Result<ModuleControlResponseToModule, ControlError> {
+        let (corr, body) = self.prepare_request(body)?;
+        self.request_prepared(corr, body).await
+    }
+
+    fn prepare_request(
+        &self,
+        body: &ModuleControlRequestFromModule,
+    ) -> Result<(u64, Vec<u8>), ControlError> {
         let body =
             serde_json::to_vec(body).map_err(|error| ControlError::Decode(error.to_string()))?;
         let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
+        Ok((corr, body))
+    }
+
+    async fn request_prepared(
+        &self,
+        corr: u64,
+        body: Vec<u8>,
+    ) -> Result<ModuleControlResponseToModule, ControlError> {
         let rx = self.pending.register(corr);
         let _guard = PendingGuard {
             pending: &self.pending,
@@ -618,6 +641,68 @@ impl DaemonControl {
         let reply = rx.await.map_err(|_| ControlError::ConnectionClosed)?;
         decode_control_reply(&reply)
     }
+
+    #[cfg(feature = "test-timing-hooks")]
+    async fn describe_with_test_clock(
+        &self,
+        body: &ModuleControlRequestFromModule,
+        directory: &std::path::Path,
+    ) -> Result<ModuleControlResponseToModule, ControlError> {
+        let (corr, body) = self.prepare_request(body)?;
+        let budget = super::scope_describe::describe_timeout();
+        let wall_clock = directory.join("wall-clock").exists();
+        let result = if wall_clock {
+            match tokio::time::timeout(budget, self.request_prepared(corr, body)).await {
+                Ok(result) => result,
+                Err(_) => Err(ControlError::Timeout),
+            }
+        } else {
+            // The fixture owns expiry of each correlation. The wall timer only
+            // reports that its former budget elapsed; it cannot cancel the RPC.
+            let request = self.request_prepared(corr, body);
+            tokio::pin!(request);
+            let wall_budget = tokio::time::sleep(budget);
+            tokio::pin!(wall_budget);
+            let expire_path = directory.join(format!("expire-{corr}"));
+            let expiry = async {
+                while !expire_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            tokio::pin!(expiry);
+            let mut reported_budget = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut request => break result,
+                    _ = &mut expiry => break Err(ControlError::Timeout),
+                    _ = &mut wall_budget, if !reported_budget => {
+                        scope_clock_event_for_test(directory, "elapsed", corr)?;
+                        reported_budget = true;
+                    }
+                }
+            }
+        };
+        // Both timeout paths have dropped the request and its PendingGuard
+        // before publishing this acknowledgment, so a late reply is unmatched.
+        if matches!(&result, Err(ControlError::Timeout)) {
+            scope_clock_event_for_test(directory, "expired", corr)?;
+            if wall_clock {
+                scope_clock_event_for_test(directory, "elapsed", corr)?;
+            }
+        }
+        result
+    }
+}
+
+#[cfg(feature = "test-timing-hooks")]
+fn scope_clock_event_for_test(
+    directory: &std::path::Path,
+    event: &str,
+    corr: u64,
+) -> Result<(), ControlError> {
+    std::fs::write(directory.join(format!("{event}-{corr}")), b"observed")
+        .map_err(|error| ControlError::Decode(format!("scope describe test clock: {error}")))
 }
 
 fn decode_control_reply(frame: &Frame) -> Result<ModuleControlResponseToModule, ControlError> {

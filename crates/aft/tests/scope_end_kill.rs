@@ -33,6 +33,8 @@ struct Daemon {
     controls: Vec<(u64, String)>,
     stderr_path: PathBuf,
     frame_trace: Vec<String>,
+    #[cfg(feature = "test-timing-hooks")]
+    describe_clock: tempfile::TempDir,
 }
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -117,6 +119,15 @@ impl Daemon {
         connection_file::write_atomic(&connection_path, &connection).unwrap();
         let mut command = Command::new(aft_binary::aft_binary());
         let stderr_path = root.join("daemon.stderr");
+        #[cfg(feature = "test-timing-hooks")]
+        let describe_clock = tempfile::Builder::new()
+            .prefix("describe-clock-")
+            .tempdir_in(root)
+            .unwrap();
+        #[cfg(feature = "test-timing-hooks")]
+        {
+            command.env("AFT_TEST_SCOPE_DESCRIBE_CLOCK_DIR", describe_clock.path());
+        }
         command
             .current_dir(root)
             .arg("--subc")
@@ -197,6 +208,8 @@ impl Daemon {
             controls: vec![],
             stderr_path,
             frame_trace: Vec::new(),
+            #[cfg(feature = "test-timing-hooks")]
+            describe_clock,
         }
     }
     async fn send(
@@ -409,6 +422,45 @@ impl Daemon {
     #[cfg(feature = "test-timing-hooks")]
     async fn answer(&mut self, request: &Frame, status: &str, synced: bool, epoch: u64) {
         self.send(FrameType::Response, 0, 0, request.header.corr, Some(json!({"op":"scope.describe", "status":status,"scope_epoch":epoch,"owner_synced":synced,"owner_configured":true,"daemon_incarnation":"test-daemon"}))).await;
+    }
+    #[cfg(feature = "test-timing-hooks")]
+    async fn wait_describe_clock(&self, event: &str, corr: u64) {
+        let path = self.describe_clock.path().join(format!("{event}-{corr}"));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("scope describe clock did not report {event} for correlation {corr}")
+        });
+    }
+    #[cfg(feature = "test-timing-hooks")]
+    async fn expire_describe(&self, request: &Frame) {
+        std::fs::write(
+            self.describe_clock
+                .path()
+                .join(format!("expire-{}", request.header.corr)),
+            b"expire",
+        )
+        .unwrap();
+        self.wait_describe_clock("expired", request.header.corr)
+            .await;
+    }
+    #[cfg(feature = "test-timing-hooks")]
+    async fn answer_after_describe_budget(
+        &mut self,
+        request: &Frame,
+        status: &str,
+        synced: bool,
+        epoch: u64,
+    ) {
+        // Keep the reply held until the old wall budget has actually elapsed,
+        // even when process startup is fast. The correlation must remain live.
+        self.wait_describe_clock("elapsed", request.header.corr)
+            .await;
+        self.answer(request, status, synced, epoch).await;
     }
     #[cfg(feature = "test-timing-hooks")]
     async fn goodbye(&mut self, channel: u16, epoch: u32) {
@@ -704,6 +756,9 @@ async fn nondefinitive_answers_retry_without_killing_and_detached_result_is_once
         )
         .await;
     let timed_out = daemon.describe().await;
+    daemon.expire_describe(&timed_out).await;
+    // An expired request holds work; even its late Ended reply must not kill it.
+    daemon.answer(&timed_out, "ended", true, 1).await;
     let retry = daemon.describe().await;
     assert_ne!(timed_out.header.corr, retry.header.corr);
     daemon.answer(&retry, "live", true, 2).await;
@@ -811,7 +866,9 @@ async fn rebind_live_epoch_move_survives_then_old_answer_spares_new_epoch() {
         assert!(tokio::time::Instant::now() < until);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    daemon.answer(&poll, "ended", true, 1).await;
+    daemon
+        .answer_after_describe_budget(&poll, "ended", true, 1)
+        .await;
     let until = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if task_metadata(&root)
