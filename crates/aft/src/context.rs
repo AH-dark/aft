@@ -6350,7 +6350,10 @@ impl AppContext {
     }
 
     pub(crate) fn database_runtime_pending(&self, command: &str) -> bool {
-        crate::persistence_gate::requires_database(command)
+        // Status can read finished task bundles if the store fails, but must
+        // wait for an opening store to recover running tasks after a restart.
+        (crate::persistence_gate::requires_database(command)
+            || command.strip_prefix("aft_").unwrap_or(command) == "bash_status")
             && self.database_runtime_state.load(Ordering::Acquire) == 1
     }
 

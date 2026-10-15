@@ -277,6 +277,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_status_waits_for_database_initialization_but_not_failure() {
+        let (_dir, root) = test_support::test_root("bash-status-database-waits");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let route = route_key(42, 1);
+        let routes = HashMap::from([(route, test_support::route_identity(&root, "test"))]);
+        let frame = |name: &str, corr, deadline_ms| DecodedFrame {
+            parsed_body: Default::default(),
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                42,
+                1,
+                corr,
+                serde_json::to_vec(&json!({
+                    "name": name, "arguments": {}, "deadline_ms": deadline_ms,
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        let mut waits = DatabaseWaits::default();
+        for name in ["bash_status", "aft_bash_status"] {
+            assert!(waits
+                .defer(frame(name, 1, None::<u64>), &routes, &executor)
+                .is_ok());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), waits.next())
+                    .await
+                    .is_err()
+            );
+            assert!(waits.cancel(route, 1).is_some());
+        }
+
+        // An expired caller deadline releases the request even if the open
+        // never finishes; the handler can then try its finished-bundle fallback.
+        assert!(waits
+            .defer(frame("bash_status", 2, Some(0)), &routes, &executor)
+            .is_ok());
+        let resumed = tokio::time::timeout(Duration::from_millis(500), waits.next())
+            .await
+            .unwrap();
+        assert_eq!(resumed.frame.header.corr, 2);
+        assert!(ctx.database_runtime_pending("bash_status"));
+        assert!(ctx
+            .database_runtime_refusal("status", "bash_status")
+            .is_none());
+
+        assert!(waits
+            .defer(frame("bash_status", 3, None), &routes, &executor)
+            .is_ok());
+        ctx.finish_database_runtime_error("database cannot open".into(), false);
+        let resumed = tokio::time::timeout(Duration::from_millis(500), waits.next())
+            .await
+            .unwrap();
+        assert_eq!(resumed.frame.header.corr, 3);
+        assert!(ctx
+            .database_runtime_refusal("status", "bash_status")
+            .is_none());
+        assert!(waits
+            .defer(frame("bash_status", 4, None), &routes, &executor)
+            .is_err());
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
     async fn database_wait_notification_releases_only_persistence_calls_and_cancel_aborts_wait() {
         let (_dir, root) = test_support::test_root("database-waits");
         let ctx = test_support::test_ctx();

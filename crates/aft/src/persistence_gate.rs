@@ -5,8 +5,8 @@
 /// mutating tools instead of silently depending on that fallback.
 pub(crate) fn classification(name: &str) -> Option<bool> {
     let name = name.strip_prefix("aft_").unwrap_or(name);
-    // Finished task files remain readable when aft.db cannot open. The status
-    // handler reads only finished-task records and output, without recovering processes.
+    // Finished task files remain readable when aft.db cannot open. Status still
+    // waits for initialization so running tasks can be recovered after a restart.
     if name == "bash_status" {
         return Some(false);
     }

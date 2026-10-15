@@ -26,6 +26,18 @@ const ROUTE_CHANNEL: u16 = 1;
 
 #[test]
 fn subc_background_bash_survives_module_process_group_restart() {
+    background_bash_survives_restart(None);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn subc_background_bash_status_waits_for_persistence_after_restart() {
+    // Only the restarted module delays its open; the task is already running
+    // when status arrives during persistence initialization.
+    background_bash_survives_restart(Some(1_500));
+}
+
+fn background_bash_survives_restart(database_open_delay_ms: Option<u64>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -88,7 +100,9 @@ fn subc_background_bash_survives_module_process_group_restart() {
         drop(stream);
         assert_process_alive(child_pid, "background child after module process-group SIGTERM");
 
-        let mut second_module = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut second_module = ModuleProcess::spawn_with_database_open_delay(
+            &conn_path, config_home.path(), data_home.path(), database_open_delay_ms,
+        );
         let mut stream = accept_module(&listener).await;
         bind_route(&mut stream, project.path()).await;
 
@@ -102,6 +116,7 @@ fn subc_background_bash_survives_module_process_group_restart() {
             Some(u64::from(child_pid)),
             "rehydrated status should describe the same detached child"
         );
+        assert!(replayed.get("store_unavailable").is_none(), "{replayed}");
         assert_process_alive(child_pid, "rehydrated background child");
 
         drop(_stop_guard);
@@ -664,6 +679,7 @@ fn drain_with_live_lsp_servers_and_writer(
             writer_delay,
             flush_hold,
             phase_rendezvous.then_some(phase_events_path.as_path()),
+            None,
         );
         let mut stream = accept_module(&listener).await;
         for (index, project) in projects.iter().enumerate() {
@@ -926,6 +942,28 @@ impl ModuleProcess {
             "40",
             None,
             None,
+            None,
+        )
+    }
+
+    fn spawn_with_database_open_delay(
+        conn_path: &Path,
+        config_home: &Path,
+        data_home: &Path,
+        delay_ms: Option<u64>,
+    ) -> Self {
+        Self::spawn_with_exit_hooks(
+            conn_path,
+            config_home,
+            data_home,
+            None,
+            None,
+            false,
+            false,
+            "40",
+            None,
+            None,
+            delay_ms,
         )
     }
 
@@ -940,6 +978,7 @@ impl ModuleProcess {
         writer_delay: &str,
         flush_hold: Option<&str>,
         phase_events_path: Option<&Path>,
+        database_open_delay_ms: Option<u64>,
     ) -> Self {
         use std::os::unix::process::CommandExt;
 
@@ -964,6 +1003,9 @@ impl ModuleProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr);
+        if let Some(delay_ms) = database_open_delay_ms {
+            command.env("AFT_TEST_DATABASE_OPEN_DELAY_MS", delay_ms.to_string());
+        }
         if active_ort {
             command.env("AFT_TEST_HOLD_ORT_SECTION", "1");
         }
