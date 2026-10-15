@@ -3,6 +3,7 @@
 #[allow(dead_code)]
 pub mod executable_cache;
 pub mod fake_lsp;
+mod timeout_forensics;
 
 #[path = "../../src/test_env.rs"]
 mod shared_test_env;
@@ -183,6 +184,7 @@ pub struct AftProcess {
     stdout_rx: Receiver<StdoutEvent>,
     stdout_eof: bool,
     pending_frames: VecDeque<serde_json::Value>,
+    last_request: Option<String>,
     diag_enabled: bool,
     spawned_at: Instant,
     stdout_trace_log_path: Option<PathBuf>,
@@ -552,6 +554,7 @@ impl AftProcess {
             stdout_rx,
             stdout_eof: false,
             pending_frames: VecDeque::new(),
+            last_request: None,
             diag_enabled,
             spawned_at,
             stdout_trace_log_path,
@@ -572,6 +575,7 @@ impl AftProcess {
 
     pub fn send_with_timeout(&mut self, request: &str, timeout: Duration) -> serde_json::Value {
         let request = self.prepare_request(request);
+        self.last_request = Some(request.clone());
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");
@@ -660,13 +664,26 @@ impl AftProcess {
                 panic!("parse response JSON: {error}; line: {line}")
             }
             Err(RecvTimeoutError::Timeout) => {
+                let pid = self.child.id();
+                let mut stacks = "not collected: child is not known to be running".to_string();
                 let child_status = match self.child.try_wait() {
                     Ok(Some(status)) => format!("exited with status {status}"),
-                    Ok(None) => "still running".to_string(),
+                    Ok(None) => {
+                        // Sample before unwinding drops the handle and tears down
+                        // the child. The sampler has its own independent deadline.
+                        stacks = timeout_forensics::capture_stacks(pid);
+                        "still running".to_string()
+                    }
                     Err(error) => format!("try_wait error: {error}"),
                 };
+                let stderr_tail = self.read_stderr_tail();
+                let request = self.last_request.as_deref().unwrap_or("<none sent>");
                 panic!(
-                    "timed out after {}s waiting for {context} from aft stdout (child {child_status})",
+                    "timed out after {}s waiting for {context} from aft stdout (child {child_status})\n\
+                     ↳ child pid: {pid}\n\
+                     ↳ last sent request (pending response or push frame): {request}\n\
+                     ↳ stderr tail (last {STDERR_TAIL_LINES} lines):\n{stderr_tail}\n\
+                     ↳ stack capture:\n{stacks}",
                     timeout.as_secs()
                 );
             }
@@ -800,6 +817,7 @@ impl AftProcess {
     /// Verifies the process is still alive by sending a follow-up ping.
     pub fn send_silent(&mut self, request: &str) {
         let request = self.prepare_request(request);
+        self.last_request = Some(request.clone());
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");
@@ -807,6 +825,7 @@ impl AftProcess {
 
     /// Send bytes as one protocol line, including deliberately invalid UTF-8.
     pub fn send_bytes(&mut self, request: &[u8]) -> serde_json::Value {
+        self.last_request = Some(String::from_utf8_lossy(request).into_owned());
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         stdin.write_all(request).expect("write protocol bytes");
         stdin.write_all(b"\n").expect("write protocol delimiter");
@@ -820,6 +839,7 @@ impl AftProcess {
         F: FnMut(&serde_json::Value) -> bool,
     {
         let request = self.prepare_request(request);
+        self.last_request = Some(request.clone());
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");
@@ -1468,6 +1488,45 @@ pub fn take_logs() -> Vec<String> {
 #[cfg(test)]
 mod exit_timeout_forensics_tests {
     use super::*;
+
+    #[test]
+    fn response_timeout_captures_live_child_stacks_request_and_stderr() {
+        let mut aft = AftProcess::spawn();
+        let pong = aft.send(r#"{"id":"forensics-ping","command":"ping"}"#);
+        assert_eq!(pong["success"], true);
+        // Keep the response channel idle without stopping the child, so this
+        // exercises the live-child timeout path deterministically.
+        let (_sender, receiver) = mpsc::channel();
+        aft.stdout_rx = receiver;
+        let request = r#"{"id":"pending-forensics-request","command":"ping"}"#;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aft.send_with_timeout(request, Duration::from_millis(50))
+        }));
+        let message = panic_message_string(&result.expect_err("response must time out"));
+        assert!(
+            message.contains(request),
+            "missing pending request: {message}"
+        );
+        assert!(message.contains("child pid"), "missing pid: {message}");
+        assert!(message.contains("stderr tail"), "missing stderr: {message}");
+        assert!(message.contains("[aft]"), "missing child stderr: {message}");
+        assert!(
+            message.contains("stack capture"),
+            "missing stacks: {message}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            message.contains("sample"),
+            "missing sampler name: {message}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            message.contains("/proc/"),
+            "missing sampler name: {message}"
+        );
+        assert!(aft.child.try_wait().unwrap().is_none());
+        aft.shutdown();
+    }
 
     /// A deliberately-still-alive `aft` child must produce an exit-timeout
     /// panic whose message carries evidence: the stderr tail (so the next
