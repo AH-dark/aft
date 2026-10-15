@@ -263,6 +263,65 @@ describe("Pi background notifications", () => {
     expect(content).toBeUndefined();
   });
 
+  test("idle hooks stay quiet without a bridge and replay once one appears", async () => {
+    const send = mock(async (_command: string, _params: Record<string, unknown>) => ({
+      success: true,
+      bg_completions: [],
+    }));
+    const bridge = { send };
+    let activeBridge: typeof bridge | null = null;
+    const ctx = {
+      pool: {
+        getActiveBridgeForRoot: () => activeBridge,
+        getBridge: () => activeBridge,
+      },
+      config: {},
+      storageDir: "/tmp/aft-test",
+    } as unknown as PluginContext;
+    const drainContext = { ctx, directory: "/tmp/project", sessionID: "s1" };
+    const runtime = { sendUserMessage: mock(() => {}) };
+
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "first" }]);
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "second" }]);
+    await handleTurnEndBgCompletions({ ...drainContext, runtime });
+
+    expect(send).toHaveBeenCalledTimes(0);
+    expect(sessionWarnSpy).not.toHaveBeenCalled();
+    expect(sessionBgStates.get("s1")?.forcedDrainCompleted).toBe(false);
+
+    activeBridge = bridge;
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "third" }]);
+    await appendToolResultBgCompletions(drainContext, [{ type: "text", text: "fourth" }]);
+    await handleTurnEndBgCompletions({ ...drainContext, runtime });
+
+    expect(send.mock.calls.map((call) => call[0])).toEqual(["bash_drain_completions"]);
+    expect(sessionWarnSpy).not.toHaveBeenCalled();
+    expect(sessionBgStates.get("s1")?.forcedDrainCompleted).toBe(true);
+  });
+
+  test("tracked work still warns when its bridge is unavailable", async () => {
+    const ctx = {
+      pool: {
+        getActiveBridgeForRoot: () => null,
+        getBridge: () => null,
+      },
+      config: {},
+      storageDir: "/tmp/aft-test",
+    } as unknown as PluginContext;
+    trackBgTask("s1", "task-1");
+
+    await appendToolResultBgCompletions(
+      { ctx, directory: "/tmp/project", sessionID: "s1" },
+      [{ type: "text", text: "tool output" }],
+    );
+
+    expect(
+      sessionWarnSpy.mock.calls.some(
+        (call) => (call[2] as { event?: string } | undefined)?.event === "bash_completion_drain_error",
+      ),
+    ).toBe(true);
+  });
+
   test("completion replay uses a bounded non-killing transport poll", async () => {
     const send = mock(async (_command: string, _params: unknown, _options: unknown) => ({
       success: true,
