@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "Reuses each compact source line's byte trigram membership across query tokens, preserving duplicate query-trigram contributions, scores, selected lines, and tie breaks. All ranked benchmark rows must remain byte-identical; no ranking change or reference re-recording is intended. The remaining recovered fixes concern bash execution and replay, persistence retries, inspect reuse, eviction sizing, and bridge scope recovery."
+}
