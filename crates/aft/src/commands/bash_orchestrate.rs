@@ -36,9 +36,49 @@ struct BashOrchestrateParams {
     timeout: Option<u64>,
 }
 
-/// Port of `packages/aft-bridge/src/bash-format.ts` `formatForegroundResult` (lines 8-25).
+/// Foreground output and terminal diagnostics, including a status fallback when
+/// no exit diagnostic can explain a failed or killed task.
 pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
-    let mut rendered = snapshot.output_preview.clone();
+    let terminal_status = match snapshot.info.status {
+        BgTaskStatus::Failed if snapshot.exit_code.is_none_or(|code| code == 0) => Some("failed"),
+        BgTaskStatus::Killed
+            if !matches!(
+                snapshot.info.status_reason.as_deref(),
+                Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
+            ) =>
+        {
+            Some("killed")
+        }
+        _ => None,
+    };
+    let mut rendered = if let Some(status) = terminal_status {
+        // Reuse the status tool's wording so a terminal record without captured
+        // output or an exit code cannot look like an empty successful command.
+        let mut text = crate::subc_format::format_bash_task_status_header(
+            &snapshot.info.task_id,
+            status,
+            snapshot.exit_code,
+            snapshot.info.status_reason.as_deref(),
+        );
+        if !snapshot.output_preview.is_empty() {
+            push_line(&mut text, &snapshot.output_preview);
+        }
+        text
+    } else {
+        snapshot.output_preview.clone()
+    };
+    if snapshot.info.status == BgTaskStatus::Failed
+        || (snapshot.info.status == BgTaskStatus::Killed && terminal_status.is_some())
+    {
+        if let Some(reason) = snapshot
+            .info
+            .status_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+        {
+            push_line(&mut rendered, &format!("[{reason}]"));
+        }
+    }
     if snapshot.output_truncated {
         if let Some(output_path) = snapshot.output_path.as_deref() {
             rendered.push_str(&format!(

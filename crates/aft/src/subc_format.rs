@@ -1041,6 +1041,27 @@ fn bash_task_id(data: &Value) -> &str {
 // Mirrors packages/opencode-plugin/src/tools/bash.ts formatBashStatusText and
 // formatPtyStatus, so a catalog consumer shows the model the same status text
 // the OpenCode tool does.
+pub(crate) fn format_bash_task_status_header(
+    task_id: &str,
+    status: &str,
+    exit_code: Option<i64>,
+    status_reason: Option<&str>,
+) -> String {
+    let mut text = format!("Task {task_id}: {status}");
+    if status == "killed"
+        && matches!(
+            status_reason,
+            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
+        )
+    {
+        text.push_str(" (scope revoked)");
+    }
+    if let Some(exit_code) = exit_code {
+        text.push_str(&format!(" (exit {exit_code})"));
+    }
+    text
+}
+
 fn format_bash_status(
     data: &Value,
     output_mode: Option<&str>,
@@ -1052,18 +1073,12 @@ fn format_bash_status(
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let mut text = format!("Task {task_id}: {status}");
-    if status == "killed"
-        && matches!(
-            data.get("status_reason").and_then(Value::as_str),
-            Some(crate::bash_background::registry::SCOPE_REVOKED_REASON | "scope revoked")
-        )
-    {
-        text.push_str(" (scope revoked)");
-    }
-    if let Some(exit_code) = data.get("exit_code").and_then(Value::as_i64) {
-        text.push_str(&format!(" (exit {exit_code})"));
-    }
+    let mut text = format_bash_task_status_header(
+        task_id,
+        status,
+        data.get("exit_code").and_then(Value::as_i64),
+        data.get("status_reason").and_then(Value::as_str),
+    );
     if let Some(duration_ms) = data.get("duration_ms").and_then(Value::as_u64) {
         // Rounded to the nearest second, as the plugin displays it.
         text.push_str(&format!(" {}s", duration_ms.saturating_add(500) / 1000));

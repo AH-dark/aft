@@ -10705,7 +10705,9 @@ fn terminal_metadata_from_marker(
     match marker {
         ExitMarker::Code(code) => {
             #[cfg(unix)]
-            if metadata.mode == BgMode::Pipes && code == super::process::BOOTSTRAP_ABORTED_MARKER {
+            if metadata.mode == BgMode::Pipes
+                && i64::from(code) == i64::from(super::process::BOOTSTRAP_ABORTED_MARKER)
+            {
                 metadata.mark_terminal(
                     BgTaskStatus::Failed,
                     None,
@@ -12495,6 +12497,79 @@ mod tests {
     }
 
     #[test]
+    fn recovered_terminal_reply_matches_live_status_text() {
+        use crate::commands::bash_orchestrate::{decide_bash_step, BashStep};
+        for (status, exit, reason, expected) in [
+            (BgTaskStatus::Failed, None, Some("spawn aborted"), "failed"),
+            (BgTaskStatus::Failed, Some(17), None, "[exit code: 17]"),
+            (BgTaskStatus::Killed, None, None, "killed"),
+            (
+                BgTaskStatus::Killed,
+                None,
+                Some("cancelled by caller"),
+                "killed",
+            ),
+            (
+                BgTaskStatus::TimedOut,
+                None,
+                Some("timeout elapsed"),
+                "[command timed out]",
+            ),
+            (BgTaskStatus::Failed, Some(0x8000_0000), None, "2147483648"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let task_id = random_slug();
+            let paths = task_paths(dir.path(), "session", &task_id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                task_id,
+                "session".into(),
+                "unused".into(),
+                dir.path().to_path_buf(),
+                Some(dir.path().to_path_buf()),
+                None,
+                false,
+                false,
+            );
+            metadata.mark_terminal(status.clone(), exit, reason.map(str::to_string));
+            let row = metadata.to_bash_task_row("runner", &paths).unwrap();
+            let snapshot = terminal_db_row_snapshot(row, metadata);
+            let now = Instant::now();
+            let BashStep::Done(live) =
+                decide_bash_step(snapshot.clone(), now, true, false, now, "terminal")
+            else {
+                panic!("terminal record must have a live foreground result");
+            };
+            let context = crate::subc_format::FormatContext::from_tool_call(
+                "bash",
+                &serde_json::json!({}),
+                dir.path(),
+            );
+            let live_text =
+                crate::subc_format::format_response_with_context("bash", &live, &context);
+            let key = crate::db::call_ledger::Key {
+                carrier: "reserved:carrier".into(),
+                call_key: "terminal".into(),
+            };
+            let (frame, _) = crate::subc::recovered_bash_frame(snapshot, &key, dir.path())
+                .expect("terminal recovered frame");
+            let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(body["content"][0]["text"], live_text);
+            assert!(
+                live.success,
+                "a failed command is still a successful tool call"
+            );
+            assert_eq!(body["isError"], false);
+            assert!(
+                live_text.contains(expected),
+                "terminal {status:?}/{exit:?}/{reason:?} lost its status: {body}"
+            );
+            if let Some(reason) = reason {
+                assert!(live_text.contains(reason), "{live_text}");
+            }
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     fn bootstrap_abort_marker_is_never_started_without_command_exit_code() {
         let metadata = PersistedTask::starting(
@@ -12509,7 +12584,7 @@ mod tests {
         );
         let terminal = terminal_metadata_from_marker(
             metadata,
-            ExitMarker::Code(super::super::process::BOOTSTRAP_ABORTED_MARKER),
+            ExitMarker::Code(super::super::process::BOOTSTRAP_ABORTED_MARKER.into()),
             None,
         );
         assert_eq!(terminal.status, BgTaskStatus::Failed);
