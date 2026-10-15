@@ -584,6 +584,7 @@ impl Harness for Subject {
         )
         .await?;
         route.scoped_preset = stamp.scope.as_ref().map(|_| self.preset.unwrap_or("head"));
+        wait_for_route_ready(&route, self.quick_call()).await;
         Ok(route)
     }
     async fn kill_at(
@@ -821,6 +822,40 @@ fn marker_command(marker: &Path) -> String {
 
 fn response_json(frame: &Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
+}
+
+fn is_database_initializing(frame: &Frame) -> bool {
+    response_json(frame)["structuredContent"]["code"] == "database_initializing"
+        || String::from_utf8_lossy(&frame.body)
+            .contains("Project persistence is still initializing")
+}
+
+async fn wait_for_route_ready(route: &Route, probe: CallSpec) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (name, arguments) = probe.clone();
+        let frame = tokio::time::timeout_at(
+            deadline,
+            route.terminal(json!({"name":name,"arguments":arguments})),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("project persistence did not become ready within 15 seconds"));
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "route readiness probe did not return a response: {}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        if !is_database_initializing(&frame) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "project persistence did not become ready within 15 seconds: {}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
