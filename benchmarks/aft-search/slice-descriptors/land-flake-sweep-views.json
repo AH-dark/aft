@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Test-only change: the ranking-fenced files change only inside their #[cfg(test)] modules (a contended-read test now waits on a channel instead of wall time, and semantic probe tests wait causally). Ranking and routing are unchanged; benchmark rows must remain byte-identical."
+}
