@@ -149,11 +149,62 @@ describe("precheckArchiveSize", () => {
   test("rejects an archive TOC with a sparse-sized member before extraction", async () => {
     const root = createStagingFixture();
     const archivePath = join(root, "bomb.zip");
-    writeFakeZipWithUncompressedSize(archivePath, 1024 * 1024 * 1024 + 1);
+    const oversizedSize = 1_073_741_825;
+    writeFakeZipWithUncompressedSize(archivePath, oversizedSize);
+    const calls: string[][] = [];
+    const child = { stdin: { end: () => {} } } as unknown as childProcess.ChildProcess;
+    // Keep the size assertion independent of how long the host takes to start unzip.
+    const toolMock = spyOn(childProcess, "execFile").mockImplementation(((
+      command: string,
+      args: string[],
+      _options: unknown,
+      callback: (
+        error: childProcess.ExecFileException | null,
+        stdout: string,
+        stderr: string,
+      ) => void,
+    ) => {
+      calls.push(args);
+      const listing = [
+        `Archive:  ${archivePath}`,
+        "  Length      Date    Time    Name",
+        "---------  ---------- -----   ----",
+        `${oversizedSize}  1980-01-01 00:00   sparse.bin`,
+        "---------                     -------",
+        `${oversizedSize}                     1 file`,
+        "",
+      ].join("\n");
+      if (args[0] === "-l") {
+        expect(command).toBe("unzip");
+        callback(null, listing, "");
+      } else if (args[0] === "-Z1") {
+        expect(command).toBe("unzip");
+        callback(null, "sparse.bin\n", "");
+      } else if (args[0] === "-tvf") {
+        callback(null, `-rw-r--r-- 0 user group ${oversizedSize} Jan 1 00:00 sparse.bin\n`, "");
+      } else if (args[0] === "-tf") callback(null, "sparse.bin\n", "");
+      else callback(new Error(`unexpected archive tool arguments: ${args.join(" ")}`), "", "");
+      return child;
+    }) as typeof childProcess.execFile);
 
-    await expect(
-      withArchiveDiagnostics(() => precheckArchiveSize(archivePath, "zip")),
-    ).rejects.toThrow(/archive uncompressed size/);
+    try {
+      await expect(precheckArchiveSize(archivePath, "zip")).rejects.toThrow(
+        /archive uncompressed size/,
+      );
+      expect(calls).toEqual(
+        process.platform === "win32"
+          ? [
+              ["-tvf", archivePath],
+              ["-tf", archivePath],
+            ]
+          : [
+              ["-l", archivePath],
+              ["-Z1", archivePath],
+            ],
+      );
+    } finally {
+      toolMock.mockRestore();
+    }
   });
 });
 
