@@ -4524,6 +4524,7 @@ mod grant_path_tests {
             Instant::now(),
         );
 
+        drop(completion_tx);
         let started_by = Instant::now() + Duration::from_secs(3);
         while metrics
             .deferred_bash_waits_in_flight
@@ -4577,18 +4578,15 @@ mod grant_path_tests {
         );
         holder.join().expect("holder thread");
 
-        // The call still answers normally once the command exits.
-        let completion = tokio::time::timeout(Duration::from_secs(8), completion_rx.recv())
-            .await
-            .expect("deferred completion deadline")
-            .expect("deferred completion");
-        assert!(
-            completion
-                .result
-                .expect("terminal bash result")
-                .response
-                .success
-        );
+        // Wait for the completion event, not a second deadline that also charges
+        // Windows shell startup and persistence against the frame-loop test.
+        // The command's hard kill still bounds execution; require a normal exit
+        // below so a hung command cannot pass merely by timing out.
+        let completion = completion_rx.recv().await.expect("deferred completion");
+        let response = completion.result.expect("terminal bash result").response;
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "completed", "{response:?}");
+        assert_eq!(response.data["exit_code"], 0, "{response:?}");
     }
 }
 
