@@ -11703,7 +11703,9 @@ mod interactive_artifact_read_budget_tests {
         let reader = thread::spawn(move || {
             let started = Instant::now();
             let result = try_read_with_budget(&reader_lock, Duration::from_millis(20));
-            result_tx.send((result.is_some(), started.elapsed())).unwrap();
+            result_tx
+                .send((result.is_some(), started.elapsed()))
+                .unwrap();
         });
 
         // Keep the writer live until the reader reports degradation. A delayed
