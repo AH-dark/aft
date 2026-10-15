@@ -39,6 +39,23 @@ impl Drop for Daemon {
         self.reader.abort();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            // Assertions outside reply() also need the control-frame history.
+            eprintln!(
+                "scope daemon sent/received frames:\n{}",
+                self.frame_trace.join("\n")
+            );
+            while let Ok(frame) = self.frames.try_recv() {
+                eprintln!(
+                    "scope daemon unread frame at failure: type={:?} channel={} epoch={} corr={} body={}",
+                    frame.header.ty,
+                    frame.header.channel,
+                    frame.header.epoch,
+                    frame.header.corr,
+                    String::from_utf8_lossy(&frame.body)
+                );
+            }
+        }
         if std::thread::panicking() || std::env::var_os("AFT_TEST_SCOPE_DIAGNOSTICS").is_some() {
             eprintln!(
                 "scope daemon stderr:\n{}",
