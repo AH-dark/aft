@@ -1159,3 +1159,106 @@ async fn worker_jail_temp_and_cortexkit_scratch_match_tools() {
         );
     }
 }
+
+#[tokio::test]
+async fn worker_jail_short_temp_binds_and_connects_unix_socket() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let script = r#"import os, pathlib, socket, stat
+root = pathlib.Path(os.environ['TMPDIR'])
+assert os.environ['TMP'] == str(root) == os.environ['TEMP']
+assert root == root.resolve()
+assert stat.S_IMODE(root.stat().st_mode) == 0o700
+nested = root / ('a' * 30)
+nested.mkdir()
+path = str(nested / ('b' * 30 + '.sock'))
+server = socket.socket(socket.AF_UNIX)
+server.settimeout(3)
+server.bind(path)
+server.listen(1)
+client = socket.socket(socket.AF_UNIX)
+client.settimeout(3)
+client.connect(path)
+peer, _ = server.accept()
+peer.sendall(b'hello')
+assert client.recv(5) == b'hello'
+print('SOCKET_ROUNDTRIP_OK')
+"#;
+    let reply = jail
+        .bash(&format!("python3 -B -c {}", quote(Path::new(script))))
+        .await;
+    assert!(reply.contains("SOCKET_ROUNDTRIP_OK"), "{reply}");
+}
+
+#[tokio::test]
+async fn worker_jail_temp_denies_other_task_directory() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    let recorded = jail.worktree.join("first-temp.txt");
+    let reply = jail.bash(&format!("printf '%s' \"$TMPDIR\" > {}; printf original > \"$TMPDIR/sentinel\" && echo FIRST_TEMP_OK", quote(&recorded))).await;
+    assert!(reply.contains("FIRST_TEMP_OK"), "{reply}");
+    let first = PathBuf::from(std::fs::read_to_string(recorded).unwrap());
+    assert!(first.join("sentinel").is_file());
+    let script = r#"import errno, os, pathlib, sys
+own = pathlib.Path(os.environ['TMPDIR'])
+assert own != pathlib.Path(sys.argv[1])
+(own / 'positive-control').write_text('allowed')
+try:
+    (pathlib.Path(sys.argv[1]) / 'sentinel').write_text('tampered')
+except OSError as e:
+    assert e.errno in (errno.EPERM, errno.EACCES), e
+    print('OTHER_TASK_DENIED')
+else:
+    raise AssertionError('other task directory was writable')
+"#;
+    let reply = jail
+        .bash(&format!(
+            "python3 -B -c {} {}",
+            quote(Path::new(script)),
+            quote(&first)
+        ))
+        .await;
+    assert!(reply.contains("OTHER_TASK_DENIED"), "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(first.join("sentinel")).unwrap(),
+        "original"
+    );
+}
+
+#[tokio::test]
+async fn worker_jail_temp_denies_shared_tmp_write() {
+    if !native_available() {
+        return;
+    }
+    let mut jail = Jail::start().await;
+    // Use a fresh name so even a broken policy cannot overwrite a host file.
+    let outside = PathBuf::from(format!(
+        "/tmp/aft-denied-{}",
+        jail.base.file_name().unwrap().to_str().unwrap()
+    ));
+    let script = r#"import errno, os, pathlib, sys
+(pathlib.Path(os.environ['TMPDIR']) / 'positive-control').write_text('allowed')
+try:
+    with open(sys.argv[1], 'x') as f:
+        f.write('unexpected')
+except OSError as e:
+    assert e.errno in (errno.EPERM, errno.EACCES), e
+    print('SHARED_TMP_DENIED')
+else:
+    os.unlink(sys.argv[1])
+    raise AssertionError('shared tmp was writable')
+"#;
+    let reply = jail
+        .bash(&format!(
+            "python3 -B -c {} {}",
+            quote(Path::new(script)),
+            quote(&outside)
+        ))
+        .await;
+    assert!(reply.contains("SHARED_TMP_DENIED"), "{reply}");
+    assert!(!outside.exists());
+}

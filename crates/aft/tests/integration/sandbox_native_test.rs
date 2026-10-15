@@ -584,10 +584,13 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
         "temp probe: {temp_probe:?}"
     );
     let task_temp = PathBuf::from(std::fs::read_to_string(&temp_path_file).unwrap());
-    let canonical_storage = storage.canonicalize().unwrap();
+    #[cfg(target_os = "macos")]
+    let temp_root = Path::new("/private/tmp/aft-w");
+    #[cfg(target_os = "linux")]
+    let temp_root = Path::new("/tmp/aft-w");
     assert!(
-        task_temp.starts_with(&canonical_storage),
-        "task temp must live in the task bundle: {}",
+        task_temp.parent() == Some(temp_root),
+        "task temp must live in the short private root: {}",
         task_temp.display()
     );
     assert_eq!(

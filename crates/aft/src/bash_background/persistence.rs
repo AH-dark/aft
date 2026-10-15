@@ -1589,7 +1589,7 @@ fn delete_task_tombstone(session_dir: &Path, task_id: &str) -> io::Result<bool> 
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    validate_task_tombstone_metadata(&task, task_id)?;
+    validate_and_cleanup_task_tombstone_metadata(&task, task_id)?;
     remove_optional_task_directory(&task, IO_DIR, remove_tree_contents)?;
     remove_optional_task_directory(&task, CONTROL_DIR, |control| {
         let mut names = control.list_names()?;
@@ -1636,7 +1636,7 @@ fn find_task_tombstone(session: &PinnedDir, task_id: &str) -> io::Result<Option<
 }
 
 #[cfg(unix)]
-fn validate_task_tombstone_metadata(task: &PinnedDir, task_id: &str) -> io::Result<()> {
+fn validate_and_cleanup_task_tombstone_metadata(task: &PinnedDir, task_id: &str) -> io::Result<()> {
     let control = match task.open_dir_at(OsStr::new(CONTROL_DIR)) {
         Ok(control) => control,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1654,6 +1654,9 @@ fn validate_task_tombstone_metadata(task: &PinnedDir, task_id: &str) -> io::Resu
             io::ErrorKind::InvalidData,
             "background task tombstone metadata identity mismatch",
         ));
+    }
+    if let Some(temp_dir) = &metadata.sandbox_temp_dir {
+        crate::sandbox_spawn::cleanup_task_temp_dir(temp_dir)?;
     }
     Ok(())
 }
@@ -1823,6 +1826,13 @@ fn remove_directory_task_with_io_cleanup(
 
     #[cfg(unix)]
     {
+        // The short scratch directory is outside the bundle, so retire it
+        // before removing the metadata that records its ownership.
+        if let Ok(metadata) = read_task_at(task) {
+            if let Some(temp_dir) = &metadata.sandbox_temp_dir {
+                crate::sandbox_spawn::cleanup_task_temp_dir(temp_dir)?;
+            }
+        }
         let tombstone = rename_task_to_tombstone(task)?;
         // Windows may refuse to delete an output file while the killed process
         // still has it open. Remove the child-writable IO tree before control
@@ -3640,6 +3650,25 @@ mod tests {
         assert_eq!(error.to_string(), "task path is a reparse point");
         assert_eq!(fs::read(&victim).unwrap(), b"victim-bytes");
         fs::remove_dir(&junction).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn directory_cleanup_removes_short_sandbox_temp() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, mut metadata) = counted_task(storage.path());
+        let temp = crate::sandbox_spawn::create_task_temp_dir(task.dirs.io.path()).unwrap();
+        fs::write(temp.join("scratch"), "payload").unwrap();
+        metadata.sandbox_temp_dir = Some(temp.clone());
+        write_task_at(&task, &metadata).unwrap();
+        delete_resolved_task(&task).unwrap();
+        assert!(!temp.exists());
+        assert!(!temp.with_extension("owner").exists());
+        crate::sandbox_spawn::cleanup_task_temp_dir(&temp).unwrap();
+        crate::sandbox_spawn::cleanup_task_temp_dir(
+            &task.dirs.io.path().join(".sandbox-tmp-already-removed"),
+        )
+        .unwrap();
     }
 
     #[test]

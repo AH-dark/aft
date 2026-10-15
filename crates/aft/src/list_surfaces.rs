@@ -329,6 +329,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal housekeeping advances bounded round-robin queues and resumable directory iterators; retained work is revisited on later passes, not truncated from an agent-visible list",
     },
     ExclusionEntry {
+        file: "sandbox_spawn/task_temp.rs",
+        enclosing_item: "sweep_stale",
+        location_or_primitive: "SWEEP_BUDGET directory iterator advancement",
+        reason: "internal crash cleanup resumes the same iterator on later task launches; the budget bounds maintenance work and does not cut an agent-visible list",
+    },
+    ExclusionEntry {
         file: "bash_background/gc_cursor.rs",
         enclosing_item: "next_batch",
         location_or_primitive: "GC_ENTRY_BUDGET directory iterator advancement",

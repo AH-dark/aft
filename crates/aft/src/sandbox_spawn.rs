@@ -24,8 +24,6 @@ use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "linux")]
 use std::ffi::{CStr, CString};
 use std::ffi::{OsStr, OsString};
-#[cfg(unix)]
-use std::fs::DirBuilder;
 use std::fs::File;
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom};
@@ -37,13 +35,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(not(unix))]
 type RawFd = i32;
-#[cfg(unix)]
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Command;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -54,6 +48,9 @@ use portable_pty::CommandBuilder;
 
 use crate::context::AppContext;
 use crate::sandbox_profile::SandboxProfile;
+
+#[cfg(unix)]
+mod task_temp;
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
@@ -572,7 +569,7 @@ impl SpawnPlan {
             return;
         };
         if is_managed_task_temp_dir(temp_dir) {
-            let _ = std::fs::remove_dir_all(temp_dir);
+            let _ = cleanup_task_temp_dir(temp_dir);
         }
     }
 
@@ -1371,7 +1368,7 @@ pub fn resolve_sandbox_spawn(
         let launcher_path = match std::env::current_exe() {
             Ok(path) => path,
             Err(error) => {
-                let _ = std::fs::remove_dir_all(&profile.temp_dir);
+                let _ = cleanup_task_temp_dir(&profile.temp_dir);
                 return sandbox_setup_refusal(
                     ctx,
                     principal,
@@ -1733,7 +1730,7 @@ fn build_native_profile(
         Ok(profile)
     })();
     if result.is_err() {
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = cleanup_task_temp_dir(&temp_dir);
     }
     result
 }
@@ -3243,30 +3240,9 @@ fn normalized_relative_components(path: &Path) -> Result<Vec<&OsStr>, String> {
 }
 
 #[cfg(unix)]
-fn create_task_temp_dir(task_bundle_dir: &Path) -> Result<PathBuf, String> {
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    for _ in 0..32 {
-        let nonce = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let path = task_bundle_dir.join(format!(".sandbox-tmp-{}-{nonce}", std::process::id()));
-        match DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => {
-                return path.canonicalize().map_err(|error| {
-                    format!(
-                        "failed to canonicalize task temp directory {}: {error}",
-                        path.display()
-                    )
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(format!(
-                    "failed to create task temp directory {}: {error}",
-                    path.display()
-                ));
-            }
-        }
-    }
-    Err("failed to allocate a fresh task temp directory after 32 attempts".to_string())
+pub(crate) fn create_task_temp_dir(task_bundle_dir: &Path) -> Result<PathBuf, String> {
+    task_temp::create(task_bundle_dir)
+        .map_err(|error| format!("failed to allocate task temp directory: {error}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -3298,9 +3274,28 @@ exec /usr/bin/mktemp "$@" "${TMPDIR:?}/tmp.XXXXXXXX"
 }
 
 pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
+    #[cfg(unix)]
+    if task_temp::is_managed(path) {
+        return true;
+    }
     path.file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| name.starts_with(".sandbox-tmp-"))
+}
+
+pub(crate) fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if task_temp::is_managed(path) {
+        return task_temp::remove(path);
+    }
+    // Older persisted tasks kept their temporary files inside the IO bundle.
+    if is_managed_task_temp_dir(path) {
+        return match std::fs::remove_dir_all(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        };
+    }
+    Ok(())
 }
 
 fn note_test_observation(
@@ -4206,6 +4201,27 @@ mod tests {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_task_temp_supports_long_unix_socket_names() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root
+            .path()
+            .join("runner/bash-tasks/0123456789abcdef/bash-0123456789abcdef/io");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let temp = create_task_temp_dir(&bundle).unwrap();
+        let nested = temp.join("a".repeat(30));
+        std::fs::create_dir(&nested).unwrap();
+        let socket = nested.join(format!("{}.sock", "b".repeat(30)));
+        let bound = UnixListener::bind(&socket);
+        if bound.is_ok() {
+            UnixStream::connect(&socket).unwrap();
+        }
+        cleanup_task_temp_dir(&temp).unwrap();
+        assert!(bound.is_ok(), "cannot bind {}: {bound:?}", socket.display());
+    }
 
     #[cfg(unix)]
     #[test]
