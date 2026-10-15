@@ -8752,42 +8752,39 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
             break;
         }
     }
-    // StreamData can also announce a long-running command. Only the retry
-    // counter proves that a nudge for unacknowledged durable state was rearmed.
-    let rearm_deadline = Instant::now() + Duration::from_secs(3);
+    // StreamData can also announce a long-running command. Require both a
+    // delivered nudge and the counter that advances after a retry is enqueued.
+    // Poll health without waiting for another event first: retries back off,
+    // and a nudge read alongside a health response must not be forgotten.
+    // The bridge watchdog bounds this state-based wait, including on busy hosts.
+    let mut saw_rearmed_nudge = false;
     loop {
-        wait_for_bg_event(
-            &mut stream,
-            BG_CHANNEL,
-            BG_CORR,
-            rearm_deadline.saturating_duration_since(Instant::now()),
-            "rearmed pattern nudge",
-        )
-        .await;
         send_control_request(&mut stream, 795, ModuleControlRequest::HealthCheck {}).await;
         let report = loop {
-            let frame = read_any_frame_until(&mut stream, rearm_deadline, "pattern rearm health")
-                .await
-                .expect("health response before rearm deadline");
-            if is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR)
-                || frame.header.ty == FrameType::Push
-            {
+            let frame = read_any_frame_timeout(&mut stream, "pattern rearm health").await;
+            if is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR) {
+                saw_rearmed_nudge = true;
                 continue;
             }
+            assert_no_bg_events_terminal(&frame, BG_CHANNEL, BG_CORR, "pattern rearm health");
+            if frame.header.ty == FrameType::Push {
+                continue;
+            }
+            assert_eq!(frame.header.ty, FrameType::Response);
             assert_eq!(frame.header.corr, 795);
             let response: ModuleControlResponse = serde_json::from_slice(&frame.body).unwrap();
             break response.health_report().expect("rearm health report");
         };
-        if report
+        let rearm_total = report
             .metrics
             .as_ref()
             .and_then(|metrics| metrics.pointer("/runtime/bg_wake_rearm_total"))
             .and_then(Value::as_u64)
-            .expect("bg wake rearm counter")
-            > 0
-        {
+            .expect("bg wake rearm counter");
+        if rearm_total > 0 && saw_rearmed_nudge {
             break;
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
     send_tool_call(&mut stream, 1, 793, "bash_drain_completions", json!({})).await;
