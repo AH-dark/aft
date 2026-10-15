@@ -3245,6 +3245,7 @@ impl BgTaskRegistry {
             &mut io_handles,
             capture_pipeline_status,
             linux_scope,
+            LocalIdentityGate::Required,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -10856,6 +10857,16 @@ fn detached_shell_command_for(
     Ok(cmd)
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum LocalIdentityGate {
+    /// Caller publishes the ordinary local PID checkpoint, then releases stdin.
+    Required,
+    /// A remote refusal already persisted local_fallback_started, so recovery
+    /// reports an uncertain local run rather than executing the command twice.
+    CommittedFallback,
+}
+
 /// Spawn a detached background bash child process.
 ///
 /// On Unix this is a single spawn against `/bin/sh`. On Windows it walks
@@ -10882,6 +10893,7 @@ fn spawn_detached_child(
     io_handles: &mut TaskIoHandles,
     capture_pipeline_status: bool,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] linux_scope: bool,
+    #[cfg(unix)] identity_gate: LocalIdentityGate,
 ) -> Result<std::process::Child, String> {
     #[cfg(windows)]
     let _ = capture_pipeline_status;
@@ -10927,7 +10939,10 @@ fn spawn_detached_child(
             OsString::from(crate::sandbox_spawn::CHILD_EXIT_FD.to_string()),
             pipeline_status_path,
             OsString::from(pipeline_shell),
-            OsString::from("wait-for-identity"),
+            OsString::from(match identity_gate {
+                LocalIdentityGate::Required => "wait-for-identity",
+                LocalIdentityGate::CommittedFallback => "",
+            }),
         ];
         #[cfg(target_os = "linux")]
         let (executable, args) = if linux_scope {
@@ -10967,7 +10982,10 @@ fn spawn_detached_child(
         )?;
         child_command
             .current_dir(workdir)
-            .stdin(Stdio::piped())
+            .stdin(match identity_gate {
+                LocalIdentityGate::Required => Stdio::piped(),
+                LocalIdentityGate::CommittedFallback => Stdio::null(),
+            })
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         crate::agent_child_env::apply_to_command(&mut child_command, env);

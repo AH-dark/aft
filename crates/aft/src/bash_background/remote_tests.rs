@@ -117,6 +117,175 @@ async fn terminal(registry: &BgTaskRegistry, task: &str) -> BgTaskSnapshot {
 }
 
 #[tokio::test]
+async fn every_local_spawn_entrypoint_executes_command_once() {
+    use crate::bash_background::{BashShell, HardKill, TaskSlot};
+    struct ReleaseOnDrop(PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"release");
+        }
+    }
+    for entry in [
+        "foreground",
+        "background",
+        "pty",
+        "deferred-wait",
+        "replay-running",
+        "remote-fallback",
+        "replay-fallback",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("executions");
+        let release = dir.path().join("release");
+        let _release_on_failure = ReleaseOnDrop(release.clone());
+        if entry == "deferred-wait" {
+            crate::subc::test_support::assert_deferred_wait_entrypoint(&format!(
+                "printf x >> '{}'; /bin/sleep 2",
+                counter.display()
+            ))
+            .await;
+            assert_eq!(
+                fs::read(&counter).unwrap(),
+                b"x",
+                "deferred wait must run its command once"
+            );
+            eprintln!(
+                "spawn entrypoint deferred-wait: command executed and held-lock wait completed"
+            );
+            continue;
+        }
+        let command = format!("printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf entrypoint-proof", counter.display(), release.display());
+        let mut registry = registry();
+        let mut fake = None;
+        let task_id = match entry {
+            "foreground" => registry
+                .spawn_with_shell_in_slot(
+                    SpawnPlan::Unsandboxed,
+                    &command,
+                    BashShell::Bash,
+                    resolve_posix_shell(),
+                    "session".into(),
+                    dir.path().into(),
+                    HashMap::new(),
+                    HardKill::After(Duration::from_secs(30)),
+                    dir.path().into(),
+                    TaskSlot::Foreground,
+                    true,
+                    false,
+                    Some(dir.path().into()),
+                )
+                .unwrap(),
+            "background" | "replay-running" => registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    &command,
+                    "session".into(),
+                    dir.path().into(),
+                    HashMap::new(),
+                    HardKill::After(Duration::from_secs(30)),
+                    dir.path().into(),
+                    10,
+                    true,
+                    false,
+                    Some(dir.path().into()),
+                )
+                .unwrap(),
+            "pty" => registry
+                .spawn_pty(
+                    SpawnPlan::Unsandboxed,
+                    &command,
+                    "session".into(),
+                    dir.path().into(),
+                    HashMap::new(),
+                    HardKill::After(Duration::from_secs(30)),
+                    dir.path().into(),
+                    10,
+                    true,
+                    false,
+                    Some(dir.path().into()),
+                    24,
+                    80,
+                )
+                .unwrap(),
+            "remote-fallback" => {
+                ensure_git_fixture(dir.path());
+                let daemon = daemon(Script::Refused, "exec-remote/v1").await;
+                let id = registry
+                    .spawn_remote(
+                        launch(daemon.connection.clone()),
+                        SpawnPlan::Unsandboxed,
+                        &command,
+                        resolve_posix_shell(),
+                        "session".into(),
+                        dir.path().into(),
+                        HashMap::new(),
+                        HardKill::After(Duration::from_secs(30)),
+                        dir.path().into(),
+                        TaskSlot::Background { max: 10 },
+                        true,
+                        false,
+                        Some(dir.path().into()),
+                    )
+                    .unwrap();
+                fake = Some(daemon);
+                id
+            }
+            "replay-fallback" => {
+                let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
+                let (original, id, _) =
+                    persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
+                drop(original);
+                registry.replay_session(dir.path(), "session").unwrap();
+                fake = Some(daemon);
+                id
+            }
+            _ => unreachable!(),
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::read(&counter).map_or(true, |bytes| bytes != b"x") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{entry}: command never crossed its startup boundary"));
+        if entry == "replay-running" {
+            registry.inner.shutdown.store(true, Ordering::SeqCst);
+            let replacement = super::tests::registry();
+            replacement.replay_session(dir.path(), "session").unwrap();
+            registry = replacement;
+        }
+        fs::write(&release, b"release").unwrap();
+        let done = terminal(&registry, &task_id).await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::Completed,
+            "{entry}: {done:?}"
+        );
+        assert_eq!(
+            fs::read(&counter).unwrap(),
+            b"x",
+            "{entry}: duplicate execution"
+        );
+        let replay = super::tests::registry();
+        replay.replay_session(dir.path(), "session").unwrap();
+        assert_eq!(
+            terminal(&replay, &task_id).await.info.status,
+            BgTaskStatus::Completed,
+            "{entry}: terminal replay"
+        );
+        assert_eq!(
+            fs::read(&counter).unwrap(),
+            b"x",
+            "{entry}: replay ran command again"
+        );
+        eprintln!("spawn entrypoint {entry}: command executed once and replay completed");
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        replay.inner.shutdown.store(true, Ordering::SeqCst);
+        drop(fake);
+    }
+}
+
+#[tokio::test]
 async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
     use crate::bash_background::{HardKill, TaskSlot};
 

@@ -1648,6 +1648,11 @@ impl BgTaskRegistry {
             state.io_handles.as_mut().ok_or("task handles absent")?,
             local.capture_pipeline,
             local.linux_scope,
+            // local_fallback_started was persisted above before process creation;
+            // a later failed PID write reports unknown, never "did not run" or a
+            // second execution. This caller has no ordinary-local "run" sender,
+            // so its wrapper must start without that identity-checkpoint gate.
+            LocalIdentityGate::CommittedFallback,
         )?;
         #[cfg(test)]
         if tests::simulate_crash_before_local_pid(&task.task_id) {

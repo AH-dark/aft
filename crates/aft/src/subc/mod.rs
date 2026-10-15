@@ -10048,6 +10048,11 @@ pub(crate) mod test_support {
     };
     use serde_json::json;
 
+    #[cfg(unix)]
+    pub(crate) async fn assert_deferred_wait_entrypoint(command: &str) {
+        super::bash::assert_deferred_wait_entrypoint_for_test(command).await;
+    }
+
     /// Frame metadata for a tracked request in tests that never write its frame.
     pub(super) fn test_request_meta() -> RequestFrameMeta {
         RequestFrameMeta {
