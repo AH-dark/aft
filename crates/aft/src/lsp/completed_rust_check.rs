@@ -608,7 +608,10 @@ pub(crate) struct Runtime {
     pub(crate) options: Option<serde_json::Value>,
     pub(crate) launch_env: Option<BTreeMap<String, String>>,
     #[cfg(test)]
-    pub(crate) validation_delay: Duration,
+    pub(crate) validation_gate: Option<(
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    )>,
 }
 
 fn relevant_environment_key(key: &str) -> bool {
@@ -1626,7 +1629,12 @@ impl CompletedRustCheck {
             .name("aft-rust-fingerprint".into())
             .spawn(move || {
                 #[cfg(test)]
-                std::thread::sleep(runtime.validation_delay);
+                if let Some((entered, release)) = &runtime.validation_gate {
+                    let _ = entered.send(());
+                    // Disconnecting the sender also releases the worker if the
+                    // test unwinds before explicitly opening the gate.
+                    let _ = release.recv();
+                }
                 let result = runtime
                     .capture(&root, Some(&saved.fingerprint), deadline, None)
                     .and_then(|current| accept_saved(&saved, current));
@@ -1777,7 +1785,7 @@ mod tests {
             env: HashMap::new(),
             options: None,
             launch_env: None,
-            validation_delay: Duration::ZERO,
+            validation_gate: None,
         };
         let mut cache =
             CompletedRustCheck::new(&root, &root, &temp.path().join("storage"), runtime).unwrap();
@@ -2366,7 +2374,7 @@ mod tests {
             env: HashMap::new(),
             options: Some(serde_json::json!({"checkOnSave": false, "cargo": {"targetDir": true}})),
             launch_env: None,
-            validation_delay: Duration::ZERO,
+            validation_gate: None,
         };
         let mut check =
             CompletedRustCheck::new(&root, &root, &temp.path().join("storage"), runtime).unwrap();
@@ -2447,7 +2455,7 @@ mod tests {
                 serde_json::json!({"cargo":{"targetDir":true,"extraArgs":["--locked"],"metadataExtraArgs":["--locked"]}}),
             ),
             launch_env: None,
-            validation_delay: Duration::ZERO,
+            validation_gate: None,
         };
         let cache =
             CompletedRustCheck::new(&root, &root, &temp.path().join("storage"), runtime).unwrap();
@@ -2721,20 +2729,63 @@ mod tests {
             cache.validated(Instant::now() + BUDGET).is_some(),
             "control: the saved result is valid"
         );
-        // The injected fingerprint delay is far longer than the bound below, so
-        // a validation that waited for it fails clearly while a loaded runner's
-        // scheduling noise (hundreds of ms) cannot.
-        cache.runtime.validation_delay = Duration::from_secs(5);
-        let started = Instant::now();
+        let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        cache.runtime.validation_gate = Some((entered_tx, release_rx));
+        let cache = std::sync::Arc::new(cache);
+        // A caller descheduled for longer than its 20 ms deadline returns before
+        // spawning the fingerprint worker. That outcome is also correct (no saved
+        // diagnostics served), but it skips the path under test, so retry with a
+        // fresh deadline until one attempt reaches the gate.
+        let mut gated = false;
+        for _ in 0..5 {
+            let (returned_tx, returned_rx) = crossbeam_channel::bounded(1);
+            let attempt = std::sync::Arc::clone(&cache);
+            let caller = std::thread::spawn(move || {
+                let result = attempt.validated(Instant::now() + Duration::from_millis(20));
+                returned_tx.send(result).unwrap();
+            });
+            crossbeam_channel::select! {
+                recv(entered_rx) -> entered => {
+                    entered.expect("validation entered the gate");
+                    // The caller must return while fingerprinting is still
+                    // held. The timeout is only a deadlock guard.
+                    assert!(
+                        returned_rx
+                            .recv_timeout(BUDGET)
+                            .expect("validation ignored its deadline")
+                            .is_none(),
+                        "an incomplete validation served saved diagnostics"
+                    );
+                    release_tx.send(()).unwrap();
+                    caller.join().unwrap();
+                    gated = true;
+                }
+                recv(returned_rx) -> returned => {
+                    assert!(
+                        returned.expect("caller returned").is_none(),
+                        "an expired validation served saved diagnostics"
+                    );
+                    caller.join().unwrap();
+                    // The caller may return before the worker it spawned has
+                    // reached the gate. A recorded pending validation means a
+                    // worker exists, so this attempt did exercise the path.
+                    if cache.validation.lock().is_some() {
+                        entered_rx
+                            .recv_timeout(BUDGET)
+                            .expect("spawned validation reached the gate");
+                        release_tx.send(()).unwrap();
+                        gated = true;
+                    }
+                }
+            }
+            if gated {
+                break;
+            }
+        }
         assert!(
-            cache
-                .validated(started + Duration::from_millis(20))
-                .is_none(),
-            "an incomplete validation served saved diagnostics"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "inspect waited past the validation budget"
+            gated,
+            "no attempt reached the fingerprint worker before its deadline"
         );
     }
 

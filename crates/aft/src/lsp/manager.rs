@@ -6261,7 +6261,7 @@ impl PreparedSpawn {
                         options: self.initialization_options.clone(),
                         launch_env: None,
                         #[cfg(test)]
-                        validation_delay: Duration::ZERO,
+                        validation_gate: None,
                     };
                     super::completed_rust_check::CompletedRustCheck::new(
                         &self.root,
@@ -7033,6 +7033,16 @@ pub fn spawn_watcher_rust_workspace_reload(
     key: ServerKey,
     manifests: Vec<PathBuf>,
 ) {
+    if let Some(probes) = WATCHER_RELOAD_PROBES.get() {
+        if let Some(count) = probes
+            .lock()
+            .unwrap()
+            .get(&key.root)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     let spawned = std::thread::Builder::new()
         .name("aft-rust-reload".into())
         .spawn(move || {
@@ -7051,6 +7061,46 @@ pub fn spawn_watcher_rust_workspace_reload(
         });
     if let Err(error) = spawned {
         crate::slog_warn!("could not start a rust-analyzer workspace reload thread: {error}");
+    }
+}
+
+type WatcherReloadProbes =
+    std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<std::sync::atomic::AtomicUsize>>>;
+static WATCHER_RELOAD_PROBES: std::sync::OnceLock<WatcherReloadProbes> = std::sync::OnceLock::new();
+
+/// Observes reload submissions before their helper threads are scheduled.
+/// Normal operation never installs a probe or initializes the probe registry.
+#[doc(hidden)]
+pub struct WatcherReloadProbeForTest {
+    root: PathBuf,
+    count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WatcherReloadProbeForTest {
+    pub fn new(root: &Path) -> Self {
+        let root = resolve_for_lsp_uri(root);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        WATCHER_RELOAD_PROBES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(root.clone(), Arc::downgrade(&count));
+        Self { root, count }
+    }
+
+    pub fn submissions(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for WatcherReloadProbeForTest {
+    fn drop(&mut self) {
+        WATCHER_RELOAD_PROBES
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove(&self.root);
     }
 }
 
