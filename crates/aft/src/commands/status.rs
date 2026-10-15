@@ -554,6 +554,7 @@ impl AppContext {
             },
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,
+            "callgraph_refresh": config.project_root.as_deref().map(crate::callgraph_store::callgraph_refresh_status),
             "status_bar": status_bar,
             "status_bar_values": status_bar_values,
             "disk": disk_info,

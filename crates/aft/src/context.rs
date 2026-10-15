@@ -5189,8 +5189,11 @@ impl AppContext {
     }
 
     pub fn advance_configure_generation(&self) -> u64 {
-        self.subc_lifecycle
-            .advance_generation(self.configure_generation.as_ref())
+        let generation = self
+            .subc_lifecycle
+            .advance_generation(self.configure_generation.as_ref());
+        crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
+        generation
     }
 
     pub(crate) fn mark_subc_bound(&self) {
@@ -5205,6 +5208,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        crate::callgraph_store::retire_obsolete_callgraph_refresh_waiters();
         self.repeat_breaker.clear();
     }
 
