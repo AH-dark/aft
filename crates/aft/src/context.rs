@@ -6210,6 +6210,7 @@ impl AppContext {
             && slot.pending.is_none()
             && slot.ready_for.as_ref() == Some(&target)
             && self.app.db_for_path(&target.1.join("aft.db")).is_some()
+            && self.bash_background.db_pool_attached()
         {
             return;
         }

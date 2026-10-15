@@ -1475,6 +1475,10 @@ impl BgTaskRegistry {
         }
     }
 
+    pub(crate) fn db_pool_attached(&self) -> bool {
+        self.inner.db_pool.read().is_ok_and(|pool| pool.is_some())
+    }
+
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
         if let Ok(mut slot) = self.inner.db_pool.write() {
             if slot.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &conn)) {

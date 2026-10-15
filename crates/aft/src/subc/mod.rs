@@ -18315,6 +18315,132 @@ mod tests {
     }
 
     #[test]
+    fn evicted_quiesced_root_rebind_reopens_db_pool_before_bash() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let disabled_indexes = json!({
+            "indexes": { "semantic": false, "trigram": false, "callgraph": false },
+            "experimental": { "bash": { "background": true } }
+        });
+        let mut first_bind = fixture.bind_request(0, "opencode");
+        first_bind.params["config"][0]["doc"] = disabled_indexes.to_string().into();
+        let first_bind = fixture
+            .submit_bind(&executor, first_bind)
+            .blocking_recv()
+            .unwrap();
+        assert!(first_bind.success, "first bind failed: {}", first_bind.data);
+        fixture.ctx.mark_subc_bound();
+        start_post_ack_database_open(&executor, &fixture.root);
+        assert!(wait_for_database_ready(&fixture.ctx, Duration::from_secs(5)).is_some());
+        crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
+        assert!(fixture.ctx.bash_background().db_pool_attached());
+
+        fixture.ctx.mark_subc_unbound();
+        assert!(
+            fixture.ctx.try_artifact_eviction_blocker(true).is_none(),
+            "artifact blocker before eviction: {:?}",
+            fixture.ctx.try_artifact_eviction_blocker(true)
+        );
+        let mut live_roots = HashMap::new();
+        let mut meta = RootMeta::new(Instant::now());
+        meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        meta.unbound_quiesced = true;
+        live_roots.insert(fixture.root.clone(), meta);
+        assert_eq!(
+            reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+                &DispatchPathMetrics::new(),
+            )
+            .evicted,
+            1,
+            "the unbound root should pass through artifact eviction"
+        );
+
+        let wait_started = Instant::now();
+        while fixture.ctx.bash_background().db_pool_attached()
+            && wait_started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!fixture.ctx.bash_background().db_pool_attached());
+        let prior_ready_opens = crate::database_open::recorded_opens_for_test()
+            .into_iter()
+            .filter(|open| open.root == fixture.canonical_root)
+            .count();
+
+        let mut rebind_request = fixture.bind_request(1, "opencode");
+        rebind_request.params["config"][0]["doc"] = disabled_indexes.to_string().into();
+        let rebind = fixture
+            .submit_bind(&executor, rebind_request)
+            .blocking_recv()
+            .expect("rebind response");
+        assert!(rebind.success, "rebind failed: {}", rebind.data);
+        fixture.ctx.mark_subc_bound();
+        start_post_ack_database_open(&executor, &fixture.root);
+
+        let opened = Instant::now();
+        loop {
+            let opens = crate::database_open::recorded_opens_for_test()
+                .into_iter()
+                .filter(|open| open.root == fixture.canonical_root)
+                .collect::<Vec<_>>();
+            if let Some(open) = opens.get(prior_ready_opens) {
+                if open.finished_at.is_some() {
+                    assert_eq!(
+                        open.outcome,
+                        Some(crate::database_open::DatabaseOpenOutcome::Ready),
+                        "the rebind should log a ready aft.db open"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                opened.elapsed() < Duration::from_secs(5),
+                "rebind did not stage and log a fresh aft.db open"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fixture.ctx.bash_background().db_pool_attached());
+        assert!(fixture
+            .ctx
+            .database_runtime_refusal("probe", "bash")
+            .is_none());
+
+        let task_id = fixture
+            .ctx
+            .bash_background()
+            .spawn(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "printf rebind-persisted",
+                "herd-session-1".to_string(),
+                fixture.canonical_root.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                fixture.storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(fixture.canonical_root.clone()),
+            )
+            .expect("spawn Bash after rebind");
+        let db = fixture.ctx.db().expect("opened aft.db handle");
+        let row = crate::db::bash_tasks::get_bash_task(
+            &db.lock().expect("aft.db lock"),
+            "opencode",
+            "herd-session-1",
+            &task_id,
+        )
+        .expect("query Bash task row");
+        assert!(row.is_some(), "Bash row was not persisted after rebind");
+        fixture.ctx.bash_background().shutdown();
+    }
+
+    #[test]
     fn failed_database_open_refuses_tools_and_rebind_retries_persistence() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let executor = Arc::new(Executor::new());
