@@ -48,6 +48,17 @@ mod slot_limit_tests;
 pub(crate) struct SpawnReceipt {
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
+    #[cfg(feature = "test-timing-hooks")]
+    startup_clock_for_test: Option<StartupClockForTest>,
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[derive(Clone, Copy)]
+/// Fixture clock shared by the startup reply timer and receipt commit fence.
+/// Freezing time never overrides an already refused or committed receipt.
+pub(crate) enum StartupClockForTest {
+    Frozen,
+    Expired,
 }
 
 #[derive(Default)]
@@ -79,7 +90,20 @@ impl SpawnReceipt {
         Self {
             state: std::sync::Mutex::new(SpawnReceiptState::Pending),
             deadline,
+            #[cfg(feature = "test-timing-hooks")]
+            startup_clock_for_test: match std::env::var("AFT_TEST_SUBC_BASH_STARTUP_CLOCK")
+                .as_deref()
+            {
+                Ok("frozen") => Some(StartupClockForTest::Frozen),
+                Ok("expired") => Some(StartupClockForTest::Expired),
+                _ => None,
+            },
         }
+    }
+
+    #[cfg(feature = "test-timing-hooks")]
+    pub(crate) fn startup_clock_for_test(&self) -> Option<StartupClockForTest> {
+        self.startup_clock_for_test
     }
 
     /// Settles the receipt at the reply deadline. A pending receipt becomes
@@ -106,6 +130,12 @@ impl SpawnReceipt {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = std::time::Instant::now();
+        #[cfg(feature = "test-timing-hooks")]
+        let now = match self.startup_clock_for_test {
+            Some(StartupClockForTest::Frozen) => self.deadline - std::time::Duration::from_nanos(1),
+            Some(StartupClockForTest::Expired) => self.deadline,
+            None => now,
+        };
         #[cfg(test)]
         let now = SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.get().unwrap_or(now));
         if !matches!(*state, SpawnReceiptState::Pending) || now >= self.deadline {

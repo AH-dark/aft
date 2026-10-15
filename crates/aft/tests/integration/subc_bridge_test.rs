@@ -3466,6 +3466,7 @@ fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
                 // without the ordinary foreground deadline handoff competing
                 // for the reply. This exercises delivered errors deterministically.
                 set_test_env("AFT_TEST_WORKER_WAIT_MAX_MS", "200"),
+                set_test_env("AFT_TEST_SUBC_BASH_STARTUP_CLOCK", "frozen"),
                 set_test_force_bash_promote_error(),
             ]
         },

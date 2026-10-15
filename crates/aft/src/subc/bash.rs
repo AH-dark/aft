@@ -1114,6 +1114,17 @@ pub(super) fn submit_deferred_bash(
                 if let Some(timing) = &timing_for_test {
                     return timing.startup.wait().await;
                 }
+                #[cfg(feature = "test-timing-hooks")]
+                match receipt.startup_clock_for_test() {
+                    // Execution-handoff fixtures test commands that have started.
+                    // Let control/output files, process creation and task records
+                    // finish first; a startup refusal tests a different outcome.
+                    Some(crate::bash_background::StartupClockForTest::Frozen) => {
+                        return std::future::pending::<()>().await;
+                    }
+                    Some(crate::bash_background::StartupClockForTest::Expired) => return,
+                    None => {},
+                }
                 tokio::time::sleep_until(startup_deadline.into()).await;
             } => {
                 // Settling the receipt is the one synchronization point with
