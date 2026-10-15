@@ -4708,9 +4708,61 @@ impl BgTaskRegistry {
         // disk actually returned tasks (real migration signal); WARN when the
         // DB lookup itself errored.
         let tasks = match self.replay_session_from_db(session_id, project_root) {
-            Some(Ok(tasks)) if !tasks.is_empty() => tasks,
+            Some(Ok(mut tasks)) if !tasks.is_empty() => {
+                // A task can be written to its disk bundle while this registry
+                // has no database pool. Preserve DB rows as authoritative for
+                // matching IDs, but add replayable disk records omitted by the
+                // query. Delivered terminal bundles are intentionally retired
+                // from DB replay and must not be resurrected from disk.
+                let mut seen = tasks
+                    .iter()
+                    .map(|task| (task.session_id.clone(), task.task_id.clone()))
+                    .collect::<HashSet<_>>();
+                let disk_sessions = HashSet::from([session_id.to_string()])
+                    .into_iter()
+                    .chain(tasks.iter().map(|task| task.session_id.clone()))
+                    .collect::<HashSet<_>>();
+                let disk_tasks = if let Some(project_root) = project_root {
+                    match self.replay_session_from_disk_for_project(storage_dir, project_root) {
+                        Ok(tasks) => tasks,
+                        Err(error) => {
+                            crate::slog_warn!(
+                                "bash task replay disk merge failed for project {}; retaining DB results: {error}",
+                                project_root.display()
+                            );
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    let mut disk_tasks = Vec::new();
+                    for disk_session in disk_sessions {
+                        match self.replay_session_from_disk(storage_dir, &disk_session) {
+                            Ok(session_tasks) => disk_tasks.extend(session_tasks),
+                            Err(error) => crate::slog_warn!(
+                                "bash task replay disk merge failed for session {disk_session}; retaining DB results: {error}"
+                            ),
+                        }
+                    }
+                    disk_tasks
+                };
+                for task in disk_tasks {
+                    if task.is_terminal() && task.completion_delivered {
+                        continue;
+                    }
+                    let key = (task.session_id.clone(), task.task_id.clone());
+                    if seen.insert(key) {
+                        tasks.push(task);
+                    }
+                }
+                tasks
+            }
             Some(Ok(_)) => {
-                let disk_tasks = self.replay_session_from_disk(storage_dir, session_id)?;
+                let disk_tasks = match project_root {
+                    Some(project_root) => {
+                        self.replay_session_from_disk_for_project(storage_dir, project_root)?
+                    }
+                    None => self.replay_session_from_disk(storage_dir, session_id)?,
+                };
                 if !disk_tasks.is_empty() {
                     crate::slog_info!(
                         "bash task replay: 0 in DB for session {}, {} from disk fallback",
@@ -4726,11 +4778,21 @@ impl BgTaskRegistry {
                     session_id,
                     error
                 );
-                self.replay_session_from_disk(storage_dir, session_id)?
+                match project_root {
+                    Some(project_root) => {
+                        self.replay_session_from_disk_for_project(storage_dir, project_root)?
+                    }
+                    None => self.replay_session_from_disk(storage_dir, session_id)?,
+                }
             }
             None => {
                 // DB pool unconfigured — common in tests + before harness is set.
-                self.replay_session_from_disk(storage_dir, session_id)?
+                match project_root {
+                    Some(project_root) => {
+                        self.replay_session_from_disk_for_project(storage_dir, project_root)?
+                    }
+                    None => self.replay_session_from_disk(storage_dir, session_id)?,
+                }
             }
         };
 
@@ -5295,6 +5357,112 @@ impl BgTaskRegistry {
                         );
                     }
                 }
+            }
+        }
+        Ok(tasks)
+    }
+
+    fn replay_session_from_disk_for_project(
+        &self,
+        storage_dir: &Path,
+        project_root: &Path,
+    ) -> Result<Vec<PersistedTask>, String> {
+        let canonical_project = canonicalized_path(project_root);
+        let mut storage_roots = vec![storage_dir.to_path_buf()];
+        match fs::read_dir(storage_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        storage_roots.push(entry.path());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("failed to inspect Bash task storage: {error}")),
+        }
+
+        let mut session_dirs = BTreeSet::new();
+        for root in storage_roots {
+            let path = root.join("bash-tasks");
+            match fs::read_dir(&path) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                            session_dirs.insert(entry.path());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => crate::slog_warn!(
+                    "failed to scan Bash task sessions at {} during project replay: {error}",
+                    path.display()
+                ),
+            }
+        }
+
+        let mut matching_sessions = HashSet::new();
+        for session_dir in session_dirs {
+            let (task_ids, invalid_entries) = match discover_task_ids(&session_dir) {
+                Ok(found) => found,
+                Err(error) => {
+                    crate::slog_warn!(
+                        "failed to discover Bash task bundles at {} during project replay: {error}",
+                        session_dir.display()
+                    );
+                    continue;
+                }
+            };
+            for entry in invalid_entries {
+                if let Err(error) = quarantine_invalid_entry(storage_dir, &session_dir, &entry) {
+                    crate::slog_warn!(
+                        "failed to quarantine invalid Bash task entry during project replay: {error}"
+                    );
+                }
+            }
+            for task_id in task_ids {
+                let resolved = match resolve_task_layout(&session_dir, &task_id) {
+                    Ok(resolved) => resolved,
+                    Err(_) => continue,
+                };
+                let metadata = match read_task_at(&resolved) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        crate::slog_warn!(
+                            "failed to read Bash task {task_id} during project replay: {error}"
+                        );
+                        continue;
+                    }
+                };
+                if session_tasks_dir(storage_dir, &metadata.session_id) != session_dir {
+                    continue;
+                }
+                if metadata.is_terminal() && metadata.completion_delivered {
+                    continue;
+                }
+                if metadata
+                    .project_root
+                    .as_deref()
+                    .is_some_and(|root| canonicalized_path(root) == canonical_project)
+                {
+                    matching_sessions.insert(metadata.session_id);
+                }
+            }
+        }
+
+        let mut tasks = Vec::new();
+        for session_id in matching_sessions {
+            match self.replay_session_from_disk(storage_dir, &session_id) {
+                Ok(session_tasks) => tasks.extend(session_tasks.into_iter().filter(|task| {
+                    !(task.is_terminal() && task.completion_delivered)
+                        && task
+                            .project_root
+                            .as_deref()
+                            .is_some_and(|root| canonicalized_path(root) == canonical_project)
+                })),
+                Err(error) => crate::slog_warn!(
+                    "failed to replay Bash task session {session_id} from disk for project {}: {error}",
+                    project_root.display()
+                ),
             }
         }
         Ok(tasks)
@@ -13565,6 +13733,78 @@ mod tests {
             )
             .expect("owning project should replay its task");
         assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+    }
+
+    #[test]
+    fn replay_merges_disk_task_omitted_by_nonempty_db_result() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let session = "partial-db-replay-session";
+        let db_task_id = "bash-1111111111111111";
+        let disk_task_id = "bash-2222222222222222";
+        let delivered_task_id = "bash-3333333333333333";
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+
+        write_running_project_task(storage.path(), project.path(), session, db_task_id);
+        write_running_project_task(storage.path(), project.path(), session, disk_task_id);
+        write_running_project_task(storage.path(), project.path(), session, delivered_task_id);
+        let delivered_paths = task_paths(storage.path(), session, delivered_task_id).unwrap();
+        let mut delivered = read_task(&delivered_paths.json).unwrap();
+        delivered.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        delivered.completion_delivered = true;
+        write_task(&delivered_paths.json, &delivered).unwrap();
+
+        let db_paths = task_paths(storage.path(), session, db_task_id).unwrap();
+        let db_metadata = read_task(&db_paths.json).unwrap();
+        let row = db_metadata.to_bash_task_row("opencode", &db_paths).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
+
+        registry.replay_session(storage.path(), session).unwrap();
+
+        assert!(
+            registry.task_for_session(disk_task_id, session).is_some(),
+            "a replayable disk task omitted from a nonempty DB result must be restored"
+        );
+        assert!(registry.task_for_session(db_task_id, session).is_some());
+        assert!(
+            registry
+                .task_for_session(delivered_task_id, session)
+                .is_none(),
+            "a delivered terminal bundle must not be resurrected after DB retirement"
+        );
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_merges_disk_only_tasks_from_sessions_without_db_rows() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let db_session = "project-replay-db-session";
+        let disk_session = "project-replay-disk-session";
+        let bind_session = "project-replay-bind-session";
+        let db_task_id = "bash-4444444444444444";
+        let disk_task_id = "bash-5555555555555555";
+        let (registry, db, _) = registry_with_db_and_frames(storage.path());
+
+        write_running_project_task(storage.path(), project.path(), db_session, db_task_id);
+        write_running_project_task(storage.path(), project.path(), disk_session, disk_task_id);
+        let db_paths = task_paths(storage.path(), db_session, db_task_id).unwrap();
+        let db_metadata = read_task(&db_paths.json).unwrap();
+        let row = db_metadata.to_bash_task_row("opencode", &db_paths).unwrap();
+        crate::db::bash_tasks::upsert_bash_task(&db.lock().unwrap(), &row).unwrap();
+
+        registry
+            .replay_session_for_project(storage.path(), bind_session, project.path())
+            .unwrap();
+
+        assert!(registry.task_for_session(db_task_id, db_session).is_some());
+        assert!(
+            registry
+                .task_for_session(disk_task_id, disk_session)
+                .is_some(),
+            "project replay must merge disk-only tasks from sessions with no DB rows"
+        );
+        registry.detach();
     }
 
     #[cfg(unix)]
