@@ -110,9 +110,35 @@ fn dispatch_loop(
                         started.elapsed(),
                     )
                 });
+            #[cfg(debug_assertions)]
+            let scanner_ready = result.outcome.is_ok()
+                && matches!(
+                    result.category,
+                    InspectCategory::Metrics | InspectCategory::Todos
+                );
+            #[cfg(debug_assertions)]
+            let category = result.category;
             let _ = tx.send(result);
+            #[cfg(debug_assertions)]
+            if scanner_ready {
+                signal_scanner_ready_for_debug(category);
+            }
         });
     }
+}
+
+#[cfg(debug_assertions)]
+fn signal_scanner_ready_for_debug(category: InspectCategory) {
+    let Some(directory) = std::env::var_os("AFT_TEST_INSPECT_SCANNER_READY_DIR") else {
+        return;
+    };
+    // Signal only after the scanner has populated its memo and sent its result.
+    // Subprocess tests can exclude cold scanner work from a timed LSP assertion.
+    std::fs::write(
+        std::path::Path::new(&directory).join(category.as_str()),
+        b"complete\n",
+    )
+    .expect("signal completed inspect scanner");
 }
 
 fn panic_message(panic: &(dyn Any + Send)) -> &str {

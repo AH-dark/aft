@@ -1108,8 +1108,15 @@ fn warming_rust_inspect_response(
         rust_env["RUSTC"] = json!(binary);
         rust_env["AFT_FAKE_CARGO_CHECK_MARKER"] = json!(check_marker);
     }
-    let mut aft =
-        AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_SERVER_STATUS", std::ffi::OsStr::new("1"))]);
+    let scanners_ready = temp.path().join("scanners-ready");
+    fs::create_dir(&scanners_ready).unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_FAKE_LSP_SERVER_STATUS", std::ffi::OsStr::new("1")),
+        (
+            "AFT_TEST_INSPECT_SCANNER_READY_DIR",
+            scanners_ready.as_os_str(),
+        ),
+    ]);
     let configured = aft.send(
         &json!({
             "id": "configure-partial", "command": "configure", "harness": "opencode",
@@ -1126,6 +1133,29 @@ fn warming_rust_inspect_response(
         .to_string(),
     );
     assert_eq!(configured["success"], true, "{configured:#}");
+    // Metrics and TODO parsing have independent cold-start work. Wait for their
+    // actual producers before timing diagnostics; a completed Cargo check does
+    // not make those scanners ready. This pass does not start rust-analyzer.
+    let warm_scanners = aft.send_with_timeout(
+        &json!({
+            "id": "warm-scanners", "command": "inspect", "scope": "crates",
+            "sections": ["metrics", "todos"]
+        })
+        .to_string(),
+        Duration::from_millis(diagnostics_timeout_ms) + Duration::from_secs(5),
+    );
+    assert_eq!(warm_scanners["success"], true, "{warm_scanners:#}");
+    let readiness_deadline = Instant::now() + Duration::from_secs(60);
+    for category in ["metrics", "todos"] {
+        let signal = scanners_ready.join(category);
+        while !signal.exists() {
+            assert!(
+                Instant::now() < readiness_deadline,
+                "{category} scanner did not finish: {warm_scanners:#}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     let started = Instant::now();
     let response = aft.send_with_timeout(
         &json!({
@@ -1181,6 +1211,8 @@ fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming()
         warming_rust_inspect_response(true, 10_000, json!({"AFT_FAKE_CARGO_CHECK": "1"}));
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], true, "{response:#}");
+    assert_eq!(response["summary"]["metrics"]["files"], 1, "{response:#}");
+    assert_eq!(response["summary"]["todos"]["count"], 1, "{response:#}");
 
     assert_eq!(
         response["summary"]["diagnostics"]["errors"], 0,

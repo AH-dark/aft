@@ -312,13 +312,25 @@ fn inspect_engine_roots_share_bounded_named_thread_pool() {
     let (_first_temp, first_root, _first_file) = fixture_project();
     let (_second_temp, second_root, _second_file) = fixture_project();
     let worker_count = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = crossbeam_channel::unbounded();
+    let controlled_worker = |count| -> InspectWorker {
+        let worker = test_worker(Arc::clone(&worker_count), Duration::ZERO, count);
+        let release_rx = release_rx.clone();
+        Arc::new(move |job| {
+            let result = worker(job);
+            release_rx
+                .recv_timeout(WORKER_START_LIVENESS)
+                .expect("release shared-pool worker");
+            result
+        })
+    };
     let first_manager = Arc::new(InspectManager::with_worker(
-        test_worker(Arc::clone(&worker_count), Duration::from_millis(150), 1),
-        Duration::from_secs(2),
+        controlled_worker(1),
+        Duration::ZERO,
     ));
     let second_manager = Arc::new(InspectManager::with_worker(
-        test_worker(Arc::clone(&worker_count), Duration::from_millis(150), 2),
-        Duration::from_secs(2),
+        controlled_worker(2),
+        Duration::ZERO,
     ));
 
     let first_pool = first_manager.inspect_pool_for_test();
@@ -333,24 +345,32 @@ fn inspect_engine_roots_share_bounded_named_thread_pool() {
     let second_snapshot = snapshot(&second_root, &second_root.join(".aft-cache/inspect"));
     let first_scope = JobScope::for_project(first_root.clone());
     let second_scope = JobScope::for_project(second_root.clone());
+    // The test releases workers after observing the shared pool. Caller-
+    // owned liveness deadlines prevent a wedged test, not normal scan latency.
     let first_manager_for_thread = Arc::clone(&first_manager);
     let first = thread::spawn(move || {
-        first_manager_for_thread.submit_category(
+        first_manager_for_thread.submit_category_until(
             first_snapshot,
             InspectCategory::DeadCode,
             first_scope,
+            Instant::now() + WORKER_START_LIVENESS,
         )
     });
     let second_manager_for_thread = Arc::clone(&second_manager);
     let second = thread::spawn(move || {
-        second_manager_for_thread.submit_category(
+        second_manager_for_thread.submit_category_until(
             second_snapshot,
             InspectCategory::DeadCode,
             second_scope,
+            Instant::now() + WORKER_START_LIVENESS,
         )
     });
 
-    wait_for_worker_count(worker_count.as_ref(), 2, WORKER_START_LIVENESS);
+    wait_for_worker_count(
+        worker_count.as_ref(),
+        pool_size.min(2),
+        WORKER_START_LIVENESS,
+    );
     let named_threads = inspect_pool_thread_count_for_test();
     assert!(
         named_threads > 0,
@@ -360,14 +380,22 @@ fn inspect_engine_roots_share_bounded_named_thread_pool() {
         named_threads <= pool_size,
         "named inspect workers ({named_threads}) must stay within the shared pool size ({pool_size})"
     );
-    assert!(matches!(
-        first.join().expect("first scan"),
-        JobOutcome::Fresh { .. }
-    ));
-    assert!(matches!(
-        second.join().expect("second scan"),
-        JobOutcome::Fresh { .. }
-    ));
+    release_tx.send(()).expect("release first worker");
+    if pool_size == 1 {
+        // A single-thread pool must finish one root before it can run the other.
+        wait_for_worker_count(worker_count.as_ref(), 2, WORKER_START_LIVENESS);
+    }
+    release_tx.send(()).expect("release second worker");
+    let first_outcome = first.join().expect("first scan");
+    assert!(
+        matches!(first_outcome, JobOutcome::Fresh { .. }),
+        "first scan outcome: {first_outcome:?}"
+    );
+    let second_outcome = second.join().expect("second scan");
+    assert!(
+        matches!(second_outcome, JobOutcome::Fresh { .. }),
+        "second scan outcome: {second_outcome:?}"
+    );
 }
 
 #[test]
