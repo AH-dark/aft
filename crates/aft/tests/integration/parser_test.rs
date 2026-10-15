@@ -146,3 +146,79 @@ fn ts_export_default_identifier_marks_local_symbol_exported() {
         "foo should be exported via default identifier"
     );
 }
+
+#[test]
+fn swift_try_await_control_flow_expressions_have_no_parse_errors() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("ControlFlow.swift");
+    let cases = [
+        (
+            "for record in try await pending()",
+            "for record in try await pending() { #expect(record.id != nil) }",
+        ),
+        ("for x in try f()", "for x in try f() { use(x) }"),
+        ("for x in await f()", "for x in await f() { use(x) }"),
+        (
+            "for try await x in seq",
+            "for try await x in seq { use(x) }",
+        ),
+        ("while try await f()", "while try await f() { useValue() }"),
+        (
+            "guard let x = try await f() else",
+            "guard let x = try await f() else { return }",
+        ),
+        (
+            "switch try await f()",
+            "switch try await f() { default: break }",
+        ),
+        (
+            "for x in try? await f()",
+            "for x in try? await f() { use(x) }",
+        ),
+        (
+            "for x in try! await f()",
+            "for x in try! await f() { use(x) }",
+        ),
+        (
+            "while try? await f()",
+            "while try? await f() { useValue() }",
+        ),
+        (
+            "while try! await f()",
+            "while try! await f() { useValue() }",
+        ),
+        (
+            "guard let x = try? await f() else",
+            "guard let x = try? await f() else { return }",
+        ),
+        (
+            "guard let x = try! await f() else",
+            "guard let x = try! await f() else { return }",
+        ),
+        (
+            "switch try? await f()",
+            "switch try? await f() { default: break }",
+        ),
+        (
+            "switch try! await f()",
+            "switch try! await f() { default: break }",
+        ),
+    ];
+    let mut failures = Vec::new();
+
+    for (form, body) in cases {
+        let source = format!("@Test func consentRecords() async throws {{\n    {body}\n}}\n");
+        std::fs::write(&file, &source).expect("write Swift file");
+        let mut parser = FileParser::new();
+        let (tree, _) = parser.parse(&file).expect("parse Swift file");
+        if tree.root_node().has_error() {
+            failures.push(format!("{form}: {}", tree.root_node().to_sexp()));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Swift control-flow forms parsed with errors:\n{}",
+        failures.join("\n")
+    );
+}
