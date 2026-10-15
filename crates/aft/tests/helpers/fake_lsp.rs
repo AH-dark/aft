@@ -1,4 +1,4 @@
-//! Sources travel inside the test executable so nextest archives need no checkout.
+//! Build the workspace member so its locked dependencies are fetched with AFT.
 
 #[allow(dead_code)]
 #[path = "binary_cache.rs"]
@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-const SOURCES: &[(&str, &[u8])] = &[
-    ("Cargo.toml", include_bytes!("../lsp/helper/Cargo.toml.in")),
-    ("Cargo.lock", include_bytes!("../lsp/helper/Cargo.lock.in")),
-    ("main.rs", include_bytes!("../lsp/helper/main.rs.in")),
-    ("fake_server.rs", include_bytes!("../lsp/fake_server.rs")),
-    ("jsonrpc.rs", include_bytes!("../../src/lsp/jsonrpc.rs")),
-    ("transport.rs", include_bytes!("../../src/lsp/transport.rs")),
+const SOURCES: &[&[u8]] = &[
+    include_bytes!("../../../../Cargo.toml"),
+    include_bytes!("../../../../crates/aft-fake-lsp/Cargo.toml"),
+    include_bytes!("../../../../crates/aft-fake-lsp/src/main.rs"),
+    include_bytes!("../lsp/fake_server.rs"),
+    include_bytes!("../../src/lsp/jsonrpc.rs"),
+    include_bytes!("../../src/lsp/transport.rs"),
 ];
 
 pub fn fake_server_binary() -> PathBuf {
@@ -26,6 +26,9 @@ pub fn fake_server_binary() -> PathBuf {
 
 #[allow(dead_code)]
 pub(crate) fn build_in(root: &Path) -> PathBuf {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let lockfile = std::fs::read(workspace.join("Cargo.lock"))
+        .expect("workspace Cargo.lock is required for helper cache identity");
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let version = Command::new(&rustc)
         .arg("-vV")
@@ -37,27 +40,30 @@ pub(crate) fn build_in(root: &Path) -> PathBuf {
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .expect("rustc host target");
-    let key = binary_cache::key(
-        &SOURCES.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(),
-        &version,
-        target,
-    );
+    let mut sources = SOURCES.to_vec();
+    sources.push(&lockfile);
+    let key = binary_cache::key(&sources, &version, target);
     binary_cache::install(root, &key, target, |pending| {
         eprintln!("Building shared AFT test helper fake-lsp-server ({key})");
-        let project = tempfile::tempdir_in(root)?;
-        for (name, source) in SOURCES {
-            std::fs::write(project.path().join(name), source)?;
-        }
         // An isolated target directory avoids taking the test runner's Cargo
         // lock recursively; the per-helper lock serializes all nested builds.
         let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-            .current_dir(project.path())
+            .current_dir(&workspace)
             .env("RUSTC", &rustc)
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
             .env_remove("RUSTFLAGS")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .args(["build", "--locked", "--target", target, "--jobs", "2"])
+            .args([
+                "build",
+                "--locked",
+                "-p",
+                "aft-test-fake-lsp-server",
+                "--target",
+                target,
+                "--jobs",
+                "2",
+            ])
             .arg("--target-dir")
             .arg(root.join("build"))
             .output()?;

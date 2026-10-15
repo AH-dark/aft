@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/aft", "crates/aft-tokenizer"]
+members = ["crates/aft", "crates/aft-tokenizer", "crates/aft-fake-lsp"]
+default-members = ["crates/aft", "crates/aft-tokenizer"]
 
 # MSRV contract: the locked oxc 0.126 dependency family requires rustc 1.92,
 # so `cargo check --locked` on an older toolchain dies with a transitive
