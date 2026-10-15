@@ -3691,7 +3691,7 @@ mod tests {
         let cache = InspectCache::open(dir.path().join("inspect"), dir.path().into()).unwrap();
         let config = Config::default();
         let key = JobKey::for_project_category(InspectCategory::Duplicates);
-        for version in [34, 35, 36, 37, 38, 39] {
+        for version in [34, 35, 36, 37, 38, 39, 40] {
             let legacy_hash = cache
                 .contribution_set_hash_for_version_for_test(
                     InspectCategory::Duplicates,
