@@ -2732,25 +2732,51 @@ mod tests {
         let (entered_tx, entered_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         cache.runtime.validation_gate = Some((entered_tx, release_rx));
-        let (returned_tx, returned_rx) = crossbeam_channel::bounded(1);
-        let caller = std::thread::spawn(move || {
-            let result = cache.validated(Instant::now() + Duration::from_millis(20));
-            returned_tx.send(result).unwrap();
-        });
-        entered_rx
-            .recv_timeout(BUDGET)
-            .expect("validation entered the gate");
-        // The caller must return while fingerprinting is still held. The
-        // receive timeout is only a deadlock guard, not a speed assertion.
+        let cache = std::sync::Arc::new(cache);
+        // A caller descheduled for longer than its 20 ms deadline returns before
+        // spawning the fingerprint worker. That outcome is also correct (no saved
+        // diagnostics served), but it skips the path under test, so retry with a
+        // fresh deadline until one attempt reaches the gate.
+        let mut gated = false;
+        for _ in 0..5 {
+            let (returned_tx, returned_rx) = crossbeam_channel::bounded(1);
+            let attempt = std::sync::Arc::clone(&cache);
+            let caller = std::thread::spawn(move || {
+                let result = attempt.validated(Instant::now() + Duration::from_millis(20));
+                returned_tx.send(result).unwrap();
+            });
+            crossbeam_channel::select! {
+                recv(entered_rx) -> entered => {
+                    entered.expect("validation entered the gate");
+                    // The caller must return while fingerprinting is still
+                    // held. The timeout is only a deadlock guard.
+                    assert!(
+                        returned_rx
+                            .recv_timeout(BUDGET)
+                            .expect("validation ignored its deadline")
+                            .is_none(),
+                        "an incomplete validation served saved diagnostics"
+                    );
+                    release_tx.send(()).unwrap();
+                    caller.join().unwrap();
+                    gated = true;
+                }
+                recv(returned_rx) -> returned => {
+                    assert!(
+                        returned.expect("caller returned").is_none(),
+                        "an expired validation served saved diagnostics"
+                    );
+                    caller.join().unwrap();
+                }
+            }
+            if gated {
+                break;
+            }
+        }
         assert!(
-            returned_rx
-                .recv_timeout(BUDGET)
-                .expect("validation ignored its deadline")
-                .is_none(),
-            "an incomplete validation served saved diagnostics"
+            gated,
+            "no attempt reached the fingerprint worker before its deadline"
         );
-        release_tx.send(()).unwrap();
-        caller.join().unwrap();
     }
 
     #[cfg(unix)]
