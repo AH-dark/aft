@@ -610,6 +610,55 @@ mod tests {
     }
 
     #[test]
+    fn restart_store_unavailable_pages_are_bounded_without_replay() {
+        use base64::Engine;
+
+        let fixture = RestoreFixture::new(Harness::Opencode);
+        let stdout = vec![b'o'; 65_536 + 17];
+        let stderr = vec![b'e'; 65_536 + 23];
+        fs::write(&fixture.running.stdout, &stdout).unwrap();
+        fs::write(&fixture.running.stderr, &stderr).unwrap();
+        fs::write(&fixture.running.exit, "7\n").unwrap();
+        fixture.ctx.finish_database_runtime_error(
+            "storage_requires_newer_reader: database reader floor".into(),
+            false,
+        );
+
+        for (offset, more) in [(0, true), (65_536, false)] {
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "bounded-restart-page", "command": "bash_status", "session_id": SESSION,
+                "params": {
+                    "task_id": RUNNING_TASK,
+                    "output_offset": offset,
+                    "stderr_offset": offset
+                },
+            }))
+            .unwrap();
+            let response = super::handle(&request, &fixture.ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["exit_code"], 7);
+            for (prefix, bytes) in [("output", &stdout), ("stderr", &stderr)] {
+                let page = base64::engine::general_purpose::STANDARD
+                    .decode(
+                        response.data[format!("{prefix}_chunk_base64")]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let end = (offset + 65_536).min(bytes.len());
+                assert_eq!(page, bytes[offset..end]);
+                assert_eq!(response.data[format!("{prefix}_next_offset")], end);
+                assert_eq!(response.data[format!("{prefix}_has_more")], more);
+            }
+            assert!(fixture.ctx.bash_background().list(0).is_empty());
+        }
+        assert_eq!(
+            fs::read(&fixture.future.json).unwrap(),
+            fixture.future_bytes
+        );
+    }
+
+    #[test]
     fn future_bash_task_restore_preserves_output_even_after_failed_gc() {
         for harness in [Harness::Opencode, Harness::Pi, Harness::Runner] {
             let fixture = RestoreFixture::new(harness);

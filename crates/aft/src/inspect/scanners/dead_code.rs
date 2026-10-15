@@ -1295,10 +1295,7 @@ fn callgraph_hashes(
     for file in &files {
         hashes.remove(file);
     }
-    let absolute_files = files
-        .iter()
-        .map(|file| (project_root.join(file), file))
-        .collect::<BTreeMap<_, _>>();
+
     let mut hashers = BTreeMap::<String, blake3::Hasher>::new();
     for call in &snapshot.outbound_calls {
         let Some(file) = files_by_caller
@@ -6731,8 +6728,8 @@ mod tests {
             vec![],
             vec![outbound(&root, "lib.rs", "caller", "target")],
         );
-        let expected = callgraph_hashes(&root, &snapshot, None, &BTreeSet::new());
-        let actual = callgraph_hashes(&alias, &snapshot, None, &BTreeSet::new());
+        let expected = callgraph_hashes(&root, &snapshot, None, &BTreeSet::new(), None);
+        let actual = callgraph_hashes(&alias, &snapshot, None, &BTreeSet::new(), None);
         assert_eq!(expected.len(), 1);
         assert_eq!(actual, expected);
     }

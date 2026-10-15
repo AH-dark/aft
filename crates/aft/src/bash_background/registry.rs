@@ -3473,9 +3473,7 @@ impl BgTaskRegistry {
                 Some("spawn aborted".to_string()),
             );
             let _ = self.persist_task(&paths, &metadata);
-            return Err(format!(
-                "failed to persist background task metadata: {error}"
-            ));
+            return Err(format!("failed to persist background task metadata: {error}").into());
         }
         metadata.mark_running(child_pid, child_pid as i32);
         if crate::privacy_spawn::requested(&env) {

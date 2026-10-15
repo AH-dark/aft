@@ -5443,7 +5443,9 @@ mod settlement_failure_tests {
                 root,
                 key,
                 expires_at: Instant::now() + Duration::from_secs(60),
-                withdrawn: false,
+                withdrawn: None,
+                shell: false,
+                detached: false,
             },
         );
         let metrics = Arc::new(DispatchPathMetrics::new());
@@ -5570,6 +5572,8 @@ mod authorization_failure_tests {
             format_context: crate::subc_format::FormatContext::default(),
             cancel: bash::BashWaitCancel {
                 run_scope: None,
+                scope: None,
+                late_results: false,
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -5623,7 +5627,9 @@ mod authorization_failure_tests {
                 root: root.clone(),
                 key,
                 expires_at: Instant::now() + Duration::from_secs(60),
-                withdrawn: false,
+                withdrawn: None,
+                shell: true,
+                detached: false,
             },
         );
         let reverse = ReverseCorrKey { route, corr: 100 };
