@@ -1,0 +1,3 @@
+# Back up the files git does not track: internal documents and private scripts.
+.cortexkit/internal-docs/
+.cortexkit/scripts/
