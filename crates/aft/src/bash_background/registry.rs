@@ -12160,8 +12160,9 @@ mod tests {
             "promotion must serialize its slot claim with admission"
         );
         let refusal = registry
-            .check_background_slot(super::super::TaskSlot::Background { max: 1 }, "session")
-            .expect_err("successful promotion must hold the slot");
+            .check_background_slot_typed(super::super::TaskSlot::Background { max: 1 }, "session")
+            .expect_err("successful promotion must hold the slot")
+            .to_string();
         assert!(refusal.contains(&task.task_id), "{refusal}");
     }
 
