@@ -350,6 +350,17 @@ impl FamilyRegistry {
     /// it was busy, so that nothing read through it sees a session that has
     /// already ended in this process.
     fn connection(&self) -> MutexGuard<'_, TrackedConnection> {
+        #[cfg(test)]
+        CONNECTION_BLOCKED.with(|hook| {
+            if matches!(
+                self.inner.connection.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                if let Some(blocked) = hook.borrow_mut().take() {
+                    blocked.send(()).unwrap();
+                }
+            }
+        });
         let connection = lock(&self.inner.connection);
         flush_ended_sessions(&self.inner, &connection);
         connection
@@ -884,6 +895,13 @@ impl ViewRegistration {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    // Only the pinning thread observes contention; unrelated registry users do
+    // not consume its acknowledgement.
+    static CONNECTION_BLOCKED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
 static READER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1253,7 +1271,8 @@ mod tests {
 
     /// A pin started while another holder has the barrier waits for it. When
     /// that holder deregisters the view before letting go, the pin is refused.
-    /// A pin that skipped the barrier would be created during the wait below.
+    /// The holder waits for an observed contended connection acquisition before
+    /// deleting the member, rather than assuming the pinning thread ran first.
     #[test]
     fn a_pin_waits_for_the_barrier_and_is_refused_after_a_removal_inside_it() {
         let storage = tempfile::tempdir().unwrap();
@@ -1261,13 +1280,19 @@ mod tests {
         let view = registry
             .register_view("scope-a", &storage.path().join("root"))
             .unwrap();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
         let pinning = registry
             .with_barrier(|tx| {
                 let pinning = std::thread::spawn({
                     let view = view.clone();
-                    move || crate::pins::LivePin::create(&view).map(drop)
+                    move || {
+                        CONNECTION_BLOCKED.with(|hook| *hook.borrow_mut() = Some(blocked_tx));
+                        crate::pins::LivePin::create(&view).map(drop)
+                    }
                 });
-                std::thread::sleep(Duration::from_millis(300));
+                blocked_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("pin must encounter the held registry barrier");
                 tx.execute("DELETE FROM members WHERE scope = ?1", params!["scope-a"])?;
                 Ok(pinning)
             })

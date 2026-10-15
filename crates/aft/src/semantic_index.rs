@@ -14331,10 +14331,18 @@ public class Greeter {
     }
 
     static SLOW_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PROBE_GATE: std::sync::Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    > = std::sync::Mutex::new(None);
 
-    fn slow_refusing_probe(_url: &str) -> Result<(), String> {
+    fn held_refusing_probe(_url: &str) -> Result<(), String> {
         SLOW_PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(300));
+        let (entered, release) = PROBE_GATE.lock().unwrap().as_ref().unwrap().clone();
+        entered.send(()).unwrap();
+        let _ = release.recv();
         Err(
             "embedding backend unreachable (connection refused or connect failure): stub"
                 .to_string(),
@@ -14353,13 +14361,25 @@ public class Greeter {
         let root = tempfile::tempdir().expect("root");
         let url = "http://backend.invalid:1234/v1";
 
-        let started = Instant::now();
-        let first = check_remote_backend_for_root(root.path(), url, slow_refusing_probe);
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "{:?}",
-            started.elapsed()
-        );
+        let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+        let (release_tx, release_rx) = crossbeam_channel::unbounded();
+        *PROBE_GATE.lock().unwrap() = Some((entered_tx, release_rx));
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let checking_root = root.path().to_path_buf();
+        let checking = thread::spawn(move || {
+            let first = check_remote_backend_for_root(&checking_root, url, held_refusing_probe);
+            let second = check_remote_backend_for_root(&checking_root, url, held_refusing_probe);
+            checked_tx.send((first, second)).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        // Both callers must return while the backend is still held, regardless
+        // of how long the operating system takes to schedule either thread.
+        let checked = checked_rx.recv_timeout(Duration::from_secs(30));
+        drop(release_tx);
+        // Disconnecting the release channel also unblocks a mistakenly started
+        // duplicate probe, so assertion failures cannot strand worker threads.
+        let (first, second) = checked.expect("backend checks must not wait for the probe");
+        checking.join().unwrap();
         assert_eq!(
             first,
             RemoteBackendCheck::Checking {
@@ -14369,14 +14389,14 @@ public class Greeter {
         // A second request while the probe is out neither waits nor starts
         // another probe.
         assert_eq!(
-            check_remote_backend_for_root(root.path(), url, slow_refusing_probe),
+            second,
             RemoteBackendCheck::Checking {
                 base_url: url.to_string()
             }
         );
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while check_remote_backend_for_root(root.path(), url, slow_refusing_probe)
+        while check_remote_backend_for_root(root.path(), url, held_refusing_probe)
             != RemoteBackendCheck::Settled
         {
             assert!(Instant::now() < deadline, "probe result never arrived");
@@ -14386,6 +14406,7 @@ public class Greeter {
         assert!(health.probe_only);
         assert!(health.last_error.ends_with("stub"), "{}", health.last_error);
         assert_eq!(SLOW_PROBE_CALLS.load(Ordering::SeqCst), 1);
+        *PROBE_GATE.lock().unwrap() = None;
         clear_embedding_backend_retry_status(root.path());
     }
 
@@ -14399,7 +14420,12 @@ public class Greeter {
             check_remote_backend_for_root(root.path(), "http://127.0.0.1:1/v1", unexpected_probe),
             RemoteBackendCheck::Settled
         );
-        thread::sleep(Duration::from_millis(50));
+        // Probe registration happens before spawning. Absence here proves that
+        // even a worker not yet scheduled cannot later overwrite build evidence.
+        assert!(!root_backend_probes()
+            .lock()
+            .unwrap()
+            .contains_key(root.path()));
         assert_eq!(UNEXPECTED_PROBE_CALLS.load(Ordering::SeqCst), 0);
 
         // And a probe result arriving late neither clears nor rewrites it.
