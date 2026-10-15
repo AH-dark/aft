@@ -6003,7 +6003,37 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
         "AFT_FAKE_LSP_QUIESCENCE_RELEASE_FILE",
         ready_release.to_str().unwrap(),
     );
-    open_with_lsp(&ctx, &pre_opened, "pub fn old() {}\n");
+    // This fixture intentionally holds the initial report provisional. Wait for
+    // its publication here; authoritative version proof must wait until the
+    // readiness gate below is released.
+    let config = ctx.config().clone();
+    let (pre, expected) = {
+        let mut lsp = ctx.lsp();
+        lsp.drain_events();
+        let pre = lsp.snapshot_pre_edit_state(&pre_opened);
+        let expected = lsp
+            .notify_file_changed_versioned(&pre_opened, "pub fn old() {}\n", &config)
+            .expect("notify file changed");
+        (pre, expected)
+    };
+    assert!(
+        !expected.is_empty(),
+        "the fake must receive a versioned edit"
+    );
+    wait_for_lsp_report_state(&ctx, &pre_opened, true);
+    let warming = aft::lsp::manager::wait_for_post_edit_diagnostics_unlocked(
+        || ctx.lsp(),
+        &pre_opened,
+        &expected,
+        &pre,
+        Duration::ZERO,
+    );
+    assert!(
+        !warming.complete(),
+        "warming reports cannot prove freshness"
+    );
+    assert!(warming.accepted_snapshots.is_empty());
+    assert_eq!(warming.pending_servers.len(), expected.len());
     ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
     assert!(ctx.lsp().has_diagnostic_report_for_file(&pre_opened));
     assert!(
@@ -6011,12 +6041,23 @@ fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
         "the fake must hold the initial report provisional until the readiness wait"
     );
     let wait_for_before = || {
-        // `open_with_lsp` waits for a stored diagnostic publication, which can
-        // still be provisional while the server is warming. Allow the fake to
-        // announce readiness, then wait for a non-provisional report and keep
-        // the first bar snapshot with a known error count. A later fresh read
-        // could hit the manager-contention fallback again.
+        // Require the same notified versions after readiness, without sending
+        // another edit. Keep the first bar snapshot with a known error count;
+        // a later read could hit the manager-contention fallback again.
         std::fs::write(&ready_release, "ready\n").unwrap();
+        let ready = aft::lsp::manager::wait_for_post_edit_diagnostics_unlocked(
+            || ctx.lsp(),
+            &pre_opened,
+            &expected,
+            &pre,
+            Duration::from_secs(30),
+        );
+        assert!(
+            ready.complete(),
+            "the notified versions must become fresh: {ready:?}"
+        );
+        assert_eq!(ready.accepted_snapshots.len(), expected.len());
+        assert!(!ready.diagnostics.is_empty());
         wait_for_lsp_report_state(&ctx, &pre_opened, false);
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
