@@ -28,7 +28,13 @@ pub fn handle_db_get_state(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let harness_name = harness.storage_segment();
     match ctx.db() {
-        Some(db) => match db.lock() {
+        Some(db) => match {
+            #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+            let result = crate::db::contention_probe::lock_state_read(&db);
+            #[cfg(not(any(debug_assertions, feature = "test-timing-hooks")))]
+            let result = db.lock();
+            result
+        } {
             Ok(conn) => {
                 match crate::db::state::get_harness_state(&conn, &harness_name, &params.key) {
                     Ok(Some(value)) => {

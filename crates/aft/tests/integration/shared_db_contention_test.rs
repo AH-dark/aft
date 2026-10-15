@@ -18,15 +18,9 @@ use super::helpers::AftProcess;
 /// Longer than the steady busy wait, so any maintenance still using it fails.
 const HOLD: Duration = Duration::from_secs(7);
 /// How long the child's maintenance keeps retrying a write that meets the
-/// held write lock. Set far above [`READ_BUDGET`], so a maintenance path that
-/// waits while holding the connection mutex delays reads by about this much,
-/// on fast and slow machines alike.
+/// held write lock. The retry gate can hold this phase open independently of
+/// the budget when a test needs to establish request/maintenance ordering.
 const MAINTENANCE_BUSY_BUDGET_MS: &str = "2000";
-/// A read must never wait out a maintenance busy budget. One second is half
-/// that budget, so a regression still fails by a wide margin, and it leaves a
-/// loaded CI runner room for scheduling delays that have nothing to do with
-/// the connection mutex.
-const READ_BUDGET: Duration = Duration::from_millis(1_000);
 
 struct Contended {
     _project: tempfile::TempDir,
@@ -220,6 +214,19 @@ impl MaintenanceRetryGate {
         std::fs::write(self.0.path().join("release"), b"resume retry")
             .expect("release maintenance retry");
     }
+
+    fn evidence(&self, name: &str) -> serde_json::Value {
+        let path = self.0.path().join(name);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("missing contention event {}: {error}", path.display()));
+        serde_json::from_slice(&bytes).expect("contention event JSON")
+    }
+
+    fn clear_read_evidence(&self) {
+        for name in ["read-requested", "read-waiting", "read-acquired"] {
+            let _ = std::fs::remove_file(self.0.path().join(name));
+        }
+    }
 }
 
 impl Drop for MaintenanceRetryGate {
@@ -289,36 +296,79 @@ fn status_answers_while_another_process_holds_the_write_lock() {
     );
 }
 
-/// Maintenance retries a write that meets another process's write lock, but
-/// it must not hold this process's connection mutex while it waits, or every
-/// request that reads the database queues behind it, although a read in WAL
-/// mode never needs the write lock itself.
+/// A real SQLite BUSY result must release the shared mutex before maintenance
+/// waits. Reads must acquire that same connection and return committed data
+/// before either maintenance or the foreign writer is allowed to resume.
 #[test]
 fn database_reads_are_not_held_behind_maintenance_waiting_on_a_foreign_write_lock() {
-    let mut contended = Contended::start();
-    let mut latencies = Vec::new();
-    contended.hold_write_lock(|aft| {
-        let started = Instant::now();
-        let response = aft.send_with_timeout(
-            &json!({
-                "id": "read",
-                "command": "db_get_state",
-                "params": { "key": "contention-probe" },
-            })
-            .to_string(),
-            Duration::from_secs(30),
+    let gate = MaintenanceRetryGate::new();
+    let mut contended = Contended::start_with_retry_gate(Some(gate.0.path()));
+    aft::db::state::set_harness_state(
+        &contended.conn,
+        "opencode",
+        "contention-probe",
+        "committed before the foreign write lock",
+        0,
+    )
+    .expect("seed committed read probe");
+    let log_path = contended.log_path();
+    contended.with_write_lock(|aft, writer| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !gate.is_paused() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance never released the shared mutex during its foreign-lock retry; busy event: {}; log: {}",
+                std::fs::read_to_string(gate.0.path().join("busy")).unwrap_or_default(),
+                std::fs::read_to_string(&log_path).unwrap_or_default(),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let maintenance = gate.evidence("paused");
+        assert_eq!(maintenance["sqlite_busy"], true, "{maintenance}");
+        assert_eq!(
+            maintenance["mutex_available"], true,
+            "maintenance waited on the foreign lock while holding the shared mutex: {maintenance}"
         );
-        latencies.push(started.elapsed());
-        assert_eq!(response["success"], true, "read failed: {response:?}");
+        assert_eq!(
+            maintenance["observed_connection_id"], maintenance["connection_id"],
+            "the hook must try_lock the actual maintenance connection: {maintenance}"
+        );
+        for i in 0..5 {
+            gate.clear_read_evidence();
+            let response = aft.send_with_timeout(
+                &json!({
+                    "id": format!("read-{i}"),
+                    "command": "db_get_state",
+                    "params": { "key": "contention-probe" },
+                })
+                .to_string(),
+                Duration::from_secs(30),
+            );
+            let read = gate.evidence("read-acquired");
+            assert_eq!(
+                response["success"], true,
+                "read failed: {response:?}; {read}"
+            );
+            assert_eq!(response["value"], "committed before the foreign write lock");
+            assert_eq!(read["mutex_id"], maintenance["mutex_id"], "{read}");
+            assert_eq!(
+                read["connection_id"], maintenance["connection_id"],
+                "{read}"
+            );
+            assert_eq!(read["maintenance_paused"], true, "{read}");
+            assert!(
+                gate.is_paused(),
+                "read finished after maintenance resumed: {read}"
+            );
+            assert!(
+                !writer.is_autocommit(),
+                "foreign writer released before read"
+            );
+            eprintln!("maintenance={maintenance}; read={read}");
+        }
     });
+    gate.release();
     contended.finish();
-
-    assert!(latencies.len() >= 5, "only {} reads ran", latencies.len());
-    let slowest = latencies.iter().max().copied().unwrap_or_default();
-    assert!(
-        slowest < READ_BUDGET,
-        "a read waited {slowest:?}, not under {READ_BUDGET:?}, behind maintenance: {latencies:?}"
-    );
 }
 
 /// Retention runs under the same contention without a warning per attempt:

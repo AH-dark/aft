@@ -19,6 +19,8 @@ pub mod bash_tasks;
 pub mod bash_watches;
 pub mod call_ledger;
 pub mod compression_events;
+#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+pub(crate) mod contention_probe;
 pub mod github_read_cache;
 pub mod remote_exec;
 pub mod removal;
@@ -497,7 +499,11 @@ pub(crate) fn maintenance_write<T>(
     loop {
         match db.try_lock() {
             Ok(mut conn) => {
+                #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+                let attempt_started = std::time::Instant::now();
                 let result = with_busy_wait(&mut *conn, Duration::ZERO, &mut work);
+                #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
+                let connection_id = &*conn as *const TrackedConnection as usize;
                 drop(conn);
                 match result {
                     Ok(value) => return Ok(value),
@@ -506,7 +512,11 @@ pub(crate) fn maintenance_write<T>(
                             // A test can hold this retry phase open to prove reads
                             // finish before maintenance resumes, not just eventually.
                             #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
-                            maintenance_retry_checkpoint();
+                            contention_probe::maintenance_retry_checkpoint(
+                                db,
+                                connection_id,
+                                attempt_started.elapsed(),
+                            );
                         }
                         last_busy = Some(error);
                     }
@@ -533,35 +543,6 @@ pub(crate) fn maintenance_write<T>(
         std::thread::sleep(sleep.min(deadline - now));
         sleep = (sleep * 2).min(LONGEST_RETRY_SLEEP);
     }
-}
-
-/// Pause after a real SQLite BUSY result, with the connection mutex released.
-/// Release builds without timing hooks do not expose this checkpoint. The
-/// long timeout only bounds an abandoned test fixture and must outlast its
-/// request hang ceiling.
-#[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
-fn maintenance_retry_checkpoint() {
-    let Some(directory) = std::env::var_os("AFT_TEST_MAINTENANCE_RETRY_GATE") else {
-        return;
-    };
-    let directory = std::path::PathBuf::from(directory);
-    let paused = directory.join("paused");
-    let released = directory.join("release");
-    crate::slog_debug!(
-        "maintenance write busy retry paused: gate={}",
-        directory.display()
-    );
-    std::fs::write(&paused, b"sqlite busy retry in progress")
-        .expect("publish maintenance retry gate");
-    let ceiling = std::time::Instant::now() + Duration::from_secs(120);
-    while !released.exists() && std::time::Instant::now() < ceiling {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::fs::remove_file(&paused).ok();
-    crate::slog_debug!(
-        "maintenance write busy retry resumed: gate={}",
-        directory.display()
-    );
 }
 
 /// Run `work` on a connection with a different busy wait, restoring the steady
