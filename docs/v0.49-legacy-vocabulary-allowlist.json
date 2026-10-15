@@ -8646,6 +8646,39 @@
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/undo.rs",
+      "line": 179,
+      "column": 37,
+      "token": "filePath",
+      "text": ".or_else(|| req.params.get(\"filePath\"))",
+      "location": "line 179, column 37",
+      "ordinal": 2,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/undo.rs",
+      "line": 244,
+      "column": 72,
+      "token": "filePath",
+      "text": "serde_json::json!({\"id\": \"alias-undo\", \"command\": \"undo\", \"filePath\": first}),",
+      "location": "line 244, column 72",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "packages/opencode-plugin/src/shared/rpc-server.ts",
+      "line": 245,
+      "column": 51,
+      "token": "filePath",
+      "text": "if (!temporary || Date.now() - statSync(filePath).mtimeMs >= UNREADABLE_TMP_MAX_AGE_MS) {",
+      "location": "line 245, column 51",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     }
   ]
 }

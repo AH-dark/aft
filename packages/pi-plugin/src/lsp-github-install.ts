@@ -1606,8 +1606,8 @@ export {
   type GithubServerSpec,
   type Platform,
   precheckArchiveContents as _precheckArchiveSizeForTesting,
-  runArchiveTool as _runArchiveToolForTesting,
   precheckWithTar as _precheckTarForTesting,
   resolveTargetTag as _resolveTargetTagForTesting,
+  runArchiveTool as _runArchiveToolForTesting,
   writeGithubInstalledMetaIn as _writeGithubInstalledMetaForTesting,
 };

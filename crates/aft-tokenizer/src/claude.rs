@@ -354,10 +354,10 @@ mod tests {
             lossy,
         ];
         for text in corpus {
-            let reference = encode(&text).len();
+            let reference = encode(&text).unwrap().len();
             TOKEN_VECTOR_BYTES.with(|bytes| bytes.set(0));
             assert_eq!(
-                count_tokens(&text),
+                count_tokens(&text).unwrap(),
                 reference,
                 "exact encoding length for {text:?}"
             );
@@ -380,7 +380,7 @@ mod tests {
                 end -= 1;
             }
             text.truncate(end);
-            let expected = encode(&text).len();
+            let expected = encode(&text).unwrap().len();
             let mut elapsed = Vec::new();
             let mut encoded_elapsed = Vec::new();
             let mut count_bytes = 0;
@@ -388,12 +388,12 @@ mod tests {
             for _ in 0..16 {
                 TOKEN_VECTOR_BYTES.with(|count| count.set(0));
                 let start = std::time::Instant::now();
-                assert_eq!(count_tokens(std::hint::black_box(&text)), expected);
+                assert_eq!(count_tokens(std::hint::black_box(&text)).unwrap(), expected);
                 elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
                 count_bytes += TOKEN_VECTOR_BYTES.with(|count| count.get());
                 TOKEN_VECTOR_BYTES.with(|count| count.set(0));
                 let start = std::time::Instant::now();
-                assert_eq!(encode(std::hint::black_box(&text)).len(), expected);
+                assert_eq!(encode(std::hint::black_box(&text)).unwrap().len(), expected);
                 encoded_elapsed.push(start.elapsed().as_secs_f64() * 1000.0);
                 encode_bytes += TOKEN_VECTOR_BYTES.with(|count| count.get());
             }
