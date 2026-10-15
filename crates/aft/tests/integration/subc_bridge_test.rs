@@ -8660,6 +8660,7 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
     let ctx = executor
         .actor_context(&root_id)
         .expect("bound root actor context");
+    ctx.update_config(|config| config.storage_dir = Some(root1.join("task-storage")));
     ctx.bash_background().set_harness(Harness::Opencode);
     let watch_db = Arc::new(Mutex::new(
         aft::db::open(&root1.join("dropped-pattern-watch.db")).expect("open watch DB"),
@@ -8679,10 +8680,24 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
     )
     .await;
 
-    send_bash_background(
+    let marker = root1.join("pattern-started");
+    let release = crate::test_helpers::ReleaseOnDrop::new(root1.join("pattern-release"));
+    let done = crate::test_helpers::ReleaseOnDrop::new(root1.join("pattern-done"));
+    // Keep the command silent until the watch is registered, and alive until
+    // after the retry is observed. Completion must not supply the second nudge.
+    let command = format!(
+        "{}; {}",
+        hold_bash_until_release_command(&marker, &release.0, "PATTERN-READY"),
+        hold_bash_until_release_command(&root1.join("pattern-printed"), &done.0, "done"),
+    );
+    send_tool_call(
         &mut stream,
+        1,
         791,
-        "sleep 1; printf 'PATTERN-READY\n'; sleep 5",
+        "bash",
+        json!({ "params": {
+            "command": command, "background": true, "timeout": 10_000,
+        }}),
     )
     .await;
     let launch = read_tool_response_allowing_bg_events(
@@ -8693,10 +8708,12 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
         "pattern dropped-nudge launch",
     )
     .await;
+    assert_eq!(launch["success"], true, "pattern launch failed: {launch:?}");
     let task_id = launch["task_id"]
         .as_str()
         .expect("background task id")
         .to_string();
+    wait_for_path_event(&marker, "pattern command started").await;
     send_tool_call(
         &mut stream,
         1,
@@ -8714,23 +8731,61 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
     )
     .await;
     assert_eq!(notify["success"], true, "bash_notify failed: {notify:?}");
+    std::fs::write(&release.0, "release").unwrap();
 
-    let _dropped = wait_for_bg_event(
-        &mut stream,
-        BG_CHANNEL,
-        BG_CORR,
-        Duration::from_secs(30),
-        "first pattern nudge to drop",
-    )
-    .await;
-    let _rearmed = wait_for_bg_event(
-        &mut stream,
-        BG_CHANNEL,
-        BG_CORR,
-        Duration::from_secs(3),
-        "rearmed pattern nudge",
-    )
-    .await;
+    let first_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let _dropped = wait_for_bg_event(
+            &mut stream,
+            BG_CHANNEL,
+            BG_CORR,
+            first_deadline.saturating_duration_since(Instant::now()),
+            "first pattern nudge to drop",
+        )
+        .await;
+        if ctx
+            .bash_background()
+            .pending_pattern_matches_for_session("session-1")
+            .iter()
+            .any(|item| item.task_id == task_id)
+        {
+            break;
+        }
+    }
+    // StreamData can also announce a long-running command. Require both a
+    // delivered nudge and the counter that advances after a retry is enqueued.
+    // Poll health without waiting for another event first: retries back off,
+    // and a nudge read alongside a health response must not be forgotten.
+    // The bridge watchdog bounds this state-based wait, including on busy hosts.
+    let mut saw_rearmed_nudge = false;
+    loop {
+        send_control_request(&mut stream, 795, ModuleControlRequest::HealthCheck {}).await;
+        let report = loop {
+            let frame = read_any_frame_timeout(&mut stream, "pattern rearm health").await;
+            if is_expected_bg_event_stream_data(&frame, BG_CHANNEL, BG_CORR) {
+                saw_rearmed_nudge = true;
+                continue;
+            }
+            assert_no_bg_events_terminal(&frame, BG_CHANNEL, BG_CORR, "pattern rearm health");
+            if frame.header.ty == FrameType::Push {
+                continue;
+            }
+            assert_eq!(frame.header.ty, FrameType::Response);
+            assert_eq!(frame.header.corr, 795);
+            let response: ModuleControlResponse = serde_json::from_slice(&frame.body).unwrap();
+            break response.health_report().expect("rearm health report");
+        };
+        let rearm_total = report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.pointer("/runtime/bg_wake_rearm_total"))
+            .and_then(Value::as_u64)
+            .expect("bg wake rearm counter");
+        if rearm_total > 0 && saw_rearmed_nudge {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     send_tool_call(&mut stream, 1, 793, "bash_drain_completions", json!({})).await;
     let drained = read_tool_response_allowing_bg_events(
@@ -8763,6 +8818,7 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
     )
     .await;
     assert_eq!(ack["success"], true);
+    std::fs::write(&done.0, "done").unwrap();
     send_connection_goodbye(&mut stream).await;
 }
 

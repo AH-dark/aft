@@ -165,6 +165,68 @@ pub fn set_discovery_entry_delay(root: &Path, delay: Duration) {
     }
 }
 
+fn discovery_holds() -> &'static Mutex<HashMap<PathBuf, Arc<DiscoveryHoldState>>> {
+    static HOLDS: OnceLock<Mutex<HashMap<PathBuf, Arc<DiscoveryHoldState>>>> = OnceLock::new();
+    HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Default)]
+struct DiscoveryHoldState {
+    // (worker entered discovery, test released it)
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+/// Holds only the session worker's discovery, not configure's bounded probe.
+/// Dropping the guard releases the worker even when an assertion unwinds.
+#[doc(hidden)]
+pub struct DiscoveryHold {
+    root: PathBuf,
+    state: Arc<DiscoveryHoldState>,
+}
+
+impl DiscoveryHold {
+    pub fn wait_until_started(&self, timeout: Duration) -> bool {
+        let (state, _) = self
+            .state
+            .changed
+            .wait_timeout_while(lock(&self.state.state), timeout, |state| !state.0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.0
+    }
+}
+
+impl Drop for DiscoveryHold {
+    fn drop(&mut self) {
+        lock(discovery_holds()).remove(&self.root);
+        lock(&self.state.state).1 = true;
+        self.state.changed.notify_all();
+    }
+}
+
+/// Pauses background discovery for one root until the returned guard is dropped.
+#[doc(hidden)]
+pub fn hold_discovery_for_test(root: &Path) -> DiscoveryHold {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let state = Arc::new(DiscoveryHoldState::default());
+    assert!(lock(discovery_holds())
+        .insert(root.clone(), Arc::clone(&state))
+        .is_none());
+    DiscoveryHold { root, state }
+}
+
+fn wait_for_discovery_hold(root: &Path) {
+    let state = lock(discovery_holds()).get(root).cloned();
+    if let Some(state) = state {
+        let mut held = lock(&state.state);
+        held.0 = true;
+        state.changed.notify_all();
+        while !held.1 {
+            held = state.changed.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// Canonical `root` when it may be a parent folder: not inside a git checkout
 /// (which keeps its own indexes) and not the home folder (which indexes
 /// nothing).

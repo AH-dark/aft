@@ -1243,8 +1243,8 @@ fn over_cap_parent_names_skipped_and_unindexed_children() {
 }
 
 /// Discovery runs on the session worker, never on the configure path: with
-/// a walk slowed to seconds, the bind still answers promptly, queries name
-/// the discovery as a gap meanwhile, and the children appear once it ends.
+/// a walk held until the test releases it, the bind still answers promptly.
+/// Queries name discovery as a gap meanwhile; the children appear once it ends.
 #[test]
 fn slow_discovery_never_delays_the_bind() {
     fast_refresh();
@@ -1255,9 +1255,7 @@ fn slow_discovery_never_delays_the_bind() {
     for index in 0..20 {
         std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
     }
-    // 150 ms per examined entry: the full walk takes about 3 s, while the
-    // configure probe stops at the first repository it meets.
-    aft::views::parent::set_discovery_entry_delay(&root, Duration::from_millis(150));
+    let discovery = aft::views::parent::hold_discovery_for_test(&root);
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
@@ -1277,15 +1275,20 @@ fn slow_discovery_never_delays_the_bind() {
     let bind = started.elapsed();
     assert!(configured.success, "{configured:?}");
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
-    let first = grep(&ctx, "anything");
+    assert!(
+        discovery.wait_until_started(DEADLINE),
+        "discovery never started"
+    );
     let session = aft::views::parent::session_for(&ctx).expect("parent session");
+    assert!(session.discovery().is_none(), "discovery escaped its hold");
+    let first = grep(&ctx, "anything");
     let discovered_at = Instant::now() + DEADLINE;
     assert!(
         gap_kinds(&first).contains(&"parent_discovering".to_string()),
         "{first:#}"
     );
     eprintln!(
-        "parent folder bind with a 3 s discovery walk answered in {} ms",
+        "parent folder bind with discovery held answered in {} ms",
         bind.as_millis()
     );
     assert!(
@@ -1293,11 +1296,11 @@ fn slow_discovery_never_delays_the_bind() {
         "the bind waited for discovery: {} ms",
         bind.as_millis()
     );
+    drop(discovery);
     while session.discovery().is_none() {
         assert!(Instant::now() < discovered_at, "discovery never finished");
         thread::sleep(Duration::from_millis(20));
     }
-    aft::views::parent::set_discovery_entry_delay(&root, Duration::ZERO);
     assert_eq!(session.children().len(), 20);
     let after = grep(&ctx, "anything");
     assert!(!gap_kinds(&after).contains(&"parent_discovering".to_string()));
