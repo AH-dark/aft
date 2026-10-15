@@ -290,6 +290,67 @@ describe("OpenCode background notifications", () => {
     expect(output.output).toBe("tool output");
   });
 
+  test("idle hooks stay quiet without a bridge and replay once one appears", async () => {
+    const send = mock(async (_command: string, _params: Record<string, unknown>) => ({
+      success: true,
+      bg_completions: [],
+    }));
+    const bridge = { send };
+    let activeBridge: typeof bridge | null = null;
+    const ctx = {
+      pool: {
+        getActiveBridgeForRoot: () => activeBridge,
+        getBridge: () => activeBridge,
+      },
+      client: {},
+      config: {},
+      storageDir: "/tmp/aft-test",
+    } as unknown as PluginContext;
+    const drainContext = { ctx, directory: "/tmp/project", sessionID: "s1" };
+    const client = makeClient(mock(async () => {}));
+
+    await appendInTurnBgCompletions(drainContext, { output: "first" });
+    await appendInTurnBgCompletions(drainContext, { output: "second" });
+    await handleIdleBgCompletions({ ...drainContext, client });
+
+    expect(send).toHaveBeenCalledTimes(0);
+    expect(sessionWarnSpy).not.toHaveBeenCalled();
+    expect(sessionBgStates.get("s1")?.forcedDrainCompleted).toBe(false);
+
+    activeBridge = bridge;
+    await appendInTurnBgCompletions(drainContext, { output: "third" });
+    await appendInTurnBgCompletions(drainContext, { output: "fourth" });
+    await handleIdleBgCompletions({ ...drainContext, client });
+
+    expect(send.mock.calls.map((call) => call[0])).toEqual(["bash_drain_completions"]);
+    expect(sessionWarnSpy).not.toHaveBeenCalled();
+    expect(sessionBgStates.get("s1")?.forcedDrainCompleted).toBe(true);
+  });
+
+  test("tracked work still warns when its bridge is unavailable", async () => {
+    const ctx = {
+      pool: {
+        getActiveBridgeForRoot: () => null,
+        getBridge: () => null,
+      },
+      client: {},
+      config: {},
+      storageDir: "/tmp/aft-test",
+    } as unknown as PluginContext;
+    trackBgTask("s1", "task-1");
+
+    await appendInTurnBgCompletions(
+      { ctx, directory: "/tmp/project", sessionID: "s1" },
+      { output: "tool output" },
+    );
+
+    expect(
+      sessionWarnSpy.mock.calls.some(
+        (call) => (call[2] as { event?: string } | undefined)?.event === "bash_completion_drain_error",
+      ),
+    ).toBe(true);
+  });
+
   test("forced drain delivers replayed completion even when task is not tracked", async () => {
     const send = mock(async (command: string) =>
       command === "bash_drain_completions"
