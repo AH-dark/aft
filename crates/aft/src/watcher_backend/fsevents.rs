@@ -846,6 +846,10 @@ mod tests {
         let backend_matcher = Arc::clone(&matcher);
         let backend_generation = Arc::clone(&generation);
         let (raw_tx, raw_rx) = mpsc::channel();
+        // Keep real streams alive to exercise matcher/exclusion updates, but
+        // isolate their unsolicited OS events from the injected callback feed.
+        // A system-wide kernel drop must not replace the UserDropped under test.
+        let (native_tx, native_rx) = mpsc::channel();
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
         let config = WatcherFilterConfig::new(root.clone(), None);
         let filter_generation = Arc::clone(&generation);
@@ -858,19 +862,29 @@ mod tests {
                 dispatch_tx,
                 thread_shutdown,
                 move |root, extra, tx| {
+                    let native_noise =
+                        translate_event(fs::kFSEventStreamEventFlagKernelDropped, &root);
                     let watcher = ProjectWatcher::create(
                         root,
                         extra,
-                        tx,
+                        native_tx,
                         backend_matcher,
                         backend_generation,
                     )?;
-                    raw_tx.send(watcher.raw_sender.clone()).unwrap();
+                    for event in native_noise {
+                        watcher.raw_sender.send(Ok(event)).unwrap();
+                    }
+                    raw_tx.send(tx).unwrap();
                     Ok::<_, notify::Error>(watcher)
                 },
             );
         });
         let sender = raw_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        while !native_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("native noise must be acknowledged outside the injected event feed")
+            .is_ok_and(|event| event.info() == Some("rescan: kernel dropped"))
+        {}
         let initial = counters.snapshot().fsevents_stream_creations_total;
         assert_eq!(initial, 1);
         // Inject native callback flags into the live backend/filter pipeline.

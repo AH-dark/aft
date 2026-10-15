@@ -527,6 +527,20 @@ mod root_repair_warning_tests {
 
 #[cfg(test)]
 mod write_amplification_tests {
+    thread_local! {
+        static BEFORE_READINESS_QUERY: std::cell::RefCell<Option<Box<dyn FnOnce(u64)>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_readiness_query(connection: &TrackedConnection) {
+        let hook = BEFORE_READINESS_QUERY.with(|hook| hook.borrow_mut().take());
+        if let Some(hook) = hook {
+            let busy_timeout = connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            hook(busy_timeout);
+        }
+    }
+
     #[test]
     fn durability_callgraph_pointer_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -582,6 +596,10 @@ mod write_amplification_tests {
         let path = temp.path().join(format!("derived-{generation}.sqlite"));
         let writer = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
         writer.execute_batch("PRAGMA journal_mode=DELETE; CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT); BEGIN EXCLUSIVE;").unwrap();
+        let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
+        BEFORE_READINESS_QUERY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |timeout| timeout_tx.send(timeout).unwrap()));
+        });
         let started = Instant::now();
         let error = manifest_view_database_ready(
             temp.path(),
@@ -591,16 +609,20 @@ mod write_amplification_tests {
         .unwrap_err();
         assert!(error.is_transient_lock_contention(), "{error}");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "probe exceeded its bounded wait"
+            timeout_rx
+                .try_recv()
+                .expect("probe must install its SQLite wait policy")
+                <= 20,
+            "SQLite must not wait beyond the probe's 20ms deadline"
         );
 
-        // A short-lived writer should clear inside the next attempt's budget,
-        // rather than every attempt immediately observing a busy database.
-        let release = std::thread::spawn(move || {
-            let (_tx, rx) = std::sync::mpsc::channel::<()>();
-            let _ = rx.recv_timeout(Duration::from_millis(50));
-            writer.execute_batch("ROLLBACK").unwrap();
+        // Release the writer only after the next probe has opened its reader
+        // and installed the deadline. The first probe above proves contention;
+        // this one proves that a cleared lock is not cached as an error.
+        BEFORE_READINESS_QUERY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                writer.execute_batch("ROLLBACK").unwrap();
+            }));
         });
         assert!(!manifest_view_database_ready(
             temp.path(),
@@ -608,7 +630,6 @@ mod write_amplification_tests {
             Instant::now() + Duration::from_secs(2)
         )
         .unwrap());
-        release.join().unwrap();
     }
 
     #[test]
@@ -621,15 +642,19 @@ mod write_amplification_tests {
                 "PRAGMA journal_mode=DELETE; CREATE TABLE meta (k TEXT, v TEXT); BEGIN EXCLUSIVE;",
             )
             .unwrap();
-        let started = std::time::Instant::now();
         let reader = open_readonly_connection(&path)
             .expect("reader setup must not read a schema held by a writer");
+        // Inspect SQLite's actual wait policy instead of charging host
+        // scheduling and filesystem latency to the request-reader budget.
+        let busy_timeout: u64 = reader
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            busy_timeout, 0,
+            "request readers must never wait for a writer"
+        );
         let error = database_ready(&reader).unwrap_err();
         assert!(error.is_transient_lock_contention(), "{error}");
-        // Request readers use an expired busy deadline, so they must not wait
-        // for the writer. A regression would wait for a 5 s busy timeout; 2 s
-        // tells that apart from a slow open on a loaded CI runner.
-        assert!(started.elapsed() < Duration::from_secs(2));
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
@@ -9853,6 +9878,8 @@ pub(crate) fn manifest_view_database_ready(
     // result (the SQLite busy/locked error), never a definitive negative answer.
     let conn = open_readonly_connection_before(&path, deadline)?;
     conn.busy_timeout(deadline.saturating_duration_since(Instant::now()))?;
+    #[cfg(test)]
+    write_amplification_tests::before_readiness_query(&conn);
     database_ready(&conn)
 }
 

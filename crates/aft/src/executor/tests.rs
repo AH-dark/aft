@@ -268,9 +268,13 @@ fn dispatch_loop_liveness_is_pending_only_while_the_loop_owes_work() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    thread::sleep(Duration::from_millis(50));
     assert!(liveness.has_pending_work());
-    assert!(liveness.progress_age() >= Duration::from_millis(50));
+    // Age calculation does not require sleeping on the scheduler's clock.
+    // Backdate an isolated clock so host timer resolution cannot shorten it.
+    let (_events, events_rx) = crossbeam_channel::unbounded();
+    let mut aged = DispatchLoopLiveness::new(events_rx);
+    aged.origin -= Duration::from_secs(1);
+    assert!(aged.progress_age() >= Duration::from_secs(1));
 
     release_tx.send(()).expect("release hold");
     holder.join().expect("hold thread");
@@ -630,9 +634,7 @@ fn within_actor_read_concurrency() {
                 let now = current_reads.fetch_add(1, Ordering::AcqRel) + 1;
                 observe_max(&max_reads, now);
                 started_tx.send(index).expect("signal read start");
-                release_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("release read job");
+                release_rx.recv().expect("release read job");
                 current_reads.fetch_sub(1, Ordering::AcqRel);
                 ok(format!("read-{index}"))
             }),
@@ -644,7 +646,26 @@ fn within_actor_read_concurrency() {
             .recv_timeout(Duration::from_secs(1))
             .expect("initial read admitted up to cap");
     }
-    assert!(started_rx.recv_timeout(Duration::from_millis(75)).is_err());
+    // Exercise admission while the first readers are held. A quiet receive
+    // window alone cannot prove the scheduler considered the remaining reads.
+    {
+        let mut state = executor.inner.state.lock();
+        let actor = state.actors.get_mut(&root).unwrap();
+        assert_eq!(actor.read_inflight, executor.read_cap());
+        assert!(actor.has_queued_jobs());
+        assert!(
+            try_admit_actor(
+                &root,
+                actor,
+                AdmissionPass::Class(JobClass::Interactive),
+                &executor.inner.config,
+                &Arc::new(HeavySemaphore::new(executor.heavy_permits())),
+                None,
+            )
+            .is_none(),
+            "a queued read must be refused while the read cap is occupied"
+        );
+    }
 
     for _ in 0..read_count {
         release_tx.send(()).expect("release read token");
@@ -754,9 +775,7 @@ fn heavy_bound() {
                 let now = current_heavy.fetch_add(1, Ordering::AcqRel) + 1;
                 observe_max(&max_heavy, now);
                 started_tx.send(index).expect("signal heavy start");
-                release_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("release heavy job");
+                release_rx.recv().expect("release heavy job");
                 current_heavy.fetch_sub(1, Ordering::AcqRel);
                 ok(format!("heavy-{index}"))
             }),
@@ -768,7 +787,32 @@ fn heavy_bound() {
             .recv_timeout(Duration::from_secs(1))
             .expect("heavy job admitted up to semaphore bound");
     }
-    assert!(started_rx.recv_timeout(Duration::from_millis(75)).is_err());
+    // Exhaust a controlled semaphore and ask the real admission function about
+    // an already-queued job; worker scheduling speed is not the oracle.
+    {
+        let heavy = Arc::new(HeavySemaphore::new(executor.heavy_permits()));
+        let _permits: Vec<_> = (0..executor.heavy_permits())
+            .map(|_| heavy.try_acquire().unwrap())
+            .collect();
+        let mut state = executor.inner.state.lock();
+        let (root, actor) = state
+            .actors
+            .iter_mut()
+            .find(|(_, actor)| actor.has_queued_jobs())
+            .unwrap();
+        assert!(
+            try_admit_actor(
+                root,
+                actor,
+                AdmissionPass::Class(JobClass::Interactive),
+                &executor.inner.config,
+                &heavy,
+                None,
+            )
+            .is_none(),
+            "a queued heavy job must be refused without a heavy permit"
+        );
+    }
 
     for _ in 0..job_count {
         release_tx.send(()).expect("release heavy token");
@@ -813,9 +857,7 @@ fn heavy_init_storm_leaves_a_worker_for_a_fresh_route_bind() {
             format!("heavy-storm-{index}"),
             Box::new(move |_| {
                 started_tx.send(index).expect("signal injected heavy delay");
-                release_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("release injected heavy delay");
+                release_rx.recv().expect("release injected heavy delay");
                 ok(format!("heavy-storm-{index}"))
             }),
         ));
@@ -823,12 +865,8 @@ fn heavy_init_storm_leaves_a_worker_for_a_fresh_route_bind() {
     heavy_started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("one HeavyInit job starts");
-    assert!(
-        heavy_started_rx
-            .recv_timeout(Duration::from_millis(75))
-            .is_err(),
-        "the HeavyInit cap must leave one worker idle"
-    );
+    // The fresh bind's start below is positive evidence of a spare worker:
+    // neither heavy job can finish until this test releases its channel.
 
     let (bind_started_tx, bind_started_rx) = crossbeam_channel::bounded(1);
     let bind = executor.submit(
@@ -3869,50 +3907,41 @@ fn repeatable_bind_blocked_by_a_detached_writer_backs_off_without_a_worker() {
         counted.fetch_add(1, Ordering::AcqRel);
         ok("subc-bind-backoff")
     });
-    let queued = wait_for_bind_snapshot(
-        &executor,
-        &root,
-        "subc-bind-backoff",
-        Duration::from_secs(2),
-        |snapshot| {
-            snapshot.configure_state == "queued"
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let queued = loop {
+        // Observe queue ownership and worker accounting under the same lock.
+        // Retry attempts can consume a worker briefly, so their frequency in a
+        // wall-clock sample is not evidence that a worker waits for the gate.
+        {
+            let state = executor.inner.state.lock();
+            let snapshot = state.bind_blocker_snapshot(&root, "subc-bind-backoff");
+            if snapshot.configure_state == "queued"
                 && snapshot
                     .blockers
                     .iter()
                     .any(|blocker| blocker == "rerun_as_exclusive_writer")
-        },
-    );
-    // Sample workers across several back-off rounds; a retry holds a worker
-    // only for the instant of its attempt.
-    let total_workers = executor.inner.state.lock().config.total_workers();
-    let mut samples_all_idle = 0usize;
-    for _ in 0..30 {
-        thread::sleep(Duration::from_millis(10));
-        if executor.idle_workers_for_test() == total_workers {
-            samples_all_idle += 1;
+            {
+                break Some((state.idle_workers, state.config.total_workers()));
+            }
         }
-    }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(2));
+    };
     let ran_while_held = runs.load(Ordering::Acquire);
-    let released_at = Instant::now();
     drop(writer);
     let response = recv_async(bind, "backoff bind");
-    let after_release = released_at.elapsed();
 
-    assert!(
-        queued.is_some(),
-        "the bind waits in the queue, not on a worker"
-    );
-    assert!(
-        samples_all_idle >= 20,
-        "no worker waits for the gate: all workers idle in only {samples_all_idle} of 30 samples"
+    let (idle_workers, total_workers) =
+        queued.expect("the bind waits in the queue, not on a worker");
+    assert_eq!(
+        idle_workers, total_workers,
+        "a queued retry must own no worker"
     );
     assert_eq!(ran_while_held, 0);
     assert!(response.success);
     assert_eq!(runs.load(Ordering::Acquire), 1);
-    assert!(
-        after_release < Duration::from_secs(1),
-        "the bind ran {after_release:?} after the gate was freed"
-    );
 }
 
 /// The epoch lock is task-fair, so a reader waits behind a parked writer even

@@ -685,6 +685,10 @@ mod tests {
         let wal = PathBuf::from(format!("{}-wal", source.display()));
         assert!(fs::metadata(&wal).unwrap().len() > 0);
 
+        // The worker cannot checkpoint until publication has returned and the
+        // pending-WAL assertion below has observed the still-live generation.
+        let checkpoint = checkpoint_lock(&source);
+        let checkpoint_guard = checkpoint.lock().unwrap();
         schedule_derived_checkpoint(
             source.clone(),
             crate::db::file_identity::IdentityConnection::new(connection, "checkpoint test"),
@@ -695,14 +699,12 @@ mod tests {
             fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),
             "checkpoint ran synchronously on the publication path"
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0) {
-            assert!(
-                Instant::now() < deadline,
-                "detached derived checkpoint did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        drop(checkpoint_guard);
+        wait_for_derived_checkpoint_for_test(directory.path());
+        assert!(
+            !fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),
+            "detached derived checkpoint did not truncate the WAL"
+        );
         assert_eq!(
             crate::write_ledger::pending_for_test(
                 crate::write_ledger::Domain::ViewsDerived,
@@ -712,19 +714,7 @@ mod tests {
             0,
             "an unknowable TRUNCATE quantity must not receive guessed credit"
         );
-        // Classification is recorded after the WAL is truncated and the keeper
-        // is dropped. Wait on that record rather than a lagging WAL-length proxy.
         let ledger_root = source.parent().unwrap().display().to_string();
-        while !crate::write_ledger::unmeasurable_for_test(&ledger_root)
-            .iter()
-            .any(|entry| entry.seam == DERIVED_CHECKPOINT_SEAM)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "detached derived checkpoint never recorded its unmeasurable seam"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
         assert!(crate::write_ledger::unmeasurable_for_test(&ledger_root)
             .iter()
             .any(|entry| entry.seam == DERIVED_CHECKPOINT_SEAM

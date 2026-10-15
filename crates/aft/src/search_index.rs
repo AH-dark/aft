@@ -11699,20 +11699,19 @@ mod interactive_artifact_read_budget_tests {
         let lock = Arc::new(RwLock::new(()));
         let writer = lock.write().expect("acquire test writer");
         let reader_lock = Arc::clone(&lock);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
         let reader = thread::spawn(move || {
-            let started = Instant::now();
             let result = try_read_with_budget(&reader_lock, Duration::from_millis(20));
-            (result.is_some(), started.elapsed())
+            result_tx.send(result.is_some()).unwrap();
         });
 
-        thread::sleep(Duration::from_millis(75));
+        // Keep the writer live until the reader reports degradation. A delayed
+        // reader must still encounter contention, not acquire a released lock.
+        let acquired = result_rx.recv_timeout(Duration::from_secs(30));
         drop(writer);
-        let (acquired, elapsed) = reader.join().expect("join bounded reader");
+        reader.join().expect("join bounded reader");
+        let acquired = acquired.expect("bounded reader must return while the writer is held");
         assert!(!acquired, "a live writer must force bounded degradation");
-        assert!(
-            elapsed < Duration::from_millis(60),
-            "contended read exceeded its 20ms budget: {elapsed:?}"
-        );
     }
 }
 

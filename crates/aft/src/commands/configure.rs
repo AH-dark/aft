@@ -13129,12 +13129,24 @@ mod tests {
             first_request_arrived,
             "initial semantic builder did not reach the mock backend"
         );
+        let receiver_before = ctx.semantic_index_rx().lock().as_ref().unwrap().clone();
+        let receiver_epoch_before = ctx.semantic_index_rx_epoch();
+        let build_epoch_before = ctx.semantic_build_epoch();
 
         let unrelated_reconfigure =
             configure_semantic_with_options(&project, &storage, &server.base_url, true, 64, true);
         assert!(handle_configure_for_test(&unrelated_reconfigure, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
-        std::thread::sleep(Duration::from_millis(150));
+        // Adoption preserves the actual live worker channel and its epochs;
+        // counting requests after a quiet interval can miss a delayed restart.
+        assert!(ctx
+            .semantic_index_rx()
+            .lock()
+            .as_ref()
+            .expect("adopted semantic builder receiver")
+            .same_channel(&receiver_before));
+        assert_eq!(ctx.semantic_index_rx_epoch(), receiver_epoch_before);
+        assert_eq!(ctx.semantic_build_epoch(), build_epoch_before);
         assert_eq!(
             server.non_probe_request_count(),
             1,
