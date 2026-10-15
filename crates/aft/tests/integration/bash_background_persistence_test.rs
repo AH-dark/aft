@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aft::bash_background::persistence::{
-    resolve_task_layout, session_tasks_dir, task_bundle_files, task_paths, write_task,
-    PersistedTask,
+    create_task_layout, resolve_task_layout, session_tasks_dir, task_bundle_files, task_paths,
+    write_task, write_task_at, PersistedTask,
 };
 use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
@@ -23,6 +23,8 @@ use super::helpers::{user_config, wait_for_task_metadata, AftProcess, ReleaseOnD
 use super::test_helpers::{init_test_logger, take_logs};
 
 const SESSION: &str = "persist-session";
+const TASK_LAYOUT_RESOLVE_RETRY_WINDOW: Duration = Duration::from_millis(500);
+const TASK_LAYOUT_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 fn spawn_storage_dir(name: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -333,19 +335,93 @@ fn wait_for_status(aft: &mut AftProcess, session: &str, task_id: &str, expected:
 }
 
 fn task_file(storage: &Path, session: &str, task_id: &str, suffix: &str) -> PathBuf {
+    task_file_with_resolver(storage, session, task_id, suffix, resolve_task_layout)
+}
+
+fn task_file_with_resolver(
+    storage: &Path,
+    session: &str,
+    task_id: &str,
+    suffix: &str,
+    mut resolve: impl FnMut(
+        &Path,
+        &str,
+    ) -> std::io::Result<aft::bash_background::persistence::ResolvedTask>,
+) -> PathBuf {
     let session_dir = session_tasks_dir(storage, session);
-    if let Ok(task) = resolve_task_layout(&session_dir, task_id) {
-        return match suffix {
-            "json" => task.paths.json,
-            "stdout" => task.paths.stdout,
-            "stderr" => task.paths.stderr,
-            "exit" => task.paths.exit,
-            "pty" => task.paths.pty,
-            "sandbox-unavailable" => task.paths.sandbox_unavailable,
-            other => task.paths.io_dir.join(other),
-        };
+    let legacy_json = session_dir.join(format!("{task_id}.json"));
+    let task_dir = session_dir.join(task_id);
+    let legacy_path = session_dir.join(format!("{task_id}.{suffix}"));
+    let deadline = Instant::now() + TASK_LAYOUT_RESOLVE_RETRY_WINDOW;
+
+    // Task directories and their metadata are created in separate filesystem
+    // operations, so an unresolved directory task is not evidence of a flat
+    // legacy layout. Use the flat path only when its metadata is present and no
+    // directory task exists; otherwise give the layout time to become resolvable.
+    loop {
+        match resolve(&session_dir, task_id) {
+            Ok(task) => {
+                return match suffix {
+                    "json" => task.paths.json,
+                    "stdout" => task.paths.stdout,
+                    "stderr" => task.paths.stderr,
+                    "exit" => task.paths.exit,
+                    "pty" => task.paths.pty,
+                    "sandbox-unavailable" => task.paths.sandbox_unavailable,
+                    other => task.paths.io_dir.join(other),
+                };
+            }
+            Err(_error) if legacy_json.is_file() && !task_dir.exists() => return legacy_path,
+            Err(error) if Instant::now() >= deadline => {
+                panic!("could not resolve task layout for {task_id}: {error}");
+            }
+            Err(_) => std::thread::sleep(TASK_LAYOUT_RESOLVE_RETRY_DELAY),
+        }
     }
-    session_dir.join(format!("{task_id}.{suffix}"))
+}
+
+#[test]
+fn task_file_does_not_mistake_a_transient_resolution_error_for_legacy_layout() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let task_id = "bash-0000000000000001";
+    let task = create_task_layout(storage.path(), SESSION, task_id).unwrap();
+    let metadata = PersistedTask::starting(
+        task_id.to_string(),
+        SESSION.to_string(),
+        "true".to_string(),
+        project.path().to_path_buf(),
+        Some(project.path().to_path_buf()),
+        None,
+        true,
+        true,
+    );
+    write_task_at(&task, &metadata).unwrap();
+
+    let mut resolve_attempts = 0;
+    let path = task_file_with_resolver(
+        storage.path(),
+        SESSION,
+        task_id,
+        "json",
+        |session_dir, id| {
+            resolve_attempts += 1;
+            if resolve_attempts == 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "simulated transient resolver failure during metadata rewrite",
+                ));
+            }
+            resolve_task_layout(session_dir, id)
+        },
+    );
+
+    let contents = fs::read_to_string(path).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&contents).unwrap()["task_id"],
+        task_id
+    );
+    assert_eq!(resolve_attempts, 2);
 }
 
 fn read_json(storage: &Path, session: &str, task_id: &str) -> Value {
@@ -483,7 +559,7 @@ fn configure_repairs_legacy_root_bash_tasks_into_harness_namespace() {
 }
 
 fn write_legacy_task_json(storage: &Path, session: &str, task_id: &str, project: &Path) -> PathBuf {
-    let path = task_file(storage, session, task_id, "json");
+    let path = session_tasks_dir(storage, session).join(format!("{task_id}.json"));
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         &path,
@@ -1838,7 +1914,7 @@ fn pre_spawn_metadata_starting_replays_as_failed() {
         true,
         true,
     );
-    let path = task_file(storage.path(), SESSION, task_id, "json");
+    let path = session_tasks_dir(storage.path(), SESSION).join(format!("{task_id}.json"));
     write_task(&path, &metadata).unwrap();
 
     let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
@@ -2884,7 +2960,7 @@ fn restart_sweep_marks_dead_pid_fate_unknown_once() {
     metadata.child_pid = Some(999_999);
     metadata.pgid = Some(999_999);
     write_task(
-        &task_file(storage.path(), SESSION, task_id, "json"),
+        &session_tasks_dir(storage.path(), SESSION).join(format!("{task_id}.json")),
         &metadata,
     )
     .unwrap();
