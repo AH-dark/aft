@@ -11701,17 +11701,27 @@ mod interactive_artifact_read_budget_tests {
         let reader_lock = Arc::clone(&lock);
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let reader = thread::spawn(move || {
+            let started = Instant::now();
             let result = try_read_with_budget(&reader_lock, Duration::from_millis(20));
-            result_tx.send(result.is_some()).unwrap();
+            result_tx.send((result.is_some(), started.elapsed())).unwrap();
         });
 
         // Keep the writer live until the reader reports degradation. A delayed
         // reader must still encounter contention, not acquire a released lock.
-        let acquired = result_rx.recv_timeout(Duration::from_secs(30));
+        let reported = result_rx.recv_timeout(Duration::from_secs(30));
         drop(writer);
         reader.join().expect("join bounded reader");
-        let acquired = acquired.expect("bounded reader must return while the writer is held");
+        let (acquired, elapsed) =
+            reported.expect("bounded reader must return while the writer is held");
         assert!(!acquired, "a live writer must force bounded degradation");
+        // The read itself must honour its 20 ms budget. The bound is 100 times
+        // the budget so runner scheduling noise cannot trip it, while a read
+        // that ignored the budget and waited on the writer (held up to 30 s)
+        // still fails.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "contended read ignored its 20 ms budget: {elapsed:?}"
+        );
     }
 }
 
