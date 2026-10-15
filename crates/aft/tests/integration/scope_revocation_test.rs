@@ -641,22 +641,27 @@ fn close_case(name: &'static str, case: CloseCase) {
                 )
                 .await;
             }
-            let pid = child_pid(&pid_path).await;
             #[cfg(feature = "test-timing-hooks")]
             if let Some((gate, _, _, _)) = &registration {
+                // Registration precedes bootstrap release, so the command cannot
+                // publish its PID until this fixture lets registration finish.
                 wait_test_marker(&gate.with_extension("reached")).await;
+                assert!(
+                    !pid_path.exists(),
+                    "bash command ran before task registration"
+                );
                 std::fs::remove_file(gate).unwrap();
             }
+            let pid = child_pid(&pid_path).await;
             let _cleanup = ChildCleanup(pid);
             assert!(
                 alive(pid),
                 "control: grandchild must be live before closing the scope"
             );
             if matches!(case, CloseCase::Duplicate) {
-                // The shell can publish its PID before registry insertion.
-                // If route 2 closes before insertion, Goodbye finds no task to
-                // describe. Route 1 still binds the stamp, so periodic polling
-                // cannot recover that missing query. Wait for spawn dispatch.
+                // The command can start before its task joins scope monitoring.
+                // Wait for spawn dispatch to finish so closing the sibling route
+                // finds the task and asks whether its scope is still live.
                 await_registered_run_task().await;
             }
             // Close the unused sibling first: it must already share the run's
