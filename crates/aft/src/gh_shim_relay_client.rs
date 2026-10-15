@@ -520,9 +520,35 @@ thread_local! {
     static ATTEMPT_DEADLINES: std::cell::RefCell<Option<Vec<Instant>>> = const { std::cell::RefCell::new(None) };
 }
 
-struct Exchange<'a> {
+/// The exchange uses one monotonic clock for requests and retry sleeps. Tests
+/// can advance that clock without depending on daemon or runner scheduling.
+trait ExchangeIo {
+    fn now(&self) -> Instant;
+    async fn sleep(&self, delay: Duration);
+    async fn request(&self, bytes: Vec<u8>, options: CallOptions) -> Result<Vec<u8>, CallError>;
+}
+
+struct SubcExchangeIo<'a> {
     consumer: &'a SubcConsumer,
     route: &'a subc_client_rs::RouteHandle,
+}
+
+impl ExchangeIo for SubcExchangeIo<'_> {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    async fn sleep(&self, delay: Duration) {
+        tokio::time::sleep(delay).await;
+    }
+
+    async fn request(&self, bytes: Vec<u8>, options: CallOptions) -> Result<Vec<u8>, CallError> {
+        self.consumer.request(self.route, bytes, options).await
+    }
+}
+
+struct Exchange<'a, Io> {
+    io: &'a Io,
     ticket: &'a str,
     stage: &'a Mutex<ProbeStage>,
     /// When the exchange began; `budget` after it is the exchange's deadline.
@@ -530,7 +556,7 @@ struct Exchange<'a> {
     budget: Duration,
 }
 
-impl Exchange<'_> {
+impl<Io: ExchangeIo> Exchange<'_, Io> {
     fn deadline(&self) -> Instant {
         self.started + self.budget
     }
@@ -546,7 +572,7 @@ impl Exchange<'_> {
         *self.stage.lock().unwrap() = ProbeStage::Request;
         let bytes = serde_json::to_vec(body)
             .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
-        let now = Instant::now();
+        let now = self.io.now();
         let remaining = self.deadline().saturating_duration_since(now);
         if remaining.is_zero() {
             return Err(RouteOutcome::Unavailable(format!(
@@ -566,7 +592,7 @@ impl Exchange<'_> {
                 }
             });
         }
-        match self.consumer.request(self.route, bytes, options).await {
+        match self.io.request(bytes, options).await {
             Ok(bytes) => Ok(bytes),
             Err(CallError::NotSent(_)) => Err(RouteOutcome::GovernanceUnavailable),
             Err(CallError::Module(body)) => Err(RouteOutcome::RelayRefusal {
@@ -579,7 +605,12 @@ impl Exchange<'_> {
             // Reported as the time the whole exchange waited, which is what
             // the caller experienced; it never exceeds the budget.
             Err(_) => Err(RouteOutcome::OutcomeUnknown {
-                elapsed_ms: self.started.elapsed().min(self.budget).as_millis() as u64,
+                elapsed_ms: self
+                    .io
+                    .now()
+                    .saturating_duration_since(self.started)
+                    .min(self.budget)
+                    .as_millis() as u64,
             }),
         }
     }
@@ -662,7 +693,7 @@ impl Exchange<'_> {
 /// it, and a retry sleep that would run past it is not taken.
 #[allow(clippy::too_many_arguments)]
 async fn exchange(
-    exchange: &Exchange<'_>,
+    exchange: &Exchange<'_, impl ExchangeIo>,
     paths: &StatePaths,
     agent_binding: &AgentBinding,
     manifest: &Manifest,
@@ -760,7 +791,7 @@ async fn exchange(
                 match class {
                     CodeClass::Transient if transient_retries < transient_delays.len() => {
                         let delay = transient_delays[transient_retries];
-                        if Instant::now() + delay >= exchange.deadline() {
+                        if exchange.io.now() + delay >= exchange.deadline() {
                             // Plexus refused this attempt, so nothing was
                             // written; stopping here is a named refusal.
                             return RouteOutcome::RelayRefusal {
@@ -771,7 +802,7 @@ async fn exchange(
                                 code,
                             };
                         }
-                        tokio::time::sleep(delay).await;
+                        exchange.io.sleep(delay).await;
                         transient_retries += 1;
                     }
                     CodeClass::Remint if !reminted => reminted = true,
@@ -903,8 +934,10 @@ pub(super) fn route(
         }
         let outcome = exchange(
             &Exchange {
-                consumer: &consumer,
-                route: &route,
+                io: &SubcExchangeIo {
+                    consumer: &consumer,
+                    route: &route,
+                },
                 ticket: &ticket,
                 stage: &stage,
                 started: {

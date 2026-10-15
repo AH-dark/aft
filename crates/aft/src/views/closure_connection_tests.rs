@@ -12,16 +12,24 @@ fn fixture() -> (tempfile::TempDir, SqliteClosure, Manifest) {
     };
     fs::write(&closure.trigram, []).unwrap();
     for path in [&closure.semantic, &closure.callgraph] {
-        let conn = Connection::open(path).unwrap();
+        let mut conn = Connection::open(path).unwrap();
         conn.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB); CREATE INDEX blob_membership ON blob_payloads(full_key)")
             .unwrap();
+        // These fixtures measure read-side reuse, not write durability. Commit
+        // each blob database once rather than flushing each row on Windows.
+        let tx = conn.transaction().unwrap();
         for key in 0..600u16 {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO blob_payloads VALUES(?1, X'')",
                 [decode_hex(&format!("{key:064x}")).unwrap()],
             )
             .unwrap();
         }
+        assert!(
+            !tx.is_autocommit(),
+            "fixture keys must share one transaction"
+        );
+        tx.commit().unwrap();
     }
     let manifest = Manifest::new((0..600u16).map(|key| {
         (

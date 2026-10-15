@@ -1264,39 +1264,98 @@ fn dispatch_timed(
 
 /// Transient refusals whose retries would outlast the relay budget stop at
 /// the budget instead of sleeping past it. Each refusal proves nothing was
-/// written, so the command exits with the named refusal (86).
+/// written, so the exchange returns the named refusal (reported by dispatch as 86).
 #[test]
 fn transient_retries_stop_inside_the_relay_budget_with_a_named_refusal() {
-    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-budget", "call-b", "/p");
-    // Every write attempt takes 400 ms and is refused as transient, and each
-    // retry sleeps 700 ms. After the second attempt ends (about 1.5 s) the
-    // next sleep would end past the 2 s budget, so the shim stops there;
-    // all three attempts would need 2.6 s.
-    let handler: Handler = Arc::new(|body: &Value| {
-        if body["op"] == BINDINGS_READ_OPERATION {
-            return bindings_ok();
+    struct ClockedRelay {
+        now: std::cell::Cell<Instant>,
+        attempts: std::cell::RefCell<Vec<(Instant, Duration, Value)>>,
+        sleeps: std::cell::RefCell<Vec<Duration>>,
+    }
+
+    impl ExchangeIo for ClockedRelay {
+        fn now(&self) -> Instant {
+            self.now.get()
         }
-        std::thread::sleep(Duration::from_millis(400));
-        plexus_refused("store_failure")
-    });
-    let harness = harness(handler);
+
+        async fn sleep(&self, delay: Duration) {
+            self.sleeps.borrow_mut().push(delay);
+            self.now.set(self.now() + delay);
+        }
+
+        async fn request(
+            &self,
+            bytes: Vec<u8>,
+            options: CallOptions,
+        ) -> Result<Vec<u8>, CallError> {
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            if body["op"] == BINDINGS_READ_OPERATION {
+                return Ok(serde_json::to_vec(&bindings_ok()).unwrap());
+            }
+            self.attempts
+                .borrow_mut()
+                .push((self.now(), options.timeout, body));
+            self.now.set(self.now() + Duration::from_millis(400));
+            Ok(serde_json::to_vec(&plexus_refused("store_failure")).unwrap())
+        }
+    }
+
+    // Two 400 ms refusals and one 700 ms sleep consume 1500 ms. The second
+    // attempt must get only 900 ms, and another 700 ms sleep must not start.
+    // The real consumer's timeout enforcement is covered by the silent-retry test.
+    let started = Instant::now();
     let budget = Duration::from_secs(2);
-    let (status, elapsed) = dispatch_timed(
-        &harness,
-        live.value(),
-        [Duration::from_millis(700); 2],
+    let io = ClockedRelay {
+        now: std::cell::Cell::new(started),
+        attempts: Default::default(),
+        sleeps: Default::default(),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(temp.path().join("state"));
+    let manifest = v12_manifest();
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    let stage = Mutex::new(ProbeStage::Request);
+    let timing = Exchange {
+        io: &io,
+        ticket: "test-ticket",
+        stage: &stage,
+        started,
         budget,
-    );
-    assert_eq!(status, REFUSAL_EXIT_STATUS);
-    assert!(
-        elapsed < budget,
-        "took {elapsed:?} against a {budget:?} budget"
-    );
-    let sent = nonces(&harness);
-    assert_eq!(sent.len(), 2, "the second retry would pass the budget");
-    assert_eq!(sent[0], sent[1], "a retry reuses the request nonce");
-    let seam = super::super::seam_state(&harness.paths);
-    assert_eq!(seam.last_seam_refusal.unwrap().code, "store_failure");
+    };
+    let body = json!({"op": BOT_REQUEST_OPERATION, "params": {"request_nonce": "same-nonce"}});
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(exchange(
+            &timing,
+            &paths,
+            &binding,
+            &manifest,
+            &body,
+            [Duration::from_millis(700); 2],
+        ));
+    let RouteOutcome::RelayRefusal { code, text } = outcome else {
+        panic!("expected a named refusal, got {outcome:?}");
+    };
+    assert_eq!(code, "store_failure");
+    assert!(text.contains("2000 ms budget"));
+    assert_eq!(io.now() - started, Duration::from_millis(1500));
+    assert_eq!(*io.sleeps.borrow(), [Duration::from_millis(700)]);
+    let attempts = io.attempts.borrow();
+    assert_eq!(attempts.len(), 2, "the second retry would pass the budget");
+    assert_eq!(attempts[0].1, budget);
+    assert_eq!(attempts[1].1, Duration::from_millis(900));
+    for (sent_at, timeout, sent) in attempts.iter() {
+        assert_eq!(
+            *sent_at + *timeout,
+            timing.deadline(),
+            "retry received a fresh budget"
+        );
+        assert_eq!(sent, &body, "a retry reuses the request nonce");
+    }
 }
 
 /// A retried attempt only gets what is left of the relay budget, so a silent

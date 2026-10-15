@@ -52,7 +52,10 @@ struct Fixture {
 }
 
 fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
-    Manifest::new(files.iter().map(|(path, source)| {
+    // Seed each manifest in one transaction; per-row durable commits make the
+    // read-side fixtures unnecessarily expensive on Windows.
+    let tx = blobs.unchecked_transaction().unwrap();
+    let manifest = Manifest::new(files.iter().map(|(path, source)| {
         let language = if path.ends_with(".rs") {
             "rust"
         } else {
@@ -61,16 +64,15 @@ fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
         let blob = join::CallgraphBlob::extract(source, language, "fixture").unwrap();
         let payload = blob.to_bytes().unwrap();
         let key = blake3::hash(&payload);
-        blobs
-            .execute(
-                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
-                params![
-                    key.as_bytes().as_slice(),
-                    payload,
-                    blake3::hash(&payload).as_bytes().as_slice()
-                ],
-            )
-            .unwrap();
+        tx.execute(
+            "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+            params![
+                key.as_bytes().as_slice(),
+                payload,
+                blake3::hash(&payload).as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
         (
             RelPath::new(path.as_bytes()).unwrap(),
             ManifestEntry::Regular {
@@ -83,7 +85,13 @@ fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
             },
         )
     }))
-    .unwrap()
+    .unwrap();
+    assert!(
+        !tx.is_autocommit(),
+        "fixture payloads must share one transaction"
+    );
+    tx.commit().unwrap();
+    manifest
 }
 
 fn fixture() -> Fixture {

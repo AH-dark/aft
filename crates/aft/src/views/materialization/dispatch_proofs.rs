@@ -2,23 +2,25 @@ use super::*;
 use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 
 fn manifest(connection: &Connection, types: &str) -> Manifest {
+    // Dispatch assertions read these blobs after setup; batch fixture writes
+    // rather than paying for a durable commit for each input on Windows.
+    let tx = connection.unchecked_transaction().unwrap();
     let inputs = [("types.ts", types), ("caller.ts", "import { I } from './types'; export function caller(x: I) { x.m(); }\nexport function unknown(x) { x.m(); }")];
-    Manifest::new(inputs.into_iter().map(|(path, source)| {
+    let manifest = Manifest::new(inputs.into_iter().map(|(path, source)| {
         let payload = join::CallgraphBlob::extract(source, "typescript", "dispatch-proof")
             .unwrap()
             .to_bytes()
             .unwrap();
         let key = blake3::hash(&payload).to_hex().to_string();
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
-                params![
-                    decode_manifest_full_key(&key).unwrap(),
-                    payload,
-                    blake3::hash(&payload).as_bytes().as_slice()
-                ],
-            )
-            .unwrap();
+        tx.execute(
+            "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+            params![
+                decode_manifest_full_key(&key).unwrap(),
+                payload,
+                blake3::hash(&payload).as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
         (
             RelPath::new(path.as_bytes()).unwrap(),
             ManifestEntry::Regular {
@@ -31,7 +33,13 @@ fn manifest(connection: &Connection, types: &str) -> Manifest {
             },
         )
     }))
-    .unwrap()
+    .unwrap();
+    assert!(
+        !tx.is_autocommit(),
+        "fixture payloads must share one transaction"
+    );
+    tx.commit().unwrap();
+    manifest
 }
 fn blobs(path: &Path) -> Connection {
     let connection = Connection::open(path).unwrap();

@@ -1448,24 +1448,51 @@ mod reuse_tests {
     use super::*;
     use crate::blob_store::{PayloadReadCounts, PAYLOAD_READ_COUNTS};
 
+    fn seed_callgraph_payloads(store: &BlobStore, project: &Path, files: usize) -> usize {
+        let mut connection = Connection::open(store.path()).unwrap();
+        // These fixtures measure reads, not write durability. Commit the blob
+        // database once so Windows does not flush each payload to disk.
+        let tx = connection.transaction().unwrap();
+        let mut payload_bytes = 0;
+        {
+            let mut insert = tx.prepare("INSERT INTO blob_payloads (full_key, payload, payload_digest, payload_schema) VALUES (?1, ?2, ?3, ?4)").unwrap();
+            for index in 0..files {
+                let source = fs::read(project.join(format!("file_{index}.ts"))).unwrap();
+                let key = CallgraphKey::from_bytes(
+                    &source,
+                    "typescript",
+                    crate::views::callgraph::PRODUCER,
+                )
+                .full_key();
+                let payload = missing_callgraph_payload(store, &key, &source, "typescript", false)
+                    .unwrap()
+                    .unwrap();
+                payload_bytes += payload.len();
+                insert
+                    .execute(rusqlite::params![
+                        key.as_bytes().as_slice(),
+                        &payload,
+                        blake3::hash(&payload).as_bytes().as_slice(),
+                        crate::blob_store::CALLGRAPH_PAYLOAD_SCHEMA
+                    ])
+                    .unwrap();
+            }
+        }
+        assert!(
+            !tx.is_autocommit(),
+            "fixture payloads must share one transaction"
+        );
+        tx.commit().unwrap();
+        payload_bytes
+    }
+
     #[test]
     fn views_shared_checkout_presence_reads_no_payloads() {
         const FILES: usize = 2048;
         let project = super::cold_fallback_tests::repository(FILES);
         let storage = tempfile::tempdir().unwrap();
-        let mut store = BlobStore::open(storage.path(), "shared", BlobPlane::Callgraph).unwrap();
-        let mut payload_bytes = 0;
-        for index in 0..FILES {
-            let source = fs::read(project.path().join(format!("file_{index}.ts"))).unwrap();
-            let key =
-                CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
-                    .full_key();
-            let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
-                .unwrap()
-                .unwrap();
-            payload_bytes += payload.len();
-            store.put(&key, &payload).unwrap();
-        }
+        let store = BlobStore::open(storage.path(), "shared", BlobPlane::Callgraph).unwrap();
+        let payload_bytes = seed_callgraph_payloads(&store, project.path(), FILES);
         let request = AssemblyRequest {
             storage: storage.path().to_path_buf(),
             project_root: project.path().to_path_buf(),
@@ -1538,16 +1565,7 @@ mod reuse_tests {
         let project = super::cold_fallback_tests::repository(FILES);
         let storage = tempfile::tempdir().unwrap();
         let mut store = BlobStore::open(storage.path(), "pending", BlobPlane::Callgraph).unwrap();
-        for index in 0..FILES - 1 {
-            let source = fs::read(project.path().join(format!("file_{index}.ts"))).unwrap();
-            let key =
-                CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
-                    .full_key();
-            let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
-                .unwrap()
-                .unwrap();
-            store.put(&key, &payload).unwrap();
-        }
+        seed_callgraph_payloads(&store, project.path(), FILES - 1);
         let mut request = AssemblyRequest {
             storage: storage.path().to_path_buf(),
             project_root: project.path().to_path_buf(),
