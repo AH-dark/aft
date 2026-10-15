@@ -7793,12 +7793,30 @@ fn scoped_rust_inspect_does_not_take_a_check_announced_before_a_save_for_the_sav
         .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "1000");
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_DROP", "save");
 
-    // Start the server without waiting for its first check, then give that
-    // check time to run while nothing drains the server's events.
+    let completed = root.join("initial-check-completed");
+    ctx.lsp().set_extra_env(
+        "AFT_FAKE_LSP_CHECK_COMPLETED_SIGNAL",
+        completed.to_str().unwrap(),
+    );
+    // Keep the first check queued until after the edit. A server marker and
+    // a request round trip prove it ran and the reader queued its events,
+    // without draining those events through the manager before the save.
     let config = ctx.config().clone();
     let started = ctx.lsp().ensure_server_for_file(&lib, &config);
     assert!(!started.is_empty(), "the fake rust server must start");
-    thread::sleep(Duration::from_secs(3));
+    wait_for_path_event(&completed, "initial check completed");
+    ctx.lsp()
+        .client_for_file_mut(&lib, &config)
+        .unwrap()
+        .send_request_with_timeout::<lsp_types::request::HoverRequest>(
+            serde_json::from_value(json!({
+                "textDocument": { "uri": file_uri(&lib) },
+                "position": { "line": 0, "character": 0 },
+            }))
+            .unwrap(),
+            Duration::from_secs(30),
+        )
+        .expect("reader barrier after initial check");
 
     let fix = aft::commands::edit_match::handle_edit_match(
         &request(json!({
@@ -7862,6 +7880,20 @@ fn scoped_rust_inspect_reports_an_unstarted_first_check_as_unknown_then_asks_aga
 fn unscoped_inspect_names_an_unfinished_cargo_check() {
     let (_temp_dir, root, _lib) = single_crate_fixture("unscoped-flycheck-slow");
     let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    // Enable only diagnostics so unrelated cold scanners cannot use the
+    // inspection request budget and crowd the unfinished-check cause out
+    // of the bounded status line.
+    ctx.update_config(|config| {
+        config.inspect.categories = aft::config::InspectCategories {
+            diagnostics: true,
+            todos: false,
+            dead_code: false,
+            unused_exports: false,
+            duplicates: false,
+            cycles: false,
+            complexity: false,
+        };
+    });
     configure_fake_rust_lsp(&ctx);
     ctx.lsp().set_extra_env("AFT_FAKE_LSP_FLYCHECK", "never");
     // Hold begin after the already-flushed quiescent status to expose the
@@ -7892,8 +7924,7 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
         "{response:#}"
     );
     let text = response["text"].as_str().expect("rendered text");
-    // An unscoped request also reports incomplete dead-code analysis. The
-    // diagnostic cause must remain in the same status line, not necessarily first.
+    // The unscoped status line must name why Rust diagnostics are unknown.
     assert!(
         text.lines()
             .next()

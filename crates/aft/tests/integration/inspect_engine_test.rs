@@ -67,6 +67,26 @@ fn test_worker(worker_count: Arc<AtomicUsize>, sleep_for: Duration, count: u64) 
     })
 }
 
+fn gated_worker(
+    worker_count: Arc<AtomicUsize>,
+    count: u64,
+) -> (
+    InspectWorker,
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+    let (release_tx, release_rx) = crossbeam_channel::unbounded();
+    let worker = test_worker(worker_count, Duration::ZERO, count);
+    let gated: InspectWorker = Arc::new(move |job| {
+        entered_tx.send(()).unwrap();
+        // Dropping the release sender also unblocks the worker on test failure.
+        let _ = release_rx.recv();
+        worker(job)
+    });
+    (gated, entered_rx, release_tx)
+}
+
 /// Liveness ceiling for "the pool started my worker". Nothing in these tests
 /// asserts speed; the bound exists only so a wedged pool fails instead of
 /// hanging, and it must survive a contended CI runner starting the pool cold
@@ -274,10 +294,8 @@ fn inspect_engine_blocking_deadline_outlives_soft_deadline_for_cold_scan() {
     let (_temp_dir, root, _file) = fixture_project();
     let inspect_dir = root.join(".aft-cache").join("inspect");
     let worker_count = Arc::new(AtomicUsize::new(0));
-    let manager = InspectManager::with_worker(
-        test_worker(Arc::clone(&worker_count), Duration::from_millis(100), 11),
-        Duration::from_millis(1),
-    );
+    let (worker, entered, release) = gated_worker(Arc::clone(&worker_count), 11);
+    let manager = InspectManager::with_worker(worker, Duration::from_millis(1));
     let snapshot = snapshot(&root, &inspect_dir);
     let scope = JobScope::for_project(root.clone());
 
@@ -290,6 +308,11 @@ fn inspect_engine_blocking_deadline_outlives_soft_deadline_for_cold_scan() {
             ..
         }
     ));
+
+    entered
+        .recv_timeout(WORKER_START_LIVENESS)
+        .expect("cold scan entered");
+    drop(release);
 
     let blocking_outcome = manager.submit_category_until(
         snapshot,
@@ -439,24 +462,28 @@ fn inspect_engine_drain_routes_idle_scan_to_cache() {
     let (_temp_dir, root, _file) = fixture_project();
     let inspect_dir = root.join(".aft-cache").join("inspect");
     let worker_count = Arc::new(AtomicUsize::new(0));
-    let manager = InspectManager::with_worker(
-        test_worker(Arc::clone(&worker_count), Duration::from_millis(25), 3),
-        Duration::from_secs(1),
-    );
+    let (worker, entered, release) = gated_worker(Arc::clone(&worker_count), 3);
+    let manager = InspectManager::with_worker(worker, Duration::from_secs(1));
     let snapshot = snapshot(&root, &inspect_dir);
     let scope = JobScope::for_project(root.clone());
     let key = manager
         .submit_background(snapshot.clone(), InspectCategory::Duplicates, scope)
         .expect("queue background scan");
 
-    let mut drained = 0usize;
-    for _ in 0..20 {
-        drained += manager.drain_completions();
-        if drained > 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
+    entered
+        .recv_timeout(WORKER_START_LIVENESS)
+        .expect("background scan entered");
+    assert_eq!(manager.drain_completions(), 0, "held scan is not complete");
+    drop(release);
+    let deadline = Instant::now() + WORKER_START_LIVENESS;
+    while !manager.has_pending_completions() {
+        assert!(
+            Instant::now() < deadline,
+            "background result was not queued"
+        );
+        thread::sleep(Duration::from_millis(5));
     }
+    let drained = manager.drain_completions();
 
     assert_eq!(worker_count.load(Ordering::SeqCst), 1);
     assert_eq!(

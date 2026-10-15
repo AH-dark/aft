@@ -1946,15 +1946,17 @@ fn test_ensure_file_open_detects_disk_drift() {
     // Open the file the first time.
     manager.ensure_file_open(file, &config).expect("first open");
 
-    // Sleep briefly to ensure the new mtime is observably different from
-    // the original write. macOS mtime resolution is 1 second, so this
-    // ensures DocumentStore::has_disk_drifted detects the change.
-    thread::sleep(Duration::from_millis(1100));
+    let original_mtime = fs::metadata(file).unwrap().modified().unwrap();
 
-    // Simulate external modification: change content. The new mtime is set
-    // implicitly by the write call.
+    // Set the timestamp explicitly so drift detection does not depend on the
+    // filesystem clock advancing between the open and the external write.
     let new_content = "fn main() { println!(\"changed externally\"); }\n";
     fs::write(file, new_content).expect("external write");
+    filetime::set_file_mtime(
+        file,
+        filetime::FileTime::from_system_time(original_mtime + Duration::from_secs(2)),
+    )
+    .unwrap();
 
     // Drain anything queued and then re-open. Should re-sync (didChange).
     let _ = manager.drain_events();
@@ -3344,32 +3346,46 @@ fn saw_workspace_reload(ctx: &AppContext, timeout: Duration) -> bool {
 
 #[test]
 fn watcher_manifest_change_outside_registered_globs_reloads_rust_workspace() {
-    let (_temp_dir, root, _file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| {
+    let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| {
         env_pair(
             "AFT_FAKE_LSP_WATCHED_GLOBS",
             r#"[{ "globPattern": "**/*.rs" }]"#,
         )
     });
-    // Let file times move past the server's load time.
-    thread::sleep(Duration::from_millis(1100));
-
+    let reloads = aft::lsp::manager::WatcherReloadProbeForTest::new(&root);
     fs::write(root.join("src/other.rs"), "fn other() {}\n").expect("write source");
     watcher_tx
         .send(WatcherDispatchEvent::Paths(vec![root.join("src/other.rs")]))
         .expect("send watcher event");
     drain_watcher_events(&ctx);
+    wait_for_watcher_forward_helper(&ctx);
+    assert_eq!(
+        reloads.submissions(),
+        0,
+        "a source change queued a workspace reload"
+    );
+    let (_, methods) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
     assert!(
-        !saw_workspace_reload(&ctx, Duration::from_millis(1500)),
+        !methods
+            .iter()
+            .any(|method| method == "custom/reloadWorkspace"),
         "control: a source change does not reload the workspace"
     );
 
     // The server's globs do not cover the lockfile, so it cannot hear about
     // the change: AFT asks it to reload instead.
     fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
+    manifest_mtime_after_server_load(&root.join("Cargo.lock"));
     watcher_tx
         .send(WatcherDispatchEvent::Paths(vec![root.join("Cargo.lock")]))
         .expect("send watcher event");
     drain_watcher_events(&ctx);
+    wait_for_watcher_forward_helper(&ctx);
+    assert_eq!(
+        reloads.submissions(),
+        1,
+        "the uncovered lockfile must queue a reload"
+    );
     assert!(
         saw_workspace_reload(&ctx, Duration::from_secs(15)),
         "a lockfile change the server was not told about must reload its workspace"
@@ -3380,18 +3396,35 @@ fn watcher_manifest_change_outside_registered_globs_reloads_rust_workspace() {
 fn watcher_manifest_change_forwarded_to_registered_glob_does_not_reload() {
     // The default fake registers `**/*`, which covers the lockfile.
     let (_temp_dir, root, file, ctx, watcher_tx) = fake_rust_server_with_watcher(|_| Vec::new());
-    thread::sleep(Duration::from_millis(1100));
+    let reloads = aft::lsp::manager::WatcherReloadProbeForTest::new(&root);
     fs::write(root.join("Cargo.lock"), "version = 4\n").expect("write lockfile");
+    manifest_mtime_after_server_load(&root.join("Cargo.lock"));
     watcher_tx
         .send(WatcherDispatchEvent::Paths(vec![root.join("Cargo.lock")]))
         .expect("send watcher event");
     drain_watcher_events(&ctx);
-    let (watched, _) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
+    wait_for_watcher_forward_helper(&ctx);
+    assert_eq!(
+        reloads.submissions(),
+        0,
+        "a forwarded lockfile queued a redundant reload"
+    );
+    let (watched, methods) = server_reports_before_barrier(&ctx, &file, "fn main() { 1; }\n");
     assert_eq!(watched.len(), 1, "{watched:?}");
     assert!(
-        !saw_workspace_reload(&ctx, Duration::from_millis(1500)),
+        !methods.iter().any(|method| method == "custom/reloadWorkspace"),
         "rust-analyzer re-reads a lockfile it registered for; a reload on top would repeat the load"
     );
+}
+
+fn manifest_mtime_after_server_load(path: &std::path::Path) {
+    // The server is already running. A future timestamp puts this change
+    // strictly after its load even on filesystems with coarse timestamps.
+    filetime::set_file_mtime(
+        path,
+        filetime::FileTime::from_system_time(std::time::SystemTime::now() + Duration::from_secs(2)),
+    )
+    .unwrap();
 }
 
 /// Wait until the helper serving contended watcher drains has forwarded

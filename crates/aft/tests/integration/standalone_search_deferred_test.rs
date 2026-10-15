@@ -241,6 +241,7 @@ fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
     let storage = tempfile::tempdir().expect("create shared storage fixture");
     let transient_root = tempfile::tempdir().expect("create transient cache root");
     let sweep_signal = project.path().join("sweep-started");
+    let sweep_release = project.path().join("sweep-release");
     seed_stale_storage_entries(storage.path(), transient_root.path(), 1);
     // Payload age no longer proves an abandoned checkout: durable retention
     // gives unknown roots an observation grace. Transient caches still have an
@@ -255,19 +256,42 @@ fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
         ("TMP", transient_root.path().as_os_str()),
         ("TEMP", transient_root.path().as_os_str()),
         (
-            "AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS",
-            std::ffi::OsStr::new("750"),
+            "AFT_TEST_CONFIGURE_STORAGE_SWEEP_RELEASE_FILE",
+            sweep_release.as_os_str(),
         ),
         (
             "AFT_TEST_CONFIGURE_STORAGE_SWEEP_START_FILE",
             sweep_signal.as_os_str(),
         ),
+        (
+            "AFT_TEST_STANDALONE_INITIAL_REQUEST_COUNT",
+            std::ffi::OsStr::new("2"),
+        ),
     ]);
-    let configure = aft.send(&configure_without_indexes(project.path()));
+    let _release_on_drop = super::helpers::ReleaseOnDrop::new(&sweep_release);
+    // Keep unrelated view-store loading out of the storage-sweep readiness
+    // condition, and queue input before configure can start its maintenance.
+    aft.send_silent(
+        &serde_json::to_string(&json!({
+            "id": "configure-maintenance",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "config": user_config(json!({
+                "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+                "views": { "enabled": false }
+            }))
+        }))
+        .unwrap(),
+    );
+    aft.send_silent(r#"{"id":"sweep-queued-ping","command":"ping"}"#);
+    let (configure, _) = read_response(&mut aft, "configure-maintenance", Duration::from_secs(60));
     assert_eq!(
         configure["success"], true,
         "configure failed: {configure:?}"
     );
+    let (queued_ping, _) = read_response(&mut aft, "sweep-queued-ping", Duration::from_secs(60));
+    assert_eq!(queued_ping["command"], "pong", "{queued_ping:?}");
 
     let signal_deadline = Instant::now() + Duration::from_secs(5);
     while !sweep_signal.exists() {
@@ -278,17 +302,16 @@ fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
         thread::sleep(Duration::from_millis(10));
     }
 
-    let ping_started = Instant::now();
-    let ping = aft.send_with_timeout(
-        r#"{"id":"sweep-ping","command":"ping"}"#,
-        Duration::from_millis(500),
-    );
-    let ping_latency = ping_started.elapsed();
+    let ping = aft.send(r#"{"id":"sweep-ping","command":"ping"}"#);
     assert_eq!(ping["command"], "pong", "ping failed: {ping:?}");
+    // A pong before the sweep can finish proves detached service, independent
+    // of how long process startup or scheduling takes on the runner.
+    assert!(!sweep_release.exists());
     assert!(
-        ping_latency < Duration::from_millis(500),
-        "ping waited for detached storage sweep for {ping_latency:?}"
+        orphan.exists(),
+        "the held sweep must not remove its cache yet"
     );
+    fs::write(&sweep_release, "release\n").unwrap();
 
     let sweep_deadline = Instant::now() + Duration::from_secs(10);
     while orphan.exists() {

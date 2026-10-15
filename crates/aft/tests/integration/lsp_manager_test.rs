@@ -336,15 +336,23 @@ fn inspect_deadline_does_not_kill_initializing_server() {
 
     let (_temp_dir, file, _) = rust_fixture_files();
     let root = file.parent().unwrap().parent().unwrap();
+    let init_started = root.join("init-started");
+    let init_release = root.join("init-release");
+    let _release_on_drop = super::helpers::ReleaseOnDrop::new(&init_release);
     let mut config = Config::default();
     config.project_root = Some(root.to_path_buf());
     let manager = Arc::new(parking_lot::Mutex::new(LspManager::new()));
     manager
         .lock()
         .override_binary(ServerKind::Rust, fake_server_path());
-    manager
-        .lock()
-        .set_extra_env("AFT_FAKE_LSP_INIT_DELAY_MS", "350");
+    manager.lock().set_extra_env(
+        "AFT_FAKE_LSP_INIT_DELAY_SIGNAL",
+        init_started.to_str().unwrap(),
+    );
+    manager.lock().set_extra_env(
+        "AFT_FAKE_LSP_INIT_RELEASE_FILE",
+        init_release.to_str().unwrap(),
+    );
     let walk =
         walk_applicable_area(root, Some(&[file.clone()]), &config, None).expect("walk source");
     let snapshot = manager.lock().classify_applicable_servers(walk, &config);
@@ -358,6 +366,16 @@ fn inspect_deadline_does_not_kill_initializing_server() {
         Instant::now() + Duration::from_millis(80),
     );
     assert_eq!(outcome.deadline_exceeded, Some(key.clone()));
+    let until = Instant::now() + Duration::from_secs(5);
+    while !init_started.exists() {
+        assert!(
+            Instant::now() < until,
+            "fake server did not reach initialization"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(manager.lock().active_server_keys().is_empty());
+    fs::write(&init_release, "release").unwrap();
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until && manager.lock().active_server_keys().is_empty() {
         thread::sleep(Duration::from_millis(20));

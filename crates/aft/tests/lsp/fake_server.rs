@@ -663,6 +663,9 @@ pub(crate) fn main() -> io::Result<()> {
                         }
                         write_flycheck_progress(&mut writer, "end")?;
                         check_completed = true;
+                        if let Some(path) = std::env::var_os("AFT_FAKE_LSP_CHECK_COMPLETED_SIGNAL") {
+                            std::fs::write(path, b"completed")?;
+                        }
                     }
                     continue;
                 }
@@ -697,6 +700,13 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                     if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_INIT_DELAY_SIGNAL") {
                         let _ = std::fs::write(signal_path, b"waiting");
+                    }
+                    // Hold the handshake until the test has observed its caller's
+                    // deadline. A release file avoids racing a fixed init delay.
+                    if let Some(path) = std::env::var_os("AFT_FAKE_LSP_INIT_RELEASE_FILE") {
+                        while !std::path::Path::new(&path).exists() {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
                     }
                     if let Some(delay_ms) = std::env::var("AFT_FAKE_LSP_INIT_DELAY_MS")
                         .ok()
