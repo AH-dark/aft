@@ -2767,6 +2767,16 @@ mod tests {
                         "an expired validation served saved diagnostics"
                     );
                     caller.join().unwrap();
+                    // The caller may return before the worker it spawned has
+                    // reached the gate. A recorded pending validation means a
+                    // worker exists, so this attempt did exercise the path.
+                    if cache.validation.lock().is_some() {
+                        entered_rx
+                            .recv_timeout(BUDGET)
+                            .expect("spawned validation reached the gate");
+                        release_tx.send(()).unwrap();
+                        gated = true;
+                    }
                 }
             }
             if gated {
