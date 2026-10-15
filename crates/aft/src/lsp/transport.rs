@@ -148,7 +148,9 @@ pub fn write_response(
     write_message(writer, &json)
 }
 
-#[cfg(test)]
+// The fake LSP test helper includes this file; its build sets
+// `aft_fake_lsp_helper` so these tests run only once, in this crate.
+#[cfg(all(test, not(aft_fake_lsp_helper)))]
 mod audit_regressions {
     #[test]
     fn content_type_accepts_utf8_alias() {
