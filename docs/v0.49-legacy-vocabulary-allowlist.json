@@ -8635,6 +8635,17 @@
       "ordinal": 2,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/apply_patch.rs",
+      "line": 1072,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"edge.ts\", \"relativePath\": \"edge.ts\", \"type\": \"update\", \"patch\": \"Index: edge.ts\\n===================================================================\\n--- edge.ts\\n+++ edge.ts\\n@@ -1 +1 @@\\n-original\\n+é\\n\", \"additions\": 1, \"deletions\": 1})",
+      "location": "line 1072, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     }
   ]
 }
