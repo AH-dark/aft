@@ -252,27 +252,110 @@ fn worker_blocking_foreground_detaches_at_the_worker_wait_limit() {
 #[test]
 fn worker_wait_returns_the_result_before_the_limit() {
     let project = tempfile::tempdir().expect("worker fast project");
-    let mut aft = spawn_with_worker_limit();
+    // The gate, not shell startup speed, determines when this command finishes.
+    // A minute leaves headroom for a loaded runner; the held-command case below
+    // independently checks promotion with the short test limit.
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_WORKER_WAIT_MAX_MS",
+        std::ffi::OsStr::new("60000"),
+    )]);
     aft.configure(project.path());
-    let (response, _) = foreground_bash(
-        &mut aft,
-        "worker-wait-fast",
-        json!({
-            "command": "sleep 0.2; printf 'done\\n'",
-            "workdir": project.path(),
-            "foreground_orchestrate": true,
-            "wait": true,
-            "compressed": false,
-        }),
-        true,
-    );
+    let (marker, release) = queue_gated_worker_wait(&mut aft, project.path());
+    wait_for_worker_marker(&marker);
+    std::fs::write(&release.0, "release").unwrap();
+    let response = read_gated_worker_wait(&mut aft);
     assert_eq!(response["success"], true, "{response:?}");
     assert_eq!(response["status"], "completed", "{response:?}");
+    assert_eq!(response["exit_code"], 0, "{response:?}");
     assert!(response["output"]
         .as_str()
         .unwrap_or_default()
         .contains("done"));
     assert!(aft.shutdown().success());
+}
+
+#[test]
+fn worker_wait_promotes_a_held_command_at_the_limit() {
+    let project = tempfile::tempdir().expect("worker held project");
+    let mut aft = spawn_with_worker_limit();
+    aft.configure(project.path());
+    let (marker, release) = queue_gated_worker_wait(&mut aft, project.path());
+    let response = read_gated_worker_wait(&mut aft);
+    assert_eq!(response["success"], true, "{response:?}");
+    assert_eq!(response["status"], "running", "{response:?}");
+    assert!(response["output"]
+        .as_str()
+        .unwrap()
+        .contains("still running after 1.5s"));
+    wait_for_worker_marker(&marker);
+    assert!(!release.0.exists(), "command was released before promotion");
+    let task_id = response["task_id"].as_str().expect("promoted task id");
+    assert_eq!(status_of(&mut aft, task_id)["status"], "running");
+    std::fs::write(&release.0, "release").unwrap();
+    kill(&mut aft, task_id);
+    assert!(aft.shutdown().success());
+}
+
+fn queue_gated_worker_wait(
+    aft: &mut AftProcess,
+    project: &std::path::Path,
+) -> (std::path::PathBuf, crate::test_helpers::ReleaseOnDrop) {
+    let marker = project.join("started");
+    let release = crate::test_helpers::ReleaseOnDrop::new(project.join("release"));
+    let quote = |path: &std::path::Path| {
+        let path = path.to_string_lossy();
+        if cfg!(windows) {
+            path.replace('\\', "/").replace('\'', "''")
+        } else {
+            path.replace('\'', "'\\''")
+        }
+    };
+    let command = if cfg!(windows) {
+        format!("Set-Content -Path '{}' -Value started; while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output done", quote(&marker), quote(&release.0))
+    } else {
+        format!(
+            "printf started > '{}'; until [ -e '{}' ]; do sleep 0.01; done; printf 'done\\n'",
+            quote(&marker),
+            quote(&release.0)
+        )
+    };
+    aft.send_silent(
+        &json!({
+            "id": "gated-worker-wait", "command": "bash", "session_id": SESSION,
+            "worker_session": true,
+            "params": { "command": command, "workdir": project,
+                "foreground_orchestrate": true, "wait": true, "compressed": false },
+        })
+        .to_string(),
+    );
+    (marker, release)
+}
+
+fn wait_for_worker_marker(marker: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker command never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_gated_worker_wait(aft: &mut AftProcess) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = aft
+            .try_read_next_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("worker wait response before the hang deadline");
+        if response["id"] == "gated-worker-wait" {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker wait response missing"
+        );
+    }
 }
 
 /// Head blocking calls share the worker wait limit without killing the task.

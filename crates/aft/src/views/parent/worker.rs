@@ -108,6 +108,7 @@ pub(super) fn run(weak: Weak<ParentSession>) {
 
 /// The full discovery walk. False when the session ended meanwhile.
 fn discover(session: &Arc<ParentSession>) -> bool {
+    super::wait_for_discovery_hold(session.root());
     let started = Instant::now();
     let discovery = super::discover(session.root(), DEFAULT_MAX_CHILD_REPOS).unwrap_or(Discovery {
         root: session.root().to_path_buf(),
