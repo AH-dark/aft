@@ -224,7 +224,12 @@ def run(args:argparse.Namespace)->int:
             raise InputFault("missing_diff_base")
         paths = diff_paths(args.base_ref, args.head)
         path = descriptor_path(args.descriptor, args.branch)
-        descriptor = read_json(path) if path else None
+        if path is None:
+            # The merge queue refuses any member without its branch-keyed
+            # descriptor, so a PR without one must not look green here.
+            print(f"missing branch-keyed descriptor for {args.branch}; the merge queue requires one for every PR", file=sys.stderr)
+            return 1
+        descriptor = read_json(path)
         resolved, missing_ranking = resolve_descriptor(descriptor, paths)
         if missing_ranking:
             print("missing ranking descriptor", file=sys.stderr)

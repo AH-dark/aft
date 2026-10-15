@@ -62,8 +62,13 @@ class PRSearchDescriptorTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return search_quality.run(args)
 
-    def test_non_ranking_diff_needs_no_descriptor_or_benchmark_artifacts(self) -> None:
+    def test_non_ranking_diff_without_descriptor_fails_like_the_queue(self) -> None:
         self.commit_file("docs/guide.md", "docs\n")
+        self.assertEqual(self.check(), 1)
+
+    def test_non_ranking_diff_with_descriptor_needs_no_benchmark_artifacts(self) -> None:
+        self.commit_file("docs/guide.md", "docs\n")
+        self.descriptor("non_ranking")
         self.assertEqual(self.check(), 0)
 
     def test_ranking_diff_without_descriptor_fails(self) -> None:
