@@ -81,7 +81,7 @@ if a[:2] == ['pr', 'merge']:
     assert os.environ.get('GH_SHIM_BYPASS') == 'operator'
     assert '--match-head-commit' in a and a[a.index('--match-head-commit')+1] == head()
     assert '--admin' not in a
-    if s.get('checks_pending'):
+    if s.get('checks_pending') and not s.get('auto_merge'):
         raise SystemExit('GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)')
     h = head(); base = g('--git-dir', s['origin'], 'rev-parse', 'main')
     tree = g('--git-dir', s['origin'], 'rev-parse', h+'^{tree}')
@@ -126,6 +126,8 @@ endpoint = next(x for x in a[1:] if x.startswith('repos/'))
 slurp = '--slurp' in a
 if endpoint == 'repos/example/repo/pulls/7':
     answer({'user': s.get('author', {'login': 'aft-alfonso[bot]', 'type': 'Bot', 'id': 318960130})})
+if endpoint == 'repos/example/repo':
+    answer({'allow_auto_merge': s.get('auto_merge', False)})
 if '/protection/required_status_checks' in endpoint: answer({'contexts': ['Landing policy']})
 if '/pulls?' in endpoint: answer([[pr()] if s.get('exists') else []] if slurp else [pr()])
 if endpoint.endswith('/comments'):
@@ -288,6 +290,21 @@ class MergeAdmissionTests(PRFixture):
                                  "MERGE_PR_CHECK_POLL_SECONDS": "1"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("timed out waiting for required checks", result.stderr)
+        self.assertEqual(self.merges(), [])
+
+    def test_auto_merge_submits_pending_checks_without_waiting(self) -> None:
+        self.write_state(checks_pending=True, auto_merge=True)
+        result = self.merge(env={"MERGE_PR_CHECK_TIMEOUT_SECONDS": "1",
+                                 "MERGE_PR_CHECK_POLL_SECONDS": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.state_path.read_text())["check_polls"], 1)
+        self.assertIn("--match-head-commit", self.merges()[0]["args"])
+
+    def test_auto_merge_still_refuses_a_red_check_by_name(self) -> None:
+        self.write_state(failed_check="Design gate", auto_merge=True)
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Design gate", result.stderr)
         self.assertEqual(self.merges(), [])
 
     def test_unresolved_threads_refuse_admission(self) -> None:

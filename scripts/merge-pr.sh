@@ -126,6 +126,16 @@ else
   exit 1
 fi
 
+AUTO_MERGE_ALLOWED=false
+if [[ "$QUEUE_ENABLED" == true ]]; then
+  AUTO_MERGE_ALLOWED=$("$OPERATOR_GH" api "repos/$OWNER_REPO" --jq .allow_auto_merge) ||
+    hard_refuse "could not read the repository's auto-merge setting"
+fi
+
+# With auto-merge allowed, GitHub admits the PR to the queue itself once its
+# required checks pass, so one read is enough: refuse a red check by name, and
+# otherwise submit without waiting. Without it, a merge request on a PR whose
+# checks are still running is refused, so wait for them first.
 if [[ "$QUEUE_ENABLED" == true ]]; then
   CHECK_TIMEOUT_SECONDS="${MERGE_PR_CHECK_TIMEOUT_SECONDS:-3600}"
   CHECK_POLL_SECONDS="${MERGE_PR_CHECK_POLL_SECONDS:-30}"
@@ -167,6 +177,10 @@ if [[ "$QUEUE_ENABLED" == true ]]; then
     fi
     if [ "${#PENDING_NAMES[@]}" -eq 0 ]; then
       echo "merge-pr: required checks complete for #$PR"
+      break
+    fi
+    if [[ "$AUTO_MERGE_ALLOWED" == true ]]; then
+      echo "merge-pr: required checks still running for #$PR; GitHub queues it when they pass" >&2
       break
     fi
     NOW_EPOCH=$(date -u +%s)
