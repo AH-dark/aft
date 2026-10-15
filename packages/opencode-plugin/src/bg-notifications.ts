@@ -1488,10 +1488,7 @@ function isTerminalNudgeError(error: unknown): boolean {
  * A task spawned through the bash tool is tracked as outstanding, which takes
  * the normal drain path, so finishing between two tool results is covered.
  */
-function idleDrainMayFindWork(
-  state: SessionBgState,
-  drainContext: DrainContext,
-): boolean {
+function idleDrainMayFindWork(state: SessionBgState, drainContext: DrainContext): boolean {
   if (state.untrackedCompletionSinceDrain || state.deliveredAwaitingAckTaskIds.size > 0) {
     return true;
   }

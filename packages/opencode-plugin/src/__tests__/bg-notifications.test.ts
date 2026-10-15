@@ -346,7 +346,37 @@ describe("OpenCode background notifications", () => {
 
     expect(
       sessionWarnSpy.mock.calls.some(
-        (call) => (call[2] as { event?: string } | undefined)?.event === "bash_completion_drain_error",
+        (call) =>
+          (call[2] as { event?: string } | undefined)?.event === "bash_completion_drain_error",
+      ),
+    ).toBe(true);
+  });
+
+  test("pending completions still warn when the bridge is unavailable", async () => {
+    const ctx = {
+      pool: {
+        getActiveBridgeForRoot: () => null,
+        getBridge: () => null,
+      },
+      client: {},
+      config: {},
+      storageDir: "/tmp/aft-test",
+    } as unknown as PluginContext;
+    trackBgTask("s1", "task-1");
+    ingestBgCompletions("s1", [completion("task-1", "echo done")]);
+    const client = makeClient(mock(async () => {}));
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client,
+    });
+
+    expect(
+      sessionWarnSpy.mock.calls.some(
+        (call) =>
+          (call[2] as { event?: string } | undefined)?.event === "bash_completion_drain_error",
       ),
     ).toBe(true);
   });
