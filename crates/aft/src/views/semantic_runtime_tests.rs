@@ -1182,7 +1182,10 @@ fn fifth_small_fill_waits_for_preparation_capacity_and_stays_pending() {
         workers.push(std::thread::spawn(move || {
             super::super::semantic::before_claim_for_test(move || {
                 entered.send(i).unwrap();
-                release.recv_timeout(Duration::from_secs(10)).unwrap();
+                // Keep the permit until the main thread has observed all pending
+                // work, even when fixture setup or queries are slow on Windows.
+                // The test runner's overall timeout bounds a genuine hang.
+                release.recv().unwrap();
             });
             catch_up_with_preparation_limiter(
                 &weak,
@@ -1196,11 +1199,23 @@ fn fifth_small_fill_waits_for_preparation_capacity_and_stays_pending() {
         }));
         lanes.push((slot, runtime));
     }
+    drop(entered_tx);
     let first_four: Vec<_> = (0..4)
-        .filter_map(|_| entered_rx.recv_timeout(Duration::from_secs(3)).ok())
+        .map(|_| entered_rx.recv().expect("fill did not enter preparation"))
         .collect();
-    let queued = wait_for_fill_queue(&preparation);
-    let holders = preparation.census().holders.len();
+    let census = loop {
+        let census = preparation.census();
+        if !census.queued.is_empty() {
+            break census;
+        }
+        assert!(
+            workers.iter().all(|worker| !worker.is_finished()),
+            "fill exited before the preparation wait was visible"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let queued = !census.queued.is_empty();
+    let holders = census.holders.len();
     let early_fifth = entered_rx.try_recv().ok();
     let pending: Vec<_> = lanes
         .iter()
@@ -1213,7 +1228,7 @@ fn fifth_small_fill_waits_for_preparation_capacity_and_stays_pending() {
             .any(|job| job.kind == PREPARATION_KIND)
     });
     release_tx.send(()).unwrap();
-    let fifth = entered_rx.recv_timeout(Duration::from_secs(3)).ok();
+    let fifth = entered_rx.recv().ok();
     for _ in 0..4 {
         release_tx.send(()).unwrap();
     }
