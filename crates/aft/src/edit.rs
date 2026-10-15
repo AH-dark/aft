@@ -1325,6 +1325,36 @@ mod tests {
     }
 
     #[test]
+    fn swift_write_pipeline_accepts_try_cast_with_dictionary_default() {
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("Transcript.swift");
+        std::fs::write(
+            &path,
+            "import Foundation\nfunc decode(data: Data) throws {\n\
+             let page = AgentTranscriptDecoder.decode(data)\n_ = page\n}\n",
+        )
+        .unwrap();
+        let updated = "import Foundation
+func decode(data: Data) throws {
+    let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+    let page = AgentTranscriptDecoder.decode(json)
+    _ = page
+}
+";
+        let config = Config {
+            format_on_edit: false,
+            ..Config::default()
+        };
+
+        let result =
+            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+
+        assert_eq!(result.syntax_valid, Some(true));
+        assert!(!result.rolled_back);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+    }
+
+    #[test]
     fn swift_write_pipeline_accepts_try_await_optional_binding() {
         let files = tempfile::tempdir().unwrap();
         let path = files.path().join("ViewModel.swift");
