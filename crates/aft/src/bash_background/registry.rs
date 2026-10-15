@@ -606,6 +606,13 @@ pub struct BgTaskSnapshot {
 pub struct BgTaskHealthCounts {
     pub running: usize,
     pub pending_completions: usize,
+    /// Known task bundles without an aft.db row because their dual-write was
+    /// skipped while this registry had no usable database pool.
+    pub db_rows_missing: usize,
+    /// Explicit reason for skipped database rows, including the disk-only
+    /// fallback that currently holds their task metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_persistence_warning: Option<&'static str>,
     /// Abandoned undelivered results retired by this registry's disk sweeps.
     pub retired_undelivered_completions: u64,
 }
@@ -838,6 +845,13 @@ pub(crate) struct RegistryInner {
     pub(crate) compressor:
         Mutex<Option<Arc<dyn Fn(&str, String, Option<i64>) -> CompressionResult + Send + Sync>>>,
     pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
+    /// Task ids whose disk metadata is durable but whose aft.db mirror was
+    /// skipped while this registry had no attached pool. Cleared after a
+    /// successful row write or task cleanup.
+    db_rows_missing: Mutex<HashSet<String>>,
+    /// Keeps repeated metadata writes from repeating the same skipped-write
+    /// warning. Entries are discarded when the registry releases the task.
+    db_skip_warnings: Mutex<HashSet<String>>,
     /// Harness of the most recent configure of this root. Routes from several
     /// harnesses share the root, so this is only a fallback for a task,
     /// session or request that cannot name its own harness (a spawn with no
@@ -1225,6 +1239,8 @@ impl BgTaskRegistry {
                 session_recovery: Mutex::new(HashMap::new()),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
+                db_rows_missing: Mutex::new(HashSet::new()),
+                db_skip_warnings: Mutex::new(HashSet::new()),
                 db_harness: RwLock::new(None),
                 session_harnesses: Mutex::new(HashMap::new()),
                 session_task_ids: Mutex::new(HashMap::new()),
@@ -1469,16 +1485,19 @@ impl BgTaskRegistry {
             *slot = Some(conn);
         }
         self.inner.compression_aggregates.clear();
-        // Tasks started while no handle was installed have no row yet; the
-        // in-memory task is authoritative, so write their rows now.
-        let running = self
+        // Tasks started while no handle was installed have no row yet. Their
+        // in-memory state is authoritative until cleanup, including terminal
+        // tasks whose completion was not yet acknowledged.
+        let tasks = self
             .inner
             .tasks
             .lock()
             .map(|tasks| tasks.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        for task in running.into_iter().filter(|task| !task.is_terminal()) {
-            self.ensure_task_row(&task);
+        for task in tasks {
+            if self.ensure_task_row(&task) {
+                self.clear_db_row_missing(&task.task_id);
+            }
         }
     }
 
@@ -2132,16 +2151,12 @@ impl BgTaskRegistry {
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
         let pool = self.inner.db_pool.read().ok().and_then(|slot| slot.clone());
         let Some(pool) = pool else {
-            // A registry without a harness belongs to an unconfigured library
-            // context, which never has a database. A configured one without a
-            // handle is missing a row it should have; a later watch
-            // registration or erased-row check writes it once the handle is
-            // installed.
-            if self.fallback_db_harness().is_some() {
-                crate::slog_warn!(
-                    "dual-write bash_task to DB skipped for {}: aft.db is not attached to this registry",
-                    metadata.task_id
-                );
+            // A registry without a task or fallback harness belongs to an
+            // unconfigured library context, which never expects a DB row. A
+            // configured task keeps its durable bundle on disk; when a pool is
+            // attached later, the registry backfills its task row.
+            if metadata.harness.is_some() || self.fallback_db_harness().is_some() {
+                self.note_db_row_missing(&metadata.task_id);
             }
             return;
         };
@@ -2199,9 +2214,47 @@ impl BgTaskRegistry {
                 metadata.task_id,
                 error
             );
+        } else {
+            self.clear_db_row_missing(&metadata.task_id);
         }
         drop(conn);
         self.settle_recovered_call(metadata, paths, row);
+    }
+
+    fn note_db_row_missing(&self, task_id: &str) {
+        self.inner
+            .db_rows_missing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task_id.to_string());
+        let first_warning = self
+            .inner
+            .db_skip_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task_id.to_string());
+        if first_warning {
+            crate::slog_warn!(
+                "dual-write bash_task to DB skipped for {task_id}: aft.db is not attached to this registry; task metadata remains in its disk bundle, but its DB row is missing"
+            );
+        }
+    }
+
+    fn clear_db_row_missing(&self, task_id: &str) {
+        self.inner
+            .db_rows_missing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(task_id);
+    }
+
+    fn forget_db_row_state(&self, task_id: &str) {
+        self.clear_db_row_missing(task_id);
+        self.inner
+            .db_skip_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(task_id);
     }
 
     fn settle_recovered_call(&self, metadata: &PersistedTask, paths: &TaskPaths, row: BashTaskRow) {
@@ -6717,6 +6770,7 @@ impl BgTaskRegistry {
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             tasks.remove(&task.task_id);
         }
+        self.forget_db_row_state(&task.task_id);
         self.inner
             .completion_pass_cause
             .lock()
@@ -7197,6 +7251,16 @@ impl BgTaskRegistry {
             }
             tasks.clear();
         }
+        self.inner
+            .db_rows_missing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.inner
+            .db_skip_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.prune_session_harnesses();
     }
 
@@ -9233,9 +9297,20 @@ impl BgTaskRegistry {
             .ok()
             .map(|tasks| tasks.values().filter(|task| task.try_is_running()).count())?;
         let pending_completions = self.inner.completions.try_lock().ok().map(|q| q.len())?;
+        let db_rows_missing = self
+            .inner
+            .db_rows_missing
+            .try_lock()
+            .ok()
+            .map(|ids| ids.len())?;
+        let db_persistence_warning = (db_rows_missing > 0).then_some(
+            "aft.db is not attached to this registry; task bundles remain on disk without DB rows",
+        );
         Some(BgTaskHealthCounts {
             running,
             pending_completions,
+            db_rows_missing,
+            db_persistence_warning,
             retired_undelivered_completions: self
                 .inner
                 .retired_undelivered_completions
@@ -16880,6 +16955,51 @@ mod tests {
             "{}",
             spawn_logs[0]
         );
+        assert!(registry.kill(&task_id, session).is_ok());
+        registry.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattached_db_pool_warning_is_emitted_once_per_task() {
+        let storage = tempfile::tempdir().expect("storage dir");
+        let root = storage.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        registry.set_harness(Harness::Opencode);
+        let session = "unattached-db-warning-session";
+
+        let ((task_id, task), lines) = crate::logging::capture_log_lines(|| {
+            let task_id = registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    "sleep 30",
+                    session.to_string(),
+                    root.clone(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                    storage.path().to_path_buf(),
+                    10,
+                    true,
+                    false,
+                    Some(root.clone()),
+                )
+                .unwrap();
+            let task = registry.task_for_session(&task_id, session).unwrap();
+            let metadata = task.lock_state().unwrap().metadata.clone();
+            for _ in 0..4 {
+                registry.dual_write_task(&task.paths, &metadata);
+            }
+            (task_id, task)
+        });
+
+        let warnings: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("dual-write bash_task to DB skipped"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "captured warnings: {lines:?}");
+        assert!(warnings[0].contains("aft.db is not attached to this registry"));
+        assert!(task.paths.json.exists());
         assert!(registry.kill(&task_id, session).is_ok());
         registry.shutdown();
     }
