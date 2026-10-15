@@ -4652,26 +4652,34 @@ impl AppContext {
         } else {
             "stale"
         };
-        let (tier2_stale_since_ms, tier2_next_refresh_at_ms, tier2_pending_paths) =
-            if tier2_status == "stale" {
-                let now = Instant::now();
-                let now_ms = semantic_health_unix_millis();
-                let next_dispatch = match self.tier2_refresh_scheduler.try_lock() {
-                    Some(scheduler) => scheduler.next_dispatch_at(now).unwrap_or(now),
-                    None => return RootHealthSummary::busy(),
-                };
-                let pending_paths = match self.pending_tier2_paths.try_lock() {
-                    Some(paths) => paths.len(),
-                    None => return RootHealthSummary::busy(),
-                };
-                (
-                    Some(tier2.stale_since_ms.unwrap_or(now_ms)),
-                    Some(instant_to_unix_millis(next_dispatch, now, now_ms)),
-                    Some(pending_paths),
-                )
-            } else {
-                (None, None, None)
+        let (tier2_stale_since_ms, tier2_next_refresh_at_ms, tier2_pending_paths) = if tier2_status
+            == "stale"
+        {
+            let now = Instant::now();
+            let now_ms = semantic_health_unix_millis();
+            let next_dispatch = match self.tier2_refresh_scheduler.try_lock() {
+                Some(mut scheduler) => {
+                    let Some(retry_at) = self.inspect_manager.try_tier2_resource_retry_at(&config)
+                    else {
+                        return RootHealthSummary::busy();
+                    };
+                    scheduler.set_resource_retry_at(retry_at);
+                    scheduler.next_dispatch_at(now).unwrap_or(now)
+                }
+                None => return RootHealthSummary::busy(),
             };
+            let pending_paths = match self.pending_tier2_paths.try_lock() {
+                Some(paths) => paths.len(),
+                None => return RootHealthSummary::busy(),
+            };
+            (
+                Some(tier2.stale_since_ms.unwrap_or(now_ms)),
+                Some(instant_to_unix_millis(next_dispatch, now, now_ms)),
+                Some(pending_paths),
+            )
+        } else {
+            (None, None, None)
+        };
 
         RootHealthSummary {
             state: RootHealthState::Ready,
@@ -9860,6 +9868,11 @@ impl AppContext {
             callgraph_cold_build_active: self.callgraph_cold_build_active(),
         };
         let mut scheduler = self.tier2_refresh_scheduler.lock();
+        scheduler.set_resource_retry_at(
+            manager
+                .try_tier2_resource_retry_at(&self.config())
+                .flatten(),
+        );
         let decision =
             scheduler.tick_with_gates(now, changed_path_count, can_write, in_flight, gates);
         // A deadline the daemon publishes and then does not honour is invisible
@@ -9922,9 +9935,18 @@ impl AppContext {
         // contention says nothing about whether a refresh is due. Fail open
         // like the other maintenance probes: the watcher drain re-reads the
         // scheduler under its own lock and does nothing if no refresh is due.
+        let Some(retry_at) = self
+            .inspect_manager
+            .try_tier2_resource_retry_at(&self.config())
+        else {
+            return false;
+        };
         self.tier2_refresh_scheduler
             .try_lock()
-            .is_none_or(|scheduler| scheduler.dispatch_due(Instant::now()))
+            .is_none_or(|mut scheduler| {
+                scheduler.set_resource_retry_at(retry_at);
+                scheduler.dispatch_due(Instant::now())
+            })
     }
 
     pub fn note_tier2_refresh_started(&self) {
@@ -10032,6 +10054,13 @@ impl AppContext {
                 pause.reason,
                 pause.identical_failures,
                 pause.retry_at_ms
+            );
+        }
+        for wait in submission.resource_waits {
+            crate::slog_info!(
+                "tier2 refresh waiting for the inspect cache writer lease: category={}, resource_retry_at_unix_ms={}",
+                wait.category,
+                wait.retry_at_ms
             );
         }
     }
@@ -14292,6 +14321,37 @@ mod callgraph_store_for_ops_tests {
             second >= first + crate::inspect::tier2_scheduler::TIER2_COLD_START_SPACING
                 || second >= ceiling,
             "the second root's cold refresh must be paced after the first"
+        );
+    }
+
+    #[test]
+    fn tier2_scheduler_rearms_cache_writer_wait_without_source_changes() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let base = Instant::now();
+        ctx.note_tier2_refresh_started_at(base);
+        ctx.inspect_manager.record_tier2_attempt_outcome_for_test(
+            crate::inspect::InspectCategory::Complexity,
+            crate::inspect::JobOutcome::Failed {
+                message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
+            },
+        );
+        assert!(
+            !ctx.tier2_refresh_dispatch_due(),
+            "no immediate maintenance retry"
+        );
+        let retry_at = ctx
+            .tier2_refresh_scheduler
+            .lock()
+            .next_dispatch_at(base)
+            .expect("maintenance arms a resource retry");
+        assert!(retry_at <= Instant::now() + Duration::from_secs(30));
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(retry_at - Duration::from_millis(1), 0),
+            None
+        );
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(retry_at, 0),
+            Some(Tier2TriggerReason::ResourceRetry)
         );
     }
 

@@ -2534,6 +2534,24 @@ pub fn handle_inspect_tier2_run(req: &RawRequest, ctx: &AppContext) -> Response 
                 .collect(),
         );
     }
+    if !submission.resource_waits.is_empty() {
+        let skipped = data["skipped_categories"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        data["skipped_categories"] = Value::Array(
+            skipped
+                .into_iter()
+                .chain(submission.resource_waits.iter().map(|wait| {
+                    serde_json::json!({
+                        "category": wait.category.as_str(),
+                        "reason": "waiting_for_inspect_cache_writer_lease",
+                        "retry_at_ms": wait.retry_at_ms,
+                    })
+                }))
+                .collect(),
+        );
+    }
 
     Response::success(&req.id, data)
 }
@@ -7667,6 +7685,10 @@ mod deferred_terminal_tests {
     #[test]
     fn inspect_builder_state_detail_uses_stable_honest_names() {
         assert_eq!(InspectBuilderState::Building.as_str(), "building");
+        assert_eq!(
+            InspectBuilderState::WaitingForCacheWriterLease.as_str(),
+            "waiting_for_inspect_cache_writer_lease"
+        );
         assert_eq!(
             InspectBuilderState::QueuedBehindColdBuilds.as_str(),
             "queued_behind_cold_builds"

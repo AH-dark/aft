@@ -16,6 +16,9 @@ pub const TIER2_REFRESH_STORM_PATH_THRESHOLD: usize = 200;
 // keeps being refused would retry (and log) several times a second for as long
 // as the limiter stays full.
 pub const TIER2_REFRESH_DEFERRAL_BACKOFF: Duration = Duration::from_secs(30);
+/// A foreign cache writer can release its lease without any input changing.
+/// Retry at most once every 30 seconds, even after repeated lease timeouts.
+pub const TIER2_CACHE_WRITER_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 /// Minimum gap between two roots' first (cold-cache) Tier-2 refreshes.
 ///
 /// Every root configured in the same burst (all sessions rebinding after a
@@ -88,6 +91,7 @@ pub fn process_tier2_cold_start_pacer() -> &'static parking_lot::Mutex<Tier2Cold
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2TriggerReason {
+    ResourceRetry,
     Debounce,
     Ceiling,
     Pull,
@@ -97,6 +101,7 @@ pub enum Tier2TriggerReason {
 impl Tier2TriggerReason {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ResourceRetry => "resource_retry",
             Self::Debounce => "debounce",
             Self::Ceiling => "ceiling",
             Self::Pull => "pull",
@@ -185,6 +190,7 @@ pub struct Tier2RefreshScheduler {
     last_trigger_reason: Option<Tier2TriggerReason>,
     dispatch_rollback: Option<Tier2DispatchRollback>,
     deferred_retry_at: Option<Instant>,
+    resource_retry_at: Option<Instant>,
     overdue_reported: bool,
 }
 
@@ -201,6 +207,7 @@ impl Tier2RefreshScheduler {
             last_trigger_reason: None,
             dispatch_rollback: None,
             deferred_retry_at: None,
+            resource_retry_at: None,
             overdue_reported: false,
         }
     }
@@ -222,6 +229,7 @@ impl Tier2RefreshScheduler {
         self.last_trigger_reason = None;
         self.dispatch_rollback = None;
         self.deferred_retry_at = None;
+        self.resource_retry_at = None;
         self.overdue_reported = false;
     }
 
@@ -261,7 +269,7 @@ impl Tier2RefreshScheduler {
             self.record_changes(now, changed_path_count);
         }
 
-        if !can_write || in_flight || !self.min_interval_elapsed(now) {
+        if !can_write || in_flight {
             return None;
         }
 
@@ -274,6 +282,15 @@ impl Tier2RefreshScheduler {
         }
 
         if self.deferral_backoff_pending(now) {
+            return None;
+        }
+
+        // Resource retries have their own bounded delay, not the scan interval:
+        // no analysis could run while another process held the cache lease.
+        if self.resource_retry_at.is_some_and(|at| now >= at) {
+            return Some(self.record_scan_start(now, Tier2TriggerReason::ResourceRetry));
+        }
+        if !self.min_interval_elapsed(now) {
             return None;
         }
 
@@ -331,6 +348,10 @@ impl Tier2RefreshScheduler {
         self.last_trigger_reason
     }
 
+    pub fn set_resource_retry_at(&mut self, retry_at: Option<Instant>) {
+        self.resource_retry_at = retry_at;
+    }
+
     pub fn pull_demand_pending(&self) -> bool {
         self.pull_demand_pending
     }
@@ -338,6 +359,17 @@ impl Tier2RefreshScheduler {
     /// Earliest instant at which the scheduler's current demand can dispatch,
     /// before external gates such as an in-flight builder or semantic cold seed.
     pub fn next_dispatch_at(&self, now: Instant) -> Option<Instant> {
+        let resource_at = self.resource_retry_at.map(|at| {
+            self.deferred_retry_at
+                .map_or(at, |deferred| at.max(deferred))
+        });
+        [resource_at, self.next_regular_dispatch_at(now)]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    fn next_regular_dispatch_at(&self, now: Instant) -> Option<Instant> {
         let min_interval_at = self
             .last_scan_started_at
             .map(|started| started + TIER2_REFRESH_MIN_INTERVAL);
@@ -479,6 +511,7 @@ impl Tier2RefreshScheduler {
         self.configure_warm_pending = false;
         self.last_trigger_reason = Some(reason);
         self.deferred_retry_at = None;
+        self.resource_retry_at = None;
         self.overdue_reported = false;
         self.clear_activity_window();
         reason
@@ -515,6 +548,52 @@ mod tests {
 
     fn no_gates() -> Tier2ExternalGates {
         Tier2ExternalGates::default()
+    }
+
+    #[test]
+    fn cache_writer_resource_retry_is_bounded_and_respects_external_gates() {
+        let (mut scheduler, base) = configured_scheduler();
+        scheduler.note_external_scan_started(base);
+        let retry_at = base + TIER2_CACHE_WRITER_RETRY_BACKOFF;
+        scheduler.set_resource_retry_at(Some(retry_at));
+        assert_eq!(TIER2_CACHE_WRITER_RETRY_BACKOFF, Duration::from_secs(30));
+        assert_eq!(scheduler.next_dispatch_at(base), Some(retry_at));
+        assert!(!scheduler.dispatch_due(retry_at - Duration::from_millis(1)));
+        assert_eq!(
+            scheduler.tick(retry_at - Duration::from_millis(1), 0, true, false),
+            None
+        );
+        assert!(scheduler.dispatch_due(retry_at));
+        assert_eq!(scheduler.tick(retry_at, 0, false, false), None);
+        assert_eq!(scheduler.tick(retry_at, 0, true, true), None);
+        assert_eq!(
+            scheduler.tick_with_gates(retry_at, 0, true, false, semantic_cold_seed()),
+            None
+        );
+        assert_eq!(
+            scheduler.tick_with_gates(retry_at, 0, true, false, callgraph_cold_build()),
+            None
+        );
+        assert_eq!(
+            scheduler.tick(retry_at, 0, true, false),
+            Some(Tier2TriggerReason::ResourceRetry)
+        );
+        assert_eq!(
+            scheduler.next_dispatch_at(retry_at),
+            None,
+            "one dispatch consumes the resource deadline"
+        );
+        scheduler.set_resource_retry_at(Some(retry_at));
+        scheduler.note_dispatch_deferred(retry_at);
+        assert_eq!(
+            scheduler.next_dispatch_at(retry_at),
+            Some(retry_at + TIER2_REFRESH_DEFERRAL_BACKOFF)
+        );
+        assert_eq!(scheduler.tick(retry_at, 0, true, false), None);
+        assert_eq!(
+            scheduler.tick(retry_at + TIER2_REFRESH_DEFERRAL_BACKOFF, 0, true, false),
+            Some(Tier2TriggerReason::ResourceRetry)
+        );
     }
 
     fn semantic_cold_seed() -> Tier2ExternalGates {
