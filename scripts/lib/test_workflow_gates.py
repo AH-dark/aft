@@ -32,6 +32,49 @@ def workflow_job(job_id: str) -> str:
     return match.group(1)
 
 
+class CacheSaveRefGateTests(unittest.TestCase):
+    """A main-only cache write is policy; a main-only check or job is dead code."""
+
+    def _scan(self, steps_yaml: str) -> list[str]:
+        import tempfile
+
+        text = (
+            "on:\n  push:\n    branches: [main, 'train/**']\n"
+            "concurrency:\n  group: x-${{ github.ref }}\n"
+            "jobs:\n  unit:\n    runs-on: ubuntu-latest\n    steps:\n" + steps_yaml
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as handle:
+            handle.write(text)
+        refs, _warns, _group = workflow_gates.scan(handle.name)
+        return refs
+
+    def test_main_only_cache_save_is_not_a_dead_ref_gate(self) -> None:
+        refs = self._scan(
+            "      - name: Save cache on main\n"
+            "        if: ${{ github.ref == 'refs/heads/main' }}\n"
+            "        uses: actions/cache/save@v4\n"
+            "        with: {path: x, key: y}\n"
+        )
+        self.assertEqual(refs, [])
+
+    def test_main_only_ordinary_step_is_still_refused(self) -> None:
+        refs = self._scan(
+            "      - name: Check only on main\n"
+            "        if: ${{ github.ref == 'refs/heads/main' }}\n"
+            "        run: ./check.sh\n"
+        )
+        self.assertEqual(len(refs), 1, refs)
+
+    def test_main_only_cache_restore_is_still_refused(self) -> None:
+        refs = self._scan(
+            "      - name: Restore only on main\n"
+            "        if: ${{ github.ref == 'refs/heads/main' }}\n"
+            "        uses: actions/cache/restore@v4\n"
+            "        with: {path: x, key: y}\n"
+        )
+        self.assertEqual(len(refs), 1, refs)
+
+
 class BranchPatternTests(unittest.TestCase):
     def test_single_star_does_not_match_slash(self) -> None:
         self.assertTrue(workflow_gates.branch_patterns_include("train/fix", ["train/*"]))

@@ -330,6 +330,18 @@ def step_label(step: Any) -> str:
     return ""
 
 
+def is_cache_save(step: dict[str, Any]) -> bool:
+    """A cache write is not a check, so a main-only condition on it is policy.
+
+    Only the default branch writes CI caches (branches still restore them), so
+    trains, pull requests and the merge queue cannot push the default branch's
+    entries out of the repository's cache quota. Such a step guards nothing a
+    train needs to prove, which is what the ref rule below exists to catch.
+    """
+    uses = step.get("uses")
+    return isinstance(uses, str) and uses.strip().startswith("actions/cache/save@")
+
+
 def classify(condition: str) -> str | None:
     """ref = provably dead under trains, warn = depends on the landing path."""
     if "github.ref" in condition:
@@ -370,7 +382,11 @@ def scan(path: str) -> tuple[list[str], list[str], str]:
             entries = [("", job.get("if"))]
             steps = job.get("steps")
             if isinstance(steps, list):
-                entries += [(step_label(s), s.get("if")) for s in steps if isinstance(s, dict)]
+                entries += [
+                    (step_label(s), s.get("if"))
+                    for s in steps
+                    if isinstance(s, dict) and not is_cache_save(s)
+                ]
             for label, condition in entries:
                 if not isinstance(condition, str) or not condition.strip():
                     continue
