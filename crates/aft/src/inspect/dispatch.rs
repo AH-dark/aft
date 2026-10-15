@@ -1,6 +1,7 @@
 use std::any::Any;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::thread;
 use std::time::Instant;
 
@@ -110,35 +111,36 @@ fn dispatch_loop(
                         started.elapsed(),
                     )
                 });
-            #[cfg(debug_assertions)]
             let scanner_ready = result.outcome.is_ok()
                 && matches!(
                     result.category,
                     InspectCategory::Metrics | InspectCategory::Todos
                 );
-            #[cfg(debug_assertions)]
             let category = result.category;
             let _ = tx.send(result);
-            #[cfg(debug_assertions)]
             if scanner_ready {
-                signal_scanner_ready_for_debug(category);
+                signal_scanner_ready_for_test(category);
             }
         });
     }
 }
 
-#[cfg(debug_assertions)]
-fn signal_scanner_ready_for_debug(category: InspectCategory) {
-    let Some(directory) = std::env::var_os("AFT_TEST_INSPECT_SCANNER_READY_DIR") else {
+/// Test hook that signals successful scanner completion to subprocess fixtures.
+/// This keeps cold scanner work outside timed language-server assertions.
+fn signal_scanner_ready_for_test(category: InspectCategory) {
+    static DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(directory) = DIRECTORY
+        .get_or_init(|| std::env::var_os("AFT_TEST_INSPECT_SCANNER_READY_DIR").map(PathBuf::from))
+    else {
         return;
     };
-    // Signal only after the scanner has populated its memo and sent its result.
-    // Subprocess tests can exclude cold scanner work from a timed LSP assertion.
-    std::fs::write(
-        std::path::Path::new(&directory).join(category.as_str()),
-        b"complete\n",
-    )
-    .expect("signal completed inspect scanner");
+    let signal = directory.join(category.as_str());
+    if let Err(error) = std::fs::write(&signal, b"complete\n") {
+        log::warn!(
+            "failed to signal completed inspect scanner at {}: {error}",
+            signal.display()
+        );
+    }
 }
 
 fn panic_message(panic: &(dyn Any + Send)) -> &str {
