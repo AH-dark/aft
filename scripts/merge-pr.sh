@@ -134,64 +134,48 @@ fi
 
 # With auto-merge allowed, GitHub admits the PR to the queue itself once its
 # required checks pass, so one read is enough: refuse a red check by name, and
-# otherwise submit without waiting. Without it, a merge request on a PR whose
-# checks are still running is refused, so wait for them first.
+# otherwise submit. Without auto-merge, a merge request on a PR whose checks are
+# still running is refused by GitHub, so refuse here too and let the caller
+# rerun once they pass. Never wait inside this script: the review gates above
+# were read before any wait and would go stale.
 if [[ "$QUEUE_ENABLED" == true ]]; then
-  CHECK_TIMEOUT_SECONDS="${MERGE_PR_CHECK_TIMEOUT_SECONDS:-3600}"
-  CHECK_POLL_SECONDS="${MERGE_PR_CHECK_POLL_SECONDS:-30}"
-  [[ "$CHECK_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
-    hard_refuse "MERGE_PR_CHECK_TIMEOUT_SECONDS must be a positive integer"
-  [[ "$CHECK_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
-    hard_refuse "MERGE_PR_CHECK_POLL_SECONDS must be a positive integer"
-  CHECK_DEADLINE=$(( $(date -u +%s) + CHECK_TIMEOUT_SECONDS ))
-  while true; do
-    CHECK_EXIT=0
-    if REQUIRED_CHECKS=$("$OPERATOR_GH" pr checks "$PR" --required --json name,bucket \
-        --jq '.[] | [.name, .bucket] | @tsv'); then
-      :
-    else
-      CHECK_EXIT=$?
-    fi
-    if [ "$CHECK_EXIT" -ne 0 ] && [ "$CHECK_EXIT" -ne 1 ] && [ "$CHECK_EXIT" -ne 8 ]; then
-      hard_refuse "could not read required checks for PR #$PR"
-    fi
-    [ -n "$REQUIRED_CHECKS" ] || hard_refuse "no required checks found for PR #$PR"
-    PENDING_NAMES=()
-    while IFS=$'\t' read -r CHECK_NAME CHECK_BUCKET; do
-      [ -n "$CHECK_NAME" ] && [ -n "$CHECK_BUCKET" ] ||
-        hard_refuse "malformed required-check result for PR #$PR"
-      case "$CHECK_BUCKET" in
-        pass|skipping) ;;
-        pending) PENDING_NAMES+=("$CHECK_NAME") ;;
-        fail|cancel)
-          hard_refuse "required check '$CHECK_NAME' did not pass ($CHECK_BUCKET)"
-          ;;
-        *) hard_refuse "required check '$CHECK_NAME' has unknown status '$CHECK_BUCKET'" ;;
-      esac
-    done <<< "$REQUIRED_CHECKS"
-    if [ "$CHECK_EXIT" -eq 1 ]; then
-      hard_refuse "gh pr checks failed without a named required-check result for PR #$PR"
-    fi
-    if [ "$CHECK_EXIT" -eq 8 ] && [ "${#PENDING_NAMES[@]}" -eq 0 ]; then
-      hard_refuse "gh reported pending required checks without naming a pending check for PR #$PR"
-    fi
-    if [ "${#PENDING_NAMES[@]}" -eq 0 ]; then
-      echo "merge-pr: required checks complete for #$PR"
-      break
-    fi
+  CHECK_EXIT=0
+  if REQUIRED_CHECKS=$("$OPERATOR_GH" pr checks "$PR" --required --json name,bucket \
+      --jq '.[] | [.name, .bucket] | @tsv'); then
+    :
+  else
+    CHECK_EXIT=$?
+  fi
+  if [ "$CHECK_EXIT" -ne 0 ] && [ "$CHECK_EXIT" -ne 1 ] && [ "$CHECK_EXIT" -ne 8 ]; then
+    hard_refuse "could not read required checks for PR #$PR"
+  fi
+  [ -n "$REQUIRED_CHECKS" ] || hard_refuse "no required checks found for PR #$PR"
+  PENDING_NAMES=()
+  while IFS=$'\t' read -r CHECK_NAME CHECK_BUCKET; do
+    [ -n "$CHECK_NAME" ] && [ -n "$CHECK_BUCKET" ] ||
+      hard_refuse "malformed required-check result for PR #$PR"
+    case "$CHECK_BUCKET" in
+      pass|skipping) ;;
+      pending) PENDING_NAMES+=("$CHECK_NAME") ;;
+      fail|cancel)
+        hard_refuse "required check '$CHECK_NAME' did not pass ($CHECK_BUCKET)"
+        ;;
+      *) hard_refuse "required check '$CHECK_NAME' has unknown status '$CHECK_BUCKET'" ;;
+    esac
+  done <<< "$REQUIRED_CHECKS"
+  if [ "$CHECK_EXIT" -eq 1 ]; then
+    hard_refuse "gh pr checks failed without a named required-check result for PR #$PR"
+  fi
+  if [ "$CHECK_EXIT" -eq 8 ] && [ "${#PENDING_NAMES[@]}" -eq 0 ]; then
+    hard_refuse "gh reported pending required checks without naming a pending check for PR #$PR"
+  fi
+  if [ "${#PENDING_NAMES[@]}" -gt 0 ]; then
     if [[ "$AUTO_MERGE_ALLOWED" == true ]]; then
       echo "merge-pr: required checks still running for #$PR; GitHub queues it when they pass" >&2
-      break
+    else
+      hard_refuse "required checks still running on PR #$PR and auto-merge is off; rerun once they pass: ${PENDING_NAMES[*]}"
     fi
-    NOW_EPOCH=$(date -u +%s)
-    REMAINING=$(( CHECK_DEADLINE - NOW_EPOCH ))
-    [ "$REMAINING" -gt 0 ] ||
-      hard_refuse "timed out waiting for required checks on PR #$PR: ${PENDING_NAMES[*]}"
-    WAIT_SECONDS=$CHECK_POLL_SECONDS
-    [ "$WAIT_SECONDS" -le "$REMAINING" ] || WAIT_SECONDS=$REMAINING
-    echo "merge-pr: waiting for required checks on #$PR (${PENDING_NAMES[*]}; ${REMAINING}s remaining)" >&2
-    sleep "$WAIT_SECONDS"
-  done
+  fi
 fi
 
 echo "merge-pr: admission gates satisfied (head ${AGE_MIN}m settled) - submitting #$PR at $HEAD_SHA"

@@ -269,13 +269,14 @@ class MergeAdmissionTests(PRFixture):
         self.assertEqual(self.merges()[0]["args"], ["pr", "merge", "7", "--match-head-commit", head])
         self.assertEqual(self.merges()[0]["bypass"], "operator")
 
-    def test_pending_required_checks_finish_before_queue_admission(self) -> None:
-        self.write_state(checks_pending=True, finish_after_polls=1)
+    def test_pending_required_checks_without_auto_merge_refuse_without_waiting(self) -> None:
+        self.write_state(checks_pending=True)
         result = self.merge()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertGreaterEqual(json.loads(self.state_path.read_text())["check_polls"], 2)
-        self.assertIn("required checks complete", result.stdout + result.stderr)
-        self.assertIn("--match-head-commit", self.merges()[0]["args"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required checks still running", result.stderr)
+        self.assertIn("auto-merge is off", result.stderr)
+        self.assertEqual(json.loads(self.state_path.read_text())["check_polls"], 1)
+        self.assertEqual(self.merges(), [])
 
     def test_red_required_check_refuses_by_name(self) -> None:
         self.write_state(failed_check="Design gate")
@@ -284,18 +285,9 @@ class MergeAdmissionTests(PRFixture):
         self.assertIn("Design gate", result.stderr)
         self.assertEqual(self.merges(), [])
 
-    def test_pending_required_checks_time_out_without_queue_admission(self) -> None:
-        self.write_state(checks_pending=True)
-        result = self.merge(env={"MERGE_PR_CHECK_TIMEOUT_SECONDS": "1",
-                                 "MERGE_PR_CHECK_POLL_SECONDS": "1"})
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("timed out waiting for required checks", result.stderr)
-        self.assertEqual(self.merges(), [])
-
     def test_auto_merge_submits_pending_checks_without_waiting(self) -> None:
         self.write_state(checks_pending=True, auto_merge=True)
-        result = self.merge(env={"MERGE_PR_CHECK_TIMEOUT_SECONDS": "1",
-                                 "MERGE_PR_CHECK_POLL_SECONDS": "1"})
+        result = self.merge()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(self.state_path.read_text())["check_polls"], 1)
         self.assertIn("--match-head-commit", self.merges()[0]["args"])
