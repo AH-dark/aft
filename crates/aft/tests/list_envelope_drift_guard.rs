@@ -236,10 +236,12 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     // bytes and must remain registered even though they are not list payloads.
     files_to_scan.push(src_dir.join("url_fetch.rs"));
     files_to_scan.push(src_dir.join("response_finalize.rs"));
+    files_to_scan.push(src_dir.join("runtime_drain.rs"));
     // 4. crates/aft/src/compress/**
     files_to_scan.extend(collect_rs_files(&src_dir.join("compress")));
 
     let primitives: &[&'static str] = &[
+        "budget.exhausted()",
         ".take(",
         "truncate(",
         "DEFAULT_MAX_RESULTS",
@@ -265,6 +267,12 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
 
         for (idx, line) in raw_lines.iter().enumerate() {
             let trimmed = line.trim();
+            // These limits defer index maintenance rather than shorten a reply.
+            // Scan their explicit budget checks; this file's other maintenance
+            // limits do not govern lists returned to callers.
+            if rel_path == "runtime_drain.rs" && !trimmed.contains("budget.exhausted()") {
+                continue;
+            }
             if trimmed.starts_with("//") || trimmed.starts_with('*') {
                 continue;
             }

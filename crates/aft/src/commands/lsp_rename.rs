@@ -210,6 +210,10 @@ fn apply_workspace_edit(
         ));
     }
 
+    let _mutation = crate::runtime_drain::record_file_mutation(
+        ctx,
+        file_changes.keys().map(|path| path.as_path()),
+    );
     let rollback = snapshot_affected_files(&file_changes, session, ctx, &op_id)
         .map_err(|err| Response::error(req_id, "lsp_error", format!("rename failed: {err}")))?;
     let result = apply_collected_changes(&file_changes, &rollback.captures, ctx);

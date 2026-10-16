@@ -2166,8 +2166,10 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let mut paths = collect_rs_files(&source_dir.join("commands"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
+    paths.push(source_dir.join("runtime_drain.rs"));
     paths.extend(collect_rs_files(&source_dir.join("compress")));
     let primitives = [
+        "budget.exhausted()",
         ".take(",
         "truncate(",
         "DEFAULT_MAX_RESULTS",
@@ -2189,6 +2191,12 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         let lines = source.lines().collect::<Vec<_>>();
         for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
+            // These limits defer index maintenance rather than shorten a reply.
+            // Scan their explicit budget checks; this file's other maintenance
+            // limits do not govern lists returned to callers.
+            if file == "runtime_drain.rs" && !trimmed.contains("budget.exhausted()") {
+                continue;
+            }
             if trimmed.starts_with("//") || trimmed.starts_with('*') {
                 continue;
             }

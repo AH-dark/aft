@@ -287,6 +287,18 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "runtime_drain.rs",
+        enclosing_item: "collect_mutation_paths",
+        location_or_primitive: "budget.exhausted()",
+        reason: "bounded internal mutation-index discovery, not a response list; ignored directories are pruned, examined counts are logged, and unfinished work schedules a background corpus replacement with the index marked not ready",
+    },
+    ExclusionEntry {
+        file: "runtime_drain.rs",
+        enclosing_item: "drop",
+        location_or_primitive: "budget.exhausted()",
+        reason: "bounded internal mutation-index refresh, not a response list; refreshed counts are logged and budget exhaustion schedules one background corpus replacement instead of certifying stale search answers as complete",
+    },
+    ExclusionEntry {
         file: "commands/configure.rs",
         enclosing_item: "view_working_tree_refresh_path",
         location_or_primitive: "max_examined .take()",

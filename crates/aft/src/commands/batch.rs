@@ -160,6 +160,7 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // Phase 6: Write, format, and validate via shared pipeline
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
     let mut write_result = match edit::write_format_validate_observed(
         &path,
         &content,

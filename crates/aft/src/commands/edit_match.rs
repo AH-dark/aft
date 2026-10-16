@@ -200,7 +200,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         return edit::no_change_response(&req.id);
     }
 
-    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
     if create_dirs {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -589,8 +589,10 @@ fn handle_glob_edit_match(
         return edit::no_change_response(&req.id);
     }
     pending.retain(|edit| edit.original_source != edit.new_source);
-    let _view_intent =
-        crate::views::intent::record_paths(pending.iter().map(|edit| edit.path.as_path()));
+    let _mutation = crate::runtime_drain::record_file_mutation(
+        ctx,
+        pending.iter().map(|edit| edit.path.as_path()),
+    );
 
     let mut captures = pending
         .iter()
@@ -1331,7 +1333,7 @@ fn handle_single_file_edit_match(
         return edit::no_change_response(&req.id);
     }
 
-    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
 
     // Auto-backup before mutation
     let label = if replace_all {

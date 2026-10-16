@@ -173,6 +173,19 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
             backups_enabled,
             fault: None,
         };
+        let _mutation = (!preview).then(|| {
+            crate::runtime_drain::record_file_mutation(
+                ctx,
+                inputs.iter().flat_map(|input| {
+                    std::iter::once(input.canonical_path).chain(
+                        input
+                            .mv_destination
+                            .as_ref()
+                            .map(|dest| dest.canonical_path),
+                    )
+                }),
+            )
+        });
         let envelope = run_transaction(&inputs, &register_snapshot, &mut execute, preview)?;
         drop(execute);
         let display_files = display_files_from_envelope(&envelope, &display_baselines);

@@ -93,7 +93,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         return edit::no_change_response(&req.id);
     }
 
-    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
 
     // Auto-backup existing files before overwriting. For create-only writes,
     // record a tombstone so operation undo removes the created file.

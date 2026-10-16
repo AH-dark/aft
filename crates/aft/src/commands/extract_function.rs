@@ -331,6 +331,7 @@ pub fn handle_extract_function(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Write, format, validate ---
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
     let mut write_result =
         match edit::write_format_validate(&path, &new_source, &ctx.config(), &req.params) {
             Ok(r) => r,

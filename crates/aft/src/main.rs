@@ -1983,6 +1983,59 @@ fn recoverable_stdin_error(error: &io::Error) -> Option<Response> {
 }
 
 #[cfg(test)]
+mod mutation_index_membership_tests {
+    use super::*;
+
+    #[test]
+    fn ndjson_deletes_retire_index_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let deleted = root.join("deleted.ts");
+        std::fs::write(&deleted, "const value = 'deleted_token';\n").unwrap();
+        let ctx = AppContext::new(
+            aft::context::default_language_provider_factory(),
+            aft::config::Config {
+                project_root: Some(root.clone()),
+                ..aft::config::Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.search_index().write().unwrap() = Some(aft::search_index::SearchIndex::build(&root));
+        let request: RawRequest = serde_json::from_str(
+            r#"{"id":"delete","command":"apply_patch","patch_text":"*** Begin Patch\n*** Delete File: deleted.ts\n*** End Patch"}"#,
+        ).unwrap();
+        let response = dispatch(request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(!deleted.exists());
+        let index = ctx.search_index().read().unwrap();
+        assert!(index
+            .as_ref()
+            .unwrap()
+            .glob("**/*", &root)
+            .iter()
+            .all(|path| path != &deleted));
+        drop(index);
+        let deleted = root.join("tool-deleted.ts");
+        std::fs::write(&deleted, "const value = 'deleted_token';\n").unwrap();
+        *ctx.search_index().write().unwrap() = Some(aft::search_index::SearchIndex::build(&root));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "delete-tool", "command": "delete_file", "file": deleted
+        }))
+        .unwrap();
+        let response = dispatch(request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(!deleted.exists());
+        let index = ctx.search_index().read().unwrap();
+        assert!(index
+            .as_ref()
+            .unwrap()
+            .glob("**/*", &root)
+            .iter()
+            .all(|path| path != &deleted));
+    }
+}
+
+#[cfg(test)]
 mod core_framing_tests {
     use super::*;
 

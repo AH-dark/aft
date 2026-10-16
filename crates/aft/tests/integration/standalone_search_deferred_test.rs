@@ -971,18 +971,46 @@ fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
 #[cfg(unix)]
 #[test]
 fn standalone_edit_then_queued_grep_observes_watcher_update() {
+    assert_edit_then_queued_grep_is_fresh(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_edit_then_queued_grep_is_fresh_without_watcher_delivery() {
+    // Withhold OS delivery entirely: read-after-write must not depend on when
+    // FSEvents or inotify happens to report AFT's own completed edit.
+    assert_edit_then_queued_grep_is_fresh(false);
+}
+
+#[cfg(unix)]
+fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
     let project = tempfile::tempdir().expect("create freshness project");
     let storage = tempfile::tempdir().expect("create freshness storage");
     let target = project.path().join("source.ts");
     fs::write(&target, "export const value = 'old_watcher_token';\n")
         .expect("write freshness fixture");
 
+    let formatter_listener = TcpListener::bind("127.0.0.1:0").expect("bind formatter barrier");
+    let formatter_port = formatter_listener.local_addr().unwrap().port().to_string();
+    let (formatter_tx, formatter_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = formatter_listener.accept().expect("accept formatter");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut ready = [0];
+        stream
+            .read_exact(&mut ready)
+            .expect("formatter ready signal");
+        assert_eq!(ready, [b'R']);
+        let _ = formatter_tx.send(stream);
+    });
     let formatter_dir = project.path().join("bin");
     fs::create_dir_all(&formatter_dir).expect("create formatter directory");
     let formatter = formatter_dir.join("biome");
     link_cached_executable(
         &formatter,
-        b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'biome 2.0.0'; exit 0; fi\nsleep 0.4\n",
+        b"#!/bin/bash\nif [ \"$1\" = \"--version\" ]; then echo 'biome 2.0.0'; exit 0; fi\nexec 3<>/dev/tcp/127.0.0.1/$AFT_TEST_FORMATTER_PORT || exit 1\nprintf R >&3\nread -r -t 5 release <&3\n",
     )
     .expect("cache formatter shim");
     let formatter_path = std::env::join_paths(
@@ -994,10 +1022,17 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
 
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_STORAGE_DIR", storage.path().as_os_str()),
-        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+        (
+            "AFT_TEST_DISABLE_FILE_WATCHER",
+            std::ffi::OsStr::new(if watcher_enabled { "0" } else { "1" }),
+        ),
         (
             "AFT_TEST_SYNC_FILE_WATCHER_START",
             std::ffi::OsStr::new("1"),
+        ),
+        (
+            "AFT_TEST_FORMATTER_PORT",
+            std::ffi::OsStr::new(&formatter_port),
         ),
         ("PATH", formatter_path.as_os_str()),
     ]);
@@ -1021,7 +1056,6 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
 
     let ready_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        thread::sleep(Duration::from_millis(125));
         let status = aft.send(r#"{"id":"freshness-status","command":"status"}"#);
         if status["search_index"]["status"] == "ready" {
             break;
@@ -1040,10 +1074,6 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
             .is_some_and(|matches| !matches.is_empty()),
         "initial search index did not include the fixture: {initial:?}"
     );
-    // The search index can become ready before the file watcher is attached, so
-    // wait briefly for watcher setup to finish.
-    thread::sleep(Duration::from_secs(1));
-
     let edit = serde_json::to_string(&json!({
         "id": "freshness-edit",
         "command": "tool_call",
@@ -1066,7 +1096,18 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
     }))
     .expect("serialize grep request");
     aft.send_silent(&edit);
+    let mut formatter = formatter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("edit did not reach formatter barrier");
+    assert!(fs::read_to_string(&target)
+        .unwrap()
+        .contains("fresh_watcher_token"));
+    // Queue the query while the edit handler is still in its formatter, then
+    // allow the edit to finish. No OS notification or timing guess orders this.
     aft.send_silent(&grep);
+    formatter
+        .write_all(b"release\n")
+        .expect("release formatter");
 
     let (edit_response, _) = read_response(&mut aft, "freshness-edit", Duration::from_secs(5));
     assert_eq!(
@@ -1084,7 +1125,181 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
             .is_some_and(|matches| !matches.is_empty()),
         "queued grep did not observe the edit: {grep_response:?}"
     );
+    assert_eq!(grep_response["total_matches"], 1, "{grep_response:?}");
+    assert_eq!(grep_response["files_searched"], 1, "{grep_response:?}");
+    if !watcher_enabled {
+        assert_eq!(grep_response["complete"], true, "{grep_response:?}");
+    }
+    let old = aft.send(
+        r#"{"id":"freshness-old","command":"grep","pattern":"old_watcher_token","max_results":20}"#,
+    );
+    assert_eq!(old["total_matches"], 0, "stale entry survived: {old:?}");
 
+    assert!(aft.shutdown().success());
+}
+
+fn mutation_freshness_fixture() -> (tempfile::TempDir, tempfile::TempDir, AftProcess) {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("src/source.ts"),
+        "export const value = 'qqqq_before_mutation';\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_STORAGE_DIR", storage.path().as_os_str()),
+        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("1")),
+    ]);
+    let configured = aft.send(
+        &json!({
+            "id": "configure", "command": "configure", "harness": "opencode",
+            "project_root": project.path(),
+            "config": user_config(json!({
+                "indexes": { "trigram": true, "semantic": false, "callgraph": false },
+                "format_on_edit": false
+            }))
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:?}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = aft.send(r#"{"id":"status","command":"status"}"#);
+        if status["search_index"]["status"] == "ready" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "index not ready: {status:?}");
+    }
+    assert_mutation_freshness(&mut aft, "qqqq_before_mutation", "zzzz_after_mutation");
+    (project, storage, aft)
+}
+
+fn assert_mutation_freshness(aft: &mut AftProcess, present: &str, absent: &str) -> Value {
+    let grep = |aft: &mut AftProcess, pattern| {
+        aft.send(
+            &json!({
+                "id": "freshness", "command": "grep", "pattern": pattern, "max_results": 20
+            })
+            .to_string(),
+        )
+    };
+    let fresh = grep(aft, present);
+    assert_eq!(fresh["success"], true, "{fresh:?}");
+    assert_eq!(fresh["complete"], true, "{fresh:?}");
+    assert!(
+        fresh["total_matches"].as_u64().unwrap() > 0,
+        "new token missing: {fresh:?}"
+    );
+    assert!(
+        fresh["files_searched"].as_u64().unwrap() > 0,
+        "no candidates searched: {fresh:?}"
+    );
+    let old = grep(aft, absent);
+    assert_eq!(old["success"], true, "{old:?}");
+    assert_eq!(old["total_matches"], 0, "old token survived: {old:?}");
+    // Disjoint tokens also detect outdated candidates after a content rewrite.
+    // Deleted-path membership is checked directly by the mutation-guard unit test.
+    assert_eq!(
+        old["files_searched"], 0,
+        "stale index candidate survived: {old:?}"
+    );
+    fresh
+}
+
+#[test]
+fn standalone_glob_edit_is_fresh_without_watcher_delivery() {
+    let (project, _storage, mut aft) = mutation_freshness_fixture();
+    let seeded = aft.send(
+        &json!({
+            "id": "write-second", "command": "write", "file": project.path().join("src/second.ts"),
+            "content": "export const value = 'qqqq_before_mutation';\n"
+        })
+        .to_string(),
+    );
+    assert_eq!(seeded["success"], true, "{seeded:?}");
+    let edited = aft.send(
+        &json!({
+            "id": "glob-edit", "command": "edit_match", "file": "src/*.ts",
+            "match": "qqqq_before_mutation", "replacement": "zzzz_after_mutation"
+        })
+        .to_string(),
+    );
+    assert_eq!(edited["success"], true, "{edited:?}");
+    let fresh = assert_mutation_freshness(&mut aft, "zzzz_after_mutation", "qqqq_before_mutation");
+    assert_eq!(fresh["total_matches"], 2, "{fresh:?}");
+    assert_eq!(fresh["files_searched"], 2, "{fresh:?}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn standalone_patch_move_delete_is_fresh_without_watcher_delivery() {
+    let (project, _storage, mut aft) = mutation_freshness_fixture();
+    let moved = aft.send(&json!({
+        "id": "patch-move", "command": "apply_patch",
+        "patch_text": "*** Begin Patch\n*** Update File: src/source.ts\n*** Move to: src/moved.ts\n@@\n-export const value = 'qqqq_before_mutation';\n+export const value = 'zzzz_after_mutation';\n*** End Patch"
+    }).to_string());
+    assert_eq!(moved["success"], true, "{moved:?}");
+    assert!(!project.path().join("src/source.ts").exists());
+    let fresh = assert_mutation_freshness(&mut aft, "zzzz_after_mutation", "qqqq_before_mutation");
+    assert!(
+        fresh["matches"][0]["file"]
+            .as_str()
+            .unwrap()
+            .replace('\\', "/")
+            .ends_with("src/moved.ts"),
+        "{fresh:?}"
+    );
+    let deleted = aft.send(&json!({
+        "id": "patch-delete", "command": "apply_patch",
+        "patch_text": "*** Begin Patch\n*** Delete File: src/moved.ts\n*** Add File: src/added.ts\n+export const value = 'yyyy_after_delete';\n*** End Patch"
+    }).to_string());
+    assert_eq!(deleted["success"], true, "{deleted:?}");
+    assert_mutation_freshness(&mut aft, "yyyy_after_delete", "zzzz_after_mutation");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn standalone_patch_delete_is_fresh_without_watcher_delivery() {
+    let (project, _storage, mut aft) = mutation_freshness_fixture();
+    let written = aft.send(&json!({
+        "id": "write-survivor", "command": "write", "file": project.path().join("src/survivor.ts"),
+        "content": "export const value = 'zzzz_after_mutation';\n"
+    }).to_string());
+    assert_eq!(written["success"], true, "{written:?}");
+    let deleted = aft.send(
+        &json!({
+            "id": "delete-only", "command": "apply_patch",
+            "patch_text": "*** Begin Patch\n*** Delete File: src/source.ts\n*** End Patch"
+        })
+        .to_string(),
+    );
+    assert_eq!(deleted["success"], true, "{deleted:?}");
+    assert_mutation_freshness(&mut aft, "zzzz_after_mutation", "qqqq_before_mutation");
+    let glob = aft.send(r#"{"id":"removed-path","command":"glob","pattern":"**/source.ts"}"#);
+    assert_eq!(
+        glob["files"],
+        json!([]),
+        "deleted index entry survived: {glob:?}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn standalone_undo_is_fresh_without_watcher_delivery() {
+    let (project, _storage, mut aft) = mutation_freshness_fixture();
+    let written = aft.send(
+        &json!({
+            "id": "write", "command": "write", "file": project.path().join("src/source.ts"),
+            "content": "export const value = 'zzzz_after_mutation';\n"
+        })
+        .to_string(),
+    );
+    assert_eq!(written["success"], true, "{written:?}");
+    assert_mutation_freshness(&mut aft, "zzzz_after_mutation", "qqqq_before_mutation");
+    let undone = aft.send(r#"{"id":"undo","command":"undo","file":"src/source.ts"}"#);
+    assert_eq!(undone["success"], true, "{undone:?}");
+    assert_mutation_freshness(&mut aft, "qqqq_before_mutation", "zzzz_after_mutation");
     assert!(aft.shutdown().success());
 }
 

@@ -493,7 +493,7 @@ fn delete_one_or_dir(
             ));
         }
     };
-    let _view_intent = crate::views::intent::record_paths([path.as_path()]);
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [path.as_path()]);
     let is_symlink = metadata.file_type().is_symlink();
     let is_dir = metadata.is_dir();
     let no_backup = forced_skip.or_else(|| no_backup_reason(ctx, &path, is_dir));
