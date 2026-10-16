@@ -1,6 +1,115 @@
 use aft::parser::FileParser;
 
 #[test]
+fn swift_try_cast_coalescing_expressions_have_no_parse_errors() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("CastExpressions.swift");
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for prefix in ["", "try ", "try? ", "try! "] {
+        let call = if prefix.is_empty() {
+            "value()"
+        } else {
+            "throwingValue()"
+        };
+        for cast in ["as?", "as!"] {
+            for (ty, default) in [("[String: Any]", "[:]"), ("[Any]", "[]")] {
+                for coalescing in [false, true] {
+                    let fallback = if coalescing {
+                        format!(" ?? {default}")
+                    } else {
+                        String::new()
+                    };
+                    let expression = format!("{prefix}{call} {cast} {ty}{fallback}");
+                    for (context, function) in [
+                        (
+                            "let",
+                            format!("func probe() throws {{ let json = {expression}; _ = json }}"),
+                        ),
+                        (
+                            "return",
+                            format!("func probe() throws -> Any? {{ return {expression} }}"),
+                        ),
+                        (
+                            "argument",
+                            format!("func probe() throws {{ consume({expression}) }}"),
+                        ),
+                    ] {
+                        let source = format!(
+                            "func value() -> Any {{ [:] }}\n\
+                             func throwingValue() throws -> Any {{ [:] }}\n\
+                             func consume<T>(_ value: T) {{}}\n{function}\n"
+                        );
+                        std::fs::write(&file, &source).expect("write Swift file");
+                        let mut parser = FileParser::new();
+                        let (tree, _) = parser.parse(&file).expect("parse Swift file");
+                        checked += 1;
+                        if tree.root_node().has_error() {
+                            failures.push(format!(
+                                "{context}: {expression}: {}",
+                                tree.root_node().to_sexp()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 96);
+    assert!(
+        failures.is_empty(),
+        "Swift cast/coalescing forms parsed with errors:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn swift_json_serialization_cast_and_split_workaround_have_no_parse_errors() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("Transcript.swift");
+    for body in [
+        "let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]",
+        "let object = try JSONSerialization.jsonObject(with: data)\n\
+         let json = (object as? [String: Any]) ?? [:]",
+    ] {
+        let source =
+            format!("import Foundation\nfunc decode(data: Data) throws {{\n{body}\n_ = json\n}}\n");
+        std::fs::write(&file, &source).expect("write Swift file");
+        let mut parser = FileParser::new();
+        let (tree, _) = parser.parse(&file).expect("parse Swift file");
+        assert!(
+            !tree.root_node().has_error(),
+            "body {body:?} parsed with errors: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+}
+
+#[test]
+fn swift_optional_binding_try_await_conditions_have_no_parse_errors() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("ViewModel.swift");
+    for condition in [
+        "if let fresh = try? await fleet.fetch() {\n            rows = fresh.rows\n        }",
+        "if ready, let fresh = try? await fleet.fetch() {\n            rows = fresh.rows\n        }",
+        "guard let fresh = try? await fleet.fetch() else { return }\n        rows = fresh.rows",
+        "while let fresh = try? await fleet.fetch() {\n            rows = fresh.rows\n        }",
+    ] {
+        let source = format!(
+            "class ViewModel {{\n    func probe() async {{\n        {condition}\n    }}\n}}\n"
+        );
+        std::fs::write(&file, &source).expect("write Swift file");
+        let mut parser = FileParser::new();
+        let (tree, _) = parser.parse(&file).expect("parse Swift file");
+        assert!(
+            !tree.root_node().has_error(),
+            "condition {condition:?} parsed with errors: {}",
+            tree.root_node().to_sexp()
+        );
+    }
+}
+
+#[test]
 fn python_decorated_function_range_includes_decorators() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let file = tmp.path().join("decorated.py");
@@ -120,5 +229,81 @@ fn ts_export_default_identifier_marks_local_symbol_exported() {
     assert!(
         foo.exported,
         "foo should be exported via default identifier"
+    );
+}
+
+#[test]
+fn swift_try_await_control_flow_expressions_have_no_parse_errors() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let file = tmp.path().join("ControlFlow.swift");
+    let cases = [
+        (
+            "for record in try await pending()",
+            "for record in try await pending() { #expect(record.id != nil) }",
+        ),
+        ("for x in try f()", "for x in try f() { use(x) }"),
+        ("for x in await f()", "for x in await f() { use(x) }"),
+        (
+            "for try await x in seq",
+            "for try await x in seq { use(x) }",
+        ),
+        ("while try await f()", "while try await f() { useValue() }"),
+        (
+            "guard let x = try await f() else",
+            "guard let x = try await f() else { return }",
+        ),
+        (
+            "switch try await f()",
+            "switch try await f() { default: break }",
+        ),
+        (
+            "for x in try? await f()",
+            "for x in try? await f() { use(x) }",
+        ),
+        (
+            "for x in try! await f()",
+            "for x in try! await f() { use(x) }",
+        ),
+        (
+            "while try? await f()",
+            "while try? await f() { useValue() }",
+        ),
+        (
+            "while try! await f()",
+            "while try! await f() { useValue() }",
+        ),
+        (
+            "guard let x = try? await f() else",
+            "guard let x = try? await f() else { return }",
+        ),
+        (
+            "guard let x = try! await f() else",
+            "guard let x = try! await f() else { return }",
+        ),
+        (
+            "switch try? await f()",
+            "switch try? await f() { default: break }",
+        ),
+        (
+            "switch try! await f()",
+            "switch try! await f() { default: break }",
+        ),
+    ];
+    let mut failures = Vec::new();
+
+    for (form, body) in cases {
+        let source = format!("@Test func consentRecords() async throws {{\n    {body}\n}}\n");
+        std::fs::write(&file, &source).expect("write Swift file");
+        let mut parser = FileParser::new();
+        let (tree, _) = parser.parse(&file).expect("parse Swift file");
+        if tree.root_node().has_error() {
+            failures.push(format!("{form}: {}", tree.root_node().to_sexp()));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Swift control-flow forms parsed with errors:\n{}",
+        failures.join("\n")
     );
 }

@@ -451,7 +451,7 @@ export async function appendToolResultBgCompletions(
     // tracked or pending, a drain can only find something the daemon holds
     // that this process does not know about; skip the round trip unless
     // that is possible (see idleDrainMayFindWork).
-    if (!idleDrainMayFindWork(state)) return undefined;
+    if (!idleDrainMayFindWork(state, drainContext)) return undefined;
     await drainCompletions(drainContext);
   }
   if (
@@ -685,9 +685,15 @@ async function triggerWakeIfPending(
   // Mirrors the OpenCode fix.
   const state = stateFor(drainContext.sessionID);
 
+  const hasTrackedOrPendingWork =
+    state.outstandingTaskIds.size > 0 ||
+    state.pendingCompletions.length > 0 ||
+    state.pendingLongRunning.length > 0 ||
+    state.pendingPatternMatches.length > 0;
   if (
     !skipDrain &&
-    (forceDrain || state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted)
+    (forceDrain || state.outstandingTaskIds.size > 0 || !state.forcedDrainCompleted) &&
+    (forceDrain || hasTrackedOrPendingWork || idleDrainMayFindWork(state, drainContext))
   ) {
     await drainCompletions(drainContext);
   }
@@ -843,20 +849,26 @@ function isTerminalNudgeError(error: unknown): boolean {
 }
 
 /**
- * Whether a drain with nothing tracked or pending could still return work:
- * - no drain has succeeded yet in this session, so completions from before a
- *   restart may be waiting (the one-time replay drain);
+ * Whether an idle drain with nothing tracked or pending could still return work:
+ * - an initial replay drain may find completions from before a restart, but
+ *   generic idle hooks should only try it when a bridge is already active;
  * - a pushed completion for an untracked task arrived since the last drain;
  * - a delivered completion's ack has not been confirmed, and only a drain
  *   re-acks it.
  * A task spawned through the bash tool is tracked as outstanding, which takes
  * the normal drain path, so finishing between two tool results is covered.
  */
-function idleDrainMayFindWork(state: SessionBgState): boolean {
-  return (
-    !state.forcedDrainCompleted ||
-    state.untrackedCompletionSinceDrain ||
-    state.deliveredAwaitingAckTaskIds.size > 0
+function idleDrainMayFindWork(state: SessionBgState, drainContext: DrainContext): boolean {
+  if (state.untrackedCompletionSinceDrain || state.deliveredAwaitingAckTaskIds.size > 0) {
+    return true;
+  }
+  if (state.forcedDrainCompleted) return false;
+
+  // Checking the pool does not start a transport. A later idle hook will retry
+  // discovery if lazy startup creates the bridge after this no-work check.
+  return Boolean(
+    drainContext.resolvedBridge ??
+      drainContext.ctx.pool.getActiveBridgeForRoot(drainContext.directory),
   );
 }
 

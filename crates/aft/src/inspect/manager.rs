@@ -32,6 +32,7 @@ use crate::callgraph_store::{
     ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
+use crate::config::Config;
 
 #[cfg(test)]
 use crate::views::read::{record_checkout_view_refusal, take_checkout_view_refusal};
@@ -265,6 +266,7 @@ pub struct Tier2RunSubmission {
     /// Categories not started because their last build failed and the
     /// automatic-retry pause has not elapsed.
     pub retry_paused: Vec<Tier2RetryPause>,
+    pub resource_waits: Vec<Tier2ResourceWait>,
     pub errors: Vec<Tier2RunSubmissionError>,
 }
 
@@ -305,6 +307,7 @@ impl Default for Tier2ReuseOptions {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InspectBuilderState {
     Building,
+    WaitingForCacheWriterLease,
     QueuedBehindColdBuilds,
     GatedBySemanticSeed,
     Suspended,
@@ -316,6 +319,7 @@ impl InspectBuilderState {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Building => "building",
+            Self::WaitingForCacheWriterLease => "waiting_for_inspect_cache_writer_lease",
             Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
             Self::GatedBySemanticSeed => "gated_by_semantic_seed",
             Self::Suspended => "suspended",
@@ -346,6 +350,8 @@ struct BuilderStateEntry {
     /// millisecond), because its last build failed for a reason a rerun with
     /// the same inputs would only repeat.
     retry_paused_until: Option<(Instant, u64)>,
+    /// A resource wait survives source edits: they do not release a foreign lease.
+    resource_retry_at: Option<(Instant, u64)>,
     /// The manager's input-change epoch when the current (or last) attempt
     /// started. A failure is not paused when inputs changed during the attempt,
     /// because the build may not have seen that change.
@@ -366,6 +372,7 @@ impl BuilderStateEntry {
             last_failure: None,
             identical_failures: 0,
             retry_paused_until: None,
+            resource_retry_at: None,
             input_epoch_at_start: 0,
             suspension: None,
             progress: "checking cached analysis".into(),
@@ -386,6 +393,7 @@ impl BuilderStateEntry {
     fn begin_attempt(&mut self, state: InspectBuilderState) {
         self.state = Some(state);
         self.suspension = None;
+        self.resource_retry_at = None;
         self.started_at = Instant::now();
         self.started_unix = unix_now_secs();
         if self.attempt_count == 0 && self.last_failure.is_none() {
@@ -403,6 +411,7 @@ impl BuilderStateEntry {
     fn record_failure(&mut self, terminal: String, pause_retries: bool) {
         self.state = None;
         self.suspension = None;
+        self.resource_retry_at = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.identical_failures = if self.last_failure.as_deref() == Some(terminal.as_str()) {
             self.identical_failures.saturating_add(1)
@@ -432,10 +441,30 @@ impl BuilderStateEntry {
         self.last_failure = None;
         self.identical_failures = 0;
         self.retry_paused_until = None;
+        self.resource_retry_at = None;
         self.suspension = Some(suspension);
     }
 
+    fn record_cache_writer_wait(&mut self) {
+        self.state = Some(InspectBuilderState::WaitingForCacheWriterLease);
+        self.suspension = None;
+        self.attempt_count = self.attempt_count.saturating_add(1);
+        self.last_failure = None;
+        self.identical_failures = 0;
+        self.retry_paused_until = None;
+        let delay = super::tier2_scheduler::TIER2_CACHE_WRITER_RETRY_BACKOFF;
+        self.resource_retry_at = Some((
+            Instant::now() + delay,
+            unix_millis_now().saturating_add(delay.as_millis() as u64),
+        ));
+    }
+
     fn detail_at(&self, now_ms: u64) -> String {
+        if let Some((_, retry_at_ms)) = self.resource_retry_at {
+            return format!(
+                "waiting for the inspect cache writer lease; automatic resource retry at unix_ms={retry_at_ms}"
+            );
+        }
         if let Some(suspension) = self.suspension.as_ref() {
             return format!(
                 "suspended domain={} deaths={} age_s={} reason={}",
@@ -542,6 +571,7 @@ fn run_tier2_pass_with_deadline<T>(
 
 enum BuilderAttemptTerminal {
     Succeeded,
+    CacheWriterLeaseWait,
     Failed(String),
     Inconclusive,
 }
@@ -552,6 +582,9 @@ fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
             BuilderAttemptTerminal::Failed("callgraph_unavailable".to_string())
         }
         JobOutcome::Fresh { .. } => BuilderAttemptTerminal::Succeeded,
+        JobOutcome::Failed { message } if message.contains("writer_lease_timeout:") => {
+            BuilderAttemptTerminal::CacheWriterLeaseWait
+        }
         JobOutcome::Failed { message } => {
             BuilderAttemptTerminal::Failed(builder_failure_terminal(message))
         }
@@ -606,6 +639,7 @@ fn failure_pauses_automatic_retries(outcome: &JobOutcome) -> bool {
         "cold build concurrency limit",
         "exited without publishing a result",
         "lock poisoned",
+        "writer_lease_timeout:",
     ];
     match outcome {
         JobOutcome::Failed { message } => !NOT_INPUT_DETERMINED
@@ -615,7 +649,8 @@ fn failure_pauses_automatic_retries(outcome: &JobOutcome) -> bool {
     }
 }
 
-/// An automatic-retry pause on a Tier-2 category whose last build failed.
+/// An automatic-retry pause on a Tier-2 category whose last build failed
+/// for an input-determined reason. Resource waits are reported separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tier2RetryPause {
     pub category: InspectCategory,
@@ -624,6 +659,13 @@ pub struct Tier2RetryPause {
     /// Consecutive failures with this same reason.
     pub identical_failures: u32,
     /// Unix millisecond at which automatic refreshes may retry.
+    pub retry_at_ms: u64,
+}
+
+/// A short resource wait, distinct from failures determined by source inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier2ResourceWait {
+    pub category: InspectCategory,
     pub retry_at_ms: u64,
 }
 
@@ -1082,6 +1124,12 @@ impl InspectManager {
             BuilderAttemptTerminal::Succeeded => {
                 states.remove(key);
             }
+            BuilderAttemptTerminal::CacheWriterLeaseWait => {
+                states
+                    .entry(key.clone())
+                    .or_insert_with(|| BuilderStateEntry::new(InspectBuilderState::Building))
+                    .record_cache_writer_wait();
+            }
             BuilderAttemptTerminal::Failed(terminal) => {
                 let epoch = self.tier2_input_epoch.load(Ordering::SeqCst);
                 let pause_retries = failure_pauses_automatic_retries(outcome);
@@ -1247,6 +1295,39 @@ impl InspectManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         retry_pause_from_states(&states, category, Instant::now())
+    }
+
+    pub(crate) fn tier2_resource_wait(
+        &self,
+        category: InspectCategory,
+    ) -> Option<Tier2ResourceWait> {
+        let states = self.builder_states.lock().ok()?;
+        let entry = states.get(&JobKey::for_project_category(category))?;
+        let (retry_at, retry_at_ms) = entry.resource_retry_at?;
+        (Instant::now() < retry_at).then_some(Tier2ResourceWait {
+            category,
+            retry_at_ms,
+        })
+    }
+
+    /// Include expired waits so maintenance can retry without a source change.
+    /// Disabled categories and active attempts must not keep arming dispatches.
+    pub(crate) fn try_tier2_resource_retry_at(&self, config: &Config) -> Option<Option<Instant>> {
+        let states = self.builder_states.try_lock().ok()?;
+        Some(
+            states
+                .iter()
+                .filter_map(|(key, entry)| {
+                    (config.inspect.enabled
+                        && config.inspect.category_enabled(key.category)
+                        && (key.category != InspectCategory::DeadCode || config.indexes.callgraph)
+                        && !entry.is_in_flight())
+                    .then_some(entry.resource_retry_at)
+                    .flatten()
+                    .map(|(at, _)| at)
+                })
+                .min(),
+        )
     }
 
     /// Record watcher-observed (or agent-written) changes. When any of
@@ -1828,6 +1909,9 @@ impl InspectManager {
         if self.tier2_retry_pause(category).is_some() {
             return Ok(None);
         }
+        if self.tier2_resource_wait(category).is_some() {
+            return Ok(None);
+        }
         self.automatic_tier2_schedule_count
             .fetch_add(1, Ordering::SeqCst);
 
@@ -1932,6 +2016,13 @@ impl InspectManager {
         requested.retain(|category| match self.tier2_retry_pause(*category) {
             Some(pause) => {
                 submission.retry_paused.push(pause);
+                false
+            }
+            None => true,
+        });
+        requested.retain(|category| match self.tier2_resource_wait(*category) {
+            Some(wait) => {
+                submission.resource_waits.push(wait);
                 false
             }
             None => true,
@@ -11518,6 +11609,7 @@ mod tier2_unreadable_source_tests {
             "tier2 pass timed out after 600000ms and was cancelled"
         )));
         for transient in [
+            "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed",
             "callgraph_unavailable",
             "tier2 pass cancelled before incremental scan",
             "explicit inspect Tier-2 cold-build admission was cancelled",
@@ -11532,6 +11624,216 @@ mod tier2_unreadable_source_tests {
         assert!(!failure_pauses_automatic_retries(&JobOutcome::Fresh {
             payload: json!({ "callgraph_available": false }),
         }));
+    }
+
+    #[test]
+    fn writer_lease_timeout_completion_waits_for_resource_not_input_change() {
+        let (_dir, root, snapshot) = fixture();
+        let category = InspectCategory::Complexity;
+        let project_key = crate::path_identity::project_scope_key(&root);
+        let project_dir = snapshot.inspect_dir.join(project_key);
+        std::fs::create_dir_all(&project_dir).expect("inspect directory");
+        let held = crate::fs_lock::try_acquire(
+            &crate::root_cache::writer_lease_path(&project_dir),
+            Duration::ZERO,
+        )
+        .expect("independent live writer lease");
+        let manager = Arc::new(InspectManager::new());
+        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
+        let first =
+            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
+        assert_eq!(first.newly_queued_categories, vec![category]);
+        let (flights, timeout) = manager
+            .in_flight_changed
+            .wait_timeout_while(
+                manager.in_flight.lock().unwrap(),
+                Duration::from_secs(30),
+                |flights| !flights.is_empty(),
+            )
+            .unwrap();
+        assert!(!timeout.timed_out(), "lease attempt did not complete");
+        assert!(flights.is_empty());
+        drop(flights);
+        assert_eq!(manager.reuse_completion_count(), 1);
+        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
+        assert!(
+            held.verify_writer_epoch().expect("lease verification"),
+            "never steal a live lease"
+        );
+        assert!(
+            manager.tier2_retry_pause(category).is_none(),
+            "lease timeout must not record an input-failure pause: {:?}",
+            manager.tier2_retry_pause(category),
+        );
+        let wait = manager
+            .tier2_resource_wait(category)
+            .expect("resource wait recorded");
+        assert_eq!(manager.try_tier2_retry_pauses(), Some(Vec::new()));
+        assert_eq!(
+            manager.tier2_builder_state(category),
+            InspectBuilderState::WaitingForCacheWriterLease
+        );
+        let detail = manager.tier2_builder_state_detail(category);
+        assert!(
+            detail.contains("waiting for the inspect cache writer lease"),
+            "{detail}"
+        );
+        assert!(!detail.contains("failed"), "{detail}");
+        let key = JobKey::for_project_category(category);
+        let retry_at = manager
+            .try_tier2_resource_retry_at(&snapshot.config)
+            .unwrap()
+            .unwrap();
+        assert!(retry_at > Instant::now());
+        assert!(retry_at <= Instant::now() + Duration::from_secs(30));
+        assert_eq!(
+            wait.retry_at_ms,
+            manager.builder_states.lock().unwrap()[&key]
+                .resource_retry_at
+                .unwrap()
+                .1
+        );
+        let blocked =
+            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
+        assert!(blocked.newly_queued_categories.is_empty(), "{blocked:?}");
+        assert!(blocked.retry_paused.is_empty(), "{blocked:?}");
+        assert_eq!(blocked.resource_waits, vec![wait]);
+        assert!(manager
+            .submit_tier2_run_with_reuse_background(snapshot.clone(), category)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            manager.automatic_tier2_schedule_count_for_test(),
+            1,
+            "no immediate automatic retry"
+        );
+
+        drop(held);
+        // Advance the resource deadline, not the input epoch. A lease release
+        // needs no watcher edit to make the next automatic admission succeed.
+        manager
+            .builder_states
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .resource_retry_at = Some((Instant::now(), unix_millis_now()));
+        let resumed =
+            manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
+        assert_eq!(resumed.newly_queued_categories, vec![category]);
+        let (flights, timeout) = manager
+            .in_flight_changed
+            .wait_timeout_while(
+                manager.in_flight.lock().unwrap(),
+                Duration::from_secs(30),
+                |flights| !flights.is_empty(),
+            )
+            .unwrap();
+        assert!(!timeout.timed_out(), "retry did not complete");
+        drop(flights);
+        assert_eq!(manager.reuse_completion_count(), 2);
+        assert_eq!(manager.successful_reuse_completion_count(), 1);
+        assert_eq!(manager.tier2_input_epoch.load(Ordering::SeqCst), 0);
+        assert!(manager.tier2_resource_wait(category).is_none());
+        assert_eq!(
+            manager.try_tier2_resource_retry_at(&snapshot.config),
+            Some(None)
+        );
+        assert!(manager.tier2_retry_pause(category).is_none());
+    }
+
+    #[test]
+    fn repeated_lease_waits_are_bounded_and_explicit_inspect_bypasses_them() {
+        let (_dir, root, snapshot) = fixture();
+        let manager = Arc::new(InspectManager::new());
+        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
+        let category = InspectCategory::Complexity;
+        let key = JobKey::for_project_category(category);
+        let lease_timeout = JobOutcome::Failed {
+            message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
+        };
+        for _ in 0..8 {
+            manager
+                .in_flight
+                .lock()
+                .unwrap()
+                .entry(key.clone())
+                .or_default();
+            manager.record_flight_start(&key);
+            manager.finish_tier2_flight(&key, lease_timeout.clone());
+            let states = manager.builder_states.lock().unwrap();
+            let entry = &states[&key];
+            let retry_at = entry.resource_retry_at.unwrap().0;
+            assert!(retry_at > Instant::now());
+            assert!(retry_at <= Instant::now() + Duration::from_secs(30));
+            assert!(entry.retry_paused_until.is_none());
+            assert!(entry.last_failure.is_none());
+        }
+        manager.clear_tier2_retry_pauses();
+        assert!(
+            manager.tier2_resource_wait(category).is_some(),
+            "input resets do not release a lease"
+        );
+        let mut disabled = (*snapshot.config).clone();
+        disabled.inspect.enabled = false;
+        assert_eq!(manager.try_tier2_resource_retry_at(&disabled), Some(None));
+        let explicit = manager.tier2_run_with_reuse_blocking(
+            snapshot.clone(),
+            category,
+            JobScope::for_project(root),
+        );
+        assert!(matches!(explicit, JobOutcome::Fresh { .. }), "{explicit:?}");
+        assert!(manager.tier2_resource_wait(category).is_none());
+        assert_eq!(
+            manager.try_tier2_resource_retry_at(&snapshot.config),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn completion_preserves_input_failure_pause_and_transient_controls() {
+        let manager = InspectManager::new();
+        let category = InspectCategory::Complexity;
+        let key = JobKey::for_project_category(category);
+        let complete = |outcome| {
+            manager
+                .in_flight
+                .lock()
+                .unwrap()
+                .entry(key.clone())
+                .or_default();
+            manager.record_flight_start(&key);
+            manager.finish_tier2_flight(&key, outcome);
+        };
+        complete(JobOutcome::Failed {
+            message: "failed to read source input: Permission denied".into(),
+        });
+        assert!(
+            manager.tier2_retry_pause(category).is_some(),
+            "genuine input failures still pause"
+        );
+        assert!(manager.tier2_resource_wait(category).is_none());
+        for outcome in [
+            JobOutcome::Failed {
+                message: "admission was cancelled".into(),
+            },
+            JobOutcome::Failed {
+                message: "tier2 pass cancelled before incremental scan".into(),
+            },
+            JobOutcome::Failed {
+                message: "callgraph_unavailable".into(),
+            },
+            JobOutcome::Fresh {
+                payload: json!({"callgraph_available": false}),
+            },
+        ] {
+            complete(outcome.clone());
+            assert!(manager.tier2_retry_pause(category).is_none(), "{outcome:?}");
+            assert!(
+                manager.tier2_resource_wait(category).is_none(),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

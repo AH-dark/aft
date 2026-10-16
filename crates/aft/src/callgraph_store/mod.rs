@@ -76,6 +76,7 @@ const CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES: i64 = 4_000;
 const CALLGRAPH_SQLITE_CACHE_KIB: i64 = -8 * 1024;
 const CALLGRAPH_STATEMENT_CACHE_CAPACITY: usize = 96;
 const REFRESH_IDLE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+const REFRESH_WRITER_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// A root removed from `cache-keys.json` cannot be reached by a future checkout.
 /// Wait the same seven-day grace period as cache-key eviction before deleting its
 /// callgraph directory so an interrupted configuration never loses recent data.
@@ -2024,9 +2025,8 @@ struct RefreshBatch {
     pending_sinks: Vec<PendingCallGraphStorePaths>,
     refresh_states: Vec<CallgraphRefreshState>,
     ticket: Option<CallgraphRefreshTicket>,
-    /// Held until the worker is done with this batch (applied, failed or
-    /// deferred), then dropped with it. Callers use it to learn when a refresh
-    /// they depend on has settled.
+    /// Held until the batch settles, including while a writer-excluded batch
+    /// waits for readiness. Queries must not mistake parked work for completion.
     keepalive: Vec<RefreshKeepalive>,
 }
 
@@ -2034,6 +2034,26 @@ struct RefreshBatch {
 pub(crate) type RefreshKeepalive = Arc<dyn std::any::Any + Send + Sync>;
 
 impl RefreshBatch {
+    fn eligible_for_replay(&self) -> bool {
+        self.ticket
+            .as_ref()
+            .is_none_or(CallgraphRefreshTicket::is_current)
+            && (self.refresh_states.is_empty()
+                || self
+                    .refresh_states
+                    .iter()
+                    .any(|state| state.heavy_root_work_allowed.load(AtomicOrdering::SeqCst)))
+    }
+
+    fn remove_pending_paths(&self) {
+        for sink in &self.pending_sinks {
+            let mut pending = sink.lock();
+            for path in &self.paths {
+                pending.remove(path);
+            }
+        }
+    }
+
     fn path_is_ignored(&self, path: &Path) -> bool {
         self.refresh_states.iter().any(|state| {
             state.matcher.as_ref().is_some_and(|matcher| {
@@ -2057,7 +2077,7 @@ impl RefreshBatch {
         }
     }
 
-    fn defer_after_open_failure(&self) {
+    fn defer_after_open_failure(&self, before_open: &[Option<Arc<ReadonlyCallGraphStore>>]) {
         self.defer();
         if self
             .ticket
@@ -2071,21 +2091,37 @@ impl RefreshBatch {
             return;
         }
 
-        let ready_store_installed = self.refresh_states.iter().any(|state| {
-            let store = state.installed_store_snapshot();
-            store.is_some_and(|store| {
-                store.project_root() == self.root.project_root
-                    && !store.is_legacy_fallback()
-                    && store.is_current()
-            })
-        });
+        let ready_store_installed =
+            self.refresh_states
+                .iter()
+                .zip(before_open)
+                .any(|(state, before)| {
+                    let store = state.installed_store_snapshot();
+                    store.is_some_and(|store| {
+                        !before
+                            .as_ref()
+                            .is_some_and(|before| Arc::ptr_eq(before, &store))
+                            && store.project_root() == self.root.project_root
+                            && !store.is_legacy_fallback()
+                            && store.is_current()
+                    })
+                });
         if !ready_store_installed {
             return;
         }
+        match refresh_writer_available(&self.root, false) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                crate::slog_warn!("could not determine writer lease availability: {error}");
+                return;
+            }
+        }
 
-        // This re-check and the ready-store install's pending-sink take form a
-        // check-then-act handoff: after this defer, exactly one site observes
-        // the parked paths with a ready current store, so no polling is needed.
+        // A ready-store installation may drain the project's pending refresh
+        // paths before the failed batch parks them. A changed installed snapshot
+        // lets the batch finish that missed replay, but only once the lease no
+        // longer has a live owner.
         for sink in &self.pending_sinks {
             let paths = {
                 let mut pending = sink.lock();
@@ -2105,7 +2141,7 @@ impl RefreshBatch {
                 Arc::clone(sink),
                 self.refresh_states.clone(),
                 self.ticket.clone(),
-                None,
+                Some(Arc::new(self.keepalive.clone())),
             );
         }
     }
@@ -2147,7 +2183,207 @@ struct RefreshQueue {
     order: VecDeque<RefreshRoot>,
     queued: HashMap<RefreshRoot, RefreshBatch>,
     active: Option<RefreshBatch>,
+    waiting: HashMap<RefreshRoot, WaitingRefresh>,
+    readiness_events: HashSet<RefreshRoot>,
     shutdown_requested: bool,
+}
+
+struct WaitingRefresh {
+    batch: RefreshBatch,
+    failure: RefreshOpenFailure,
+    lease_probe_error: Option<String>,
+    identity: Arc<()>,
+    next_recheck: Instant,
+}
+
+impl WaitingRefresh {
+    fn writer_available(&mut self, fallback: bool) -> bool {
+        match refresh_writer_available(&self.batch.root, fallback) {
+            Ok(available) => {
+                self.lease_probe_error = None;
+                available
+            }
+            Err(error) => {
+                self.lease_probe_error = Some(format!(
+                    "could not determine writer lease availability: {error}"
+                ));
+                false
+            }
+        }
+    }
+}
+
+struct RefreshOpenFailure {
+    writer_excluded: bool,
+    published_generation: Option<String>,
+}
+
+impl RefreshOpenFailure {
+    fn readiness_changed(&self, root: &RefreshRoot) -> bool {
+        (self.writer_excluded
+            && !crate::root_cache::writer_lease_path(&root.callgraph_dir).exists())
+            || read_pointer(
+                &root.callgraph_dir,
+                &crate::search_index::artifact_cache_key(&root.project_root),
+            ) != self.published_generation
+    }
+}
+
+fn refresh_writer_available(root: &RefreshRoot, fallback: bool) -> std::io::Result<bool> {
+    use crate::fs_lock::LockAvailability;
+    let lease = crate::root_cache::writer_lease_path(&root.callgraph_dir);
+    match crate::fs_lock::lock_availability(&lease)? {
+        LockAvailability::Available | LockAvailability::Stale => Ok(true),
+        LockAvailability::LiveOwner => Ok(false),
+        // Only the slow fallback retries malformed leases. Normal acquisition
+        // owns the grace-period reread and reclaim, including replacement checks.
+        LockAvailability::Malformed => Ok(fallback),
+    }
+}
+
+fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
+    use notify::{event::ModifyKind, EventKind};
+    let named_release = matches!(
+        event.kind,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    ) && event.paths.iter().any(|path| path == lease);
+    // Native watchers can report SQLite sidecar writes without the adjacent
+    // lease deletion. Those writes are readiness hints only if the lease is
+    // gone; the worker still checks writer liveness before reopening the store.
+    let sibling_change = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) && event
+        .paths
+        .iter()
+        .any(|path| path.parent() == lease.parent())
+        && !lease.exists();
+    named_release || sibling_change
+}
+
+fn refresh_readiness_watch(
+    shared: &Arc<RefreshWorkerShared>,
+    root: &RefreshRoot,
+) -> notify::Result<notify::RecommendedWatcher> {
+    use notify::{EventKind, RecursiveMode, Watcher};
+    #[cfg(test)]
+    if refresh_worker_test_seam(&root.project_root).fail_watch {
+        return Err(notify::Error::generic(
+            "injected readiness watch subscription failure",
+        ));
+    }
+    let shared = Arc::downgrade(shared);
+    let root = root.clone();
+    let watch_dir = fs_canonicalize(&root.callgraph_dir).map_err(notify::Error::io)?;
+    let lease = crate::root_cache::writer_lease_path(&watch_dir);
+    let pointer = pointer_path(
+        &watch_dir,
+        &crate::search_index::artifact_cache_key(&root.project_root),
+    );
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else { return };
+        let lease_released = refresh_lease_release_event(&event, &lease);
+        #[cfg(test)]
+        let lease_released =
+            lease_released && !refresh_worker_test_seam(&root.project_root).ignore_lease_release;
+        let published = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) && event.paths.contains(&pointer);
+        if lease_released || published {
+            if let Some(shared) = shared.upgrade() {
+                let mut queue = shared
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                queue.readiness_events.insert(root.clone());
+                shared.wake.notify_all();
+            }
+        }
+    })?;
+    watcher.watch(&watch_dir, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
+pub(crate) fn callgraph_refresh_status(project_root: &Path) -> serde_json::Value {
+    let isolated = ISOLATED_REFRESH_TEST_WORKERS
+        .get()
+        .and_then(|workers| workers.lock().unwrap().get(project_root).cloned());
+    let worker = isolated.or_else(|| {
+        CALLGRAPH_REFRESH_WORKER
+            .get()
+            .and_then(|worker| worker.lock().unwrap().clone())
+    });
+    let Some(worker) = worker else {
+        return serde_json::Value::Null;
+    };
+    let queue = worker.shared.queue.lock().unwrap();
+    let waiting = queue
+        .waiting
+        .values()
+        .find(|waiting| waiting.batch.root.project_root == project_root);
+    waiting.map_or(serde_json::Value::Null, |waiting| serde_json::json!({
+        "state": "waiting",
+        "reason": waiting.lease_probe_error.as_deref().unwrap_or(if waiting.failure.writer_excluded { "waiting for writer lease held by another process" } else { "waiting for a ready callgraph store" }),
+        "pending_paths": waiting.batch.paths.len(),
+    }))
+}
+
+pub(crate) fn retire_obsolete_callgraph_refresh_waiters() {
+    let mut workers = ISOLATED_REFRESH_TEST_WORKERS
+        .get()
+        .map(|workers| {
+            workers
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(worker) = CALLGRAPH_REFRESH_WORKER
+        .get()
+        .and_then(|slot| slot.lock().unwrap().clone())
+    {
+        workers.push(worker);
+    }
+    for worker in workers {
+        // Enqueue holds lifecycle admission before locking the queue. Check
+        // tickets outside the queue lock to preserve that lock order.
+        let candidates = {
+            let queue = worker.shared.queue.lock().unwrap();
+            queue
+                .waiting
+                .iter()
+                .map(|(root, waiting)| {
+                    (
+                        root.clone(),
+                        Arc::clone(&waiting.identity),
+                        waiting.batch.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let obsolete = candidates
+            .into_iter()
+            .filter(|(_, _, batch)| !batch.eligible_for_replay())
+            .collect::<Vec<_>>();
+        let mut queue = worker.shared.queue.lock().unwrap();
+        for (root, identity, _) in obsolete {
+            if !queue
+                .waiting
+                .get(&root)
+                .is_some_and(|waiting| Arc::ptr_eq(&waiting.identity, &identity))
+            {
+                continue;
+            }
+            // Paths are already parked. Release the old query guard without
+            // waiting for a foreign writer unrelated to the new lifecycle.
+            queue.waiting.remove(&root);
+            queue.readiness_events.insert(root);
+        }
+        worker.shared.wake.notify_all();
+    }
 }
 
 struct RefreshWorkerShared {
@@ -2210,6 +2446,31 @@ impl Drop for RefreshWorkerWatchdog {
 }
 
 impl RefreshWorker {
+    #[cfg(test)]
+    fn wait_for_root_with_budget(&self, project_root: &Path, budget: Duration) -> bool {
+        let root_busy = |queue: &RefreshQueue| {
+            queue
+                .active
+                .as_ref()
+                .is_some_and(|batch| batch.root.project_root == project_root)
+                || queue
+                    .queued
+                    .keys()
+                    .any(|root| root.project_root == project_root)
+                || queue
+                    .waiting
+                    .keys()
+                    .any(|root| root.project_root == project_root)
+        };
+        let queue = self.shared.queue.lock().unwrap();
+        let (queue, _) = self
+            .shared
+            .wake
+            .wait_timeout_while(queue, budget, |queue| root_busy(queue))
+            .unwrap();
+        !root_busy(&queue)
+    }
+
     fn spawn() -> Arc<Self> {
         let shared = Arc::new(RefreshWorkerShared {
             queue: Mutex::new(RefreshQueue::default()),
@@ -2244,6 +2505,25 @@ impl RefreshWorker {
             pending_sink.lock().extend(paths);
             return false;
         }
+        if let Some(waiting) = queue.waiting.remove(&root) {
+            let mut waiting = waiting;
+            waiting
+                .batch
+                .merge(paths, pending_sink, refresh_states, ticket);
+            waiting.batch.keepalive.extend(keepalive);
+            if !waiting.writer_available(false) {
+                waiting.batch.defer();
+                queue.waiting.insert(root, waiting);
+                self.shared.wake.notify_all();
+                return true;
+            }
+            let batch = waiting.batch;
+            batch.remove_pending_paths();
+            queue.order.push_back(root.clone());
+            queue.queued.insert(root, batch);
+            self.shared.wake.notify_all();
+            return true;
+        }
         if let Some(batch) = queue.queued.get_mut(&root) {
             batch.merge(paths, pending_sink, refresh_states, ticket);
             batch.keepalive.extend(keepalive);
@@ -2276,6 +2556,8 @@ impl RefreshWorker {
             .lock()
             .expect("callgraph refresh queue mutex poisoned");
         queue.shutdown_requested = true;
+        let had_waiting = !queue.waiting.is_empty();
+        queue.waiting.clear();
         self.shared.wake.notify_all();
         while (queue.active.is_some() || !queue.order.is_empty()) && Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2309,7 +2591,7 @@ impl RefreshWorker {
                 let _ = thread.join();
             }
         }
-        drained
+        drained && !had_waiting
     }
 }
 
@@ -2477,9 +2759,12 @@ pub(crate) fn retire_ignored_refresh_paths(
         .lock()
         .expect("callgraph refresh queue mutex poisoned");
     let mut dropped = 0;
-    for batch in queue
-        .queued
+    let RefreshQueue {
+        queued, waiting, ..
+    } = &mut *queue;
+    for batch in queued
         .values_mut()
+        .chain(waiting.values_mut().map(|waiting| &mut waiting.batch))
         .filter(|batch| batch.root.project_root == project_root)
     {
         let before = batch.paths.len();
@@ -2488,6 +2773,16 @@ pub(crate) fn retire_ignored_refresh_paths(
         });
         dropped += before - batch.paths.len();
     }
+    let emptied = waiting
+        .iter()
+        .filter(|(_, waiting)| waiting.batch.paths.is_empty())
+        .map(|(root, _)| root.clone())
+        .collect::<Vec<_>>();
+    for root in emptied {
+        queue.waiting.remove(&root);
+        queue.readiness_events.insert(root);
+    }
+    worker.shared.wake.notify_all();
     // The active batch is worker-owned and may already be resolving a graph.
     // Its admission and defer gates read the shared matcher instead.
     dropped
@@ -2592,7 +2887,14 @@ pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
         return true;
     };
     let drained = worker.shutdown_with_budget(budget);
-    if drained {
+    // Parked paths make the flush incomplete even after shutdown has joined the
+    // thread. Detach that stopped worker so the next enqueue can start a new one.
+    let stopped = worker
+        .thread
+        .lock()
+        .expect("callgraph refresh worker thread mutex poisoned")
+        .is_none();
+    if stopped {
         let mut current = slot
             .lock()
             .expect("callgraph refresh worker mutex poisoned");
@@ -2604,6 +2906,19 @@ pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
         }
     }
     drained
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_process_callgraph_refresh_for_test(
+    project_root: &Path,
+    budget: Duration,
+) -> bool {
+    // A fixture's completion must not depend on other roots' parked refreshes.
+    // Unlike shutdown, this wait neither discards their work nor stops the worker.
+    let worker = CALLGRAPH_REFRESH_WORKER
+        .get()
+        .and_then(|slot| slot.lock().unwrap().clone());
+    worker.is_none_or(|worker| worker.wait_for_root_with_budget(project_root, budget))
 }
 
 fn idle_checkpoint_due(last: Option<Instant>, now: Instant) -> bool {
@@ -2649,42 +2964,160 @@ impl Drop for ActiveRefreshBatchGuard<'_> {
     }
 }
 
-fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
+fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
     // The worker owns these caches so maps are shared only by refreshes for the
     // same canonical root and disappear when the worker shuts down.
     let mut workspace_crate_prefixes = HashMap::new();
     let mut last_idle_checkpoints: HashMap<RefreshRoot, Instant> = HashMap::new();
+    // Watchers live outside the queue lock: dropping a native watcher can join
+    // its callback thread, which may itself be waiting to lock the queue.
+    let mut readiness_watches = HashMap::new();
     loop {
-        let batch = {
+        enum Work {
+            Batch(RefreshBatch),
+            Readiness { root: RefreshRoot, fallback: bool },
+            Shutdown,
+        }
+        let work = {
             let mut queue = shared
                 .queue
                 .lock()
                 .expect("callgraph refresh queue mutex poisoned");
             loop {
+                // One fixed deadline per root recovers missed notifications and
+                // killed owners; the liveness gate below still forbids a reopen
+                // while a live writer owns the lease.
+                let next_recheck = queue
+                    .waiting
+                    .iter()
+                    .min_by_key(|(_, waiting)| waiting.next_recheck)
+                    .map(|(root, waiting)| (root.clone(), waiting.next_recheck));
+                if let Some((root, deadline)) = next_recheck.as_ref() {
+                    if *deadline <= Instant::now() {
+                        queue.waiting.get_mut(root).unwrap().next_recheck =
+                            Instant::now() + REFRESH_WRITER_RECHECK_INTERVAL;
+                        break Work::Readiness {
+                            root: root.clone(),
+                            fallback: true,
+                        };
+                    }
+                }
+                if let Some(root) = queue.readiness_events.iter().next().cloned() {
+                    queue.readiness_events.remove(&root);
+                    break Work::Readiness {
+                        root,
+                        fallback: false,
+                    };
+                }
                 if let Some(root) = queue.order.pop_front() {
                     let batch = queue
                         .queued
                         .remove(&root)
                         .expect("queued callgraph refresh root has a batch");
                     queue.active = Some(batch.clone());
-                    break batch;
+                    break Work::Batch(batch);
                 }
                 if queue.shutdown_requested {
-                    return;
+                    break Work::Shutdown;
                 }
-                queue = shared
-                    .wake
-                    .wait(queue)
-                    .expect("callgraph refresh queue mutex poisoned while waiting");
+                queue = if let Some((_, deadline)) = next_recheck {
+                    shared
+                        .wake
+                        .wait_timeout(queue, deadline.saturating_duration_since(Instant::now()))
+                        .expect(
+                            "callgraph refresh queue mutex poisoned while waiting for readiness",
+                        )
+                        .0
+                } else {
+                    shared
+                        .wake
+                        .wait(queue)
+                        .expect("callgraph refresh queue mutex poisoned while waiting")
+                };
             }
         };
+
+        let batch = match work {
+            Work::Shutdown => return,
+            Work::Readiness { root, fallback } => {
+                let mut queue = shared.queue.lock().unwrap();
+                let changed = queue.waiting.get_mut(&root).is_some_and(|waiting| {
+                    if !fallback && !waiting.failure.readiness_changed(&root) {
+                        return false;
+                    }
+                    waiting.writer_available(fallback)
+                });
+                if !queue.waiting.contains_key(&root) {
+                    drop(queue);
+                    readiness_watches.remove(&root);
+                    continue;
+                }
+                if changed {
+                    let waiting = queue.waiting.remove(&root).unwrap();
+                    queue.active = Some(waiting.batch.clone());
+                    drop(queue);
+                    let mut active = ActiveRefreshBatchGuard {
+                        shared,
+                        released: false,
+                    };
+                    readiness_watches.remove(&root);
+                    let batch = waiting.batch;
+                    let current = batch.eligible_for_replay();
+                    let mut queue = shared.queue.lock().unwrap();
+                    if current && !queue.shutdown_requested {
+                        batch.remove_pending_paths();
+                        if let Some(queued) = queue.queued.get_mut(&root) {
+                            for sink in &batch.pending_sinks {
+                                queued.merge(
+                                    batch.paths.iter().cloned(),
+                                    Arc::clone(sink),
+                                    batch.refresh_states.clone(),
+                                    None,
+                                );
+                            }
+                            queued.keepalive.extend(batch.keepalive);
+                        } else {
+                            queue.order.push_back(root.clone());
+                            queue.queued.insert(root.clone(), batch);
+                        }
+                    } else {
+                        drop(batch);
+                    }
+                    drop(queue);
+                    active.release();
+                }
+                #[cfg(test)]
+                {
+                    let mut seams = REFRESH_WORKER_TEST_SEAMS
+                        .get_or_init(Default::default)
+                        .lock()
+                        .unwrap();
+                    if let Some(seam) = seams.get_mut(&root.project_root) {
+                        if fallback {
+                            seam.fallback_checks += 1;
+                        } else {
+                            seam.readiness_checks += 1;
+                        }
+                    }
+                    shared.wake.notify_all();
+                }
+                continue;
+            }
+            Work::Batch(batch) => batch,
+        };
+        readiness_watches.remove(&batch.root);
 
         let mut active = ActiveRefreshBatchGuard {
             shared,
             released: false,
         };
+        let mut open_failure = None;
         let store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_callgraph_refresh_batch(&batch, &mut workspace_crate_prefixes)
+            process_callgraph_refresh_batch(
+                &batch,
+                &mut workspace_crate_prefixes,
+                &mut open_failure,
+            )
         }))
         .unwrap_or_else(|_| {
             batch.defer();
@@ -2718,6 +3151,57 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
             store
         });
         let root = batch.root.clone();
+        if let Some(failure) = open_failure {
+            let current = batch.eligible_for_replay();
+            let parked = batch.pending_sinks.iter().any(|sink| {
+                let pending = sink.lock();
+                batch.paths.iter().any(|path| pending.contains(path))
+            });
+            if current && parked {
+                match refresh_readiness_watch(shared, &root) {
+                    Ok(watch) => { readiness_watches.insert(root.clone(), watch); }
+                    Err(error) => crate::slog_warn!("callgraph refresh readiness watch unavailable; paths remain pending: {error}"),
+                }
+                let mut queue = shared.queue.lock().unwrap();
+                let waiting_batch = if let Some(mut queued) = queue.queued.remove(&root) {
+                    queue.order.retain(|queued_root| queued_root != &root);
+                    for sink in &batch.pending_sinks {
+                        queued.merge(
+                            batch.paths.iter().cloned(),
+                            Arc::clone(sink),
+                            batch.refresh_states.clone(),
+                            None,
+                        );
+                    }
+                    queued.keepalive.extend(batch.keepalive.iter().cloned());
+                    queued.defer();
+                    queued
+                } else {
+                    batch.clone()
+                };
+                if !queue.shutdown_requested {
+                    // Arm first, then check: a release/publication between the
+                    // failed open and subscription must not strand the batch.
+                    if failure.readiness_changed(&root) {
+                        queue.readiness_events.insert(root.clone());
+                    }
+                    queue.waiting.insert(
+                        root.clone(),
+                        WaitingRefresh {
+                            batch: waiting_batch,
+                            failure,
+                            lease_probe_error: None,
+                            identity: Arc::new(()),
+                            next_recheck: Instant::now() + REFRESH_WRITER_RECHECK_INTERVAL,
+                        },
+                    );
+                }
+                drop(queue);
+                // A lifecycle change can miss a batch still entering waiting.
+                // Recheck after insertion so either side retires its old guard.
+                retire_obsolete_callgraph_refresh_waiters();
+            }
+        }
         // Release catch-up tickets before publishing idle to event waiters.
         drop(batch);
 
@@ -2728,6 +3212,8 @@ fn callgraph_refresh_worker_loop(shared: &RefreshWorkerShared) {
                 idle_checkpoint_due(last_idle_checkpoints.get(&root).copied(), Instant::now());
             if checkpoint_due {
                 if let Some(store) = store {
+                    #[cfg(test)]
+                    hold_idle_writer_for_test(shared, &root.project_root, &store);
                     if store.checkpoint_wal_truncate() {
                         last_idle_checkpoints.insert(root.clone(), Instant::now());
                     }
@@ -2744,6 +3230,7 @@ pub(crate) fn invalidate_refresh_workspace_package_cache(project_root: &Path) {
 fn process_callgraph_refresh_batch(
     batch: &RefreshBatch,
     workspace_crate_prefixes: &mut HashMap<RefreshRoot, WorkspaceCratePrefixCache>,
+    open_failure: &mut Option<RefreshOpenFailure>,
 ) -> Option<CallGraphStore> {
     // A manifest event is an invalidation signal, not a source file to parse.
     // Drop the root's map even for a superseded batch: the filesystem changed,
@@ -2792,6 +3279,15 @@ fn process_callgraph_refresh_batch(
     let _watchdog = RefreshWorkerWatchdog::start(&paths);
     let test_seam = refresh_worker_test_seam(&batch.root.project_root);
     note_refresh_worker_call_for_test(&batch.root.project_root);
+    let before_open = batch
+        .refresh_states
+        .iter()
+        .map(CallgraphRefreshState::installed_store_snapshot)
+        .collect::<Vec<_>>();
+    let published_generation = read_pointer(
+        &batch.root.callgraph_dir,
+        &crate::search_index::artifact_cache_key(&batch.root.project_root),
+    );
     let opened = if test_seam.fail_open {
         Ok(None)
     } else {
@@ -2810,11 +3306,22 @@ fn process_callgraph_refresh_batch(
     let store = match opened {
         Ok(Some(store)) => store,
         Ok(None) => {
-            batch.defer_after_open_failure();
+            batch.defer_after_open_failure(&before_open);
+            *open_failure = Some(RefreshOpenFailure {
+                writer_excluded: false,
+                published_generation,
+            });
             return None;
         }
         Err(error) => {
-            batch.defer_after_open_failure();
+            batch.defer_after_open_failure(&before_open);
+            *open_failure = Some(RefreshOpenFailure {
+                writer_excluded: matches!(
+                    error,
+                    CallGraphStoreError::Lock(crate::fs_lock::AcquireError::Timeout)
+                ),
+                published_generation,
+            });
             crate::slog_warn!(
                 "callgraph store writer open failed during refresh; deferred paths: {}",
                 error
@@ -2939,6 +3446,16 @@ fn workspace_crate_prefix_cache_for_root(
 #[derive(Clone, Default)]
 struct RefreshWorkerTestSeam {
     #[cfg(test)]
+    idle_writer_held: Option<crossbeam_channel::Sender<()>>,
+    #[cfg(test)]
+    fail_watch: bool,
+    #[cfg(test)]
+    ignore_lease_release: bool,
+    #[cfg(test)]
+    fallback_checks: usize,
+    #[cfg(test)]
+    readiness_checks: usize,
+    #[cfg(test)]
     panic_once: bool,
     #[cfg(test)]
     fail_stale_mark: bool,
@@ -2953,6 +3470,34 @@ struct RefreshWorkerTestSeam {
 
 static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
     OnceLock::new();
+
+#[cfg(test)]
+fn hold_idle_writer_for_test(
+    shared: &RefreshWorkerShared,
+    project_root: &Path,
+    store: &CallGraphStore,
+) {
+    let Some(held) = refresh_worker_test_seam(project_root).idle_writer_held else {
+        return;
+    };
+    // Queue idle precedes checkpointing and closing the writer connection. Hold
+    // an exclusive SQLite lock in that window so a fail-fast reader cannot win
+    // a scheduling race; shutdown is the fixture's signal to finish maintenance.
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")
+        .unwrap();
+    held.send(()).unwrap();
+    let queue = shared.queue.lock().unwrap();
+    drop(
+        shared
+            .wake
+            .wait_while(queue, |queue| !queue.shutdown_requested)
+            .unwrap(),
+    );
+}
 
 struct RefreshWorkerTestGate {
     held_tx: crossbeam_channel::Sender<()>,
@@ -21758,6 +22303,962 @@ mod refresh_worker_tests {
         Arc::new(parking_lot::Mutex::new(BTreeSet::new()))
     }
 
+    #[test]
+    fn root_refresh_wait_ignores_parked_sibling() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let (_other_temp, other_root, other_dir, other_source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(other_root.clone(), Duration::ZERO, false);
+        set_callgraph_refresh_worker_test_open_failure(other_root.clone(), true);
+        assert!(worker.worker.enqueue(
+            RefreshRoot {
+                callgraph_dir: other_dir,
+                project_root: other_root.clone(),
+            },
+            vec![other_source.clone()],
+            Arc::clone(&pending),
+            Vec::new(),
+            None,
+            None,
+        ));
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert!(worker
+            .worker
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .waiting
+            .keys()
+            .any(|root| root.project_root == other_root));
+        assert!(pending.lock().contains(&other_source));
+
+        let (held, release) = install_callgraph_refresh_worker_test_gate(root.clone());
+        assert!(enqueue_callgraph_store_refresh(
+            dir,
+            root.clone(),
+            vec![source],
+            pending_paths()
+        ));
+        held.recv_timeout(Duration::from_secs(12)).unwrap();
+        assert!(!worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::ZERO));
+        release.send(()).unwrap();
+        assert!(worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::from_secs(12)));
+        assert!(worker
+            .worker
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .waiting
+            .keys()
+            .any(|root| root.project_root == other_root));
+        assert!(pending.lock().contains(&other_source));
+        clear_callgraph_refresh_worker_test_seam(&other_root);
+    }
+
+    #[test]
+    fn sibling_write_signals_released_lease_but_not_live_writer() {
+        use notify::{
+            event::{DataChange, ModifyKind},
+            Event, EventKind,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let lease = temp.path().join("writer.lease");
+        fs::write(&lease, b"live writer").unwrap();
+        let sidecar = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(temp.path().join("generation.sqlite-shm"));
+        assert!(!refresh_lease_release_event(&sidecar, &lease));
+        fs::remove_file(&lease).unwrap();
+        assert!(refresh_lease_release_event(&sidecar, &lease));
+        let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(temp.path().join("generation.sqlite-shm"));
+        assert!(!refresh_lease_release_event(&access, &lease));
+        let unrelated = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(temp.path().join("another-cache/generation.sqlite-shm"));
+        assert!(!refresh_lease_release_event(&unrelated, &lease));
+    }
+
+    #[test]
+    fn deferred_shutdown_allows_next_process_worker_refresh() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(12));
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        set_callgraph_refresh_worker_test_open_failure(root.clone(), true);
+        assert!(enqueue_callgraph_store_refresh(
+            dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending)
+        ));
+        let worker = CALLGRAPH_REFRESH_WORKER
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let queue = worker.shared.queue.lock().unwrap();
+        let (queue, _) = worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                queue.active.is_some() || !queue.order.is_empty()
+            })
+            .unwrap();
+        assert!(queue
+            .waiting
+            .keys()
+            .any(|waiting| waiting.project_root == root));
+        drop(queue);
+        assert!(!flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(12)
+        ));
+        assert!(pending.lock().contains(&source));
+        assert!(worker.thread.lock().unwrap().is_none());
+
+        set_callgraph_refresh_worker_test_open_failure(root.clone(), false);
+        assert!(
+            enqueue_callgraph_store_refresh(dir, root.clone(), vec![source], pending_paths()),
+            "deferred shutdown must detach its stopped worker"
+        );
+        assert!(wait_for_process_callgraph_refresh_for_test(
+            &root,
+            Duration::from_secs(12)
+        ));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(12));
+        clear_callgraph_refresh_worker_test_seam(&root);
+    }
+
+    #[test]
+    #[ignore = "child-process writer fixture"]
+    fn foreign_writer_lease_child() {
+        use std::io::Write;
+        let Some(root) = std::env::var_os("AFT_REFRESH_FOREIGN_WRITER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let dir = PathBuf::from(std::env::var_os("AFT_REFRESH_FOREIGN_WRITER_DIR").unwrap());
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        let _store = CallGraphStore::open_ready(dir.clone(), root.clone())
+            .unwrap()
+            .unwrap();
+        println!("writer-ready");
+        std::io::stdout().flush().unwrap();
+        let mut command = [0];
+        while std::io::stdin().read_exact(&mut command).is_ok() {
+            if command[0] == b'p' {
+                let files = vec![root.join("main.rs")];
+                let _ = CallGraphStore::force_cold_build_with_lease_chunked(
+                    dir.clone(),
+                    root.clone(),
+                    &files,
+                    16,
+                )
+                .unwrap();
+                println!("published-ready");
+                std::io::stdout().flush().unwrap();
+            }
+        }
+    }
+
+    struct ForeignRefreshWriter {
+        child: std::process::Child,
+        killed: bool,
+    }
+
+    impl ForeignRefreshWriter {
+        fn start(root: &Path, dir: &Path) -> Self {
+            use std::io::BufRead;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "callgraph_store::refresh_worker_tests::foreign_writer_lease_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("AFT_REFRESH_FOREIGN_WRITER_ROOT", root)
+                .env("AFT_REFRESH_FOREIGN_WRITER_DIR", dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = std::io::BufReader::new(child.stdout.as_mut().unwrap());
+            let mut line = String::new();
+            loop {
+                assert!(
+                    output.read_line(&mut line).unwrap() > 0,
+                    "writer exited before acquiring lease"
+                );
+                if line.trim() == "writer-ready" {
+                    break;
+                }
+                line.clear();
+            }
+            Self {
+                child,
+                killed: false,
+            }
+        }
+
+        fn kill(&mut self) {
+            self.child.kill().unwrap();
+            assert!(!self.child.wait().unwrap().success());
+            self.killed = true;
+        }
+
+        fn publish(&mut self) {
+            use std::io::{BufRead, Write};
+            self.child.stdin.as_mut().unwrap().write_all(b"p").unwrap();
+            let mut output = std::io::BufReader::new(self.child.stdout.as_mut().unwrap());
+            let mut line = String::new();
+            loop {
+                assert!(
+                    output.read_line(&mut line).unwrap() > 0,
+                    "writer exited before publishing"
+                );
+                if line.trim() == "published-ready" {
+                    break;
+                }
+                line.clear();
+            }
+        }
+    }
+
+    impl Drop for ForeignRefreshWriter {
+        fn drop(&mut self) {
+            drop(self.child.stdin.take());
+            assert!(self.killed || self.child.wait().unwrap().success());
+        }
+    }
+
+    fn run_refresh_fallback_probe(worker: &CallgraphRefreshTestWorker) {
+        let mut queue = worker.worker.shared.queue.lock().unwrap();
+        let previous = refresh_worker_test_seam(&worker.root).fallback_checks;
+        let waiting = queue
+            .waiting
+            .values_mut()
+            .find(|waiting| waiting.batch.root.project_root == worker.root)
+            .unwrap();
+        // Advance the isolated root's fallback deadline instead of sleeping for
+        // the production writer-availability recheck interval of 60 seconds.
+        waiting.next_recheck = Instant::now() + Duration::from_millis(10);
+        worker.worker.shared.wake.notify_all();
+        let (queue, _) = worker
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                refresh_worker_test_seam(&worker.root).fallback_checks == previous
+                    || queue.active.is_some()
+                    || !queue.order.is_empty()
+            })
+            .unwrap();
+        let completed = refresh_worker_test_seam(&worker.root).fallback_checks == previous + 1
+            && queue.active.is_none()
+            && queue.order.is_empty();
+        drop(queue);
+        assert!(
+            completed,
+            "one scheduled fallback check must finish without another invalidation"
+        );
+    }
+
+    fn fallback_refresh_fixture(
+        fail_watch: bool,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        CallgraphRefreshTestWorker,
+        ForeignRefreshWriter,
+        PendingCallGraphStorePaths,
+        Arc<ReadonlyCallGraphStore>,
+    ) {
+        let (temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let ready = Arc::new(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .unwrap(),
+        );
+        let state = CallgraphRefreshState::new(
+            Arc::new(std::sync::RwLock::new(Some(Arc::clone(&ready)))),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .fail_watch = fail_watch;
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::new(AtomicU64::new(1)),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        enqueue_callgraph_store_refresh_fenced_with_state(
+            dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            state,
+            ticket,
+            None,
+        );
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        (temp, root, dir, source, worker, foreign, pending, ready)
+    }
+
+    #[test]
+    fn parked_refresh_recovers_from_empty_lease_on_fallback() {
+        assert_malformed_lease_refresh_recovers(b"");
+    }
+
+    #[test]
+    fn parked_refresh_recovers_from_partial_lease_on_fallback() {
+        assert_malformed_lease_refresh_recovers(b"{\"pid\":999999999,\"hostname\":");
+    }
+
+    fn assert_malformed_lease_refresh_recovers(contents: &[u8]) {
+        let (_temp, root, dir, source, worker, mut foreign, pending, ready) =
+            fallback_refresh_fixture(true);
+        foreign.kill();
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        fs::write(&lease, contents).unwrap();
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        assert!(pending.lock().contains(&source));
+
+        run_refresh_fallback_probe(&worker);
+
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+        assert!(callgraph_refresh_status(&root).is_null());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn parked_refresh_preserves_live_owner_on_fallback() {
+        let (_temp, root, dir, source, worker, foreign, pending, _ready) =
+            fallback_refresh_fixture(true);
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease).unwrap()).unwrap();
+        metadata["heartbeat_at_ms"] = serde_json::json!(0);
+        fs::write(&lease, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        for _ in 0..2 {
+            run_refresh_fallback_probe(&worker);
+            assert_eq!(
+                callgraph_refresh_worker_test_counts(&root),
+                (1, 0),
+                "even a stale heartbeat must not cause a retry against a live owner"
+            );
+            assert!(pending.lock().contains(&source));
+            assert_eq!(callgraph_refresh_status(&root)["state"], "waiting");
+            let current: serde_json::Value =
+                serde_json::from_slice(&fs::read(&lease).unwrap()).unwrap();
+            assert_eq!(current["writer_epoch"], metadata["writer_epoch"]);
+        }
+        drop(worker);
+        drop(foreign);
+    }
+
+    #[test]
+    fn parked_refresh_retries_lease_io_error_on_next_fallback() {
+        let (_temp, root, dir, source, worker, mut foreign, pending, ready) =
+            fallback_refresh_fixture(true);
+        foreign.kill();
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        fs::remove_file(&lease).unwrap();
+        // A directory at the lease path makes the read fail on every platform,
+        // including test runners whose privileges bypass file permission bits.
+        fs::create_dir(&lease).unwrap();
+        for _ in 0..2 {
+            run_refresh_fallback_probe(&worker);
+            assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+            assert!(pending.lock().contains(&source));
+            let status = callgraph_refresh_status(&root);
+            assert_eq!(status["state"], "waiting");
+            assert!(status["reason"]
+                .as_str()
+                .unwrap()
+                .contains("could not determine writer lease availability"));
+            assert!(lease.is_dir());
+        }
+        fs::remove_dir(&lease).unwrap();
+        run_refresh_fallback_probe(&worker);
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+        assert!(callgraph_refresh_status(&root).is_null());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn killed_foreign_writer_refresh_settles_on_fallback() {
+        let (_temp, root, dir, source, worker, mut foreign, pending, ready) =
+            fallback_refresh_fixture(false);
+        assert_eq!(
+            callgraph_refresh_worker_test_counts(&root),
+            (1, 0),
+            "no extra open while the foreign writer is live"
+        );
+        foreign.kill();
+        assert!(
+            crate::root_cache::writer_lease_path(&dir).exists(),
+            "killing the writer must leave the lease file in place"
+        );
+        run_refresh_fallback_probe(&worker);
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(!pending.lock().contains(&source));
+        assert!(callgraph_refresh_status(&root).is_null());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn failed_readiness_watch_refresh_settles_on_fallback() {
+        let (_temp, root, dir, source, worker, foreign, pending, ready) =
+            fallback_refresh_fixture(true);
+        drop(foreign);
+        assert!(!crate::root_cache::writer_lease_path(&dir).exists());
+        run_refresh_fallback_probe(&worker);
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(!pending.lock().contains(&source));
+        assert!(callgraph_refresh_status(&root).is_null());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn parked_new_input_does_not_reopen_a_live_writer_exclusion() {
+        let (_temp, root, dir, _source, worker, foreign, pending, ready) =
+            fallback_refresh_fixture(false);
+        let other = root.join("other.rs");
+        fs::write(&other, "fn additional() {}\n").unwrap();
+        enqueue_callgraph_store_refresh(
+            dir,
+            root.clone(),
+            vec![other.clone()],
+            Arc::clone(&pending),
+        );
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        assert!(pending.lock().contains(&other));
+        drop(foreign);
+        let queue = worker.worker.shared.queue.lock().unwrap();
+        let (queue, _) = worker
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                queue.active.is_some() || !queue.order.is_empty() || !queue.waiting.is_empty()
+            })
+            .unwrap();
+        let settled = queue.waiting.is_empty() && queue.active.is_none() && queue.order.is_empty();
+        drop(queue);
+        assert!(settled);
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+        assert!(ready.is_file_indexed(&other).unwrap());
+    }
+
+    #[test]
+    fn unchanged_foreign_writer_open_failure_does_not_self_replay() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let installed = Arc::new(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(installed.is_current());
+        let state = CallgraphRefreshState::new(
+            Arc::new(std::sync::RwLock::new(Some(installed))),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let pending = pending_paths();
+        let generation = Arc::new(AtomicU64::new(1));
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::clone(&generation),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        let (held, release) = install_callgraph_refresh_worker_test_gate(root.clone());
+        enqueue_callgraph_store_refresh_fenced_with_state(
+            dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            state,
+            ticket,
+            None,
+        );
+        held.recv_timeout(Duration::from_secs(12)).unwrap();
+
+        // A second root is a queue barrier: when it opens, the first batch has
+        // completed its defer, but any self-replay is still behind the barrier.
+        let (_barrier_temp, barrier_root, barrier_dir, barrier_source) = ready_store_fixture();
+        let (barrier_held, barrier_release) =
+            install_callgraph_refresh_worker_test_gate(barrier_root.clone());
+        worker.worker.enqueue(
+            RefreshRoot {
+                callgraph_dir: barrier_dir,
+                project_root: barrier_root,
+            },
+            vec![barrier_source],
+            pending_paths(),
+            Vec::new(),
+            None,
+            None,
+        );
+        release.send(()).unwrap();
+        barrier_held.recv_timeout(Duration::from_secs(12)).unwrap();
+        let queued_replays = worker
+            .worker
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .queued
+            .contains_key(&RefreshRoot {
+                callgraph_dir: dir,
+                project_root: root.clone(),
+            }) as usize;
+        let admissions = callgraph_refresh_worker_test_worker_calls(&root) + queued_replays;
+        let parked = pending.lock().contains(&source);
+        // If the failed refresh has already admitted its paths again, make its
+        // lifecycle ticket obsolete before releasing the barrier. The next
+        // admission then defers instead of queuing yet another failed open.
+        if admissions != 1 {
+            generation.store(2, AtomicOrdering::SeqCst);
+        }
+        barrier_release.send(()).unwrap();
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert_eq!(
+            admissions, 1,
+            "one invalidation must not admit its own unchanged writer-open failure again"
+        );
+        assert!(parked, "writer-excluded paths must stay pending");
+        for expected_checks in 1..=2 {
+            let scheduled_at = Instant::now();
+            run_refresh_fallback_probe(&worker);
+            assert_eq!(
+                callgraph_refresh_worker_test_counts(&root),
+                (1, 0),
+                "fallback must not reopen an unchanged live-writer exclusion"
+            );
+            assert_eq!(
+                refresh_worker_test_seam(&root).fallback_checks,
+                expected_checks
+            );
+            let next_recheck = worker
+                .worker
+                .shared
+                .queue
+                .lock()
+                .unwrap()
+                .waiting
+                .values()
+                .next()
+                .unwrap()
+                .next_recheck;
+            assert!(
+                next_recheck >= scheduled_at + Duration::from_secs(60),
+                "live exclusions keep one fixed 60s fallback deadline"
+            );
+            assert_eq!(
+                callgraph_refresh_status(&root)["reason"],
+                "waiting for writer lease held by another process"
+            );
+        }
+        generation.store(2, AtomicOrdering::SeqCst);
+        retire_obsolete_callgraph_refresh_waiters();
+        drop(foreign);
+    }
+
+    #[test]
+    fn foreign_writer_open_failure_replays_after_ready_transition() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let installed = Arc::new(std::sync::RwLock::new(None));
+        let state =
+            CallgraphRefreshState::new(Arc::clone(&installed), Arc::new(AtomicBool::new(true)));
+        let pending = pending_paths();
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::new(AtomicU64::new(1)),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        let (held, release) = install_callgraph_refresh_worker_test_gate(root.clone());
+        enqueue_callgraph_store_refresh_fenced_with_state(
+            dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            state,
+            ticket,
+            None,
+        );
+        held.recv_timeout(Duration::from_secs(12)).unwrap();
+        drop(foreign);
+        let ready = Arc::new(
+            CallGraphStore::open_readonly(dir, root.clone())
+                .unwrap()
+                .unwrap(),
+        );
+        *installed.write().unwrap() = Some(Arc::clone(&ready));
+        release.send(()).unwrap();
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn parked_foreign_writer_refresh_resumes_on_lease_release() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let ready = Arc::new(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .unwrap(),
+        );
+        let state = CallgraphRefreshState::new(
+            Arc::new(std::sync::RwLock::new(Some(Arc::clone(&ready)))),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let pending = pending_paths();
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::new(AtomicU64::new(1)),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        let keepalive = Arc::new(());
+        fs::write(&source, "fn entry() { new_leaf(); }\nfn new_leaf() {}\n").unwrap();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        enqueue_callgraph_store_refresh_fenced_with_state(
+            dir,
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            state,
+            ticket,
+            Some(keepalive.clone()),
+        );
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        assert!(pending.lock().contains(&source));
+        assert!(
+            Arc::strong_count(&keepalive) > 1,
+            "parked work must retain the query catch-up guard"
+        );
+        let status = callgraph_refresh_status(&root);
+        assert_eq!(status["state"], "waiting");
+        assert_eq!(
+            status["reason"],
+            "waiting for writer lease held by another process"
+        );
+        assert_eq!(status["pending_paths"], 1);
+
+        drop(foreign);
+        let queue = worker.worker.shared.queue.lock().unwrap();
+        let (queue, _) = worker
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                queue.active.is_some() || !queue.order.is_empty() || !queue.waiting.is_empty()
+            })
+            .unwrap();
+        let settled = queue.waiting.is_empty() && queue.active.is_none() && queue.order.is_empty();
+        drop(queue);
+        assert!(
+            settled,
+            "lease-release event must settle parked work without new input"
+        );
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+        assert_eq!(Arc::strong_count(&keepalive), 1);
+        assert!(callgraph_refresh_status(&root).is_null());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn parked_publication_waits_for_live_writer_then_settles_on_release() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let mut foreign = ForeignRefreshWriter::start(&root, &dir);
+        let ready = Arc::new(
+            CallGraphStore::open_readonly(dir.clone(), root.clone())
+                .unwrap()
+                .unwrap(),
+        );
+        let state = CallgraphRefreshState::new(
+            Arc::new(std::sync::RwLock::new(Some(ready))),
+            Arc::new(AtomicBool::new(true)),
+        );
+        let pending = pending_paths();
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::new(AtomicU64::new(1)),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        enqueue_callgraph_store_refresh_fenced_with_state(
+            dir,
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            state,
+            ticket,
+            None,
+        );
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        foreign.publish();
+        let queue = worker.worker.shared.queue.lock().unwrap();
+        let (queue, _) = worker
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                refresh_worker_test_seam(&root).readiness_checks == 0
+                    || queue.active.is_some()
+                    || !queue.order.is_empty()
+            })
+            .unwrap();
+        let checked = refresh_worker_test_seam(&root).readiness_checks > 0;
+        drop(queue);
+        assert!(
+            checked,
+            "publication must wake a liveness check, not a live-writer open"
+        );
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        assert!(pending.lock().contains(&source));
+        assert_eq!(callgraph_refresh_status(&root)["state"], "waiting");
+        drop(foreign);
+        let queue = worker.worker.shared.queue.lock().unwrap();
+        let (queue, _) = worker
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                queue.active.is_some() || !queue.order.is_empty() || !queue.waiting.is_empty()
+            })
+            .unwrap();
+        let settled = queue.waiting.is_empty() && queue.active.is_none() && queue.order.is_empty();
+        drop(queue);
+        assert!(settled);
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn publication_with_released_writer_settles_with_exactly_one_open() {
+        let (_temp, root, dir, source, worker, mut foreign, pending, _ready) =
+            fallback_refresh_fixture(false);
+        let (idle_writer_tx, idle_writer_rx) = crossbeam_channel::bounded(1);
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .ignore_lease_release = true;
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .idle_writer_held = Some(idle_writer_tx);
+        // Hold the queue until the foreign process publishes a new callgraph
+        // generation and releases its writer lease. Ignore lease-release events
+        // so the generation-pointer event is the only possible immediate wake.
+        let queue = worker.worker.shared.queue.lock().unwrap();
+        foreign.publish();
+        drop(foreign);
+        drop(queue);
+        let queue = worker.worker.shared.queue.lock().unwrap();
+        let (queue, _) = worker
+            .worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                queue.active.is_some() || !queue.order.is_empty() || !queue.waiting.is_empty()
+            })
+            .unwrap();
+        let settled = queue.waiting.is_empty() && queue.active.is_none() && queue.order.is_empty();
+        drop(queue);
+        assert!(
+            settled,
+            "publication plus release must settle without a timer or another invalidation"
+        );
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert_eq!(refresh_worker_test_seam(&root).fallback_checks, 0);
+        assert!(!pending.lock().contains(&source));
+        idle_writer_rx
+            .recv_timeout(Duration::from_secs(12))
+            .unwrap();
+        assert!(CallGraphStore::open_readonly(dir.clone(), root.clone())
+            .unwrap()
+            .is_none());
+        // Queue idle proves the replay committed, not that idle maintenance has
+        // closed its writer. Request readers deliberately fail fast on a locked
+        // generation, so join this fixture's worker before asserting a fresh open.
+        assert!(worker.worker.shutdown_with_budget(Duration::from_secs(12)));
+        let current = CallGraphStore::open_readonly(dir, root).unwrap().unwrap();
+        assert_eq!(
+            current
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn parked_refresh_releases_obsolete_catch_up_without_losing_paths() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let pending = pending_paths();
+        let generation = Arc::new(AtomicU64::new(1));
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::clone(&generation),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        let keepalive = Arc::new(());
+        enqueue_callgraph_store_refresh_inner(
+            dir,
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            Vec::new(),
+            Some(ticket),
+            Some(keepalive.clone()),
+        );
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert!(Arc::strong_count(&keepalive) > 1);
+        generation.store(2, AtomicOrdering::SeqCst);
+        retire_obsolete_callgraph_refresh_waiters();
+        assert_eq!(Arc::strong_count(&keepalive), 1);
+        assert!(pending.lock().contains(&source));
+        assert!(callgraph_refresh_status(&root).is_null());
+        drop(foreign);
+    }
+
+    #[test]
+    fn shutdown_of_writer_excluded_refresh_is_deferred_not_drained() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let pending = pending_paths();
+        let keepalive = Arc::new(());
+        enqueue_callgraph_store_refresh_inner(
+            dir,
+            root,
+            vec![source.clone()],
+            Arc::clone(&pending),
+            Vec::new(),
+            None,
+            Some(keepalive.clone()),
+        );
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert!(!worker.worker.shutdown_with_budget(Duration::from_secs(12)));
+        assert!(pending.lock().contains(&source));
+        assert_eq!(Arc::strong_count(&keepalive), 1);
+        drop(foreign);
+    }
+
     fn wait_for_refresh_calls(root: &Path, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(12);
         while callgraph_refresh_worker_test_counts(root).0 < expected {
@@ -26946,15 +28447,21 @@ edition = "2021"
             keepalive: Vec::new(),
         };
         write_file(root, "main.go", "package main\nimport \"example.com/after/util\"\nfunc main() { util.Run() }\n// warm resolver\n");
-        let primed =
-            process_callgraph_refresh_batch(&batch([main].into_iter().collect()), &mut caches)
-                .unwrap();
+        let primed = process_callgraph_refresh_batch(
+            &batch([main].into_iter().collect()),
+            &mut caches,
+            &mut None,
+        )
+        .unwrap();
         assert!(caches[&refresh_root].1.get().is_some());
         drop(primed);
         write_file(root, "go.mod", "module example.com/after\n");
-        let refreshed =
-            process_callgraph_refresh_batch(&batch([manifest].into_iter().collect()), &mut caches)
-                .unwrap();
+        let refreshed = process_callgraph_refresh_batch(
+            &batch([manifest].into_iter().collect()),
+            &mut caches,
+            &mut None,
+        )
+        .unwrap();
         assert_direct_caller(&refreshed, "util/run.go", "Run", "main.go", "main");
         let status: String = refreshed
             .conn
