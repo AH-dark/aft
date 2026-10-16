@@ -78,12 +78,20 @@ impl ProjectWatcher {
         // Same rule as the inotify backend: the exclusion set describes the
         // matcher at this generation, so the generation is captured beside it
         // rather than on the backend thread after spawn.
-        let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let generation = matcher_generation.load(Ordering::Acquire);
+        let counters = crate::context::watcher_counters_for_root(&root);
+        let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
+        let outcome = planning
+            .attempt(&root, generation, &counters, || {
+                derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT))
+            })
+            .expect("initial exclusion attempt is due");
+        let observed_generation = outcome.is_ok().then_some(generation);
+        let plan = outcome.unwrap_or_default();
         let exclusions = plan.selected;
         let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &exclusions);
         let exclusion_paths = exclusion_state.paths();
-        super::log_exclusions(&root, &exclusions, observed_generation);
+        super::log_exclusions(&root, &exclusions, generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         #[cfg(test)]
@@ -100,9 +108,8 @@ impl ProjectWatcher {
             fs::kFSEventStreamEventIdSinceNow,
             Arc::clone(&last_delivered_id),
         )?;
-        let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(
-            observed_generation,
+            observed_generation.unwrap_or(0),
             exclusion_paths,
             watcher_exclusion_paths(&plan.dropped),
         );
@@ -130,12 +137,15 @@ impl ProjectWatcher {
 
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    if generation != observed_generation {
-                        let replacement_plan = derive_watcher_exclusion_plan(
+                    if let Some(outcome) = planning.attempt(&root, generation, &counters, || {
+                        derive_watcher_exclusion_plan(
                             &root,
                             &matcher,
                             Some(WATCHER_EXCLUSION_LIMIT),
-                        );
+                        )
+                    }) {
+                        let planned = outcome.is_ok();
+                        let replacement_plan = outcome.unwrap_or_default();
                         let replacement_exclusions = replacement_plan.selected;
                         let previous_paths = exclusion_state.paths();
                         exclusion_state.replace(&replacement_exclusions);
@@ -157,19 +167,17 @@ impl ProjectWatcher {
                                 return;
                             }
                         }
-                        observed_generation = generation;
+                        if planned {
+                            observed_generation = Some(generation);
+                        }
                         dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(
-                            observed_generation,
+                            observed_generation.unwrap_or(0),
                             replacement_paths,
                             dropped_paths.clone(),
                         );
                         if replacement_exclusions != exclusions {
-                            super::log_exclusions(
-                                &root,
-                                &replacement_exclusions,
-                                observed_generation,
-                            );
+                            super::log_exclusions(&root, &replacement_exclusions, generation);
                             exclusions = replacement_exclusions;
                         }
                     }
@@ -190,7 +198,7 @@ impl ProjectWatcher {
                                         return;
                                     }
                                     counters.set_backend_exclusions(
-                                        observed_generation,
+                                        observed_generation.unwrap_or(0),
                                         paths,
                                         dropped_paths.clone(),
                                     );
@@ -1724,7 +1732,8 @@ mod tests {
         let mut builder = GitignoreBuilder::new(&root);
         builder.add(root.join(".gitignore"));
         let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
-        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let plan =
+            derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT)).unwrap();
         let exclusion_paths = watcher_exclusion_paths(&plan.selected);
 
         let (tx, rx) = mpsc::channel();

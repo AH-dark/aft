@@ -5672,6 +5672,13 @@ mod tests {
         let (_dir, root) = test_root("health-snapshot-age-coverage");
         let ctx = test_ctx();
         let watcher = ctx.watcher_counters();
+        watcher.set_exclusion_planning(crate::context::WatcherExclusionPlanningSnapshot {
+            matcher_generation: 7,
+            attempts: 8,
+            attempt_limit: 8,
+            status: "exhausted",
+            last_failure: Some("io_deadline"),
+        });
         watcher.note_fsevents_stream_creation();
         watcher.note_raw_event();
         watcher.note_raw_event();
@@ -5707,6 +5714,11 @@ mod tests {
         assert_eq!(absent["callgraph_repair_roots_annotated"].as_u64(), Some(0));
         assert_eq!(absent["callgraph_repair_roots_total"].as_u64(), Some(1));
         let watcher = &absent["roots"][0]["watcher"];
+        assert_eq!(watcher["exclusion_planning"]["status"], "exhausted");
+        assert_eq!(watcher["exclusion_planning"]["matcher_generation"], 7);
+        assert_eq!(watcher["exclusion_planning"]["attempts"], 8);
+        assert_eq!(watcher["exclusion_planning"]["attempt_limit"], 8);
+        assert_eq!(watcher["exclusion_planning"]["last_failure"], "io_deadline");
         assert_eq!(watcher["raw_events_total"].as_u64(), Some(3));
         assert_eq!(watcher["raw_events_since_last_rescan"].as_u64(), Some(1));
         assert_eq!(watcher["invalidating_events_total"].as_u64(), Some(1));

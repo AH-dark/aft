@@ -18079,14 +18079,14 @@ mod tests {
     /// The daemon-restart ordering that left roots watched with only `.git`
     /// excluded: each root is configured, its queued configure maintenance is
     /// cancelled when the root is quiesced, and the rebind then restores the
-    /// watcher directly (the `ensure_project_watcher` path) on the subc frame
-    /// loop. That thread must not walk any project for ignore files; the load
-    /// is queued and runs on another thread, and the backend must end up with
-    /// `target/` excluded.
+    /// watcher directly (the `ensure_project_watcher` path) on the daemon's
+    /// request-processing loop. That thread must not walk any project for ignore
+    /// files; the load is queued and runs on another thread, and the backend must
+    /// end up with `target/` excluded.
     ///
-    /// The fake backend below follows the OS backends' contract: derive the
-    /// plan from the shared matcher at create, then re-derive whenever the
-    /// matcher generation differs from the one it last derived at.
+    /// The fake backend uses the shared retry policy of the inotify and FSEvents
+    /// backends: derive from the shared matcher at creation, retry unavailable
+    /// planning, and re-derive when the matcher generation changes.
     #[test]
     fn watcher_restored_before_configure_tail_seeds_ecosystem_exclusions() {
         let _guard = watcher_test_mutex()
@@ -18130,27 +18130,38 @@ mod tests {
             let created_tx = created_tx.clone();
             install_project_watcher_with(ctx, root, Vec::new(), move |root, _extra, tx| {
                 let derive = move |root: &Path| {
-                    crate::watcher_filter::watcher_exclusion_paths(
-                        &crate::watcher_filter::derive_watcher_exclusion_plan(
-                            root,
-                            &matcher,
-                            Some(crate::watcher_filter::WATCHER_EXCLUSION_LIMIT),
-                        )
-                        .selected,
+                    crate::watcher_filter::derive_watcher_exclusion_plan(
+                        root,
+                        &matcher,
+                        Some(crate::watcher_filter::WATCHER_EXCLUSION_LIMIT),
                     )
                 };
                 let observed = generation.load(Ordering::Acquire);
-                *plan.lock().unwrap() = (observed, derive(&root));
+                let counters = crate::context::watcher_counters_for_root(&root);
+                let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
+                let initial = planning
+                    .attempt(&root, observed, &counters, || derive(&root))
+                    .unwrap()
+                    .unwrap_or_default();
+                *plan.lock().unwrap() = (
+                    observed,
+                    crate::watcher_filter::watcher_exclusion_paths(&initial.selected),
+                );
                 created_tx.send(observed).unwrap();
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread_stop = Arc::clone(&stop);
                 let join = std::thread::spawn(move || {
-                    let mut observed = observed;
                     while !thread_stop.load(Ordering::SeqCst) {
                         let current = generation.load(Ordering::Acquire);
-                        if current != observed {
-                            *plan.lock().unwrap() = (current, derive(&root));
-                            observed = current;
+                        if let Some(outcome) =
+                            planning.attempt(&root, current, &counters, || derive(&root))
+                        {
+                            *plan.lock().unwrap() = (
+                                current,
+                                crate::watcher_filter::watcher_exclusion_paths(
+                                    &outcome.unwrap_or_default().selected,
+                                ),
+                            );
                         }
                         std::thread::sleep(Duration::from_millis(5));
                     }

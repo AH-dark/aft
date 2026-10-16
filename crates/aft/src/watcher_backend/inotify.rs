@@ -64,12 +64,20 @@ impl ProjectWatcher {
         // it here, not on the backend thread: a bump between spawn and the
         // thread's first instruction would otherwise be read as "already
         // observed" and the rebuild it requires would never run.
-        let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let generation = matcher_generation.load(Ordering::Acquire);
+        let counters = crate::context::watcher_counters_for_root(&root);
+        let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
+        let outcome = planning
+            .attempt(&root, generation, &counters, || {
+                derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT))
+            })
+            .expect("initial exclusion attempt is due");
+        let observed_generation = outcome.is_ok().then_some(generation);
+        let plan = outcome.unwrap_or_default();
         let exclusions = plan.selected;
         let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &exclusions);
         let exclusion_paths = exclusion_state.paths();
-        super::log_exclusions(&root, &exclusions, observed_generation);
+        super::log_exclusions(&root, &exclusions, generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
@@ -78,9 +86,8 @@ impl ProjectWatcher {
             .map_or_else(BTreeSet::new, |boundary| {
                 collect_watch_directories(boundary, &matcher, &exclusion_paths)
             });
-        let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(
-            observed_generation,
+            observed_generation.unwrap_or(0),
             exclusion_paths.clone(),
             watcher_exclusion_paths(&plan.dropped),
         );
@@ -127,12 +134,15 @@ impl ProjectWatcher {
                         }
                     }
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    if generation != observed_generation {
-                        let replacement_plan = derive_watcher_exclusion_plan(
+                    if let Some(outcome) = planning.attempt(&root, generation, &counters, || {
+                        derive_watcher_exclusion_plan(
                             &root,
                             &matcher,
                             Some(WATCHER_EXCLUSION_LIMIT),
-                        );
+                        )
+                    }) {
+                        let planned = outcome.is_ok();
+                        let replacement_plan = outcome.unwrap_or_default();
                         let replacement_exclusions = replacement_plan.selected;
                         exclusion_state.replace(&replacement_exclusions);
                         let replacement_paths = exclusion_state.paths();
@@ -165,20 +175,18 @@ impl ProjectWatcher {
                             }
                         };
                         thread_count.store(watched_directories.len(), Ordering::Release);
-                        observed_generation = generation;
+                        if planned {
+                            observed_generation = Some(generation);
+                        }
 
                         dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(
-                            observed_generation,
+                            observed_generation.unwrap_or(0),
                             replacement_paths.clone(),
                             dropped_paths.clone(),
                         );
                         if replacement_exclusions != exclusions {
-                            super::log_exclusions(
-                                &root,
-                                &replacement_exclusions,
-                                observed_generation,
-                            );
+                            super::log_exclusions(&root, &replacement_exclusions, generation);
                             exclusions = replacement_exclusions;
                         }
                         exclusion_paths = replacement_paths;
@@ -190,7 +198,7 @@ impl ProjectWatcher {
                             if !changed_paths.is_empty() {
                                 exclusion_paths = exclusion_state.paths();
                                 counters.set_backend_exclusions(
-                                    observed_generation,
+                                    observed_generation.unwrap_or(0),
                                     exclusion_paths.clone(),
                                     dropped_paths.clone(),
                                 );

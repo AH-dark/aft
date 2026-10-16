@@ -905,13 +905,136 @@ fn watcher_boundary_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
 
 /// The exclusion set an OS watcher should install, plus what the cap cost.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WatcherExclusionPlan {
     /// Exclusions to install, best first.
     pub(crate) selected: Vec<WatcherExclusion>,
     /// The next candidates that lost a slot to the cap, best first. Named in
     /// the overflow log so a flood specimen shows what the cap left watched.
     pub(crate) dropped: Vec<WatcherExclusion>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExclusionPlanUnavailable {
+    CapacityDeadline,
+    IoDeadline,
+    SpawnFailed,
+    WorkerDisconnected,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl ExclusionPlanUnavailable {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CapacityDeadline => "capacity_deadline",
+            Self::IoDeadline => "io_deadline",
+            Self::SpawnFailed => "spawn_failed",
+            Self::WorkerDisconnected => "worker_disconnected",
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+type ExclusionPlanOutcome = Result<WatcherExclusionPlan, ExclusionPlanUnavailable>;
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const EXCLUSION_PLAN_MAX_ATTEMPTS: u32 = 8;
+
+/// One retry budget per matcher generation, shared by the native backends.
+/// An unavailable plan must not consume a generation: roots near the end of a
+/// restart burst may not get a worker before their first deadline expires.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Default)]
+pub(crate) struct WatcherExclusionRetry {
+    generation: Option<u64>,
+    consumed: bool,
+    attempts: u32,
+    retry_at: Option<Instant>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+impl WatcherExclusionRetry {
+    pub(crate) fn attempt(
+        &mut self,
+        root: &Path,
+        generation: u64,
+        counters: &crate::context::WatcherCounters,
+        derive: impl FnOnce() -> ExclusionPlanOutcome,
+    ) -> Option<ExclusionPlanOutcome> {
+        self.attempt_at(root, generation, counters, Instant::now(), derive)
+    }
+
+    fn attempt_at(
+        &mut self,
+        root: &Path,
+        generation: u64,
+        counters: &crate::context::WatcherCounters,
+        now: Instant,
+        derive: impl FnOnce() -> ExclusionPlanOutcome,
+    ) -> Option<ExclusionPlanOutcome> {
+        if self.generation != Some(generation) {
+            *self = Self {
+                generation: Some(generation),
+                ..Self::default()
+            };
+        }
+        if self.consumed
+            || self.attempts >= EXCLUSION_PLAN_MAX_ATTEMPTS
+            || self.retry_at.is_some_and(|deadline| now < deadline)
+        {
+            return None;
+        }
+        self.attempts += 1;
+        let outcome = derive();
+        let (status, last_failure) = match &outcome {
+            Ok(_) => {
+                self.consumed = true;
+                self.retry_at = None;
+                ("planned", None)
+            }
+            Err(reason) => {
+                // Back off after completion, not from the start of an attempt
+                // that may have spent its entire deadline in filesystem I/O.
+                let backoff = Duration::from_millis(250 * (1_u64 << (self.attempts - 1).min(4)));
+                self.retry_at = Some(Instant::now() + backoff);
+                if self.attempts == 1 {
+                    emit_exclusion_retry_log(format!(
+                        "watcher exclusion plan unavailable: root={} generation={generation} reason={}; retrying without exclusions (limit={EXCLUSION_PLAN_MAX_ATTEMPTS})",
+                        root.display(), reason.as_str()
+                    ));
+                }
+                (
+                    if self.attempts == EXCLUSION_PLAN_MAX_ATTEMPTS {
+                        "exhausted"
+                    } else {
+                        "retrying"
+                    },
+                    Some(reason.as_str()),
+                )
+            }
+        };
+        counters.set_exclusion_planning(crate::context::WatcherExclusionPlanningSnapshot {
+            matcher_generation: generation,
+            attempts: self.attempts,
+            attempt_limit: EXCLUSION_PLAN_MAX_ATTEMPTS,
+            status,
+            last_failure,
+        });
+        Some(outcome)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn emit_exclusion_retry_log(line: String) {
+    log::warn!("{line}");
+    #[cfg(test)]
+    EXCLUSION_RETRY_LOGS.with(|logs| logs.borrow_mut().push(line));
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXCLUSION_RETRY_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Cheap size signal for one directory: how many entries its top level holds,
@@ -1004,7 +1127,7 @@ pub(crate) fn derive_watcher_exclusion_plan(
     root: &Path,
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
-) -> WatcherExclusionPlan {
+) -> ExclusionPlanOutcome {
     static PLANNERS: std::sync::OnceLock<Arc<ExclusionPlannerPool>> = std::sync::OnceLock::new();
     let root = root.to_path_buf();
     let matcher = matcher.clone();
@@ -1036,27 +1159,20 @@ struct ExclusionPlannerPool {
 /// Timed-out workers retain their permit until they exit; at most two can be
 /// stuck across all roots. Wait for capacity within the same caller deadline:
 /// a restart can re-derive many roots at once, and backends consume each matcher
-/// generation only once. Brief contention must not publish an empty plan for it.
-/// Callers still fall back to no kernel exclusions when the deadline expires.
+/// generation only after a successful plan. Deadline and worker failures are
+/// unavailable outcomes, not successful empty plans; the backend can retry them.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn run_bounded_exclusion_planner(
     timeout: Duration,
     pool: Arc<ExclusionPlannerPool>,
     plan: impl FnOnce() -> WatcherExclusionPlan + Send + 'static,
-) -> WatcherExclusionPlan {
-    let empty = || WatcherExclusionPlan {
-        selected: Vec::new(),
-        dropped: Vec::new(),
-    };
+) -> ExclusionPlanOutcome {
     let deadline = Instant::now() + timeout;
     let mut in_flight = pool.in_flight.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            log::warn!(
-                "watcher exclusion planners busy past deadline; proceeding without exclusions"
-            );
-            return empty();
+            return Err(ExclusionPlanUnavailable::CapacityDeadline);
         }
         if *in_flight < 2 {
             break;
@@ -1086,14 +1202,12 @@ fn run_bounded_exclusion_planner(
         })
         .is_err()
     {
-        return empty();
+        return Err(ExclusionPlanUnavailable::SpawnFailed);
     }
     rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .unwrap_or_else(|error| {
-            log::warn!(
-                "watcher exclusion planning unavailable ({error}); proceeding without exclusions"
-            );
-            empty()
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => ExclusionPlanUnavailable::IoDeadline,
+            mpsc::RecvTimeoutError::Disconnected => ExclusionPlanUnavailable::WorkerDisconnected,
         })
 }
 
@@ -2574,6 +2688,199 @@ mod tests {
     }
 
     #[test]
+    fn exclusion_planner_timed_out_roots_retry_same_generation() {
+        let pool = Arc::new(ExclusionPlannerPool::default());
+        let started = Arc::new(AtomicU64::new(0));
+        let mut releases = Vec::new();
+        let mut callers = Vec::new();
+        for _ in 0..8 {
+            let root = TempDir::new().unwrap();
+            let path = fs::canonicalize(root.path()).unwrap();
+            fs::write(path.join("Cargo.toml"), "[workspace]\n").unwrap();
+            fs::create_dir_all(path.join("target/debug")).unwrap();
+            let mut builder = GitignoreBuilder::new(&path);
+            builder.add_line(None, "/target/").unwrap();
+            let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+            let (release, blocked) = mpsc::channel::<()>();
+            releases.push(release);
+            let pool = pool.clone();
+            let started = started.clone();
+            callers.push(thread::spawn(move || {
+                let counters = crate::context::WatcherCounters::default();
+                let mut retry = WatcherExclusionRetry::default();
+                let worker_path = path.clone();
+                let worker_matcher = matcher.clone();
+                let outcome = retry
+                    .attempt(&path, 1, &counters, || {
+                        run_bounded_exclusion_planner(Duration::from_millis(100), pool, move || {
+                            started.fetch_add(1, Ordering::AcqRel);
+                            let _ = blocked.recv();
+                            derive_exclusion_plan(
+                                &worker_path,
+                                &worker_matcher,
+                                Some(WATCHER_EXCLUSION_LIMIT),
+                                crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+                            )
+                        })
+                    })
+                    .expect("initial attempt is due");
+                assert!(
+                    outcome.is_err(),
+                    "no root can finish while both workers are held"
+                );
+                (root, path, matcher, retry, counters, outcome.unwrap_err())
+            }));
+        }
+        let roots = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(started.load(Ordering::Acquire), 2);
+        assert_eq!(*pool.in_flight.lock().unwrap(), 2);
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|root| root.5 == ExclusionPlanUnavailable::IoDeadline)
+                .count(),
+            2
+        );
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|root| root.5 == ExclusionPlanUnavailable::CapacityDeadline)
+                .count(),
+            6
+        );
+
+        // The first two workers outlive their callers' deadlines. Release their
+        // worker permits without changing any root's matcher generation, then
+        // drive WatcherExclusionRetry as the native backend poll loops do.
+        drop(releases);
+        thread::scope(|scope| {
+            let retries = roots
+                .into_iter()
+                .map(|(root, path, matcher, mut retry, counters, _)| {
+                    let pool = pool.clone();
+                    scope.spawn(move || {
+                        let worker_path = path.clone();
+                        let worker_matcher = matcher.clone();
+                        let plan = retry
+                            .attempt_at(
+                                &path,
+                                1,
+                                &counters,
+                                Instant::now() + Duration::from_secs(10),
+                                || {
+                                    run_bounded_exclusion_planner(
+                                        Duration::from_secs(2),
+                                        pool,
+                                        move || {
+                                            derive_exclusion_plan(
+                                                &worker_path,
+                                                &worker_matcher,
+                                                Some(WATCHER_EXCLUSION_LIMIT),
+                                                crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+                                            )
+                                        },
+                                    )
+                                },
+                            )
+                            .expect("an unavailable generation must not be consumed")
+                            .expect("capacity is free");
+                        assert!(
+                            watcher_exclusion_paths(&plan.selected).contains(&path.join("target")),
+                            "same-generation retry must install target/: {plan:?}"
+                        );
+                        let health = counters.snapshot().exclusion_planning.unwrap();
+                        assert_eq!(health.matcher_generation, 1);
+                        assert_eq!(health.attempts, 2);
+                        assert_eq!(health.status, "planned");
+                        drop(root);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for retry in retries {
+                retry.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn unavailable_exclusion_plans_back_off_exhaust_and_report_health() {
+        let root = TempDir::new().unwrap();
+        for reason in [
+            ExclusionPlanUnavailable::CapacityDeadline,
+            ExclusionPlanUnavailable::IoDeadline,
+            ExclusionPlanUnavailable::SpawnFailed,
+            ExclusionPlanUnavailable::WorkerDisconnected,
+        ] {
+            EXCLUSION_RETRY_LOGS.with(|logs| logs.borrow_mut().clear());
+            let counters = crate::context::WatcherCounters::default();
+            let mut retry = WatcherExclusionRetry::default();
+            for attempt in 1..=EXCLUSION_PLAN_MAX_ATTEMPTS {
+                let now = Instant::now() + Duration::from_secs(u64::from(attempt) * 10);
+                assert_eq!(
+                    retry.attempt_at(root.path(), 7, &counters, now, || Err(reason)),
+                    Some(Err(reason))
+                );
+                let health = counters.snapshot().exclusion_planning.unwrap();
+                assert_eq!(health.attempts, attempt);
+                assert_eq!(health.last_failure, Some(reason.as_str()));
+                assert_eq!(
+                    health.status,
+                    if attempt == EXCLUSION_PLAN_MAX_ATTEMPTS {
+                        "exhausted"
+                    } else {
+                        "retrying"
+                    }
+                );
+                let before_retry = retry.retry_at.unwrap() - Duration::from_nanos(1);
+                assert!(retry
+                    .attempt_at(root.path(), 7, &counters, before_retry, || panic!(
+                        "events must not bypass backoff"
+                    ))
+                    .is_none());
+            }
+            assert!(retry
+                .attempt_at(
+                    root.path(),
+                    7,
+                    &counters,
+                    Instant::now() + Duration::from_secs(3600),
+                    || panic!("exhausted planning must stop")
+                )
+                .is_none());
+            EXCLUSION_RETRY_LOGS.with(|logs| {
+                let logs = logs.borrow();
+                assert_eq!(logs.len(), 1, "retry warning must be once per generation");
+                assert!(logs[0].contains("generation=7"));
+            });
+            let health = serde_json::to_value(counters.snapshot()).unwrap();
+            assert_eq!(health["exclusion_planning"]["status"], "exhausted");
+            assert_eq!(
+                health["exclusion_planning"]["attempt_limit"],
+                EXCLUSION_PLAN_MAX_ATTEMPTS
+            );
+
+            assert_eq!(
+                retry.attempt(root.path(), 8, &counters, || Ok(
+                    WatcherExclusionPlan::default()
+                )),
+                Some(Ok(WatcherExclusionPlan::default()))
+            );
+            assert!(retry
+                .attempt(root.path(), 8, &counters, || panic!(
+                    "a genuine empty plan is final"
+                ))
+                .is_none());
+            let health = counters.snapshot().exclusion_planning.unwrap();
+            assert_eq!(health.status, "planned");
+            assert_eq!(health.attempts, 1);
+            assert_eq!(health.last_failure, None);
+        }
+    }
+
+    #[test]
     fn exclusion_planner_waits_for_capacity_before_publishing_generation_plan() {
         let root = TempDir::new().unwrap();
         let root_path = fs::canonicalize(root.path()).unwrap();
@@ -2630,14 +2937,20 @@ mod tests {
             "busy planners must wait within the caller deadline, not publish an empty plan"
         );
         drop(releases);
-        let plan = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let plan = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("capacity freed before the deadline");
         assert!(
             watcher_exclusion_paths(&plan.selected).contains(&target),
             "the waiting generation must install target/: {plan:?}"
         );
         caller.join().unwrap();
         for caller in callers {
-            caller.join().unwrap();
+            caller
+                .join()
+                .unwrap()
+                .expect("released planner must finish");
         }
     }
 
@@ -2667,7 +2980,7 @@ mod tests {
             let result = result_rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("planner must return while directory I/O is still blocked");
-            assert!(result.selected.is_empty());
+            assert_eq!(result, Err(ExclusionPlanUnavailable::IoDeadline));
             caller.join().unwrap();
         }
         assert_eq!(*in_flight.in_flight.lock().unwrap(), 2);
@@ -2680,7 +2993,7 @@ mod tests {
                     dropped: Vec::new(),
                 }
             });
-        assert!(result.selected.is_empty());
+        assert_eq!(result, Err(ExclusionPlanUnavailable::CapacityDeadline));
         assert!(
             started_rx.recv_timeout(Duration::from_millis(100)).is_err(),
             "a third blocked planner must not be spawned"
@@ -3974,7 +4287,7 @@ mod tests {
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let matcher = shared_matcher(&canonical_root);
 
-        let plan = derive_watcher_exclusion_plan(&canonical_root, &matcher, Some(2));
+        let plan = derive_watcher_exclusion_plan(&canonical_root, &matcher, Some(2)).unwrap();
 
         assert_eq!(
             watcher_exclusion_paths(&plan.selected),
