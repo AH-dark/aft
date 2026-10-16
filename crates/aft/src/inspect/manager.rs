@@ -9962,7 +9962,7 @@ mod dead_code_projection_tests {
         let first_state = manager.previous_dead_code_rollup_state(&root).unwrap();
 
         cache
-            .delete_tier2_contribution(InspectCategory::DeadCode, Path::new("src/live.ts"))
+            .delete_tier2_contribution(InspectCategory::DeadCode, &Path::new("src").join("live.ts"))
             .unwrap();
         let changed_contributions = read();
         assert!(

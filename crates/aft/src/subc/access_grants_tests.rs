@@ -87,7 +87,9 @@ fn grants_head_policy_survives_an_unregistered_parent_epoch() {
     let worker = worker_at_parent_epoch(&worker.project_root, "head", 12);
     let target = head
         .project_root
-        .join(".cortexkit/parent-inputs/setup-process-preview-original-r1");
+        .join(".cortexkit")
+        .join("parent-inputs")
+        .join("setup-process-preview-original-r1");
     remote_policy::catalog(
         catalog_request(json!([{"path":target,"mode":"read"}])),
         &worker,

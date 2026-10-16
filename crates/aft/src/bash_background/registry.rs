@@ -5071,11 +5071,11 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    /// Recover only the requested task when a watch arrives before configure's
-    /// deferred session replay. The lookup is confined to the route's storage
+    /// Recover only the requested task when a status or watch arrives before
+    /// configure's deferred replay. The lookup is confined to the route's storage
     /// namespace and session directory: it never scans other sessions or uses
     /// the project-wide relaxed status fallback.
-    pub(crate) fn recover_watch_task(
+    pub(crate) fn recover_owned_task(
         &self,
         storage_dir: &Path,
         session_id: &str,
@@ -5112,7 +5112,7 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    /// Apply the same restart rules to a single-task watch recovery and the
+    /// Apply the same restart rules to a single-task recovery and the
     /// configure replay, including exit markers, lost PTYs and dead processes.
     fn rehydrate_resolved_task(
         &self,
@@ -6168,11 +6168,19 @@ impl BgTaskRegistry {
         let mut task = self.task_for_session(task_id, session_id);
         if task.is_none() {
             if let Some(storage_dir) = storage_dir {
-                let _ = if let Some(project_root) = project_root {
-                    self.replay_session_for_project(storage_dir, session_id, project_root)
-                } else {
-                    self.replay_session(storage_dir, session_id)
-                };
+                // A bounded replay may still be busy or not yet have reached
+                // this task. Recover its exact bundle without scanning history
+                // or waiting for the project replay batch lock.
+                let harness = super::route_harness()
+                    .map(|harness| harness.storage_segment())
+                    .or_else(|| self.fallback_db_harness());
+                let _ = self.recover_owned_task(
+                    storage_dir,
+                    session_id,
+                    task_id,
+                    project_root,
+                    harness.as_deref(),
+                );
                 task = self.task_for_session(task_id, session_id);
             }
         }
@@ -8346,7 +8354,7 @@ impl BgTaskRegistry {
             self.record_live_delivery_session(&task.session_id);
         }
         self.remember_session_harness(&task);
-        // A watch's single-record recovery can race configure replay. Keep the
+        // Single-record recovery can race configure replay. Keep the
         // first registered task and its runtime instead of replacing its state
         // with another disk snapshot (or orphaning an authoritative child).
         {
@@ -13227,6 +13235,44 @@ mod tests {
             )
             .expect("owning project should replay its task");
         assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+    }
+
+    #[test]
+    fn status_recovers_only_requested_task_while_project_replay_is_busy() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, _db, _) = registry_with_db_and_frames(storage.path());
+        let session = "on-demand-session";
+        let task_id = "bash-2222222222222222";
+        let unrelated_id = "bash-3333333333333333";
+        write_running_project_task(storage.path(), project.path(), session, task_id);
+        write_running_project_task(storage.path(), project.path(), session, unrelated_id);
+        let paths = task_paths(storage.path(), session, task_id).unwrap();
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.harness = Some("opencode".to_string());
+        write_task(&paths.json, &metadata).unwrap();
+        registry.set_project_replay_scan_budget_for_test(1, Duration::from_secs(5));
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(registry.task(task_id).is_none());
+        let examined = registry.project_replay_scan_total_examined_for_test();
+        assert_eq!(examined, Some(1));
+
+        // Simulate a continuation recovering another batch. Status must neither
+        // wait for it nor advance its cursor to find the requested bundle.
+        let batch = registry.inner.project_replay_batch.lock().unwrap();
+        let snapshot = registry
+            .status_settled_owned(task_id, session, Some(project.path()), storage.path(), 1024)
+            .expect("owning status must recover the requested task before replay reaches it");
+        assert_eq!(snapshot.info.status, BgTaskStatus::Running);
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            examined
+        );
+        assert!(registry.task(unrelated_id).is_none());
+        drop(batch);
+        registry.detach();
     }
 
     #[test]
