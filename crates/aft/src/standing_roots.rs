@@ -1374,8 +1374,12 @@ mod tests {
             .is_err());
         release_rename_tx.send(()).unwrap();
         assert!(publisher.join().unwrap().is_some());
+        // Only the 100 ms check above is about ordering: the bind must not
+        // finish while the rename holds the fence. Once released, the bind does
+        // real filesystem work, so this receive is just a hang guard, sized
+        // for a loaded Windows runner.
         bind_done_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(30))
             .unwrap()
             .unwrap();
         binder.join().unwrap();
