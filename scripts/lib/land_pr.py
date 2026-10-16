@@ -232,7 +232,7 @@ def submit(args: argparse.Namespace) -> str:
     else:
         descriptor = {"slice_class": "non_ranking", "targeted_mechanism": "none",
                       "kind": "harness", "fixtures": ["harness-goldens"]}
-    quality.resolve_descriptor(descriptor, changed)
+    quality.resolve_git_descriptor(descriptor, changed, base, head)
     encoded = json.dumps(descriptor, sort_keys=True, indent=2) + "\n"
     if not descriptor_path.exists() or json.loads(descriptor_path.read_text()) != descriptor:
         descriptor_path.parent.mkdir(parents=True, exist_ok=True)

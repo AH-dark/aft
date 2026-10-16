@@ -7,10 +7,15 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest import mock
 
 from run_real_query import load_capability
 from run_search_quality import selected_profile
 from search_quality import (
+    diff_paths,
+    run as quality_run,
+    parser as quality_parser,
     descriptor_labels,
     page_zero_evaluation_projection,
     synthetic_documents,
@@ -24,8 +29,10 @@ from search_quality_lib import (
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     UNREACHABLE_SPLIT_ROWS_FIELD,
     apply_unreachable_split_rows,
+    derive_slice_class,
     included_manifest_ids,
     real_query_behavior_diff,
+    read_tool_schema_blobs,
     resolve_descriptor,
     split_paired_failures,
     split_rows_not_applicable,
@@ -375,6 +382,155 @@ class PageZeroProjectionTests(unittest.TestCase):
         score["capability"]["probe_pages_differ"] = False
         with self.assertRaisesRegex(InputFault, "reference_profile_mismatch"):
             page_zero_evaluation_projection(reference, score, manifest, descriptor)
+
+
+class ToolSchemaFenceTests(unittest.TestCase):
+    path = "crates/aft/src/subc_tool_schemas.json"
+
+    def setUp(self) -> None:
+        self.base: dict[str, Any] = {
+            "search": {"type": "object", "properties": {"query": {"type": "string"}}},
+            "zoom": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }
+
+    def classify(self, head: dict) -> str:
+        return derive_slice_class([self.path], schema_blobs=(json.dumps(self.base).encode(), json.dumps(head).encode()))
+
+    def test_zoom_only_schema_change_is_non_ranking(self) -> None:
+        head = copy.deepcopy(self.base)
+        head["zoom"]["properties"] = {"batch": {"type": "array"}}
+        self.assertEqual(self.classify(head), "non_ranking")
+
+    def test_search_schema_change_stays_fenced(self) -> None:
+        head = copy.deepcopy(self.base)
+        head["search"]["properties"]["query"]["description"] = "New search guidance"
+        self.assertEqual(self.classify(head), "ranking")
+
+    def test_referenced_shared_definition_change_stays_fenced(self) -> None:
+        self.base["$defs"] = {"Query": {"type": "string"}}
+        self.base["search"]["properties"]["query"] = {"$ref": "#/$defs/Query"}
+        head = copy.deepcopy(self.base)
+        head["$defs"]["Query"]["minLength"] = 1
+        self.assertEqual(self.classify(head), "ranking")
+
+    def test_malformed_head_fails_closed_with_gate_diagnostic(self) -> None:
+        manifest, reference, score = synthetic_documents()
+        result = total_gate(reference, score, manifest, None, [self.path], schema_blobs=(json.dumps(self.base).encode(), b'{"search":'))
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("missing ranking descriptor", result.reasons)
+        self.assertIn(f"ranking_fence:{self.path}:fail_closed:head:invalid_json", result.notes)
+
+    def test_non_search_schema_and_parity_changes_need_no_engine_unwired_descriptor(self) -> None:
+        head = copy.deepcopy(self.base)
+        head["zoom"]["description"] = "Batch-only zoom"
+        manifest, reference, score = synthetic_documents()
+        descriptor = {"slice_class": "non_ranking", "targeted_mechanism": "none", "kind": "harness", "fixtures": ["harness-goldens"]}
+        result = total_gate(reference, score, manifest, descriptor, [self.path, TOOL_CALL_PARITY_FIXTURE_SOURCE], schema_blobs=(json.dumps(self.base).encode(), json.dumps(head).encode()))
+        self.assertEqual(result.exit_code, 0, result.reasons)
+
+    def test_formatting_and_key_order_are_not_schema_changes(self) -> None:
+        blobs = (json.dumps(self.base, indent=2).encode(), json.dumps(dict(reversed(list(self.base.items())))).encode())
+        self.assertEqual(derive_slice_class([self.path], schema_blobs=blobs), "non_ranking")
+
+    def test_shared_version_change_stays_fenced(self) -> None:
+        self.base["version"] = 1
+        head = copy.deepcopy(self.base)
+        head["version"] = 2
+        self.assertEqual(self.classify(head), "ranking")
+
+    def test_json_comparison_distinguishes_booleans_from_numbers_not_numeric_formatting(self) -> None:
+        self.base["version"] = 1
+        head = copy.deepcopy(self.base)
+        head["version"] = 1.0
+        self.assertEqual(self.classify(head), "non_ranking")
+        head["version"] = True
+        self.assertEqual(self.classify(head), "ranking")
+
+    def test_json_numbers_do_not_lose_precision_during_comparison(self) -> None:
+        blob = json.dumps(self.base).encode()[:-1] + b', "version": 1e400}'
+        self.assertEqual(derive_slice_class([self.path], schema_blobs=(blob, blob.replace(b'1e400', b'2e400'))), "ranking")
+
+    def test_reference_to_another_tool_keeps_that_dependency_fenced(self) -> None:
+        self.base["search"]["properties"]["query"] = {"$ref": "#/zoom/properties/path"}
+        head = copy.deepcopy(self.base)
+        head["zoom"]["properties"]["path"]["minLength"] = 1
+        self.assertEqual(self.classify(head), "ranking")
+
+    def test_unknown_catalog_keys_are_not_silently_excluded(self) -> None:
+        head = copy.deepcopy(self.base)
+        head["new_tool_or_metadata"] = {"type": "object"}
+        self.assertEqual(self.classify(head), "ranking")
+
+    def test_other_ranking_files_still_fence_a_zoom_only_schema_change(self) -> None:
+        blobs = (json.dumps(self.base).encode(), json.dumps(self.base).encode())
+        self.assertEqual(derive_slice_class([self.path, "crates/aft/src/query_shape.rs"], schema_blobs=blobs), "ranking")
+
+    def test_unknown_shapes_and_missing_blobs_fail_closed(self) -> None:
+        valid = json.dumps(self.base).encode()
+        for blob in (None, b'[]', b'{"tools":{"search":{}}}', b'{"search":{}}', b'{"search":true}', b'{"search":{},"search":{}}', b'NaN', b'\xff'):
+            for side in (0, 1):
+                with self.subTest(blob=blob, side=side):
+                    blobs = (blob, valid) if side == 0 else (valid, blob)
+                    notes = []
+                    self.assertEqual(derive_slice_class([self.path], schema_blobs=blobs, notes=notes), "ranking")
+                    self.assertIn("fail_closed:", notes[0])
+        notes = []
+        self.assertEqual(derive_slice_class([self.path], notes=notes), "ranking")
+        self.assertIn("comparison_unavailable", notes[0])
+
+    def test_unresolved_or_unsupported_references_fail_closed(self) -> None:
+        for ref in ("#/$defs/Missing", "https://example.test/query.json", "#anchor", "#/bad~2escape"):
+            with self.subTest(ref=ref):
+                self.base["search"]["properties"]["query"] = {"$ref": ref}
+                notes = []
+                blob = json.dumps(self.base).encode()
+                self.assertEqual(derive_slice_class([self.path], schema_blobs=(blob, blob), notes=notes), "ranking")
+                self.assertIn("schema_reference", notes[0])
+
+    def test_fail_closed_note_survives_descriptor_class_mismatch(self) -> None:
+        manifest, reference, score = synthetic_documents()
+        descriptor = {"slice_class": "non_ranking", "targeted_mechanism": "none", "kind": "harness", "fixtures": ["harness-goldens"]}
+        result = total_gate(reference, score, manifest, descriptor, [self.path], schema_blobs=(b'broken', b'broken'))
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("descriptor_class_mismatch", result.reasons[0])
+        self.assertIn("fail_closed:base:invalid_json", result.notes[0])
+
+    def test_blob_reader_uses_merge_base_and_explicit_head_not_worktree(self) -> None:
+        with mock.patch("search_quality_lib.subprocess.run") as git:
+            git.side_effect = [mock.Mock(returncode=0, stdout=b"merge-base-sha\n"), mock.Mock(returncode=0, stdout=b"base"), mock.Mock(returncode=0, stdout=b"head")]
+            root = Path("/repo")
+            self.assertEqual(read_tool_schema_blobs("base-ref", "head-ref", [self.path], root=root), (b"base", b"head"))
+            self.assertEqual([call.args[0] for call in git.call_args_list], [
+                ["git", "merge-base", "base-ref", "head-ref"],
+                ["git", "show", f"merge-base-sha:{self.path}"],
+                ["git", "show", f"head-ref:{self.path}"],
+            ])
+            self.assertTrue(all(call.kwargs["cwd"] == root for call in git.call_args_list))
+
+    def test_blob_reader_leaves_missing_head_for_fail_closed_classification(self) -> None:
+        with mock.patch("search_quality_lib.subprocess.run") as git:
+            git.side_effect = [mock.Mock(returncode=0, stdout=b"base-sha\n"), mock.Mock(returncode=0, stdout=b"base"), mock.Mock(returncode=1, stdout=b"")]
+            self.assertEqual(read_tool_schema_blobs("base", "head", [self.path], root=Path("/repo")), (b"base", None))
+        with mock.patch("search_quality_lib.subprocess.run") as git:
+            self.assertIsNone(read_tool_schema_blobs("base", "head", ["README.md"], root=Path("/repo")))
+            git.assert_not_called()
+
+    def test_diff_paths_keeps_deleted_schema_path_visible_even_for_a_rename(self) -> None:
+        with mock.patch("search_quality.subprocess.run", return_value=mock.Mock(returncode=0, stdout=self.path + "\n")) as git:
+            self.assertEqual(diff_paths("base", "head"), [self.path])
+        self.assertEqual(git.call_args.args[0], ["git", "diff", "--name-only", "--no-renames", "base...head"])
+
+    def test_evaluate_cli_supplies_committed_schema_blobs_to_gate(self) -> None:
+        manifest, reference, score = synthetic_documents()
+        head = copy.deepcopy(self.base)
+        head["zoom"]["description"] = "Batch-only zoom"
+        blobs = (json.dumps(self.base).encode(), json.dumps(head).encode())
+        with tempfile.TemporaryDirectory() as directory:
+            score_path = Path(directory) / "score.json"
+            args = quality_parser().parse_args(["--score", str(score_path), "--base-ref", "base-ref", "--head", "head-ref"])
+            with mock.patch("search_quality.read_json", side_effect=[manifest, score, reference]), mock.patch("search_quality.binding"), mock.patch("search_quality.descriptor_path", return_value=None), mock.patch("search_quality.diff_paths", return_value=[self.path]), mock.patch("search_quality.read_tool_schema_blobs", return_value=blobs) as reader:
+                self.assertEqual(quality_run(args), 0)
+            reader.assert_called_once_with("base-ref", "head-ref", [self.path], root=Path(__file__).resolve().parents[2])
 
 
 class EngineUnwiredGateTests(unittest.TestCase):
