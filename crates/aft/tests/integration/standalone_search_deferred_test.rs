@@ -971,18 +971,46 @@ fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
 #[cfg(unix)]
 #[test]
 fn standalone_edit_then_queued_grep_observes_watcher_update() {
+    assert_edit_then_queued_grep_is_fresh(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_edit_then_queued_grep_is_fresh_without_watcher_delivery() {
+    // Withhold OS delivery entirely: read-after-write must not depend on when
+    // FSEvents or inotify happens to report AFT's own completed edit.
+    assert_edit_then_queued_grep_is_fresh(false);
+}
+
+#[cfg(unix)]
+fn assert_edit_then_queued_grep_is_fresh(watcher_enabled: bool) {
     let project = tempfile::tempdir().expect("create freshness project");
     let storage = tempfile::tempdir().expect("create freshness storage");
     let target = project.path().join("source.ts");
     fs::write(&target, "export const value = 'old_watcher_token';\n")
         .expect("write freshness fixture");
 
+    let formatter_listener = TcpListener::bind("127.0.0.1:0").expect("bind formatter barrier");
+    let formatter_port = formatter_listener.local_addr().unwrap().port().to_string();
+    let (formatter_tx, formatter_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = formatter_listener.accept().expect("accept formatter");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut ready = [0];
+        stream
+            .read_exact(&mut ready)
+            .expect("formatter ready signal");
+        assert_eq!(ready, [b'R']);
+        let _ = formatter_tx.send(stream);
+    });
     let formatter_dir = project.path().join("bin");
     fs::create_dir_all(&formatter_dir).expect("create formatter directory");
     let formatter = formatter_dir.join("biome");
     link_cached_executable(
         &formatter,
-        b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'biome 2.0.0'; exit 0; fi\nsleep 0.4\n",
+        b"#!/bin/bash\nif [ \"$1\" = \"--version\" ]; then echo 'biome 2.0.0'; exit 0; fi\nexec 3<>/dev/tcp/127.0.0.1/$AFT_TEST_FORMATTER_PORT || exit 1\nprintf R >&3\nread -r -t 5 release <&3\n",
     )
     .expect("cache formatter shim");
     let formatter_path = std::env::join_paths(
@@ -994,10 +1022,17 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
 
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_STORAGE_DIR", storage.path().as_os_str()),
-        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+        (
+            "AFT_TEST_DISABLE_FILE_WATCHER",
+            std::ffi::OsStr::new(if watcher_enabled { "0" } else { "1" }),
+        ),
         (
             "AFT_TEST_SYNC_FILE_WATCHER_START",
             std::ffi::OsStr::new("1"),
+        ),
+        (
+            "AFT_TEST_FORMATTER_PORT",
+            std::ffi::OsStr::new(&formatter_port),
         ),
         ("PATH", formatter_path.as_os_str()),
     ]);
@@ -1021,7 +1056,6 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
 
     let ready_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        thread::sleep(Duration::from_millis(125));
         let status = aft.send(r#"{"id":"freshness-status","command":"status"}"#);
         if status["search_index"]["status"] == "ready" {
             break;
@@ -1040,10 +1074,6 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
             .is_some_and(|matches| !matches.is_empty()),
         "initial search index did not include the fixture: {initial:?}"
     );
-    // The search index can become ready before the file watcher is attached, so
-    // wait briefly for watcher setup to finish.
-    thread::sleep(Duration::from_secs(1));
-
     let edit = serde_json::to_string(&json!({
         "id": "freshness-edit",
         "command": "tool_call",
@@ -1066,7 +1096,18 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
     }))
     .expect("serialize grep request");
     aft.send_silent(&edit);
+    let mut formatter = formatter_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("edit did not reach formatter barrier");
+    assert!(fs::read_to_string(&target)
+        .unwrap()
+        .contains("fresh_watcher_token"));
+    // Queue the query while the edit handler is still in its formatter, then
+    // allow the edit to finish. No OS notification or timing guess orders this.
     aft.send_silent(&grep);
+    formatter
+        .write_all(b"release\n")
+        .expect("release formatter");
 
     let (edit_response, _) = read_response(&mut aft, "freshness-edit", Duration::from_secs(5));
     assert_eq!(
@@ -1084,6 +1125,15 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
             .is_some_and(|matches| !matches.is_empty()),
         "queued grep did not observe the edit: {grep_response:?}"
     );
+    assert_eq!(grep_response["total_matches"], 1, "{grep_response:?}");
+    assert_eq!(grep_response["files_searched"], 1, "{grep_response:?}");
+    if !watcher_enabled {
+        assert_eq!(grep_response["complete"], true, "{grep_response:?}");
+    }
+    let old = aft.send(
+        r#"{"id":"freshness-old","command":"grep","pattern":"old_watcher_token","max_results":20}"#,
+    );
+    assert_eq!(old["total_matches"], 0, "stale entry survived: {old:?}");
 
     assert!(aft.shutdown().success());
 }

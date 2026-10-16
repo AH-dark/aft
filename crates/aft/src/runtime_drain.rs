@@ -2716,6 +2716,53 @@ fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyP
     }
 }
 
+fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
+    let max_file_size = ctx
+        .search_index()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(crate::search_index::SearchIndex::max_file_size);
+    let Some(max_file_size) = max_file_size else {
+        return;
+    };
+    let remove = watcher_path_is_ignored_by_current_matcher(ctx, path);
+    let update = crate::search_index::prepare_search_update(path, max_file_size, remove);
+    let mut index_ref = ctx
+        .search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = index_ref.as_mut() {
+        index.apply_search_update(update);
+    }
+}
+
+/// Publish AFT's own completed writes before a queued query can use the index.
+/// OS notifications can arrive after the edit response, so they cannot provide
+/// read-after-write ordering. Preparation reads at most the index's file-size
+/// limit, just as it does for a watcher update.
+pub(crate) fn refresh_search_index_after_write(ctx: &AppContext, path: &Path) {
+    if !ctx.heavy_root_work_allowed()
+        || (ctx.shared_artifacts_read_only() && !ctx.ram_overlay_active())
+    {
+        return;
+    }
+    let generation = ctx.configure_generation();
+    let _ = ctx.run_if_subc_bound_generation(generation, || {
+        ctx.invalidate_warm_verify_memo();
+        if ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            // A load finishing later must replay the write onto its snapshot.
+            ctx.add_pending_search_index_paths([path.to_path_buf()]);
+        }
+        refresh_search_index_path(ctx, path);
+    });
+}
+
 fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, started: Instant) {
     let WatcherDrainPhase::Apply {
         mut stage,
@@ -2851,28 +2898,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 |path| {
                     if heavy_root_work_allowed && apply_ram_search_updates {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
-                            let max_file_size = ctx
-                                .search_index()
-                                .read()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .as_ref()
-                                .map(crate::search_index::SearchIndex::max_file_size);
-                            let Some(max_file_size) = max_file_size else {
-                                return;
-                            };
-                            let remove = watcher_path_is_ignored_by_current_matcher(ctx, path);
-                            let update = crate::search_index::prepare_search_update(
-                                path,
-                                max_file_size,
-                                remove,
-                            );
-                            let mut index_ref = ctx
-                                .search_index()
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if let Some(index) = index_ref.as_mut() {
-                                index.apply_search_update(update);
-                            }
+                            refresh_search_index_path(ctx, path);
                         });
                     }
                 },
@@ -5489,6 +5515,52 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn own_write_refresh_survives_in_flight_search_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let source = root.join("source.rs");
+        std::fs::write(&source, "fn old_write_marker() {}\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        let stale = crate::search_index::SearchIndex::build(&root);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+
+        std::fs::write(&source, "fn fresh_write_marker() {}\n").unwrap();
+        refresh_search_index_after_write(&ctx, &source);
+        let assert_fresh = || {
+            let search = ctx.search_index().read().unwrap();
+            let index = search.as_ref().unwrap();
+            assert_eq!(
+                index
+                    .grep("fresh_write_marker", true, &[], &[], &root, 10)
+                    .matches
+                    .len(),
+                1,
+                "own write must be present even without OS delivery"
+            );
+            assert!(index
+                .grep("old_write_marker", true, &[], &[], &root, 10)
+                .matches
+                .is_empty());
+        };
+        assert_fresh();
+
+        // The worker's snapshot predates the write. Installing it must replay
+        // the same path, rather than undoing the read-after-write guarantee.
+        tx.send(stale).unwrap();
+        drain_search_index_events(&ctx);
+        assert_fresh();
     }
 
     #[test]
