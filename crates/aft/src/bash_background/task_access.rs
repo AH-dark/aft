@@ -3,10 +3,115 @@ use crate::bash_background::persistence::{PinnedDir, ResolvedTask, TaskLayout};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
+const TASK_READ_RECORD_CAPACITY: usize = 64;
+
 pub(super) struct TaskReadRecord {
     resolved: ResolvedTask,
     metadata: PersistedTask,
-    readers: Mutex<HashMap<(String, String, u64), bool>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bash_background::persistence::{create_task_layout, write_task};
+
+    fn record(registry: &BgTaskRegistry, storage: &Path, index: usize) -> TaskPaths {
+        let task_id = format!("bash-{index:016x}");
+        let paths = create_task_layout(storage, "session", &task_id)
+            .unwrap()
+            .paths;
+        let mut metadata = PersistedTask::starting(
+            task_id,
+            "session".into(),
+            "echo output".into(),
+            storage.to_path_buf(),
+            Some(storage.to_path_buf()),
+            None,
+            false,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        write_task(&paths.json, &metadata).unwrap();
+        fs::write(&paths.stdout, "output\n").unwrap();
+        assert!(registry.is_readable_task_path("session", &paths.stdout));
+        paths
+    }
+
+    #[test]
+    fn task_read_cache_is_bounded_and_eviction_releases_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let first = record(&registry, storage.path(), 0);
+        let first_record = Arc::downgrade(&registry.task_read_record(&first.dir).unwrap());
+        for index in 1..192 {
+            record(&registry, storage.path(), index);
+            assert!(
+                registry.inner.task_read_records.lock().unwrap().len() <= 64,
+                "the pinned task-read cache must hold at most 64 records"
+            );
+        }
+        assert!(
+            first_record.upgrade().is_none(),
+            "eviction must close handles"
+        );
+        assert!(registry.is_readable_task_path("session", &first.stdout));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_read_cache_identity_failure_releases_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        let cached = Arc::downgrade(&registry.task_read_record(&paths.dir).unwrap());
+        fs::rename(&paths.dir, paths.dir.with_extension("old")).unwrap();
+        assert!(registry.task_read_record(&paths.dir).is_none());
+        assert!(
+            cached.upgrade().is_none(),
+            "a stale record must not retain handles"
+        );
+        assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_read_cache_cleanup_releases_deleted_task_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        let cached = Arc::downgrade(&registry.task_read_record(&paths.dir).unwrap());
+        registry.replay_session(storage.path(), "session").unwrap();
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(
+            !paths.dir.exists(),
+            "cleanup must delete the expired bundle"
+        );
+        assert!(
+            cached.upgrade().is_none(),
+            "cleanup must close cached handles"
+        );
+        assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_read_cache_retention_releases_deleted_task_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        let cached = Arc::downgrade(&registry.task_read_record(&paths.dir).unwrap());
+        let old = std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        filetime::set_file_mtime(&paths.json, filetime::FileTime::from_system_time(old)).unwrap();
+        assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 1);
+        assert!(
+            !paths.dir.exists(),
+            "retention must delete the expired bundle"
+        );
+        assert!(
+            cached.upgrade().is_none(),
+            "retention must close cached handles"
+        );
+        assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -106,16 +211,23 @@ impl BgTaskRegistry {
     }
 
     fn task_read_record(&self, root: &Path) -> Option<Arc<TaskReadRecord>> {
-        if let Some(record) = self.inner.task_read_records.lock().ok()?.get(root).cloned() {
-            record.resolved.dirs.task.ensure_current_identity().ok()?;
-            record
-                .resolved
-                .dirs
-                .control
-                .ensure_current_identity()
-                .ok()?;
-            record.resolved.dirs.io.ensure_current_identity().ok()?;
-            return Some(record);
+        {
+            let mut records = self.inner.task_read_records.lock().ok()?;
+            if let Some(index) = records.iter().position(|(path, _)| path == root) {
+                // Take the record out first so a failed identity check also
+                // releases the cache's directory handles.
+                let (path, record) = records.remove(index)?;
+                record.resolved.dirs.task.ensure_current_identity().ok()?;
+                record
+                    .resolved
+                    .dirs
+                    .control
+                    .ensure_current_identity()
+                    .ok()?;
+                record.resolved.dirs.io.ensure_current_identity().ok()?;
+                records.push_back((path, Arc::clone(&record)));
+                return Some(record);
+            }
         }
         #[cfg(test)]
         self.inner
@@ -132,54 +244,59 @@ impl BgTaskRegistry {
         {
             return None;
         }
-        let record = Arc::new(TaskReadRecord {
-            resolved,
-            metadata,
-            readers: Mutex::new(HashMap::new()),
-        });
+        let record = Arc::new(TaskReadRecord { resolved, metadata });
         let mut records = self.inner.task_read_records.lock().ok()?;
-        Some(Arc::clone(
-            records.entry(root.to_path_buf()).or_insert(record),
-        ))
+        if let Some((_, existing)) = records.iter().find(|(path, _)| path == root) {
+            return Some(Arc::clone(existing));
+        }
+        // Keep only a small working set: each record owns three pinned
+        // directories, so retaining historical records would exhaust handles.
+        if records.len() >= TASK_READ_RECORD_CAPACITY {
+            records.pop_front();
+        }
+        records.push_back((root.to_path_buf(), Arc::clone(&record)));
+        Some(record)
+    }
+
+    pub(super) fn forget_task_read_record(&self, root: &Path) {
+        if let Ok(mut records) = self.inner.task_read_records.lock() {
+            records.retain(|(path, _)| path != root);
+        }
     }
 
     fn head_reads_record(&self, record: &TaskReadRecord) -> bool {
         let Some(caller) = crate::access_policy::current_scope() else {
             return false;
         };
-        let key = (caller.owner.clone(), caller.scope_ref.clone(), caller.epoch);
-        let Ok(mut readers) = record.readers.lock() else {
+        let Some(scope) = record.metadata.scope.as_ref() else {
             return false;
         };
-        *readers.entry(key).or_insert_with(|| {
-            let Some(scope) = record.metadata.scope.as_ref() else {
-                return false;
-            };
-            if !scope.owner_authorized || scope.kind != subc_protocol::scope::ScopeKind::Worker {
-                return false;
-            }
-            let Some(parent) = scope.parent.as_ref() else {
-                return false;
-            };
-            // A revived worker has a new session and epoch, but its parent
-            // scope's owner and reference still identify the owning head.
-            if caller.owner != serde_json::to_string(&parent.owner).expect("scope owner serializes")
-                || caller.scope_ref != parent.scope_ref
-            {
-                return false;
-            }
-            self.inner
-                .db_pool
-                .read()
-                .ok()
-                .and_then(|pool| pool.clone())
-                .and_then(|pool| {
-                    pool.lock()
-                        .ok()
-                        .and_then(|conn| crate::db::access_grants::is_head(&conn, &caller).ok())
-                })
-                .unwrap_or(false)
-        })
+        if !scope.owner_authorized || scope.kind != subc_protocol::scope::ScopeKind::Worker {
+            return false;
+        }
+        let Some(parent) = scope.parent.as_ref() else {
+            return false;
+        };
+        // A revived worker has a new session and epoch, but its parent
+        // scope's owner and reference still identify the owning head.
+        if caller.owner != serde_json::to_string(&parent.owner).expect("scope owner serializes")
+            || caller.scope_ref != parent.scope_ref
+        {
+            return false;
+        }
+        // Scope end or replacement of the head registration must take effect
+        // on the next read. Recheck the indexed database row, not the folders.
+        self.inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|pool| pool.clone())
+            .and_then(|pool| {
+                pool.lock()
+                    .ok()
+                    .and_then(|conn| crate::db::access_grants::is_head(&conn, &caller).ok())
+            })
+            .unwrap_or(false)
     }
 
     /// The read-only exception is pinned and cached per bundle, never per file.

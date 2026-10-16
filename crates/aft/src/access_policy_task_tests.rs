@@ -151,6 +151,38 @@ fn access_policy_head_reads_worker_task_records() {
 }
 
 #[test]
+fn access_policy_ended_head_loses_cached_worker_task_access() {
+    let f = fixture();
+    crate::access_policy::with_scope(Some(f.head.clone()), || {
+        assert!(read_as(&f.ctx, "head-session", &f.worker.command).success);
+        scopes::end_scope_grants(&f.ctx.db().unwrap().lock().unwrap(), &f.head).unwrap();
+        assert_floor(
+            read_as(&f.ctx, "head-session", &f.worker.command),
+            &f.worker.command,
+        );
+    });
+}
+
+#[test]
+fn access_policy_replaced_head_registration_loses_cached_worker_task_access() {
+    let f = fixture();
+    crate::access_policy::with_scope(Some(f.head.clone()), || {
+        assert!(read_as(&f.ctx, "head-session", &f.worker.command).success);
+        scopes::register_agent(
+            &f.ctx.db().unwrap().lock().unwrap(),
+            &f.head,
+            "head-agent",
+            false,
+        )
+        .unwrap();
+        assert_floor(
+            read_as(&f.ctx, "head-session", &f.worker.command),
+            &f.worker.command,
+        );
+    });
+}
+
+#[test]
 fn access_policy_head_reads_revived_worker_task_records() {
     let f = fixture();
     let revived = record(
@@ -390,7 +422,10 @@ fn access_policy_task_folder_cache_is_pinned_and_shared_between_files() {
         // handle to it, which already rules out the swap this test guards.
         let renamed = std::fs::rename(&f.worker.dir, f.worker.dir.with_extension("old"));
         if cfg!(windows) {
-            assert!(renamed.is_err(), "a pinned task folder must not be renamable");
+            assert!(
+                renamed.is_err(),
+                "a pinned task folder must not be renamable"
+            );
             return;
         }
         renamed.unwrap();

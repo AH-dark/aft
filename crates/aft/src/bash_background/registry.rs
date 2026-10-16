@@ -791,7 +791,7 @@ pub(crate) struct RegistryInner {
     /// Directory handles prevent cached permissions from following a replaced I/O directory.
     persisted_artifact_owners:
         Mutex<HashMap<PathBuf, (String, Arc<super::persistence::PinnedDir>)>>,
-    task_read_records: Mutex<HashMap<PathBuf, Arc<task_access::TaskReadRecord>>>,
+    task_read_records: Mutex<VecDeque<(PathBuf, Arc<task_access::TaskReadRecord>)>>,
     #[cfg(test)]
     task_access_work: task_access::WorkCounters,
     /// Failed finished-task bundle deletions and their bounded retry count.
@@ -1196,7 +1196,7 @@ impl BgTaskRegistry {
                 before_promotion_commit: Mutex::new(None),
                 tasks: Mutex::new(HashMap::new()),
                 persisted_artifact_owners: Mutex::new(HashMap::new()),
-                task_read_records: Mutex::new(HashMap::new()),
+                task_read_records: Mutex::new(VecDeque::new()),
                 #[cfg(test)]
                 task_access_work: task_access::WorkCounters::default(),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
@@ -6013,6 +6013,7 @@ impl BgTaskRegistry {
                             .retired_undelivered_completions
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    self.forget_task_read_record(&resolved.paths.dir);
                     match delete_task_bundle(&resolved.paths) {
                         Ok(()) => {
                             self.forget_finished_delete_attempts(&metadata.task_id);
@@ -6640,6 +6641,7 @@ impl BgTaskRegistry {
             if let Ok(mut tasks) = self.inner.tasks.lock() {
                 tasks.remove(&task_id);
             }
+            self.forget_task_read_record(&task.paths.dir);
             let handles_released = release_terminal_io_handles(&task);
             let paths = task.paths.clone();
             if self.finished_delete_attempt_count(&task_id) >= FINISHED_DELETE_MAX_ATTEMPTS {
