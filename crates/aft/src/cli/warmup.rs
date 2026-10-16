@@ -758,13 +758,11 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
             }
             *receiver = None;
             if busy_reopen {
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                tx.send(CallGraphStoreBuildEvent::Reopen {
+                ctx.defer_callgraph_store_reopen(
+                    receiver,
                     fulfilled_force_token,
-                    publication_epoch: reopen_epoch.expect("published store"),
-                })
-                .expect("new reopen receiver");
-                *receiver = Some(rx);
+                    reopen_epoch.expect("published store"),
+                );
             }
             if installed {
                 if let Some(force_token) = fulfilled_force_token {
@@ -983,7 +981,22 @@ mod tests {
         })
         .unwrap();
         drop(tx);
+        let original_epoch = ctx.callgraph_store_rx_epoch();
         drain_callgraph_store_events(&ctx);
+        let retry_epoch = ctx.callgraph_store_rx_epoch();
+        assert_ne!(
+            retry_epoch, original_epoch,
+            "a retry channel needs a new identity"
+        );
+        assert!(
+            ctx.with_current_callgraph_store_rx(
+                ctx.configure_generation(),
+                original_epoch,
+                |receiver| *receiver = None,
+            )
+            .is_none(),
+            "a disconnected waiter must not retire the retry channel"
+        );
         assert!(
             ctx.callgraph_store_rx().lock().is_some(),
             "busy reopen must stay pending"
@@ -993,6 +1006,12 @@ mod tests {
             Some(token)
         );
         assert!(ctx.callgraph_store().read().unwrap().is_none());
+        drain_callgraph_store_events(&ctx);
+        assert_ne!(
+            ctx.callgraph_store_rx_epoch(),
+            retry_epoch,
+            "repeated busy retries also replace the channel"
+        );
         blocker.execute_batch("ROLLBACK").unwrap();
         drain_callgraph_store_events(&ctx);
         assert!(ctx.callgraph_store_rx().lock().is_none());

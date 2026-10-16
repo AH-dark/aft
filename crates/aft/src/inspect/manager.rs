@@ -6677,6 +6677,13 @@ fn filter_outcome_for_scope_with_contributions(
     cache: &(impl InspectCacheRead + ?Sized),
     scope: &JobScope,
 ) -> JobOutcome {
+    // A later successful readiness probe cannot validate source facts that the
+    // earlier busy pass never scanned, including a cached pending observation.
+    if outcome.payload().is_some_and(|payload| {
+        payload["status"] == "pending" && payload["reason"] == "callgraph_building"
+    }) {
+        return JobOutcome::callgraph_pending();
+    }
     if !category.is_tier2() || scope.is_project_wide() {
         return filter_outcome_for_scope(outcome, scope);
     }
@@ -6708,7 +6715,7 @@ fn filter_outcome_for_scope_with_contributions(
                 in_flight,
             },
         },
-        JobOutcome::Pending { in_flight, wait } => JobOutcome::Pending { in_flight, wait },
+        outcome @ JobOutcome::Pending { .. } => outcome,
         JobOutcome::Failed { message } => JobOutcome::Failed { message },
     }
 }
@@ -6722,7 +6729,7 @@ fn filter_outcome_for_scope(outcome: JobOutcome, scope: &JobScope) -> JobOutcome
             cached: cached.map(|payload| filter_payload_for_scope(payload, scope)),
             in_flight,
         },
-        JobOutcome::Pending { in_flight, wait } => JobOutcome::Pending { in_flight, wait },
+        outcome @ JobOutcome::Pending { .. } => outcome,
         JobOutcome::Failed { message } => JobOutcome::Failed { message },
     }
 }
@@ -8458,6 +8465,92 @@ export function bannerUnused() {}
                 .is_some(),
             "inspect must reopen the ready callgraph instead of failing terminally"
         );
+    }
+
+    #[test]
+    fn scoped_busy_probe_stays_pending_after_unlock_before_rollup() {
+        let dir = write_ts_project(3);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let callgraph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap();
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease(callgraph_dir, root.clone(), &files).unwrap();
+        let mut job = snapshot_job(&root, &inspect_dir, true);
+        job.scope_files = files;
+        job.callgraph_writer = false;
+        let manager = InspectManager::new();
+        let seeded =
+            manager.completion_outcome(manager.tier2_run_with_reuse_job_result(job.clone()));
+        assert!(matches!(seeded, JobOutcome::Fresh { .. }), "{seeded:?}");
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            inspect_dir,
+            Arc::clone(&job.config),
+            Arc::clone(&job.symbol_cache),
+        );
+        let cache = manager.cache_for_snapshot(&snapshot).unwrap();
+        let path = root.join("file0.ts");
+        std::fs::write(&path, "function changedWhileBusy() {}\n").unwrap();
+        let scans_before = manager.source_scan_files_for_test();
+        let blocker = store.lock_readiness_for_test();
+        drop(store);
+
+        // The initial probe runs before changed-file contributions are saved.
+        let result = manager.tier2_run_with_reuse_job_result(job);
+        assert!(
+            result.deferred.is_some(),
+            "first readiness probe must be busy"
+        );
+        assert_eq!(manager.source_scan_files_for_test(), scans_before);
+        let outcome = manager.completion_outcome(result);
+        // Release the real exclusive lock exactly between the scan and scoped
+        // rollup, so a second readiness probe would now succeed.
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(manager.callgraph_ready_for_snapshot(&snapshot).unwrap());
+        let scoped = filter_outcome_for_scope_with_contributions(
+            outcome,
+            &snapshot,
+            InspectCategory::DeadCode,
+            cache.as_ref(),
+            &JobScope::from_roots(root.clone(), vec![path]),
+        );
+        let payload = scoped.payload().expect("pending observation payload");
+        assert_eq!(
+            payload["complete"], false,
+            "unlocking cannot validate cached contributions for unscanned changes: {scoped:?}"
+        );
+        assert_eq!(payload["status"], "pending");
+        assert_eq!(payload["reason"], "callgraph_building");
+        assert!(payload.get("count").is_none(), "{scoped:?}");
+        assert!(payload.get("items").is_none(), "{scoped:?}");
+        assert!(
+            scoped.is_pending(),
+            "busy observations must never be Fresh: {scoped:?}"
+        );
+
+        for input in [
+            JobOutcome::Fresh {
+                payload: payload.clone(),
+            },
+            JobOutcome::Stale {
+                cached: Some(payload.clone()),
+                in_flight: false,
+            },
+        ] {
+            let preserved = filter_outcome_for_scope_with_contributions(
+                input,
+                &snapshot,
+                InspectCategory::DeadCode,
+                cache.as_ref(),
+                &JobScope::from_roots(root.clone(), vec![root.join("file0.ts")]),
+            );
+            assert!(
+                preserved.is_pending(),
+                "pending rollup inputs must remain pending: {preserved:?}"
+            );
+            assert_eq!(preserved.payload(), Some(payload));
+        }
     }
 
     #[test]

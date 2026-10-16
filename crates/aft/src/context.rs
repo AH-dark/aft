@@ -3972,6 +3972,25 @@ fn remove_callgraph_pointer_before_inline_reopen_for_test(
 ) {
 }
 
+#[cfg(test)]
+thread_local! {
+    static CALLGRAPH_INLINE_RECEIVE_GATE: std::cell::RefCell<Option<(
+        crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn wait_after_inline_callgraph_receive_for_test() {
+    CALLGRAPH_INLINE_RECEIVE_GATE.with(|slot| {
+        if let Some((reached, release)) = slot.borrow_mut().take() {
+            reached.send(()).expect("inline receive reached");
+            release
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release inline receive");
+        }
+    });
+}
+
 /// Inline wait window for a callgraph-store cold build before returning
 /// `Building`. Default `0` (pure-async: never block the request thread).
 /// Tests set `AFT_CALLGRAPH_BUILD_WAIT_MS` large so small fixture builds
@@ -8683,6 +8702,8 @@ impl AppContext {
                         );
                     }
                     drop(store);
+                    #[cfg(test)]
+                    wait_after_inline_callgraph_receive_for_test();
                     let reopened = CallGraphStore::open_readonly_before(
                         callgraph_dir.clone(),
                         project_root.clone(),
@@ -8715,13 +8736,11 @@ impl AppContext {
                                 }
                                 Ok(None) => CallgraphStoreAccess::Building,
                                 Err(error) if error.is_transient_lock_contention() => {
-                                    let (tx, rx) = crossbeam_channel::bounded(1);
-                                    tx.send(CallGraphStoreBuildEvent::Reopen {
+                                    self.defer_callgraph_store_reopen(
+                                        receiver,
                                         fulfilled_force_token,
                                         publication_epoch,
-                                    })
-                                    .expect("new reopen receiver");
-                                    *receiver = Some(rx);
+                                    );
                                     CallgraphStoreAccess::Error(error)
                                 }
                                 Err(error) => CallgraphStoreAccess::Error(error),
@@ -8785,6 +8804,8 @@ impl AppContext {
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    #[cfg(test)]
+                    wait_after_inline_callgraph_receive_for_test();
                     let _ = self.with_current_callgraph_store_rx(
                         receiver_generation,
                         receiver_epoch,
@@ -9114,6 +9135,25 @@ impl AppContext {
         let mut receiver = self.callgraph_store_rx.lock();
         *receiver = None;
         self.next_callgraph_store_rx_epoch();
+    }
+
+    /// Replace a consumed completion with a retry while holding its receiver
+    /// slot. Advance identity so a waiter on the old channel cannot retire it.
+    #[doc(hidden)]
+    pub fn defer_callgraph_store_reopen(
+        &self,
+        receiver: &mut Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>,
+        fulfilled_force_token: Option<u64>,
+        publication_epoch: u64,
+    ) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(CallGraphStoreBuildEvent::Reopen {
+            fulfilled_force_token,
+            publication_epoch,
+        })
+        .expect("new reopen receiver");
+        self.next_callgraph_store_rx_epoch();
+        *receiver = Some(rx);
     }
 
     /// Rebind a live callgraph build receiver while its dedicated publication
@@ -13834,6 +13874,73 @@ mod callgraph_store_for_ops_tests {
             },
         ));
         ([project, storage], ctx)
+    }
+
+    #[test]
+    fn stale_inline_waiter_cannot_discard_busy_reopen_or_force_another_build() {
+        let (_dirs, ctx) = cold_build_context();
+        let root = ctx.callgraph_project_root().unwrap();
+        ctx.set_canonical_cache_root(root.clone());
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        ctx.mark_callgraph_store_force_rebuild("inline reopen race");
+
+        let spawn_waiter = || {
+            let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+            let ctx = Arc::clone(&ctx);
+            let waiter = std::thread::spawn(move || {
+                CALLGRAPH_INLINE_RECEIVE_GATE.with(|slot| {
+                    *slot.borrow_mut() = Some((reached_tx, release_rx));
+                });
+                ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(5), false)
+            });
+            (waiter, reached_rx, release_tx)
+        };
+
+        let (first, first_reached, first_release) = spawn_waiter();
+        first_reached.recv_timeout(Duration::from_secs(10)).unwrap();
+        let original_epoch = ctx.callgraph_store_rx_epoch();
+        let store = CallGraphStore::open_readonly(ctx.callgraph_store_dir(), root)
+            .unwrap()
+            .unwrap();
+        let path = store.sqlite_path().to_path_buf();
+        drop(store);
+        let blocker = rusqlite::Connection::open(path).unwrap();
+        blocker
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+
+        // The first waiter owns Ready; the second has observed its disconnected
+        // channel but must not commit that observation against a retry channel.
+        let (second, second_reached, second_release) = spawn_waiter();
+        second_reached
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        first_release.send(()).unwrap();
+        assert!(
+            matches!(first.join().unwrap(), CallgraphStoreAccess::Error(error)
+            if error.is_transient_lock_contention())
+        );
+        second_release.send(()).unwrap();
+        assert!(matches!(
+            second.join().unwrap(),
+            CallgraphStoreAccess::Building
+        ));
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        assert!(matches!(
+            ctx.callgraph_store_for_ops_with_wait(Duration::from_secs(5), false),
+            CallgraphStoreAccess::Ready(_)
+        ));
+        assert_eq!(
+            ctx.callgraph_cold_build_spawn_count_for_test(),
+            1,
+            "reopening a published forced build must not start a second build"
+        );
+        assert_ne!(ctx.callgraph_store_rx_epoch(), original_epoch);
+        assert!(ctx.pending_callgraph_store_force_token().is_none());
+        assert!(ctx.callgraph_store_rx().lock().is_none());
     }
 
     #[test]
