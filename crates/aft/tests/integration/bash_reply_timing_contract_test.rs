@@ -366,10 +366,16 @@ fn subc_foreground_without_wait_is_killed_at_its_timeout() {
     });
 }
 
+// Startup is frozen so runner scheduling cannot consume the short promotion window.
+// The command timeout and the real promotion timer remain under test.
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_promoted_foreground_is_killed_at_its_timeout() {
     run_subc_with_env(
-        &[("AFT_TEST_FOREGROUND_WAIT_MS", SHORT_FOREGROUND_WAIT_MS)],
+        &[
+            ("AFT_TEST_FOREGROUND_WAIT_MS", SHORT_FOREGROUND_WAIT_MS),
+            ("AFT_TEST_SUBC_BASH_STARTUP_CLOCK", "frozen"),
+        ],
         |mut harness| async move {
             let files = CappedFiles::new(harness.project.path());
             let started = Instant::now();
