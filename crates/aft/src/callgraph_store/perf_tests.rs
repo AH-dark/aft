@@ -722,9 +722,21 @@ fn go_package_symbol_index_matches_scan() {
         &extracts,
         WorkspaceCratePrefixCache::default(),
     );
-    fn check(index: &impl ResolverIndex) {
+    let scan_memos = DiskIndexMemos::default();
+    let scan = DiskProjectIndex {
+        memos: &scan_memos,
+        workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
+        memoize_resolver_indexes: false,
+        ..disk
+    };
+    fn check(index: &impl ResolverIndex, scan: &impl ResolverIndex) {
         for caller in ["pkg/b.go", "pkg/a_test.go"] {
             for module in [None, Some("example/pkg"), Some("external/pkg")] {
+                assert_eq!(
+                    index.go_package_files(caller, module),
+                    scan.go_package_files(caller, module),
+                    "cached membership must match independent enumeration"
+                );
                 for symbol in ["Public", "private", "duplicate", "TestOnly", "missing"] {
                     let expected = match (caller.ends_with("_test.go"), module, symbol) {
                         (_, Some("external/pkg"), _) => None,
@@ -739,16 +751,17 @@ fn go_package_symbol_index_matches_scan() {
                     );
                     assert_eq!(
                         index.go_symbol_target(caller, module, symbol),
-                        go_symbol_target_by_scan(index, caller, module, symbol)
+                        go_symbol_target_by_scan(scan, caller, module, symbol)
                     );
                 }
             }
         }
     }
-    check(&disk);
-    check(&memory);
-    check(&lazy);
+    check(&disk, &scan);
+    check(&memory, &scan);
+    check(&lazy, &scan);
     memos.ensure_lookups_succeeded().unwrap();
+    scan_memos.ensure_lookups_succeeded().unwrap();
     assert!(lazy.take_lazy_load_error().is_none());
 
     let mut oversized = ProjectIndex::from_parts(
@@ -774,6 +787,57 @@ fn go_package_symbol_index_matches_scan() {
 }
 
 #[test]
+fn go_package_oversized_build_is_attempted_once_and_scans_list_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    write(&root, "pkg/a.go", "package pkg\n");
+    write(&root, "pkg/b.go", "package pkg\n");
+    let long_symbol = "x".repeat(GO_PACKAGE_MEMO_BYTES);
+    let mut file = DbFileIndex::empty(Some(LangId::Go));
+    file.node_by_bare
+        .insert(long_symbol.clone(), "oversized-node".into());
+    let index = ProjectIndex::from_parts(
+        &root,
+        HashMap::from([
+            ("pkg/a.go".into(), file),
+            ("pkg/b.go".into(), DbFileIndex::empty(Some(LangId::Go))),
+        ]),
+        HashMap::new(),
+        WorkspaceCratePrefixCache::default(),
+        Rc::new(DiskFacts::new(&root)),
+    );
+    work_counts::reset_under(&root);
+    const REFERENCES: usize = 32;
+    for _ in 0..REFERENCES {
+        assert_eq!(
+            go_symbol_target_by_scan(&index, "pkg/b.go", None, &long_symbol),
+            Some("pkg/a.go".into())
+        );
+    }
+    assert_eq!(work_counts::go_package_builds_under(&root), 0);
+    assert_eq!(work_counts::directory_reads_under(&root), REFERENCES);
+
+    work_counts::reset_under(&root);
+    for _ in 0..REFERENCES {
+        assert_eq!(
+            index.go_symbol_target("pkg/b.go", None, &long_symbol),
+            Some("pkg/a.go".into())
+        );
+    }
+    assert_eq!(
+        work_counts::go_package_builds_under(&root),
+        1,
+        "an oversized package must be attempted only once per pass"
+    );
+    assert_eq!(
+        work_counts::directory_reads_under(&root),
+        REFERENCES + 1,
+        "one construction listing plus one uncached directory listing per scan"
+    );
+    assert!(index.go_packages.borrow().packages.is_empty());
+}
+
+#[test]
 fn go_package_memo_evicts_whole_packages_within_budget() {
     let mut memo = GoPackageMemo::default();
     let package = || {
@@ -788,6 +852,58 @@ fn go_package_memo_evicts_whole_packages_within_budget() {
     assert!(memo.packages.contains_key(Path::new("second")));
     assert_eq!(memo.order.len(), 1);
     assert!(memo.bytes <= GO_PACKAGE_MEMO_BYTES);
+}
+
+#[test]
+fn go_package_oversized_markers_are_bounded_without_retrying_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    write(&root, "pkg/a.go", "package pkg\n");
+    let mut memo = GoPackageMemo::default();
+    const DIRECTORIES: usize = 1024;
+    for number in 0..DIRECTORIES {
+        memo.mark_oversized(PathBuf::from(format!("{}-{number}", "x".repeat(256))));
+    }
+    assert!(memo.oversized_dirs.len() < DIRECTORIES);
+    assert!(memo.oversized_bytes <= GO_PACKAGE_OVERSIZED_MEMO_BYTES);
+    let retained = memo.oversized_dirs.len();
+    memo.mark_oversized("another".into());
+    assert_eq!(memo.oversized_dirs.len(), retained);
+
+    let cached_dir = root.join("cached");
+    memo.insert(cached_dir, Rc::new(GoPackage::default()));
+    let memo = RefCell::new(memo);
+    let facts = DiskFacts::new(&root);
+    let paths = FactPaths {
+        root: &root,
+        facts: &facts,
+    };
+    let modules = WorkspaceCratePrefixCache::default();
+    work_counts::reset_under(&root);
+    for caller in ["pkg/a.go", "unseen/a.go"] {
+        assert!(cached_go_package(
+            &paths,
+            &modules,
+            &memo,
+            caller,
+            None,
+            |_| true,
+            |_| None::<Rc<DbFileIndex>>,
+        )
+        .is_none());
+    }
+    assert!(cached_go_package(
+        &paths,
+        &modules,
+        &memo,
+        "cached/a.go",
+        None,
+        |_| true,
+        |_| None::<Rc<DbFileIndex>>,
+    )
+    .is_some());
+    assert_eq!(work_counts::go_package_builds_under(&root), 0);
+    assert_eq!(work_counts::directory_reads_under(&root), 0);
 }
 
 #[test]

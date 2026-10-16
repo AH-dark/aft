@@ -161,6 +161,7 @@ pub(crate) mod work_counts {
     static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static DIRECTORY_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static GO_PACKAGE_BUILDS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -207,6 +208,14 @@ pub(crate) mod work_counts {
         under(&DIRECTORY_READS, root, None)
     }
 
+    pub(crate) fn note_go_package_build(path: &Path) {
+        note(&GO_PACKAGE_BUILDS, path);
+    }
+
+    pub(crate) fn go_package_builds_under(root: &Path) -> usize {
+        under(&GO_PACKAGE_BUILDS, root, None)
+    }
+
     pub(crate) fn staging_reads_under(root: &Path) -> usize {
         under(&STAGING_READS, root, None)
     }
@@ -233,7 +242,13 @@ pub(crate) mod work_counts {
     }
 
     pub(crate) fn reset_under(root: &Path) {
-        for map in [&PARSES, &CONFIG_READS, &STAGING_READS, &DIRECTORY_READS] {
+        for map in [
+            &PARSES,
+            &CONFIG_READS,
+            &STAGING_READS,
+            &DIRECTORY_READS,
+            &GO_PACKAGE_BUILDS,
+        ] {
             map.get_or_init(Default::default)
                 .lock()
                 .expect("work counter mutex poisoned")
@@ -3856,6 +3871,12 @@ impl CrateScanMemo {
 trait ResolverIndex {
     fn macro_use_modules(&self, file: &str) -> Vec<String>;
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String>;
+    // Enumerate package files without building or reading a cached package
+    // index. Cached adapters override this to avoid rebuilding oversized
+    // indexes during symbol scans and to allow independent membership checks.
+    fn uncached_go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        self.go_package_files(caller_file, module)
+    }
     fn go_symbol_target(
         &self,
         caller_file: &str,
@@ -3899,6 +3920,13 @@ impl ResolverIndex for ProjectIndex<'_> {
         if let Some(package) = self.go_package(&paths, caller_file, module) {
             return package.files_for(caller_file);
         }
+        self.uncached_go_package_files(caller_file, module)
+    }
+    fn uncached_go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        let paths = FactPaths {
+            root: &self.project_root,
+            facts: self.facts.as_ref(),
+        };
         go_package_files(&paths, &self.workspace_crate_prefixes, caller_file, module)
             .into_iter()
             .filter(|file| self.contains_file(file))
@@ -4451,6 +4479,14 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         if let Some(package) = self.go_package(&paths, caller_file, module) {
             return package.files_for(caller_file);
         }
+        self.uncached_go_package_files(caller_file, module)
+    }
+    fn uncached_go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        let disk = DiskFacts::new(self.project_root);
+        let paths = FactPaths {
+            root: self.project_root,
+            facts: &disk,
+        };
         go_package_files(&paths, &self.workspace_crate_prefixes, caller_file, module)
             .into_iter()
             .filter(|file| self.contains_file(file))
@@ -13627,15 +13663,35 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
 // pass, independently of the file-index memo. Evict whole packages, and use the
 // original scan for oversized ones: never trim the resolver's candidates.
 const GO_PACKAGE_MEMO_BYTES: usize = 8 * 1024 * 1024;
+// Remember oversized package directories separately from cached indexes, using
+// at most 64 KiB of conservatively charged path/set storage. If that fills up,
+// stop building new indexes for this pass: otherwise an unremembered oversized
+// directory could trigger the same failed construction on every reference.
+const GO_PACKAGE_OVERSIZED_MEMO_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Default)]
 struct GoPackageMemo {
     packages: HashMap<PathBuf, Rc<GoPackage>>,
     order: VecDeque<(PathBuf, usize)>,
     bytes: usize,
+    oversized_dirs: HashSet<PathBuf>,
+    oversized_bytes: usize,
 }
 
 impl GoPackageMemo {
+    fn mark_oversized(&mut self, dir: PathBuf) {
+        if self.oversized_dirs.contains(&dir) {
+            return;
+        }
+        let bytes = dir.as_os_str().len() + 4 * std::mem::size_of::<PathBuf>() + 32;
+        if self.oversized_bytes + bytes > GO_PACKAGE_OVERSIZED_MEMO_BYTES {
+            self.oversized_bytes = GO_PACKAGE_OVERSIZED_MEMO_BYTES;
+            return;
+        }
+        self.oversized_bytes += bytes;
+        self.oversized_dirs.insert(dir);
+    }
+
     fn insert(&mut self, dir: PathBuf, package: Rc<GoPackage>) {
         while self.bytes + package.bytes > GO_PACKAGE_MEMO_BYTES {
             let (oldest, bytes) = self.order.pop_front().expect("nonempty package memo");
@@ -13731,6 +13787,13 @@ fn cached_go_package<T: std::ops::Deref<Target = DbFileIndex>>(
     if let Some(package) = memo.borrow().packages.get(&dir) {
         return Some(Rc::clone(package));
     }
+    if memo.borrow().oversized_bytes >= GO_PACKAGE_OVERSIZED_MEMO_BYTES
+        || memo.borrow().oversized_dirs.contains(&dir)
+    {
+        return None;
+    }
+    #[cfg(test)]
+    work_counts::note_go_package_build(&dir);
     let files = go_files_in_dir(facts, &dir, true)
         .into_iter()
         .filter(|file| contains(file))
@@ -13740,6 +13803,7 @@ fn cached_go_package<T: std::ops::Deref<Target = DbFileIndex>>(
         + files.capacity() * std::mem::size_of::<String>()
         + files.iter().map(|file| file.capacity() + 32).sum::<usize>();
     if bytes > GO_PACKAGE_MEMO_BYTES {
+        memo.borrow_mut().mark_oversized(dir);
         return None;
     }
     let mut package = GoPackage {
@@ -13750,6 +13814,7 @@ fn cached_go_package<T: std::ops::Deref<Target = DbFileIndex>>(
     for file in 0..package.files.len() {
         if let Some(index) = load(&package.files[file]) {
             if !package.add_symbols(file, &index) {
+                memo.borrow_mut().mark_oversized(dir);
                 return None;
             }
         }
@@ -13766,7 +13831,7 @@ fn go_symbol_target_by_scan<I: ResolverIndex + ?Sized>(
     symbol: &str,
 ) -> Option<String> {
     let mut targets = index
-        .go_package_files(caller_file, module)
+        .uncached_go_package_files(caller_file, module)
         .into_iter()
         .filter(|file| {
             index.node_for_symbol(file, symbol).is_some()
