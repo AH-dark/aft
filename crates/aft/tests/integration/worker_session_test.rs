@@ -404,7 +404,12 @@ fn head_blocking_foreground_detaches_at_the_configured_wait_limit() {
 #[test]
 fn head_wait_returns_the_result_before_the_limit() {
     let project = tempfile::tempdir().expect("head fast project");
-    let mut aft = spawn_with_worker_limit();
+    // Shell startup can be slow on loaded Windows runners; this case checks
+    // completion before the limit, while sibling tests cover the short limit.
+    let mut aft = AftProcess::spawn_with_env(&[(
+        "AFT_TEST_WORKER_WAIT_MAX_MS",
+        std::ffi::OsStr::new("60000"),
+    )]);
     aft.configure(project.path());
     let (response, _) = foreground_bash(
         &mut aft,
