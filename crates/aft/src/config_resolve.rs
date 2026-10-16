@@ -15,14 +15,13 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectCategories, InspectConfig, LspIdleMinutes, OpenCodeHostConfig, RemoteExecConfig,
-    RerankBackendKind, RerankConfig, SandboxConfig, SearchConfig, SemanticBackend,
-    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS,
-    DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_ROOT_TTL_MINUTES,
-    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES,
-    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
-    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    InspectCategories, InspectConfig, LspIdleMinutes, RemoteExecConfig, RerankBackendKind,
+    RerankConfig, SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig,
+    UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS,
+    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config;
 use crate::harness::Harness;
@@ -147,7 +146,7 @@ pub struct RawAftConfig {
     pub auto_update: Option<bool>,
     pub bridge: Option<RawBridge>,
     pub subc: Option<RawSubc>,
-    pub opencode: Option<RawOpenCode>,
+
     pub remote_exec: Option<RawRemoteExec>,
     /// Set by the resolver, never read from a file: a project tier turned
     /// `remote_exec.enabled` off.
@@ -559,17 +558,6 @@ pub struct RawSubc {
     pub client_reaper: Option<bool>,
 }
 
-/// The OpenCode plugin's permission-prompt server. User-tier only: a project
-/// naming a server could route this machine's permission prompts to a server
-/// the repository controls, so `record_project_drops` reports it and
-/// `merge_project_config` never copies it.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct RawOpenCode {
-    pub server_url: Option<String>,
-    pub server_password_env: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawViews {
@@ -706,6 +694,29 @@ pub fn resolve_config_for_harness(
     let mut merged = RawAftConfig::default();
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
+
+    let errors: Vec<String> = tiers
+        .iter()
+        .map(|tier| {
+            serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
+                .ok()
+                .and_then(|value| {
+                    value
+                        .as_object()
+                        .map(feature_config::removed_config_key_errors)
+                })
+                .unwrap_or_default()
+        })
+        .find(|errors| !errors.is_empty())
+        .unwrap_or_default();
+    if !errors.is_empty() {
+        return ResolveResult {
+            config: Config::default(),
+            dropped,
+            warnings,
+            errors,
+        };
+    }
 
     let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
@@ -979,6 +990,10 @@ pub fn strict_tier_error(tier: &ConfigTier, harness: Option<&Harness>) -> Option
     let Value::Object(mut map) = value else {
         return Some(format!("{} is not a JSON object", tier.source));
     };
+    let removed = feature_config::removed_config_key_errors(&map);
+    if !removed.is_empty() {
+        return Some(removed.join(", "));
+    }
     let document_tier = if tier.tier == "user" {
         feature_config::DocumentTier::User
     } else {
@@ -1190,9 +1205,7 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.subc.is_some() {
         base.subc = override_config.subc;
     }
-    if override_config.opencode.is_some() {
-        base.opencode = override_config.opencode;
-    }
+
     if let Some(remote_exec) = override_config.remote_exec {
         let merged = base.remote_exec.get_or_insert_with(RawRemoteExec::default);
         if remote_exec.enabled.is_some() {
@@ -1775,9 +1788,7 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.subc.is_some() {
         push_drop(dropped, "subc", tier, USER_ONLY_REASON);
     }
-    if raw.opencode.is_some() {
-        push_drop(dropped, "opencode", tier, USER_ONLY_REASON);
-    }
+
     if raw
         .backup
         .as_ref()
@@ -1995,7 +2006,7 @@ fn apply_resolved_config(
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.github = resolve_github_config(raw.github.as_ref(), warnings);
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
-    config.opencode = resolve_opencode_host_config(raw.opencode.as_ref());
+
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     config.remote_exec = resolve_remote_exec_config(raw);
@@ -2326,13 +2337,6 @@ fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
         .and_then(|raw| raw.binary_path.as_ref())
         .map(PathBuf::from);
     gh_shim
-}
-
-fn resolve_opencode_host_config(raw: Option<&RawOpenCode>) -> OpenCodeHostConfig {
-    OpenCodeHostConfig {
-        server_url: raw.and_then(|raw| raw.server_url.clone()),
-        server_password_env: raw.and_then(|raw| raw.server_password_env.clone()),
-    }
 }
 
 fn resolve_git_config(raw: Option<&RawGit>) -> GitConfig {
@@ -3540,43 +3544,24 @@ mod tests {
     }
 
     #[test]
-    fn opencode_prompt_server_is_user_only_and_records_project_drops() {
-        // A project naming a prompt server could route the user's permission
-        // prompts to a server it controls, so only the user tier may set it,
-        // directly or through a harness override.
-        let result = resolve_config_for_harness(
-            &[
-                tier(
-                    "user",
-                    r#"{"opencode":{"server_url":"http://127.0.0.1:4096","server_password_env":"OPENCODE_SERVER_PASSWORD"}}"#,
-                ),
-                tier(
-                    "project",
-                    r#"{
-                      "opencode": { "server_url": "http://evil.example.test", "server_password_env": "EVIL" },
-                      "harnesses": { "opencode": { "opencode": { "server_url": "http://evil.example.test:1" } } }
-                    }"#,
-                ),
-            ],
-            Some(&Harness::Opencode),
-        );
-        assert!(result.errors.is_empty(), "{:?}", result.errors);
-        assert_eq!(
-            result.config.opencode.server_url.as_deref(),
-            Some("http://127.0.0.1:4096")
-        );
-        assert_eq!(
-            result.config.opencode.server_password_env.as_deref(),
-            Some("OPENCODE_SERVER_PASSWORD")
-        );
-        assert!(drop_keys(&result).contains(&"opencode".to_string()));
-
-        let project_only = resolve_config(&[tier(
-            "project",
-            r#"{"opencode":{"server_url":"http://evil.example.test"}}"#,
-        )]);
-        assert_eq!(project_only.config.opencode, OpenCodeHostConfig::default());
-        assert_eq!(drop_keys(&project_only), vec!["opencode"]);
+    fn removed_opencode_prompt_keys_refuse_every_tier_and_harness() {
+        for tier_name in ["user", "project"] {
+            for doc in [
+                r#"{"opencode":{"server_url":"http://127.0.0.1:4096","server_password_env":"PW"}}"#,
+                r#"{"harnesses":{"opencode":{"opencode":{"server_url":"http://127.0.0.1:4096"}}}}"#,
+            ] {
+                let input = tier(tier_name, doc);
+                let result = resolve_config_for_harness(&[input.clone()], Some(&Harness::Opencode));
+                assert!(!result.errors.is_empty());
+                assert!(result
+                    .errors
+                    .iter()
+                    .all(|error| error.starts_with("removed_config_key:")));
+                assert!(strict_tier_error(&input, Some(&Harness::Opencode))
+                    .unwrap()
+                    .contains("removed_config_key:"));
+            }
+        }
     }
 
     #[test]

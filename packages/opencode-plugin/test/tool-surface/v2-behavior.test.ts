@@ -20,6 +20,9 @@ describe("OpenCode V2 shared behavioral cases", () => {
         project: { directory: "/work/project", canonical: "/work/canonical" },
       };
       const context = {
+        permission: { assert: () => Effect.void },
+        agent: { get: () => Effect.succeed({ data: { permissions: [] } }) },
+        session: { get: () => Effect.succeed(undefined) },
         location,
         tool: {
           transform: (

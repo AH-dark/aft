@@ -241,6 +241,7 @@ fn migrate_block(
     for (path, _) in RETIRED_PATHS
         .into_iter()
         .chain(feature_config::REMOVED_INSPECT_LSP_PATHS)
+        .chain(feature_config::REMOVED_OPENCODE_PATHS)
     {
         if path == "experimental.bash"
             && translated

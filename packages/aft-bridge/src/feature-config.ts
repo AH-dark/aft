@@ -79,6 +79,27 @@ export const BASH_GATE_DISABLES = [
 export const MIGRATION_POLICY_ID = "feature-config-v1";
 export const POLICY_INTRODUCED_MINOR: readonly [number, number] = [0, 58];
 
+export const REMOVED_OPENCODE_PATHS = [
+  "opencode.server_url",
+  "opencode.server_password_env",
+] as const;
+
+/** Removed transport settings must fail the load, including in harness blocks. */
+export function removedConfigKeyErrors(value: unknown): string[] {
+  if (!isRecord(value)) return [];
+  const errors = REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path)).map(
+    (path) => `removed_config_key:${path}; run aft doctor --fix`,
+  );
+  if (isRecord(value.harnesses)) {
+    for (const [name, block] of Object.entries(value.harnesses)) {
+      for (const error of removedConfigKeyErrors(block)) {
+        errors.push(error.replace("removed_config_key:", `removed_config_key:harnesses.${name}.`));
+      }
+    }
+  }
+  return errors;
+}
+
 /** Retired config paths and their replacement. */
 export const RETIRED_PATHS: ReadonlyArray<readonly [string, string]> = [
   ["tool_surface", "disabled_tools"],

@@ -924,10 +924,6 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     later!("github.read", github.read);
     later!("github.write", github.write);
     later!("gh_shim.binary_path", gh_shim.binary_path);
-    // The OpenCode plugin reads the server it raises permission prompts on
-    // once, at startup.
-    later!("opencode.server_url", opencode.server_url);
-    later!("opencode.server_password_env", opencode.server_password_env);
     live!("git.co_author", git.co_author);
     // Whether `runon` is offered is decided once per host process (the head
     // plugins build bash's arguments at startup), so a change waits for a
@@ -993,7 +989,6 @@ fn classification_is_exhaustive(config: &Config) {
         worktree: _,
         github,
         gh_shim: _,
-        opencode: _,
         git: _,
         remote_exec: _,
         experimental_lsp_ty: _,

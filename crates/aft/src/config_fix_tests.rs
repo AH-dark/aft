@@ -709,3 +709,22 @@ fn a_debug_build_never_rewrites_a_user_file_in_the_account_config_dir() {
         "{opted_in:?}"
     );
 }
+
+#[test]
+fn doctor_fix_removes_opencode_prompt_transport_keys() {
+    for tier in [FixTier::User, FixTier::Project] {
+        let input = r#"{
+          // Keep unrelated configuration and comments.
+          "opencode": {"server_url":"http://127.0.0.1:4096","server_password_env":"PW"},
+          "harnesses": {"opencode": {"opencode": {"server_url":"http://host"}}},
+          "format_on_edit": false
+        }"#;
+        let migrated = migrate_config_text(input, tier).unwrap();
+        assert!(migrated.changed);
+        assert!(!migrated.text.contains("server_url"));
+        assert!(!migrated.text.contains("server_password_env"));
+        assert!(migrated.text.contains("Keep unrelated"));
+        assert!(migrated.text.contains("format_on_edit"));
+        assert!(!migrate_config_text(&migrated.text, tier).unwrap().changed);
+    }
+}

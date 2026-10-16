@@ -1,10 +1,4 @@
 import { requestPermission, type V2PermissionHostContext } from "../../permissions/v2.js";
-import {
-  createV2PromptChannel,
-  discoverPromptServer,
-  type V2PromptChannel,
-  type V2PromptServerSettings,
-} from "../../permissions/v2-service.js";
 import type { V2ToolConsumers } from "../definitions/v2.js";
 
 export const V2_BUILTIN_REPLACEMENTS = ["read", "edit", "write", "apply_patch"] as const;
@@ -28,32 +22,22 @@ function domainMethod(host: object, domain: string, method: string): boolean {
 }
 
 /**
- * Bind shared projected definitions to OpenCode 2's permission service.
- *
- * The probe looks for the two domains that carry the host's configured rules,
- * because those decide every call that needs no prompt; a context missing
- * either one is left without an evaluator so every ask-site refuses rather than
- * acting unchecked. The prompt channel is created here, once per Location, so
- * the client it discovers is shared by that Location's tool calls and is
- * dropped with these consumers when the Location scope ends.
+ * Bind projected tools to the host's in-process permission engine.
+ * Missing capabilities refuse startup instead of leaving gated tools disabled.
  */
-export function hoistedV2ToolConsumers(
-  host: V2PermissionHostContext | object,
-  prompt: V2PromptChannel = createV2PromptChannel(),
-): V2ToolConsumers {
-  if (!domainMethod(host, "agent", "get") || !domainMethod(host, "session", "get")) return {};
+export function hoistedV2ToolConsumers(host: V2PermissionHostContext | object): V2ToolConsumers {
+  if (!domainMethod(host, "permission", "assert")) {
+    throw new Error(
+      "AFT requires OpenCode 2.0.29 or newer: this V2 host has no permission.assert. Upgrade OpenCode before loading AFT.",
+    );
+  }
+  if (!domainMethod(host, "agent", "get") || !domainMethod(host, "session", "get")) {
+    throw new Error(
+      "AFT requires OpenCode 2.0.29 or newer with agent.get and session.get permission rules.",
+    );
+  }
   return {
     requestPermission: (request, context) =>
-      requestPermission(host as V2PermissionHostContext, request, context, prompt),
+      requestPermission(host as V2PermissionHostContext, request, context),
   };
-}
-
-/**
- * The prompt channel for a Location, honoring the user's `opencode` setting.
- *
- * The setting is the user-tier `opencode` block of the AFT config the Location
- * booted with; a project config cannot supply it.
- */
-export function v2PromptChannelFor(settings: V2PromptServerSettings | undefined): V2PromptChannel {
-  return createV2PromptChannel(() => discoverPromptServer(settings));
 }

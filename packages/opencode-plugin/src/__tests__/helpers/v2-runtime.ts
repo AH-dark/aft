@@ -22,6 +22,8 @@ export async function bootV2Runtime(config: Record<string, unknown> = {}) {
     activeBridges: () => [bridge],
   };
   const context = {
+    permission: { assert: () => Effect.void },
+    agent: { get: () => Effect.succeed({ data: { permissions: [] } }) },
     location: { directory: "/work/project" },
     session: {
       get: () => Effect.succeed({}),

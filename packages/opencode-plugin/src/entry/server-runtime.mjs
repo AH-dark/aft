@@ -17,7 +17,7 @@ import { startOpenCodeLiveConfigReload } from "../config-live-reload.js";
 import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
-import { hoistedV2ToolConsumers, v2PromptChannelFor } from "../tools/hoisted/v2.js";
+import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
 import {
   renameV2ToolReferences,
   V2_HOST_TOOL_NAMES,
@@ -46,12 +46,10 @@ const defaults = {
   registerPromptHook: registerV2PromptDetachHook,
   registerToolHooks: registerV2ToolHooks,
   registerWorkflowHints: registerV2WorkflowHints,
-  // The prompt server comes from the user-only `opencode` block of the
-  // Location's config; without it AFT finds the server it runs inside.
   // `getConfig` returns the Location's current config, which a live reload
   // replaces; the wake consumer reads it when a completion arrives.
   toolConsumers: (context, config, getConfig = () => config) => ({
-    ...hoistedV2ToolConsumers(context, v2PromptChannelFor(config?.opencode)),
+    ...hoistedV2ToolConsumers(context),
     ...createV2RuntimeConsumer(context, getConfig),
   }),
   acquireBridge,
@@ -207,6 +205,10 @@ export function makeServerEffect(overrides = {}) {
     if (typeof location?.directory !== "string") {
       debug("V2 effect skipped: host context has no location");
       return Effect.void;
+    }
+
+    if (typeof context.permission?.assert !== "function") {
+      throw new Error("AFT requires OpenCode 2.0.29 or newer: this V2 host has no permission.assert. Upgrade OpenCode before loading AFT.");
     }
 
     return Effect.gen(function* () {

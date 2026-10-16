@@ -44,7 +44,7 @@
     "@opentui/core": "0.4.3",
     "@opentui/solid": "0.4.3",
     "comment-json": "^4.6.2",
-    "effect": "4.0.0-rc.112",
+    "effect": "4.0.1",
     "solid-js": "1.9.12",
     "undici": "^7.25.0",
     "zod": "^4.4.3"
@@ -60,7 +60,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.17.11",
     "@opencode-ai/sdk": "^1.17.11",
-    "@opencode/plugin": "2.0.11",
+    "@opencode/plugin": "^2.0.29",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   },
@@ -80,6 +80,6 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=0.0.0-beta-0",
-    "@opencode/plugin": "2.0.11"
+    "@opencode/plugin": "^2.0.29"
   }
 }

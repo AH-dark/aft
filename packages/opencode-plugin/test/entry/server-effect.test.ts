@@ -100,6 +100,9 @@ function hostContext(
 ) {
   let locationReads = 0;
   const context = {
+    permission: { assert: () => Effect.void },
+    agent: { get: () => Effect.succeed({ data: { permissions: [] } }) },
+    session: { get: () => Effect.succeed(undefined) },
     get location() {
       locationReads += 1;
       events.push(`location:${directory}`);

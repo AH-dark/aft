@@ -474,20 +474,6 @@ pub struct GhShimConfig {
     pub binary_path: Option<PathBuf>,
 }
 
-/// The OpenCode 2 server the OpenCode plugin raises permission prompts on,
-/// from the user-only `opencode` block. The engine never reads it: it is
-/// carried so the resolved config shows the same user-tier value the plugin
-/// uses, and so the cross-language parity fixtures can prove that a project
-/// tier cannot set it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct OpenCodeHostConfig {
-    /// Base URL of the server, used instead of automatic discovery.
-    pub server_url: Option<String>,
-    /// Name of the environment variable holding that server's password.
-    pub server_password_env: Option<String>,
-}
-
 /// GitHub integration gates resolved from the user-only `github` block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -846,8 +832,7 @@ pub struct Config {
     pub github: GithubConfig,
     /// Binary configuration for the managed `gh` shim (no enable state).
     pub gh_shim: GhShimConfig,
-    /// OpenCode 2 permission-prompt server. User configuration only; inert in the engine.
-    pub opencode: OpenCodeHostConfig,
+
     /// Git attribution for AFT-spawned agent children. Default off.
     pub git: GitConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
@@ -948,7 +933,7 @@ impl Default for Config {
             worktree: WorktreeConfig::default(),
             github: GithubConfig::default(),
             gh_shim: GhShimConfig::default(),
-            opencode: OpenCodeHostConfig::default(),
+
             git: GitConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),

@@ -17,8 +17,7 @@ All automatically discovered tests below `test/` run in the unit jobs:
 - `entry/config-state-isolation.test.ts`
 - `matrix/acceptance-matrix.test.ts`
 - `permissions/ask-site-inventory.test.ts`
-- `permissions/v2-permission.test.ts`
-- `permissions/v2-prompt-server.test.ts`
+- `../src/__tests__/v2-permission-assert.test.ts`
 - `rpc/contract.test.ts`
 - `rpc/register.test.ts`
 - `tool-surface/v2-bash-permission.test.ts`

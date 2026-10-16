@@ -93,6 +93,37 @@ pub const MIGRATION_POLICY_ID: &str = "feature-config-v1";
 /// First minor release that translates the retired keys.
 pub const POLICY_INTRODUCED_MINOR: (u64, u64) = (0, 58);
 
+pub const REMOVED_OPENCODE_PATHS: [(&str, &str); 2] = [
+    ("opencode.server_url", "permission.assert"),
+    ("opencode.server_password_env", "permission.assert"),
+];
+
+/// Removed transport settings must fail the load, including in harness blocks.
+pub fn removed_config_key_errors(map: &Map<String, Value>) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Some(opencode) = map.get("opencode").and_then(Value::as_object) {
+        for (path, _) in REMOVED_OPENCODE_PATHS {
+            if opencode.contains_key(path.strip_prefix("opencode.").unwrap()) {
+                errors.push(format!("removed_config_key:{path}; run aft doctor --fix"));
+            }
+        }
+    }
+    if let Some(harnesses) = map.get("harnesses").and_then(Value::as_object) {
+        for (name, block) in harnesses {
+            if let Some(block) = block.as_object() {
+                for error in removed_config_key_errors(block) {
+                    errors.push(error.replacen(
+                        "removed_config_key:",
+                        &format!("removed_config_key:harnesses.{name}."),
+                        1,
+                    ));
+                }
+            }
+        }
+    }
+    errors
+}
+
 /// Retired top-level (or nested) config paths and their replacement.
 pub const RETIRED_PATHS: [(&str, &str); 14] = [
     ("tool_surface", "disabled_tools"),

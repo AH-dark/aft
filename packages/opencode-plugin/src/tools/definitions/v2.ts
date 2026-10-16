@@ -2,6 +2,7 @@ import type { ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
 
+import { PermissionStepAbort } from "../../permissions/v2.js";
 import { renameV2ToolReferences, v2HostToolName } from "../../v2-host-tool-names.js";
 
 const V2_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
@@ -306,6 +307,7 @@ function runtimeFor(
   context: V2ExecutionContext,
   signal: AbortSignal,
   consumers: V2ToolConsumers,
+  onStepAbort: (error: unknown) => void,
 ): V2DefinitionRuntime {
   // `directory` is the Location the host runs this session in (a linked git
   // worktree when the session was created there); `worktree` is the project's
@@ -335,7 +337,12 @@ function runtimeFor(
     },
     ask: (asked) => {
       const request = v2PermissionRequest(name, asked);
-      if (consumers.requestPermission) return consumers.requestPermission(request, context);
+      if (consumers.requestPermission) {
+        return consumers.requestPermission(request, context).catch((error) => {
+          if (error instanceof PermissionStepAbort) onStepAbort(error.original);
+          throw error;
+        });
+      }
       // Only our own wiring is observable here, so say that and nothing more:
       // the previous wording blamed the host for a missing endpoint it was
       // never asked for.
@@ -386,11 +393,14 @@ export function projectV2Tool(
             if (context.sessionID) consumers.onToolAbort?.(context.sessionID);
           };
           signal.addEventListener("abort", onAbort, { once: true });
+          let stepAbort: { error: unknown } | undefined;
           try {
             if (name === "bash_status" || name === "bash_watch") {
               consumers.registerSession?.(context.sessionID);
             }
-            const runtime = runtimeFor(name, location, context, signal, consumers);
+            const runtime = runtimeFor(name, location, context, signal, consumers, (error) => {
+              stepAbort = { error };
+            });
             const input = executionArguments(name, rawInput);
             const result =
               consumers.executeBash && V2_BASH_TOOLS.has(name)
@@ -401,15 +411,27 @@ export function projectV2Tool(
                     definition,
                   })
                 : await definition.execute(input, runtime as never);
+            if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
             const refusal = failureEnvelopeMessage(result);
             if (refusal) throw new Error(refusal);
             return resultContent(result);
+          } catch (error) {
+            // The shared tool implementations can catch permission errors and
+            // return denial text. Rejecting without feedback must instead end
+            // the model's current step, so preserve the host's original defect.
+            if (stepAbort) throw new PermissionStepAbort(stepAbort.error);
+            throw error;
           } finally {
             signal.removeEventListener("abort", onAbort);
           }
         },
         catch: failure,
-      }),
+      }).pipe(
+        Effect.catchIf(
+          (error): error is PermissionStepAbort => error instanceof PermissionStepAbort,
+          (error) => Effect.die(error.original),
+        ),
+      ),
   };
 }
 
