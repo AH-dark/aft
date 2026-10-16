@@ -955,6 +955,30 @@ pub(crate) struct WatcherExclusionRetry {
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl WatcherExclusionRetry {
+    /// Only completed plans may replace installed exclusions. Unavailable
+    /// attempts update retry health but leave native watches and streams intact.
+    pub(crate) fn replacement(
+        &mut self,
+        root: &Path,
+        generation: u64,
+        counters: &crate::context::WatcherCounters,
+        derive: impl FnOnce() -> ExclusionPlanOutcome,
+    ) -> Option<WatcherExclusionPlan> {
+        self.replacement_at(root, generation, counters, Instant::now(), derive)
+    }
+
+    fn replacement_at(
+        &mut self,
+        root: &Path,
+        generation: u64,
+        counters: &crate::context::WatcherCounters,
+        now: Instant,
+        derive: impl FnOnce() -> ExclusionPlanOutcome,
+    ) -> Option<WatcherExclusionPlan> {
+        self.attempt_at(root, generation, counters, now, derive)
+            .and_then(Result::ok)
+    }
+
     pub(crate) fn attempt(
         &mut self,
         root: &Path,
@@ -1000,7 +1024,7 @@ impl WatcherExclusionRetry {
                 self.retry_at = Some(Instant::now() + backoff);
                 if self.attempts == 1 {
                     emit_exclusion_retry_log(format!(
-                        "watcher exclusion plan unavailable: root={} generation={generation} reason={}; retrying without exclusions (limit={EXCLUSION_PLAN_MAX_ATTEMPTS})",
+                        "watcher exclusion plan unavailable: root={} generation={generation} reason={}; retaining installed exclusions during retry (limit={EXCLUSION_PLAN_MAX_ATTEMPTS})",
                         root.display(), reason.as_str()
                     ));
                 }
@@ -2803,6 +2827,124 @@ mod tests {
                 retry.join().unwrap();
             }
         });
+    }
+
+    #[test]
+    fn unavailable_replans_preserve_installed_exclusions_until_success() {
+        struct FakeBackend {
+            exclusions: WatcherExclusionPaths,
+            watch_set: BTreeSet<PathBuf>,
+            stream_paths: Vec<PathBuf>,
+            watch_swaps: usize,
+            stream_restarts: usize,
+        }
+        impl FakeBackend {
+            fn replace(&mut self, plan: WatcherExclusionPlan) {
+                self.exclusions.replace(&plan.selected);
+                let paths = self.exclusions.paths();
+                self.watch_set = paths.iter().cloned().collect();
+                self.watch_swaps += 1;
+                if self.stream_paths != paths {
+                    self.stream_paths = paths;
+                    self.stream_restarts += 1;
+                }
+            }
+        }
+        let root = TempDir::new().unwrap();
+        let make_plan = |names: &[&str]| WatcherExclusionPlan {
+            selected: names
+                .iter()
+                .map(|name| WatcherExclusion {
+                    path: root.path().join(name),
+                    source: WatcherExclusionSource::Gitignore,
+                })
+                .collect(),
+            dropped: Vec::new(),
+        };
+        let counters = crate::context::WatcherCounters::default();
+        let mut retry = WatcherExclusionRetry::default();
+        let initial = retry
+            .attempt(root.path(), 1, &counters, || {
+                Ok(make_plan(&["target", "node_modules"]))
+            })
+            .unwrap()
+            .unwrap();
+        let initial_paths = watcher_exclusion_paths(&initial.selected);
+        let mut backend = FakeBackend {
+            exclusions: WatcherExclusionPaths::new(root.path(), &initial.selected),
+            watch_set: initial_paths.iter().cloned().collect(),
+            stream_paths: initial_paths.clone(),
+            watch_swaps: 0,
+            stream_restarts: 0,
+        };
+        for (index, reason) in [
+            ExclusionPlanUnavailable::CapacityDeadline,
+            ExclusionPlanUnavailable::IoDeadline,
+            ExclusionPlanUnavailable::SpawnFailed,
+            ExclusionPlanUnavailable::WorkerDisconnected,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(plan) = retry.replacement_at(
+                root.path(),
+                2,
+                &counters,
+                Instant::now() + Duration::from_secs((index as u64 + 1) * 10),
+                || Err(reason),
+            ) {
+                backend.replace(plan);
+            }
+            assert_eq!(
+                backend.exclusions.paths(),
+                initial_paths,
+                "unavailable planning must preserve installed exclusions"
+            );
+            assert_eq!(backend.watch_set, initial_paths.iter().cloned().collect());
+            assert_eq!(backend.stream_paths, initial_paths);
+            assert_eq!(
+                backend.watch_swaps, 0,
+                "failed attempts must not swap watches"
+            );
+            assert_eq!(
+                backend.stream_restarts, 0,
+                "failed attempts must not restart streams"
+            );
+            let health = counters.snapshot().exclusion_planning.unwrap();
+            assert_eq!(health.matcher_generation, 2);
+            assert_eq!(health.attempts, index as u32 + 1);
+            assert_eq!(health.status, "retrying");
+            assert_eq!(health.last_failure, Some(reason.as_str()));
+        }
+        let replacement = make_plan(&["target", "node_modules", "dist"]);
+        let replacement_paths = watcher_exclusion_paths(&replacement.selected);
+        let plan = retry
+            .replacement_at(
+                root.path(),
+                2,
+                &counters,
+                Instant::now() + Duration::from_secs(60),
+                || Ok(replacement),
+            )
+            .expect("completed replacement");
+        backend.replace(plan);
+        assert_eq!(backend.exclusions.paths(), replacement_paths);
+        assert_eq!(
+            backend.watch_set,
+            replacement_paths.iter().cloned().collect()
+        );
+        assert_eq!(backend.stream_paths, replacement_paths);
+        assert_eq!(backend.watch_swaps, 1);
+        assert_eq!(backend.stream_restarts, 1);
+        assert!(retry
+            .replacement_at(
+                root.path(),
+                2,
+                &counters,
+                Instant::now() + Duration::from_secs(120),
+                || panic!("generation was consumed")
+            )
+            .is_none());
     }
 
     #[test]

@@ -134,15 +134,15 @@ impl ProjectWatcher {
                         }
                     }
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    if let Some(outcome) = planning.attempt(&root, generation, &counters, || {
-                        derive_watcher_exclusion_plan(
-                            &root,
-                            &matcher,
-                            Some(WATCHER_EXCLUSION_LIMIT),
-                        )
-                    }) {
-                        let planned = outcome.is_ok();
-                        let replacement_plan = outcome.unwrap_or_default();
+                    if let Some(replacement_plan) =
+                        planning.replacement(&root, generation, &counters, || {
+                            derive_watcher_exclusion_plan(
+                                &root,
+                                &matcher,
+                                Some(WATCHER_EXCLUSION_LIMIT),
+                            )
+                        })
+                    {
                         let replacement_exclusions = replacement_plan.selected;
                         exclusion_state.replace(&replacement_exclusions);
                         let replacement_paths = exclusion_state.paths();
@@ -175,9 +175,7 @@ impl ProjectWatcher {
                             }
                         };
                         thread_count.store(watched_directories.len(), Ordering::Release);
-                        if planned {
-                            observed_generation = Some(generation);
-                        }
+                        observed_generation = Some(generation);
 
                         dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(

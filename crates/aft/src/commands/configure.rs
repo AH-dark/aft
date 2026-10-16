@@ -18153,13 +18153,13 @@ mod tests {
                 let join = std::thread::spawn(move || {
                     while !thread_stop.load(Ordering::SeqCst) {
                         let current = generation.load(Ordering::Acquire);
-                        if let Some(outcome) =
-                            planning.attempt(&root, current, &counters, || derive(&root))
+                        if let Some(replacement) =
+                            planning.replacement(&root, current, &counters, || derive(&root))
                         {
                             *plan.lock().unwrap() = (
                                 current,
                                 crate::watcher_filter::watcher_exclusion_paths(
-                                    &outcome.unwrap_or_default().selected,
+                                    &replacement.selected,
                                 ),
                             );
                         }
