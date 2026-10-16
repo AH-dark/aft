@@ -2615,10 +2615,10 @@
     {
       "path": "crates/aft/tests/integration/tool_call_parity_test.rs",
       "line": 572,
-      "column": 38,
+      "column": 27,
       "token": "filePath",
-      "text": "\"Provide exactly ONE of 'filePath' or 'url'\",",
-      "location": "line 572, column 38",
+      "text": "\"Conflicting 'filePath' location 'src/main.ts' and 'url' 'https://example.com/doc'\",",
+      "location": "line 572, column 27",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
