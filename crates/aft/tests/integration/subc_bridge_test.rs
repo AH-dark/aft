@@ -1160,6 +1160,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         },
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
         "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
@@ -5126,6 +5127,7 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
     for (corr, mode) in [(140_u64, "wait"), (141_u64, "block_to_completion")] {
         let marker = root1.join(format!("worker-{mode}-started"));
         let release = root1.join(format!("worker-{mode}-release"));
+        let _release_guard = ReleaseOnDrop::new(release.clone());
         let mut arguments = json!({
             "command": format!("{}; {}", print_line_command("started"), hold_bash_until_release_command(&marker, &release, "worker-done")),
             "foreground_orchestrate": true,
@@ -5169,21 +5171,49 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             text.contains("its default background limit"),
             "{mode} should name the default deadline source: {text:?}"
         );
-        assert!(text.contains("Recent output:\nstarted"), "{mode}: {text:?}");
+        // The wait cap starts at request receipt, not at shell startup. A slow
+        // shell can legitimately hand back before producing its first output.
+        // Check that output causally via status below, without moving the cap.
+        assert!(
+            text.contains("Recent output:\nstarted") || text.contains("No output yet."),
+            "{mode}: {text:?}"
+        );
         let task_id = extract_bash_task_id(&text);
-        send_tool_call(
-            &mut stream,
-            1,
-            corr + 100,
-            "bash_status",
-            json!({ "params": { "task_id": task_id } }),
-        )
-        .await;
-        let status =
-            tool_response_json(&read_frame_timeout(&mut stream, "worker limit status").await);
-        assert_eq!(
-            status["status"], "running",
-            "{mode}: the command keeps running: {status:?}"
+        let status = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "{mode}: command never started"
+            );
+            send_tool_call(
+                &mut stream,
+                1,
+                corr + 100,
+                "bash_status",
+                json!({ "params": { "task_id": task_id } }),
+            )
+            .await;
+            let frame = read_frame_timeout(&mut stream, "worker limit status").await;
+            assert_eq!(frame.header.corr, corr + 100);
+            assert!(
+                !tool_result_is_error(&frame),
+                "{mode}: {}",
+                tool_result_text(&frame)
+            );
+            let status = tool_response_json(&frame);
+            assert_eq!(
+                status["status"], "running",
+                "{mode}: the command keeps running: {status:?}"
+            );
+            if marker.exists()
+                && status["output_preview"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("started"))
+            {
+                break status;
+            }
+        };
+        let child = WorkerBashChild::observe(
+            status["child_pid"].as_u64().expect("worker bash child pid") as u32,
         );
         send_tool_call(
             &mut stream,
@@ -5193,9 +5223,93 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             json!({ "params": { "task_id": task_id } }),
         )
         .await;
-        let _ = read_frame_timeout(&mut stream, "worker limit bash kill").await;
+        let killed = read_frame_timeout(&mut stream, "worker limit bash kill").await;
+        assert_eq!(killed.header.corr, corr + 200);
+        assert!(
+            !tool_result_is_error(&killed),
+            "{mode}: {}",
+            tool_result_text(&killed)
+        );
+        assert_eq!(tool_response_json(&killed)["status"], "killed", "{mode}");
+        child.assert_reaped();
     }
     send_connection_goodbye(&mut stream).await;
+}
+
+struct WorkerBashChild {
+    #[cfg(unix)]
+    pid: libc::pid_t,
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl WorkerBashChild {
+    fn observe(pid: u32) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pid: pid as libc::pid_t,
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+            use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+            // Retain the live process object so PID reuse or a failed lookup
+            // cannot masquerade as exit after the kill response.
+            const SYNCHRONIZE_RIGHT: u32 = 0x0010_0000;
+            let handle = unsafe { OpenProcess(SYNCHRONIZE_RIGHT, 0, pid) };
+            assert!(
+                !handle.is_null(),
+                "open worker child: {}",
+                std::io::Error::last_os_error()
+            );
+            let child = Self { handle };
+            assert_eq!(
+                unsafe { WaitForSingleObject(handle, 0) },
+                WAIT_TIMEOUT,
+                "worker child must be live before kill"
+            );
+            child
+        }
+    }
+
+    fn assert_reaped(&self) {
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) };
+            assert_eq!(
+                result, -1,
+                "bash_kill must already have reaped its direct child"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+        #[cfg(windows)]
+        {
+            // bash_kill returns after waiting for its direct child. Independently
+            // require that same process object to be signaled, not merely that
+            // the task's metadata says it was killed.
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            assert_eq!(
+                unsafe { WaitForSingleObject(self.handle, 0) },
+                WAIT_OBJECT_0,
+                "worker child still live after bash_kill"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WorkerBashChild {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
 }
 
 async fn drive_bash_background_daemon(input: FakeDaemonInput) {
