@@ -308,6 +308,11 @@ pub fn prepare_checkout_deferring(
         let absolute = request
             .project_root
             .join(path_from_bytes(&tracked.rel_path));
+        // Git membership includes database fixtures and internal storage. Omit
+        // them before either opening bytes or reusing an older manifest entry.
+        if crate::project_content::is_excluded(&absolute) {
+            continue;
+        }
         // HEAD describes committed membership, not the checkout. Check absence
         // before reusing an unchanged entry as well as when reading changed bytes.
         // Do not follow symlinks: a dangling link is still a checkout member.

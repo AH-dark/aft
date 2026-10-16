@@ -355,7 +355,8 @@ function translateAftZoomToolCall(rawArgs: Record<string, unknown>): BridgeCall 
     const target = entry.target ?? "";
     const names = Array.isArray(entry.symbols) ? entry.symbols : [entry.symbols ?? ""];
     const remote = /^(https?:\/\/|issue:\/\/|pr:\/\/)/.test(target);
-    return (names.length ? names : [""]).map((symbol) => ({ file: target ? (remote ? target : resolveProjectPath(target)) : "", symbol, target_label: target || "(no target)", ...(!target.trim() || !symbol.trim() ? { batch_index: index } : {}) }));
+    const parseSymbols = /^https?:\/\//.test(target) && !/^https?:\/\/(?:www\.)?github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/\d+/.test(target) && typeof entry.symbols === "string";
+    return (names.length ? names : [""]).map((symbol) => ({ file: target ? (remote ? target : resolveProjectPath(target)) : "", symbol, target_label: target || "(no target)", ...(parseSymbols ? { parse_symbols: true } : {}), ...(!target.trim() || !symbol.trim() ? { batch_index: index } : {}) }));
   });
   return { command: "zoom", params: { targets, ...(rawArgs.contextLines !== undefined ? { context_lines: rawArgs.contextLines } : {}), ...(rawArgs.callgraph === true ? { callgraph: true } : {}) } };
 }

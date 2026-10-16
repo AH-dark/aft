@@ -2640,17 +2640,40 @@ fn translate_zoom_targets(
             .get("target")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let names: Vec<&str> = match entry.get("symbols") {
-            Some(Value::String(name)) => vec![name],
-            Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
-            None | Some(Value::Null) => vec![""],
+        let names: Vec<String> = match entry.get("symbols") {
+            Some(Value::String(name))
+                if is_http_url(target) || is_github_resource_target(target) =>
+            {
+                vec![name.clone()]
+            }
+            Some(Value::String(_)) => crate::commands::zoom::parse_zoom_symbol_names(
+                entry,
+                crate::parser::detect_language(Path::new(target)),
+            )
+            .map_err(|response| {
+                invalid_request(
+                    response.data["message"]
+                        .as_str()
+                        .unwrap_or("invalid symbols"),
+                )
+            })?,
+            Some(Value::Array(names)) => names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            None | Some(Value::Null) => vec![String::new()],
             _ => {
                 return Err(invalid_request(format!(
                     "'batch[{index}].symbols' must be a string or array of strings"
                 )))
             }
         };
-        for name in if names.is_empty() { vec![""] } else { names } {
+        for name in if names.is_empty() {
+            vec![String::new()]
+        } else {
+            names
+        } {
             let mut translated = Map::new();
             if target.is_empty() {
                 translated.insert("file".to_string(), Value::String(String::new()));
@@ -2664,6 +2687,14 @@ fn translate_zoom_targets(
                 translated.insert("batch_index".to_string(), Value::Number(index.into()));
             }
             translated.insert("symbol".to_string(), Value::String(name.to_string()));
+            if is_http_url(target)
+                && !is_github_resource_target(target)
+                && entry.get("symbols").is_some_and(Value::is_string)
+            {
+                // Downloaded content determines the language: an extensionless
+                // URL may be a heading document whose spaces must stay intact.
+                translated.insert("parse_symbols".to_string(), Value::Bool(true));
+            }
             translated.insert(
                 "target_label".to_string(),
                 Value::String(
@@ -4975,11 +5006,55 @@ mod zoom_batch_contract_tests {
             json!([
                 { "file": file, "symbol": "client", "target_label": "http_client.rs" },
                 { "file": file, "symbol": "connect", "target_label": "http_client.rs" },
-                { "file": "https://example.test/docs", "symbol": "Overview", "target_label": "https://example.test/docs" }
+                { "file": "https://example.test/docs", "symbol": "Overview", "parse_symbols": true, "target_label": "https://example.test/docs" }
             ])
         );
         assert_eq!(translated.args["context_lines"], 2);
         assert_eq!(translated.args["callgraph"], true);
+    }
+
+    #[test]
+    fn zoom_batch_and_quiet_aliases_normalize_symbol_strings() {
+        for args in [
+            json!({"batch": [{"target": "a.rs", "symbols": "alpha, beta"}]}),
+            json!({"target": "a.rs", "symbols": "alpha, beta"}),
+            json!({"path": "a.rs", "symbols": "alpha, beta"}),
+            json!({"targets": [{"path": "a.rs", "symbol": "alpha, beta"}]}),
+            json!({"batch": [{"target": "a.rs", "symbols": "[\"alpha\", \"beta\"]"}]}),
+        ] {
+            let translated = subc_translate("zoom", &args, Path::new("/project")).unwrap();
+            let names: Vec<_> = translated.args["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|target| target["symbol"].clone())
+                .collect();
+            assert_eq!(names, vec![json!("alpha"), json!("beta")], "{args}");
+        }
+        let translated = subc_translate(
+            "zoom",
+            &json!({"batch": [
+                {"target": "a.rs", "symbols": "- `alpha` — fn (lines 1-3)"},
+                {"target": "guide.md", "symbols": "Getting Started, Now"},
+                {"target": "page.html", "symbols": "Getting Started, Now"}
+            ]}),
+            Path::new("/project"),
+        )
+        .unwrap();
+        let names: Vec<_> = translated.args["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|target| target["symbol"].clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                json!("alpha"),
+                json!("Getting Started, Now"),
+                json!("Getting Started, Now")
+            ]
+        );
     }
 
     #[test]

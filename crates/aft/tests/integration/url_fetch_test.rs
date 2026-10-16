@@ -141,6 +141,49 @@ fn translated_zoom_http_path_fetches_local_heading() {
 }
 
 #[test]
+fn translated_zoom_http_symbol_strings_expand_after_download() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/plain",
+            b"pub fn alpha() {}\npub fn beta() {}\n",
+        );
+    });
+    let url = server.url("/source.rs");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    for (args, expected) in [
+        (
+            json!({"batch": [{"target": url, "symbols": "alpha, beta"}]}),
+            vec!["alpha", "beta"],
+        ),
+        (
+            json!({"url": url, "symbols": "alpha, beta"}),
+            vec!["alpha", "beta"],
+        ),
+        (
+            json!({"targets": [{"path": url, "symbols": "- `alpha` — fn (lines 1-1)"}]}),
+            vec!["alpha"],
+        ),
+    ] {
+        let response = translated_zoom(&mut aft, project.path(), args);
+        assert_eq!(response["success"], true, "{response:#}");
+        let targets = response["targets"].as_array().unwrap();
+        let names: Vec<_> = targets
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, expected);
+        for target in targets {
+            assert_eq!(target["response"]["success"], true, "{response:#}");
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn translated_zoom_http_targets_fetch_local_heading() {
     let project = TempDir::new().unwrap();
     let storage = TempDir::new().unwrap();

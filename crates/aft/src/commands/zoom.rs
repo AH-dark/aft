@@ -393,6 +393,33 @@ fn zoom_target_fields(
     Ok((file, symbol, label.unwrap_or(file)))
 }
 
+fn zoom_target_symbol_names(
+    req: &RawRequest,
+    ctx: &AppContext,
+    file: &str,
+    symbol: &str,
+    target: &serde_json::Value,
+    memo: &mut ZoomTargetMemo,
+) -> Result<Vec<String>, Response> {
+    if target["parse_symbols"] != true {
+        return Ok(vec![symbol.to_string()]);
+    }
+    if !memo.files.contains_key(file) {
+        memo.files
+            .insert(file.to_string(), resolve_zoom_file(req, ctx, file)?);
+    }
+    let lang = detect_language(&memo.files[file].0);
+    let names = parse_zoom_symbol_names(&serde_json::json!({"symbols": symbol}), lang)?;
+    if names.is_empty() {
+        return Err(Response::error(
+            &req.id,
+            "invalid_request",
+            "zoom: symbols must contain a non-empty selector",
+        ));
+    }
+    Ok(names)
+}
+
 fn handle_zoom_targets(
     req: &RawRequest,
     ctx: &AppContext,
@@ -422,20 +449,40 @@ fn handle_zoom_targets(
         match zoom_target_fields(target, index) {
             Ok((file, symbol, target_label)) => {
                 any_usable = true;
-                let response = zoom_one_target_response(
-                    req,
-                    ctx,
-                    file,
-                    symbol,
-                    context_lines,
-                    include_callgraph,
-                    &mut memo,
-                );
-                entries.push(serde_json::json!({
-                    "targetLabel": target_label,
-                    "name": symbol,
-                    "response": serialize_zoom_target_response(req, response),
-                }));
+                let responses =
+                    match zoom_target_symbol_names(req, ctx, file, symbol, target, &mut memo) {
+                        Ok(names) => names
+                            .into_iter()
+                            .map(|name| {
+                                let response = zoom_one_target_response(
+                                    req,
+                                    ctx,
+                                    file,
+                                    &name,
+                                    context_lines,
+                                    include_callgraph,
+                                    &mut memo,
+                                );
+                                (name, response)
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(response) => vec![(symbol.to_string(), response)],
+                    };
+                for (name, response) in responses {
+                    // Consent holds and retries the whole call, as with outline's
+                    // multi-file validation. Return the first ask without partial
+                    // results so the consent layer can approve it before retrying.
+                    if !response.success
+                        && response.data["code"] == crate::access_policy::ACCESS_ASK_REQUIRED
+                    {
+                        return response;
+                    }
+                    entries.push(serde_json::json!({
+                        "targetLabel": target_label,
+                        "name": name,
+                        "response": serialize_zoom_target_response(req, response),
+                    }));
+                }
             }
             Err(invalid) => {
                 let response = Response::error(&req.id, "invalid_request", invalid.message.clone());
@@ -985,7 +1032,7 @@ fn parse_stringified_symbol_array(raw: &str) -> Option<Vec<String>> {
 /// inside a signature's parentheses, brackets, or generic arguments stay intact.
 /// A pasted menu entry keeps only its selector before lookup. Markdown/HTML headings
 /// keep the full string (headings may contain spaces).
-fn parse_zoom_symbol_names(
+pub(crate) fn parse_zoom_symbol_names(
     params: &serde_json::Value,
     lang: Option<LangId>,
 ) -> Result<Vec<String>, Response> {
@@ -3242,6 +3289,72 @@ function helper(value: number): number {
             let single = serialize_zoom_target_response(&request, alone);
             assert_eq!(entry["response"], single, "{name}");
             assert_eq!(single["success"], true, "{name}: {single}");
+        }
+    }
+
+    #[test]
+    fn translated_zoom_surfaces_permission_asks_before_batch_results() {
+        use crate::access_policy::{ask_route_guard, AccessGrant, AskRoute};
+
+        let project = tempfile::tempdir().unwrap();
+        let local = project.path().join("local.ts");
+        std::fs::write(&local, "export function local() {}\n").unwrap();
+        let outside = fixture_path("calls.ts").canonicalize().unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(project.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        let local_entry = serde_json::json!({"target": local, "symbols": "local"});
+        let outside_entry = serde_json::json!({"target": outside, "symbols": "helper"});
+        for args in [
+            serde_json::json!({"batch": [outside_entry.clone()]}),
+            serde_json::json!({"path": outside, "symbols": "helper"}),
+            serde_json::json!({"batch": [local_entry.clone(), outside_entry.clone()]}),
+            serde_json::json!({"batch": [outside_entry, local_entry]}),
+        ] {
+            let translated =
+                crate::subc_translate::subc_translate("zoom", &args, project.path()).unwrap();
+            let mut params = translated.args;
+            params.insert("id".into(), serde_json::json!("ask"));
+            params.insert("command".into(), serde_json::json!("zoom"));
+            let req: RawRequest =
+                serde_json::from_value(serde_json::Value::Object(params)).unwrap();
+            let read: RawRequest = serde_json::from_value(
+                serde_json::json!({"id": "ask", "command": "read", "file": outside}),
+            )
+            .unwrap();
+            let route = ask_route_guard(Some(AskRoute::Consent {
+                once: vec![],
+                worker: true,
+            }));
+            let expected = crate::commands::read::handle_read(&read, &ctx);
+            assert!(!expected.success, "read must require consent: {expected:?}");
+            assert_eq!(
+                expected.data["code"],
+                crate::access_policy::ACCESS_ASK_REQUIRED
+            );
+            let response = handle_zoom(&req, &ctx);
+            assert!(!response.success, "ask was hidden in batch: {response:?}");
+            assert_eq!(response.data, expected.data);
+            let grant: AccessGrant = serde_json::from_value(response.data["ask"].clone()).unwrap();
+            drop(route);
+            let _approved = ask_route_guard(Some(AskRoute::Consent {
+                once: vec![grant],
+                worker: true,
+            }));
+            let response = handle_zoom(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            let entries = response.data["targets"].as_array().unwrap();
+            assert_eq!(
+                entries.len(),
+                req.params["targets"].as_array().unwrap().len()
+            );
+            for entry in entries {
+                assert_eq!(entry["response"]["success"], true, "{entry:?}");
+            }
         }
     }
 

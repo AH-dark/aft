@@ -38,7 +38,11 @@ pub(crate) fn is_excluded(path: &Path) -> bool {
     if crate::os_metadata::is_os_metadata_path(path) {
         return true;
     }
-    if let Some(name) = path.file_name().map(|n| n.as_encoded_bytes()) {
+    if let Some(name) = path
+        .file_name()
+        .filter(|_| !path.is_dir())
+        .map(|n| n.as_encoded_bytes())
+    {
         if [
             b"-wal".as_slice(),
             b"-shm",
@@ -156,6 +160,50 @@ pub(crate) use open_probe::{record_open, Probe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_named_directories_remain_project_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut expected = Vec::new();
+        for name in [
+            "models.db",
+            "models.SQLITE",
+            "models.sqlite3",
+            "event-wal",
+            "event-shm",
+            "event-journal",
+        ] {
+            let directory = root.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let source = directory.join("source.rs");
+            std::fs::write(&source, "fn user_source() {}\n").unwrap();
+            assert!(!is_excluded(&directory), "excluded directory {directory:?}");
+            assert!(!is_excluded(&source));
+            expected.push(source);
+        }
+        let storage = root.join("internal.db");
+        std::fs::create_dir(&storage).unwrap();
+        register_storage_root(&storage);
+        std::fs::write(storage.join("internal.rs"), "fn internal() {}\n").unwrap();
+        assert!(is_excluded(&storage));
+        let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        walked.sort();
+        expected.sort();
+        assert_eq!(walked, expected);
+        for name in [
+            "fixture.db",
+            "fixture.sqlite",
+            "fixture.sqlite3",
+            "fixture-wal",
+            "fixture-shm",
+            "fixture-journal",
+        ] {
+            let file = root.join(name);
+            std::fs::write(&file, "not source").unwrap();
+            assert!(is_excluded(&file), "admitted file {file:?}");
+        }
+    }
 
     #[test]
     fn direct_project_reads_reject_storage_and_sqlite_before_open() {
