@@ -5,5 +5,5 @@
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "Exclude AFT storage and live SQLite files before project walkers open source bytes, while retaining source directories with SQLite-like names. The ranking-fenced search_index.rs, semantic_index.rs, semantic_search and lib.rs changes only guard corpus admission and reads; ranking and routing are unchanged. Real-query rows and exact/concept recall must remain byte-identical."
+  "note": "Exclude AFT storage and live SQLite files before project walkers open source bytes, while retaining source directories with SQLite-like names. The ranking-fenced search_index.rs, semantic_index.rs, semantic_search and lib.rs changes only guard corpus admission and reads; ranking and routing are unchanged. Real-query rows and exact/concept recall must remain byte-identical. Linux evaluation of source commit 927a97142ad00c496b86869f79adc925acb57ef1 passed: 16 exact cases, 26 concept cases and 103 paged real-query rows; canonical reference and candidate rows both hash to 42af68eea220db50a05199f7b7c0d6172c8a5953338ee738af0f3837d87984b2 (SHA-256), with real_query_behavior:equal and no engine_unwired difference."
 }
