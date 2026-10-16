@@ -395,6 +395,15 @@ fn read_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     crate::commands::read::handle_read(&request, ctx)
 }
 
+fn scope_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
+    match request.command.as_str() {
+        "read" => read_dispatch(request, ctx),
+        "grep" => crate::commands::grep::handle_grep(&request, ctx),
+        "write" => crate::commands::write::handle_write(&request, ctx),
+        other => panic!("unexpected scope test command: {other}"),
+    }
+}
+
 impl Fixture {
     /// Send one `read` tool call on `identity`'s route and return the reply body.
     async fn read(&self, identity: &RouteIdentity, path: &Path, corr: u64) -> Value {
@@ -426,6 +435,16 @@ impl Fixture {
             .await
     }
 
+    async fn tool(&self, name: &str, arguments: Value, corr: u64) -> Value {
+        let mut replies = self
+            .send_tool(&self.worker, name, arguments, corr, scope_dispatch)
+            .await;
+        let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+            .await
+            .expect("the scope test call terminates")
+            .unwrap();
+        serde_json::from_slice(&reply.body).unwrap()
+    }
     async fn send_tool(
         &self,
         identity: &RouteIdentity,
@@ -506,6 +525,20 @@ impl Fixture {
         let db = self.ctx.db().unwrap();
         let conn = db.lock().unwrap();
         crate::db::access_grants::list(&conn, &access_grants::scope_key(&self.worker)).unwrap()
+    }
+
+    async fn allow_read_scope(&self) {
+        set_hold_budget_for_test(Some(Duration::from_millis(100)));
+        let target = self.head_root.join("shared.txt");
+        let pending = self.read(&self.worker, &target, 201).await;
+        assert_eq!(code(&pending), "access_pending", "{pending}");
+        let request = &self.fake.calls("consent.request")[0];
+        self.fake.answer(
+            request["call_key"].as_str().unwrap(),
+            json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+        );
+        let allowed = self.read(&self.worker, &target, 202).await;
+        assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
     }
 }
 
@@ -726,6 +759,222 @@ async fn consent_answer_within_the_budget_runs_the_held_call() {
     assert_eq!(f.worker_grants().len(), 1);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_read_admits_sibling_read_without_asking() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let sibling = f.head_root.join("sibling.txt");
+    std::fs::write(&sibling, "sibling contents").unwrap();
+    f.allow_read_scope().await;
+    let count = f.fake.calls("consent.request").len();
+    let reply = f.read(&f.worker, &sibling, 203).await;
+    assert!(text(&reply).contains("sibling contents"), "{reply}");
+    assert_eq!(f.fake.calls("consent.request").len(), count);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_read_admits_grep_without_asking() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    std::fs::write(f.head_root.join("sibling.txt"), "sibling contents").unwrap();
+    f.allow_read_scope().await;
+    let count = f.fake.calls("consent.request").len();
+    let reply = f
+        .tool(
+            "grep",
+            json!({"path": f.head_root, "pattern": "sibling contents"}),
+            203,
+        )
+        .await;
+    assert!(text(&reply).contains("sibling contents"), "{reply}");
+    assert_eq!(f.fake.calls("consent.request").len(), count);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_read_does_not_admit_write() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    f.allow_read_scope().await;
+    let target = f.head_root.join("shared.txt");
+    let reply = f
+        .tool(
+            "write",
+            json!({"filePath": target, "content": "changed"}),
+            203,
+        )
+        .await;
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "head-owned contents\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_read_does_not_admit_parent() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    f.allow_read_scope().await;
+    let reply = f.read(&f.worker, f.head_root.parent().unwrap(), 203).await;
+    assert_eq!(code(&reply), "access_pending", "{reply}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_read_preserves_floor_denial() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let secret = f.head_root.join("secret.txt");
+    std::fs::write(&secret, "credential").unwrap();
+    f.ctx
+        .update_config(|config| config.sandbox.read_deny.push(secret.clone()));
+    f.allow_read_scope().await;
+    let count = f.fake.calls("consent.request").len();
+    let reply = f.read(&f.worker, &secret, 203).await;
+    assert_eq!(code(&reply), "denied_floor", "{reply}");
+    assert!(!text(&reply).contains("credential"));
+    assert_eq!(f.fake.calls("consent.request").len(), count);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_card_matches_stored_directory() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    f.allow_read_scope().await;
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(
+        request["pattern"],
+        json!(format!("{}/**", f.head_root.display()))
+    );
+    assert_eq!(request["paths"], json!([f.head_root.join("shared.txt")]));
+    assert_eq!(request["tool"], "read");
+    assert_eq!(request["operation"], "read");
+    assert_eq!(request["reason"], "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.");
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: f.head_root.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_old_pending_file_is_not_widened() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let target = f.head_root.join("shared.txt");
+    assert_eq!(
+        code(&f.read(&f.worker, &target, 201).await),
+        "access_pending"
+    );
+    let record = f.asks().pop().unwrap();
+    let mut old_request = record.request.unwrap();
+    old_request["pattern"] = json!(target);
+    old_request["reason"] = json!("read needs to read a path outside this route's roots");
+    let old_grant = record.pending.unwrap();
+    {
+        let db = f.ctx.db().unwrap();
+        asks::open(
+            &db.lock().unwrap(),
+            &record.key,
+            record.call_key.as_deref().unwrap(),
+            &record.selector,
+            &old_request,
+            &old_grant,
+            crate::db::call_ledger::now_ms(),
+        )
+        .unwrap();
+    }
+    f.fake.answer(
+        record.call_key.as_deref().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"user"}),
+    );
+    let allowed = f.read(&f.worker, &target, 202).await;
+    assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
+    assert_eq!(f.worker_grants(), vec![old_grant]);
+    assert_eq!(f.fake.calls("consent.request")[1]["pattern"], json!(target));
+    let sibling = f.head_root.join("sibling.txt");
+    std::fs::write(&sibling, "sibling contents").unwrap();
+    assert_eq!(
+        code(&f.read(&f.worker, &sibling, 203).await),
+        "access_pending"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_head_file_grant_cannot_delegate_directory() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let target = f.dir.path().join("elsewhere.txt");
+    {
+        let db = f.ctx.db().unwrap();
+        crate::db::access_grants::insert(
+            &db.lock().unwrap(),
+            &access_grants::scope_key(&f.head),
+            &AccessGrant {
+                path: target.clone(),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        code(&f.read(&f.worker, &target, 201).await),
+        "access_pending"
+    );
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["head_policy"], "not_held");
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({
+            "state":"settled", "outcome":"allow_scope", "answered_by":"head",
+        }),
+    );
+    assert_eq!(
+        code(&f.read(&f.worker, &target, 202).await),
+        "access_declined"
+    );
+    assert!(f.worker_grants().is_empty());
+}
+
+#[tokio::test]
+async fn consent_scope_write_cards_keep_the_original_capability() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let db = f.ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    for (kind, path, expected_reason, expected_pattern) in [
+        (GrantKind::File, f.head_root.join("shared.txt"),
+         "Allow scope: read/write access for all AFT file tools to the displayed file only. Protected paths remain denied.",
+         f.head_root.join("shared.txt").to_string_lossy().into_owned()),
+        (GrantKind::Subtree, f.head_root.clone(),
+         "Allow scope: read/write access for all AFT file tools within the displayed directory tree. Protected paths remain denied.",
+         format!("{}/**", f.head_root.display())),
+    ] {
+        let grant = AccessGrant { path: path.clone(), kind, operation: AccessOperation::Write };
+        let Prep::Ask(prep) = prepare(&conn, &f.ctx, &f.worker, "write", &json!({"path":path}), &grant, None).unwrap() else {
+            panic!("expected a fresh write card");
+        };
+        assert_eq!(prep.request["pattern"], expected_pattern);
+        assert_eq!(prep.request["reason"], expected_reason);
+        assert_eq!(prep.request["operation"], "write");
+        assert_eq!(advertised_scope(&prep), grant);
+        FakeAccessRequest::decode(&prep.request).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn consent_floor_path_is_denied_without_asking() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -772,10 +1021,13 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     set_hold_budget_for_test(Some(Duration::from_millis(300)));
-    let target = f.dir.path().join("elsewhere.txt");
+    let directory = f.dir.path().join("delegated");
+    std::fs::create_dir(&directory).unwrap();
+    let target = directory.join("elsewhere.txt");
+    std::fs::write(&target, "unheld contents").unwrap();
     let head_grant = AccessGrant {
-        path: crate::access_policy::policy_path(&target),
-        kind: GrantKind::File,
+        path: crate::access_policy::policy_path(&directory),
+        kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     };
     {

@@ -634,12 +634,13 @@ fn prepare(
         }
     }
     let call_key = new_call_key();
+    let scope_grant = read_directory_scope(grant);
     // `head_policy` says whether the worker's head itself holds the requested
     // access, which decides whether the head may allow it. Cingulate requires
     // it on asks from a `worker` scope and refuses it on every other kind.
     let head = match identity.scope.as_ref().map(|stamp| stamp.kind) {
         Some(subc_protocol::scope::ScopeKind::Worker) => {
-            Some(head_policy(conn, ctx, identity, grant)?)
+            Some(head_policy(conn, ctx, identity, &scope_grant)?)
         }
         _ => None,
     };
@@ -649,12 +650,9 @@ fn prepare(
         tool,
         operation_name(grant.operation),
         &path,
-        &format!(
-            "{tool} needs to {} a path outside this route's roots",
-            operation_name(grant.operation)
-        ),
+        scope_reason(&scope_grant),
         &key.args_hash,
-        &pattern(grant),
+        &pattern(&scope_grant),
         head.map(head_policy_name),
     );
     asks::open(
@@ -673,6 +671,46 @@ fn prepare(
         selector,
         grant: grant.clone(),
     }))
+}
+
+const READ_TREE_SCOPE_REASON: &str = "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.";
+const READ_FILE_SCOPE_REASON: &str = "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.";
+const WRITE_TREE_SCOPE_REASON: &str = "Allow scope: read/write access for all AFT file tools within the displayed directory tree. Protected paths remain denied.";
+const WRITE_FILE_SCOPE_REASON: &str = "Allow scope: read/write access for all AFT file tools to the displayed file only. Protected paths remain denied.";
+
+fn scope_reason(grant: &AccessGrant) -> &'static str {
+    match (grant.operation, grant.kind) {
+        (AccessOperation::Read, GrantKind::Subtree) => READ_TREE_SCOPE_REASON,
+        (AccessOperation::Read, GrantKind::File) => READ_FILE_SCOPE_REASON,
+        (AccessOperation::Write, GrantKind::Subtree) => WRITE_TREE_SCOPE_REASON,
+        (AccessOperation::Write, GrantKind::File) => WRITE_FILE_SCOPE_REASON,
+    }
+}
+
+/// Read-file scopes cover only the immediate containing directory. The original
+/// file grant remains the allow-once capability.
+fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
+    if grant.operation == AccessOperation::Read && grant.kind == GrantKind::File {
+        if let Some(parent) = grant.path.parent() {
+            return AccessGrant {
+                path: parent.to_path_buf(),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Read,
+            };
+        }
+    }
+    grant.clone()
+}
+
+/// A pending card can outlive a daemon upgrade. Widen only when its persisted
+/// display pattern offered the directory; older file-only cards stay file-only.
+fn advertised_scope(prep: &Prepared) -> AccessGrant {
+    let directory = read_directory_scope(&prep.grant);
+    if prep.request.get("pattern").and_then(Value::as_str) == Some(pattern(&directory).as_str()) {
+        directory
+    } else {
+        prep.grant.clone()
+    }
 }
 
 /// The display pattern Cingulate shows for the capability an answer grants:
@@ -1102,7 +1140,11 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
             let identity = call.identity.clone();
             let key = prep.key.clone();
             let call_key = prep.call_key.clone();
-            let grant = prep.grant.clone();
+            let grant = if scope {
+                advertised_scope(prep)
+            } else {
+                prep.grant.clone()
+            };
             let claimant = holder.clone();
             let applied = with_db(call, move |conn, ctx| {
                 // A head may pass on only what it holds now: its authority is
