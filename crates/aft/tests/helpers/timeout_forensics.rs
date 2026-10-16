@@ -52,20 +52,20 @@ fn collect_stacks(pid: u32, deadline: Instant) -> String {
     {
         let task_path = format!("/proc/{pid}/task");
         let mut report = String::new();
-        let mut have_stack = false;
+        let mut have_kernel_stack = false;
         match std::fs::read_dir(&task_path) {
             Ok(tasks) => {
                 for task in tasks {
                     if Instant::now() >= deadline {
                         report.push_str("/proc stack capture deadline reached\n");
-                        return report;
+                        break;
                     }
                     match task {
                         Ok(task) => {
                             let path = task.path().join("stack");
                             match std::fs::read_to_string(&path) {
                                 Ok(stack) if !stack.trim().is_empty() => {
-                                    have_stack = true;
+                                    have_kernel_stack = true;
                                     report.push_str(&format!("{}:\n{stack}\n", path.display()));
                                 }
                                 Ok(_) => report.push_str(&format!("{}: empty\n", path.display())),
@@ -85,38 +85,51 @@ fn collect_stacks(pid: u32, deadline: Instant) -> String {
             }
             Err(error) => report.push_str(&format!("{task_path}/*/stack: unavailable: {error}\n")),
         }
-        if have_stack {
-            return report;
-        }
-        // Kernel stack access is commonly denied in unprivileged CI. Try a
-        // userspace debugger too, preserving permission failures in the report.
-        let mut eu_stack = Command::new("eu-stack");
-        eu_stack.args(["-p", &pid.to_string()]);
-        let (ok, output) = run_sampler("eu-stack", eu_stack, deadline);
-        report.push_str(&output);
-        if !ok {
-            let mut gdb = Command::new("gdb");
-            gdb.args([
-                "--batch",
-                "--nx",
-                "-iex",
-                "set auto-load off",
-                "-p",
-                &pid.to_string(),
-                "-ex",
-                "thread apply all bt",
-                "-ex",
-                "detach",
-            ]);
-            report.push_str(&run_sampler("gdb", gdb, deadline).1);
-        }
-        report
+        collect_linux_capture(report, have_kernel_stack, pid, deadline, run_sampler)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (pid, deadline);
         collector_names().into()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_capture(
+    mut report: String,
+    have_kernel_stack: bool,
+    pid: u32,
+    deadline: Instant,
+    mut run: impl FnMut(&str, Command, Instant) -> (bool, String),
+) -> String {
+    report.push_str(if have_kernel_stack {
+        "/proc stack collector: captured kernel stacks\n"
+    } else {
+        "/proc stack collector: no readable kernel stacks\n"
+    });
+    // Kernel stacks omit the Rust calls behind a hang. Keep them, then try
+    // userspace debuggers while the same capture deadline still allows it.
+    let mut eu_stack = Command::new("eu-stack");
+    eu_stack.args(["-p", &pid.to_string()]);
+    let (ok, output) = run("eu-stack", eu_stack, deadline);
+    report.push_str(&output);
+    if !ok {
+        let mut gdb = Command::new("gdb");
+        gdb.args([
+            "--batch",
+            "--nx",
+            "-iex",
+            "set auto-load off",
+            "-p",
+            &pid.to_string(),
+            "-ex",
+            "thread apply all bt",
+            "-ex",
+            "detach",
+        ]);
+        report.push_str(&run("gdb", gdb, deadline).1);
+    }
+    report
 }
 
 fn run_sampler(name: &str, mut command: Command, deadline: Instant) -> (bool, String) {
@@ -204,17 +217,103 @@ mod tests {
     #[test]
     fn stack_sampler_deadline_kills_process_group() {
         let started = Instant::now();
+        let temp = tempfile::tempdir().unwrap();
+        let child_pid_file = temp.path().join("sleep-child.pid");
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "printf 'sampler entered\\n'; sleep 2"]);
+        command
+            .args([
+                "-c",
+                "sleep 2 & child=$!; printf '%s\\n' \"$child\" > \"$PID_FILE\"; printf 'sampler entered\\n'; wait \"$child\"",
+            ])
+            .env("PID_FILE", &child_pid_file);
         let (ok, report) = run_sampler(
             "sleeping-sampler",
             command,
             started + Duration::from_millis(100),
         );
+        let child_pid: libc::pid_t = std::fs::read_to_string(&child_pid_file)
+            .expect("sampler writes its child PID before waiting")
+            .trim()
+            .parse()
+            .expect("sampler child PID is numeric");
+        let mut child_cleanup = ProcessCleanup(Some(child_pid));
         assert!(!ok, "{report}");
         assert!(report.contains("timed out"), "{report}");
         assert!(report.contains("sampler entered"), "{report}");
         assert!(started.elapsed() < Duration::from_secs(1), "{report}");
+        let stopped = wait_for_process_stop(child_pid, Instant::now() + Duration::from_millis(300));
+        if stopped {
+            child_cleanup.0 = None;
+        }
+        assert!(
+            stopped,
+            "sampler child {child_pid} outlived process-group timeout: {report}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_kernel_stacks_also_try_userspace_collector() {
+        let mut collectors = Vec::new();
+        let report = collect_linux_capture(
+            "/proc/123/task/123/stack:\nkernel-frame\n".into(),
+            true,
+            123,
+            Instant::now() + CAPTURE_BUDGET,
+            |name, _command, _deadline| {
+                collectors.push(name.to_string());
+                (true, format!("{name}: fake userspace frame\n"))
+            },
+        );
+        assert_eq!(collectors, ["eu-stack"]);
+        assert!(report.contains("kernel-frame"), "{report}");
+        assert!(
+            report.contains("eu-stack: fake userspace frame"),
+            "{report}"
+        );
+    }
+
+    struct ProcessCleanup(Option<libc::pid_t>);
+
+    impl Drop for ProcessCleanup {
+        fn drop(&mut self) {
+            let Some(pid) = self.0 else {
+                return;
+            };
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    fn wait_for_process_stop(pid: libc::pid_t, deadline: Instant) -> bool {
+        loop {
+            let exists = match unsafe { libc::kill(pid, 0) } {
+                0 => true,
+                _ => std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH),
+            };
+            if !exists {
+                return true;
+            }
+            // A zombie cannot execute even if a minimal container's init has
+            // not reaped it yet.
+            #[cfg(target_os = "linux")]
+            if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .map(|state| state == "Z" || state == "X")
+                })
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
