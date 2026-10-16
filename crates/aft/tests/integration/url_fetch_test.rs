@@ -121,7 +121,7 @@ fn translated_zoom_http_path_fetches_local_heading() {
     });
     let url = server.url("/docs/extension-authoring");
     let mut aft = configure_with_storage(project.path(), storage.path());
-    for key in ["path", "filePath", "url"] {
+    for key in ["target", "path", "filePath", "url"] {
         let response = translated_zoom(
             &mut aft,
             project.path(),
@@ -129,7 +129,7 @@ fn translated_zoom_http_path_fetches_local_heading() {
         );
         assert_eq!(response["success"], true, "{key}: {response:#}");
         assert!(
-            response["content"]
+            response["targets"][0]["response"]["content"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("An extension exports its public API."),
@@ -166,6 +166,10 @@ fn translated_zoom_http_targets_fetch_local_heading() {
             "path": url,
             "url": url,
             "symbols": "Public extension interfaces",
+            "batch": [
+                { "target": url, "symbols": "Public extension interfaces" },
+                { "target": "http_client.rs", "symbols": "client" }
+            ],
             "targets": [
                 { "path": url, "symbol": "Public extension interfaces" },
                 { "filePath": url, "url": url, "symbol": "Public extension interfaces" },
@@ -181,8 +185,9 @@ fn translated_zoom_http_targets_fetch_local_heading() {
             .all(|target| target["response"]["success"] == true),
         "{response:#}"
     );
-    assert_eq!(targets.len(), 4, "{response:#}");
-    for target in &targets[..3] {
+    assert_eq!(targets.len(), 6, "{response:#}");
+    for index in [0, 1, 3, 4] {
+        let target = &targets[index];
         assert!(
             target["response"]["content"]
                 .as_str()
@@ -192,7 +197,7 @@ fn translated_zoom_http_targets_fetch_local_heading() {
         );
     }
     assert!(
-        targets[3]["response"]["content"]
+        targets[5]["response"]["content"]
             .as_str()
             .unwrap_or_default()
             .contains("pub fn client()"),

@@ -113,47 +113,54 @@ fn normalize_path_alias_pair(
     Ok(())
 }
 
-fn normalize_zoom_target_aliases(target: &mut Value, index: usize) -> Result<(), TranslateError> {
-    let Some(object) = target.as_object_mut() else {
-        return Err(invalid_request(format!(
-            "'targets[{index}].path' must be a non-empty string"
-        )));
-    };
-    // Not required here: an entry with only a symbol still reaches the zoom
-    // command, which reports it as its own per-target error line.
-    normalize_path_alias_pair(object, "path", "filePath", false)?;
-    normalize_zoom_http_path(object, &format!("targets[{index}]."))?;
-    if zoom_field_present(object.get("path")) && zoom_field_present(object.get("url")) {
-        return Err(invalid_request(format!(
-            "Provide exactly ONE of 'targets[{index}].path' or 'targets[{index}].url' — not both"
-        )));
+fn normalize_zoom_entry(entry: &mut Value, prefix: &str) -> Result<(), TranslateError> {
+    let object = entry
+        .as_object_mut()
+        .ok_or_else(|| invalid_request(format!("'{prefix}target' must be a non-empty string")))?;
+    normalize_zoom_location(object, prefix)?;
+    if let Some(symbol) = object.remove("symbol") {
+        if zoom_field_present(object.get("symbols")) && object.get("symbols") != Some(&symbol) {
+            return Err(invalid_request(format!("Conflicting '{prefix}symbols' and '{prefix}symbol': provide the same symbols or only one spelling")));
+        }
+        if !zoom_field_present(object.get("symbols")) {
+            object.insert("symbols".to_string(), symbol);
+        }
     }
     Ok(())
 }
 
-fn normalize_zoom_http_path(
+fn normalize_zoom_location(
     map: &mut Map<String, Value>,
     prefix: &str,
 ) -> Result<(), TranslateError> {
-    let Some(path) = map
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|s| is_http_url(s))
-    else {
-        return Ok(());
-    };
-    if zoom_field_present(map.get("url")) {
-        let url = path_string(map.get("url"), &format!("{prefix}url"))?;
-        if path != url {
-            return Err(invalid_request(format!(
-                "Conflicting '{prefix}path' URL '{path}' and '{prefix}url' '{url}': provide the same URL or only one location"
-            )));
+    let mut location: Option<(String, String)> = None;
+    for key in ["target", "path", "filePath", "url"] {
+        if matches!(map.get(key), None | Some(Value::Null))
+            || map
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim().is_empty())
+        {
+            map.remove(key);
+            continue;
+        }
+        let value = path_string(map.get(key), &format!("{prefix}{key}"))?.to_string();
+        if let Some((first_key, first_value)) = &location {
+            if first_value != &value {
+                return Err(invalid_request(format!(
+                    "Conflicting '{prefix}{first_key}' location '{first_value}' and '{prefix}{key}' '{value}': provide the same location or only one target"
+                )));
+            }
+        } else {
+            location = Some((key.to_string(), value));
         }
     }
-    // Preserve the URL before filesystem resolution can collapse its scheme
-    // and join it onto the project root. Equal aliases describe one location.
-    let url = map.remove("path").expect("HTTP path is present");
-    map.insert("url".to_string(), url);
+    for alias in ["path", "filePath", "url"] {
+        map.remove(alias);
+    }
+    if let Some((_, value)) = location {
+        map.insert("target".to_string(), Value::String(value));
+    }
     Ok(())
 }
 
@@ -181,40 +188,62 @@ fn parse_stringified_collection(
 }
 
 fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
-    normalize_path_alias_pair(map, "path", "filePath", false)?;
-    normalize_zoom_http_path(map, "")?;
-    let Some(targets) = map.get_mut("targets") else {
-        return Ok(());
-    };
-    parse_stringified_collection(targets, "targets", "an array of {path, symbol}", false)?;
-    if !targets.is_array() && !targets.is_object() && !targets.is_null() {
+    let mut batch = Vec::new();
+    if let Some(mut value) = map.remove("batch") {
+        parse_stringified_collection(&mut value, "batch", "an array of {target, symbols}", false)?;
+        let entries = value
+            .as_array_mut()
+            .filter(|entries| !entries.is_empty())
+            .ok_or_else(|| {
+                invalid_request("'batch' must be a non-empty array of {target, symbols}")
+            })?;
+        for (index, entry) in entries.iter_mut().enumerate() {
+            normalize_zoom_entry(entry, &format!("batch[{index}]."))?;
+        }
+        batch.append(entries);
+    }
+    normalize_zoom_location(map, "")?;
+    if zoom_field_present(map.get("target")) || zoom_field_present(map.get("symbols")) {
+        let mut entry = Map::new();
+        if let Some(target) = map.remove("target") {
+            entry.insert("target".to_string(), target);
+        }
+        if let Some(symbols) = map.remove("symbols") {
+            entry.insert("symbols".to_string(), symbols);
+        }
+        batch.insert(0, Value::Object(entry));
+    }
+    if let Some(mut targets) = map.remove("targets") {
+        parse_stringified_collection(
+            &mut targets,
+            "targets",
+            "an array of {target, symbols}",
+            false,
+        )?;
+        let entries = match targets {
+            Value::Array(entries) => entries,
+            Value::Object(_) => vec![targets],
+            Value::Null => Vec::new(),
+            _ => {
+                return Err(invalid_request(
+                    "targets must be an array of {target, symbols} (got an invalid type)",
+                ))
+            }
+        };
+        for (index, mut entry) in entries.into_iter().enumerate() {
+            if zoom_target_entry_is_empty(&entry) {
+                continue;
+            }
+            normalize_zoom_entry(&mut entry, &format!("targets[{index}]."))?;
+            batch.push(entry);
+        }
+    }
+    if batch.is_empty() {
         return Err(invalid_request(
-            "targets must be an array of {path, symbol} (got an invalid type)",
+            "'batch' must be a non-empty array of {target, symbols}",
         ));
     }
-    // Entries whose path and symbol are both blank are placeholders from
-    // hosts that fill every declared property; they are dropped here, and a
-    // `targets` left with no entries counts as not supplied at all.
-    let keep = match targets {
-        Value::Array(items) => {
-            for (index, target) in items.iter_mut().enumerate() {
-                if !zoom_target_entry_is_empty(target) {
-                    normalize_zoom_target_aliases(target, index)?;
-                }
-            }
-            items.retain(|target| !zoom_target_entry_is_empty(target));
-            !items.is_empty()
-        }
-        Value::Object(_) if zoom_target_entry_is_empty(targets) => false,
-        Value::Object(_) => {
-            normalize_zoom_target_aliases(targets, 0)?;
-            true
-        }
-        _ => false,
-    };
-    if !keep {
-        map.remove("targets");
-    }
+    map.insert("batch".to_string(), Value::Array(batch));
     Ok(())
 }
 
@@ -1619,7 +1648,7 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
 
     if is_http_url(file_path) {
         return Err(invalid_request(format!(
-            "read does not fetch HTTP/HTTPS URLs: '{file_path}'. Use aft_outline with 'target' or aft_zoom with 'url' to inspect a remote document."
+            "read does not fetch HTTP/HTTPS URLs: '{file_path}'. Use aft_outline with 'target' or aft_zoom with 'batch: [{{ target, symbols }}]' to inspect a remote document."
         )));
     }
 
@@ -2574,7 +2603,7 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
 
 /// True when a `targets` entry carries nothing: null, or an object whose
 /// location and symbol are both missing, null, or blank. Models that fill every
-/// declared property send such entries (`{path: "", symbol: ""}`) when they
+/// declared property send such entries (`{target: "", symbol: ""}`) when they
 /// mean "no targets". Any other value is real input and is validated.
 fn zoom_target_entry_is_empty(entry: &Value) -> bool {
     let blank = |value: Option<&Value>| match value {
@@ -2587,74 +2616,69 @@ fn zoom_target_entry_is_empty(entry: &Value) -> bool {
         Value::Object(obj) => {
             blank(obj.get("path"))
                 && blank(obj.get("filePath"))
+                && blank(obj.get("target"))
                 && blank(obj.get("url"))
+                && blank(obj.get("symbols"))
                 && blank(obj.get("symbol"))
         }
         _ => false,
     }
 }
 
-fn zoom_targets_provided(value: Option<&Value>) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    if is_empty_param(value) {
-        return false;
-    }
-    match value {
-        Value::Array(items) => !items.iter().all(zoom_target_entry_is_empty),
-        Value::Object(_) => !zoom_target_entry_is_empty(value),
-        _ => false,
-    }
-}
-
-/// Translate the (already placeholder-free) `targets` entries into native
-/// `{file, symbol, target_label}` objects. An entry missing its path or its
-/// symbol is forwarded with that field empty rather than refused here: the
-/// zoom command turns it into its own per-target error line and still answers
-/// every other entry in the batch.
-fn translate_zoom_targets(targets_value: &Value, project_root: &Path) -> Vec<Value> {
-    let target_values: Vec<&Value> = match targets_value {
-        Value::Array(items) => items.iter().collect(),
-        Value::Object(_) => vec![targets_value],
-        _ => Vec::new(),
-    };
-
-    let mut out = Vec::with_capacity(target_values.len());
-    for target in target_values {
-        let field = |key: &str| {
-            target
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+fn translate_zoom_targets(
+    batch: &Value,
+    project_root: &Path,
+) -> Result<Vec<Value>, TranslateError> {
+    let mut out = Vec::new();
+    for (index, entry) in batch
+        .as_array()
+        .expect("normalized batch")
+        .iter()
+        .enumerate()
+    {
+        let target = entry
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let names: Vec<&str> = match entry.get("symbols") {
+            Some(Value::String(name)) => vec![name],
+            Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
+            None | Some(Value::Null) => vec![""],
+            _ => {
+                return Err(invalid_request(format!(
+                    "'batch[{index}].symbols' must be a string or array of strings"
+                )))
+            }
         };
-        let file_path = field("path");
-        let url = field("url");
-        let symbol = field("symbol");
-        let mut target_out = Map::new();
-        match (file_path, url) {
-            (_, Some(url)) => {
-                target_out.insert("file".to_string(), Value::String(url.to_string()));
+        for name in if names.is_empty() { vec![""] } else { names } {
+            let mut translated = Map::new();
+            if target.is_empty() {
+                translated.insert("file".to_string(), Value::String(String::new()));
+            } else {
+                insert_zoom_location(&mut translated, project_root, target);
             }
-            (Some(file_path), None) => {
-                insert_file_or_github_target(&mut target_out, project_root, file_path);
+            if target.trim().is_empty() || name.trim().is_empty() {
+                // A symbols array expands into one native lookup per name. For a
+                // blank target or name, carry the batch entry's index so the
+                // handler reports its position rather than a flattened lookup index.
+                translated.insert("batch_index".to_string(), Value::Number(index.into()));
             }
-            (None, None) => {
-                target_out.insert("file".to_string(), Value::String(String::new()));
-            }
+            translated.insert("symbol".to_string(), Value::String(name.to_string()));
+            translated.insert(
+                "target_label".to_string(),
+                Value::String(
+                    if target.is_empty() {
+                        "(no target)"
+                    } else {
+                        target
+                    }
+                    .to_string(),
+                ),
+            );
+            out.push(Value::Object(translated));
         }
-        target_out.insert(
-            "symbol".to_string(),
-            Value::String(symbol.unwrap_or_default().to_string()),
-        );
-        target_out.insert(
-            "target_label".to_string(),
-            Value::String(url.or(file_path).unwrap_or("(no path)").to_string()),
-        );
-        out.push(Value::Object(target_out));
     }
-    out
+    Ok(out)
 }
 
 /// True when a zoom field carries real input: not null, and not an empty or
@@ -2669,128 +2693,12 @@ fn zoom_field_present(value: Option<&Value>) -> bool {
 
 fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
-
-    let has_targets = zoom_targets_provided(map_in.get("targets"));
-    let has_file_path = zoom_field_present(map_in.get("path"));
-    let has_url = zoom_field_present(map_in.get("url"));
-    let has_symbols = zoom_field_present(map_in.get("symbols"));
-
+    let batch = map_in.get("batch").expect("normalized zoom batch");
     let mut out = Map::new();
-
-    if has_targets {
-        // `targets` together with `path`/`url` + `symbols` is one merged
-        // batch, not a conflict: models that fill every declared property send
-        // a real same-file request next to a placeholder `targets` entry, and
-        // refusing both lost the real request. The zoom command expands the
-        // top-level file and symbols into batch entries; each entry that does
-        // not resolve reports its own error line.
-        if has_file_path && has_url {
-            return Err(invalid_request(
-                "Provide exactly ONE of 'path' or 'url' — not both",
-            ));
-        }
-        let targets_value = map_in
-            .get("targets")
-            .expect("has_targets implies a targets value exists");
-        let mut targets = translate_zoom_targets(targets_value, project_root);
-
-        let base = if has_file_path {
-            map_in.get("path").and_then(Value::as_str).map(str::trim)
-        } else if has_url {
-            map_in.get("url").and_then(Value::as_str).map(str::trim)
-        } else {
-            None
-        };
-        if let Some(base) = base {
-            if has_url {
-                out.insert("file".to_string(), Value::String(base.to_string()));
-            } else {
-                insert_file_or_github_target(&mut out, project_root, base);
-            }
-            out.insert("target_label".to_string(), Value::String(base.to_string()));
-            insert_zoom_symbols(&mut out, &map_in)?;
-        } else if has_symbols {
-            // Symbols with no file to look in: each still gets its own line
-            // saying the path is missing, instead of vanishing silently.
-            let names: Vec<String> = match map_in.get("symbols") {
-                Some(Value::String(symbol)) => vec![symbol.trim().to_string()],
-                Some(Value::Array(items)) => items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                _ => {
-                    return Err(invalid_request(
-                        "'symbols' must be a string or array of strings",
-                    ))
-                }
-            };
-            let mut orphaned = names
-                .into_iter()
-                .map(|name| {
-                    serde_json::json!({ "file": "", "symbol": name, "target_label": "(no path)" })
-                })
-                .collect::<Vec<_>>();
-            orphaned.append(&mut targets);
-            targets = orphaned;
-        }
-        out.insert("targets".to_string(), Value::Array(targets));
-
-        if let Some(context_lines) = coerce_optional_int_result(
-            map_in.get("contextLines"),
-            "contextLines",
-            1,
-            9_007_199_254_740_991,
-        )? {
-            out.insert(
-                "context_lines".to_string(),
-                Value::Number(context_lines.into()),
-            );
-        }
-
-        if map_in.get("callgraph").is_some_and(coerce_boolean) {
-            out.insert("callgraph".to_string(), Value::Bool(true));
-        }
-
-        return Ok(Translated {
-            command: "zoom".into(),
-            args: out,
-        });
-    }
-
-    let file_path = map_in
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty());
-    let url = map_in
-        .get("url")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty());
-
-    match (file_path, url) {
-        (None, None) => {
-            return Err(invalid_request(
-                "Provide exactly one of 'path', 'url', or 'targets'",
-            ));
-        }
-        (Some(_), Some(_)) => {
-            return Err(invalid_request(
-                "Provide exactly ONE of 'path' or 'url' — not both",
-            ));
-        }
-        _ => {}
-    }
-
-    if let Some(url) = url {
-        out.insert("file".to_string(), Value::String(url.to_string()));
-    } else if let Some(file_path) = file_path {
-        insert_file_or_github_target(&mut out, project_root, file_path);
-    }
-
-    insert_zoom_symbols(&mut out, &map_in)?;
-
+    out.insert(
+        "targets".to_string(),
+        Value::Array(translate_zoom_targets(batch, project_root)?),
+    );
     if let Some(context_lines) = coerce_optional_int_result(
         map_in.get("contextLines"),
         "contextLines",
@@ -2802,54 +2710,21 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
             Value::Number(context_lines.into()),
         );
     }
-
     if map_in.get("callgraph").is_some_and(coerce_boolean) {
         out.insert("callgraph".to_string(), Value::Bool(true));
     }
-
     Ok(Translated {
         command: "zoom".into(),
         args: out,
     })
 }
 
-fn insert_zoom_symbols(
-    out: &mut Map<String, Value>,
-    map_in: &Map<String, Value>,
-) -> Result<(), TranslateError> {
-    let Some(symbols) = map_in.get("symbols") else {
-        return Ok(());
-    };
-    if is_empty_param(symbols) {
-        return Ok(());
+fn insert_zoom_location(out: &mut Map<String, Value>, project_root: &Path, target: &str) {
+    if is_http_url(target) || is_github_resource_target(target) {
+        out.insert("file".to_string(), Value::String(target.to_string()));
+    } else {
+        insert_resolved_file(out, project_root, target);
     }
-    match symbols {
-        Value::String(symbol) => {
-            out.insert("symbol".to_string(), Value::String(symbol.to_string()));
-        }
-        Value::Array(items) => {
-            // Pass the array THROUGH to the leaf (handle_zoom's
-            // parse_zoom_symbol_names handles a `symbols` array natively,
-            // one lookup per element). Joining into one space-separated
-            // string would break multi-heading markdown/HTML zoom, whose
-            // heading names legitimately contain spaces.
-            let names: Vec<Value> = items
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .map(|name| Value::String(name.to_string()))
-                .collect();
-            if !names.is_empty() {
-                out.insert("symbols".to_string(), Value::Array(names));
-            }
-        }
-        _ => {
-            return Err(invalid_request(
-                "'symbols' must be a string or array of strings",
-            ))
-        }
-    }
-    Ok(())
 }
 
 fn translate_conflicts(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
@@ -3221,7 +3096,7 @@ mod tests {
             assert!(
                 error
                     .message
-                    .contains("targets must be an array of {path, symbol}"),
+                    .contains("targets must be an array of {target, symbols}"),
                 "{error:?}"
             );
         }
@@ -3254,7 +3129,7 @@ mod tests {
             project,
         )
         .expect("zoom path form");
-        assert_eq!(zoom.args["file"].as_str(), Some("pr://302"));
+        assert_eq!(zoom.args["targets"][0]["file"].as_str(), Some("pr://302"));
         let batched = subc_translate_owned(
             "zoom",
             serde_json::json!({ "targets": [{ "path": "issue://310", "symbol": "1" }] }),
@@ -3304,6 +3179,77 @@ mod tests {
                 assert_eq!(actual.args, expected.args, "URL supplied via {key}");
             }
         }
+    }
+
+    #[test]
+    fn zoom_target_and_location_aliases_share_file_url_and_github_routing() {
+        let project = Path::new("/project");
+        for location in [
+            "http_client.rs",
+            "http://localhost/guide.md",
+            "https://example.test/docs",
+            "issue://410",
+            "pr://410",
+        ] {
+            let expected = if is_http_url(location) || is_github_resource_target(location) {
+                location.to_string()
+            } else {
+                resolve_path_from_project_root(project, location)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            for key in ["target", "path", "filePath", "url"] {
+                let single = subc_translate_owned(
+                    "zoom",
+                    serde_json::json!({ key: location, "symbols": "Heading" }),
+                    project,
+                )
+                .unwrap();
+                assert_eq!(
+                    single.args["targets"][0]["file"], expected,
+                    "{key}: {location}"
+                );
+                let batch = subc_translate_owned(
+                    "zoom",
+                    serde_json::json!({ "targets": [{ key: location, "symbol": "Heading" }] }),
+                    project,
+                )
+                .unwrap();
+                assert_eq!(
+                    batch.args["targets"][0]["file"], expected,
+                    "batched {key}: {location}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_target_aliases_reject_different_locations_and_accept_equal_values() {
+        let project = Path::new("/project");
+        for key in ["path", "filePath", "url"] {
+            for args in [
+                serde_json::json!({ "target": "a.rs", key: "b.rs", "symbols": "main" }),
+                serde_json::json!({ "targets": [{ "target": "a.rs", key: "b.rs", "symbol": "main" }] }),
+            ] {
+                let err = subc_translate_owned("zoom", args, project).unwrap_err();
+                assert!(
+                    err.message.contains("target") && err.message.contains(key),
+                    "{}",
+                    err.message
+                );
+                assert!(
+                    err.message.contains("a.rs") && err.message.contains("b.rs"),
+                    "{}",
+                    err.message
+                );
+            }
+        }
+        let aliases = serde_json::json!({ "target": "http_client.rs", "path": "http_client.rs", "filePath": "http_client.rs", "url": "http_client.rs", "symbols": "client" });
+        let actual = subc_translate_owned("zoom", aliases, project).unwrap();
+        let expected = resolve_path_from_project_root(project, "http_client.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(actual.args["targets"][0]["file"], expected);
     }
 
     #[test]
@@ -3369,7 +3315,15 @@ mod tests {
             ("read", serde_json::json!({ "path": "http_client.rs" })),
         ] {
             let translated = subc_translate_owned(tool, args, project).unwrap();
-            assert_eq!(translated.args["file"], expected, "{tool}");
+            assert_eq!(
+                if tool == "zoom" {
+                    &translated.args["targets"][0]["file"]
+                } else {
+                    &translated.args["file"]
+                },
+                &serde_json::json!(expected),
+                "{tool}"
+            );
         }
         let batch = subc_translate_owned(
             "zoom",
@@ -3576,7 +3530,7 @@ mod tests {
             project,
         )
         .expect_err("zoom with only empty path sentinels");
-        assert!(zoom.message.contains("Provide exactly one"));
+        assert!(zoom.message.contains("'batch'"));
 
         // callgraph's optional `toPath` alias is stripped the same way.
         let callgraph = subc_translate_owned(
@@ -4882,14 +4836,18 @@ mod placeholder_argument_tests {
                 "targets": targets.clone()
             }))
             .unwrap_or_else(|error| panic!("targets {targets} must count as absent: {error:?}"));
-            assert!(!translated.args.contains_key("targets"), "{targets}");
-            assert_eq!(translated.args["file"], abs("src/a.ts"));
-            assert_eq!(translated.args["symbols"], json!(["foo"]));
+            assert_eq!(
+                translated.args["targets"].as_array().unwrap().len(),
+                1,
+                "{targets}"
+            );
+            assert_eq!(translated.args["targets"][0]["file"], abs("src/a.ts"));
+            assert_eq!(translated.args["targets"][0]["symbol"], "foo");
         }
 
         let error = zoom(json!({ "targets": [{ "path": "", "symbol": "" }] }))
             .expect_err("nothing usable given");
-        assert!(error.message.contains("Provide exactly one"), "{error:?}");
+        assert!(error.message.contains("'batch'"), "{error:?}");
     }
 
     #[test]
@@ -4904,12 +4862,13 @@ mod placeholder_argument_tests {
         }))
         .expect("targets plus path and symbols merge into one batch");
         assert_eq!(translated.command, "zoom");
-        assert_eq!(translated.args["file"], abs("src/a.ts"));
-        assert_eq!(translated.args["target_label"], "src/a.ts");
-        assert_eq!(translated.args["symbols"], json!(["foo", "bar"]));
         assert_eq!(
             translated.args["targets"],
-            json!([{ "file": abs("x"), "symbol": "x", "target_label": "x" }])
+            json!([
+                { "file": abs("src/a.ts"), "symbol": "foo", "target_label": "src/a.ts" },
+                { "file": abs("src/a.ts"), "symbol": "bar", "target_label": "src/a.ts" },
+                { "file": abs("x"), "symbol": "x", "target_label": "x" }
+            ])
         );
         assert!(!translated.args.contains_key("context_lines"));
         assert!(!translated.args.contains_key("callgraph"));
@@ -4928,7 +4887,7 @@ mod placeholder_argument_tests {
             translated.args["targets"],
             json!([
                 { "file": abs("src/a.ts"), "symbol": "foo", "target_label": "src/a.ts" },
-                { "file": abs("src/b.ts"), "symbol": "", "target_label": "src/b.ts" }
+                { "file": abs("src/b.ts"), "symbol": "", "target_label": "src/b.ts", "batch_index": 1 }
             ])
         );
     }
@@ -4989,5 +4948,49 @@ mod lexical_parent_tests {
             normalize_lexically(Path::new("/../../x")),
             PathBuf::from("/x")
         );
+    }
+}
+
+#[cfg(test)]
+mod zoom_batch_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn zoom_batch_mixes_file_url_and_multiple_symbols() {
+        let translated = subc_translate(
+            "zoom",
+            &json!({ "batch": [
+            { "target": "http_client.rs", "symbols": ["client", "connect"] },
+            { "target": "https://example.test/docs", "symbols": "Overview" }
+        ], "contextLines": 2, "callgraph": true }),
+            Path::new("/project"),
+        )
+        .unwrap();
+        let file = resolve_path_from_project_root(Path::new("/project"), "http_client.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            translated.args["targets"],
+            json!([
+                { "file": file, "symbol": "client", "target_label": "http_client.rs" },
+                { "file": file, "symbol": "connect", "target_label": "http_client.rs" },
+                { "file": "https://example.test/docs", "symbol": "Overview", "target_label": "https://example.test/docs" }
+            ])
+        );
+        assert_eq!(translated.args["context_lines"], 2);
+        assert_eq!(translated.args["callgraph"], true);
+    }
+
+    #[test]
+    fn zoom_empty_batch_is_refused_even_with_a_legacy_location() {
+        for args in [
+            json!({ "batch": [] }),
+            json!({ "batch": [], "path": "a.rs", "symbols": "main" }),
+        ] {
+            let error = subc_translate("zoom", &args, Path::new("/project")).unwrap_err();
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains("'batch' must be a non-empty array"));
+        }
     }
 }

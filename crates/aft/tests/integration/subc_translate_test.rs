@@ -757,10 +757,13 @@ fn zoom_and_outline_errors_name_agent_location_parameters() {
         "zoom",
         json!({ "path": "missing.rs", "symbols": "client" }),
     );
-    assert_eq!(response["success"], false, "{response:#}");
-    let message = response["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        response["targets"][0]["response"]["code"], "file_not_found",
+        "{response:#}"
+    );
+    let message = response["text"].as_str().unwrap_or_default();
     assert!(
-        message.contains("Set `path` to an existing path"),
+        message.contains("Set `target` to an existing file path"),
         "{message}"
     );
     assert!(!message.contains("`file`"), "{message}");
@@ -917,7 +920,7 @@ fn tool_call_zoom_merges_recorded_placeholder_target_shapes() {
     let text = response["text"].as_str().unwrap_or_default();
     assert!(text.contains("function beta()"), "{text}");
     assert!(
-        text.contains("targets[1].symbol must be a non-empty string"),
+        text.contains("batch[1].symbols must be a non-empty string"),
         "{text}"
     );
 
@@ -979,4 +982,36 @@ fn search_invalid_pattern_refuses_with_invalid_pattern_code_on_both_paths() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn tool_call_zoom_batch_errors_keep_original_entry_index_after_symbol_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("lane.ts"),
+        "export function alpha() {}\nexport function beta() {}\n",
+    )
+    .unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let response = placeholder_tool_call(
+        &mut aft,
+        "zoom-batch-index",
+        "zoom",
+        json!({ "batch": [
+        { "target": "lane.ts", "symbols": ["alpha", "beta"] },
+        { "target": "lane.ts", "symbols": [] }
+    ] }),
+    );
+    let text = response["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("function alpha()") && text.contains("function beta()"),
+        "{response:#}"
+    );
+    assert!(
+        text.contains("batch[1].symbols must be a non-empty string"),
+        "{response:#}"
+    );
+    assert!(!text.contains("batch[2].symbols"), "{response:#}");
+    assert!(aft.shutdown().success());
 }
