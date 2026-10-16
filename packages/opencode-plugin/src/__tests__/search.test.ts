@@ -344,7 +344,7 @@ describe("searchTools", () => {
 
       expect(JSON.parse(raw).message).toBe("external denied");
       expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(1);
-      expect(sendCalls).toHaveLength(0);
+      expect(sendCalls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
       expect(toolCallCalls).toHaveLength(0);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });

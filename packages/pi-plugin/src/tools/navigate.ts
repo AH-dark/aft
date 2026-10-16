@@ -23,7 +23,7 @@ import {
   textResult,
   withPathAliasPreparation,
 } from "./_shared.js";
-import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
+import { assertExternalReadPermission, resolvePathArg } from "./hoisted.js";
 import {
   accentPath,
   asRecordOrEmpty,
@@ -165,9 +165,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       for (const target of [filePath, ...(toFile !== undefined ? [toFile] : [])]) {
         if (checked.has(target)) continue;
         checked.add(target);
-        await assertExternalDirectoryPermission(extCtx, target, {
-          restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-        });
+        await assertExternalReadPermission(ctx, extCtx, target);
       }
 
       const bridge = bridgeFor(ctx, extCtx.cwd);

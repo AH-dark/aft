@@ -478,11 +478,45 @@ macro_rules! artifact_read_tool_test {
 }
 
 artifact_read_tool_test!(
+    artifact_read_grep,
+    crate::commands::grep::handle_grep,
+    "grep",
+    |path| json!({"path": path, "pattern": "artifact"})
+);
+artifact_read_tool_test!(
+    artifact_read_glob,
+    crate::commands::glob::handle_glob,
+    "glob",
+    |path| json!({"path": path, "pattern": "*"})
+);
+artifact_read_tool_test!(
     artifact_read_outline,
     crate::commands::outline::handle_outline,
     "outline",
     |path| json!({"file": path})
 );
+
+#[test]
+fn artifact_read_grep_and_glob_exact_file_under_root_restriction() {
+    for restrict in [false, true] {
+        let (_directory, ctx, artifact) = artifact_read_context();
+        let mut config = (*ctx.config()).clone();
+        config.restrict_to_project_root = restrict;
+        ctx.set_config(config);
+        let grep = crate::commands::grep::handle_grep(
+            &request("grep", json!({"path": artifact, "pattern": "artifact"})),
+            &ctx,
+        );
+        assert!(grep.success, "{restrict}: {:?}", grep.data);
+        assert_eq!(grep.data["matches"][0]["line_text"], "fn artifact() {}");
+        let glob = crate::commands::glob::handle_glob(
+            &request("glob", json!({"path": artifact, "pattern": "*"})),
+            &ctx,
+        );
+        assert!(glob.success, "{restrict}: {:?}", glob.data);
+        assert_eq!(glob.data["files"], json!([artifact]));
+    }
+}
 artifact_read_tool_test!(
     artifact_read_outline_many,
     crate::commands::outline::handle_outline,

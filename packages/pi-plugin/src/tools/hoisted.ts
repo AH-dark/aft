@@ -32,6 +32,7 @@ import {
 import {
   type AgentToolResult,
   type ExtensionAPI,
+  type ExtensionContext,
   renderDiff,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -42,6 +43,7 @@ import { hashlineTagSourceSentence } from "../hashline-tag-sources.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
+  callBridge,
   callToolCall,
   callToolCallForSession,
   coerceOptionalInt,
@@ -249,7 +251,7 @@ function appendSkippedSearchPaths(text: string, missing: string[]): string {
 export async function assertExternalDirectoryPermission(
   extCtx: { cwd: string },
   target: string,
-  options: { restrictToProjectRoot?: boolean; serverValidatedRead?: boolean } = {},
+  options: { restrictToProjectRoot?: boolean } = {},
 ): Promise<void> {
   if (!target) return;
   const expanded = normalizePathInput(target);
@@ -263,11 +265,6 @@ export async function assertExternalDirectoryPermission(
   // path because `restrict_to_project_root` is false.
   if (options.restrictToProjectRoot === false) return;
 
-  // The plugin cannot identify a session-owned bash artifact without copying
-  // Rust's task registry. Forward read calls so Rust can apply that exact,
-  // session-scoped exception while continuing to reject every other path.
-  if (options.serverValidatedRead === true) return;
-
   // restrict_to_project_root is AFT's full-isolation knob — NOT a per-call
   // permission. When it's on, an out-of-root path is hard-blocked: do NOT
   // prompt (a grant could never override the Rust-side boundary anyway — that
@@ -279,6 +276,32 @@ export async function assertExternalDirectoryPermission(
       "enabled (AFT full isolation). Not overridable per-call; set restrict_to_project_root: false " +
       "in aft.jsonc to allow external paths.",
   );
+}
+
+/** Allow only Rust-confirmed, exact session-owned artifacts outside a restricted root. */
+export async function assertExternalReadPermission(
+  ctx: PluginContext,
+  extCtx: ExtensionContext,
+  target: string,
+  restrictToProjectRoot = ctx.config.restrict_to_project_root ?? false,
+): Promise<void> {
+  const expanded = normalizePathInput(target);
+  const absoluteTarget = isAbsolute(expanded) ? expanded : resolve(extCtx.cwd, expanded);
+  if (!restrictToProjectRoot || containsPath(extCtx.cwd, absoluteTarget)) return;
+  try {
+    const response = await callBridge(
+      bridgeFor(ctx, extCtx.cwd),
+      "bash_artifact_owned",
+      {
+        path: absoluteTarget,
+      },
+      extCtx,
+    );
+    if (response.success !== false && response.owned === true) return;
+  } catch {
+    // An unavailable ownership check must not relax the plugin's root restriction.
+  }
+  await assertExternalDirectoryPermission(extCtx, absoluteTarget, { restrictToProjectRoot });
 }
 
 // OpenAI-compatible tool calling requires a root JSON Schema object.
@@ -618,10 +641,7 @@ export function registerHoistedTools(
           // check and the bridge. Without this, hoisted read bypassed Pi's
           // external-path prompt/deny layer while write/edit/grep were guarded.
           const filePath = await resolvePathArg(extCtx.cwd, pathArg);
-          await assertExternalDirectoryPermission(extCtx, filePath, {
-            restrictToProjectRoot: surface.restrictToProjectRoot,
-            serverValidatedRead: true,
-          });
+          await assertExternalReadPermission(ctx, extCtx, filePath, surface.restrictToProjectRoot);
           const rawArgs: Record<string, unknown> = { filePath: pathArg };
           if (startLine !== undefined) rawArgs.startLine = startLine;
           if (endLine !== undefined) rawArgs.endLine = endLine;
@@ -915,12 +935,11 @@ export function registerHoistedTools(
           if (params.path) {
             pathSplit = await splitSearchPathArg(extCtx.cwd, params.path);
             for (const target of pathSplit.paths) {
-              await assertExternalDirectoryPermission(
+              await assertExternalReadPermission(
+                ctx,
                 extCtx,
                 absoluteSearchPath(extCtx.cwd, target),
-                {
-                  restrictToProjectRoot: surface.restrictToProjectRoot,
-                },
+                surface.restrictToProjectRoot,
               );
             }
             req.path = await bridgeSearchPathArg(extCtx.cwd, pathSplit);

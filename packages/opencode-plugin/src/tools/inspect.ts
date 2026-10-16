@@ -59,7 +59,9 @@ async function resolveAndGateScope(
   for (const target of resolved) {
     if (checked.has(target)) continue;
     checked.add(target);
-    const denial = await assertExternalDirectoryPermission(ctx, context, target);
+    const denial = await assertExternalDirectoryPermission(ctx, context, target, {
+      serverValidatedRead: true,
+    });
     if (denial) return { scope: undefined, denial };
   }
   return { scope: Array.isArray(scope) ? resolved : resolved[0] };

@@ -13,10 +13,15 @@ import {
   type V2PermissionHostContext,
   type V2PermissionRule,
 } from "../permissions/v2.js";
+import { astTools } from "../tools/ast.js";
 import { projectV2Tool, type V2DefinitionRuntime } from "../tools/definitions/v2.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
 import { hoistedTools } from "../tools/hoisted.js";
+import { inspectTools } from "../tools/inspect.js";
+import { navigationTools } from "../tools/navigation.js";
 import { classifyPermissionError } from "../tools/permissions.js";
+import { readingTools } from "../tools/reading.js";
+import { searchTools } from "../tools/search.js";
 import type { PluginContext } from "../types.js";
 
 const request = {
@@ -148,7 +153,7 @@ async function executeProjected(
   return await Effect.runPromise(tool.execute(input, context));
 }
 
-function artifactReadTool(owned: boolean) {
+function artifactReadTool(owned: boolean, name = "read") {
   const artifact = "/aft-v2-artifact-fixture/opencode/bash-tasks/bgb-0123abcd/stdout";
   const ownershipQueries: Record<string, unknown>[] = [];
   const plugin = pluginContext(
@@ -156,14 +161,25 @@ function artifactReadTool(owned: boolean) {
     (command, params) => {
       if (command !== "bash_artifact_owned") throw new Error(`unexpected ${command}`);
       ownershipQueries.push(params);
-      return { success: true, owned };
+      return {
+        success: true,
+        owned: owned && params.path === artifact && params.session_id === "ses_test",
+      };
     },
   );
   const { host, calls } = fixture({ agentRules: defaultRules });
-  const definition = hoistedTools(plugin).read;
-  if (!definition) throw new Error("the read tool definition was not created");
+  const definitions = {
+    ...hoistedTools(plugin),
+    ...searchTools(plugin),
+    ...readingTools(plugin),
+    ...navigationTools(plugin),
+    ...inspectTools(plugin),
+    ...astTools(plugin),
+  };
+  const definition = definitions[name];
+  if (!definition) throw new Error(`the ${name} tool definition was not created`);
   const read = projectV2Tool(
-    "read",
+    name,
     definition,
     { directory: process.cwd() },
     hoistedV2ToolConsumers(host),
@@ -451,6 +467,48 @@ describe("OpenCode 2 in-process permission assertion", () => {
     expect(calls.map((call) => (call as { action: string }).action)).toEqual([
       "external_directory",
     ]);
+  });
+
+  const readers = [
+    { name: "grep", args: (p: string) => ({ path: p, pattern: "task" }) },
+    { name: "glob", args: (p: string) => ({ path: p, pattern: "*" }) },
+    { name: "aft_outline", args: (p: string) => ({ target: p }) },
+    { name: "aft_zoom", args: (p: string) => ({ path: p, symbols: "task" }) },
+    { name: "aft_callgraph", args: (p: string) => ({ path: p, op: "callers", symbol: "task" }) },
+    { name: "aft_inspect", args: (p: string) => ({ scope: p, sections: ["todos"] }) },
+    {
+      name: "ast_grep_search",
+      args: (p: string) => ({ paths: [p], lang: "rust", pattern: "fn $F() { $$$ }" }),
+    },
+  ];
+  for (const scenario of ["own", "foreign", "directory", "pattern"] as const) {
+    test(`exact-file readers ${scenario} artifact permission boundary`, async () => {
+      const observations: Record<string, number> = {};
+      for (const reader of readers) {
+        const { read, artifact, calls } = artifactReadTool(scenario !== "foreign", reader.name);
+        const target =
+          scenario === "directory"
+            ? artifact.slice(0, artifact.lastIndexOf("/"))
+            : scenario === "pattern"
+              ? artifact.replace("stdout", "*")
+              : artifact;
+        await executeProjected(read, reader.args(target));
+        observations[reader.name] = calls.filter(
+          (call) => (call as { action: string }).action === "external_directory",
+        ).length;
+      }
+      expect(observations).toEqual(
+        Object.fromEntries(readers.map((reader) => [reader.name, scenario === "own" ? 0 : 1])),
+      );
+    });
+  }
+
+  test("write to own artifact still asserts external_directory", async () => {
+    const { read: write, artifact, calls } = artifactReadTool(true, "write");
+    await executeProjected(write, { path: artifact, content: "overwrite" });
+    expect(calls.map((call) => (call as { action: string }).action)).toContain(
+      "external_directory",
+    );
   });
 
   test("read, write, and edit surface a rule denial instead of a JSON envelope", async () => {

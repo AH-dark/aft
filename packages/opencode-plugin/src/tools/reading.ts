@@ -440,7 +440,10 @@ async function assertPathExternalPermissions(
     if (checked.has(key)) continue;
     checked.add(key);
 
-    const denial = await assertExternalDirectoryPermission(ctx, context, resolvedPath, { kind });
+    const denial = await assertExternalDirectoryPermission(ctx, context, resolvedPath, {
+      kind,
+      serverValidatedRead: true,
+    });
     if (denial) return denial;
   }
 

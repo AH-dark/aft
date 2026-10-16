@@ -13,7 +13,7 @@ import { type Static, Type } from "typebox";
 import { resolveInspectDiagnosticsTimeoutMs } from "../config.js";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callToolCall, isEmptyParam, textResult } from "./_shared.js";
-import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
+import { assertExternalReadPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
   asRecord,
@@ -108,9 +108,7 @@ async function resolveAndGateScope(
   for (const target of resolved) {
     if (checked.has(target)) continue;
     checked.add(target);
-    await assertExternalDirectoryPermission(extCtx, target, {
-      restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-    });
+    await assertExternalReadPermission(ctx, extCtx, target);
   }
   return Array.isArray(scope) ? resolved : resolved[0];
 }
