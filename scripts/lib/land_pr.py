@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -31,6 +32,41 @@ def gh(*args: str) -> str:
     # Removing an inherited administration bypass keeps PR creation bot-routed.
     env = {key: value for key, value in os.environ.items() if key != "GH_SHIM_BYPASS"}
     return subprocess.check_output(["gh", *args], env=env, text=True).strip()
+
+
+def verify_governed_gh() -> None:
+    shim_dir = os.environ.get("AFT_GH_SHIMS_DIR")
+    shim_path = shutil.which("gh")
+    if not shim_dir or shim_path is None or not Path(shim_dir).is_absolute():
+        raise ValueError("governed gh shim must be on PATH for PR speech")
+    expected_shim = Path(shim_dir) / "gh"
+    try:
+        path_is_shim = os.path.samefile(shim_path, expected_shim)
+    except (OSError, TypeError, ValueError):
+        path_is_shim = False
+    if not path_is_shim:
+        raise ValueError("gh on PATH does not resolve to the governed gh shim")
+    try:
+        status = json.loads(gh("--status"))
+    except (json.JSONDecodeError, subprocess.CalledProcessError) as error:
+        raise ValueError("governed gh shim --status must return JSON") from error
+    if not isinstance(status, dict):
+        raise ValueError("governed gh shim --status must return a JSON object")
+    image = status.get("executing_image")
+    if not isinstance(image, str):
+        raise ValueError("governed gh shim status JSON has no executing image")
+    try:
+        resolves_to_shim = os.path.samefile(expected_shim, image)
+    except (OSError, TypeError, ValueError):
+        resolves_to_shim = False
+    if not resolves_to_shim:
+        raise ValueError("gh on PATH does not resolve to the governed gh shim")
+    last_rung = status.get("last_rung")
+    if not isinstance(last_rung, dict) or last_rung.get("rung") != "R3":
+        raise ValueError("governed gh shim must report last_rung R3 for PR speech")
+    inputs = last_rung.get("determination_inputs")
+    if not isinstance(inputs, dict) or inputs.get("agent_credentials_present") != "absent":
+        raise ValueError("governed gh shim reports ambient credentials for PR speech")
 
 
 def api(path: str) -> dict:
@@ -242,17 +278,24 @@ def submit(args: argparse.Namespace) -> str:
             f"Co-authored-by: {AGENT_ATTRIBUTION_POLICY['coauthor']}")
     head = git("rev-parse", "HEAD")
     check_commits(base, head, branch)
-    # Require the governed checkout binding before any bot-authored PR write.
-    if gh("--co-author-line") != AGENT_ATTRIBUTION_POLICY["coauthor"]:
-        raise ValueError("governed gh shim must be bound to alfonso-aft for PR speech")
+    # In the governed gh shim's status, R3 means governance succeeded with no agent GitHub credentials detected.
+    verify_governed_gh()
+    coauthor_line = gh("--co-author-line")
+    coauthor = coauthor_line.removeprefix("Co-authored-by: ")
+    if not coauthor_line:
+        coauthor = os.environ.get("AFT_GIT_CO_AUTHOR", "")
+    if coauthor != AGENT_ATTRIBUTION_POLICY["coauthor"]:
+        raise ValueError("governed gh shim must provide alfonso-aft co-author identity for PR speech")
     state.update(repo=repo, branch=branch, head=head)
     save(path, state)
     git("push", "origin", f"HEAD:refs/heads/{branch}")
+    created = False
     if not prs:
         body = args.body_file.read_text() if args.body_file else "Accepted agent delivery; branch-keyed search descriptor included."
         try:
             gh("pr", "create", "--base", "main", "--head", branch,
                "--title", args.title or f"land: {args.name}", "--body", body)
+            created = True
         except subprocess.CalledProcessError:
             # A concurrent creator may have won; exact re-query still must find
             # one matching PR, rather than treating any create failure as green.
@@ -263,13 +306,13 @@ def submit(args: argparse.Namespace) -> str:
             raise ValueError("could not establish exactly one created delivery PR")
     state["pr"] = prs[0]["number"]
     save(path, state)
-    if args.title or args.body_file:
-        update = ["pr", "edit", str(state["pr"])]
-        if args.title:
-            update.extend(["--title", args.title])
-        if args.body_file:
-            update.extend(["--body", args.body_file.read_text()])
-        gh(*update)
+    pull = api(f"repos/{repo}/pulls/{state['pr']}")
+    author = pull.get("user") if isinstance(pull, dict) else None
+    if not isinstance(author, dict) or (author.get("login"), author.get("type"), author.get("id")) != (
+            "aft-alfonso[bot]", "Bot", 318960130):
+        raise ValueError(f"PR #{state['pr']} author is not the aft-alfonso app")
+    if not created:
+        log(f"PR #{state['pr']} already exists; leaving its current title and body unchanged")
     current = snapshot(repo, state["pr"])
     if current["headRefOid"] != head:
         raise ValueError("remote PR head does not match the pushed delivery")

@@ -29,31 +29,60 @@ def g(*args): return subprocess.check_output(['git', *args], text=True).strip()
 def head():
     r = subprocess.run(['git', '--git-dir', s['origin'], 'rev-parse', 'refs/heads/' + s['branch']], text=True, capture_output=True)
     return r.stdout.strip() if r.returncode == 0 else g('rev-parse', 'HEAD')
-def answer(v):
+def answer(v, exit_code=0):
     data = json.dumps(v)
     if '--jq' in a:
         print(subprocess.check_output(['jq', '-r', a[a.index('--jq')+1]], input=data, text=True).strip())
     else: print(data)
-    sys.exit(0)
+    sys.exit(exit_code)
 def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
 def pr():
     return {'number': 7, 'state': 'closed' if s.get('merged') else 'open',
             'head': {'sha': head(), 'ref': s['branch'], 'repo': {'full_name': 'example/repo'}},
             'base': {'ref': 'main', 'repo': {'full_name': 'example/repo'}}}
+if a == ['--status']:
+    image = s.get('status_image', str(pathlib.Path(sys.argv[0]).resolve()))
+    if s.get('wrong_gh_image'): image = '/untrusted/gh'
+    inputs = {'agent_credentials_present': 'env:GH_TOKEN' if s.get('ambient_credentials') else 'absent'}
+    answer({'executing_image': image,
+            'last_rung': {'rung': s.get('rung', 'R3'), 'determination_inputs': inputs}})
 if a == ['--co-author-line']:
-    print('alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>'); sys.exit(0)
+    if not s.get('unbound'): print('Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>')
+    sys.exit(0)
 if a[:2] == ['repo', 'view']: answer({'nameWithOwner': 'example/repo'})
 if a[:2] == ['pr', 'view']: answer({'headRefOid': 'f'*40 if s.get('wrong_head') else head()})
+if a[:3] == ['pr', 'checks', '7']:
+    assert '--required' in a
+    s['check_polls'] = s.get('check_polls', 0) + 1
+    if s.get('checks_pending') and s.get('finish_after_polls') is not None and s['check_polls'] > s['finish_after_polls']:
+        s['checks_pending'] = False
+    persist()
+    if s.get('failed_check'):
+        answer([{'name': s['failed_check'], 'bucket': 'fail'}])
+    answer([{'name': 'Landing policy', 'bucket': 'pending' if s.get('checks_pending') else 'pass'}],
+           8 if s.get('checks_pending') else 0)
 if a[:2] == ['pr', 'create']:
     assert os.environ.get('GH_SHIM_BYPASS', '') == '', 'speech bypassed shim'
     assert '--base' in a and a[a.index('--base')+1] == 'main'
+    assert '--label' not in a, 'the governed create route does not admit labels'
     s['created'] = s.get('created', 0) + 1; s['exists'] = True; persist()
     print('https://github.com/example/repo/pull/7'); sys.exit(0)
-if a[:2] == ['pr', 'edit']: sys.exit(0)
+if a[:2] == ['pr', 'edit']:
+    if '--add-label' in a:
+        assert os.environ.get('GH_SHIM_BYPASS') == 'operator', 'label edit needs operator bypass'
+        s.setdefault('labels', []).append(a[a.index('--add-label')+1]); persist()
+    elif '--title' in a or '--body' in a:
+        print('gh-shim: gh_shim_unclassified: verb "pr edit" has no bot-speech route in manifest 18; under GH_SHIM_BYPASS=operator gh pr edit admits only label changes', file=sys.stderr)
+        sys.exit(86)
+    else:
+        assert os.environ.get('GH_SHIM_BYPASS', '') == '', 'PR text edit bypassed shim'
+    sys.exit(0)
 if a[:2] == ['pr', 'merge']:
     assert os.environ.get('GH_SHIM_BYPASS') == 'operator'
     assert '--match-head-commit' in a and a[a.index('--match-head-commit')+1] == head()
     assert '--admin' not in a
+    if s.get('checks_pending') and not s.get('auto_merge'):
+        raise SystemExit('GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)')
     h = head(); base = g('--git-dir', s['origin'], 'rev-parse', 'main')
     tree = g('--git-dir', s['origin'], 'rev-parse', h+'^{tree}')
     oid = subprocess.check_output(['git', '--git-dir', s['origin'], 'commit-tree', tree,
@@ -95,6 +124,10 @@ if 'graphql' in a:
     answer({'data': {'repository': {'pullRequest': value}}})
 endpoint = next(x for x in a[1:] if x.startswith('repos/'))
 slurp = '--slurp' in a
+if endpoint == 'repos/example/repo/pulls/7':
+    answer({'user': s.get('author', {'login': 'aft-alfonso[bot]', 'type': 'Bot', 'id': 318960130})})
+if endpoint == 'repos/example/repo':
+    answer({'allow_auto_merge': s.get('auto_merge', False)})
 if '/protection/required_status_checks' in endpoint: answer({'contexts': ['Landing policy']})
 if '/pulls?' in endpoint: answer([[pr()] if s.get('exists') else []] if slurp else [pr()])
 if endpoint.endswith('/comments'):
@@ -179,7 +212,8 @@ class PRFixture(unittest.TestCase):
         self.git("checkout", "-qb", "accepted")
         self.git("commit", "--allow-empty", "-qm", "accepted delivery\n\n" + COAUTHOR)
         self.git("push", "-q", "origin", "HEAD:refs/heads/land/delivery")
-        self.state = {"origin": str(self.origin), "branch": "land/delivery", "queue": True}
+        self.state = {"origin": str(self.origin), "branch": "land/delivery", "queue": True,
+                      "author": {"login": "aft-alfonso[bot]", "type": "Bot", "id": 318960130}}
         self.write_state()
         bin_dir = root / "bin"
         bin_dir.mkdir()
@@ -203,6 +237,7 @@ else:
 ''')
         node.chmod(0o755)
         self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
+        self.env["AFT_GH_SHIMS_DIR"] = str(bin_dir)
 
     def git(self, *args: str) -> str:
         return subprocess.check_output(["git", *args], cwd=self.repo, env=self.env,
@@ -233,6 +268,36 @@ class MergeAdmissionTests(PRFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.merges()[0]["args"], ["pr", "merge", "7", "--match-head-commit", head])
         self.assertEqual(self.merges()[0]["bypass"], "operator")
+
+    def test_pending_required_checks_without_auto_merge_refuse_without_waiting(self) -> None:
+        self.write_state(checks_pending=True)
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required checks still running", result.stderr)
+        self.assertIn("auto-merge is off", result.stderr)
+        self.assertEqual(json.loads(self.state_path.read_text())["check_polls"], 1)
+        self.assertEqual(self.merges(), [])
+
+    def test_red_required_check_refuses_by_name(self) -> None:
+        self.write_state(failed_check="Design gate")
+        result = self.merge("--force-reason", "required checks cannot be waived")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Design gate", result.stderr)
+        self.assertEqual(self.merges(), [])
+
+    def test_auto_merge_submits_pending_checks_without_waiting(self) -> None:
+        self.write_state(checks_pending=True, auto_merge=True)
+        result = self.merge()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.state_path.read_text())["check_polls"], 1)
+        self.assertIn("--match-head-commit", self.merges()[0]["args"])
+
+    def test_auto_merge_still_refuses_a_red_check_by_name(self) -> None:
+        self.write_state(failed_check="Design gate", auto_merge=True)
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Design gate", result.stderr)
+        self.assertEqual(self.merges(), [])
 
     def test_unresolved_threads_refuse_admission(self) -> None:
         self.write_state(unresolved=1)
@@ -291,6 +356,57 @@ class MergeAdmissionTests(PRFixture):
 
 
 class DeliveryTests(PRFixture):
+    def test_fake_gh_refuses_pr_text_edits_with_manifest_error(self) -> None:
+        expected = ('gh-shim: gh_shim_unclassified: verb "pr edit" has no bot-speech route in manifest 18; '
+                    'under GH_SHIM_BYPASS=operator gh pr edit admits only label changes')
+        for flag in ("--title", "--body"):
+            with self.subTest(flag=flag):
+                result = subprocess.run(["gh", "pr", "edit", "7", flag, "not allowed"],
+                                        cwd=self.repo, env=self.env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 86)
+                self.assertEqual(result.stderr.strip(), expected)
+
+    def assert_status_refused(self, values: dict, refusal: str, env: dict | None = None) -> None:
+        state = {"rung": "R3", "ambient_credentials": False, "wrong_gh_image": False}
+        state.update(values)
+        self.write_state(**state)
+        result = self.run_script("land-pr.sh", "delivery", env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(refusal, result.stderr)
+        self.assertFalse(any(call["args"][:2] == ["pr", "create"] for call in self.calls()))
+
+    def test_governed_gh_status_requires_r3(self) -> None:
+        self.assert_status_refused({"rung": "R2"}, "last_rung R3")
+
+    def test_governed_gh_status_rejects_ambient_credentials(self) -> None:
+        self.assert_status_refused({"ambient_credentials": True}, "ambient credentials")
+
+    def test_governed_gh_status_must_match_executing_shim(self) -> None:
+        self.assert_status_refused({"wrong_gh_image": True}, "does not resolve to the governed gh shim")
+
+    def test_path_must_resolve_to_the_managed_shim_directory(self) -> None:
+        other_dir = Path(self.temp.name) / "other-shims"
+        other_dir.mkdir()
+        image = other_dir / "gh"
+        image.write_text("not executed")
+        self.assert_status_refused(
+            {"status_image": str(image)},
+            "does not resolve to the governed gh shim",
+            env={"AFT_GH_SHIMS_DIR": str(other_dir)},
+        )
+
+    def test_prefixed_shim_coauthor_line_allows_landing(self) -> None:
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_empty_unbound_shim_coauthor_uses_hook_identity(self) -> None:
+        self.write_state(unbound=True)
+        result = self.run_script(
+            "land-pr.sh", "delivery",
+            env={"AFT_GIT_CO_AUTHOR": "alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_delivery_is_idempotent_and_reports_final_merge_oid(self) -> None:
         result = self.run_script("land-pr.sh", "delivery", env={"GH_SHIM_BYPASS": "operator"})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -303,20 +419,52 @@ class DeliveryTests(PRFixture):
         created = [call for call in self.calls() if call["args"][:2] == ["pr", "create"]]
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0]["bypass"], "")
+        # The design gate exempts the AFT bot by identity, so landing never
+        # labels its own PR as an exception to design approval.
+        self.assertEqual(json.loads(self.state_path.read_text()).get("labels", []), [])
+        self.assertFalse([call for call in self.calls() if call["args"][:2] == ["pr", "edit"]])
+        call_args = [call["args"] for call in self.calls()]
+        create_index = next(i for i, args in enumerate(call_args) if args[:2] == ["pr", "create"])
+        merge_index = next(i for i, args in enumerate(call_args) if args[:2] == ["pr", "merge"])
+        self.assertLess(create_index, merge_index)
         self.assertTrue((self.repo / "benchmarks/aft-search/slice-descriptors/land-delivery.json").exists())
 
-    def test_existing_open_pr_is_updated_without_duplicate_creation(self) -> None:
+    def test_existing_open_pr_is_reused_and_text_stays_unchanged(self) -> None:
         self.write_state(exists=True)
         result = self.run_script("land-pr.sh", "delivery", "--title", "accepted revision")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(call["args"][:2] == ["pr", "create"] for call in self.calls()))
-        self.assertTrue(any(call["args"][:2] == ["pr", "edit"] for call in self.calls()))
+        self.assertFalse(any(call["args"][:2] == ["pr", "edit"] and
+                             ("--title" in call["args"] or "--body" in call["args"])
+                             for call in self.calls()))
+        self.assertIn("leaving its current title and body unchanged", result.stderr)
+
+    def test_new_pr_receives_title_and_body_at_creation(self) -> None:
+        body_file = Path(self.temp.name) / "body.md"
+        body_file.write_text("first body")
+        result = self.run_script("land-pr.sh", "delivery", "--title", "first title",
+                                 "--body-file", str(body_file))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        create = next(call for call in self.calls() if call["args"][:2] == ["pr", "create"])
+        self.assertEqual(create["args"][create["args"].index("--title") + 1], "first title")
+        self.assertEqual(create["args"][create["args"].index("--body") + 1], "first body")
+        self.assertFalse(any(call["args"][:2] == ["pr", "edit"] and
+                             ("--title" in call["args"] or "--body" in call["args"])
+                             for call in self.calls()))
 
     def test_delivery_remote_head_change_refuses_stale_admission(self) -> None:
         self.write_state(wrong_head=True)
         result = self.run_script("land-pr.sh", "delivery")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("remote PR head does not match", result.stderr)
+        self.assertEqual(self.merges(), [])
+
+    def test_pr_with_non_app_author_is_refused_before_label_or_queue_admission(self) -> None:
+        self.write_state(author={"login": "operator", "type": "User", "id": 1})
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("author is not the aft-alfonso app", result.stderr)
+        self.assertFalse(any(call["args"][:2] == ["pr", "edit"] for call in self.calls()))
         self.assertEqual(self.merges(), [])
 
     def test_unattributed_delivery_is_refused_before_push_or_pr_creation(self) -> None:

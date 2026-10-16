@@ -49,6 +49,11 @@ refuse() {
   exit 1
 }
 
+hard_refuse() {
+  echo "merge-pr: REFUSED - $1" >&2
+  exit 1
+}
+
 # --- 1. Unresolved review threads ------------------------------------------
 UNRESOLVED=$("$OPERATOR_GH" api graphql -f query='
   query($owner:String!,$repo:String!,$pr:Int!){
@@ -119,6 +124,58 @@ elif [[ "$LEGACY_MERGE" == 1 ]]; then
 else
   echo "merge-pr: REFUSED - queue is not enabled; explicit --legacy-merge is required before cutover" >&2
   exit 1
+fi
+
+AUTO_MERGE_ALLOWED=false
+if [[ "$QUEUE_ENABLED" == true ]]; then
+  AUTO_MERGE_ALLOWED=$("$OPERATOR_GH" api "repos/$OWNER_REPO" --jq .allow_auto_merge) ||
+    hard_refuse "could not read the repository's auto-merge setting"
+fi
+
+# With auto-merge allowed, GitHub admits the PR to the queue itself once its
+# required checks pass, so one read is enough: refuse a red check by name, and
+# otherwise submit. Without auto-merge, a merge request on a PR whose checks are
+# still running is refused by GitHub, so refuse here too and let the caller
+# rerun once they pass. Never wait inside this script: the review gates above
+# were read before any wait and would go stale.
+if [[ "$QUEUE_ENABLED" == true ]]; then
+  CHECK_EXIT=0
+  if REQUIRED_CHECKS=$("$OPERATOR_GH" pr checks "$PR" --required --json name,bucket \
+      --jq '.[] | [.name, .bucket] | @tsv'); then
+    :
+  else
+    CHECK_EXIT=$?
+  fi
+  if [ "$CHECK_EXIT" -ne 0 ] && [ "$CHECK_EXIT" -ne 1 ] && [ "$CHECK_EXIT" -ne 8 ]; then
+    hard_refuse "could not read required checks for PR #$PR"
+  fi
+  [ -n "$REQUIRED_CHECKS" ] || hard_refuse "no required checks found for PR #$PR"
+  PENDING_NAMES=()
+  while IFS=$'\t' read -r CHECK_NAME CHECK_BUCKET; do
+    [ -n "$CHECK_NAME" ] && [ -n "$CHECK_BUCKET" ] ||
+      hard_refuse "malformed required-check result for PR #$PR"
+    case "$CHECK_BUCKET" in
+      pass|skipping) ;;
+      pending) PENDING_NAMES+=("$CHECK_NAME") ;;
+      fail|cancel)
+        hard_refuse "required check '$CHECK_NAME' did not pass ($CHECK_BUCKET)"
+        ;;
+      *) hard_refuse "required check '$CHECK_NAME' has unknown status '$CHECK_BUCKET'" ;;
+    esac
+  done <<< "$REQUIRED_CHECKS"
+  if [ "$CHECK_EXIT" -eq 1 ]; then
+    hard_refuse "gh pr checks failed without a named required-check result for PR #$PR"
+  fi
+  if [ "$CHECK_EXIT" -eq 8 ] && [ "${#PENDING_NAMES[@]}" -eq 0 ]; then
+    hard_refuse "gh reported pending required checks without naming a pending check for PR #$PR"
+  fi
+  if [ "${#PENDING_NAMES[@]}" -gt 0 ]; then
+    if [[ "$AUTO_MERGE_ALLOWED" == true ]]; then
+      echo "merge-pr: required checks still running for #$PR; GitHub queues it when they pass" >&2
+    else
+      hard_refuse "required checks still running on PR #$PR and auto-merge is off; rerun once they pass: ${PENDING_NAMES[*]}"
+    fi
+  fi
 fi
 
 echo "merge-pr: admission gates satisfied (head ${AGE_MIN}m settled) - submitting #$PR at $HEAD_SHA"
