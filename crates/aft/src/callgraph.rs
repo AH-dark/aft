@@ -3876,6 +3876,30 @@ fn walk_project_files_filtered_while(
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
+    walk_project_files_filtered_while_with_builder(root, include, keep_walking, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn walk_project_files_while_sorted_for_test(
+    root: &Path,
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
+) -> impl Iterator<Item = PathBuf> {
+    walk_project_files_filtered_while_with_builder(
+        root,
+        |_| true,
+        keep_walking,
+        |builder| {
+            builder.sort_by_file_name(|left, right| left.cmp(right));
+        },
+    )
+}
+
+fn walk_project_files_filtered_while_with_builder(
+    root: &Path,
+    include: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
+    configure_builder: impl FnOnce(&mut ignore::WalkBuilder),
+) -> impl Iterator<Item = PathBuf> {
     use ignore::WalkBuilder;
 
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
@@ -3884,13 +3908,14 @@ fn walk_project_files_filtered_while(
     builder.same_file_system(true).hidden(true); // skip hidden files/dirs
                                                  // .gitignore (also outside a git repository), global excludes,
                                                  // .git/info/exclude and .aftignore (e.g. submodules).
-    #[cfg(test)]
-    // Keep the ignored siblings before the test's first eligible entry.
-    builder.sort_by_file_name(|left, right| left.cmp(right));
+    configure_builder(&mut builder);
     let filter_keep_walking = std::sync::Arc::new(keep_walking);
     let filter_budget = std::sync::Arc::clone(&filter_keep_walking);
     let mut walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(move |entry| {
+            #[cfg(test)]
+            PROJECT_WALK_FILTER_ENTRIES
+                .with(|entries| entries.borrow_mut().push(entry.path().to_path_buf()));
             // The ignore crate filters hidden and ignored entries before this hook.
             // Once the budget expires, it prevents descent and yielding, but
             // the current Walk::next() can still finish this directory. The
@@ -3899,7 +3924,11 @@ fn walk_project_files_filtered_while(
                 return false;
             }
             #[cfg(test)]
-            PROJECT_WALK_ENTRIES.with(|count| count.set(count.get() + 1));
+            {
+                PROJECT_WALK_ENTRIES.with(|count| count.set(count.get() + 1));
+                PROJECT_WALK_ACCEPTED_FILTER_ENTRIES
+                    .with(|entries| entries.borrow_mut().push(entry.path().to_path_buf()));
+            }
             if !include(entry.path()) {
                 return false;
             }
@@ -3925,6 +3954,8 @@ fn walk_project_files_filtered_while(
 #[cfg(test)]
 thread_local! {
     pub(crate) static PROJECT_WALK_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static PROJECT_WALK_FILTER_ENTRIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static PROJECT_WALK_ACCEPTED_FILTER_ENTRIES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whether [`walk_project_files`] can yield the file at this root-relative

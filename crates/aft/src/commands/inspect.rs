@@ -7145,25 +7145,100 @@ mod deferred_terminal_tests {
 
     #[test]
     fn inspect_stats_deadline_checks_after_hidden_and_gitignored_siblings() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(".gitignore"), "ignored-*\n").unwrap();
-        for i in 0..256 {
-            std::fs::write(root.path().join(format!(".hidden-{i}.rs")), "hidden").unwrap();
-            std::fs::write(root.path().join(format!("ignored-{i}.rs")), "ignored").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "0-ignored*\n").unwrap();
+        let source_dir = root.path().join("src");
+        let nested_dir = source_dir.join("a-nested");
+        std::fs::create_dir(&source_dir).unwrap();
+        std::fs::create_dir(&nested_dir).unwrap();
+        for (dir, names) in [
+            (
+                source_dir.as_path(),
+                [
+                    ".hidden-before.rs",
+                    "0-ignored-before.rs",
+                    "0-ignored-extra.rs",
+                    "z-later.rs",
+                ],
+            ),
+            (
+                nested_dir.as_path(),
+                [
+                    ".hidden-child.rs",
+                    "0-ignored-child.rs",
+                    "a-first.rs",
+                    "z-nested.rs",
+                ],
+            ),
+        ] {
+            for name in names {
+                std::fs::write(dir.join(name), "pub fn fixture() {}\n").unwrap();
+            }
         }
-        std::fs::write(root.path().join("z.rs"), "pub fn visible() {}\n").unwrap();
 
-        let budget_checks = Arc::new(AtomicUsize::new(0));
-        let walk_checks = Arc::clone(&budget_checks);
-        let files = crate::callgraph::walk_project_files_while(root.path(), move || {
-            walk_checks.fetch_add(1, Ordering::Relaxed) < 2
-        })
-        .collect::<Vec<_>>();
+        crate::callgraph::PROJECT_WALK_FILTER_ENTRIES.with(|entries| entries.borrow_mut().clear());
+        crate::callgraph::PROJECT_WALK_ACCEPTED_FILTER_ENTRIES
+            .with(|entries| entries.borrow_mut().clear());
+        let expired_at_nested_entry = Arc::new(AtomicBool::new(false));
+        let budget_expired = Arc::clone(&expired_at_nested_entry);
+        let nested_for_budget = nested_dir.clone();
+        // Sorting makes a-nested the first visible entry after src's hidden and ignored siblings.
+        let files =
+            crate::callgraph::walk_project_files_while_sorted_for_test(root.path(), move || {
+                if budget_expired.load(Ordering::Relaxed) {
+                    return false;
+                }
+                let current_path = crate::callgraph::PROJECT_WALK_FILTER_ENTRIES
+                    .with(|entries| entries.borrow().last().cloned());
+                if let Some(current_path) = current_path {
+                    if current_path == nested_for_budget {
+                        let nested_was_accepted =
+                            crate::callgraph::PROJECT_WALK_ACCEPTED_FILTER_ENTRIES
+                                .with(|entries| entries.borrow().contains(&nested_for_budget));
+                        if !nested_was_accepted {
+                            budget_expired.store(true, Ordering::Relaxed);
+                            return false;
+                        }
+                    } else if current_path.starts_with(&nested_for_budget) {
+                        budget_expired.store(true, Ordering::Relaxed);
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect::<Vec<_>>();
+        let filtered_paths =
+            crate::callgraph::PROJECT_WALK_FILTER_ENTRIES.with(|entries| entries.borrow().clone());
+        let accepted_paths = crate::callgraph::PROJECT_WALK_ACCEPTED_FILTER_ENTRIES
+            .with(|entries| entries.borrow().clone());
 
+        assert!(
+            expired_at_nested_entry.load(Ordering::Relaxed),
+            "budget did not expire at the nested directory entry"
+        );
         assert!(files.is_empty(), "expired walk returned {files:?}");
-        assert_eq!(budget_checks.load(Ordering::Relaxed), 3);
+        assert!(
+            filtered_paths.contains(&source_dir),
+            "walk did not enter src: {filtered_paths:?}"
+        );
+        assert!(
+            filtered_paths.contains(&nested_dir),
+            "walk did not reach the subdirectory after hidden and ignored siblings: {filtered_paths:?}"
+        );
+        assert!(
+            accepted_paths
+                .iter()
+                .all(|path| !path.starts_with(&nested_dir)),
+            "walk accepted or descended into {nested_dir:?} after expiry: {accepted_paths:?}"
+        );
+        assert!(
+            filtered_paths
+                .iter()
+                .all(|path| !path.starts_with(&nested_dir) || path == &nested_dir),
+            "walk descended into {nested_dir:?} after expiry: {filtered_paths:?}"
+        );
     }
 
     #[test]
