@@ -39,6 +39,8 @@ const IGNORE_RULE_CHANGED_PATHS_LOGGED: usize = 3;
 const WATCHER_DRAIN_UNIT_WARN_AFTER: Duration = Duration::from_secs(5);
 const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
+const MUTATION_REFRESH_ENTRY_CAP: usize = 128;
+const MUTATION_REFRESH_BUDGET: Duration = Duration::from_millis(20);
 
 #[cfg(test)]
 thread_local! {
@@ -54,6 +56,10 @@ thread_local! {
     static WATCHER_DRAIN_TEST_NOW: std::cell::Cell<Option<Instant>> = const {
         std::cell::Cell::new(None)
     };
+    static MUTATION_DIRECTORY_READS: std::cell::RefCell<Vec<PathBuf>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+    static MUTATION_WALK_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn watcher_drain_now() -> Instant {
@@ -2139,6 +2145,7 @@ pub fn semantic_corpus_refresh_in_progress(ctx: &AppContext) -> bool {
 }
 
 struct SearchRebuildPublishGate {
+    root: Option<PathBuf>,
     reached_tx: crossbeam_channel::Sender<()>,
     release_rx: crossbeam_channel::Receiver<()>,
 }
@@ -2154,6 +2161,16 @@ pub fn install_search_rebuild_publish_gate_for_test() -> (
     crossbeam_channel::Receiver<()>,
     crossbeam_channel::Sender<()>,
 ) {
+    install_search_rebuild_publish_gate(None)
+}
+
+fn install_search_rebuild_publish_gate(
+    root: Option<PathBuf>,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
     let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
     let (shutdown_waiting_tx, shutdown_waiting_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
@@ -2161,6 +2178,7 @@ pub fn install_search_rebuild_publish_gate_for_test() -> (
         .get_or_init(|| Mutex::new(None))
         .lock()
         .expect("search rebuild publish gate mutex poisoned") = Some(SearchRebuildPublishGate {
+        root,
         reached_tx,
         release_rx,
     });
@@ -2182,12 +2200,20 @@ pub(crate) fn note_search_rebuild_shutdown_wait_for_test() {
     }
 }
 
-fn wait_on_search_rebuild_publish_gate_for_test() {
-    let gate = SEARCH_REBUILD_PUBLISH_GATE
+fn wait_on_search_rebuild_publish_gate_for_test(root: &Path) {
+    let mut slot = SEARCH_REBUILD_PUBLISH_GATE
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .expect("search rebuild publish gate mutex poisoned")
-        .take();
+        .expect("search rebuild publish gate mutex poisoned");
+    let gate = if slot
+        .as_ref()
+        .is_some_and(|gate| gate.root.as_deref().is_none_or(|expected| expected == root))
+    {
+        slot.take()
+    } else {
+        None
+    };
+    drop(slot);
     if let Some(gate) = gate {
         let _ = gate.reached_tx.send(());
         let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
@@ -2277,7 +2303,7 @@ fn spawn_search_corpus_refresh_admitted(
                 config.search_index_max_file_size,
                 &cache_dir,
             );
-            wait_on_search_rebuild_publish_gate_for_test();
+            wait_on_search_rebuild_publish_gate_for_test(&root);
             // cache_lock is None for borrow-only roots, so ignore-refresh
             // never writes cache.bin even when ram_overlay is on.
             if cache_lock.is_some()
@@ -2743,20 +2769,88 @@ fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
 #[must_use]
 pub(crate) struct FileMutationGuard<'a> {
     ctx: &'a AppContext,
-    roots: Vec<PathBuf>,
+    revisit: Vec<PathBuf>,
     paths: std::collections::BTreeSet<PathBuf>,
+    before: MutationRefreshBudget,
+    overflowed: bool,
     _view_intent: crate::views::intent::IntentGuard,
 }
 
-fn collect_mutation_paths(roots: &[PathBuf], paths: &mut std::collections::BTreeSet<PathBuf>) {
-    let mut pending = roots.to_vec();
-    while let Some(path) = pending.pop() {
+struct MutationRefreshBudget {
+    started: Instant,
+    examined: usize,
+    refreshed: usize,
+    skipped_ignored: usize,
+}
+
+impl MutationRefreshBudget {
+    fn new() -> Self {
+        Self {
+            started: watcher_drain_now(),
+            examined: 0,
+            refreshed: 0,
+            skipped_ignored: 0,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.examined >= MUTATION_REFRESH_ENTRY_CAP
+            || watcher_drain_elapsed(self.started) >= MUTATION_REFRESH_BUDGET
+    }
+}
+
+fn collect_mutation_paths(
+    ctx: &AppContext,
+    roots: &[PathBuf],
+    paths: &mut std::collections::BTreeSet<PathBuf>,
+    mut revisit: Option<&mut Vec<PathBuf>>,
+    budget: &mut MutationRefreshBudget,
+) -> bool {
+    let mut roots = roots.iter();
+    let mut directories: Vec<std::fs::ReadDir> = Vec::new();
+    loop {
+        // Check before advancing ReadDir: collecting its children first would
+        // make a wide directory unbounded even with a capped refresh loop.
+        if budget.exhausted() {
+            return false;
+        }
+        let (path, is_root) = if let Some(entries) = directories.last_mut() {
+            match entries.next() {
+                Some(Ok(entry)) => (entry.path(), false),
+                Some(Err(_)) => return false,
+                None => {
+                    directories.pop();
+                    continue;
+                }
+            }
+        } else if let Some(root) = roots.next() {
+            (root.clone(), true)
+        } else {
+            return true;
+        };
+        budget.examined += 1;
+        if watcher_path_is_ignored_by_current_matcher(ctx, &path) {
+            budget.skipped_ignored += 1;
+            continue;
+        }
         paths.insert(path.clone());
-        // Capture descendants before deletion and after restoration. Do not
-        // follow links into trees that the mutation does not own.
-        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                pending.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+        #[cfg(test)]
+        MUTATION_WALK_STATS.with(|stats| stats.set(stats.get() + 1));
+        let metadata = std::fs::symlink_metadata(&path);
+        let is_directory = metadata.as_ref().is_ok_and(|meta| meta.is_dir());
+        if is_root && (is_directory || metadata.is_err()) {
+            if let Some(revisit) = revisit.as_mut() {
+                revisit.push(path.clone());
+            }
+        }
+        // Only directories and initially absent roots need discovery at drop.
+        // Plain files are refreshed once, without another classification walk.
+        if is_directory {
+            #[cfg(test)]
+            MUTATION_DIRECTORY_READS.with(|reads| reads.borrow_mut().push(path.clone()));
+            match std::fs::read_dir(&path) {
+                Ok(entries) => directories.push(entries),
+                Err(_) => return false,
             }
         }
     }
@@ -2769,21 +2863,73 @@ pub(crate) fn record_file_mutation<'a, 'p>(
     let roots = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
     let view_intent = crate::views::intent::record_paths(roots.iter().map(PathBuf::as_path));
     let mut paths = std::collections::BTreeSet::new();
-    collect_mutation_paths(&roots, &mut paths);
+    let mut revisit = Vec::new();
+    let mut before = MutationRefreshBudget::new();
+    let overflowed =
+        !collect_mutation_paths(ctx, &roots, &mut paths, Some(&mut revisit), &mut before);
     FileMutationGuard {
         ctx,
-        roots,
+        revisit,
         paths,
+        before,
+        overflowed,
         _view_intent: view_intent,
     }
 }
 
 impl Drop for FileMutationGuard<'_> {
     fn drop(&mut self) {
-        collect_mutation_paths(&self.roots, &mut self.paths);
+        let mut budget = MutationRefreshBudget::new();
+        let mut overflowed = self.overflowed;
         for path in &self.paths {
+            if budget.exhausted() {
+                overflowed = true;
+                break;
+            }
+            budget.examined += 1;
             refresh_search_index_after_write(self.ctx, path);
+            budget.refreshed += 1;
         }
+        if !self.revisit.is_empty() {
+            let mut discovered = std::collections::BTreeSet::new();
+            overflowed |= !collect_mutation_paths(
+                self.ctx,
+                &self.revisit,
+                &mut discovered,
+                None,
+                &mut budget,
+            );
+            for path in discovered.difference(&self.paths) {
+                if budget.exhausted() {
+                    overflowed = true;
+                    break;
+                }
+                budget.examined += 1;
+                refresh_search_index_after_write(self.ctx, path);
+                budget.refreshed += 1;
+            }
+        }
+        let root = self.ctx.canonical_cache_root_opt();
+        if overflowed
+            && self.ctx.heavy_root_work_allowed()
+            && (!self.ctx.shared_artifacts_read_only() || self.ctx.ram_overlay_active())
+            && self.ctx.config().indexes.trigram
+        {
+            if let Some(root) = root.as_ref() {
+                // One corpus replacement also retires unvisited descendants of
+                // a deleted directory. Its existing not-ready state protects
+                // queries while the watcher-independent worker rebuilds.
+                spawn_search_corpus_refresh(self.ctx, root.clone(), self.ctx.config());
+            }
+        }
+        crate::slog_info!(
+            "mutation search refresh root={} examined={} refreshed={} skipped-ignored={} overflowed={}",
+            root.as_deref().unwrap_or_else(|| Path::new(".")).display(),
+            self.before.examined + budget.examined,
+            budget.refreshed,
+            self.before.skipped_ignored + budget.skipped_ignored,
+            overflowed,
+        );
     }
 }
 
@@ -5568,7 +5714,189 @@ mod tests {
     }
 
     #[test]
+    fn own_mutation_directory_overflow_refreshes_prefix_and_defers_once() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let tree = root.join("src");
+        std::fs::create_dir(&tree).unwrap();
+        let files = (0..MUTATION_REFRESH_ENTRY_CAP + 8)
+            .map(|n| tree.join(format!("file_{n:04}.ts")))
+            .collect::<Vec<_>>();
+        for path in &files {
+            std::fs::write(path, "const value = 'qqqq_before_mutation';\n").unwrap();
+        }
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        let epoch = ctx.search_index_rx_epoch();
+        MUTATION_WALK_STATS.with(|stats| stats.set(0));
+        let mutation = record_file_mutation(&ctx, [tree.as_path()]);
+        assert!(mutation.overflowed);
+        assert!(mutation.before.examined <= MUTATION_REFRESH_ENTRY_CAP);
+        MUTATION_WALK_STATS.with(|stats| assert!(stats.get() <= MUTATION_REFRESH_ENTRY_CAP));
+        assert_eq!(ctx.search_index_rx_epoch(), epoch);
+        let retained = mutation.paths.clone();
+        let uncollected = files.iter().find(|path| !retained.contains(*path)).unwrap();
+        for path in &files {
+            let token = if path == uncollected {
+                "zzzz_uncollected_token"
+            } else {
+                "zzzz_refreshed_token"
+            };
+            std::fs::write(path, format!("const value = '{token}';\n")).unwrap();
+        }
+        let (reached, _, release) = install_search_rebuild_publish_gate(Some(root.clone()));
+        drop(mutation);
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            ctx.search_index_rx_epoch(),
+            epoch + 1,
+            "one rebuild per mutation"
+        );
+        {
+            let search = ctx.search_index().read().unwrap();
+            let index = search.as_ref().unwrap();
+            assert!(!index.ready);
+            let fresh = index.grep("zzzz_refreshed_token", true, &[], &[], &root, 1000);
+            assert_eq!(fresh.matches.len(), retained.len() - 1);
+            assert!(fresh.files_searched > 0);
+        }
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "uncollected", "command": "grep", "pattern": "zzzz_uncollected_token"
+        }))
+        .unwrap();
+        let response = crate::commands::grep::handle_grep(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_ne!(response.data["index_status"], "Ready", "{response:?}");
+        assert!(
+            response.data["complete"] != true
+                || response.data["total_matches"].as_u64().unwrap() > 0,
+            "unvisited content must not become a complete false miss: {response:?}"
+        );
+        assert_eq!(
+            ctx.search_index_rx_epoch(),
+            epoch + 1,
+            "query must reuse the pending rebuild"
+        );
+        let rx = ctx
+            .search_index_rx()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        release.send(()).unwrap();
+        let mut ready = crossbeam_channel::Select::new();
+        ready.recv(&rx);
+        ready.ready_timeout(Duration::from_secs(10)).unwrap();
+        drain_search_index_events(&ctx);
+        let search = ctx.search_index().read().unwrap();
+        let index = search.as_ref().unwrap();
+        assert!(index.ready);
+        assert_eq!(
+            index
+                .grep("zzzz_uncollected_token", true, &[], &[], &root, 10)
+                .matches
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn own_mutation_plain_file_is_not_walked_again_at_drop() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let file = root.join("source.ts");
+        std::fs::write(&file, "const value = 'before';\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        MUTATION_WALK_STATS.with(|stats| stats.set(0));
+        {
+            let _mutation = record_file_mutation(&ctx, [file.as_path()]);
+            MUTATION_WALK_STATS.with(|stats| assert_eq!(stats.get(), 1));
+        }
+        MUTATION_WALK_STATS.with(|stats| assert_eq!(stats.get(), 1));
+    }
+
+    #[test]
+    fn own_mutation_expired_walk_budget_does_not_advance_iterator() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        let mut budget = MutationRefreshBudget::new();
+        WATCHER_DRAIN_TEST_NOW
+            .with(|now| now.set(Some(watcher_drain_now() + MUTATION_REFRESH_BUDGET)));
+        let mut paths = std::collections::BTreeSet::new();
+        MUTATION_DIRECTORY_READS.with(|reads| reads.borrow_mut().clear());
+        assert!(!collect_mutation_paths(
+            &ctx,
+            &[temp.path().to_path_buf()],
+            &mut paths,
+            None,
+            &mut budget
+        ));
+        assert_eq!(budget.examined, 0);
+        assert!(paths.is_empty());
+        MUTATION_DIRECTORY_READS.with(|reads| assert!(reads.borrow().is_empty()));
+    }
+
+    #[test]
+    fn own_mutation_directory_collection_never_reads_ignored_subtree() {
+        let _clock = WatcherDrainTestClock::freeze();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let ignored = root.join("vendor");
+        std::fs::create_dir_all(ignored.join("nested")).unwrap();
+        std::fs::write(root.join(".gitignore"), "vendor/\n").unwrap();
+        std::fs::write(root.join("kept.ts"), "const value = 'kept';\n").unwrap();
+        for n in 0..200 {
+            std::fs::write(ignored.join("nested").join(format!("{n}.ts")), "ignored").unwrap();
+        }
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        ctx.rebuild_gitignore();
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        MUTATION_DIRECTORY_READS.with(|reads| reads.borrow_mut().clear());
+        {
+            let _mutation = record_file_mutation(&ctx, [root.as_path()]);
+        }
+        MUTATION_DIRECTORY_READS.with(|reads| {
+            let reads = reads.borrow();
+            assert!(!reads.is_empty());
+            assert_eq!(
+                reads
+                    .iter()
+                    .filter(|path| path.starts_with(&ignored))
+                    .count(),
+                0
+            );
+        });
+    }
+
+    #[test]
     fn own_mutation_patch_delete_retires_index_entry() {
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let old = root.join("deleted.ts");
@@ -5604,6 +5932,7 @@ mod tests {
 
     #[test]
     fn own_mutation_refresh_reconciles_directory_delete_and_restore() {
+        let _clock = WatcherDrainTestClock::freeze();
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let tree = root.join("src");
