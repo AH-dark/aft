@@ -235,9 +235,12 @@ mod tests {
         // A collector that overruns its own deadline slightly (a debugger
         // finishing late) must still beat the outer wait, or the stacks it
         // gathered are thrown away for a generic timeout message.
+        // The margin leaves the collector a ~100 ms deadline and the outer
+        // wait ~20 s of slack after it, so a loaded runner's late wake-up
+        // cannot make the overrun look like a hang.
         let report = capture_with(
-            Duration::from_millis(600),
-            Duration::from_millis(300),
+            Duration::from_secs(20),
+            Duration::from_millis(19_900),
             |deadline| {
                 std::thread::sleep(
                     deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
