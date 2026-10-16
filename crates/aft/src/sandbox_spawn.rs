@@ -4012,6 +4012,17 @@ pub(crate) fn pty_command_for_plan(
     let (program, args, profile_handle) =
         command_argv_for_plan(plan, program, args, task_marker, None)?;
     let mut command = CommandBuilder::new(program);
+    #[cfg(windows)]
+    {
+        // portable-pty refreshes its base environment from the registry, which
+        // can replace a process-local PATH and hide the shell we just selected.
+        // Inherit the actual parent block, as std::process::Command does, before
+        // applying the launch plan's isolation and request overrides below.
+        command.env_clear();
+        for (key, value) in std::env::vars_os() {
+            command.env(key, value);
+        }
+    }
     for arg in args {
         command.arg(arg);
     }
@@ -4177,6 +4188,52 @@ fn launcher_argv(
     _prepared: Option<&()>,
 ) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
     Err("sandbox_unavailable".to_string())
+}
+
+#[cfg(all(test, windows))]
+mod windows_pty_environment_tests {
+    use super::*;
+
+    #[test]
+    fn windows_pty_inherits_process_search_path_not_registry_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (command, _) = pty_command_for_plan(
+            &SpawnPlan::Unsandboxed,
+            OsStr::new("pwsh.exe"),
+            &[],
+            &dir.path().join("metadata.json"),
+            dir.path(),
+            &HashMap::new(),
+        )
+        .unwrap();
+        for key in ["PATH", "PATHEXT", "TEMP", "USERPROFILE"] {
+            assert_eq!(
+                command.get_env(key),
+                std::env::var_os(key).as_deref(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_pty_request_environment_overrides_process_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = HashMap::from([
+            ("Path".to_string(), dir.path().display().to_string()),
+            ("PATHEXT".to_string(), ".AFT".to_string()),
+        ]);
+        let (command, _) = pty_command_for_plan(
+            &SpawnPlan::Unsandboxed,
+            OsStr::new("pwsh.exe"),
+            &[],
+            &dir.path().join("metadata.json"),
+            dir.path(),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(command.get_env("PATH"), Some(OsStr::new(&request["Path"])));
+        assert_eq!(command.get_env("PATHEXT"), Some(OsStr::new(".AFT")));
+    }
 }
 
 #[cfg(all(test, unix))]

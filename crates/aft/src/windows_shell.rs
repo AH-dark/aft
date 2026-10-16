@@ -170,6 +170,9 @@ impl WindowsShell {
                 // single-quoted strings and `+` concat.
                 let exit_path = powershell_single_quote(&exit_path.display().to_string());
                 let command = powershell_single_quote(command);
+                // Invoke-Expression can report success after a command-not-found
+                // error. Catch invocation errors before publishing a success
+                // marker, even if an earlier native command set LASTEXITCODE.
                 format!(
                     concat!(
                         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
@@ -177,12 +180,13 @@ impl WindowsShell {
                         "$exitPath = {exit_path}; ",
                         "$tmpPath = $exitPath + '.tmp.' + $PID; ",
                         "$global:LASTEXITCODE = $null; ",
-                        "Invoke-Expression {command}; ",
+                        "try {{ Invoke-Expression {command}; ",
                         "$success = $?; ",
                         "$nativeCode = $global:LASTEXITCODE; ",
                         "if ($null -ne $nativeCode) {{ $code = [int]$nativeCode }} ",
                         "elseif ($success) {{ $code = 0 }} ",
-                        "else {{ $code = 1 }}; ",
+                        "else {{ $code = 1 }} ",
+                        "}} catch {{ [Console]::Error.WriteLine($_.ToString()); $code = 1 }}; ",
                         "[System.IO.File]::WriteAllText($tmpPath, [string]$code); ",
                         "Move-Item -LiteralPath $tmpPath -Destination $exitPath -Force; ",
                         "exit $code"
@@ -492,6 +496,89 @@ fn batch_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn assert_powershell_wrapper(shell: WindowsShell, command: &str, code: i32, stdout: &str) {
+        let Ok(binary) = which::which(shell.binary().as_ref()) else {
+            eprintln!("skipping {shell:?}: shell is not installed");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("wrapper.ps1");
+        let marker = temp.path().join("exit.txt");
+        std::fs::write(&wrapper, shell.wrapper_script_bytes(command, &marker)).unwrap();
+        let output = Command::new(binary)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&wrapper)
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{shell:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap().trim(),
+            code.to_string()
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), stdout);
+        if code == 1 {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("aft_missing_command_7961"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pwsh_wrapper_reports_command_not_found() {
+        for command in [
+            "aft_missing_command_7961",
+            "cmd.exe /d /c exit 42; aft_missing_command_7961",
+        ] {
+            assert_powershell_wrapper(WindowsShell::Pwsh, command, 1, "");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_5_wrapper_reports_command_not_found() {
+        for command in [
+            "aft_missing_command_7961",
+            "cmd.exe /d /c exit 42; aft_missing_command_7961",
+        ] {
+            assert_powershell_wrapper(WindowsShell::Powershell, command, 1, "");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pwsh_wrapper_preserves_native_output_and_exit_code() {
+        assert_powershell_wrapper(
+            WindowsShell::Pwsh,
+            "cmd.exe /d /c 'echo hello & exit 42'",
+            42,
+            "hello",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_5_wrapper_preserves_native_output_and_exit_code() {
+        assert_powershell_wrapper(
+            WindowsShell::Powershell,
+            "cmd.exe /d /c 'echo hello & exit 42'",
+            42,
+            "hello",
+        );
+    }
 
     #[test]
     fn cmd_wrapper_keeps_the_command_out_of_batch_parsing() {
