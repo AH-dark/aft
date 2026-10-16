@@ -575,6 +575,221 @@ fn cold_build_counts(
     (store, counts)
 }
 
+fn empty_go_caller_data() -> FileCallData {
+    FileCallData {
+        calls_by_symbol: HashMap::new(),
+        value_refs_by_symbol: HashMap::new(),
+        macro_body_calls_by_macro: HashMap::new(),
+        macro_mentions_by_symbol: HashMap::new(),
+        exported_symbols: Vec::new(),
+        symbol_metadata: HashMap::new(),
+        default_export_symbol: None,
+        import_block: crate::imports::ImportBlock::empty(),
+        lang: LangId::Go,
+    }
+}
+
+fn go_package_directory_work(adapter: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    let files = vec![
+        write(&root, "pkg/a.go", "package pkg\nfunc Target() {}\n"),
+        write(
+            &root,
+            "pkg/b.go",
+            "package pkg\nfunc Caller() { Target() }\n",
+        ),
+    ];
+    let (store, _) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    let conn = store.conn.lock().unwrap();
+    let memos = DiskIndexMemos::default();
+    let module_memo = callgraph::ModuleResolutionMemo::default();
+    let data = empty_go_caller_data();
+    let disk = DiskProjectIndex {
+        project_root: &root,
+        conn: &conn,
+        caller_file: "pkg/b.go",
+        caller_data: &data,
+        workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
+        module_resolution_memo: &module_memo,
+        memos: &memos,
+        memoize_resolver_indexes: true,
+    };
+    let extracts = HashMap::new();
+    let memory = if adapter == "lazy" {
+        ProjectIndex::from_db_and_callers(
+            &conn,
+            &root,
+            &extracts,
+            WorkspaceCratePrefixCache::default(),
+        )
+    } else {
+        ProjectIndex::from_parts(
+            &root,
+            ["pkg/a.go", "pkg/b.go"]
+                .into_iter()
+                .map(|file| (file.to_string(), (*disk.file_index(file).unwrap()).clone()))
+                .collect(),
+            HashMap::new(),
+            WorkspaceCratePrefixCache::default(),
+            Rc::new(DiskFacts::new(&root)),
+        )
+    };
+    work_counts::reset_under(&root);
+    for _ in 0..32 {
+        let target = if adapter == "disk" {
+            resolve_go_target(&disk, "pkg/b.go", "Target", "Target", &data)
+        } else {
+            resolve_go_target(&memory, "pkg/b.go", "Target", "Target", &data)
+        };
+        assert_eq!(
+            target,
+            Some(("resolved".into(), "pkg/a.go".into(), "Target".into()))
+        );
+    }
+    memos.ensure_lookups_succeeded().unwrap();
+    assert!(memory.take_lazy_load_error().is_none());
+    assert_eq!(
+        work_counts::directory_reads_under(&root.join("pkg")),
+        1,
+        "32 references into one package must list its directory only once ({adapter})"
+    );
+}
+
+#[test]
+fn go_package_directory_is_listed_once_disk() {
+    go_package_directory_work("disk");
+}
+
+#[test]
+fn go_package_directory_is_listed_once_memory() {
+    go_package_directory_work("memory");
+}
+
+#[test]
+fn go_package_directory_is_listed_once_lazy() {
+    go_package_directory_work("lazy");
+}
+
+#[test]
+fn go_package_symbol_index_matches_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    write(&root, "go.mod", "module example\n");
+    let files = vec![
+        write(
+            &root,
+            "pkg/a.go",
+            "package pkg\nfunc Public() {}\nfunc private() {}\nfunc duplicate() {}\n",
+        ),
+        write(&root, "pkg/b.go", "package pkg\nfunc duplicate() {}\n"),
+        write(
+            &root,
+            "pkg/a_test.go",
+            "package pkg\nfunc Public() {}\nfunc TestOnly() {}\n",
+        ),
+    ];
+    write(&root, "pkg/unindexed.go", "package pkg\nfunc Public() {}\n");
+    let (store, _) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    let conn = store.conn.lock().unwrap();
+    let memos = DiskIndexMemos::default();
+    let module_memo = callgraph::ModuleResolutionMemo::default();
+    let data = empty_go_caller_data();
+    let disk = DiskProjectIndex {
+        project_root: &root,
+        conn: &conn,
+        caller_file: "pkg/b.go",
+        caller_data: &data,
+        workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
+        module_resolution_memo: &module_memo,
+        memos: &memos,
+        memoize_resolver_indexes: true,
+    };
+    let memory = ProjectIndex::from_parts(
+        &root,
+        ["pkg/a.go", "pkg/b.go", "pkg/a_test.go"]
+            .into_iter()
+            .map(|file| (file.into(), (*disk.file_index(file).unwrap()).clone()))
+            .collect(),
+        HashMap::new(),
+        WorkspaceCratePrefixCache::default(),
+        Rc::new(DiskFacts::new(&root)),
+    );
+    let extracts = HashMap::new();
+    let lazy = ProjectIndex::from_db_and_callers(
+        &conn,
+        &root,
+        &extracts,
+        WorkspaceCratePrefixCache::default(),
+    );
+    fn check(index: &impl ResolverIndex) {
+        for caller in ["pkg/b.go", "pkg/a_test.go"] {
+            for module in [None, Some("example/pkg"), Some("external/pkg")] {
+                for symbol in ["Public", "private", "duplicate", "TestOnly", "missing"] {
+                    let expected = match (caller.ends_with("_test.go"), module, symbol) {
+                        (_, Some("external/pkg"), _) => None,
+                        (false, _, "Public") | (_, None, "private") => Some("pkg/a.go".into()),
+                        (true, _, "TestOnly") => Some("pkg/a_test.go".into()),
+                        _ => None,
+                    };
+                    assert_eq!(
+                        index.go_symbol_target(caller, module, symbol),
+                        expected,
+                        "caller={caller} module={module:?} symbol={symbol}"
+                    );
+                    assert_eq!(
+                        index.go_symbol_target(caller, module, symbol),
+                        go_symbol_target_by_scan(index, caller, module, symbol)
+                    );
+                }
+            }
+        }
+    }
+    check(&disk);
+    check(&memory);
+    check(&lazy);
+    memos.ensure_lookups_succeeded().unwrap();
+    assert!(lazy.take_lazy_load_error().is_none());
+
+    let mut oversized = ProjectIndex::from_parts(
+        &root,
+        memory.files.clone(),
+        HashMap::new(),
+        WorkspaceCratePrefixCache::default(),
+        Rc::new(DiskFacts::new(&root)),
+    );
+    let long_symbol = "x".repeat(GO_PACKAGE_MEMO_BYTES);
+    oversized
+        .files
+        .get_mut("pkg/a.go")
+        .unwrap()
+        .node_by_bare
+        .insert(long_symbol.clone(), "oversized-node".into());
+    assert_eq!(
+        oversized.go_symbol_target("pkg/b.go", None, &long_symbol),
+        Some("pkg/a.go".into()),
+        "an oversized package must still resolve through the scan"
+    );
+    assert!(oversized.go_packages.borrow().packages.is_empty());
+}
+
+#[test]
+fn go_package_memo_evicts_whole_packages_within_budget() {
+    let mut memo = GoPackageMemo::default();
+    let package = || {
+        Rc::new(GoPackage {
+            bytes: GO_PACKAGE_MEMO_BYTES / 2 + 1,
+            ..Default::default()
+        })
+    };
+    memo.insert("first".into(), package());
+    memo.insert("second".into(), package());
+    assert!(!memo.packages.contains_key(Path::new("first")));
+    assert!(memo.packages.contains_key(Path::new("second")));
+    assert_eq!(memo.order.len(), 1);
+    assert!(memo.bytes <= GO_PACKAGE_MEMO_BYTES);
+}
+
 #[test]
 fn cold_build_parses_each_file_once_and_matches_a_reparsing_build() {
     let dir = tempfile::tempdir().expect("temp dir");
