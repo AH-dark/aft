@@ -7144,6 +7144,29 @@ mod deferred_terminal_tests {
     }
 
     #[test]
+    fn inspect_stats_deadline_checks_after_hidden_and_gitignored_siblings() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".gitignore"), "ignored-*\n").unwrap();
+        for i in 0..256 {
+            std::fs::write(root.path().join(format!(".hidden-{i}.rs")), "hidden").unwrap();
+            std::fs::write(root.path().join(format!("ignored-{i}.rs")), "ignored").unwrap();
+        }
+        std::fs::write(root.path().join("z.rs"), "pub fn visible() {}\n").unwrap();
+
+        let budget_checks = Arc::new(AtomicUsize::new(0));
+        let walk_checks = Arc::clone(&budget_checks);
+        let files = crate::callgraph::walk_project_files_while(root.path(), move || {
+            walk_checks.fetch_add(1, Ordering::Relaxed) < 2
+        })
+        .collect::<Vec<_>>();
+
+        assert!(files.is_empty(), "expired walk returned {files:?}");
+        assert_eq!(budget_checks.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
     fn inspect_stats_unchanged_root_keeps_two_fresh_stat_passes() {
         let root = tempfile::tempdir().unwrap();
         for name in ["lib.rs", "README.md", "app.ts", "unsupported.xyz"] {

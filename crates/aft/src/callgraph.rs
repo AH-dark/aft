@@ -3866,7 +3866,7 @@ fn walk_project_files_filtered(
 /// Unsupported files and directories still consume a caller's walk budget.
 pub(crate) fn walk_project_files_while(
     root: &Path,
-    keep_walking: impl Fn() -> bool,
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
     walk_project_files_filtered_while(root, |_| true, keep_walking)
 }
@@ -3874,7 +3874,7 @@ pub(crate) fn walk_project_files_while(
 fn walk_project_files_filtered_while(
     root: &Path,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
-    keep_walking: impl Fn() -> bool,
+    keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
     use ignore::WalkBuilder;
 
@@ -3884,8 +3884,20 @@ fn walk_project_files_filtered_while(
     builder.same_file_system(true).hidden(true); // skip hidden files/dirs
                                                  // .gitignore (also outside a git repository), global excludes,
                                                  // .git/info/exclude and .aftignore (e.g. submodules).
+    #[cfg(test)]
+    // Keep the ignored siblings before the test's first eligible entry.
+    builder.sort_by_file_name(|left, right| left.cmp(right));
+    let filter_keep_walking = std::sync::Arc::new(keep_walking);
+    let filter_budget = std::sync::Arc::clone(&filter_keep_walking);
     let mut walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(move |entry| {
+            // The ignore crate filters hidden and ignored entries before this hook.
+            // Once the budget expires, it prevents descent and yielding, but
+            // the current Walk::next() can still finish this directory. The
+            // remaining worst case is one directory listing.
+            if !filter_budget() {
+                return false;
+            }
             #[cfg(test)]
             PROJECT_WALK_ENTRIES.with(|count| count.set(count.get() + 1));
             if !include(entry.path()) {
@@ -3899,10 +3911,10 @@ fn walk_project_files_filtered_while(
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
         })
         .build();
-
     // Filtering to source paths first can hide arbitrarily many directory/file
     // visits inside a single next() call. Check before each raw walker advance.
-    std::iter::from_fn(move || keep_walking().then(|| walker.next()).flatten())
+    let walk_budget = std::sync::Arc::clone(&filter_keep_walking);
+    std::iter::from_fn(move || walk_budget().then(|| walker.next()).flatten())
         .fuse()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
