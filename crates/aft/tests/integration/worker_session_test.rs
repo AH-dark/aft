@@ -155,6 +155,27 @@ fn status_of(aft: &mut AftProcess, task_id: &str) -> Value {
     )
 }
 
+/// Shell startup can outlast the worker limit, so read command output from the
+/// promoted task instead of requiring it in the detach reply.
+fn wait_for_worker_output(aft: &mut AftProcess, task_id: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = status_of(aft, task_id);
+        let has_started = status["output_preview"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("started");
+        if status["success"] != true
+            || status["status"] != "running"
+            || has_started
+            || std::time::Instant::now() >= deadline
+        {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The reply a caller gets when its blocking call reaches the configured wait
 /// limit: the call returns, the command keeps running in the background (it
 /// is not killed), and the reply names the task, how long it ran and its
@@ -180,10 +201,6 @@ fn assert_detached_at_limit(
     assert!(text.contains(&task_id), "{label}: {text:?}");
     assert!(text.contains("it was not killed"), "{label}: {text:?}");
     assert!(text.contains("It has run for"), "{label}: {text:?}");
-    assert!(
-        text.contains("Recent output:\nstarted"),
-        "{label}: {text:?}"
-    );
     assert!(text.contains("bash_kill"), "{label}: {text:?}");
     assert!(!text.contains("completion reminder"), "{label}: {text:?}");
     assert!(
@@ -192,12 +209,20 @@ fn assert_detached_at_limit(
             && text.contains("remain."),
         "{label}: the reply names the task's own kill deadline: {text:?}"
     );
-    let status = status_of(aft, &task_id);
+    // Shell startup is not part of the command's run time, so its output can
+    // arrive after the wait-limit response on a loaded runner.
+    let status = wait_for_worker_output(aft, &task_id);
+    let task_output = status["output_preview"].as_str().unwrap_or_default();
+    kill(aft, &task_id);
+    assert_eq!(status["success"], true, "{label}: {status:?}");
     assert_eq!(
         status["status"], "running",
         "{label}: the command keeps running after the call returns: {status:?}"
     );
-    kill(aft, &task_id);
+    assert!(
+        task_output.contains("started"),
+        "{label}: command output was not available after detach: {status:?}"
+    );
 }
 
 /// A delegated worker's `wait: true` call without a timeout returns at the
