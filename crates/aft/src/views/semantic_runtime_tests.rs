@@ -1413,8 +1413,12 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
     assert!(
         matches!(&*status.read().unwrap(), crate::context::SemanticIndexStatus::Failed(reason) if reason.contains("next retry due") && reason.contains("embedding model"))
     );
+    // Observe worker transitions, not retry latency: recovery also loads the
+    // stored view, and slow I/O must not be mistaken for a latched retry. These
+    // event waits have only a hang guard; no edit, wake or rebind drives recovery.
+    let hang_guard = Duration::from_secs(60);
     // A second refused connection proves a timer fires without any wake.
-    let retried = observer.rx.recv_timeout(Duration::from_secs(5)).ok();
+    let retried = observer.rx.recv_timeout(hang_guard).ok();
     if retried != Some("unavailable") {
         slot.clear();
         worker.join().unwrap();
@@ -1425,7 +1429,7 @@ fn transient_fingerprint_failure_recovers_without_edit_or_rebind() {
         "a failed probe must not walk the checkout"
     );
     backend.start(200);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + hang_guard;
     let recovered = loop {
         match observer.rx.recv_deadline(deadline) {
             Ok("unavailable") => continue,
