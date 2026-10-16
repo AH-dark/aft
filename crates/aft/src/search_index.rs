@@ -4139,6 +4139,8 @@ fn read_search_corpus_file_with_metadata(
         Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
     #[cfg(test)]
     audit_record(|work| work.corpus_opens += 1);
+    #[cfg(test)]
+    cache_freshness::record_corpus_read(path);
     let read = crate::project_content::open(path).and_then(|file| {
         file.take(max_file_size.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -7759,52 +7761,76 @@ fn verify_file_mtimes_with_budget(
         return None;
     }
 
+    enum VerifiedPath {
+        ContentFresh(usize, SearchFileMetadata),
+        Update(PreparedSearchUpdate),
+    }
+
+    // Strict verification also detects edits with restored size and mtime.
+    // Keep its reads in the bounded pool even when the stat pass found no changes.
+    let to_read = stats
+        .into_iter()
+        .filter(|(_, path, _, _)| {
+            verify_strategy == cache_freshness::VerifyStrategy::Strict
+                || changed_paths.contains(path)
+        })
+        .collect();
+    let max_file_size = index.max_file_size;
+    let verified = cache_freshness::verify_statted_files_bounded(
+        to_read,
+        |file_id, path, cached, metadata| {
+            let file = match metadata {
+                Some(metadata) => read_search_corpus_file_with_metadata(
+                    &path,
+                    max_file_size,
+                    false,
+                    search_file_metadata(&metadata),
+                ),
+                None => SearchCorpusEligibility::Skipped,
+            };
+            let file = match file {
+                SearchCorpusEligibility::Eligible(file) => {
+                    let content_hash = cache_freshness::hash_bytes(&file.bytes);
+                    if content_hash == cached.content_hash {
+                        return VerifiedPath::ContentFresh(file_id, file.metadata);
+                    }
+                    PreparedSearchPath::Indexed(PreparedIndexedFile {
+                        metadata: file.metadata,
+                        content_hash,
+                        trigram_map: trigram_filter_map(&file.bytes, true),
+                    })
+                }
+                SearchCorpusEligibility::Unindexed(metadata) => {
+                    PreparedSearchPath::Unindexed(metadata)
+                }
+                SearchCorpusEligibility::Skipped => PreparedSearchPath::Skipped,
+            };
+            VerifiedPath::Update(PreparedSearchUpdate { path, file })
+        },
+    );
+
     let mut changed = false;
     let mut canonical_parents = ParentCanonicalizationMemo::default();
     for path in removed_paths {
         index.remove_file_with_canonicalization_memo(&path, &mut canonical_parents);
         changed = true;
     }
-    for (file_id, path, cached, metadata) in stats {
-        // Strict verification also detects edits with restored size and mtime.
-        // Preserve those hash checks even when the stat pass found no changes.
-        if !changed_paths.contains(&path)
-            && verify_strategy == cache_freshness::VerifyStrategy::StatFirst
-        {
-            continue;
-        }
-        let file = match metadata {
-            Some(metadata) => read_search_corpus_file_with_metadata(
-                &path,
-                index.max_file_size,
-                false,
-                search_file_metadata(&metadata),
-            ),
-            None => SearchCorpusEligibility::Skipped,
-        };
-        let file = match file {
-            SearchCorpusEligibility::Eligible(file) => {
-                let content_hash = cache_freshness::hash_bytes(&file.bytes);
-                if content_hash == cached.content_hash {
-                    if file.metadata.modified != cached.mtime || file.metadata.size != cached.size {
-                        let entry = &mut Arc::make_mut(&mut index.files)[file_id];
-                        entry.modified = file.metadata.modified;
-                        entry.size = file.metadata.size;
-                        changed = true;
-                    }
-                    continue;
+    for result in verified {
+        match result {
+            VerifiedPath::ContentFresh(file_id, metadata) => {
+                let entry = &index.files[file_id];
+                if metadata.modified != entry.modified || metadata.size != entry.size {
+                    let entry = &mut Arc::make_mut(&mut index.files)[file_id];
+                    entry.modified = metadata.modified;
+                    entry.size = metadata.size;
+                    changed = true;
                 }
-                PreparedSearchPath::Indexed(PreparedIndexedFile {
-                    metadata: file.metadata,
-                    content_hash,
-                    trigram_map: trigram_filter_map(&file.bytes, true),
-                })
             }
-            SearchCorpusEligibility::Unindexed(metadata) => PreparedSearchPath::Unindexed(metadata),
-            SearchCorpusEligibility::Skipped => PreparedSearchPath::Skipped,
-        };
-        index.apply_search_update(PreparedSearchUpdate { path, file });
-        changed = true;
+            VerifiedPath::Update(update) => {
+                index.apply_search_update(update);
+                changed = true;
+            }
+        }
     }
     for path in new_paths {
         index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
@@ -11943,7 +11969,9 @@ mod warm_reload_verification_tests {
             0,
             "admission must precede source reads"
         );
-        assert!(watch.take_stats().hash_reads.is_empty());
+        let stats = watch.take_stats();
+        assert!(stats.hash_reads.is_empty());
+        assert!(stats.corpus_reads.is_empty());
     }
 
     #[test]
@@ -11987,6 +12015,11 @@ mod warm_reload_verification_tests {
             assert_eq!(audit_work().corpus_opens, 1);
             let stats = watch.take_stats();
             assert_eq!(
+                stats.corpus_reads.len(),
+                1,
+                "one content read for indexing and hashing"
+            );
+            assert_eq!(
                 stats.calls.len(),
                 1,
                 "reuse the admission stat for indexing"
@@ -12002,6 +12035,75 @@ mod warm_reload_verification_tests {
                     .len(),
                 1
             );
+        }
+    }
+
+    #[test]
+    fn strict_warm_refresh_reads_in_bounded_workers_with_one_stat_and_read_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for n in 0..32 {
+            fs::write(root.join(format!("file-{n}.rs")), "fn before() {}\n").unwrap();
+        }
+        let baseline = SearchIndex::build(&root);
+        for schedule in [
+            cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+            cache_freshness::VerifyScheduleForTest::Concurrent,
+        ] {
+            let watch = cache_freshness::watch_verify_stats(&root, schedule);
+            let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                baseline.clone(),
+                &root,
+                DEFAULT_MAX_FILE_SIZE,
+                None,
+                cache_freshness::VerifyStrategy::Strict,
+                Some(0),
+            )
+            .expect("unchanged files fit even a zero-path budget");
+            let stats = watch.take_stats();
+            assert_eq!(stats.pool_size, Some(2));
+            assert_eq!(stats.calls.len(), 32, "one admission stat per cached file");
+            let stat_paths: HashSet<_> = stats.calls.iter().map(|(path, _)| path).collect();
+            assert_eq!(
+                stat_paths.len(),
+                32,
+                "each cached file is statted exactly once"
+            );
+            assert_eq!(
+                stats.corpus_reads.len(),
+                32,
+                "strict must read unchanged files"
+            );
+            assert!(
+                stats.hash_reads.is_empty(),
+                "hash the corpus read, not a second read"
+            );
+            let mut counts = HashMap::new();
+            let mut threads = HashSet::new();
+            for (path, thread) in stats.corpus_reads {
+                *counts.entry(path).or_insert(0) += 1;
+                threads.insert(thread);
+                assert_ne!(
+                    thread,
+                    std::thread::current().id(),
+                    "reads must run in the pool"
+                );
+            }
+            assert_eq!(counts.len(), refreshed.path_to_id.len());
+            assert!(counts.values().all(|count| *count == 1));
+            assert!(
+                threads.len() <= 2,
+                "reads must stay within the bounded pool"
+            );
+            match schedule {
+                cache_freshness::VerifyScheduleForTest::SingleWorkerDrain => {
+                    assert_eq!(threads.len(), 1);
+                }
+                cache_freshness::VerifyScheduleForTest::Concurrent => {
+                    assert_eq!(threads.len(), 2);
+                    assert!(stats.concurrent_reads);
+                }
+            }
         }
     }
 

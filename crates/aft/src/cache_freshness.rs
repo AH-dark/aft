@@ -385,6 +385,20 @@ fn map_files_bounded<K: Send, V: Send>(
     }
 }
 
+/// Reuse admission metadata while running content verification in the same bounded pool.
+pub(crate) fn verify_statted_files_bounded<K: Send, V: Send>(
+    files: Vec<(K, PathBuf, FileFreshness, Option<fs::Metadata>)>,
+    verify: impl Fn(K, PathBuf, FileFreshness, Option<fs::Metadata>) -> V + Send + Sync,
+) -> Vec<V> {
+    let files = files
+        .into_iter()
+        .map(|(key, path, cached, metadata)| ((key, metadata), path, cached))
+        .collect();
+    map_files_bounded(files, |((key, metadata), path, cached)| {
+        verify(key, path, cached, metadata)
+    })
+}
+
 fn strict_verify_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(build_strict_verify_pool).as_ref()
@@ -486,9 +500,11 @@ static WATCHED_VERIFY_STATS: OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Arc<Ver
 #[derive(Default)]
 pub(crate) struct VerifyStatWatch {
     pub(crate) calls: Vec<(PathBuf, std::thread::ThreadId)>,
+    pub(crate) corpus_reads: Vec<(PathBuf, std::thread::ThreadId)>,
     pub(crate) hash_reads: Vec<PathBuf>,
     pub(crate) pool_size: Option<usize>,
     pub(crate) concurrent: bool,
+    pub(crate) concurrent_reads: bool,
 }
 
 #[cfg(test)]
@@ -590,6 +606,34 @@ pub(crate) fn record_metadata_call(path: &Path) {
                 assert!(
                     stats.concurrent,
                     "verification remained serial: a second worker never took an item"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_corpus_read(path: &Path) {
+    if let Some(probe) = verify_stat_probe(path) {
+        let thread = std::thread::current().id();
+        let mut stats = probe.stats.lock().unwrap();
+        stats.corpus_reads.push((path.to_path_buf(), thread));
+        if probe.schedule == VerifyScheduleForTest::Concurrent {
+            // Observe content reads independently: concurrent stats alone do not
+            // prove that strict hashing also runs in the bounded pool.
+            if stats.corpus_reads[0].1 != thread {
+                stats.concurrent_reads = true;
+                probe.second_worker.notify_all();
+            } else if !stats.concurrent_reads {
+                let (stats, _) = probe
+                    .second_worker
+                    .wait_timeout_while(stats, std::time::Duration::from_secs(2), |stats| {
+                        !stats.concurrent_reads
+                    })
+                    .unwrap();
+                assert!(
+                    stats.concurrent_reads,
+                    "content verification remained serial: a second worker never read an item"
                 );
             }
         }
