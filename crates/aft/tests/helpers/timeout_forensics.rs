@@ -7,17 +7,32 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const CAPTURE_BUDGET: Duration = Duration::from_secs(10);
+/// Collectors stop this long before the outer wait gives up, so a debugger
+/// that runs to its deadline still leaves time to hand back what was gathered
+/// (kernel stacks first) instead of the outer wait discarding it.
+const REPORT_MARGIN: Duration = Duration::from_secs(1);
 const OUTPUT_LIMIT: u64 = 256 * 1024;
 
 pub(super) fn capture_stacks(pid: u32) -> String {
-    let deadline = Instant::now() + CAPTURE_BUDGET;
+    capture_with(CAPTURE_BUDGET, REPORT_MARGIN, move |deadline| {
+        collect_stacks(pid, deadline)
+    })
+}
+
+/// Run `collect` on a worker with a deadline `margin` before the outer wait
+/// ends. The outer deadline also covers filesystem reads and tool discovery,
+/// so a stalled /proc read must not defeat the subprocess watchdog.
+fn capture_with(
+    budget: Duration,
+    margin: Duration,
+    collect: impl FnOnce(Instant) -> String + Send + 'static,
+) -> String {
+    let deadline = Instant::now() + budget;
     let (sender, receiver) = mpsc::channel();
-    // The outer deadline also covers filesystem reads and tool discovery. A
-    // stalled /proc read must not defeat the subprocess watchdog.
     let worker = std::thread::Builder::new()
         .name("aft-timeout-stacks".into())
         .spawn(move || {
-            let _ = sender.send(collect_stacks(pid, deadline));
+            let _ = sender.send(collect(deadline - margin));
         });
     if let Err(error) = worker {
         return format!("stack capture unavailable: could not start worker: {error}");
@@ -25,7 +40,8 @@ pub(super) fn capture_stacks(pid: u32) -> String {
     match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(report) => report,
         Err(error) => format!(
-            "stack capture stopped after 10s ({error}); collectors: {}",
+            "stack capture stopped after {}s ({error}); collectors: {}",
+            budget.as_secs(),
             collector_names()
         ),
     }
@@ -215,6 +231,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collector_that_runs_to_its_deadline_still_returns_its_report() {
+        // A collector that overruns its own deadline slightly (a debugger
+        // finishing late) must still beat the outer wait, or the stacks it
+        // gathered are thrown away for a generic timeout message.
+        let report = capture_with(
+            Duration::from_millis(600),
+            Duration::from_millis(300),
+            |deadline| {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+                );
+                "kernel stacks gathered".to_string()
+            },
+        );
+        assert_eq!(report, "kernel stacks gathered");
+    }
+
+    #[test]
     fn stack_sampler_deadline_kills_process_group() {
         let started = Instant::now();
         let temp = tempfile::tempdir().unwrap();
@@ -223,13 +257,17 @@ mod tests {
         command
             .args([
                 "-c",
-                "sleep 2 & child=$!; printf '%s\\n' \"$child\" > \"$PID_FILE\"; printf 'sampler entered\\n'; wait \"$child\"",
+                "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$PID_FILE\"; printf 'sampler entered\\n'; wait \"$child\"",
             ])
             .env("PID_FILE", &child_pid_file);
         let (ok, report) = run_sampler(
             "sleeping-sampler",
             command,
-            started + Duration::from_millis(100),
+            // The deadline must outlast shell startup on a loaded runner, or
+            // the sampler is killed before it records its child and the test
+            // checks nothing. The child sleeps far past it, so expiry still
+            // decides the outcome.
+            started + Duration::from_secs(2),
         );
         let child_pid: libc::pid_t = std::fs::read_to_string(&child_pid_file)
             .expect("sampler writes its child PID before waiting")
@@ -240,7 +278,7 @@ mod tests {
         assert!(!ok, "{report}");
         assert!(report.contains("timed out"), "{report}");
         assert!(report.contains("sampler entered"), "{report}");
-        assert!(started.elapsed() < Duration::from_secs(1), "{report}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{report}");
         let stopped = wait_for_process_stop(child_pid, Instant::now() + Duration::from_millis(300));
         if stopped {
             child_cleanup.0 = None;
