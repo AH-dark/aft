@@ -247,7 +247,13 @@ fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateE
     Ok(())
 }
 
-fn normalize_path_arguments(bare_name: &str, args: Value) -> Result<Value, TranslateError> {
+/// Accept older argument names (such as zoom's `path` and edit's `oldText`)
+/// without listing them in the catalog. Use this conversion before checking
+/// arguments against the catalog schema as well as before execution.
+pub(crate) fn normalize_path_arguments(
+    bare_name: &str,
+    args: Value,
+) -> Result<Value, TranslateError> {
     let mut map = match args {
         Value::Object(map) => map,
         _ => return Err(invalid_request("tool arguments must be an object")),
