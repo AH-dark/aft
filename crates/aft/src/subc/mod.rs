@@ -15134,6 +15134,163 @@ mod tests {
         assert!(!live_roots[&root].maintenance_pending);
     }
 
+    #[test]
+    fn bash_replay_slow_recovery_does_not_block_route_changes_or_other_roots() {
+        use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+
+        let (_dir, root) = test_root("slow-bash-replay");
+        let (_other_dir, other_root) = test_root("beside-slow-bash-replay");
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        let other_ctx = test_ctx();
+        let registry = ctx.bash_background();
+        let session = "slow-replay-session";
+        registry.set_project_replay_scan_budget_for_test(2, Duration::from_secs(5));
+        let task_ids = (0..12)
+            .map(|index| format!("bash-{index:016x}"))
+            .collect::<Vec<_>>();
+        for task_id in &task_ids {
+            let paths = task_paths(storage.path(), session, task_id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                task_id.clone(),
+                session.into(),
+                "echo recovered".into(),
+                root.as_path().to_path_buf(),
+                Some(root.as_path().to_path_buf()),
+                None,
+                true,
+                true,
+            );
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            write_task(&paths.json, &metadata).unwrap();
+            std::fs::write(&paths.stdout, "recovered\n").unwrap();
+            std::fs::write(&paths.stderr, "").unwrap();
+        }
+        registry
+            .replay_session_for_project(storage.path(), session, root.as_path())
+            .unwrap();
+        let before = registry.pending_completions_for_session(session).len();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        assert!(executor.register_actor(other_root.clone(), Arc::clone(&other_ctx)));
+        let (reached, release) = registry.pause_project_replay_recovery_for_test();
+        let recovery_ctx = Arc::clone(&ctx);
+        let recovery = std::thread::spawn(move || {
+            for _ in 0..100 {
+                runtime_drain::drain_bash_project_replay(&recovery_ctx);
+            }
+        });
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        for _ in 0..2 {
+            registry
+                .replay_session_for_project(storage.path(), session, root.as_path())
+                .unwrap();
+        }
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            1
+        );
+
+        let (unbound_tx, unbound_rx) = crossbeam_channel::bounded(1);
+        let (other_tx, other_rx) = crossbeam_channel::bounded(1);
+        let transport_ctx = Arc::clone(&other_ctx);
+        let transport_root = root.clone();
+        let transport = std::thread::spawn(move || {
+            let mut live_roots = HashMap::from([
+                (transport_root.clone(), RootMeta::new(Instant::now())),
+                (other_root.clone(), RootMeta::new(Instant::now())),
+            ]);
+            let mut channels = HashMap::from([
+                (transport_root.clone(), HashSet::from([route_key(7, 1)])),
+                (other_root.clone(), HashSet::from([route_key(8, 1)])),
+            ]);
+            // These operations run sequentially on the shared transport loop.
+            remove_root_channel(&mut channels, &transport_root, route_key(7, 1));
+            quiesce_unbound_root(&transport_root, &mut live_roots, &executor);
+            unbound_tx.send(()).unwrap();
+            remove_root_channel(&mut channels, &other_root, route_key(8, 1));
+            quiesce_unbound_root(&other_root, &mut live_roots, &executor);
+            transport_ctx.mark_subc_bound();
+            live_roots.get_mut(&other_root).unwrap().reactivate_bound();
+            channels.insert(other_root.clone(), HashSet::from([route_key(8, 2)]));
+            let admitted = transport_ctx
+                .run_if_subc_bound_generation(transport_ctx.configure_generation(), || true);
+            other_tx.send(admitted).unwrap();
+        });
+        let unbound_while_paused = unbound_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let other_while_paused = other_rx.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        recovery.join().unwrap();
+        transport.join().unwrap();
+        assert!(
+            unbound_while_paused,
+            "mark_subc_unbound and last-route removal must finish while recovery is paused"
+        );
+        assert_eq!(
+            other_while_paused.ok(),
+            Some(Some(true)),
+            "the shared transport loop must process another root while recovery is paused"
+        );
+
+        assert!(ctx.subc_unbound_quiesced());
+        let recovered = task_ids
+            .iter()
+            .filter_map(|id| registry.task_for_test(id).map(|task| (id, task)))
+            .collect::<Vec<_>>();
+        assert!(
+            recovered.len() > before,
+            "the admitted batch must finish recovery"
+        );
+        assert!(recovered.len() < task_ids.len());
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            1
+        );
+        let examined = registry.project_replay_scan_total_examined_for_test();
+        for _ in 0..3 {
+            runtime_drain::drain_bash_project_replay(&ctx);
+        }
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            examined
+        );
+        assert!(registry.live_delivery_sessions_for_test().is_empty());
+
+        ctx.mark_subc_bound();
+        registry.set_project_replay_scan_budget_for_test(128, Duration::from_secs(5));
+        for _ in 0..20 {
+            runtime_drain::drain_bash_project_replay(&ctx);
+        }
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            0
+        );
+        assert_eq!(
+            registry.pending_completions_for_session(session).len(),
+            task_ids.len()
+        );
+        for (id, task) in recovered {
+            assert!(Arc::ptr_eq(&task, &registry.task_for_test(id).unwrap()));
+        }
+        assert!(registry.live_delivery_sessions_for_test().is_empty());
+        registry.detach();
+        other_ctx.bash_background().detach();
+    }
+
     #[tokio::test]
     async fn bash_registry_replay_backlog_schedules_completion_maintenance_until_done() {
         use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};

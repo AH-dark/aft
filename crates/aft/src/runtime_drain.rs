@@ -664,16 +664,24 @@ pub fn drain_build_completions(ctx: &AppContext) {
 }
 
 /// Resume one bounded replay batch on the maintenance lane, never on bind.
-/// Lifecycle admission closes before unbind returns; pending sessions remain
-/// visible in health and resume on rebind without replacing live task handles.
+/// Only claiming the batch needs lifecycle admission: disk scans and recovery
+/// must not delay unbind on the shared transport loop. An admitted batch may
+/// finish after unbind; its registry guard serializes replay and preserves the
+/// remaining cursor without restoring routes. Later batches require admission
+/// again, so pending sessions resume only on rebind.
 pub fn drain_bash_project_replay(ctx: &AppContext) {
     if !ctx.bash_background().project_replay_has_work() {
         return;
     }
     let generation = ctx.configure_generation();
-    ctx.run_if_subc_bound_generation(generation, || {
-        ctx.bash_background().continue_project_replay();
-    });
+    let batch = ctx
+        .run_if_subc_bound_generation(generation, || {
+            ctx.bash_background().claim_project_replay_batch()
+        })
+        .flatten();
+    if let Some(batch) = batch {
+        batch.continue_project_replay();
+    }
 }
 
 /// Return true when any background build-completion receiver is currently set.

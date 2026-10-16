@@ -835,6 +835,32 @@ struct ProjectReplayRequest {
     session_id: String,
 }
 
+/// Holds the replay mutex from lifecycle admission through the cursor and
+/// pending-request updates, so a concurrent bind cannot start another batch.
+/// Recovery may finish after the last route disconnects: SessionRecoveryGuard
+/// keeps persisted-task GC away from directories being rewritten, existing task
+/// handles stay authoritative, and recovery never marks a session as connected.
+pub(crate) struct ProjectReplayBatch<'a> {
+    registry: &'a BgTaskRegistry,
+    request: ProjectReplayRequest,
+    disk_only: bool,
+    _batch: std::sync::MutexGuard<'a, ()>,
+}
+
+impl ProjectReplayBatch<'_> {
+    pub(crate) fn continue_project_replay(self) {
+        if let Err(error) = self
+            .registry
+            .run_project_replay_batch(&self.request, self.disk_only)
+        {
+            crate::slog_warn!(
+                "bash task replay incomplete for session {}: {error}; maintenance will retry",
+                self.request.session_id
+            );
+        }
+    }
+}
+
 pub(crate) struct RegistryInner {
     #[cfg(unix)]
     db_hint_jobs:
@@ -908,6 +934,13 @@ pub(crate) struct RegistryInner {
     project_replay_batch: Mutex<()>,
     #[cfg(test)]
     project_replay_scan_budget_for_test: Mutex<Option<(usize, Duration)>>,
+    #[cfg(test)]
+    project_replay_recovery_gate: Mutex<
+        Option<(
+            crossbeam_channel::Sender<()>,
+            crossbeam_channel::Receiver<()>,
+        )>,
+    >,
     /// Output compression callback. Set by `AppContext` after construction.
     /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
@@ -1313,6 +1346,8 @@ impl BgTaskRegistry {
                 project_replay_batch: Mutex::new(()),
                 #[cfg(test)]
                 project_replay_scan_budget_for_test: Mutex::new(None),
+                #[cfg(test)]
+                project_replay_recovery_gate: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_rows_missing: Mutex::new(HashSet::new()),
@@ -1623,6 +1658,11 @@ impl BgTaskRegistry {
             let _hold = self.inner.live_delivery_lock_diagnostics.hold();
             *live_sessions = sessions;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_delivery_sessions_for_test(&self) -> HashSet<String> {
+        self.inner.live_delivery_sessions.lock().unwrap().clone()
     }
 
     pub(crate) fn live_delivery_lock_diagnostics(
@@ -4339,27 +4379,36 @@ impl BgTaskRegistry {
             .unwrap_or(true)
     }
 
-    /// Advance at most one saved disk batch. The caller checks that the project
-    /// still has a connected session route before starting recovery work.
-    pub(crate) fn continue_project_replay(&self) {
-        let Ok(_batch) = self.inner.project_replay_batch.try_lock() else {
-            return;
-        };
-        let request = self
+    /// Claim a saved batch under lifecycle admission without doing disk work.
+    /// Contending binds queue their requests until the returned guard is dropped.
+    pub(crate) fn claim_project_replay_batch(&self) -> Option<ProjectReplayBatch<'_>> {
+        let batch = self.inner.project_replay_batch.try_lock().ok()?;
+        let (request, disk_only) = self
             .inner
             .project_replay_pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_lock()
+            .ok()?
             .first_key_value()
-            .map(|(request, disk_only)| (request.clone(), *disk_only));
-        if let Some((request, disk_only)) = request {
-            if let Err(error) = self.run_project_replay_batch(&request, disk_only) {
-                crate::slog_warn!(
-                    "bash task replay incomplete for session {}: {error}; maintenance will retry",
-                    request.session_id
-                );
-            }
-        }
+            .map(|(request, disk_only)| (request.clone(), *disk_only))?;
+        Some(ProjectReplayBatch {
+            registry: self,
+            request,
+            disk_only,
+            _batch: batch,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_project_replay_recovery_for_test(
+        &self,
+    ) -> (
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        *self.inner.project_replay_recovery_gate.lock().unwrap() = Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
     }
 
     fn run_project_replay_batch(
@@ -4810,6 +4859,20 @@ impl BgTaskRegistry {
         for metadata in &tasks {
             if guarded.insert(metadata.session_id.clone()) {
                 recovering.push(self.begin_session_recovery(storage_dir, &metadata.session_id));
+            }
+        }
+
+        #[cfg(test)]
+        if !tasks.is_empty() {
+            let gate = self
+                .inner
+                .project_replay_recovery_gate
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(());
+                let _ = release.recv();
             }
         }
 
