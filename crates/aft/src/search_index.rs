@@ -6326,19 +6326,63 @@ pub fn artifact_cache_key_with_memo(
     storage_root: &Path,
     git_common_dir: Option<&Path>,
 ) -> Result<String, ArtifactCacheKeyProbeError> {
+    artifact_cache_key_with_memo_profiled(
+        probe_root,
+        memo_root,
+        storage_root,
+        git_common_dir,
+        &mut ArtifactCacheKeyTimings::default(),
+    )
+}
+
+/// Wall times overlap: memo_hold includes load, pruning and writes, while
+/// rev_list includes child execution and waiting for the child to exit.
+#[derive(Debug, Default)]
+pub(crate) struct ArtifactCacheKeyTimings {
+    pub(crate) git_usable: Duration,
+    pub(crate) rev_list: Duration,
+    pub(crate) git_spawns: usize,
+    pub(crate) retry_wait: Duration,
+    pub(crate) memo_wait: Duration,
+    pub(crate) memo_hold: Duration,
+    pub(crate) memo_load: Duration,
+    pub(crate) memo_prune: Duration,
+    pub(crate) memo_write: Duration,
+    pub(crate) context_memo_wait: Duration,
+    pub(crate) context_cache_hit: bool,
+}
+
+fn time_cache_key_work<T>(elapsed: &mut Duration, run: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = run();
+    *elapsed += started.elapsed();
+    result
+}
+
+pub(crate) fn artifact_cache_key_with_memo_profiled(
+    probe_root: &Path,
+    memo_root: &Path,
+    storage_root: &Path,
+    git_common_dir: Option<&Path>,
+    timings: &mut ArtifactCacheKeyTimings,
+) -> Result<String, ArtifactCacheKeyProbeError> {
     let memo_root_key = artifact_cache_key_memo_root_key(memo_root);
     let git_marker_state = root_git_marker_state(probe_root, git_common_dir);
     if git_marker_state == GitMarkerState::Absent {
         return Ok(artifact_path_identity_key(probe_root));
     }
 
-    match repo_root_commit_with_retry(probe_root) {
+    match repo_root_commit_with_retry_profiled(probe_root, timings) {
         RootCommitResolution::Commit(root_commit) => {
             let key = session_artifact_key_from_git_identity(probe_root, &root_commit);
             record_derived_cache_key(memo_root, &key);
-            if let Err(error) =
-                record_artifact_cache_key_memo(storage_root, &memo_root_key, &key, &root_commit)
-            {
+            if let Err(error) = record_artifact_cache_key_memo_profiled(
+                storage_root,
+                &memo_root_key,
+                &key,
+                &root_commit,
+                timings,
+            ) {
                 crate::slog_warn!(
                     "artifact cache key: failed to persist memo for {} in {}: {}",
                     memo_root.display(),
@@ -6350,7 +6394,9 @@ pub fn artifact_cache_key_with_memo(
         }
         RootCommitResolution::NotARepo => Ok(artifact_path_identity_key(probe_root)),
         RootCommitResolution::Failed(detail) => {
-            if let Some(entry) = lookup_artifact_cache_key_memo(storage_root, &memo_root_key) {
+            if let Some(entry) =
+                lookup_artifact_cache_key_memo_profiled(storage_root, &memo_root_key, timings)
+            {
                 // Re-derive from the memoized repository identity rather than
                 // trusting the memoized key: memos written by older versions
                 // hold the whole-repository key even for subfolder roots, and
@@ -6536,9 +6582,12 @@ impl ArtifactCacheKeyMemoState {
     fn entries_for_storage_root(
         &mut self,
         storage_root: &Path,
+        timings: &mut ArtifactCacheKeyTimings,
     ) -> &mut BTreeMap<String, ArtifactCacheKeyMemoEntry> {
         if !self.by_storage_root.contains_key(storage_root) {
-            let entries = read_artifact_cache_key_memo_file(storage_root);
+            let entries = time_cache_key_work(&mut timings.memo_load, || {
+                read_artifact_cache_key_memo_file(storage_root)
+            });
             self.by_storage_root
                 .insert(storage_root.to_path_buf(), entries);
         }
@@ -6548,66 +6597,116 @@ impl ArtifactCacheKeyMemoState {
     }
 }
 
+#[cfg(test)]
 fn lookup_artifact_cache_key_memo(
     storage_root: &Path,
     memo_root_key: &str,
 ) -> Option<ArtifactCacheKeyMemoEntry> {
+    lookup_artifact_cache_key_memo_profiled(
+        storage_root,
+        memo_root_key,
+        &mut ArtifactCacheKeyTimings::default(),
+    )
+}
+
+fn lookup_artifact_cache_key_memo_profiled(
+    storage_root: &Path,
+    memo_root_key: &str,
+    timings: &mut ArtifactCacheKeyTimings,
+) -> Option<ArtifactCacheKeyMemoEntry> {
+    let waiting = Instant::now();
     let mut state = artifact_cache_key_memo_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entries = state.entries_for_storage_root(storage_root);
-    let entry = entries.get(memo_root_key)?.clone();
-    let now = current_time_millis();
-    if Path::new(memo_root_key).exists()
-        && now.saturating_sub(entry.recorded_at_ms)
-            >= ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE.as_millis() as u64
-    {
-        // Read-only roots may reuse the same borrowed artifact key for months without
-        // deriving a new key. Refresh at most daily to keep the cached key available
-        // while avoiding a disk write on every failed lookup.
-        let mut refreshed = entry.clone();
-        refreshed.recorded_at_ms = now;
-        entries.insert(memo_root_key.to_string(), refreshed);
-        if let Err(error) = write_artifact_cache_key_memo_file(storage_root, entries) {
-            entries.insert(memo_root_key.to_string(), entry.clone());
-            crate::slog_warn!(
-                "artifact cache key: failed to refresh memo for {} in {}: {}",
-                memo_root_key,
-                storage_root.display(),
-                error
-            );
+    timings.memo_wait += waiting.elapsed();
+    let holding = Instant::now();
+    let result = (|| {
+        let entries = state.entries_for_storage_root(storage_root, timings);
+        let entry = entries.get(memo_root_key)?.clone();
+        let now = current_time_millis();
+        if Path::new(memo_root_key).exists()
+            && now.saturating_sub(entry.recorded_at_ms)
+                >= ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE.as_millis() as u64
+        {
+            // Read-only roots may reuse the same borrowed artifact key for months without
+            // deriving a new key. Refresh at most daily to keep the cached key available
+            // while avoiding a disk write on every failed lookup.
+            let mut refreshed = entry.clone();
+            refreshed.recorded_at_ms = now;
+            entries.insert(memo_root_key.to_string(), refreshed);
+            if let Err(error) = time_cache_key_work(&mut timings.memo_write, || {
+                write_artifact_cache_key_memo_file(storage_root, entries)
+            }) {
+                entries.insert(memo_root_key.to_string(), entry.clone());
+                crate::slog_warn!(
+                    "artifact cache key: failed to refresh memo for {} in {}: {}",
+                    memo_root_key,
+                    storage_root.display(),
+                    error
+                );
+            }
         }
-    }
-    entries.get(memo_root_key).cloned()
+        entries.get(memo_root_key).cloned()
+    })();
+    timings.memo_hold += holding.elapsed();
+    result
 }
 
+#[cfg(test)]
 fn record_artifact_cache_key_memo(
     storage_root: &Path,
     memo_root_key: &str,
     key: &str,
     git_root_commit: &str,
 ) -> std::io::Result<()> {
+    record_artifact_cache_key_memo_profiled(
+        storage_root,
+        memo_root_key,
+        key,
+        git_root_commit,
+        &mut ArtifactCacheKeyTimings::default(),
+    )
+}
+
+fn record_artifact_cache_key_memo_profiled(
+    storage_root: &Path,
+    memo_root_key: &str,
+    key: &str,
+    git_root_commit: &str,
+    timings: &mut ArtifactCacheKeyTimings,
+) -> std::io::Result<()> {
+    let waiting = Instant::now();
     let mut state = artifact_cache_key_memo_state()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entries = state.entries_for_storage_root(storage_root);
-    if entries
-        .get(memo_root_key)
-        .is_some_and(|entry| entry.key == key && entry.git_root_commit == git_root_commit)
-    {
-        return Ok(());
-    }
-    let now = current_time_millis();
-    entries.insert(
-        memo_root_key.to_string(),
-        ArtifactCacheKeyMemoEntry {
-            key: key.to_string(),
-            git_root_commit: git_root_commit.to_string(),
-            recorded_at_ms: now,
-        },
-    );
-    prune_expired_artifact_cache_key_memo_entries(entries, now);
-    write_artifact_cache_key_memo_file(storage_root, entries)
+    timings.memo_wait += waiting.elapsed();
+    let holding = Instant::now();
+    let result = (|| {
+        let entries = state.entries_for_storage_root(storage_root, timings);
+        if entries
+            .get(memo_root_key)
+            .is_some_and(|entry| entry.key == key && entry.git_root_commit == git_root_commit)
+        {
+            return Ok(());
+        }
+        let now = current_time_millis();
+        entries.insert(
+            memo_root_key.to_string(),
+            ArtifactCacheKeyMemoEntry {
+                key: key.to_string(),
+                git_root_commit: git_root_commit.to_string(),
+                recorded_at_ms: now,
+            },
+        );
+        time_cache_key_work(&mut timings.memo_prune, || {
+            prune_expired_artifact_cache_key_memo_entries(entries, now)
+        });
+        time_cache_key_work(&mut timings.memo_write, || {
+            write_artifact_cache_key_memo_file(storage_root, entries)
+        })
+    })();
+    timings.memo_hold += holding.elapsed();
+    result
 }
 
 fn prune_expired_artifact_cache_key_memo_entries(
@@ -6986,11 +7085,18 @@ pub(crate) fn canonical_git_root_commit_identity(
 /// therefore be retried, and callers that need stable identity can refuse path
 /// fallback when the result is still ambiguous after retry.
 fn repo_root_commit_with_retry(project_root: &Path) -> RootCommitResolution {
+    repo_root_commit_with_retry_profiled(project_root, &mut ArtifactCacheKeyTimings::default())
+}
+
+fn repo_root_commit_with_retry_profiled(
+    project_root: &Path,
+    timings: &mut ArtifactCacheKeyTimings,
+) -> RootCommitResolution {
     for attempt in 0..3u32 {
         if root_commit_probe_cancelled() {
             return RootCommitResolution::Cancelled;
         }
-        let probe = git_root_commit_once(project_root);
+        let probe = git_root_commit_once(project_root, timings);
         if root_commit_probe_cancelled() {
             return RootCommitResolution::Cancelled;
         }
@@ -7005,7 +7111,9 @@ fn repo_root_commit_with_retry(project_root: &Path) -> RootCommitResolution {
                 if root_commit_probe_cancelled() {
                     return RootCommitResolution::Cancelled;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                time_cache_key_work(&mut timings.retry_wait, || {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+                });
                 if root_commit_probe_cancelled() {
                     return RootCommitResolution::Cancelled;
                 }
@@ -7037,7 +7145,10 @@ enum RootCommitProbe {
     Transient(String),
 }
 
-fn git_root_commit_once(project_root: &Path) -> RootCommitProbe {
+fn git_root_commit_once(
+    project_root: &Path,
+    timings: &mut ArtifactCacheKeyTimings,
+) -> RootCommitProbe {
     #[cfg(test)]
     if let Some(override_probe) = GIT_ROOT_COMMIT_PROBE_OVERRIDE
         .get_or_init(|| Mutex::new(None))
@@ -7050,7 +7161,7 @@ fn git_root_commit_once(project_root: &Path) -> RootCommitProbe {
         }
     }
 
-    git_root_commit_once_real(project_root)
+    git_root_commit_once_real(project_root, timings)
 }
 
 /// Canonicalize the root set before it becomes an artifact-cache identity.
@@ -7073,19 +7184,24 @@ fn canonicalize_root_commit_output(stdout: &[u8]) -> RootCommitProbe {
     }
 }
 
-fn git_root_commit_once_real(project_root: &Path) -> RootCommitProbe {
+fn git_root_commit_once_real(
+    project_root: &Path,
+    timings: &mut ArtifactCacheKeyTimings,
+) -> RootCommitProbe {
     // Without runnable git, answer the way a non-git directory does: a
     // deterministic NotARepo, so the caller takes the path-identity fallback
     // and never retries.
-    if !crate::developer_tools::git_usable() {
+    if !time_cache_key_work(&mut timings.git_usable, crate::developer_tools::git_usable) {
         return RootCommitProbe::NotARepo;
     }
-    let output = match crate::effective_path::new_command("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["rev-list", "--max-parents=0", "HEAD"])
-        .output()
-    {
+    timings.git_spawns += 1;
+    let output = match time_cache_key_work(&mut timings.rev_list, || {
+        crate::effective_path::new_command("git")
+            .arg("-C")
+            .arg(project_root)
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+    }) {
         Ok(output) => output,
         Err(error) => return RootCommitProbe::Transient(format!("spawn failed: {error}")),
     };

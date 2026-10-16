@@ -5783,26 +5783,49 @@ impl AppContext {
         storage_root: &Path,
         git_common_dir: Option<&Path>,
     ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
+        self.memoized_artifact_cache_key_for_configure_profiled(
+            raw_root,
+            canonical_root,
+            storage_root,
+            git_common_dir,
+            &mut crate::search_index::ArtifactCacheKeyTimings::default(),
+        )
+    }
+
+    pub(crate) fn memoized_artifact_cache_key_for_configure_profiled(
+        &self,
+        raw_root: &Path,
+        canonical_root: &Path,
+        storage_root: &Path,
+        git_common_dir: Option<&Path>,
+        timings: &mut crate::search_index::ArtifactCacheKeyTimings,
+    ) -> Result<String, crate::search_index::ArtifactCacheKeyProbeError> {
         {
+            let waiting = Instant::now();
             let keys = self.artifact_cache_keys.lock();
+            timings.context_memo_wait += waiting.elapsed();
             if let Some(key) = keys
                 .get(canonical_root)
                 .or_else(|| keys.get(raw_root))
                 .cloned()
             {
+                timings.context_cache_hit = true;
                 return Ok(key);
             }
         }
 
-        let key = crate::search_index::artifact_cache_key_with_memo(
+        let key = crate::search_index::artifact_cache_key_with_memo_profiled(
             canonical_root,
             raw_root,
             storage_root,
             git_common_dir,
+            timings,
         )?;
         self.artifact_cache_key_derivations
             .fetch_add(1, Ordering::SeqCst);
+        let waiting = Instant::now();
         let mut keys = self.artifact_cache_keys.lock();
+        timings.context_memo_wait += waiting.elapsed();
         keys.insert(canonical_root.to_path_buf(), key.clone());
         keys.insert(raw_root.to_path_buf(), key.clone());
         Ok(key)
