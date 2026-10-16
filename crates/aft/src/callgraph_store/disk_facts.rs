@@ -75,6 +75,8 @@ impl ProjectFacts for DiskFacts {
     }
     fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
         let dir = self.project_root.join(byte_path(rel));
+        #[cfg(test)]
+        super::work_counts::note_directory_read(&dir);
         let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(&self.project_root)
         else {
             return Vec::new();

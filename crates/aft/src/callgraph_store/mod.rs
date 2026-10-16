@@ -160,6 +160,8 @@ pub(crate) mod work_counts {
     static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static DIRECTORY_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static GO_PACKAGE_BUILDS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -198,6 +200,22 @@ pub(crate) mod work_counts {
         note(&STAGING_READS, path);
     }
 
+    pub(crate) fn note_directory_read(path: &Path) {
+        note(&DIRECTORY_READS, path);
+    }
+
+    pub(crate) fn directory_reads_under(root: &Path) -> usize {
+        under(&DIRECTORY_READS, root, None)
+    }
+
+    pub(crate) fn note_go_package_build(path: &Path) {
+        note(&GO_PACKAGE_BUILDS, path);
+    }
+
+    pub(crate) fn go_package_builds_under(root: &Path) -> usize {
+        under(&GO_PACKAGE_BUILDS, root, None)
+    }
+
     pub(crate) fn staging_reads_under(root: &Path) -> usize {
         under(&STAGING_READS, root, None)
     }
@@ -224,7 +242,13 @@ pub(crate) mod work_counts {
     }
 
     pub(crate) fn reset_under(root: &Path) {
-        for map in [&PARSES, &CONFIG_READS, &STAGING_READS] {
+        for map in [
+            &PARSES,
+            &CONFIG_READS,
+            &STAGING_READS,
+            &DIRECTORY_READS,
+            &GO_PACKAGE_BUILDS,
+        ] {
             map.get_or_init(Default::default)
                 .lock()
                 .expect("work counter mutex poisoned")
@@ -3777,6 +3801,7 @@ struct ProjectIndex<'a> {
     /// uses it. Such an index's file set is fixed when it is constructed: a
     /// changed file set means a new `ProjectIndex`, which starts empty.
     crate_scans: std::cell::OnceCell<CrateScanMemo>,
+    go_packages: RefCell<GoPackageMemo>,
 }
 
 #[cfg(test)]
@@ -3846,6 +3871,20 @@ impl CrateScanMemo {
 trait ResolverIndex {
     fn macro_use_modules(&self, file: &str) -> Vec<String>;
     fn go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String>;
+    // Enumerate package files without building or reading a cached package
+    // index. Cached adapters override this to avoid rebuilding oversized
+    // indexes during symbol scans and to allow independent membership checks.
+    fn uncached_go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        self.go_package_files(caller_file, module)
+    }
+    fn go_symbol_target(
+        &self,
+        caller_file: &str,
+        module: Option<&str>,
+        symbol: &str,
+    ) -> Option<String> {
+        go_symbol_target_by_scan(self, caller_file, module, symbol)
+    }
     fn caller_data(&self, file: &str) -> Option<&FileCallData>;
     fn lang_for(&self, file: &str) -> Option<LangId>;
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String>;
@@ -3878,10 +3917,35 @@ impl ResolverIndex for ProjectIndex<'_> {
             root: &self.project_root,
             facts: self.facts.as_ref(),
         };
+        if let Some(package) = self.go_package(&paths, caller_file, module) {
+            return package.files_for(caller_file);
+        }
+        self.uncached_go_package_files(caller_file, module)
+    }
+    fn uncached_go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        let paths = FactPaths {
+            root: &self.project_root,
+            facts: self.facts.as_ref(),
+        };
         go_package_files(&paths, &self.workspace_crate_prefixes, caller_file, module)
             .into_iter()
             .filter(|file| self.contains_file(file))
             .collect()
+    }
+    fn go_symbol_target(
+        &self,
+        caller_file: &str,
+        module: Option<&str>,
+        symbol: &str,
+    ) -> Option<String> {
+        let paths = FactPaths {
+            root: &self.project_root,
+            facts: self.facts.as_ref(),
+        };
+        if let Some(package) = self.go_package(&paths, caller_file, module) {
+            return package.target(caller_file, module.is_some(), symbol);
+        }
+        go_symbol_target_by_scan(self, caller_file, module, symbol)
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         self.caller_data.get(file).copied()
@@ -3989,6 +4053,28 @@ impl ResolverIndex for ProjectIndex<'_> {
 }
 
 impl ProjectIndex<'_> {
+    fn go_package(
+        &self,
+        paths: &FactPaths<'_>,
+        caller: &str,
+        module: Option<&str>,
+    ) -> Option<Rc<GoPackage>> {
+        // Generation-owned view builds record filesystem consultations and
+        // per-file symbol/export answers to invalidate reused results later.
+        // Keep those reads observable instead of hiding them behind this memo.
+        if self.facts.records_config_facts() {
+            return None;
+        }
+        cached_go_package(
+            paths,
+            &self.workspace_crate_prefixes,
+            &self.go_packages,
+            caller,
+            module,
+            |file| self.contains_file(file),
+            |file| self.file_index(file),
+        )
+    }
     /// The crate-wide lookup memo, or `None` for an index that loads stored
     /// files on demand: its file set is not all in memory, so those lookups
     /// keep scanning.
@@ -4134,6 +4220,7 @@ struct DiskProjectIndex<'a> {
 /// indexes and rescanned every module reference and Rust file.
 #[derive(Default)]
 struct DiskIndexMemos {
+    go_packages: RefCell<GoPackageMemo>,
     file_indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
     file_index_order: RefCell<VecDeque<String>>,
     /// Target file -> first `(declaring file, module path)` naming it, in
@@ -4195,6 +4282,25 @@ impl DiskIndexMemos {
 }
 
 impl DiskProjectIndex<'_> {
+    fn go_package(
+        &self,
+        paths: &FactPaths<'_>,
+        caller: &str,
+        module: Option<&str>,
+    ) -> Option<Rc<GoPackage>> {
+        if !self.memoize_resolver_indexes {
+            return None;
+        }
+        cached_go_package(
+            paths,
+            &self.workspace_crate_prefixes,
+            &self.memos.go_packages,
+            caller,
+            module,
+            |file| self.contains_file(file),
+            |file| self.file_index(file),
+        )
+    }
     fn file_index(&self, rel_path: &str) -> Option<Rc<DbFileIndex>> {
         if self.memoize_resolver_indexes {
             if let Some(cached) = self.memos.file_indexes.borrow().get(rel_path).cloned() {
@@ -4370,10 +4476,37 @@ impl ResolverIndex for DiskProjectIndex<'_> {
             root: self.project_root,
             facts: &disk,
         };
+        if let Some(package) = self.go_package(&paths, caller_file, module) {
+            return package.files_for(caller_file);
+        }
+        self.uncached_go_package_files(caller_file, module)
+    }
+    fn uncached_go_package_files(&self, caller_file: &str, module: Option<&str>) -> Vec<String> {
+        let disk = DiskFacts::new(self.project_root);
+        let paths = FactPaths {
+            root: self.project_root,
+            facts: &disk,
+        };
         go_package_files(&paths, &self.workspace_crate_prefixes, caller_file, module)
             .into_iter()
             .filter(|file| self.contains_file(file))
             .collect()
+    }
+    fn go_symbol_target(
+        &self,
+        caller_file: &str,
+        module: Option<&str>,
+        symbol: &str,
+    ) -> Option<String> {
+        let disk = DiskFacts::new(self.project_root);
+        let paths = FactPaths {
+            root: self.project_root,
+            facts: &disk,
+        };
+        if let Some(package) = self.go_package(&paths, caller_file, module) {
+            return package.target(caller_file, module.is_some(), symbol);
+        }
+        go_symbol_target_by_scan(self, caller_file, module, symbol)
     }
     fn caller_data(&self, file: &str) -> Option<&FileCallData> {
         (file == self.caller_file).then_some(self.caller_data)
@@ -13526,13 +13659,207 @@ fn resolve_ref<I: ResolverIndex>(raw: RawRef, index: &I) -> Result<ResolvedRef> 
     })
 }
 
+// Retain at most 8 MiB of conservatively charged package data per resolution
+// pass, independently of the file-index memo. Evict whole packages, and use the
+// original scan for oversized ones: never trim the resolver's candidates.
+const GO_PACKAGE_MEMO_BYTES: usize = 8 * 1024 * 1024;
+// Remember oversized package directories separately from cached indexes, using
+// at most 64 KiB of conservatively charged path/set storage. If that fills up,
+// stop building new indexes for this pass: otherwise an unremembered oversized
+// directory could trigger the same failed construction on every reference.
+const GO_PACKAGE_OVERSIZED_MEMO_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Default)]
+struct GoPackageMemo {
+    packages: HashMap<PathBuf, Rc<GoPackage>>,
+    order: VecDeque<(PathBuf, usize)>,
+    bytes: usize,
+    oversized_dirs: HashSet<PathBuf>,
+    oversized_bytes: usize,
+}
+
+impl GoPackageMemo {
+    fn mark_oversized(&mut self, dir: PathBuf) {
+        if self.oversized_dirs.contains(&dir) {
+            return;
+        }
+        let bytes = dir.as_os_str().len() + 4 * std::mem::size_of::<PathBuf>() + 32;
+        if self.oversized_bytes + bytes > GO_PACKAGE_OVERSIZED_MEMO_BYTES {
+            self.oversized_bytes = GO_PACKAGE_OVERSIZED_MEMO_BYTES;
+            return;
+        }
+        self.oversized_bytes += bytes;
+        self.oversized_dirs.insert(dir);
+    }
+
+    fn insert(&mut self, dir: PathBuf, package: Rc<GoPackage>) {
+        while self.bytes + package.bytes > GO_PACKAGE_MEMO_BYTES {
+            let (oldest, bytes) = self.order.pop_front().expect("nonempty package memo");
+            self.packages.remove(&oldest);
+            self.bytes -= bytes;
+        }
+        self.bytes += package.bytes;
+        self.order.push_back((dir.clone(), package.bytes));
+        self.packages.insert(dir, package);
+    }
+}
+
+#[derive(Default)]
+struct GoPackage {
+    files: Vec<String>,
+    symbols: HashMap<String, GoSymbolTargets>,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct GoSymbolTargets {
+    // Slot 0 excludes _test.go files; slot 1 includes them. `exported` also
+    // requires the symbol to be exported, as an imported package lookup does.
+    // None means no matching file; usize::MAX means multiple matching files.
+    local: [Option<usize>; 2],
+    exported: [Option<usize>; 2],
+}
+
+impl GoPackage {
+    fn files_for(&self, caller: &str) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|file| caller.ends_with("_test.go") || !file.ends_with("_test.go"))
+            .cloned()
+            .collect()
+    }
+
+    fn target(&self, caller: &str, imported: bool, symbol: &str) -> Option<String> {
+        let targets = self.symbols.get(symbol)?;
+        let candidates = if imported {
+            &targets.exported
+        } else {
+            &targets.local
+        };
+        self.files
+            .get(candidates[usize::from(caller.ends_with("_test.go"))]?)
+            .cloned()
+    }
+
+    fn add_symbols(&mut self, file: usize, index: &DbFileIndex) -> bool {
+        let test_only = self.files[file].ends_with("_test.go");
+        for symbol in index.node_by_scoped.keys().chain(
+            index
+                .node_by_bare
+                .keys()
+                .filter(|symbol| !index.node_by_scoped.contains_key(*symbol)),
+        ) {
+            if !self.symbols.contains_key(symbol) {
+                // Charge spare hash buckets and string allocation overhead as
+                // well as payload, so tiny symbols/packages are bounded too.
+                self.bytes += symbol.len() + 4 * std::mem::size_of::<(String, GoSymbolTargets)>();
+                if self.bytes > GO_PACKAGE_MEMO_BYTES {
+                    return false;
+                }
+            }
+            let targets = self.symbols.entry(symbol.clone()).or_default();
+            for variant in usize::from(test_only)..2 {
+                let add = |slot: &mut Option<usize>| {
+                    *slot = Some(if slot.is_none() { file } else { usize::MAX });
+                };
+                add(&mut targets.local[variant]);
+                if index.exports.contains(symbol) {
+                    add(&mut targets.exported[variant]);
+                }
+            }
+        }
+        true
+    }
+}
+
+fn cached_go_package<T: std::ops::Deref<Target = DbFileIndex>>(
+    facts: &FactPaths<'_>,
+    modules: &WorkspaceCratePrefixCache,
+    memo: &RefCell<GoPackageMemo>,
+    caller: &str,
+    module: Option<&str>,
+    contains: impl Fn(&str) -> bool,
+    load: impl Fn(&str) -> Option<T>,
+) -> Option<Rc<GoPackage>> {
+    let Some(dir) = go_package_dir(facts, modules, caller, module) else {
+        return Some(Rc::new(GoPackage::default()));
+    };
+    if let Some(package) = memo.borrow().packages.get(&dir) {
+        return Some(Rc::clone(package));
+    }
+    if memo.borrow().oversized_bytes >= GO_PACKAGE_OVERSIZED_MEMO_BYTES
+        || memo.borrow().oversized_dirs.contains(&dir)
+    {
+        return None;
+    }
+    #[cfg(test)]
+    work_counts::note_go_package_build(&dir);
+    let files = go_files_in_dir(facts, &dir, true)
+        .into_iter()
+        .filter(|file| contains(file))
+        .collect::<Vec<_>>();
+    let bytes = 512
+        + 2 * dir.as_os_str().len()
+        + files.capacity() * std::mem::size_of::<String>()
+        + files.iter().map(|file| file.capacity() + 32).sum::<usize>();
+    if bytes > GO_PACKAGE_MEMO_BYTES {
+        memo.borrow_mut().mark_oversized(dir);
+        return None;
+    }
+    let mut package = GoPackage {
+        files,
+        bytes,
+        ..Default::default()
+    };
+    for file in 0..package.files.len() {
+        if let Some(index) = load(&package.files[file]) {
+            if !package.add_symbols(file, &index) {
+                memo.borrow_mut().mark_oversized(dir);
+                return None;
+            }
+        }
+    }
+    let package = Rc::new(package);
+    memo.borrow_mut().insert(dir, Rc::clone(&package));
+    Some(package)
+}
+
+fn go_symbol_target_by_scan<I: ResolverIndex + ?Sized>(
+    index: &I,
+    caller_file: &str,
+    module: Option<&str>,
+    symbol: &str,
+) -> Option<String> {
+    let mut targets = index
+        .uncached_go_package_files(caller_file, module)
+        .into_iter()
+        .filter(|file| {
+            index.node_for_symbol(file, symbol).is_some()
+                && (module.is_none() || index.has_export(file, symbol))
+        });
+    let target = targets.next()?;
+    targets.next().is_none().then_some(target)
+}
+
 fn go_package_files(
     facts: &FactPaths<'_>,
     cache: &WorkspaceCratePrefixCache,
     caller_file: &str,
     module: Option<&str>,
 ) -> Vec<String> {
-    let dir = if let Some(module) = module {
+    let Some(dir) = go_package_dir(facts, cache, caller_file, module) else {
+        return Vec::new();
+    };
+    go_files_in_dir(facts, &dir, caller_file.ends_with("_test.go"))
+}
+
+fn go_package_dir(
+    facts: &FactPaths<'_>,
+    cache: &WorkspaceCratePrefixCache,
+    caller_file: &str,
+    module: Option<&str>,
+) -> Option<PathBuf> {
+    Some(if let Some(module) = module {
         let modules = cache.1.get_or_init(|| {
             let mut modules = HashMap::new();
             let mut stack = vec![facts.root.to_path_buf()];
@@ -13578,7 +13905,7 @@ fn go_package_files(
             })
             .max_by_key(|(prefix, _)| prefix.len())
         else {
-            return Vec::new();
+            return None;
         };
         facts
             .root
@@ -13591,7 +13918,10 @@ fn go_package_files(
             .parent()
             .unwrap_or(facts.root)
             .to_path_buf()
-    };
+    })
+}
+
+fn go_files_in_dir(facts: &FactPaths<'_>, dir: &Path, include_tests: bool) -> Vec<String> {
     let mut files = facts
         .list_dir(&dir)
         .into_iter()
@@ -13599,8 +13929,7 @@ fn go_package_files(
             let path = dir.join(byte_path(&entry.name));
             (entry.kind == EntryKind::Regular
                 && path.extension().and_then(|s| s.to_str()) == Some("go")
-                && (caller_file.ends_with("_test.go")
-                    || !path.to_string_lossy().ends_with("_test.go")))
+                && (include_tests || !path.to_string_lossy().ends_with("_test.go")))
             .then(|| relative_path(facts.root, &path))
         })
         .collect::<Vec<_>>();
@@ -13637,17 +13966,7 @@ fn resolve_go_target<I: ResolverIndex>(
     } else {
         None
     };
-    let mut targets = index
-        .go_package_files(caller_file, module)
-        .into_iter()
-        .filter(|file| {
-            index.node_for_symbol(file, short_name).is_some()
-                && (module.is_none() || index.has_export(file, short_name))
-        });
-    let target = targets.next()?;
-    if targets.next().is_some() {
-        return None;
-    }
+    let target = index.go_symbol_target(caller_file, module, short_name)?;
     Some(("resolved".to_string(), target, short_name.to_string()))
 }
 
@@ -14608,6 +14927,7 @@ impl<'a> ProjectIndex<'a> {
             workspace_crate_prefixes,
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            go_packages: RefCell::default(),
         }
     }
 
@@ -27367,6 +27687,7 @@ mod reexport_resolution_tests {
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
             crate_scans: std::cell::OnceCell::new(),
+            go_packages: RefCell::default(),
         }
     }
 
