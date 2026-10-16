@@ -6,6 +6,35 @@ State is stored in `$AFT_SENTINEL_STATE_DIR/state.json`; launchd sets this to `~
 
 The collector reads `ck module status aft --json`, which exposes the same ManagementSurface `health.check` report as `subc-probe --health-probe aft`. It also reads only new bytes from the current `aft-<pid>.log` and OpenCode plugin log, accounting for rotation; process and filesystem counters; storage sizes; and the running image's LC_UUID and dSYM. Every unreadable input raises `instrument:<name>` rather than silently disabling a detector. A serving daemon with zero new pid-log lines raises `instrument:log-silent`.
 
+## Census freshness and unknown values
+
+Health `metrics` includes `stale`, `stale_reason`, `generated_at_ms`, and `age_ms`.
+`generated_at_ms` is the last successful census's monotonic milliseconds since the
+health cache started, **not a Unix timestamp**. `age_ms` is the current cache time
+minus that timestamp; `snapshot_age_ms` is an alias retained for existing clients.
+A successful census sets `stale: false` and `stale_reason: null` (even if an
+individual root reports busy or degraded).
+
+When the executor scheduler cannot be snapshotted without contention, health is
+Degraded with detail `executor scheduler state could not be snapshotted without contention`.
+It retains the last measured census and its original timestamp, sets `stale: true`
+and `stale_reason: "executor_contended"`, and keeps increasing the age across
+repeated failed refreshes. Before any successful census, the timestamp and ages
+are null, as are unmeasured actor/root counts, root rows, call-graph counters,
+LSP/lifecycle data, memory totals, and embedding availability. Null means
+**unknown**, not zero, empty, or available. The initial pending census uses
+`not_yet_sampled`; a nonblocking cache-read miss uses `cache_contended`.
+
+Fresh probe signals (dispatch liveness, dispatch-path/runtime counters other than
+the census-derived LSP counts, process I/O, indexing progress, and write-ledger
+counters) remain independent of census freshness. The sentinel reports unavailable
+or stale census data as `instrument:health-census`, skips census-based verdicts,
+preserves watcher baselines and existing census findings until a fresh observation
+can confirm recovery, and leaves live liveness/log detectors running. It does not
+turn unknown roots into an empty memory census or use stale footprint values in
+place of the live process sample. Instrument findings follow the normal
+three-consecutive-tick warning policy.
+
 ## Rules
 
 | Rule | Severity and trigger | Clears when |

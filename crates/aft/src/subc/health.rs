@@ -1605,24 +1605,35 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
 struct HealthDiagnosticRollup {
     status: HealthStatus,
     detail: Option<String>,
+    generated_at_ms: Option<u64>,
+    /// Publication number of this census; 0 for the placeholder served before
+    /// the first one.
+    generation: u64,
+    stale_reason: Option<&'static str>,
     metrics: Value,
     memory_census: Value,
 }
 
 impl HealthDiagnosticRollup {
     fn unavailable() -> Self {
-        let mut metrics = json!({
-            "actor_count": 0,
-            "root_count": 0,
-            "root_details_omitted": 0,
-            "callgraph_repair_entries_60s_total": 0,
-            "callgraph_repair_roots_annotated": 0,
-            "callgraph_repair_roots_total": 0,
-            "callgraph_commits_60s_total": 0,
-            "callgraph_pages_or_bytes_written_60s_total": 0,
-            "lsp_children": { "spawned": 0, "cwd_gone": 0 },
+        let metrics = json!({
+            "actor_count": Value::Null,
+            "root_count": Value::Null,
+            "warming_roots": Value::Null,
+            "root_details_omitted": Value::Null,
+            "callgraph_repair_entries_60s_total": Value::Null,
+            "callgraph_repair_roots_annotated": Value::Null,
+            "callgraph_repair_roots_total": Value::Null,
+            "callgraph_commits_60s_total": Value::Null,
+            "callgraph_pages_or_bytes_written_60s_total": Value::Null,
+            "lsp_children": { "spawned": Value::Null, "cwd_gone": Value::Null },
+            "lsp": Value::Null,
+            "threads": Value::Null,
+            "sqlite": Value::Null,
+            "children": Value::Null,
+            "fds": Value::Null,
             "embedding_backend": {
-                "available": true,
+                "available": Value::Null,
                 "last_error": Value::Null,
                 "since_ms": Value::Null,
             },
@@ -1634,17 +1645,21 @@ impl HealthDiagnosticRollup {
                 "consecutive_skips": crate::db::compression_events::retention_sweep_skip_counts().1,
                 "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
             },
+            "storage_retention": Value::Null,
+            "storage_retention_totals": Value::Null,
+            "storage_retention_reports_omitted": Value::Null,
+            "bash_db_schema_hints": Value::Null,
+            "bash_task_refusals": Value::Null,
             "mutating_lanes": { "scheduler_busy": true },
             "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
-            "roots": [],
+            "roots": Value::Null,
         });
-        insert_lifecycle_metrics(
-            &mut metrics,
-            crate::lifecycle_census::LifecycleCensusSnapshot::default(),
-        );
         Self {
             status: HealthStatus::Degraded,
             detail: Some("health diagnostic snapshot is being refreshed".to_string()),
+            generated_at_ms: None,
+            generation: 0,
+            stale_reason: Some("not_yet_sampled"),
             metrics,
             memory_census: placeholder_memory_census(),
         }
@@ -1652,7 +1667,7 @@ impl HealthDiagnosticRollup {
 }
 
 /// The census served before a full snapshot exists, or when the executor could
-/// not be read without contention. It has no root or allocator rows, but it
+/// not be read without contention. Its unmeasured roots are null, but it
 /// still carries `process_io` at both census positions: that sample reads only
 /// process-wide kernel counters, so it never depends on the actor snapshot.
 /// Consumers can rely on the field; `available: false` marks a host or moment
@@ -1660,7 +1675,7 @@ impl HealthDiagnosticRollup {
 fn placeholder_memory_census() -> Value {
     let process_io = crate::process_io::ProcessIoSnapshot::capture().to_value();
     json!({
-        "roots": {},
+        "roots": Value::Null,
         "process": { "process_io": process_io.clone() },
         "process_io": process_io,
     })
@@ -1676,11 +1691,18 @@ struct PlaneTiming {
 
 pub(super) struct HealthRollupCache {
     origin: Instant,
-    generated_at_ms: AtomicU64,
-    /// Count of completed refreshes. `generated_at_ms` cannot signal "published"
-    /// on its own: a refresh that finishes within the cache's first millisecond
-    /// stores 0, the same value as never-published.
+    #[cfg(test)]
+    clock_ms: AtomicU64,
+    /// Count of completed refresh attempts, including scheduler contention.
     refreshes: AtomicU64,
+    /// Generation of the newest published census.
+    published_generation: AtomicU64,
+    /// One more than the highest census generation that a contended refresh
+    /// found still being served, or 0 if no refresh has been contended. The
+    /// offset lets a contention before the first census mark the placeholder
+    /// (generation 0). It only grows, so a reader holding an older census
+    /// cannot see it reported fresh after a later recovery.
+    stale_through_generation: AtomicU64,
     #[cfg(test)]
     root_details_assembled: AtomicUsize,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
@@ -1693,8 +1715,11 @@ impl HealthRollupCache {
     pub(super) fn new() -> Self {
         Self {
             origin: Instant::now(),
-            generated_at_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            clock_ms: AtomicU64::new(u64::MAX),
             refreshes: AtomicU64::new(0),
+            published_generation: AtomicU64::new(0),
+            stale_through_generation: AtomicU64::new(0),
             #[cfg(test)]
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
@@ -1703,8 +1728,7 @@ impl HealthRollupCache {
         }
     }
 
-    /// Assemble outside the cache lock, then hold the write lock only long
-    /// enough to replace one `Arc`. Probe readers never wait for a refresh.
+    /// Assemble outside the cache lock. Probe readers never wait for a refresh.
     pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) {
         #[cfg(test)]
         self.root_details_assembled.store(0, Ordering::Relaxed);
@@ -1714,23 +1738,36 @@ impl HealthRollupCache {
     fn refresh_for_test(&self, executor: &Executor, shared_app: &App) {
         // The owned test worker may wait for the scheduler snapshot. Production
         // probes and periodic rollups retain their non-blocking census policy.
-        self.publish(build_health_diagnostic_rollup_from_actors(
+        self.publish(Some(build_health_diagnostic_rollup_from_actors(
             self,
             executor,
             shared_app,
-            Some(executor.actor_entries()),
-        ));
+            executor.actor_entries(),
+        )));
     }
 
-    fn publish(&self, rollup: HealthDiagnosticRollup) {
-        let rollup = Arc::new(rollup);
-        let generated_at_ms = duration_millis_u64(self.origin.elapsed());
-        match self.snapshot.write() {
-            Ok(mut snapshot) => *snapshot = rollup,
-            Err(error) => *error.into_inner() = rollup,
+    fn publish(&self, rollup: Option<HealthDiagnosticRollup>) {
+        if let Some(mut rollup) = rollup {
+            // Keep the timestamp with its payload so a reader cannot pair two
+            // different publications when a refresh races with a probe.
+            rollup.generated_at_ms = Some(self.now_ms());
+            rollup.generation = self.published_generation.load(Ordering::Acquire) + 1;
+            let generation = rollup.generation;
+            let rollup = Arc::new(rollup);
+            let mut snapshot = self
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            *snapshot = rollup;
+            self.published_generation
+                .store(generation, Ordering::Release);
+        } else {
+            // Mark the census being served now as stale, without touching it.
+            self.stale_through_generation.fetch_max(
+                self.published_generation.load(Ordering::Acquire) + 1,
+                Ordering::AcqRel,
+            );
         }
-        self.generated_at_ms
-            .store(generated_at_ms, Ordering::Release);
         self.refreshes.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -1789,17 +1826,37 @@ impl HealthRollupCache {
         }
     }
 
-    fn snapshot(&self) -> (Arc<HealthDiagnosticRollup>, u64) {
-        let generated_at_ms = self.generated_at_ms.load(Ordering::Acquire);
-        let age_ms = duration_millis_u64(self.origin.elapsed()).saturating_sub(generated_at_ms);
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let clock_ms = self.clock_ms.load(Ordering::Relaxed);
+            if clock_ms != u64::MAX {
+                return clock_ms;
+            }
+        }
+        duration_millis_u64(self.origin.elapsed())
+    }
+
+    fn snapshot(&self) -> (Arc<HealthDiagnosticRollup>, Option<u64>) {
         let snapshot = match self.snapshot.try_read() {
             Ok(snapshot) => Arc::clone(&snapshot),
             Err(std::sync::TryLockError::Poisoned(error)) => Arc::clone(&error.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                Arc::new(HealthDiagnosticRollup::unavailable())
-            }
+            Err(std::sync::TryLockError::WouldBlock) => Arc::new(HealthDiagnosticRollup {
+                stale_reason: Some("cache_contended"),
+                ..HealthDiagnosticRollup::unavailable()
+            }),
         };
+        let age_ms = snapshot
+            .generated_at_ms
+            .map(|generated| self.now_ms().saturating_sub(generated));
         (snapshot, age_ms)
+    }
+
+    /// Whether a contended refresh has found this census still being served.
+    /// Judged by the census's own generation, so a reader holding an older
+    /// census never pairs it with a later recovery.
+    fn census_contended(&self, rollup: &HealthDiagnosticRollup) -> bool {
+        rollup.generation < self.stale_through_generation.load(Ordering::Acquire)
     }
 
     fn annotate_plane_timings(&self, root: &str, value: &mut Value) {
@@ -2028,10 +2085,20 @@ fn memory_rollup_metrics(
     let Some(roots) = roots else {
         return json!({
             "status": "busy",
-            "allocator_slack_bytes": 0,
+            "roots": Value::Null,
+            "roots_total": Value::Null,
+            "roots_omitted": Value::Null,
+            "roots_omitted_bytes": Value::Null,
+            "rss_bytes": Value::Null,
+            "phys_footprint_bytes": Value::Null,
+            "total_attributed_bytes": Value::Null,
+            "sqlite_bytes": Value::Null,
+            "allocator_slack_bytes": Value::Null,
             "allocator_slack_kind": ALLOCATOR_SLACK_KIND,
             "allocator_slack_measured": false,
             "allocator_observation_age_ms": Value::Null,
+            "last_relief_allocator_accounting_bytes": Value::Null,
+            "last_relief_rss_drop_bytes": Value::Null,
         });
     };
     let snapshot = crate::memory::MemoryRollupSnapshot::new("ready", roots);
@@ -2189,20 +2256,20 @@ fn build_health_diagnostic_rollup(
     cache: &HealthRollupCache,
     executor: &Executor,
     shared_app: &App,
-) -> HealthDiagnosticRollup {
-    build_health_diagnostic_rollup_from_actors(
+) -> Option<HealthDiagnosticRollup> {
+    Some(build_health_diagnostic_rollup_from_actors(
         cache,
         executor,
         shared_app,
-        executor.try_actor_entries(),
-    )
+        executor.try_actor_entries()?,
+    ))
 }
 
 fn build_health_diagnostic_rollup_from_actors(
     cache: &HealthRollupCache,
     executor: &Executor,
     shared_app: &App,
-    actor_entries: Option<Vec<(ProjectRootId, Arc<AppContext>)>>,
+    actor_entries: Vec<(ProjectRootId, Arc<AppContext>)>,
 ) -> HealthDiagnosticRollup {
     struct RootCandidate {
         root_label: String,
@@ -2219,15 +2286,6 @@ fn build_health_diagnostic_rollup_from_actors(
         disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
     }
-
-    let Some(actor_entries) = actor_entries else {
-        return HealthDiagnosticRollup {
-            status: HealthStatus::Degraded,
-            detail: Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string()),
-            metrics: HealthDiagnosticRollup::unavailable().metrics,
-            memory_census: placeholder_memory_census(),
-        };
-    };
 
     let lifecycle_contexts = actor_entries
         .iter()
@@ -2569,6 +2627,9 @@ fn build_health_diagnostic_rollup_from_actors(
             HealthStatus::Ok
         },
         detail,
+        generated_at_ms: None,
+        generation: 0,
+        stale_reason: None,
         metrics,
         memory_census,
     }
@@ -2622,6 +2683,14 @@ fn build_health_report_with_indexing(
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
     let (rollup, snapshot_age_ms) = cache.snapshot();
+    // A contended refresh, now or at the last rollup, leaves the retained
+    // census in place and reports it as stale.
+    let scheduler_busy = executor.try_actor_count().is_none() || cache.census_contended(&rollup);
+    let stale_reason = if scheduler_busy {
+        Some("executor_contended")
+    } else {
+        rollup.stale_reason
+    };
     let mut metrics = rollup
         .metrics
         .as_object()
@@ -2637,6 +2706,10 @@ fn build_health_report_with_indexing(
         None => cached_mutating_lanes.unwrap_or_else(|| json!({ "scheduler_busy": true })),
     };
     metrics.insert("snapshot_age_ms".to_string(), json!(snapshot_age_ms));
+    metrics.insert("age_ms".to_string(), json!(snapshot_age_ms));
+    metrics.insert("generated_at_ms".to_string(), json!(rollup.generated_at_ms));
+    metrics.insert("stale".to_string(), json!(stale_reason.is_some()));
+    metrics.insert("stale_reason".to_string(), json!(stale_reason));
     metrics.insert(
         "durable_log".to_string(),
         crate::logging::durable_log_health(),
@@ -2722,7 +2795,6 @@ fn build_health_report_with_indexing(
     metrics.insert("headline".to_string(), json!(headline));
     budget_health_metrics(&mut metrics);
 
-    let scheduler_busy = executor.try_actor_count().is_none();
     let warning = if scheduler_busy {
         Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string())
     } else {
@@ -4096,6 +4168,191 @@ mod tests {
             .contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL));
     }
 
+    fn contended_health_fixture() -> (tempfile::TempDir, Executor, HealthRollupCache, Arc<App>) {
+        let (dir, root) = test_root("health-contended-census");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("storage")),
+                project_root: Some(root.as_path().into()),
+                ..crate::config::Config::default()
+            },
+        ));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, ctx));
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(1_000, Ordering::Relaxed);
+        let app = App::default_shared();
+        app.lsp_child_registry().track(std::process::id());
+        cache.refresh_for_test(&executor, &app);
+        assert_eq!(cache.snapshot().0.metrics["actor_count"], 1);
+        (dir, executor, cache, app)
+    }
+
+    #[test]
+    fn health_contention_preserves_census_and_timestamp_with_age() {
+        let (_dir, executor, cache, app) = contended_health_fixture();
+        let good = cache.snapshot().0;
+        assert_eq!(good.metrics["lsp_children"]["spawned"], 1);
+        cache.clock_ms.store(1_300, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+
+        let stale = cache.snapshot().0;
+        // A failed refresh only marks the retained census stale. It must not
+        // replace or copy the payload while holding the cache lock.
+        assert!(
+            Arc::ptr_eq(&good, &stale),
+            "failed refresh copied the census"
+        );
+        assert_eq!(
+            stale.metrics, good.metrics,
+            "last measured census must survive"
+        );
+        assert_eq!(stale.memory_census, good.memory_census);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_eq!(
+            report.detail.as_deref(),
+            Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL)
+        );
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["generated_at_ms"], 1_000);
+        assert_eq!(metrics["stale"], true);
+        assert_eq!(metrics["stale_reason"], "executor_contended");
+        assert_eq!(metrics["age_ms"], 300);
+        assert_eq!(metrics["snapshot_age_ms"], 300);
+        assert_eq!(metrics["runtime"]["spawned_lsp_children"], 1);
+    }
+
+    #[test]
+    fn health_contention_before_first_census_reports_unknown_metrics() {
+        let executor = Executor::new();
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(250, Ordering::Relaxed);
+        let app = App::default_shared();
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Degraded);
+        let metrics = report.metrics.unwrap();
+        for key in [
+            "actor_count",
+            "root_count",
+            "root_details_omitted",
+            "warming_roots",
+            "roots",
+            "callgraph_repair_entries_60s_total",
+            "callgraph_repair_roots_annotated",
+            "callgraph_repair_roots_total",
+            "callgraph_commits_60s_total",
+            "callgraph_pages_or_bytes_written_60s_total",
+            "lsp",
+            "threads",
+            "sqlite",
+            "children",
+            "fds",
+            "generated_at_ms",
+            "age_ms",
+            "snapshot_age_ms",
+        ] {
+            assert_eq!(metrics.get(key), Some(&Value::Null), "unmeasured {key}");
+        }
+        assert_eq!(metrics["stale"], true);
+        assert_eq!(metrics["stale_reason"], "executor_contended");
+        assert_eq!(metrics["embedding_backend"]["available"], Value::Null);
+        assert_eq!(metrics["runtime"]["spawned_lsp_children"], Value::Null);
+        assert_eq!(
+            metrics["runtime"]["lsp_children_with_deleted_cwd"],
+            Value::Null
+        );
+        for key in [
+            "allocator_slack_bytes",
+            "roots",
+            "roots_total",
+            "rss_bytes",
+            "total_attributed_bytes",
+        ] {
+            assert_eq!(
+                metrics["memory"].get(key),
+                Some(&Value::Null),
+                "unmeasured memory.{key}"
+            );
+        }
+        assert_eq!(cache.memory_census()["roots"], Value::Null);
+    }
+
+    #[test]
+    fn a_census_read_before_recovery_stays_stale_after_it() {
+        let (_dir, executor, cache, app) = contended_health_fixture();
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        // A probe takes the stale census, then a refresh recovers before the
+        // probe judges its freshness.
+        let held = cache.snapshot().0;
+        cache.refresh_for_test(&executor, &app);
+        assert!(
+            cache.census_contended(&held),
+            "a census read before recovery was reported fresh after it"
+        );
+        assert!(!cache.census_contended(&cache.snapshot().0));
+    }
+
+    #[test]
+    fn health_contention_recovery_clears_staleness() {
+        let (_dir, executor, cache, app) = contended_health_fixture();
+        cache.clock_ms.store(1_300, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        cache.clock_ms.store(1_900, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert_eq!(report.status, HealthStatus::Ok);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["stale"], false);
+        assert_eq!(metrics["stale_reason"], Value::Null);
+        assert_eq!(metrics["generated_at_ms"], 1_900);
+        assert_eq!(metrics["age_ms"], 0);
+        assert_eq!(metrics["actor_count"], 1);
+    }
+
+    #[test]
+    fn health_contention_repeated_attempts_do_not_reset_age() {
+        let (_dir, executor, cache, app) = contended_health_fixture();
+        let dispatch = DispatchPathMetrics::new();
+        for (now_ms, age_ms) in [(1_300, 300), (1_700, 700)] {
+            cache.clock_ms.store(now_ms, Ordering::Relaxed);
+            executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+            let report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app);
+            let metrics = report.metrics.unwrap();
+            assert_eq!(metrics["age_ms"], age_ms);
+            assert_eq!(metrics["generated_at_ms"], 1_000);
+            assert_eq!(metrics["stale_reason"], "executor_contended");
+        }
+        cache.clock_ms.store(2_000, Ordering::Relaxed);
+        let metrics = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
+            .metrics
+            .unwrap();
+        assert_eq!(
+            metrics["age_ms"], 1_000,
+            "age advances on reads, not only refreshes"
+        );
+    }
+
     #[test]
     fn health_wait_retries_an_unavailable_rollup() {
         let (dir, root) = test_root("health-contended-rollup");
@@ -4901,7 +5158,7 @@ mod tests {
         assert_eq!(runtime["lsp_children_with_deleted_cwd"].as_u64(), Some(0));
 
         let busy_memory = memory_rollup_metrics(None);
-        assert_eq!(busy_memory["allocator_slack_bytes"].as_u64(), Some(0));
+        assert_eq!(busy_memory["allocator_slack_bytes"], Value::Null);
         assert_eq!(
             busy_memory["allocator_slack_measured"].as_bool(),
             Some(false)
@@ -5706,7 +5963,7 @@ mod tests {
     fn placeholder_memory_census_carries_process_io() {
         // A cache that has not refreshed yet serves the placeholder census.
         let census = HealthRollupCache::new().memory_census();
-        assert!(census["roots"].is_object(), "{census}");
+        assert_eq!(census["roots"], Value::Null, "{census}");
         for io in [&census["process_io"], &census["process"]["process_io"]] {
             assert!(io["available"].is_boolean(), "{census}");
             assert!(io["sampled_at_ms"].is_u64(), "{census}");
