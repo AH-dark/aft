@@ -797,7 +797,12 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
         for run in runs:
             value = run.metrics.get(metric) if run.ready else None
             values.append("n/a" if value is None else f"{value:g}")
-        parts.append(f"{metric}={'/'.join(values)}")
+        label = metric
+        if metric == "cpu_seconds":
+            precision_values = {run.row.get("cpu_precision", "unknown") for run in runs if run.ready}
+            precision = next(iter(precision_values)) if len(precision_values) == 1 else "mixed"
+            label = f"cpu_seconds[precision={precision}]"
+        parts.append(f"{label}={'/'.join(values)}")
     # Read straight from the CSV row rather than through row_metrics, so this
     # stays a recorded observation: anything row_metrics returns is eligible to
     # be written into a future baseline by repo_metrics_from_runs, and would
@@ -976,7 +981,7 @@ def self_test() -> int:
         line = observation_line("fixture", runs)
         assert line.startswith("OBSERVED fixture: "), line
         assert "peak_rss_mb=119/118" in line, line
-        assert "cpu_seconds=13/12" in line, line
+        assert "cpu_seconds[precision=unknown]=13/12" in line, line
         assert observation_line("fixture", []) == "OBSERVED fixture: no ready run"
         # The high-water mark is recorded beside the sampled peak, and must stay
         # out of the gate: it has no baseline and must not acquire one.
