@@ -4169,6 +4169,18 @@ async fn connection_goodbye_waits_for_module_eof() {
     let mut module = connected.expect("module socket");
     let goodbye = send_connection_goodbye(&mut daemon);
     tokio::pin!(goodbye);
+    let request = tokio::select! {
+        biased;
+        _ = &mut goodbye => panic!("daemon closed before the module consumed the health fence"),
+        frame = read_subc_frame(&mut module) => frame.expect("module reads health fence").expect("health fence before EOF"),
+    };
+    assert_eq!(request.header.ty, FrameType::Request);
+    assert_eq!(request.header.channel, 0);
+    assert_eq!(request.header.corr, CONNECTION_GOODBYE_FENCE_CORR);
+    assert_eq!(
+        serde_json::from_slice::<ModuleControlRequest>(&request.body).unwrap(),
+        ModuleControlRequest::HealthCheck {}
+    );
     let frame = tokio::select! {
         biased;
         _ = &mut goodbye => panic!("daemon closed before the module consumed Goodbye"),
@@ -4183,28 +4195,189 @@ async fn connection_goodbye_waits_for_module_eof() {
         read = module.read(&mut byte) => assert_eq!(read.expect("daemon half-close"), 0),
     }
     // The module may still have reliable output queued when it accepts Goodbye.
-    tokio::io::AsyncWriteExt::write_all(&mut module, b"queued writer tail")
+    write_frame(&mut module, &connection_goodbye_health_response())
         .await
         .expect("module drains its writer");
     drop(module);
     goodbye.await;
 }
 
+const CONNECTION_GOODBYE_FENCE_CORR: u64 = u64::MAX;
+
 pub(super) async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
+    // Goodbye is one-way. Require a terminal response to this last request so
+    // a Windows reset cannot silently stand in for missing module output. Each
+    // driver must still assert its own scenario's terminals: this health fence
+    // proves only that its request was processed, not that unrelated async work
+    // finished. Send no data frames after Goodbye for the exiting reader to lose.
+    send_control_request(
+        stream,
+        CONNECTION_GOODBYE_FENCE_CORR,
+        ModuleControlRequest::HealthCheck {},
+    )
+    .await;
     send_frame(
         stream,
         Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
             .expect("goodbye frame"),
     )
     .await;
-    // Keep reading until the module closes its writer. Dropping a socket with
-    // unread reliable output can reset it before the module consumes Goodbye.
+    // FIN ends daemon-to-module input, not module-to-daemon output. Keep reading
+    // the writer tail; Windows can report reset rather than EOF at module close.
     tokio::io::AsyncWriteExt::shutdown(stream)
         .await
         .expect("daemon half-closes after Goodbye");
-    tokio::io::copy(stream, &mut tokio::io::sink())
+    drain_connection_goodbye_output(stream)
         .await
-        .expect("drain module output through EOF");
+        .expect("drain complete module output through teardown health fence");
+}
+
+async fn drain_connection_goodbye_output<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    let mut output = Vec::new();
+    let end = stream.read_to_end(&mut output).await;
+    if let Err(error) = &end {
+        if error.kind() != ErrorKind::ConnectionReset {
+            return Err(end.unwrap_err());
+        }
+    }
+
+    // read_to_end retains bytes preceding an error. Decode all of them, including
+    // any tail after the fence, so a reset mid-frame is never accepted as a close.
+    let mut frames = std::io::Cursor::new(output.as_slice());
+    let mut fence_seen = false;
+    while frames.position() < output.len() as u64 {
+        let frame = read_subc_frame(&mut frames)
+            .await
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "truncated module output frame"))?;
+        if frame.header.ty == FrameType::Response
+            && frame.header.channel == 0
+            && frame.header.epoch == 0
+            && frame.header.corr == CONNECTION_GOODBYE_FENCE_CORR
+        {
+            let response: ModuleControlResponse = serde_json::from_slice(&frame.body)?;
+            if response.health_report().is_none() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid teardown health response",
+                ));
+            }
+            fence_seen = true;
+        }
+    }
+    if !fence_seen {
+        return Err(Error::new(
+            end.err()
+                .map_or(ErrorKind::UnexpectedEof, |error| error.kind()),
+            "connection closed before teardown health.check terminal response",
+        ));
+    }
+    Ok(())
+}
+
+fn connection_goodbye_health_response() -> Frame {
+    let report = HealthReport {
+        status: subc_protocol::session::HealthStatus::Ok,
+        detail: None,
+        metrics: None,
+    };
+    Frame::build(
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        CONNECTION_GOODBYE_FENCE_CORR,
+        serde_json::to_vec(&ModuleControlResponse::from(report)).unwrap(),
+    )
+    .unwrap()
+}
+
+struct ConnectionGoodbyeOutput {
+    bytes: std::io::Cursor<Vec<u8>>,
+    end: std::io::ErrorKind,
+}
+
+impl tokio::io::AsyncRead for ConnectionGoodbyeOutput {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.bytes.position() == self.bytes.get_ref().len() as u64 {
+            return std::task::Poll::Ready(Err(self.end.into()));
+        }
+        std::pin::Pin::new(&mut self.bytes).poll_read(cx, buf)
+    }
+}
+
+async fn connection_goodbye_output(frames: &[Frame]) -> ConnectionGoodbyeOutput {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        write_frame(&mut bytes, frame).await.unwrap();
+    }
+    ConnectionGoodbyeOutput {
+        bytes: std::io::Cursor::new(bytes),
+        end: std::io::ErrorKind::ConnectionReset,
+    }
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_accepts_reset_after_terminal_response() {
+    let tail = Frame::build(FrameType::StreamEnd, control_flags(), 1, 1, 101, Vec::new()).unwrap();
+    let mut output = connection_goodbye_output(&[connection_goodbye_health_response(), tail]).await;
+    drain_connection_goodbye_output(&mut output).await.unwrap();
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_reset_before_terminal_response() {
+    let mut unrelated = connection_goodbye_health_response();
+    unrelated.header.corr -= 1;
+    for frames in [Vec::new(), vec![unrelated]] {
+        let mut output = connection_goodbye_output(&frames).await;
+        let error = drain_connection_goodbye_output(&mut output)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(error
+            .to_string()
+            .contains("before teardown health.check terminal response"));
+    }
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_eof_before_terminal_response() {
+    let error = drain_connection_goodbye_output(&mut std::io::Cursor::new(Vec::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_reset_mid_frame() {
+    let fence = connection_goodbye_health_response();
+    let tail = Frame::build(FrameType::StreamEnd, control_flags(), 1, 1, 101, Vec::new()).unwrap();
+    for frames in [vec![fence.clone()], vec![fence, tail]] {
+        let mut output = connection_goodbye_output(&frames).await;
+        output.bytes.get_mut().pop();
+        let error = drain_connection_goodbye_output(&mut output)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_other_io_errors_after_terminal_response() {
+    let mut output = connection_goodbye_output(&[connection_goodbye_health_response()]).await;
+    output.end = std::io::ErrorKind::ConnectionAborted;
+    let error = drain_connection_goodbye_output(&mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
 }
 
 async fn drive_oversized_tool_response_daemon(input: FakeDaemonInput) {
