@@ -674,10 +674,11 @@ pub(crate) fn effective_sandbox_mode(
 }
 
 pub(crate) fn principal_requires_strict(principal: &AuthenticatedPrincipal) -> bool {
-    // Harness names are client claims; they must not override daemon-stamped trust.
+    // An MCP harness claim can only tighten confinement, including if a facade is
+    // mistakenly stamped first-party. It never grants trust or relaxes a profile.
     !principal_is_first_party(principal)
-        || matches!(principal, AuthenticatedPrincipal::RouteBind { principal_id, .. }
-        if principal_id.as_deref().is_none_or(|id| id == "unverified"))
+        || matches!(principal, AuthenticatedPrincipal::RouteBind { harness, principal_id, .. }
+        if harness.starts_with("mcp:") || principal_id.as_deref().is_none_or(|id| id == "unverified"))
 }
 
 /// Resolve the role and authenticated principal before choosing the launcher.
@@ -5806,6 +5807,7 @@ mod policy_tests {
         for (trust, harness, principal_id) in [
             (PrincipalTrust::Untrusted, "runner", Some("direct")),
             (PrincipalTrust::Untrusted, "mcp:test", Some("direct")),
+            (PrincipalTrust::FirstParty, "mcp:test", Some("direct")),
             (PrincipalTrust::FirstParty, "runner", Some("unverified")),
             (PrincipalTrust::FirstParty, "runner", None),
         ] {
@@ -5833,7 +5835,7 @@ mod policy_tests {
     }
 
     #[test]
-    fn trusted_direct_mcp_harness_preserves_role_profiles() {
+    fn trusted_direct_non_mcp_harness_preserves_role_profiles() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path().to_path_buf());
         ctx.update_config(|config| config.sandbox = crate::config::SandboxConfig::default());
@@ -5842,7 +5844,7 @@ mod policy_tests {
             route_channel: 7,
             route_epoch: 1,
             project_root: dir.path().to_path_buf(),
-            harness: "mcp:evil".into(),
+            harness: "runner".into(),
             session_id: "trusted-direct".into(),
             principal_id: Some("direct".into()),
         };
@@ -5858,6 +5860,38 @@ mod policy_tests {
             effective_sandbox_mode(&ctx, &principal),
             SandboxMode::Strict
         );
+    }
+
+    #[test]
+    fn first_party_mcp_harness_forces_strict_for_every_role_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path().to_path_buf());
+        let principal = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::FirstParty,
+            route_channel: 7,
+            route_epoch: 1,
+            project_root: dir.path().to_path_buf(),
+            harness: "mcp:evil".into(),
+            session_id: "first-party-mcp".into(),
+            principal_id: Some("direct".into()),
+        };
+        for head in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+            for worker in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+                ctx.update_config(|config| {
+                    config.sandbox.profile.head = head;
+                    config.sandbox.profile.worker = worker;
+                });
+                for jailed in [false, true] {
+                    with_worker_jail(jailed, || {
+                        assert_eq!(
+                            effective_sandbox_mode(&ctx, &principal),
+                            SandboxMode::Strict,
+                            "MCP confinement must hold for head={head}, worker={worker}, jailed={jailed}"
+                        );
+                    });
+                }
+            }
+        }
     }
 
     #[test]

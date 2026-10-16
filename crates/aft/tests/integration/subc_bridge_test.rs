@@ -11606,11 +11606,20 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
     let trusted_bash = read_frame_timeout(&mut stream, "trusted direct bash").await;
     assert_eq!(trusted_bash.header.channel, 1);
     assert_eq!(trusted_bash.header.corr, 103);
-    assert!(
-        !tool_result_is_error(&trusted_bash),
-        "trusted direct bash should reach spawn: {:?}",
-        tool_result_text(&trusted_bash)
-    );
+    if cfg!(windows) {
+        // The MCP harness forces strict confinement even for a verified Direct principal.
+        assert!(tool_result_is_error(&trusted_bash));
+        assert_eq!(
+            tool_result_text(&trusted_bash),
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
+        );
+    } else {
+        assert!(
+            !tool_result_is_error(&trusted_bash),
+            "trusted direct bash should reach spawn under strict confinement: {:?}",
+            tool_result_text(&trusted_bash)
+        );
+    }
 
     // Anti-spoof in the other direction: a runner harness is untrusted when the
     // daemon-stamped principal is the MCP facade id.
