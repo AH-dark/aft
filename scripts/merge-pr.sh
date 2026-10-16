@@ -64,33 +64,41 @@ disarm_auto_merge() {
       }
     }' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" \
     --jq '[.data.repository.pullRequest.id, .data.repository.pullRequest.isInMergeQueue, (.data.repository.pullRequest.autoMergeRequest != null)] | @tsv') ||
-    hard_refuse "could not inspect auto-merge/queue state before refusing unresolved review threads"
+    hard_refuse "could not inspect auto-merge/queue state before merge admission"
   IFS=$'\t' read -r pull_request_id queued auto_merge <<< "$state"
   [[ -n "$pull_request_id" ]] || hard_refuse "could not identify PR #$PR to disarm auto-merge"
   if [[ "$queued" == true ]]; then
     "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){dequeuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
-      -F id="$pull_request_id" >/dev/null || hard_refuse "could not dequeue PR #$PR after finding unresolved review threads"
-    echo "merge-pr: dequeued #$PR because it has unresolved review threads" >&2
+      -F id="$pull_request_id" >/dev/null || hard_refuse "could not dequeue PR #$PR before merge admission"
+    echo "merge-pr: dequeued #$PR before merge admission" >&2
   fi
   if [[ "$auto_merge" == true ]]; then
     "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}' \
-      -F id="$pull_request_id" >/dev/null || hard_refuse "could not disable auto-merge for PR #$PR after finding unresolved review threads"
-    echo "merge-pr: disabled auto-merge for #$PR because it has unresolved review threads" >&2
+      -F id="$pull_request_id" >/dev/null || hard_refuse "could not disable auto-merge for PR #$PR before merge admission"
+    echo "merge-pr: disabled auto-merge for #$PR before merge admission" >&2
   fi
 }
 
 wait_for_greptile_review() {
-  local head_sha="$1" timeout poll started now review_status
+  local head_sha="$1" timeout poll started now review_status review_conclusion review_result
   timeout="${AFT_MERGE_PR_GREPTILE_TIMEOUT_SECONDS:-1200}"
   poll="${AFT_MERGE_PR_GREPTILE_POLL_SECONDS:-15}"
   started=$(date -u +%s)
   while :; do
-    review_status=$("$OPERATOR_GH" api "repos/$OWNER_REPO/commits/$head_sha/check-runs?per_page=100" \
-      --jq '[.check_runs[] | select(.head_sha == "'"$head_sha"'" and .name == "Greptile Review" and .app.slug == "greptile-apps")] | sort_by(.started_at // .created_at // "") | if length == 0 then "" else .[-1].status end') ||
+    review_result=$("$OPERATOR_GH" api "repos/$OWNER_REPO/commits/$head_sha/check-runs?per_page=100" \
+      --jq '[.check_runs[] | select(.head_sha == "'"$head_sha"'" and .name == "Greptile Review" and .app.slug == "greptile-apps")] | sort_by(.started_at // .created_at // "") | if length == 0 then ["", ""] else [.[-1].status, (.[-1].conclusion // "")] end | @tsv') ||
       hard_refuse "could not read Greptile Review status for head $head_sha"
+    IFS=$'\t' read -r review_status review_conclusion <<< "$review_result"
     if [[ "$review_status" == completed ]]; then
-      echo "merge-pr: Greptile Review completed for head $head_sha" >&2
-      return 0
+      case "$review_conclusion" in
+        success|neutral)
+          echo "merge-pr: Greptile Review concluded $review_conclusion for head $head_sha" >&2
+          return 0
+          ;;
+        *)
+          hard_refuse "Greptile Review concluded ${review_conclusion:-<missing>} for head $head_sha; refusing submission"
+          ;;
+      esac
     fi
     now=$(date -u +%s)
     if (( now - started >= timeout )); then
@@ -99,6 +107,10 @@ wait_for_greptile_review() {
     sleep "$poll"
   done
 }
+
+# Clear any previous queue admission before waiting: GitHub can merge an armed
+# PR while a review gate is still running, and refusals must leave it disarmed.
+disarm_auto_merge
 
 # --- 1. Wait for the automated review of the exact current head -------------
 HEAD_SHA=$("$OPERATOR_GH" pr view "$PR" --json headRefOid --jq .headRefOid)
@@ -114,15 +126,31 @@ if [[ "$CURRENT_HEAD" != "$HEAD_SHA" ]]; then
 fi
 
 # --- 2. Unresolved review threads ------------------------------------------
-UNRESOLVED=$("$OPERATOR_GH" api graphql -f query='
-  query($owner:String!,$repo:String!,$pr:Int!){
+UNRESOLVED=0
+THREAD_CURSOR=""
+while :; do
+  THREAD_QUERY='query($owner:String!,$repo:String!,$pr:Int!,$after:String){
     repository(owner:$owner,name:$repo){
       pullRequest(number:$pr){
-        reviewThreads(first:100){nodes{isResolved}}
+        reviewThreads(first:100,after:$after){nodes{isResolved} pageInfo{hasNextPage endCursor}}
       }
     }
-  }' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" \
-  --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false)] | length')
+  }'
+  THREAD_ARGS=(api graphql -f "query=$THREAD_QUERY" -F owner="$OWNER" -F repo="$REPO" -F pr="$PR")
+  [[ -n "$THREAD_CURSOR" ]] && THREAD_ARGS+=(-F after="$THREAD_CURSOR")
+  THREAD_PAGE=$("$OPERATOR_GH" "${THREAD_ARGS[@]}" \
+    --jq '[([.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved==false)] | length), (.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage // false), (.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // "")] | @tsv') ||
+    hard_refuse "could not read review threads for PR #$PR"
+  THREAD_COUNT=""
+  THREAD_HAS_NEXT=""
+  THREAD_NEXT_CURSOR=""
+  IFS=$'\t' read -r THREAD_COUNT THREAD_HAS_NEXT THREAD_NEXT_CURSOR <<< "$THREAD_PAGE"
+  [[ "$THREAD_COUNT" =~ ^[0-9]+$ ]] || hard_refuse "malformed review-thread page for PR #$PR"
+  UNRESOLVED=$((UNRESOLVED + THREAD_COUNT))
+  [[ "$THREAD_HAS_NEXT" == true ]] || break
+  [[ -n "$THREAD_NEXT_CURSOR" ]] || hard_refuse "review-thread pagination returned no cursor for PR #$PR"
+  THREAD_CURSOR="$THREAD_NEXT_CURSOR"
+done
 if [ "$UNRESOLVED" -ne 0 ]; then
   disarm_auto_merge
   refuse "$UNRESOLVED unresolved review thread(s); resolve or let the author finish"

@@ -64,13 +64,26 @@ def disarm_auto_merge(repo: str, number: int, reason: str) -> None:
 
 def unresolved_review_threads(repo: str, number: int) -> int:
     owner, name = repo.split("/")
-    query = ("query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){"
-             "pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved}}}}}")
-    response = json.loads(operator_gh("api", "graphql", "-f", f"query={query}",
-                                      "-F", f"owner={owner}", "-F", f"repo={name}", "-F", f"pr={number}"))
-    pull = response.get("data", {}).get("repository", {}).get("pullRequest") or {}
-    threads = pull.get("reviewThreads") or {}
-    return sum(not thread.get("isResolved", True) for thread in threads.get("nodes") or [])
+    query = ("query($owner:String!,$repo:String!,$pr:Int!,$after:String){repository(owner:$owner,name:$repo){"
+             "pullRequest(number:$pr){reviewThreads(first:100,after:$after){nodes{isResolved} "
+             "pageInfo{hasNextPage endCursor}}}}}")
+    cursor = None
+    unresolved = 0
+    while True:
+        args = ["api", "graphql", "-f", f"query={query}",
+                "-F", f"owner={owner}", "-F", f"repo={name}", "-F", f"pr={number}"]
+        if cursor is not None:
+            args.extend(("-F", f"after={cursor}"))
+        response = json.loads(operator_gh(*args))
+        pull = response.get("data", {}).get("repository", {}).get("pullRequest") or {}
+        threads = pull.get("reviewThreads") or {}
+        unresolved += sum(not thread.get("isResolved", True) for thread in threads.get("nodes") or [])
+        page_info = threads.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return unresolved
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            raise ValueError(f"review-thread pagination returned no cursor for PR #{number}")
 
 
 def admission_timestamp(current: dict) -> str | None:
@@ -195,9 +208,10 @@ def diagnostic_context(repo: str, run: dict, member_head: str) -> bool:
 
 
 def report_removed(repo: str, state: dict, removal: dict | None) -> None:
-    heads = list(state.get("groups", []))
+    admitted_at = state.get("admitted_at")
+    heads = list(state.get("groups", [])) if admitted_at else []
     candidate = ((removal or {}).get("beforeCommit") or {}).get("oid")
-    if candidate and candidate not in heads:
+    if admitted_at and candidate and candidate not in heads:
         cursor = candidate
         for _ in range(100):
             parents = api(f"repos/{repo}/git/commits/{cursor}")["parents"]
@@ -208,18 +222,20 @@ def report_removed(repo: str, state: dict, removal: dict | None) -> None:
                 break
             cursor = parents[0]["sha"]
     runs = {run["id"]: run for head in heads for run in workflow_runs(repo, head)
-            if run["head_sha"] == head}
+            if run["head_sha"] == head} if admitted_at else {}
     # A short-lived entry may be missed, and its headCommit need not be the
     # Actions group SHA. Discover recent candidates only with event metadata
     # plus merge-parent proof; a branch-name or timestamp match alone is unsafe.
-    for run in workflow_runs(repo, "", state["admitted_at"]):
-        if (run["event"] == "merge_group" and stamp(run["created_at"]) >= stamp(state["admitted_at"])
-                and run["conclusion"] in {"failure", "timed_out", "cancelled"}
-                and run["id"] not in runs and diagnostic_context(repo, run, state["head"])):
-            runs[run["id"]] = run
+    # Without an admission time, older merge-group failures cannot be attributed safely.
+    if admitted_at:
+        for run in workflow_runs(repo, "", admitted_at):
+            if (run["event"] == "merge_group" and stamp(run["created_at"]) >= stamp(admitted_at)
+                    and run["conclusion"] in {"failure", "timed_out", "cancelled"}
+                    and run["id"] not in runs and diagnostic_context(repo, run, state["head"])):
+                runs[run["id"]] = run
     found = False
     for run in runs.values():
-        if (run["event"] != "merge_group" or stamp(run["created_at"]) < stamp(state["admitted_at"])
+        if (not admitted_at or run["event"] != "merge_group" or stamp(run["created_at"]) < stamp(admitted_at)
                 or run["conclusion"] not in {"failure", "timed_out", "cancelled"}):
             continue
         log(f"failing group {run['head_sha']}: {run['html_url']} ({run['conclusion']})")
@@ -252,9 +268,11 @@ def wait_merged(repo: str, state: dict, path: Path, deadline: float, poll: float
             return oid
         if current["state"] != "OPEN":
             raise ValueError("PR closed without merging")
+        if current.get("isInMergeQueue") and not state.get("seen_queued"):
+            state["seen_queued"] = True
+            save(path, state)
         entry = current.get("mergeQueueEntry") or {}
         if entry:
-            state["seen_queued"] = True
             group = (entry.get("headCommit") or {}).get("oid")
             if group and group not in state["groups"]:
                 state["groups"].append(group)

@@ -111,14 +111,29 @@ if endpoint.endswith('/check-runs?per_page=100'):
     pending = s.get('greptile_never_completes', False) or s['greptile_polls'] <= s.get('greptile_pending_polls', 0)
     persist()
     answer({'check_runs': [{'name': 'Greptile Review', 'app': {'slug': 'greptile-apps'},
-                            'head_sha': head(), 'status': 'in_progress' if pending else 'completed'}]})
+                            'head_sha': head(), 'status': 'in_progress' if pending else 'completed',
+                            'conclusion': None if pending else s.get('greptile_conclusion', 'success')}]})
 if 'graphql' in a:
     q = a[a.index('-f')+1]
     if 'reviewThreads' in q:
         unresolved = s.get('unresolved', 0)
         if s.get('unresolved_after_admission') and s.get('admitted'): unresolved = 1
+        after = next((a[i+1].split('=', 1)[1] for i, arg in enumerate(a[:-1])
+                      if arg == '-F' and a[i+1].startswith('after=')), None)
+        page = 1 if after == 'cursor-1' else 0
+        if s.get('thread_page_two') or s.get('thread_page_two_after_admission'):
+            page_two_unresolved = bool(s.get('thread_page_two') or
+                                       (s.get('thread_page_two_after_admission') and s.get('admitted')))
+            if page == 0:
+                nodes = [{'isResolved': True}] * 100
+            else:
+                nodes = [{'isResolved': not page_two_unresolved}]
+        else:
+            nodes = [{'isResolved': False}] * unresolved
+        has_next_page = page == 0 and bool(s.get('thread_page_two') or s.get('thread_page_two_after_admission'))
         answer({'data': {'repository': {'pullRequest': {'reviewThreads': {'nodes':
-                [{'isResolved': False}]*unresolved}}}}})
+                nodes, 'pageInfo': {'hasNextPage': has_next_page,
+                                    'endCursor': 'cursor-1' if has_next_page else None}}}}}})
     if 'dequeuePullRequest' in q:
         s['dequeued'] = s.get('dequeued', 0) + 1
         s['queued'] = False; persist()
@@ -148,6 +163,15 @@ if 'graphql' in a:
                 'state': 'MERGED', 'baseRefName': 'main', 'headRefOid': head(),
                 'isMergeQueueEnabled': True, 'isInMergeQueue': False,
                 'autoMergeRequest': None, 'mergeCommit': {'oid': 'a'*40},
+                'mergeQueueEntry': None, 'timelineItems': {'nodes': []}}}}})
+    if s.get('membership_only_then_removed') and s.get('admitted'):
+        s['membership_snapshot_polls'] = s.get('membership_snapshot_polls', 0) + 1
+        persist()
+        answer({'data': {'repository': {'pullRequest': {
+                'state': 'OPEN', 'baseRefName': 'main', 'headRefOid': head(),
+                'isMergeQueueEnabled': True,
+                'isInMergeQueue': s['membership_snapshot_polls'] == 1,
+                'autoMergeRequest': None, 'mergeCommit': None,
                 'mergeQueueEntry': None, 'timelineItems': {'nodes': []}}}}})
     removed = s.get('remove') and s.get('admitted') and s.get('polls', 0) > 0
     queued = s.get('remove') and s.get('admitted') and not removed
@@ -380,6 +404,52 @@ class MergeAdmissionTests(PRFixture):
         self.assertIn("Greptile Review did not complete", result.stderr)
         self.assertEqual(self.merges(), [])
 
+    def test_cancelled_or_skipped_greptile_review_refuses(self) -> None:
+        for conclusion in ("cancelled", "skipped"):
+            with self.subTest(conclusion=conclusion):
+                self.write_state(greptile_conclusion=conclusion, greptile_polls=0)
+                result = self.merge()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(conclusion, result.stderr)
+                self.assertEqual(self.merges(), [])
+
+    def test_neutral_greptile_review_is_accepted(self) -> None:
+        self.write_state(greptile_conclusion="neutral")
+        result = self.merge()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.merges()), 1)
+
+    def test_armed_pr_is_disarmed_before_greptile_review_wait(self) -> None:
+        self.write_state(auto_merge_armed=True, queued=True, greptile_pending_polls=1)
+        result = self.merge()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [call["args"] for call in self.calls()]
+        review_index = next(i for i, args in enumerate(calls) if "/check-runs?per_page=100" in " ".join(args))
+        dequeue_index = next(i for i, args in enumerate(calls) if "dequeuePullRequest" in " ".join(args))
+        disable_index = next(i for i, args in enumerate(calls) if "disablePullRequestAutoMerge" in " ".join(args))
+        self.assertLess(dequeue_index, review_index)
+        self.assertLess(disable_index, review_index)
+
+    def test_greptile_review_timeout_disarms_armed_pr(self) -> None:
+        self.write_state(auto_merge_armed=True, queued=True, greptile_never_completes=True)
+        result = self.merge(env={"AFT_MERGE_PR_GREPTILE_TIMEOUT_SECONDS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Greptile Review did not complete", result.stderr)
+        self.assertEqual(self.merges(), [])
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state.get("disabled_auto_merge"), 1)
+        self.assertEqual(state.get("dequeued"), 1)
+        self.assertFalse(state["auto_merge_armed"])
+        self.assertFalse(state["queued"])
+
+    def test_unresolved_thread_on_second_graphql_page_refuses_admission(self) -> None:
+        self.write_state(thread_page_two=True)
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unresolved review thread", result.stderr)
+        self.assertEqual(self.merges(), [])
+        self.assertTrue(any("after=cursor-1" in " ".join(call["args"]) for call in self.calls()))
+
     def test_post_head_findings_require_acknowledgment(self) -> None:
         self.write_state(findings=True)
         self.assertNotEqual(self.merge().returncode, 0)
@@ -527,6 +597,44 @@ class DeliveryTests(PRFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "a" * 40)
         self.assertNotIn("REFUSED", result.stderr)
+
+    def test_landing_helper_finds_unresolved_thread_on_second_graphql_page(self) -> None:
+        self.write_state(thread_page_two=True)
+        script = ("import sys; sys.path.insert(0, 'scripts/lib'); import land_pr; "
+                  "print(land_pr.unresolved_review_threads('example/repo', 7))")
+        result = subprocess.run([sys.executable, "-c", script], cwd=self.repo, env=self.env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        self.assertTrue(any("after=cursor-1" in " ".join(call["args"]) for call in self.calls()))
+
+    def test_queue_removal_is_detected_from_membership_without_entry_or_timestamp(self) -> None:
+        self.write_state(group="a" * 40)
+        script = r'''import sys, time
+from pathlib import Path
+sys.path.insert(0, 'scripts/lib')
+import land_pr
+head = 'a' * 40
+base = {'state': 'OPEN', 'headRefOid': head, 'baseRefName': 'main',
+        'autoMergeRequest': None, 'mergeQueueEntry': None, 'mergeCommit': None,
+        'timelineItems': {'nodes': []}}
+snapshots = [{**base, 'isInMergeQueue': True}, {**base, 'isInMergeQueue': False}]
+def next_snapshot(repo, number):
+    return snapshots.pop(0) if snapshots else {**base, 'isInMergeQueue': False}
+land_pr.snapshot = next_snapshot
+state = {'pr': 7, 'head': head, 'groups': [], 'seen_queued': False, 'removed': False}
+try:
+    land_pr.wait_merged('example/repo', state, Path('land-state.json'), time.monotonic() + 1, 0)
+except ValueError as error:
+    print(error)
+    sys.exit(0 if str(error).startswith('PR #7 removed from queue:') else 1)
+sys.exit(2)
+'''
+        result = subprocess.run([sys.executable, "-c", script], cwd=self.repo, env=self.env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("removed from queue", result.stdout)
+        self.assertIn("exact failing group/run could not be established", result.stderr)
 
     def test_existing_open_pr_is_reused_and_text_stays_unchanged(self) -> None:
         self.write_state(exists=True)
