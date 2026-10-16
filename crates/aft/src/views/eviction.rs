@@ -1243,6 +1243,38 @@ mod tests {
 
     const FAMILY: &str = "family";
 
+    #[cfg(unix)]
+    #[test]
+    fn tree_bytes_preserves_permission_errors_for_non_searchable_directory() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("permission fixture requires a non-root user");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::os::unix::fs::symlink("absent", root.join("link")).unwrap();
+        fs::set_permissions(root, fs::Permissions::from_mode(0o400)).unwrap();
+        // Listing still succeeds, but looking up a child requires search
+        // permission. Ignoring a symlink's stat must not turn this uncertainty
+        // into a complete zero-byte measurement used by admission.
+        let listed = fs::read_dir(root).unwrap().count();
+        let lookup = fs::symlink_metadata(root.join("link"));
+        let measured = tree_bytes(root, None);
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(listed, 1);
+        assert_eq!(
+            lookup.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            measured.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
     fn policy() -> TrigramPolicy {
         TrigramPolicy {
             max_file_size: 1 << 20,

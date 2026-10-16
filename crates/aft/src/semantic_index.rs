@@ -4043,6 +4043,9 @@ struct SharedSemanticBase {
     /// single-run base iterates exactly like the vector it was frozen from.
     segments: Vec<Arc<SemanticVectors>>,
     entry_count: usize,
+    // Vectors and metadata are immutable for this base's lifetime. Cache only
+    // their memory estimate, not the mutable per-root overlay or health status.
+    memory_estimate: OnceLock<crate::memory::MemoryEstimate>,
     /// Files with embedding rows, including those lacking recorded mtimes.
     /// Membership must not require scanning every row during invalidation.
     entry_files: HashSet<PathBuf>,
@@ -4118,14 +4121,29 @@ fn live_shared_semantic_bases() -> Vec<Arc<SharedSemanticBase>> {
 static SHARED_SEMANTIC_BASE_LOADS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_SEMANTIC_BASE_HITS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static SHARED_BASE_ENTRIES_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl SharedSemanticBase {
     fn entries(&self) -> impl Iterator<Item = &EmbeddingEntry> {
         self.segments
             .iter()
             .flat_map(|segment| segment.entries.iter())
+            .inspect(|_| {
+                #[cfg(test)]
+                SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.set(count.get() + 1));
+            })
     }
 
     fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
+        self.memory_estimate
+            .get_or_init(|| self.compute_estimated_memory())
+            .clone()
+    }
+
+    fn compute_estimated_memory(&self) -> crate::memory::MemoryEstimate {
         let vector_bytes = self.entries().fold(0u64, |bytes, entry| {
             bytes.saturating_add(
                 crate::memory::usize_to_u64(entry.vector.len())
@@ -4861,6 +4879,7 @@ impl SemanticIndex {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(SharedSemanticBase {
+            memory_estimate: OnceLock::new(),
             entry_files: self
                 .entries
                 .iter()
@@ -4999,6 +5018,10 @@ impl SemanticIndex {
 
     /// Number of embedded symbol entries.
     pub fn entry_count(&self) -> usize {
+        if self.tombstones.is_empty() {
+            return self.shared_base.as_ref().map_or(0, |base| base.entry_count)
+                + self.entries.len();
+        }
         self.shared_base
             .iter()
             .flat_map(|base| base.entries())
@@ -9735,6 +9758,7 @@ impl ViewSemanticBase {
             .collect();
         Self {
             base: Arc::new(SharedSemanticBase {
+                memory_estimate: OnceLock::new(),
                 entry_count: runs.iter().map(|run| run.entries.len()).sum(),
                 segments: runs,
                 entry_files,
@@ -13801,6 +13825,57 @@ public class Greeter {
             .adopt_frozen_base_for_root(&borrower, &config)
             .is_some());
         assert!(shareable.shared_base.is_some());
+    }
+
+    #[test]
+    fn health_memory_reuses_immutable_semantic_base_accounting() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut source = SemanticIndex::new(root.clone(), 2);
+        for ordinal in 0..2048 {
+            add_invalidation_fixture_entry(
+                &mut source,
+                root.join(format!("file_{ordinal}.rs")),
+                ordinal,
+            );
+        }
+        let base = Arc::new(source.into_shared_base().ok().unwrap());
+        SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.set(0));
+        let expected = base.estimated_memory();
+        let cold = SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.replace(0));
+        assert_eq!(cold, 4096, "both byte folds must examine the fixture");
+        for _ in 0..3 {
+            assert_eq!(base.estimated_memory(), expected);
+        }
+        let warm = SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.replace(0));
+        let views = (0..50)
+            .map(|_| SemanticIndex::from_shared_base(root.clone(), Arc::clone(&base)))
+            .collect::<Vec<_>>();
+        for view in &views {
+            assert_eq!(view.estimated_memory().counts["entries"], 2048);
+        }
+        let root_visits = SHARED_BASE_ENTRIES_EXAMINED.with(|count| count.replace(0));
+        println!("shared semantic accounting: entries=2048 cold_visits={cold} warm_3_visits={warm} root_50_visits={root_visits}");
+        assert_eq!(
+            (warm, root_visits),
+            (0, 0),
+            "unchanged shared rows were rescanned"
+        );
+
+        // Tombstones hide base-file entries only in this root's view, so a changed
+        // view must not reuse the shared base's unfiltered count.
+        let mut changed = SemanticIndex::from_shared_base(root.clone(), Arc::clone(&base));
+        changed.hide_base_files([&root.join("file_0.rs")]);
+        assert_eq!(changed.entry_count(), 2047);
+        add_invalidation_fixture_entry(&mut changed, root.join("file_0.rs"), 3000);
+        assert_eq!(changed.entry_count(), 2048);
+        assert_eq!(views[0].entry_count(), 2048);
+        assert_eq!(base.estimated_memory(), expected);
+        let replacement = ViewSemanticBase::new(vec![Arc::new(SemanticVectors {
+            entries: changed.entries,
+        })]);
+        assert_eq!(replacement.base.estimated_memory().counts["entries"], 1);
+        assert_ne!(replacement.base.estimated_memory(), expected);
     }
 
     #[test]
