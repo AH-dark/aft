@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -41,7 +42,8 @@ def handoff(kind="library", target="aarch64-apple-darwin", explicit=False):
         archive = root / "handoff.tar"
         expected = {**facts(), "target": target, "profile_manifest_sha256": native.digest(source)}
         with patch.object(native, "ROOT", root), patch.object(native, "facts", return_value=expected), \
-                patch.object(native, "input_clocks", return_value=clocks):
+                patch.object(native, "input_clocks", return_value=clocks), \
+                patch.object(native, "manifest_digest", return_value=expected["profile_manifest_sha256"]):
             argv = ["native-release-artifact.py", f"pack-{kind}", "--archive", str(archive)]
             if explicit:
                 argv += ["--target", target]
@@ -56,6 +58,23 @@ def unpack(archive, kind="library"):
 
 
 class NativeReleaseArtifactTests(unittest.TestCase):
+    def test_manifest_digest_ignores_checkout_line_endings(self):
+        # A Windows build checks out Cargo.toml with CRLF; publication on Linux
+        # sees LF. Both must record the same digest for the same commit.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+            run = lambda *args: subprocess.run(args, cwd=root, env=env, check=True, capture_output=True)
+            run("git", "init", "-q")
+            (root / "Cargo.toml").write_bytes(b"[workspace]\nmembers = []\n")
+            run("git", "add", "Cargo.toml")
+            run("git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "init")
+            with patch.object(native, "ROOT", root):
+                committed = native.manifest_digest()
+                (root / "Cargo.toml").write_bytes(b"[workspace]\r\nmembers = []\r\n")
+                self.assertEqual(native.manifest_digest(), committed)
+            self.assertEqual(committed, hashlib.sha256(b"[workspace]\nmembers = []\n").hexdigest())
+
     def test_library_handoff_restores_compiled_output_and_verified_source_clock(self):
         with handoff() as (root, archive, product, clocks):
             product.write_bytes(b"stale compiled output in consumer")
