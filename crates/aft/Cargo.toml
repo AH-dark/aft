@@ -88,6 +88,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 [features]
 # Explicit opt-in for cross-process timing controls used by integration tests.
 test-timing-hooks = []
+# In-process integration fixtures need the real binary for native re-exec.
+test-sandbox-launcher = []
 semantic-chunk-census = []
 
 [dependencies]
@@ -238,6 +240,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Enable the launcher seam only in test builds, not ordinary aft binaries.
+agent-file-tools = { path = ".", features = ["test-sandbox-launcher"] }
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.7.1"
 cortexkit-role-harness = "=0.1.0"

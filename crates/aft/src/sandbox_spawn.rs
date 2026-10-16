@@ -605,6 +605,9 @@ pub struct SandboxSpawnObservation {
 static TEST_OBSERVATIONS: OnceLock<Mutex<HashMap<PathBuf, Vec<SandboxSpawnObservation>>>> =
     OnceLock::new();
 
+#[cfg(all(unix, any(test, feature = "test-sandbox-launcher")))]
+static TEST_LAUNCHERS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+
 thread_local! {
     static CURRENT_PRINCIPAL: RefCell<Option<AuthenticatedPrincipal>> = const { RefCell::new(None) };
     static WORKER_JAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1396,7 +1399,7 @@ pub fn resolve_sandbox_spawn(
                 return sandbox_setup_refusal(ctx, principal, error);
             }
         };
-        let launcher_path = match std::env::current_exe() {
+        let launcher_path = match native_launcher_path(ctx) {
             Ok(path) => path,
             Err(error) => {
                 let _ = cleanup_task_temp_dir(&profile.temp_dir);
@@ -4022,6 +4025,56 @@ pub fn clear_sandbox_spawn_test_seam(project_root: &Path) {
 
 fn observation_key(project_root: &Path) -> PathBuf {
     std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf())
+}
+
+#[cfg(unix)]
+fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
+    #[cfg(any(test, feature = "test-sandbox-launcher"))]
+    if let Some(launchers) = TEST_LAUNCHERS.get() {
+        if let Some(root) = ctx.config().project_root.as_deref() {
+            if let Some(path) = launchers
+                .lock()
+                .expect("sandbox launcher test mutex poisoned")
+                .get(&observation_key(root))
+            {
+                return Ok(path.clone());
+            }
+        }
+    }
+    let _ = ctx;
+    std::env::current_exe()
+}
+
+/// Use the real aft executable for an in-process integration fixture. The test
+/// harness cannot re-exec itself as `aft sandbox-launch`; it only accepts libtest
+/// arguments. Only executable selection changes, not the native sandbox policy.
+#[cfg(all(unix, any(test, feature = "test-sandbox-launcher")))]
+#[doc(hidden)]
+pub fn install_sandbox_launcher_for_test(project_root: &Path, launcher_path: PathBuf) -> impl Drop {
+    struct LauncherScope(PathBuf, Option<PathBuf>);
+
+    impl Drop for LauncherScope {
+        fn drop(&mut self) {
+            let mut launchers = TEST_LAUNCHERS
+                .get()
+                .expect("sandbox launcher test map installed")
+                .lock()
+                .expect("sandbox launcher test mutex poisoned");
+            if let Some(previous) = self.1.take() {
+                launchers.insert(self.0.clone(), previous);
+            } else {
+                launchers.remove(&self.0);
+            }
+        }
+    }
+
+    let root = observation_key(project_root);
+    let previous = TEST_LAUNCHERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("sandbox launcher test mutex poisoned")
+        .insert(root.clone(), launcher_path);
+    LauncherScope(root, previous)
 }
 
 #[cfg(test)]

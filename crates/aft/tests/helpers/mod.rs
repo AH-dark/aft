@@ -1616,4 +1616,4 @@ pub fn canonicalize_like_product(path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(display)
 }
 
-mod aft_binary;
+pub(crate) mod aft_binary;

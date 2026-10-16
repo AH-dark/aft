@@ -1663,6 +1663,13 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     install_bridge_state(Arc::clone(&state));
 
     let roots = SubcBridgeTestRoots::new();
+    // Strict untrusted routes re-exec the native launcher. This fixture runs the
+    // bridge in libtest, so use the real binary without bypassing confinement.
+    #[cfg(unix)]
+    let _sandbox_launcher = aft::sandbox_spawn::install_sandbox_launcher_for_test(
+        roots.root1.path(),
+        crate::test_helpers::aft_binary::aft_binary(),
+    );
     let conn_path = roots.conn_dir.path().join("subc-connection.json");
     let user_config_path = roots.storage.path().join("user-aft.jsonc");
     // Written before the module connects, because the catalog it sends at
@@ -11176,7 +11183,8 @@ async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
     assert!(!tool_result_is_error(&frame), "allow should run bash");
     assert!(
         touched.exists(),
-        "allowed bash should create the side-effect file"
+        "allowed bash should create the side-effect file: {:?}",
+        tool_result_text(&frame)
     );
 
     send_connection_goodbye(&mut stream).await;
@@ -11481,10 +11489,16 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
     let observations = sandbox_spawn_test_observations(&seam_root);
     clear_sandbox_spawn_test_seam(&seam_root);
     assert_eq!(observations.len(), 2, "observations: {observations:?}");
-    assert!(observations.iter().all(|observation| {
-        observation.requested_tier == RequestedSandboxTier::Disabled
-            && observation.task_kind == SandboxTaskKind::BashForeground
-    }));
+    assert!(observations
+        .iter()
+        .all(|observation| observation.task_kind == SandboxTaskKind::BashForeground));
+    // The head profile defaults to off, but an untrusted route must use strict
+    // confinement even when the user has not enabled sandboxing explicitly.
+    assert_eq!(
+        observations[0].requested_tier,
+        RequestedSandboxTier::Disabled
+    );
+    assert_eq!(observations[1].requested_tier, RequestedSandboxTier::Native);
 
     match &observations[0].principal {
         AuthenticatedPrincipal::RouteBind {
