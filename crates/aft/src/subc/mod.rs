@@ -17553,6 +17553,7 @@ mod tests {
         configured: ConfiguredRoot,
         release: Option<crossbeam_channel::Sender<()>>,
         tail: Option<tokio::sync::oneshot::Receiver<Response>>,
+        held_stage: &'static str,
         _gate: crate::commands::configure::ConfigureTailStageGateGuard,
         _git_env: Option<crate::test_env::HermeticGitEnvGuard>,
     }
@@ -17598,6 +17599,7 @@ mod tests {
                 configured,
                 release: Some(release),
                 tail: Some(tail),
+                held_stage,
                 _gate: gate,
                 _git_env: None,
             };
@@ -17620,6 +17622,7 @@ mod tests {
                 let tail = tail.blocking_recv().expect("tail completion");
                 assert!(tail.success);
             }
+            self._gate.join_storage_sweep_worker();
         }
     }
 
@@ -17628,6 +17631,12 @@ mod tests {
             // A failed assertion must not leave the tail parked on its gate.
             if let Some(release) = self.release.take() {
                 let _ = release.send(());
+            }
+            if self.held_stage == "storage_sweeps" {
+                if let Some(tail) = self.tail.take() {
+                    let _ = tail.blocking_recv();
+                }
+                self._gate.join_storage_sweep_worker();
             }
         }
     }
@@ -17720,6 +17729,35 @@ mod tests {
         name: &str,
         wait_budget: Duration,
     ) -> Value {
+        database_wire_tool_with_dispatch(
+            executor,
+            fixture,
+            name,
+            wait_budget,
+            (Duration::from_millis(500), Duration::from_secs(3)),
+            |req, ctx| {
+                assert!(
+                    ctx.database_runtime_refusal(&req.id, &req.command)
+                        .is_none(),
+                    "unready mutation dispatched"
+                );
+                match req.command.as_str() {
+                    "read" => crate::commands::read::handle_read(&req, ctx),
+                    "bash" => crate::commands::bash::handle(&req, ctx),
+                    other => panic!("unexpected dispatch {other}"),
+                }
+            },
+        )
+    }
+
+    fn database_wire_tool_with_dispatch(
+        executor: &Arc<Executor>,
+        fixture: &ConfiguredRoot,
+        name: &str,
+        wait_budget: Duration,
+        (dispatch_guard, response_guard): (Duration, Duration),
+        dispatch: DispatchFn,
+    ) -> Value {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -17760,7 +17798,7 @@ mod tests {
                 wake: crate::response_finalize::DeferredResponseWake::default(),
             };
             tokio::time::timeout(
-                Duration::from_millis(500),
+                dispatch_guard,
                 handle_tool_call(&writer, &frame, None, decoded.phase_trace,
                 &routes,
                 &HashMap::new(),
@@ -17781,14 +17819,7 @@ mod tests {
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
-                |req, ctx| {
-                    assert!(ctx.database_runtime_refusal(&req.id, &req.command).is_none(), "unready mutation dispatched");
-                    match req.command.as_str() {
-                        "read" => crate::commands::read::handle_read(&req, ctx),
-                        "bash" => crate::commands::bash::handle(&req, ctx),
-                        other => panic!("unexpected dispatch {other}"),
-                    }
-                },
+                dispatch,
                 &deferred_tx,
                 false,
                 1024 * 1024,
@@ -17797,7 +17828,7 @@ mod tests {
             .await
             .expect("persistence refusal must not wait for the executor")
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::time::timeout(response_guard, async {
                 tokio::select! {
                     reply = replies.recv() => serde_json::from_slice::<Value>(&reply.unwrap().body).unwrap()["structuredContent"].clone(),
                     completion = bash_rx.recv() => serde_json::to_value(completion.unwrap().response_for_test()).unwrap(),
@@ -18394,36 +18425,52 @@ mod tests {
 
     #[test]
     fn storage_sweeps_do_not_hold_bind_or_bash_admission() {
+        const HANG_GUARD: Duration = Duration::from_secs(30);
         let mut fixture = HeldConfigureTail::start("storage_sweeps");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let generation = fixture.ctx.configure_generation();
-        let rebind = fixture.submit_bind(fixture.bind_request(1, "opencode"));
+        let mut rebind = fixture.submit_bind(fixture.bind_request(1, "opencode"));
         let rebound =
-            runtime.block_on(async { tokio::time::timeout(Duration::from_secs(1), rebind).await });
+            runtime.block_on(async { tokio::time::timeout(HANG_GUARD, &mut rebind).await });
+        let rebound_generation = fixture.ctx.configure_generation();
+
+        // Even a bind that needs exclusive use must not wait for sweep I/O.
+        // Leaving that writer queued would also fence off bash's shared admission.
+        let mut bind = fixture.submit_bind(fixture.bind_request(2, "pi"));
+        let bound = runtime.block_on(async { tokio::time::timeout(HANG_GUARD, &mut bind).await });
+        // Exercise the real wire and executor admission path, but stop at the
+        // dispatch boundary: admission needs no shell child to leave running.
+        let bash = database_wire_tool_with_dispatch(
+            &fixture.executor,
+            &fixture.configured,
+            "bash",
+            HANG_GUARD,
+            (HANG_GUARD, HANG_GUARD),
+            |req, _ctx| {
+                assert_eq!(req.command, "bash");
+                Response::success(req.id, json!({ "admitted": true }))
+            },
+        );
+        // All replies above must arrive before releasing the sweep. These are
+        // hang guards, not latency requirements on a loaded runner.
+        fixture.release_tail();
+        for (timed_out, pending) in [(rebound.is_err(), rebind), (bound.is_err(), bind)] {
+            if timed_out {
+                runtime
+                    .block_on(async { tokio::time::timeout(HANG_GUARD, pending).await })
+                    .expect("bind completes after releasing the sweep")
+                    .expect("bind response");
+            }
+        }
         assert!(
             rebound.is_ok(),
             "an equivalent bind waited on the held storage sweep"
         );
         assert!(rebound.unwrap().unwrap().success);
-        assert_eq!(fixture.ctx.configure_generation(), generation);
-
-        // Even a bind that needs exclusive use must not wait for sweep I/O.
-        // Leaving that writer queued would also fence off bash's shared admission.
-        let bind = fixture.submit_bind(fixture.bind_request(2, "pi"));
-        let bound =
-            runtime.block_on(async { tokio::time::timeout(Duration::from_secs(1), bind).await });
-        let bash_started = Instant::now();
-        let bash = database_wire_tool(
-            &fixture.executor,
-            &fixture.configured,
-            "bash",
-            Duration::from_millis(500),
-        );
-        let bash_latency = bash_started.elapsed();
-        fixture.release_tail();
+        assert_eq!(rebound_generation, generation);
         assert!(
             bound.is_ok(),
             "a config-changing bind waited on the held storage sweep: {bound:?}; bash={bash}"
@@ -18434,8 +18481,8 @@ mod tests {
             "bash waited on the held storage sweep: {bash}"
         );
         assert!(
-            bash_latency < Duration::from_secs(1),
-            "bash admission took {bash_latency:?}"
+            bash["admitted"] == true,
+            "bash never reached dispatch while the sweep was held: {bash}"
         );
     }
 
