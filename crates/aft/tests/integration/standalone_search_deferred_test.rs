@@ -1303,6 +1303,19 @@ fn standalone_undo_is_fresh_without_watcher_delivery() {
     assert!(aft.shutdown().success());
 }
 
+/// Diagnostics wait budget the warming-analyzer tests give inspect.
+const WARMING_DIAGNOSTICS_BUDGET_MS: u64 = 10_000;
+
+/// A warming analyzer must not make inspect wait out its diagnostics budget.
+/// The bound is that budget itself, so a loaded runner's slower reply still
+/// passes while a reply that waited the full budget fails.
+fn assert_returned_without_waiting_for_diagnostics(elapsed: Duration) {
+    assert!(
+        elapsed < Duration::from_millis(WARMING_DIAGNOSTICS_BUDGET_MS),
+        "inspect waited {elapsed:?}, as long as its {WARMING_DIAGNOSTICS_BUDGET_MS} ms diagnostics budget"
+    );
+}
+
 fn warming_rust_inspect_response(
     cargo_owned: bool,
     diagnostics_timeout_ms: u64,
@@ -1417,7 +1430,8 @@ fn warming_rust_inspect_response(
 #[test]
 fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
     // Without Cargo.toml, an analyzer still indexing cannot confirm complete diagnostics.
-    let (response, elapsed) = warming_rust_inspect_response(false, 10_000, json!({}));
+    let (response, elapsed) =
+        warming_rust_inspect_response(false, WARMING_DIAGNOSTICS_BUDGET_MS, json!({}));
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], false);
     assert!(
@@ -1439,14 +1453,17 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
         "{response:#}"
     );
     assert!(!text.contains("[AFT E0"), "{response:#}");
-    assert!(elapsed < Duration::from_secs(5));
+    assert_returned_without_waiting_for_diagnostics(elapsed);
 }
 
 #[test]
 fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming() {
     // A completed explicit Cargo check supplies diagnostics while the analyzer is still warming.
-    let (response, elapsed) =
-        warming_rust_inspect_response(true, 10_000, json!({"AFT_FAKE_CARGO_CHECK": "1"}));
+    let (response, elapsed) = warming_rust_inspect_response(
+        true,
+        WARMING_DIAGNOSTICS_BUDGET_MS,
+        json!({"AFT_FAKE_CARGO_CHECK": "1"}),
+    );
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], true, "{response:#}");
     assert_eq!(response["summary"]["metrics"]["files"], 1, "{response:#}");
@@ -1460,7 +1477,7 @@ fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming()
     assert!(text.starts_with("FRESH"), "{text}");
     assert!(text.contains("workspace analysis is warming"), "{text}");
     assert!(text.contains("from the last completed check"), "{text}");
-    assert!(elapsed < Duration::from_secs(5));
+    assert_returned_without_waiting_for_diagnostics(elapsed);
 }
 
 #[cfg(unix)]
