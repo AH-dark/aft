@@ -12412,6 +12412,9 @@ impl AppContext {
         let owned_artifact = artifact_session.is_some_and(|session| {
             self.bash_background
                 .is_session_owned_artifact_path(session, &identity)
+                || self
+                    .bash_background
+                    .is_readable_task_path(session, &identity)
         });
         let policy = self.access_policy(req_id)?;
         let decision = if preserve_final {

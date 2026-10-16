@@ -5,6 +5,9 @@ use crate::protocol::RawRequest;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+#[path = "access_policy_task_tests.rs"]
+mod task_records;
+
 fn context(root: &Path, denied: &Path) -> AppContext {
     let mut config = Config {
         project_root: Some(root.to_path_buf()),

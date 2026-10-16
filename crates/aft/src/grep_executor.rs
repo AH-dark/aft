@@ -766,6 +766,9 @@ fn fallback_target_walk_builder(
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(true)
         .filter_entry(move |entry| {
+            if !crate::bash_background::registry::safe_task_entry(entry.path()) {
+                return false;
+            }
             if entry.depth() > 0 && entry.file_type().map_or(false, |ft| ft.is_dir()) {
                 match boundary
                     .as_ref()

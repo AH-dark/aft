@@ -39,6 +39,12 @@ const MIGRATION_VERSIONS: &[u32] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
 ];
 
+// Performance-only indexes do not change the table format or reader floor.
+// Install them on writable opens, including databases already at schema 18.
+const ADDITIVE_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_bash_tasks_task_owner ON bash_tasks(task_id, harness, session_id);
+"#;
+
 const MIGRATION_V14: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_exec_policies (
   project_root TEXT NOT NULL, harness TEXT NOT NULL, session TEXT NOT NULL,
@@ -638,6 +644,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
         let mut conn = TrackedConnection::open(path, SqliteStore::AftDb)?;
         apply_pragmas_with_timeout(&conn, TOOL_RETRY_BUSY_WAIT)?;
         run_migrations(&mut conn)?;
+        ensure_additive_indexes(&conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         return Ok(conn);
     }
@@ -668,6 +675,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
                     .min(Duration::from_millis(100)),
             )?;
             run_migrations(&mut conn)?;
+            ensure_additive_indexes(&conn)?;
             Ok::<(), OpenError>(())
         })();
         match result {
@@ -795,6 +803,10 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
     }
 
     Ok(CURRENT_SCHEMA_VERSION)
+}
+
+fn ensure_additive_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(ADDITIVE_INDEXES)
 }
 
 fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
@@ -982,6 +994,7 @@ mod tests {
         "idx_bash_tasks_status",
         "idx_bash_tasks_session_status",
         "idx_bash_tasks_project_lookup",
+        "idx_bash_tasks_task_owner",
         "idx_bash_pattern_watches_session",
         "idx_bash_pattern_watches_task",
         "idx_bash_tasks_started_activity",
@@ -1423,6 +1436,96 @@ mod tests {
         // the bash-task lookup index on the way.
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         assert!(sqlite_names(&conn, "index").contains(&"idx_bash_tasks_project_lookup".to_string()));
+    }
+
+    #[test]
+    fn additive_task_owner_index_keeps_v18_schema_and_reader_floor() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=18 {
+            apply_migration_statements(&conn, version).unwrap();
+        }
+        conn.execute("INSERT INTO schema_version(version) VALUES (18)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO host_state(key, value, updated_at) VALUES ('compatibility', 'v18', 0)",
+            [],
+        )
+        .unwrap();
+        let table_schema = |conn: &Connection| {
+            conn.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let v18_tables = table_schema(&conn);
+        assert!(!sqlite_names(&conn, "index").contains(&"idx_bash_tasks_task_owner".to_string()));
+        drop(conn);
+
+        assert!(crate::reader_floor::prepare(dir.path()).is_empty());
+        let floor_before = std::fs::read(crate::reader_floor::floor_path(dir.path())).unwrap();
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn), 18);
+        assert_eq!(
+            crate::reader_floor::read(dir.path())
+                .unwrap()
+                .unwrap()
+                .get(crate::persisted_format::PersistedStore::AftDb),
+            Some(18)
+        );
+        assert_eq!(
+            std::fs::read(crate::reader_floor::floor_path(dir.path())).unwrap(),
+            floor_before
+        );
+        assert!(sqlite_names(&conn, "index").contains(&"idx_bash_tasks_task_owner".to_string()));
+        assert_eq!(table_schema(&conn), v18_tables);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM host_state WHERE key = 'compatibility'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "v18"
+        );
+        drop(conn);
+
+        // A v18 reader accepts these version gates and can still query every
+        // table it knew before the optional performance index was installed.
+        let legacy = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(schema_version(&legacy), 18);
+        assert_eq!(table_schema(&legacy), v18_tables);
+        for (table, _) in v18_tables {
+            let mut statement = legacy
+                .prepare(&format!("SELECT * FROM \"{table}\" LIMIT 0"))
+                .unwrap();
+            assert!(statement.query([]).unwrap().next().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn additive_task_owner_index_is_repaired_in_both_open_modes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = open(&path).unwrap();
+        conn.execute("DROP INDEX idx_bash_tasks_task_owner", [])
+            .unwrap();
+        drop(conn);
+        for mode in [OpenMode::Deferred, OpenMode::SingleAttempt] {
+            let conn = open_with_mode(&path, mode).unwrap();
+            assert!(sqlite_names(&conn, "index").contains(&"idx_bash_tasks_task_owner".to_string()));
+            conn.execute("DROP INDEX idx_bash_tasks_task_owner", [])
+                .unwrap();
+        }
+        let readonly = open_readonly(&path).unwrap();
+        assert!(
+            !sqlite_names(&readonly, "index").contains(&"idx_bash_tasks_task_owner".to_string())
+        );
     }
 
     #[test]

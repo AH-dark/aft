@@ -756,6 +756,10 @@ pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
 }
 
+#[path = "task_access.rs"]
+mod task_access;
+pub(crate) use task_access::{is_task_environment, safe_task_entry};
+
 /// What woke the watchdog pass in which a task was observed terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchdogPassCause {
@@ -787,6 +791,9 @@ pub(crate) struct RegistryInner {
     /// Directory handles prevent cached permissions from following a replaced I/O directory.
     persisted_artifact_owners:
         Mutex<HashMap<PathBuf, (String, Arc<super::persistence::PinnedDir>)>>,
+    task_read_records: Mutex<VecDeque<(PathBuf, Arc<task_access::TaskReadRecord>)>>,
+    #[cfg(test)]
+    task_access_work: task_access::WorkCounters,
     /// Failed finished-task bundle deletions and their bounded retry count.
     finished_delete_attempts: Mutex<HashMap<String, usize>>,
     cleanup_queue: Mutex<VecDeque<String>>,
@@ -1189,6 +1196,9 @@ impl BgTaskRegistry {
                 before_promotion_commit: Mutex::new(None),
                 tasks: Mutex::new(HashMap::new()),
                 persisted_artifact_owners: Mutex::new(HashMap::new()),
+                task_read_records: Mutex::new(VecDeque::new()),
+                #[cfg(test)]
+                task_access_work: task_access::WorkCounters::default(),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
                 cleanup_queue: Mutex::new(VecDeque::new()),
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
@@ -5378,6 +5388,7 @@ impl BgTaskRegistry {
             storage_dir,
             preview_bytes,
             Duration::ZERO,
+            true,
         )
     }
 
@@ -5447,6 +5458,26 @@ impl BgTaskRegistry {
             storage_dir,
             preview_bytes,
             KILL_IN_FLIGHT_WAIT,
+            true,
+        )
+    }
+
+    pub(crate) fn status_settled_owned(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: &Path,
+        preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        self.status_with_kill_wait(
+            task_id,
+            session_id,
+            project_root,
+            Some(storage_dir),
+            preview_bytes,
+            KILL_IN_FLIGHT_WAIT,
+            false,
         )
     }
 
@@ -5458,6 +5489,7 @@ impl BgTaskRegistry {
         storage_dir: Option<&Path>,
         preview_bytes: usize,
         kill_wait: Duration,
+        allow_relaxed: bool,
     ) -> Option<BgTaskSnapshot> {
         validate_task_id(task_id).ok()?;
         let terminal_db_fallback_allowed = storage_dir
@@ -5480,6 +5512,9 @@ impl BgTaskRegistry {
                 }) {
                     return Some(snapshot);
                 }
+            }
+            if !allow_relaxed {
+                return None;
             }
             return self.status_relaxed(
                 task_id,
@@ -5563,8 +5598,7 @@ impl BgTaskRegistry {
                 );
             }
         }
-        let root = storage_dir.join("bash-tasks");
-        let entries = fs::read_dir(&root).ok()?;
+        let entries = self.task_namespaces(storage_dir).ok()?;
         for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.is_dir() {
@@ -5675,7 +5709,7 @@ impl BgTaskRegistry {
     pub(super) fn status_relaxed(
         &self,
         task_id: &str,
-        _session_id: &str,
+        session_id: &str,
         project_root: &Path,
         storage_dir: &Path,
         preview_bytes: usize,
@@ -5691,6 +5725,13 @@ impl BgTaskRegistry {
         .flatten()
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
         if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
+            if task.session_id != session_id
+                && task
+                    .lock_state()
+                    .map_or(true, |state| state.metadata.scope.is_some())
+            {
+                return None;
+            }
             let _ = self.poll_task(&task);
             if !kill_wait.is_zero() && task.wait_for_kill_settled(kill_wait) {
                 let _ = self.poll_task(&task);
@@ -5699,6 +5740,9 @@ impl BgTaskRegistry {
         }
         let row = fallback_row?;
         let metadata = PersistedTask::from(row.clone());
+        if metadata.session_id != session_id && metadata.scope.is_some() {
+            return None;
+        }
         metadata
             .status
             .is_terminal()
@@ -5714,6 +5758,12 @@ impl BgTaskRegistry {
         let task = self
             .status_relaxed_task(task_id, project_root, storage_dir)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        if task
+            .lock_state()
+            .map_or(true, |state| state.metadata.scope.is_some())
+        {
+            return Err(format!("background task not found: {task_id}"));
+        }
         self.kill_with_status(task_id, &task.session_id, BgTaskStatus::Killed)
     }
 
@@ -5963,6 +6013,7 @@ impl BgTaskRegistry {
                             .retired_undelivered_completions
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    self.forget_task_read_record(&resolved.paths.dir);
                     match delete_task_bundle(&resolved.paths) {
                         Ok(()) => {
                             self.forget_finished_delete_attempts(&metadata.task_id);
@@ -6590,6 +6641,7 @@ impl BgTaskRegistry {
             if let Ok(mut tasks) = self.inner.tasks.lock() {
                 tasks.remove(&task_id);
             }
+            self.forget_task_read_record(&task.paths.dir);
             let handles_released = release_terminal_io_handles(&task);
             let paths = task.paths.clone();
             if self.finished_delete_attempt_count(&task_id) >= FINISHED_DELETE_MAX_ATTEMPTS {

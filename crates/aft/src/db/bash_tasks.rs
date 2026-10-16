@@ -456,6 +456,18 @@ pub fn get_bash_task(
     .optional()
 }
 
+const TASK_OWNER_SQL: &str =
+    "SELECT session_id FROM bash_tasks WHERE task_id = ?1 AND harness = ?2 LIMIT 1";
+
+pub(crate) fn find_bash_task_session(
+    conn: &Connection,
+    harness: &str,
+    task_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(TASK_OWNER_SQL, params![task_id, harness], |row| row.get(0))
+        .optional()
+}
+
 const SESSION_TASKS_SQL: &str =
     "SELECT harness, session_id, task_id, project_key, command, cwd, status,
                 exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
@@ -515,10 +527,8 @@ fn bash_task_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 /// a task directory still belongs to a live process must not restrict the
 /// lookup to one harness.
 ///
-/// No index leads with `task_id`, so a lookup without a harness would read
-/// the whole table. Instead each harness is queried through the
-/// harness-keyed project-lookup index, which reads that harness's index
-/// entries and fetches only the matching rows.
+/// This batched GC lookup uses the harness-keyed project-lookup index,
+/// reading each harness's index entries and fetching only the matching rows.
 pub fn list_bash_task_process_ids(
     conn: &Connection,
     task_ids: &[String],
@@ -869,6 +879,35 @@ mod tests {
         assert!(
             i64::from(page_reads) < table_pages / 10,
             "looking up three task ids read {page_reads} of {table_pages} pages"
+        );
+    }
+    #[test]
+    fn task_owner_lookup_uses_task_id_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {TASK_OWNER_SQL}"))
+            .unwrap()
+            .query_map(params!["bash-0123456789abcdef", "opencode"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_bash_tasks_task_owner")
+                    && detail.contains("SEARCH")
+                    && detail.contains("task_id=?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("SCAN")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            find_bash_task_session(&conn, "opencode", "bash-0123456789abcdef").unwrap(),
+            None
         );
     }
 }

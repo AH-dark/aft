@@ -71,6 +71,14 @@ fn agent_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<Scop
     }).optional()
 }
 
+pub(crate) fn is_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM access_scope_agents a JOIN access_scopes s USING(owner,scope_ref,epoch) WHERE a.owner=?1 AND a.scope_ref=?2 AND a.epoch=?3 AND a.kind='head' AND s.ended=0)",
+        params![key.owner, key.scope_ref, key.epoch.to_string()],
+        |row| row.get(0),
+    )
+}
+
 pub fn set_mode(
     conn: &Connection,
     key: &ScopeKey,

@@ -1,0 +1,364 @@
+use super::*;
+use crate::bash_background::persistence::{PinnedDir, ResolvedTask, TaskLayout};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
+const TASK_READ_RECORD_CAPACITY: usize = 64;
+
+pub(super) struct TaskReadRecord {
+    resolved: ResolvedTask,
+    metadata: PersistedTask,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bash_background::persistence::{create_task_layout, write_task};
+
+    fn record(registry: &BgTaskRegistry, storage: &Path, index: usize) -> TaskPaths {
+        let task_id = format!("bash-{index:016x}");
+        let paths = create_task_layout(storage, "session", &task_id)
+            .unwrap()
+            .paths;
+        let mut metadata = PersistedTask::starting(
+            task_id,
+            "session".into(),
+            "echo output".into(),
+            storage.to_path_buf(),
+            Some(storage.to_path_buf()),
+            None,
+            false,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        write_task(&paths.json, &metadata).unwrap();
+        fs::write(&paths.stdout, "output\n").unwrap();
+        assert!(registry.is_readable_task_path("session", &paths.stdout));
+        paths
+    }
+
+    #[test]
+    fn task_read_cache_is_bounded_and_eviction_releases_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let first = record(&registry, storage.path(), 0);
+        let first_record = Arc::downgrade(&registry.task_read_record(&first.dir).unwrap());
+        for index in 1..192 {
+            record(&registry, storage.path(), index);
+            assert!(
+                registry.inner.task_read_records.lock().unwrap().len() <= 64,
+                "the pinned task-read cache must hold at most 64 records"
+            );
+        }
+        assert!(
+            first_record.upgrade().is_none(),
+            "eviction must close handles"
+        );
+        assert!(registry.is_readable_task_path("session", &first.stdout));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_read_cache_identity_failure_releases_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        let cached = Arc::downgrade(&registry.task_read_record(&paths.dir).unwrap());
+        fs::rename(&paths.dir, paths.dir.with_extension("old")).unwrap();
+        assert!(registry.task_read_record(&paths.dir).is_none());
+        assert!(
+            cached.upgrade().is_none(),
+            "a stale record must not retain handles"
+        );
+        assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_read_cache_cleanup_releases_deleted_task_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        let cached = Arc::downgrade(&registry.task_read_record(&paths.dir).unwrap());
+        registry.replay_session(storage.path(), "session").unwrap();
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(
+            !paths.dir.exists(),
+            "cleanup must delete the expired bundle"
+        );
+        assert!(
+            cached.upgrade().is_none(),
+            "cleanup must close cached handles"
+        );
+        assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_read_cache_retention_releases_deleted_task_handles() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let paths = record(&registry, storage.path(), 0);
+        let cached = Arc::downgrade(&registry.task_read_record(&paths.dir).unwrap());
+        let old = std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        filetime::set_file_mtime(&paths.json, filetime::FileTime::from_system_time(old)).unwrap();
+        assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 1);
+        assert!(
+            !paths.dir.exists(),
+            "retention must delete the expired bundle"
+        );
+        assert!(
+            cached.upgrade().is_none(),
+            "retention must close cached handles"
+        );
+        assert!(registry.inner.task_read_records.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct WorkCounters {
+    owner_lookups: AtomicUsize,
+    namespace_reads: AtomicUsize,
+    task_folder_reads: AtomicUsize,
+}
+
+/// Recognize the task bundle structurally, without trusting a caller's session
+/// namespace or granting access to the enclosing private store.
+fn task_directory(path: &Path) -> Option<&Path> {
+    // Ordinary project paths never need ancestor-by-ancestor task validation.
+    // A marker match is only a fast prefilter; the component checks still win.
+    static MARKER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"bash-tasks"));
+    MARKER.find(path.as_os_str().as_encoded_bytes())?;
+    path.ancestors().find(|ancestor| {
+        ancestor
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            == Some(std::ffi::OsStr::new("bash-tasks"))
+            && ancestor
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| validate_task_id(name).is_ok())
+    })
+}
+
+pub(crate) fn is_task_environment(path: &Path) -> bool {
+    task_directory(path).is_some_and(|root| path == root.join("control/environment.bin"))
+}
+
+/// Recursive readers must not bypass the explicit-path check by entering a
+/// bundle through its directory. Do not follow links or credential payloads.
+pub(crate) fn safe_task_entry(path: &Path) -> bool {
+    if task_directory(path).is_none() {
+        return true;
+    }
+    if is_task_environment(path) {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+        return false;
+    }
+    if metadata.is_file() {
+        return path
+            .parent()
+            .and_then(|parent| PinnedDir::open(parent).ok())
+            .is_some_and(|parent| {
+                path.file_name()
+                    .is_some_and(|name| parent.open_file(name, false).is_ok())
+            });
+    }
+    true
+}
+
+impl BgTaskRegistry {
+    pub(super) fn task_namespaces(&self, storage: &Path) -> std::io::Result<fs::ReadDir> {
+        #[cfg(test)]
+        self.inner
+            .task_access_work
+            .namespace_reads
+            .fetch_add(1, Ordering::Relaxed);
+        fs::read_dir(storage.join("bash-tasks"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_task_access_work(&self) {
+        self.inner
+            .task_access_work
+            .owner_lookups
+            .store(0, Ordering::Relaxed);
+        self.inner
+            .task_access_work
+            .namespace_reads
+            .store(0, Ordering::Relaxed);
+        self.inner
+            .task_access_work
+            .task_folder_reads
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_access_work(&self) -> (usize, usize, usize) {
+        let work = &self.inner.task_access_work;
+        (
+            work.owner_lookups.load(Ordering::Relaxed),
+            work.namespace_reads.load(Ordering::Relaxed),
+            work.task_folder_reads.load(Ordering::Relaxed),
+        )
+    }
+
+    fn task_read_record(&self, root: &Path) -> Option<Arc<TaskReadRecord>> {
+        {
+            let mut records = self.inner.task_read_records.lock().ok()?;
+            if let Some(index) = records.iter().position(|(path, _)| path == root) {
+                // Take the record out first so a failed identity check also
+                // releases the cache's directory handles.
+                let (path, record) = records.remove(index)?;
+                record.resolved.dirs.task.ensure_current_identity().ok()?;
+                record
+                    .resolved
+                    .dirs
+                    .control
+                    .ensure_current_identity()
+                    .ok()?;
+                record.resolved.dirs.io.ensure_current_identity().ok()?;
+                records.push_back((path, Arc::clone(&record)));
+                return Some(record);
+            }
+        }
+        #[cfg(test)]
+        self.inner
+            .task_access_work
+            .task_folder_reads
+            .fetch_add(1, Ordering::Relaxed);
+        let resolved = resolve_task_layout(root.parent()?, root.file_name()?.to_str()?).ok()?;
+        if resolved.paths.layout != TaskLayout::Directory {
+            return None;
+        }
+        let metadata = read_task_at(&resolved).ok()?;
+        if root.parent()?.file_name()?.to_str()?
+            != crate::backup::hash_session(&metadata.session_id)
+        {
+            return None;
+        }
+        let record = Arc::new(TaskReadRecord { resolved, metadata });
+        let mut records = self.inner.task_read_records.lock().ok()?;
+        if let Some((_, existing)) = records.iter().find(|(path, _)| path == root) {
+            return Some(Arc::clone(existing));
+        }
+        // Keep only a small working set: each record owns three pinned
+        // directories, so retaining historical records would exhaust handles.
+        if records.len() >= TASK_READ_RECORD_CAPACITY {
+            records.pop_front();
+        }
+        records.push_back((root.to_path_buf(), Arc::clone(&record)));
+        Some(record)
+    }
+
+    pub(super) fn forget_task_read_record(&self, root: &Path) {
+        if let Ok(mut records) = self.inner.task_read_records.lock() {
+            records.retain(|(path, _)| path != root);
+        }
+    }
+
+    fn head_reads_record(&self, record: &TaskReadRecord) -> bool {
+        let Some(caller) = crate::access_policy::current_scope() else {
+            return false;
+        };
+        let Some(scope) = record.metadata.scope.as_ref() else {
+            return false;
+        };
+        if !scope.owner_authorized || scope.kind != subc_protocol::scope::ScopeKind::Worker {
+            return false;
+        }
+        let Some(parent) = scope.parent.as_ref() else {
+            return false;
+        };
+        // A revived worker has a new session and epoch, but its parent
+        // scope's owner and reference still identify the owning head.
+        if caller.owner != serde_json::to_string(&parent.owner).expect("scope owner serializes")
+            || caller.scope_ref != parent.scope_ref
+        {
+            return false;
+        }
+        // Scope end or replacement of the head registration must take effect
+        // on the next read. Recheck the indexed database row, not the folders.
+        self.inner
+            .db_pool
+            .read()
+            .ok()
+            .and_then(|pool| pool.clone())
+            .and_then(|pool| {
+                pool.lock()
+                    .ok()
+                    .and_then(|conn| crate::db::access_grants::is_head(&conn, &caller).ok())
+            })
+            .unwrap_or(false)
+    }
+
+    /// The read-only exception is pinned and cached per bundle, never per file.
+    /// Bash's separate output-file exception remains exact-file-only: permission
+    /// to inspect a task folder must not let a shell command enter that folder.
+    pub(crate) fn is_readable_task_path(&self, session: &str, path: &Path) -> bool {
+        if !safe_task_entry(path) {
+            return false;
+        }
+        let Some(root) = task_directory(path) else {
+            return false;
+        };
+        let Some(record) = self.task_read_record(root) else {
+            return false;
+        };
+        let own_io = record.metadata.session_id == session
+            && path.starts_with(&record.resolved.paths.io_dir);
+        if !own_io && !self.head_reads_record(&record) {
+            return false;
+        }
+        if path.is_dir() {
+            return PinnedDir::open(path).is_ok();
+        }
+        let Ok(parent) = PinnedDir::open(path.parent().unwrap_or(root)) else {
+            return false;
+        };
+        path.file_name()
+            .is_some_and(|name| parent.open_file(name, false).is_ok())
+    }
+
+    pub(crate) fn readable_worker_task_owner(
+        &self,
+        task_id: &str,
+        storage: &Path,
+    ) -> Option<String> {
+        #[cfg(test)]
+        self.inner
+            .task_access_work
+            .owner_lookups
+            .fetch_add(1, Ordering::Relaxed);
+        validate_task_id(task_id).ok()?;
+        let caller = crate::access_policy::current_scope()?;
+        let pool = self.inner.db_pool.read().ok()?.clone()?;
+        {
+            let conn = pool.lock().ok()?;
+            if !crate::db::access_grants::is_head(&conn, &caller).ok()? {
+                return None;
+            }
+        }
+        let session = if let Some(task) = self.task(task_id) {
+            task.session_id.clone()
+        } else {
+            let harness = crate::bash_background::route_harness()
+                .map(|harness| harness.storage_segment())
+                .or_else(|| self.fallback_db_harness())?;
+            let conn = pool.lock().ok()?;
+            crate::db::bash_tasks::find_bash_task_session(&conn, &harness, task_id).ok()??
+        };
+        // The row or live task names one namespace, including an earlier worker
+        // session after revival. A missing row never causes a directory sweep.
+        let root = session_tasks_dir(storage, &session).join(task_id);
+        let record = self.task_read_record(&root)?;
+        self.head_reads_record(&record).then_some(session)
+    }
+}

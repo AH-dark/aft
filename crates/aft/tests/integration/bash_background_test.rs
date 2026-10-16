@@ -652,12 +652,12 @@ fn restricted_read_allows_only_current_session_bash_artifacts() {
 
     #[cfg(unix)]
     {
-        let artifact_dir = output_path.parent().unwrap();
+        let task_dir = output_path.parent().unwrap().parent().unwrap();
         let link = _dir.path().join("artifact-link");
-        std::os::unix::fs::symlink(artifact_dir, &link).unwrap();
-        let unregistered = artifact_dir.join("unregistered-output");
+        std::os::unix::fs::symlink(task_dir, &link).unwrap();
+        let unregistered = task_dir.join("control/unregistered-output");
         std::fs::write(&unregistered, "not registered\n").unwrap();
-        for target in [link.clone(), link.join("unregistered-output")] {
+        for target in [link.clone(), link.join("control/unregistered-output")] {
             let response = aft.send(
                 &json!({
                     "id": "symlink-artifact-prefix-read",
@@ -750,7 +750,9 @@ fn assert_background_artifact_search_access(command: &str) {
             std::thread::sleep(Duration::from_millis(50));
         };
         let output_path = Path::new(completed["output_path"].as_str().unwrap());
-        let unregistered = output_path.parent().unwrap().join("unregistered-output");
+        let io_dir = output_path.parent().unwrap();
+        let task_dir = io_dir.parent().unwrap();
+        let unregistered = task_dir.join("control/unregistered-output");
         let private_file = storage.path().join("private-file");
         std::fs::write(&unregistered, "artifact-search-marker").unwrap();
         std::fs::write(&private_file, "artifact-search-marker").unwrap();
@@ -781,6 +783,15 @@ fn assert_background_artifact_search_access(command: &str) {
                 "files"
             };
             assert_eq!(own[results].as_array().unwrap().len(), 1, "{own:?}");
+            let own_folder = send(&mut aft, owner, io_dir);
+            assert_eq!(
+                own_folder["success"], true,
+                "owned I/O folder {command} failed: {own_folder:?}"
+            );
+            assert!(
+                own_folder[results].to_string().contains("stdout"),
+                "{own_folder:?}"
+            );
             let code = if restricted {
                 "path_outside_root"
             } else {
@@ -790,7 +801,7 @@ fn assert_background_artifact_search_access(command: &str) {
                 ("another-session", output_path),
                 (owner, unregistered.as_path()),
                 (owner, private_file.as_path()),
-                (owner, output_path.parent().unwrap()),
+                (owner, task_dir),
             ] {
                 let denied = send(&mut aft, session, path);
                 assert_eq!(denied["success"], false, "{command} leaked: {denied:?}");

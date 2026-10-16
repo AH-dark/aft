@@ -310,6 +310,9 @@ impl AccessPolicy {
         path: &Path,
         owned_artifact: bool,
     ) -> AccessDecision {
+        if crate::bash_background::registry::is_task_environment(path) {
+            return AccessDecision::Deny(AccessDenial::Floor);
+        }
         if self
             .absolute_floor
             .iter()
