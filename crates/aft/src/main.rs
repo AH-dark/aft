@@ -4606,15 +4606,18 @@ mod watcher_filter_tests {
     /// tree produces, without forcing a rebuild of the whole store.
     #[test]
     fn watcher_overflow_refreshes_exactly_the_edited_files() {
+        check_watcher_overflow_refresh(false);
+    }
+
+    #[test]
+    fn watcher_overflow_refresh_wait_ignores_parked_sibling() {
+        check_watcher_overflow_refresh(true);
+    }
+
+    fn check_watcher_overflow_refresh(park_sibling: bool) {
         let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
-                30
-            )),
-            "a prior callgraph refresh worker should fully stop before this test"
-        );
 
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
@@ -4691,6 +4694,28 @@ mod watcher_filter_tests {
             false,
         );
 
+        let sibling = TempDir::new().unwrap();
+        let sibling_root = std::fs::canonicalize(sibling.path()).unwrap();
+        let sibling_source = sibling_root.join("sibling.ts");
+        let sibling_pending: aft::callgraph_store::PendingCallGraphStorePaths = Default::default();
+        if park_sibling {
+            std::fs::write(&sibling_source, "export function sibling() {}\n").unwrap();
+            aft::callgraph_store::set_callgraph_refresh_worker_test_open_failure(
+                sibling_root.clone(),
+                true,
+            );
+            // The shared worker processes this root first. Its failed open
+            // parks the paths before the overflow root's batch can start.
+            assert!(aft::callgraph_store::enqueue_callgraph_store_refresh(
+                storage.path().join("sibling-store"),
+                sibling_root.clone(),
+                vec![sibling_source.clone()],
+                sibling_pending.clone(),
+            ));
+        }
+
+        let (held, release) =
+            aft::callgraph_store::install_callgraph_refresh_worker_test_gate(root.clone());
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
             .send(WatcherDispatchEvent::RescanRequired(
@@ -4704,18 +4729,17 @@ mod watcher_filter_tests {
             None,
             "lost watcher events must be reconciled, not answered with a full rebuild"
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        while aft::callgraph_store::callgraph_refresh_worker_test_counts(&root).0 == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the reconcile never handed its changed paths to the refresh"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        held.recv_timeout(Duration::from_secs(20))
+            .expect("the reconcile never handed its changed paths to the refresh");
+        release.send(()).unwrap();
+        // A batch-start counter is not completion, and process-wide shutdown
+        // can report failure solely because another root has a parked refresh.
+        // Wait for this root's queue-idle notification before reading its edges.
         assert!(
-            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
-                20
-            )),
+            aft::callgraph_store::wait_for_process_callgraph_refresh_for_test(
+                &root,
+                Duration::from_secs(20)
+            ),
             "the reconcile refresh should finish"
         );
         assert_eq!(
@@ -4743,6 +4767,18 @@ mod watcher_filter_tests {
         cold_store.cold_build(&files).expect("cold build");
         let cold = cold_store.edge_snapshot().expect("cold edges");
         assert_eq!(refreshed, cold, "reconciled edges must equal a cold build");
+
+        if park_sibling {
+            assert!(sibling_pending.lock().contains(&sibling_source));
+            // Only fixture cleanup shuts the worker down. A parked sibling
+            // intentionally makes a process-wide shutdown report incomplete.
+            assert!(
+                !aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+                    Duration::from_secs(20)
+                )
+            );
+            aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&sibling_root);
+        }
     }
 
     #[test]
