@@ -709,7 +709,13 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         file: "search_index.rs",
         enclosing_item: "git_diff_within_path_limit",
         location_or_primitive: "WARM_GIT_DIFF_PATH_LIMIT",
-        reason: "bounds warm Git-diff admission only; an over-limit diff is rejected before path mutation and configure falls back to a full cold rebuild, so no agent-visible list is truncated",
+        reason: "bounds the union of warm Git-diff and disk-stale paths; over-limit refreshes are rejected before content reads and configure falls back to a full cold rebuild, so no agent-visible list is truncated",
+    },
+    ExclusionEntry {
+        file: "search_index.rs",
+        enclosing_item: "verify_file_mtimes_with_budget",
+        location_or_primitive: "changed_paths.len() > limit",
+        reason: "admission budget for disk-only changes and Git-diff paths; an over-budget refresh returns a cache miss for a permitted full rebuild, not a truncated agent-visible list",
     },
     ExclusionEntry {
         file: "commands/semantic_search/lexical_lane.rs",

@@ -92,6 +92,15 @@ pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blak
     if size > CONTENT_HASH_SIZE_CAP {
         return Ok(None);
     }
+    #[cfg(test)]
+    if let Some(probe) = verify_stat_probe(path) {
+        probe
+            .stats
+            .lock()
+            .unwrap()
+            .hash_reads
+            .push(path.to_path_buf());
+    }
     #[cfg(debug_assertions)]
     HASH_FILE_IF_SMALL_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(any(debug_assertions, test))]
@@ -313,22 +322,35 @@ pub(crate) fn verify_files_bounded<K: Send>(
     files: Vec<(K, PathBuf, FileFreshness)>,
     strategy: VerifyStrategy,
 ) -> Vec<(K, PathBuf, FreshnessVerdict)> {
-    fn verify_one<K>(
-        (key, path, cached): (K, PathBuf, FileFreshness),
-        strategy: VerifyStrategy,
-    ) -> (K, PathBuf, FreshnessVerdict) {
+    map_files_bounded(files, |(key, path, cached)| {
         let verdict = match strategy {
             VerifyStrategy::StatFirst => verify_file(&path, &cached),
             VerifyStrategy::Strict => verify_file_strict(&path, &cached),
         };
         (key, path, verdict)
-    }
+    })
+}
 
+/// Collect metadata without hashing so admission can precede all content reads.
+pub(crate) fn stat_files_bounded<K: Send>(
+    files: Vec<(K, PathBuf, FileFreshness)>,
+) -> Vec<(K, PathBuf, FileFreshness, Option<fs::Metadata>)> {
+    map_files_bounded(files, |(key, path, cached)| {
+        #[cfg(test)]
+        record_metadata_call(&path);
+        let metadata = fs::metadata(&path)
+            .ok()
+            .filter(|metadata| metadata.is_file());
+        (key, path, cached, metadata)
+    })
+}
+
+fn map_files_bounded<K: Send, V: Send>(
+    files: Vec<(K, PathBuf, FileFreshness)>,
+    map: impl Fn((K, PathBuf, FileFreshness)) -> V + Send + Sync,
+) -> Vec<V> {
     if files.len() <= 1 {
-        return files
-            .into_iter()
-            .map(|file| verify_one(file, strategy))
-            .collect();
+        return files.into_iter().map(map).collect();
     }
 
     #[cfg(test)]
@@ -357,12 +379,9 @@ pub(crate) fn verify_files_bounded<K: Send>(
             let files = files.into_par_iter();
             #[cfg(test)]
             let files = files.with_min_len(min_len);
-            files.map(|file| verify_one(file, strategy)).collect()
+            files.map(map).collect()
         }),
-        None => files
-            .into_iter()
-            .map(|file| verify_one(file, strategy))
-            .collect(),
+        None => files.into_iter().map(map).collect(),
     }
 }
 
@@ -467,6 +486,7 @@ static WATCHED_VERIFY_STATS: OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Arc<Ver
 #[derive(Default)]
 pub(crate) struct VerifyStatWatch {
     pub(crate) calls: Vec<(PathBuf, std::thread::ThreadId)>,
+    pub(crate) hash_reads: Vec<PathBuf>,
     pub(crate) pool_size: Option<usize>,
     pub(crate) concurrent: bool,
 }

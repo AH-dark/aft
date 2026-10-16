@@ -5,5 +5,5 @@
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "Changed-HEAD search caches use the bounded warm-load lane for at most 512 changed paths; larger diffs fall back to the existing cold-build permit and full refresh. Scoring and routing are unchanged; benchmark rows must remain byte-identical."
+  "note": "Search caches admit at most 512 unique Git-diff and metadata-stale paths in the warm-load lane, including same-HEAD reloads. Admission uses metadata before reading content; larger refreshes fall back to the existing cold-build permit and full refresh. Strict verification retains its existing matching-metadata hash checks. Scoring and routing are unchanged; benchmark rows must remain byte-identical."
 }

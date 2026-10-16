@@ -4994,7 +4994,7 @@ fn schedule_artifact_loads_admitted(
                 let baseline = SearchIndex::read_from_disk(&cache_dir, &root_for_search);
                 let mut persist_to_disk = true;
                 let mut record_completed_verify = true;
-                let mut index = match baseline {
+                let refreshed = match baseline {
                     Some(mut index)
                         if index.stored_git_head() == current_head.as_deref()
                             && index.configured_max_file_size() == search_index_max_file_size =>
@@ -5005,6 +5005,7 @@ fn schedule_artifact_loads_admitted(
                                 index.set_ready(true);
                                 persist_to_disk = false;
                                 record_completed_verify = false;
+                                Some(index)
                             }
                             WarmVerifyPlan::StatFirst | WarmVerifyPlan::Strict => {
                                 let strategy = match verify_plan {
@@ -5012,14 +5013,18 @@ fn schedule_artifact_loads_admitted(
                                     WarmVerifyPlan::Strict => VerifyStrategy::Strict,
                                     WarmVerifyPlan::Skip => unreachable!(),
                                 };
-                                let disk_changed = index.verify_against_disk_with_strategy(
-                                    current_head.clone(),
-                                    strategy,
-                                );
-                                persist_to_disk = disk_changed || index.has_pending_disk_changes();
+                                index
+                                    .verify_against_disk_with_warm_budget(
+                                        current_head.clone(),
+                                        strategy,
+                                    )
+                                    .map(|disk_changed| {
+                                        persist_to_disk =
+                                            disk_changed || index.has_pending_disk_changes();
+                                        index
+                                    })
                             }
                         }
-                        index
                     }
                     baseline => {
                         let strategy = match verify_plan {
@@ -5028,9 +5033,8 @@ fn schedule_artifact_loads_admitted(
                                 VerifyStrategy::StatFirst
                             }
                         };
-                        // A different HEAD can still reuse the saved index through
-                        // git's file delta. Only a full rebuild needs a cold slot.
-                        let refreshed = baseline.and_then(|baseline| {
+                        // Git-diff paths and disk-only changes share one warm budget.
+                        baseline.and_then(|baseline| {
                             SearchIndex::refresh_cached_with_strategy(
                                 baseline,
                                 &root_for_search,
@@ -5038,43 +5042,41 @@ fn schedule_artifact_loads_admitted(
                                 current_head.clone(),
                                 strategy,
                             )
-                        });
-                        if let Some(index) = refreshed {
-                            index
-                        } else {
-                            drop(warm_permit.take());
-                            // No reusable cache remains. A full project build still
-                            // shares the process-wide limit with embedding builds.
-                            let Some(_permit) =
-                            crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-                                &search_cold_build_limiter,
-                                "search index post-configure load",
-                                &root_for_search,
-                                || {
-                                    search_lifecycle.is_current(
-                                        search_generation_flag.as_ref(),
-                                        search_generation,
-                                    )
-                                },
-                            )
-                        else {
-                            return;
-                        };
-                            if search_persist_epoch_flag.current() != search_persist_epoch {
-                                return;
-                            }
-                            let index = SearchIndex::rebuild_or_refresh_with_strategy(
-                                &root_for_search,
-                                search_index_max_file_size,
-                                current_head,
-                                None,
-                                Some(&cache_dir),
-                                strategy,
-                            );
-                            delay_search_rebuild_publish_for_debug();
-                            index
-                        }
+                        })
                     }
+                };
+                let mut index = if let Some(index) = refreshed {
+                    index
+                } else {
+                    drop(warm_permit.take());
+                    // Incompatible or over-budget refreshes share the cold-build
+                    // limit with embedding builds, including same-HEAD disk edits.
+                    let Some(_permit) =
+                        crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                            &search_cold_build_limiter,
+                            "search index post-configure load",
+                            &root_for_search,
+                            || {
+                                search_lifecycle
+                                    .is_current(search_generation_flag.as_ref(), search_generation)
+                            },
+                        )
+                    else {
+                        return;
+                    };
+                    if search_persist_epoch_flag.current() != search_persist_epoch {
+                        return;
+                    }
+                    let index = SearchIndex::rebuild_or_refresh_with_strategy(
+                        &root_for_search,
+                        search_index_max_file_size,
+                        current_head,
+                        None,
+                        Some(&cache_dir),
+                        VerifyStrategy::StatFirst,
+                    );
+                    delay_search_rebuild_publish_for_debug();
+                    index
                 };
                 // Once admitted, a build may finish generation-safe disk
                 // persistence after its last route closes. This avoids throwing
@@ -15707,15 +15709,35 @@ mod tests {
 
     #[test]
     fn owner_changed_head_diff_at_512_paths_stays_in_warm_lane() {
-        changed_head_diff_admission(512, false);
+        changed_head_diff_admission(512, 0, false);
     }
 
     #[test]
     fn owner_changed_head_diff_over_512_paths_requests_cold_slot() {
-        changed_head_diff_admission(513, true);
+        changed_head_diff_admission(513, 0, true);
     }
 
-    fn changed_head_diff_admission(changed_paths: usize, expect_cold: bool) {
+    #[test]
+    fn owner_changed_head_with_over_budget_local_changes_requests_cold_slot() {
+        changed_head_diff_admission(1, 513, true);
+    }
+
+    #[test]
+    fn owner_changed_head_combined_512_paths_stays_in_warm_lane() {
+        changed_head_diff_admission(1, 511, false);
+    }
+
+    #[test]
+    fn owner_changed_head_combined_513_paths_requests_cold_slot() {
+        changed_head_diff_admission(1, 512, true);
+    }
+
+    #[test]
+    fn owner_same_head_over_budget_local_changes_requests_cold_slot() {
+        changed_head_diff_admission(0, 513, true);
+    }
+
+    fn changed_head_diff_admission(changed_paths: usize, local_changes: usize, expect_cold: bool) {
         let _artifact_guard = artifact_owner_test_lock();
         let _env_lock = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -15726,16 +15748,33 @@ mod tests {
             "pub fn limiter_fixture_marker() {}\n",
         )
         .unwrap();
+        // Half of the local changes replace cached files; the rest are untracked.
+        for ordinal in 0..local_changes.div_ceil(2) {
+            std::fs::write(
+                root.path().join(format!("local_{ordinal}.rs")),
+                "pub fn original_local() {}\n",
+            )
+            .unwrap();
+        }
         init_git_fixture(root.path());
         persist_search_index_fixture(root.path(), storage.path());
         for ordinal in 0..changed_paths {
             std::fs::write(
                 root.path().join(format!("added_{ordinal}.rs")),
-                format!("pub fn added_{ordinal}() {{}}\n"),
+                format!("pub fn added_{ordinal}() {{ /* CommittedAdmissionNeedle */ }}\n"),
             )
             .unwrap();
         }
-        git_commit_all(root.path(), "changed search files");
+        if changed_paths > 0 {
+            git_commit_all(root.path(), "changed search files");
+        }
+        for ordinal in 0..local_changes {
+            std::fs::write(
+                root.path().join(format!("local_{ordinal}.rs")),
+                format!("pub fn local_{ordinal}() {{ /* LocalAdmissionNeedle */ }}\n"),
+            )
+            .unwrap();
+        }
         let ctx = test_context();
         ctx.update_config(|config| {
             config.project_root = Some(root.path().to_path_buf());
@@ -15756,7 +15795,7 @@ mod tests {
             while limiter.census().queued.is_empty() {
                 assert!(
                     Instant::now() < deadline,
-                    "over-limit diff never requested a cold slot"
+                    "over-limit refresh never requested a cold slot"
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -15783,6 +15822,26 @@ mod tests {
                 .stored_git_head(),
             crate::search_index::current_git_head(root.path()).as_deref()
         );
+        let guard = ctx.search_index().read().unwrap();
+        let index = guard.as_ref().unwrap();
+        for (needle, prefix, count) in [
+            ("CommittedAdmissionNeedle", "added", changed_paths),
+            ("LocalAdmissionNeedle", "local", local_changes),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            let result = index.grep(needle, true, &[], &[], root.path(), count + 1);
+            let found: std::collections::BTreeSet<_> = result
+                .matches
+                .iter()
+                .map(|matched| matched.file.file_name().unwrap().to_owned())
+                .collect();
+            let expected = (0..count)
+                .map(|ordinal| std::ffi::OsString::from(format!("{prefix}_{ordinal}.rs")))
+                .collect();
+            assert_eq!(found, expected, "ready index must find {needle}");
+        }
     }
 
     #[test]

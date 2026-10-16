@@ -64,8 +64,8 @@ pub enum ExactEvidenceScope {
 }
 
 pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
-// Four warm workers can each apply at most 512 Git-diff paths. Larger branch
-// switches belong under the shared build limit, not the cheap disk-load lane.
+// The warm change budget admits at most 512 Git-diff or stat-stale paths.
+// Larger refreshes belong under the shared build limit, not the disk-load lane.
 const WARM_GIT_DIFF_PATH_LIMIT: usize = 512;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
@@ -2535,6 +2535,22 @@ impl SearchIndex {
         changed
     }
 
+    pub(crate) fn verify_against_disk_with_warm_budget(
+        &mut self,
+        current_head: Option<String>,
+        verify_strategy: cache_freshness::VerifyStrategy,
+    ) -> Option<bool> {
+        let changed = verify_file_mtimes_with_budget(
+            self,
+            verify_strategy,
+            HashSet::new(),
+            WARM_GIT_DIFF_PATH_LIMIT,
+        )?;
+        self.git_head = current_head;
+        self.ready = true;
+        Some(changed)
+    }
+
     /// Bring a borrowed (read-only) snapshot in line with the files that are
     /// actually on disk under this index's root, entirely in RAM.
     ///
@@ -2764,6 +2780,23 @@ impl SearchIndex {
         }
         baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
 
+        if let Some(limit) = max_changed_paths {
+            let diff_paths = if baseline.git_head == current_head || current_head.is_none() {
+                HashSet::new()
+            } else {
+                git_diff_paths(
+                    &baseline.project_root,
+                    baseline.git_head.as_deref()?,
+                    current_head.as_deref()?,
+                    Some(limit),
+                )?
+            };
+            verify_file_mtimes_with_budget(&mut baseline, verify_strategy, diff_paths, limit)?;
+            baseline.git_head = current_head;
+            baseline.ready = true;
+            return Some(baseline);
+        }
+
         if baseline.git_head == current_head || current_head.is_none() {
             // HEAD matches, but files may have changed on disk since the index was
             // last written (e.g., uncommitted edits, stash pop, manual file changes
@@ -2779,13 +2812,7 @@ impl SearchIndex {
 
         if let (Some(previous), Some(current)) = (baseline.git_head.clone(), current_head.clone()) {
             let project_root = baseline.project_root.clone();
-            if apply_git_diff_updates(
-                &mut baseline,
-                &project_root,
-                &previous,
-                &current,
-                max_changed_paths,
-            ) {
+            if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current, None) {
                 baseline.git_head = Some(current);
                 let _ = verify_file_mtimes(&mut baseline, verify_strategy);
                 baseline.ready = true;
@@ -4081,16 +4108,26 @@ fn read_search_corpus_file_inner(
         return SearchCorpusEligibility::Skipped;
     }
     #[cfg(test)]
+    cache_freshness::record_metadata_call(path);
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
+        _ => return SearchCorpusEligibility::Skipped,
+    };
+    read_search_corpus_file_with_metadata(path, max_file_size, classify_generated, metadata)
+}
+
+fn read_search_corpus_file_with_metadata(
+    path: &Path,
+    max_file_size: u64,
+    classify_generated: bool,
+    metadata: SearchFileMetadata,
+) -> SearchCorpusEligibility {
+    #[cfg(test)]
     AUDIT_IO_PROBE.with(|probe| {
         if let Some(probe) = probe.borrow_mut().as_mut() {
             probe();
         }
     });
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
-        _ => return SearchCorpusEligibility::Skipped,
-    };
-
     if metadata.size > max_file_size {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
@@ -7665,6 +7702,117 @@ where
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+/// Admit the union of Git-diff paths and disk-only changes before reading content.
+/// Keep the stat results for verification and indexing so neither pass re-reads files.
+fn verify_file_mtimes_with_budget(
+    index: &mut SearchIndex,
+    verify_strategy: cache_freshness::VerifyStrategy,
+    mut changed_paths: HashSet<PathBuf>,
+    limit: usize,
+) -> Option<bool> {
+    let current_files = walk_project_files_from_inner(
+        &index.project_root,
+        &index.project_root,
+        &PathFilters::default(),
+        None,
+        false,
+    )
+    .expect("unbounded project walk cannot exceed a file limit");
+    let current_file_set: HashSet<_> = current_files.iter().collect();
+    let mut removed_paths = Vec::new();
+    let mut to_stat = Vec::new();
+    for (file_id, entry) in index.files.iter().enumerate() {
+        if entry.path.as_os_str().is_empty() {
+            continue;
+        }
+        if !current_file_set.contains(&entry.path) {
+            removed_paths.push(entry.path.clone());
+            changed_paths.insert(entry.path.clone());
+        } else {
+            to_stat.push((
+                file_id,
+                entry.path.clone(),
+                FileFreshness {
+                    mtime: entry.modified,
+                    size: entry.size,
+                    content_hash: entry.content_hash,
+                },
+            ));
+        }
+    }
+    let new_paths: Vec<_> = current_files
+        .iter()
+        .filter(|path| !index.path_to_id.contains_key(*path))
+        .cloned()
+        .collect();
+    changed_paths.extend(new_paths.iter().cloned());
+    let stats = cache_freshness::stat_files_bounded(to_stat);
+    for (_, path, cached, metadata) in &stats {
+        if metadata.as_ref().is_none_or(|metadata| {
+            metadata.len() != cached.size
+                || metadata.modified().unwrap_or(UNIX_EPOCH) != cached.mtime
+        }) {
+            changed_paths.insert(path.clone());
+        }
+    }
+    if changed_paths.len() > limit {
+        return None;
+    }
+
+    let mut changed = false;
+    let mut canonical_parents = ParentCanonicalizationMemo::default();
+    for path in removed_paths {
+        index.remove_file_with_canonicalization_memo(&path, &mut canonical_parents);
+        changed = true;
+    }
+    for (file_id, path, cached, metadata) in stats {
+        // Strict verification also detects edits with restored size and mtime.
+        // Preserve those hash checks even when the stat pass found no changes.
+        if !changed_paths.contains(&path)
+            && verify_strategy == cache_freshness::VerifyStrategy::StatFirst
+        {
+            continue;
+        }
+        let file = match metadata {
+            Some(metadata) => read_search_corpus_file_with_metadata(
+                &path,
+                index.max_file_size,
+                false,
+                search_file_metadata(&metadata),
+            ),
+            None => SearchCorpusEligibility::Skipped,
+        };
+        let file = match file {
+            SearchCorpusEligibility::Eligible(file) => {
+                let content_hash = cache_freshness::hash_bytes(&file.bytes);
+                if content_hash == cached.content_hash {
+                    if file.metadata.modified != cached.mtime || file.metadata.size != cached.size {
+                        let entry = &mut Arc::make_mut(&mut index.files)[file_id];
+                        entry.modified = file.metadata.modified;
+                        entry.size = file.metadata.size;
+                        changed = true;
+                    }
+                    continue;
+                }
+                PreparedSearchPath::Indexed(PreparedIndexedFile {
+                    metadata: file.metadata,
+                    content_hash,
+                    trigram_map: trigram_filter_map(&file.bytes, true),
+                })
+            }
+            SearchCorpusEligibility::Unindexed(metadata) => PreparedSearchPath::Unindexed(metadata),
+            SearchCorpusEligibility::Skipped => PreparedSearchPath::Skipped,
+        };
+        index.apply_search_update(PreparedSearchUpdate { path, file });
+        changed = true;
+    }
+    for path in new_paths {
+        index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
+        changed = true;
+    }
+    Some(changed)
+}
+
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
 /// since the index was last written. Also detect new files and deleted files.
 fn verify_file_mtimes(
@@ -8006,15 +8154,14 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn apply_git_diff_updates(
-    index: &mut SearchIndex,
+fn read_git_diff(
     root: &Path,
     from: &str,
     to: &str,
     max_changed_paths: Option<usize>,
-) -> bool {
+) -> Option<String> {
     if !crate::developer_tools::git_usable() {
-        return false;
+        return None;
     }
     let diff_range = format!("{}..{}", from, to);
     let output = match crate::effective_path::new_command("git")
@@ -8024,19 +8171,53 @@ fn apply_git_diff_updates(
         .output()
     {
         Ok(output) => output,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     if !output.status.success() {
-        return false;
+        return None;
     }
 
     let Ok(diff) = String::from_utf8(output.stdout) else {
-        return false;
+        return None;
     };
     if max_changed_paths.is_some_and(|limit| !git_diff_within_path_limit(&diff, limit)) {
-        return false;
+        return None;
     }
+    Some(diff)
+}
+
+fn git_diff_paths(
+    root: &Path,
+    from: &str,
+    to: &str,
+    max_changed_paths: Option<usize>,
+) -> Option<HashSet<PathBuf>> {
+    let diff = read_git_diff(root, from, to, max_changed_paths)?;
+    let mut canonical_parents = ParentCanonicalizationMemo::default();
+    let mut paths = HashSet::new();
+    for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for path in line.split('\t').skip(1) {
+            if let Some(path) =
+                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
+            {
+                paths.insert(path);
+            }
+        }
+    }
+    Some(paths)
+}
+
+fn apply_git_diff_updates(
+    index: &mut SearchIndex,
+    root: &Path,
+    from: &str,
+    to: &str,
+    max_changed_paths: Option<usize>,
+) -> bool {
+    let Some(diff) = read_git_diff(root, from, to, max_changed_paths) else {
+        return false;
+    };
     let mut canonical_parents = ParentCanonicalizationMemo::default();
 
     for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -11726,6 +11907,103 @@ mod tests {
 #[cfg(test)]
 mod warm_reload_verification_tests {
     use super::*;
+
+    #[test]
+    fn warm_refresh_rejects_local_changes_before_source_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let touched = root.join("touched.rs");
+        fs::write(&touched, "fn before() {}\n").unwrap();
+        fs::write(root.join("resized.rs"), "fn before() {}\n").unwrap();
+        let baseline = SearchIndex::build(&root);
+        fs::write(&touched, "fn afterx() {}\n").unwrap();
+        filetime::set_file_mtime(&touched, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        fs::write(root.join("resized.rs"), "fn local_resize() {}\n").unwrap();
+        fs::write(root.join("new.rs"), "fn local_new() {}\n").unwrap();
+
+        audit_work_reset();
+        let watch = cache_freshness::watch_verify_stats(
+            &root,
+            cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+        );
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            baseline,
+            &root,
+            DEFAULT_MAX_FILE_SIZE,
+            None,
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(2),
+        );
+        assert!(
+            refreshed.is_none(),
+            "three local changes exceed the two-path budget"
+        );
+        assert_eq!(
+            audit_work().corpus_opens,
+            0,
+            "admission must precede source reads"
+        );
+        assert!(watch.take_stats().hash_reads.is_empty());
+    }
+
+    #[test]
+    fn warm_refresh_reads_admitted_local_changes_once() {
+        for (strategy, preserve_mtime) in [
+            (cache_freshness::VerifyStrategy::StatFirst, false),
+            (cache_freshness::VerifyStrategy::Strict, false),
+            (cache_freshness::VerifyStrategy::Strict, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(dir.path()).unwrap();
+            let path = root.join("changed.rs");
+            fs::write(&path, "fn before() {}\n").unwrap();
+            let baseline = SearchIndex::build(&root);
+            let original_mtime =
+                filetime::FileTime::from_last_modification_time(&fs::metadata(&path).unwrap());
+            fs::write(&path, "fn afterx() {}\n").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                if preserve_mtime {
+                    original_mtime
+                } else {
+                    filetime::FileTime::from_unix_time(1, 0)
+                },
+            )
+            .unwrap();
+            audit_work_reset();
+            let watch = cache_freshness::watch_verify_stats(
+                &root,
+                cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+            );
+            let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                baseline,
+                &root,
+                DEFAULT_MAX_FILE_SIZE,
+                None,
+                strategy,
+                Some(1),
+            )
+            .expect("one local change fits the budget");
+            assert_eq!(audit_work().corpus_opens, 1);
+            let stats = watch.take_stats();
+            assert_eq!(
+                stats.calls.len(),
+                1,
+                "reuse the admission stat for indexing"
+            );
+            assert!(
+                stats.hash_reads.is_empty(),
+                "verification must reuse the content read for indexing"
+            );
+            assert_eq!(
+                refreshed
+                    .grep("afterx", true, &[], &[], &root, 10)
+                    .matches
+                    .len(),
+                1
+            );
+        }
+    }
 
     #[test]
     fn warm_verify_uses_bounded_workers_and_one_stat_per_indexed_file() {
