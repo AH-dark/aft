@@ -462,7 +462,18 @@ thread_local! {
 fn delay_watcher_unit_for_test() {
     let delay = WATCHER_UNIT_TEST_DELAY.with(std::cell::Cell::get);
     if !delay.is_zero() {
-        thread::sleep(delay);
+        // Advance an injected clock without sleeping when a test pins slice timing.
+        let advanced = WATCHER_DRAIN_TEST_NOW.with(|clock| {
+            if let Some(now) = clock.get() {
+                clock.set(Some(now + delay));
+                true
+            } else {
+                false
+            }
+        });
+        if !advanced {
+            thread::sleep(delay);
+        }
     }
 }
 
@@ -8455,6 +8466,7 @@ mod watcher_slice_tests {
 
     #[test]
     fn owner_root_still_uses_normal_path_when_overlay_gate_is_on() {
+        let _clock = WatcherDrainTestClock::freeze();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(root.path());
@@ -8475,7 +8487,21 @@ mod watcher_slice_tests {
 
         std::fs::write(&file, "new owner token\n").expect("edit source");
         tx.send(WatcherDispatchEvent::Paths(vec![file])).unwrap();
+        // A loaded runner may yield before the search phase even for one file.
+        // Force that continuation so the owner assertions cannot rely on one slice.
+        set_watcher_unit_test_seam(WATCHER_DRAIN_SLICE_BUDGET, None);
         drain_watcher_events(&ctx);
+        clear_watcher_unit_test_seam();
+        assert!(ctx.watcher_drain_has_work());
+        assert_eq!(grep_count(&ctx, "new owner token", &canonical), 0);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while ctx.watcher_drain_has_work() {
+            assert!(
+                Instant::now() < deadline,
+                "owner watcher drain did not finish"
+            );
+            drain_watcher_events(&ctx);
+        }
         assert_eq!(grep_count(&ctx, "new owner token", &canonical), 1);
         assert_eq!(grep_count(&ctx, "old owner token", &canonical), 0);
 
