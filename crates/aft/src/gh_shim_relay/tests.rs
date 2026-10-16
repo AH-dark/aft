@@ -703,6 +703,61 @@ fn an_unstamped_route_is_refused_before_any_call() {
     );
 }
 
+#[test]
+fn v19_pr_ready_without_a_bot_identity_is_refused_before_any_call() {
+    let live =
+        crate::gh_shim_ticket::ScopedTicket::issue("ses-ready-no-bot", "call-ready-no-bot", "/p");
+    for scope in [None, Some(stamp(None, true, true))] {
+        for undo in [false, true] {
+            let transport = FakeTransport::scoped();
+            let mut params = bot_params(live.value().unwrap(), "nonce-ready-no-bot");
+            params["request"] = json!({
+                "operation": "gh.route", "gh_route_schema": 1,
+                "verb": "pr ready", "repository": "cortexkit/aft", "number": "7",
+                "undo": undo, "manifest_version": 19,
+                "metadata": { "agent_id": "agent-fixture" }
+            });
+            let (reply, _) = run_with_scopes(
+                &transport,
+                BOT_REQUEST_OPERATION,
+                params,
+                &scopes_for("ses-ready-no-bot", scope.clone()),
+            );
+            assert!(!reply.ok);
+            assert_eq!(reply.data["refusal_code"], "bot_write_requires_scope");
+            assert_eq!(reply.data["stage"], "scope");
+            assert_eq!(reply.data["action"], "pr ready");
+            assert!(transport.calls().is_empty());
+        }
+    }
+}
+
+#[test]
+fn v19_pr_ready_is_forwarded_unchanged_under_the_callers_bot_scope() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-ready", "call-ready", "/p");
+    for undo in [false, true] {
+        let transport = FakeTransport::scoped();
+        let request = json!({
+            "operation": "gh.route", "gh_route_schema": 1,
+            "verb": "pr ready", "repository": "cortexkit/aft", "number": "7",
+            "undo": undo, "manifest_version": 19,
+            "metadata": { "agent_id": "agent-fixture" }
+        });
+        let (reply, _) = run_with_scopes(
+            &transport,
+            BOT_REQUEST_OPERATION,
+            json!({"ticket": live.value().unwrap(), "request_nonce": "nonce-ready", "request": request}),
+            &scopes_for("ses-ready", Some(delegating_stamp())),
+        );
+        assert!(reply.ok, "{:?}", reply.data);
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "ses-ready");
+        assert_eq!(calls[0].2["arguments"]["request"], request);
+        assert!(transport.plexus_scopes()[0].is_some());
+    }
+}
+
 /// A stamp that does not let plexus act as its agent (not delegating, an
 /// owner the daemon does not trust with agent identity, or no agent) is
 /// refused exactly as an unstamped route is.

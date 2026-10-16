@@ -1,0 +1,33 @@
+{
+  "manifest_version": 19,
+  "tiers": {
+    "governed": [
+      { "tuple": "pr ready", "platform": ["macos", "linux"] }
+    ],
+    "admin": [
+      { "tuple": "repo rename", "platform": ["macos", "linux"] },
+      { "tuple": "repo create", "platform": ["macos", "linux"] }
+    ]
+  },
+  "api_rules": [
+    {
+      "method": "PUT",
+      "path_glob": "/repos/*/*/private-vulnerability-reporting",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    },
+    {
+      "method": "DELETE",
+      "path_glob": "/repos/*/*/private-vulnerability-reporting",
+      "tier": "admin",
+      "platform": ["macos", "linux"]
+    }
+  ],
+  "canonicalization": {
+    "pr ready": {
+      "argv_forms": ["target-and-state"],
+      "target_fields": ["number"],
+      "body_fields": ["undo"]
+    }
+  }
+}

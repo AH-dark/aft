@@ -146,10 +146,13 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 | **`issue create`** | **SPEECH-AS-BOT** | **v14** |
 | **`api` PATCH `/repos/*/*/issues/comments/*`** | **SPEECH-AS-BOT** | **v14** |
 | **`pr create`** (same-repository head, `--base` required) | **SPEECH-AS-BOT** | **v16** |
+| `pr ready` (including `--undo`) | SPEECH-AS-BOT | v19 |
 | `pr merge`, `release create` | ADMINISTRATION | v1 |
 | `repo edit`, `run delete` | ADMINISTRATION | v9 |
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
 | `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
+| `repo rename`, `repo create` | ADMINISTRATION-AS-OPERATOR | v19 |
+| `api` PUT and DELETE `/repos/*/*/private-vulnerability-reporting` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `release edit`, `release upload` | ADMINISTRATION | v13 |
 | `api` PUT and DELETE `/repos/*/*/branches/*/protection` | ADMINISTRATION | v13 |
 | **`issue edit`, label flags only, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
@@ -267,6 +270,50 @@ Prepare the unsigned payload from the unsigned v15 bytes with
 to `.alfonso/ceremonies/gh-routing-manifest-v16/` by default and prints the
 SHA-256. It adds the one row and its canonicalization and keeps every other
 byte of v15.
+
+## The v19 rows
+
+`pr ready` changes a pull request's public state as the calling session's bot,
+like `pr close` and `pr reopen`; it never uses the operator's credentials on the
+bound-repository path, even with the bypass set. It requires a bot-bound target
+and a session that delegates its bot identity. `--undo` marks the pull request as
+a draft again. The governed form takes one pull request positional and optional
+`--repo`/`-R`, plus the boolean `--undo`; other flags are refused. As with the
+other thread-state verbs, a missing positional is refused rather than guessing
+from the current branch.
+
+The canonicalization is `argv_forms: ["target-and-state"]`,
+`target_fields: ["number"]`, `body_fields: ["undo"]`. The daemon receives the
+thread-state wire shape with `verb: "pr ready"`, `repository`, `number`, and
+`undo: false` by default or `undo: true` for `--undo`, alongside the usual
+schema, manifest-version, rung and metadata fields. The relay preserves the
+request and the caller's scoped identity; the GitHub route holder must support
+this verb and boolean before activation.
+
+`repo rename`, `repo create`, and the PUT/DELETE private vulnerability reporting
+setting run only as administration under `GH_SHIM_BYPASS=operator`, with the audit
+synced before upstream execution. A new repository cannot already be bot-bound:
+`repo create` therefore takes the existing account-write refusal and audited
+operator bypass, including from a bound checkout. There is no unapproved create
+exception. These commands do not enter the bot-speech relay.
+
+The API setting matches exactly `/repos/<owner>/<repo>/private-vulnerability-reporting`
+(with or without the leading slash in argv). Neither nested or neighbouring
+paths nor POST/PATCH inherit its allowance. Field-free GET remains a mechanical
+read. Both the tuple declarations and these API write rules require manifest
+version 19 or later; adding code does not activate them.
+
+The exact additive JSON fields are recorded in the synthetic
+`crates/aft/tests/fixtures/gh_shim/v19-additions.json` fixture: append the rows to
+the corresponding arrays of the trusted unsigned v18 payload, add the
+`canonicalization["pr ready"]` entry, and set `manifest_version` to `19`.
+Preserve all existing declarations and bindings. The fixture is an additions
+fragment, not a complete production manifest and not signing material. CKCRED
+signs the exact UTF-8 bytes of the complete reviewed unsigned payload; envelope
+version 2 carries the complete payload verbatim as a JSON string in
+`manifest_bytes` and the base64-encoded Ed25519 signature in `signature`. Do not
+re-serialize after signing. No signed envelope, production identity, or activation
+artifact is part of this change.
 
 ## Operator label rows (v14)
 
