@@ -6892,6 +6892,7 @@ struct ConfigureTailStageGate {
     stage: &'static str,
     reached: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
+    worker: Option<(thread::JoinHandle<()>, crossbeam_channel::Receiver<()>)>,
 }
 
 #[cfg(test)]
@@ -6908,8 +6909,34 @@ pub(crate) struct ConfigureTailStageGateGuard {
 }
 
 #[cfg(test)]
+impl ConfigureTailStageGateGuard {
+    pub(crate) fn join_storage_sweep_worker(&self) {
+        let worker = configure_tail_stage_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter_mut()
+            .find(|gate| gate.root == self.root)
+            .and_then(|gate| gate.worker.take());
+        if let Some((worker, finished)) = worker {
+            // The storage stage outlives the executor's tail response. Reap its
+            // worker before the test removes the root and storage directories.
+            let completed = finished.recv_timeout(Duration::from_secs(30));
+            if completed.is_ok() {
+                let result = worker.join();
+                if !thread::panicking() {
+                    result.expect("storage sweep worker panicked");
+                }
+            } else if !thread::panicking() {
+                panic!("storage sweep worker did not finish: {completed:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 impl Drop for ConfigureTailStageGateGuard {
     fn drop(&mut self) {
+        self.join_storage_sweep_worker();
         configure_tail_stage_gates()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6940,6 +6967,7 @@ pub(crate) fn gate_configure_tail_stage_for_test(
             stage,
             reached: reached_tx,
             release: release_rx,
+            worker: None,
         });
     (ConfigureTailStageGateGuard { root }, reached_rx, release_tx)
 }
@@ -6954,7 +6982,13 @@ fn wait_on_configure_tail_stage_gate_for_test(root: &Path, stage: ConfigureMaint
         .map(|gate| (gate.reached.clone(), gate.release.clone()));
     if let Some((reached, release)) = gate {
         let _ = reached.try_send(());
-        let _ = release.recv_timeout(Duration::from_secs(60));
+        if matches!(stage, ConfigureMaintenanceStage::StorageSweeps) {
+            // Only the test may release the sweep: a timer must not let an
+            // admission reply pass after the supposedly held worker resumes.
+            let _ = release.recv();
+        } else {
+            let _ = release.recv_timeout(Duration::from_secs(60));
+        }
     }
 }
 
@@ -7804,7 +7838,9 @@ fn spawn_configure_storage_sweeps(
     let harness = job.harness.clone();
     let session = Some(job.session_id.clone());
     let thread_name = format!("aft-storage-sweep-{}", std::process::id());
-    if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
+    #[cfg(test)]
+    let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+    let worker = thread::Builder::new().name(thread_name).spawn(move || {
         log_ctx::with_session(session, || {
             wait_on_configure_tail_stage_gate_for_test(
                 &root,
@@ -7816,8 +7852,27 @@ fn spawn_configure_storage_sweeps(
                 run_configure_view_sweep(&view);
             }
         });
-    }) {
-        slog_warn!("failed to spawn configure storage maintenance thread: {error}");
+        #[cfg(test)]
+        let _ = finished_tx.send(());
+    });
+    match worker {
+        Ok(worker) => {
+            #[cfg(test)]
+            if let Some(gate) = configure_tail_stage_gates()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter_mut()
+                .find(|gate| {
+                    gate.root == job.canonical_cache_root && gate.stage == "storage_sweeps"
+                })
+            {
+                assert!(gate.worker.is_none(), "only one held storage sweep worker");
+                gate.worker = Some((worker, finished_rx));
+            }
+            #[cfg(not(test))]
+            drop(worker);
+        }
+        Err(error) => slog_warn!("failed to spawn configure storage maintenance thread: {error}"),
     }
 }
 

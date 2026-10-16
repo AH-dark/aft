@@ -300,6 +300,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/configure.rs",
+        enclosing_item: "join_storage_sweep_worker",
+        location_or_primitive: "Option .take()",
+        reason: "test-only handoff of the held storage sweep worker's join handle out of its gate, not a list",
+    },
+    ExclusionEntry {
+        file: "commands/configure.rs",
         enclosing_item: "view_working_tree_refresh_path",
         location_or_primitive: "max_examined .take()",
         reason: "startup verification of persisted view bytes, not a result list; reaching the iterator budget schedules a full background publication and refuses stale graph answers rather than treating partial verification as complete",
