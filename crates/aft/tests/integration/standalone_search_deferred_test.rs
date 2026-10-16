@@ -1246,6 +1246,7 @@ fn standalone_patch_move_delete_is_fresh_without_watcher_delivery() {
         fresh["matches"][0]["file"]
             .as_str()
             .unwrap()
+            .replace('\\', "/")
             .ends_with("src/moved.ts"),
         "{fresh:?}"
     );
