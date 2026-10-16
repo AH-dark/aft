@@ -833,11 +833,11 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "line": 122,
+      "line": 124,
       "column": 48,
       "token": "filePath",
-      "text": "normalize_path_alias_pair(object, \"path\", \"filePath\", false)",
-      "location": "line 122, column 48",
+      "text": "normalize_path_alias_pair(object, \"path\", \"filePath\", false)?;",
+      "location": "line 124, column 48",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -987,47 +987,58 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "line": 2510,
-      "column": 54,
+      "line": 2549,
+      "column": 35,
       "token": "filePath",
-      "text": "blank(obj.get(\"path\")) && blank(obj.get(\"filePath\")) && blank(obj.get(\"symbol\"))",
-      "location": "line 2510, column 54",
+      "text": "&& blank(obj.get(\"filePath\"))",
+      "location": "line 2549, column 35",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "line": 2604,
-      "column": 42,
+      "line": 3068,
+      "column": 34,
       "token": "filePath",
-      "text": "\"Provide exactly ONE of 'filePath' or 'url' — not both\",",
-      "location": "line 2604, column 42",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 3068, column 34",
       "ordinal": 1,
       "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+      "reason": "URL translation regression coverage verifies that the legacy filePath input behaves like canonical path."
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "line": 2690,
-      "column": 42,
+      "line": 3086,
+      "column": 30,
       "token": "filePath",
-      "text": "\"Provide exactly one of 'filePath', 'url', or 'targets'\",",
-      "location": "line 2690, column 42",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/subc_translate.rs",
-      "line": 2695,
-      "column": 42,
-      "token": "filePath",
-      "text": "\"Provide exactly ONE of 'filePath' or 'url' — not both\",",
-      "location": "line 2695, column 42",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 3086, column 30",
       "ordinal": 2,
       "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+      "reason": "Conflicting URL regression coverage verifies refusal for both legacy filePath and canonical path inputs."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 3121,
+      "column": 98,
+      "token": "filePath",
+      "text": "serde_json::json!({ \"targets\": [{ \"path\": url, \"url\": url, \"symbol\": \"Heading\" }, { \"filePath\": \"http://localhost/docs\", \"symbol\": \"Other\" }] }),",
+      "location": "line 3121, column 98",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Batched URL translation regression coverage retains a legacy filePath input alongside canonical targets."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 3159,
+      "column": 34,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 3159, column 34",
+      "ordinal": 3,
+      "class": "rust-compatibility",
+      "reason": "Read URL refusal regression coverage verifies the legacy filePath input receives the same explicit unsupported-URL error."
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
@@ -2328,6 +2339,17 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 633,
+      "column": 26,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 633, column 26",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The tool-call regression verifies unsupported HTTP reads are refused explicitly for canonical and legacy inputs."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
       "line": 600,
       "column": 19,
       "token": "filePath",
@@ -2369,6 +2391,28 @@
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/integration/url_fetch_test.rs",
+      "line": 124,
+      "column": 26,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\", \"url\"] {",
+      "location": "line 124, column 26",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The loopback HTTP regression verifies canonical path, legacy filePath, and explicit url inputs reach the same fetch handler."
+    },
+    {
+      "path": "crates/aft/tests/integration/url_fetch_test.rs",
+      "line": 171,
+      "column": 20,
+      "token": "filePath",
+      "text": "{ \"filePath\": url, \"url\": url, \"symbol\": \"Public extension interfaces\" },",
+      "location": "line 171, column 20",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The loopback HTTP batch regression retains a legacy filePath target to verify equal URL aliases describe one location."
     },
     {
       "path": "crates/aft/tests/integration/tool_call_parity_test.rs",
