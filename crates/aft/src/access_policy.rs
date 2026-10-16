@@ -43,31 +43,42 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
 }
 
 /// Worker library reads use daemon-owned roots, never a caller's environment.
-/// Snapshot real directories once so later symlink changes cannot widen a grant.
-pub(crate) fn worker_rust_read_grants() -> &'static [AccessGrant] {
-    static GRANTS: std::sync::LazyLock<Vec<AccessGrant>> = std::sync::LazyLock::new(|| {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from);
-        [
-            ("CARGO_HOME", ".cargo", "registry/src"),
-            ("RUSTUP_HOME", ".rustup", "toolchains"),
-        ]
-        .into_iter()
-        .filter_map(|(variable, default, subtree)| {
-            let root = crate::environment::non_empty_os_var(variable)
-                .map(PathBuf::from)
-                .or_else(|| home.as_ref().map(|home| home.join(default)))?;
-            let path = root.join(subtree).canonicalize().ok()?;
-            path.is_dir().then(|| AccessGrant {
-                path: crate::inspect::job::normalize_path(&path),
-                kind: GrantKind::Subtree,
-                operation: AccessOperation::Read,
-            })
-        })
-        .collect()
-    });
-    &GRANTS
+/// A root is pinned to its real directory the first time it resolves, so later
+/// symlink changes cannot widen a grant. A root that does not exist yet (no
+/// crate downloaded on a fresh machine) is retried on the next policy build
+/// instead of being skipped until AFT restarts.
+pub(crate) fn worker_rust_read_grants() -> Vec<AccessGrant> {
+    const ROOTS: [(&str, &str, &str); 2] = [
+        ("CARGO_HOME", ".cargo", "registry/src"),
+        ("RUSTUP_HOME", ".rustup", "toolchains"),
+    ];
+    static RESOLVED: std::sync::Mutex<[Option<AccessGrant>; 2]> =
+        std::sync::Mutex::new([None, None]);
+    let mut resolved = RESOLVED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (slot, (variable, default, subtree)) in resolved.iter_mut().zip(ROOTS) {
+        if slot.is_none() {
+            *slot = resolve_worker_rust_root(variable, default, subtree);
+        }
+    }
+    resolved.iter().flatten().cloned().collect()
+}
+
+fn resolve_worker_rust_root(variable: &str, default: &str, subtree: &str) -> Option<AccessGrant> {
+    let root = crate::environment::non_empty_os_var(variable)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(default))
+        })?;
+    let path = root.join(subtree).canonicalize().ok()?;
+    path.is_dir().then(|| AccessGrant {
+        path: crate::inspect::job::normalize_path(&path),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    })
 }
 
 /// Who answers an `ask` decision for the call running on this thread.

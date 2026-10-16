@@ -245,6 +245,29 @@ async fn worker_rust_home_overrides_are_canonical() {
 }
 
 #[tokio::test]
+async fn worker_registry_created_after_first_policy_is_granted() {
+    if !in_rust_home(
+        "worker_registry_created_after_first_policy_is_granted",
+        false,
+    ) {
+        return;
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = rust_fixture();
+    // A fresh machine has no registry/src until the first crate download.
+    let registry = cargo_root().join("registry/src");
+    let parked = cargo_root().join("registry/src-parked");
+    std::fs::rename(&registry, &parked).unwrap();
+    let other = cargo_root().join("credentials.toml");
+    let before = f.read(&f.worker, &other, 1).await;
+    assert_eq!(code(&before), "access_pending", "{before}");
+    std::fs::rename(&parked, &registry).unwrap();
+    let after = f.read(&f.worker, &registry.join("example/lib.rs"), 2).await;
+    assert_eq!(code(&after), "", "{after}");
+    assert!(text(&after).contains("rust_library_marker"), "{after}");
+}
+
+#[tokio::test]
 async fn worker_registry_symlink_escape_still_ask() {
     if !in_rust_home("worker_registry_symlink_escape_still_ask", false) {
         return;

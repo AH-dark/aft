@@ -328,7 +328,7 @@ pub(super) fn policy_for_scope(
     if store::is_worker(conn, key)? {
         policy
             .grants
-            .extend_from_slice(crate::access_policy::worker_rust_read_grants());
+            .extend(crate::access_policy::worker_rust_read_grants());
     }
     Ok(Some(policy))
 }

@@ -12313,7 +12313,7 @@ impl AppContext {
             if worker {
                 policy
                     .grants
-                    .extend_from_slice(crate::access_policy::worker_rust_read_grants());
+                    .extend(crate::access_policy::worker_rust_read_grants());
             }
             policy.mode = mode;
             if force_restrict {
