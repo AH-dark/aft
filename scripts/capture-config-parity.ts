@@ -442,6 +442,12 @@ const CASES: ParityCase[] = [
       user: { sandbox: { profile: { worker: "strict" } }, harnesses: { [harness]: { sandbox: { profile: { head: "relaxed" } } } } },
     },
     {
+      name: `sandbox_profiles_project_harness_deny_only_${harness}`,
+      harness,
+      user: { sandbox: { profile: { worker: "off", head: "relaxed" } } },
+      project: { harnesses: { [harness]: { sandbox: { read_deny: ["/tmp/aft-project-secret"] } } } },
+    },
+    {
       name: `sandbox_profiles_legacy_false_canonical_${harness}`,
       harness,
       user: { sandbox: { enabled: false, profile: { worker: "strict" } } },

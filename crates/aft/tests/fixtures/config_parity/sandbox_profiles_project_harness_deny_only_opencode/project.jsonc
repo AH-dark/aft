@@ -1,0 +1,11 @@
+{
+  "harnesses": {
+    "opencode": {
+      "sandbox": {
+        "read_deny": [
+          "/tmp/aft-project-secret"
+        ]
+      }
+    }
+  }
+}

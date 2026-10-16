@@ -514,6 +514,26 @@ describe("loadAftConfig", () => {
     expect(result.stderr).not.toContain("Ignoring sandbox.profile.head");
   });
 
+  test("project harness deny-only sandbox preserves missing role choices", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ sandbox: { profile: { worker: "off", head: "relaxed" } } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        harnesses: { opencode: { sandbox: { read_deny: ["/tmp/project-secret"] } } },
+      }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).sandbox.profile).toEqual({ worker: "off", head: "relaxed" });
+    expect(JSON.parse(result.stdout).sandbox.read_deny).toEqual(["/tmp/project-secret"]);
+  });
+
   test("git.co_author uses ordinary project-over-user precedence", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ git: { co_author: "auto" } }));

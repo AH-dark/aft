@@ -1104,7 +1104,9 @@ function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftCon
   const indexes = mergeIndexes(base.indexes, override.indexes, !trusted);
   if (indexes === undefined) delete merged.indexes;
   else merged.indexes = indexes;
-  merged.sandbox = mergeSandboxConfig(base.sandbox, override.sandbox, trusted);
+  // Apply harness values over this file's base values. Project-versus-user
+  // hardening happens later in mergeConfigs, after both files' harnesses are applied.
+  merged.sandbox = mergeSandboxConfig(base.sandbox, override.sandbox, true);
   if (!trusted && override.sandbox?.write_allow !== undefined) {
     // Retain the attempted grant until the project-tier warning names it.
     merged.sandbox = { ...merged.sandbox, write_allow: override.sandbox.write_allow };
@@ -1677,7 +1679,11 @@ function mergeSandboxConfig(
     worker: base?.profile?.worker ?? "relaxed",
     head: base?.profile?.head ?? "off",
   } as const;
-  const next = { ...profile };
+  // A harnesses.<name>.sandbox block must not invent a profile for an omitted role:
+  // that default could later override an explicit user choice during the project merge.
+  const next: NonNullable<SandboxConfig["profile"]> = trusted
+    ? { ...base?.profile }
+    : { ...profile };
   for (const role of ["worker", "head"] as const) {
     const requested = project?.profile?.[role];
     if (requested !== undefined && (trusted || order[requested] >= order[profile[role]]))

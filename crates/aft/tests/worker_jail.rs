@@ -130,12 +130,32 @@ impl Jail {
         profile: &str,
         standalone: bool,
     ) -> Self {
+        Self::start_with_layout(port, uds, pack_refs, profile, standalone, false).await
+    }
+
+    async fn start_with_layout(
+        port: Option<u16>,
+        uds: Option<&Path>,
+        pack_refs: bool,
+        profile: &str,
+        standalone: bool,
+        custom_layout: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let home = base.join("home");
         let main = base.join("main");
         let data = home.join(".local/share");
-        let worktree = data.join("cortexkit/alfonso/worktrees/0123456789abcdef/worker");
+        let worktree = if custom_layout {
+            home.join("Work")
+        } else {
+            data.join("cortexkit/alfonso/worktrees/0123456789abcdef/worker")
+        };
+        let sibling = if custom_layout {
+            worktree.join("sibling")
+        } else {
+            base.join("sibling")
+        };
         let other_repo = base.join("other-repo");
         let rustup = base.join("rustup");
         let xdg = base.join("xdg");
@@ -185,7 +205,7 @@ impl Jail {
                 "-q",
                 "-b",
                 "sibling",
-                base.join("sibling").to_str().unwrap(),
+                sibling.to_str().unwrap(),
             ],
         );
         std::fs::write(other_repo.join("README.md"), "other\n").unwrap();
@@ -282,7 +302,13 @@ impl Jail {
             pid: std::process::id(),
             daemon_ver: "worker-jail".into(),
         };
-        let connection_path = base.join("connection.json");
+        let connection_path = if custom_layout {
+            let auth = base.join("custom-relay/auth");
+            std::fs::create_dir_all(&auth).unwrap();
+            auth.join("connection.json")
+        } else {
+            base.join("connection.json")
+        };
         connection_file::write_atomic(&connection_path, &connection).unwrap();
         let mut command = Command::new(aft_binary::aft_binary());
         command
@@ -313,6 +339,14 @@ impl Jail {
         command
             .env_remove("SCCACHE_SERVER_PORT")
             .env_remove("SCCACHE_SERVER_UDS");
+        if custom_layout {
+            let cargo = base.join("custom-cargo");
+            std::fs::create_dir_all(&cargo).unwrap();
+            for name in ["credentials", "credentials.toml"] {
+                std::fs::write(cargo.join(name), "custom-cargo-secret").unwrap();
+            }
+            command.env("CARGO_HOME", cargo);
+        }
         if let Some(port) = port {
             command.env("SCCACHE_SERVER_PORT", port.to_string());
         }
@@ -500,6 +534,63 @@ impl Jail {
         self.tool("bash", json!({"command": command, "timeout": 300_000}))
             .await
     }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_denies_private_file_ancestor_rename() {
+    let mut jail = Jail::start_with_layout(None, None, true, "relaxed", false, true).await;
+    let auth = jail.base.join("custom-relay/auth");
+    let moved = jail.base.join("custom-relay/moved");
+    let before = std::fs::read(auth.join("connection.json")).unwrap();
+    let reply = jail
+        .bash(&format!(
+            "mv {} {}; cat {}/connection.json; cat {}/connection.json",
+            quote(&auth),
+            quote(&moved),
+            quote(&moved),
+            quote(&auth)
+        ))
+        .await;
+    assert!(reply.contains("Operation not permitted"), "{reply}");
+    assert!(!moved.exists(), "private ancestor was renamed: {reply}");
+    assert_eq!(std::fs::read(auth.join("connection.json")).unwrap(), before);
+    assert!(
+        !reply.contains("worker-jail"),
+        "credentials leaked: {reply}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_denies_custom_cargo_home_credentials() {
+    let mut jail = Jail::start_with_layout(None, None, true, "relaxed", false, true).await;
+    for name in ["credentials", "credentials.toml"] {
+        let path = jail.base.join("custom-cargo").join(name);
+        let reply = jail.bash(&format!("cat {}", quote(&path))).await;
+        assert!(reply.contains("Operation not permitted"), "{reply}");
+        assert!(!reply.contains("custom-cargo-secret"), "{reply}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_checkout_at_work_is_writable_but_sibling_is_not() {
+    let mut jail = Jail::start_with_layout(None, None, true, "relaxed", false, true).await;
+    assert_eq!(jail.worktree, jail.home.join("Work"));
+    let own = jail.worktree.join("own-write");
+    let sibling = jail.worktree.join("sibling/README.md");
+    let reply = jail
+        .bash(&format!(
+            "printf own > {} && echo OWN_WRITABLE; printf tamper >> {}",
+            quote(&own),
+            quote(&sibling)
+        ))
+        .await;
+    assert!(reply.contains("OWN_WRITABLE"), "{reply}");
+    assert_eq!(std::fs::read_to_string(own).unwrap(), "own");
+    assert!(reply.contains("Operation not permitted"), "{reply}");
+    assert_eq!(std::fs::read_to_string(sibling).unwrap(), "main\n");
 }
 
 #[cfg(target_os = "macos")]

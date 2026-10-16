@@ -1830,6 +1830,9 @@ fn build_relaxed_profile(
         ]
         .map(|path| home.join(path)),
     );
+    let (credential_denies, cargo_homes) =
+        relaxed_credential_paths(home, roots, |key| std::env::var_os(key));
+    read_deny.extend(credential_denies);
     let mut write_deny = read_deny.clone();
     write_deny.extend(
         [
@@ -1993,24 +1996,75 @@ fn build_relaxed_profile(
         cache_roots: Vec::new(),
         temp_dir: temp.to_path_buf(),
     };
-    profile.deny_prefixes.push(home.join(".cargo/credentials"));
-    // Resolve existing prefix matches too: a credentials file can itself be a
-    // symlink to a secret outside CARGO_HOME.
-    if let Ok(entries) = std::fs::read_dir(home.join(".cargo")) {
-        for entry in entries.flatten().filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .starts_with("credentials")
-        }) {
-            profile.read_deny.push(entry.path());
-            profile.write_deny.push(entry.path());
+    for cargo_home in cargo_homes {
+        profile.deny_prefixes.push(cargo_home.join("credentials"));
+        // Resolve existing prefix matches too: a credentials file can itself be a
+        // symlink to a secret outside CARGO_HOME.
+        if let Ok(entries) = std::fs::read_dir(&cargo_home) {
+            for entry in entries.flatten().filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .starts_with("credentials")
+            }) {
+                profile.read_deny.push(entry.path());
+                profile.write_deny.push(entry.path());
+            }
         }
     }
     profile
         .canonicalize_for_launch()
         .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn relaxed_credential_paths(
+    home: &Path,
+    roots: &[PathBuf],
+    getenv: impl Fn(&str) -> Option<OsString>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    // Relative tool settings are resolved from the shell's checkout, not the
+    // daemon's working directory. Keep the default denies as well as overrides.
+    let resolve = |value: OsString| {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            vec![path]
+        } else {
+            roots.iter().map(|root| root.join(&path)).collect()
+        }
+    };
+    let paths = |key: &str| {
+        getenv(key)
+            .filter(|value| !value.is_empty())
+            .map(&resolve)
+            .unwrap_or_default()
+    };
+    let mut cargo_homes = vec![home.join(".cargo")];
+    cargo_homes.extend(paths("CARGO_HOME"));
+    let mut denies = vec![home.join(".kube/config")];
+    for key in ["GNUPGHOME", "GH_CONFIG_DIR", "CLOUDSDK_CONFIG"] {
+        denies.extend(paths(key));
+    }
+    for key in ["AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"] {
+        denies.extend(paths(key));
+    }
+    denies.extend(
+        paths("DOCKER_CONFIG")
+            .into_iter()
+            .map(|dir| dir.join("config.json")),
+    );
+    for dir in paths("XDG_CONFIG_HOME") {
+        denies.extend([dir.join("gh"), dir.join("gcloud")]);
+    }
+    if let Some(value) = getenv("KUBECONFIG") {
+        for path in std::env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()) {
+            denies.extend(resolve(path.into_os_string()));
+        }
+    }
+    // RUSTUP_HOME holds toolchains and settings, not a credential store. Denying
+    // it would disable the compiler without protecting authentication material.
+    (denies, cargo_homes)
 }
 
 /// Prepare the shell environment after injecting managed Git/GitHub settings.
@@ -4588,8 +4642,68 @@ mod windows_pty_environment_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn relaxed_credentials_follow_tool_environment_paths() {
+        let home = Path::new("/operator");
+        let roots = vec![PathBuf::from("/checkout")];
+        let environment = HashMap::from([
+            ("CARGO_HOME", "/custom/cargo"),
+            ("GNUPGHOME", "/custom/gnupg"),
+            ("AWS_CONFIG_FILE", "/custom/aws/config"),
+            ("AWS_SHARED_CREDENTIALS_FILE", "/custom/aws/credentials"),
+            ("DOCKER_CONFIG", "/custom/docker"),
+            ("KUBECONFIG", "/custom/kube/one:/custom/kube/two"),
+            ("GH_CONFIG_DIR", "/custom/gh"),
+            ("XDG_CONFIG_HOME", "/custom/xdg"),
+            ("CLOUDSDK_CONFIG", "/custom/gcloud"),
+        ]);
+        let (denies, cargo_homes) =
+            relaxed_credential_paths(home, &roots, |key| environment.get(key).map(OsString::from));
+        assert!(cargo_homes.contains(&PathBuf::from("/custom/cargo")));
+        assert!(cargo_homes.contains(&home.join(".cargo")));
+        for expected in [
+            "/custom/gnupg",
+            "/custom/aws/config",
+            "/custom/aws/credentials",
+            "/custom/docker/config.json",
+            "/custom/kube/one",
+            "/custom/kube/two",
+            "/custom/gh",
+            "/custom/xdg/gh",
+            "/custom/xdg/gcloud",
+            "/custom/gcloud",
+        ] {
+            assert!(
+                denies.contains(&PathBuf::from(expected)),
+                "missing {expected}: {denies:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relaxed_credentials_resolve_relative_settings_for_each_checkout() {
+        let roots = [PathBuf::from("/one"), PathBuf::from("/two")];
+        let (denies, cargo_homes) =
+            relaxed_credential_paths(Path::new("/operator"), &roots, |key| match key {
+                "CARGO_HOME" => Some("cargo".into()),
+                "KUBECONFIG" => Some(":kube/a::kube/b:".into()),
+                "GNUPGHOME" => Some(OsString::new()),
+                _ => None,
+            });
+        for root in roots {
+            assert!(cargo_homes.contains(&root.join("cargo")));
+            assert!(denies.contains(&root.join("kube/a")));
+            assert!(denies.contains(&root.join("kube/b")));
+            assert!(
+                !denies.contains(&root),
+                "empty entries must not deny the checkout"
+            );
+        }
+    }
 
     struct SupervisorRun {
         code: Option<i32>,

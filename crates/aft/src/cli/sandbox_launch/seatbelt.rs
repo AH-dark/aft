@@ -140,12 +140,14 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
             relaxed_filter(path, false)?
         ));
     }
-    // Renaming an enclosing .git or credential directory must not replace a
-    // protected descendant with a new, worker-controlled directory tree.
+    // Path-based denies must survive renaming any enclosing directory, including
+    // parents of private files outside the usual credential and store locations.
     let ancestors = profile
         .write_deny
         .iter()
         .chain(&profile.deny_prefixes)
+        .chain(&profile.read_deny)
+        .chain(&profile.data_policy.deny)
         .flat_map(|path| path.ancestors().skip(1))
         .collect::<std::collections::BTreeSet<_>>();
     for ancestor in ancestors {
@@ -178,6 +180,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         &profile.write_deny_nested,
         &writes,
         &profile.writable_files,
+        &profile.writable_roots,
     )?;
     render_relaxed_scopes(
         &mut source,
@@ -185,6 +188,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         &profile.data_policy.deny,
         &profile.data_policy.write_allow,
         &profile.writable_files,
+        &[],
     )?;
     render_relaxed_scopes(
         &mut source,
@@ -192,6 +196,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         &profile.data_policy.deny,
         &profile.data_policy.read_allow,
         &profile.writable_files,
+        &[],
     )?;
     for allow in profile
         .data_policy
@@ -226,6 +231,7 @@ fn render_relaxed_scopes(
     denies: &[std::path::PathBuf],
     allows: &[std::path::PathBuf],
     files: &[std::path::PathBuf],
+    equal_roots: &[std::path::PathBuf],
 ) -> Result<(), String> {
     for deny in denies {
         source.push_str(&format!(
@@ -234,7 +240,12 @@ fn render_relaxed_scopes(
         ));
         for allow in allows
             .iter()
-            .filter(|allow| *allow != deny && allow.starts_with(deny))
+            // Only checkout exceptions may equal a denied directory, such as ~/Work.
+            // Unrelated nested repos then belong to that checkout; linked siblings
+            // retain their own denies. Private-store allows stay strict descendants.
+            .filter(|allow| {
+                allow.starts_with(deny) && (*allow != deny || equal_roots.contains(allow))
+            })
         {
             let filter = if files.contains(allow) {
                 format!("(literal \"{}\")", escape_path(allow)?)
@@ -534,6 +545,68 @@ mod tests {
             ),
         ] {
             assert!(source.contains(&rule), "missing mandatory rule: {rule}");
+        }
+    }
+
+    #[test]
+    fn relaxed_private_ancestors_and_equal_checkout_exceptions() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let work = root.join("Work");
+        let sibling = work.join("sibling");
+        let auth = root.join("relay/auth");
+        let temp = root.join("temp");
+        for dir in [&sibling, &auth, &temp] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let secret = auth.join("connection.json");
+        std::fs::write(&secret, "private").unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![work.clone()],
+            Vec::new(),
+            vec![work.clone(), sibling.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        profile.mode = aft::config::SandboxMode::Relaxed;
+        profile.data_policy.deny.push(secret.clone());
+        profile.data_policy.read_allow.push(secret.clone());
+        profile.data_policy.write_allow.push(secret.clone());
+        let source = render_profile(&profile).unwrap();
+        assert!(
+            source.contains(&format!(
+                "(deny file-write-unlink (literal \"{}\"))",
+                escape_path(&auth).unwrap()
+            )),
+            "private file ancestor must be immutable: {source}"
+        );
+        assert!(
+            source.contains(&format!(
+                "(deny file-write* (require-all {} (require-not {})))",
+                relaxed_filter(&work, false).unwrap(),
+                relaxed_filter(&work, false).unwrap()
+            )),
+            "equal checkout must be writable: {source}"
+        );
+        assert!(
+            source.contains(&format!(
+                "(deny file-write* (require-all {}))",
+                relaxed_filter(&sibling, false).unwrap()
+            )),
+            "linked sibling must remain denied: {source}"
+        );
+        for operation in ["file-read*", "file-write*"] {
+            assert!(
+                source.contains(&format!(
+                    "(deny {operation} (require-all {}))",
+                    relaxed_filter(&secret, false).unwrap()
+                )),
+                "equal private-file grants must not weaken denies: {source}"
+            );
         }
     }
 

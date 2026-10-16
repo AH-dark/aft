@@ -1,0 +1,11 @@
+{
+  "harnesses": {
+    "pi": {
+      "sandbox": {
+        "read_deny": [
+          "/tmp/aft-project-secret"
+        ]
+      }
+    }
+  }
+}
