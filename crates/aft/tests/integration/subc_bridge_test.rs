@@ -11180,12 +11180,22 @@ async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
     let frame = read_frame_timeout(&mut stream, "allowed bash response").await;
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 102);
-    assert!(!tool_result_is_error(&frame), "allow should run bash");
-    assert!(
-        touched.exists(),
-        "allowed bash should create the side-effect file: {:?}",
-        tool_result_text(&frame)
-    );
+    if cfg!(windows) {
+        // Permission to run does not waive the untrusted route's strict sandbox.
+        assert!(tool_result_is_error(&frame));
+        assert_eq!(
+            tool_result_text(&frame),
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
+        );
+        assert!(!touched.exists(), "a refused command must not run");
+    } else {
+        assert!(!tool_result_is_error(&frame), "allow should run bash");
+        assert!(
+            touched.exists(),
+            "allowed bash should create the side-effect file: {:?}",
+            tool_result_text(&frame)
+        );
+    }
 
     send_connection_goodbye(&mut stream).await;
 }

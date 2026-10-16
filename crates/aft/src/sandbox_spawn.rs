@@ -674,9 +674,10 @@ pub(crate) fn effective_sandbox_mode(
 }
 
 pub(crate) fn principal_requires_strict(principal: &AuthenticatedPrincipal) -> bool {
+    // Harness names are client claims; they must not override daemon-stamped trust.
     !principal_is_first_party(principal)
-        || matches!(principal, AuthenticatedPrincipal::RouteBind { harness, principal_id, .. }
-        if harness.starts_with("mcp:") || principal_id.as_deref().is_none_or(|id| id == "unverified"))
+        || matches!(principal, AuthenticatedPrincipal::RouteBind { principal_id, .. }
+        if principal_id.as_deref().is_none_or(|id| id == "unverified"))
 }
 
 /// Resolve the role and authenticated principal before choosing the launcher.
@@ -5804,7 +5805,7 @@ mod policy_tests {
         });
         for (trust, harness, principal_id) in [
             (PrincipalTrust::Untrusted, "runner", Some("direct")),
-            (PrincipalTrust::FirstParty, "mcp:test", Some("direct")),
+            (PrincipalTrust::Untrusted, "mcp:test", Some("direct")),
             (PrincipalTrust::FirstParty, "runner", Some("unverified")),
             (PrincipalTrust::FirstParty, "runner", None),
         ] {
@@ -5829,6 +5830,34 @@ mod policy_tests {
                 )
             });
         }
+    }
+
+    #[test]
+    fn trusted_direct_mcp_harness_preserves_role_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path().to_path_buf());
+        ctx.update_config(|config| config.sandbox = crate::config::SandboxConfig::default());
+        let principal = AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::FirstParty,
+            route_channel: 7,
+            route_epoch: 1,
+            project_root: dir.path().to_path_buf(),
+            harness: "mcp:evil".into(),
+            session_id: "trusted-direct".into(),
+            principal_id: Some("direct".into()),
+        };
+        assert_eq!(effective_sandbox_mode(&ctx, &principal), SandboxMode::Off);
+        with_worker_jail(true, || {
+            assert_eq!(
+                effective_sandbox_mode(&ctx, &principal),
+                SandboxMode::Relaxed
+            );
+        });
+        ctx.update_config(|config| config.sandbox.profile.head = SandboxMode::Strict);
+        assert_eq!(
+            effective_sandbox_mode(&ctx, &principal),
+            SandboxMode::Strict
+        );
     }
 
     #[test]

@@ -828,6 +828,23 @@ fn response_json(frame: &Frame) -> Value {
     serde_json::from_slice(&frame.body).unwrap()
 }
 
+fn assert_approved_scoped_shell_result(frame: &Frame, marker: &Path) {
+    assert_eq!(frame.header.ty, FrameType::Response);
+    let result = response_json(frame);
+    if cfg!(windows) {
+        // Elicitation authorizes the command, not an escape from strict confinement.
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(
+            result["content"][0]["text"],
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
+        );
+        assert!(!marker.exists(), "a refused command must not run");
+    } else {
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(marker.exists(), "the approved command must run");
+    }
+}
+
 fn is_database_initializing(frame: &Frame) -> bool {
     response_json(frame)["structuredContent"]["code"] == "database_initializing"
         || String::from_utf8_lossy(&frame.body)
@@ -1327,8 +1344,7 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     .unwrap();
     let completed = wire.next().await.unwrap();
     assert_eq!(completed.header.corr, first);
-    assert_eq!(completed.header.ty, FrameType::Response);
-    assert_eq!(response_json(&completed)["isError"], false);
+    assert_approved_scoped_shell_result(&completed, &marker);
     assert!(
         tokio::time::timeout(Duration::from_millis(400), wire.next())
             .await
@@ -1338,7 +1354,9 @@ async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
     drop(wire);
     let replay = route.raw(body, false).await;
     assert_eq!(replay.body, completed.body);
-    assert_eq!(std::fs::read(marker).unwrap(), b"ran");
+    if !cfg!(windows) {
+        assert_eq!(std::fs::read(marker).unwrap(), b"ran");
+    }
 }
 
 #[tokio::test]
@@ -1404,26 +1422,29 @@ async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execu
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !marker.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let running = wire.corr();
-    wire.send(&send(running)).await.unwrap();
     let mut replies = BTreeMap::new();
+    if !cfg!(windows) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let repeat = wire.corr();
+    wire.send(&send(repeat)).await.unwrap();
     for _ in 0..3 {
         let frame = wire.next().await.unwrap();
-        assert_eq!(frame.header.ty, FrameType::Response);
-        assert_eq!(response_json(&frame)["isError"], false);
+        assert_approved_scoped_shell_result(&frame, &marker);
         replies.insert(frame.header.corr, frame.body);
     }
     assert_eq!(replies.len(), 3);
     assert_eq!(replies[&first], replies[&held]);
-    assert_eq!(replies[&first], replies[&running]);
-    assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+    assert_eq!(replies[&first], replies[&repeat]);
+    if !cfg!(windows) {
+        assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+    }
     drop(wire);
     drop(process);
     let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
@@ -1538,10 +1559,13 @@ async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
             "{}",
             String::from_utf8_lossy(&frame.body)
         );
+        assert_approved_scoped_shell_result(&frame, &marker);
         replies.insert(frame.header.corr, frame.body);
     }
     assert_eq!(replies[&first], replies[&repeat]);
-    assert_eq!(std::fs::read(marker).unwrap(), b"x");
+    if !cfg!(windows) {
+        assert_eq!(std::fs::read(marker).unwrap(), b"x");
+    }
 }
 
 #[cfg(feature = "test-timing-hooks")]
@@ -1659,14 +1683,10 @@ async fn s1_unarmed_shell_commits_both_held_states_and_replays_before_injections
     let body =
         json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"unarmed"});
     let first = route.raw(body.clone(), true).await;
-    assert_eq!(
-        response_json(&first)["isError"],
-        false,
-        "{}",
-        String::from_utf8_lossy(&first.body)
-    );
-    assert!(marker.exists());
-    std::fs::remove_file(&marker).unwrap();
+    assert_approved_scoped_shell_result(&first, &marker);
+    if !cfg!(windows) {
+        std::fs::remove_file(&marker).unwrap();
+    }
     let repeat = route.raw(body, false).await;
     assert_eq!(first.body, repeat.body);
     assert!(!marker.exists());
@@ -1757,6 +1777,32 @@ async fn restart_recovers_shell_once(hold_running_record: bool) {
     )
     .await
     .unwrap();
+    if cfg!(windows) {
+        // There can be no running child to recover without a Windows sandbox backend.
+        // The terminal refusal must instead survive restart and replay without asking again.
+        let refused = wire.next().await.unwrap();
+        assert_eq!(refused.header.corr, corr);
+        assert_approved_scoped_shell_result(&refused, &started);
+        assert!(!finished.exists());
+        drop(wire);
+        drop(process);
+        let process = Subject::head().restart(&root).await.unwrap();
+        let route = Subject::head().route(&process, &stamp).await.unwrap();
+        let replay = route.raw(body, false).await;
+        assert_eq!(replay.body, refused.body);
+        assert_approved_scoped_shell_result(&replay, &started);
+        assert!(!finished.exists());
+        let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+        let key = Key {
+            carrier: "reserved:carrier".into(),
+            call_key: "recover-shell".into(),
+        };
+        assert_eq!(
+            ledger::get(&conn, &key).unwrap().unwrap().state,
+            State::Settled
+        );
+        return;
+    }
     tokio::time::timeout(Duration::from_secs(10), async {
         while !started.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2319,9 +2365,7 @@ async fn s2_completed_scoped_bash_reaches_only_its_owner_once_and_is_acked_once(
             true,
         )
         .await;
-    assert_eq!(response_json(&completed)["isError"], false);
-    // The approved command really ran: the marker file it writes exists.
-    assert!(marker.exists());
+    assert_approved_scoped_shell_result(&completed, &marker);
     let owner = Subject::head()
         .route(&process, &scoped_stamp("owner", "owner", "scope"))
         .await
