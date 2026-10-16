@@ -16,10 +16,11 @@ import re
 import shutil
 import socket
 import struct
+import subprocess
 import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_EVEN
+from decimal import Decimal, DecimalException, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -70,9 +71,17 @@ RANKING_FENCE_PREFIXES = (
     "packages/pi-plugin/src/__tests__/semantic",
     "packages/opencode-plugin/src/tools/semantic.ts",
     "packages/opencode-plugin/src/__tests__/semantic",
-    "crates/aft/src/subc_tool_schemas.json",
     "benchmarks/aft-search/engine-fixtures/",
 )
+TOOL_SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json"
+# Only these known tool entries can be excluded from the search surface. New
+# catalog keys remain shared until reviewed, rather than silently bypassing it.
+NON_SEARCH_SCHEMA_ENTRIES = frozenset({
+    "status", "bash", "powershell", "read", "write", "edit", "apply_patch",
+    "grep", "glob", "outline", "zoom", "inspect", "callgraph", "conflicts",
+    "ast_search", "ast_replace", "delete", "move", "import", "safety",
+    "bash_status", "bash_kill", "bash_write",
+})
 # The parity cases and fixture-project data currently live inline in
 # tool_call_parity_test.rs. Changes there or in future extracted fixture files
 # count as parity fixture differences.
@@ -623,10 +632,119 @@ def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, 
             raise InputFault(f"invalid_stop_fields:{expected_id}:pages_fetched")
 
 
-def derive_slice_class(paths: Sequence[str]) -> str:
+def read_tool_schema_blobs(base: str | None, head: str, paths: Sequence[str], *, root: Path) -> tuple[bytes | None, bytes | None] | None:
+    """Read committed blobs from the same merge-base diff used for path names."""
+    if TOOL_SCHEMA_PATH not in paths:
+        return None
+    if not base:
+        return (None, None)
+    try:
+        merge_base = subprocess.run(["git", "merge-base", base, head], cwd=root, capture_output=True, check=False)
+        if merge_base.returncode:
+            return (None, None)
+        blobs = []
+        for revision in (merge_base.stdout.decode().strip(), head):
+            result = subprocess.run(["git", "show", f"{revision}:{TOOL_SCHEMA_PATH}"], cwd=root, capture_output=True, check=False)
+            blobs.append(result.stdout if result.returncode == 0 else None)
+        return (blobs[0], blobs[1])
+    except (OSError, UnicodeError):
+        return (None, None)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate_key")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non_json_constant:{value}")
+
+
+def _search_schema_surface(blob: bytes | None, side: str) -> dict[str, Any]:
+    if blob is None:
+        raise InputFault(f"{side}:blob_unavailable")
+    try:
+        document = json.loads(blob, object_pairs_hook=_unique_json_object, parse_constant=_reject_json_constant, parse_float=Decimal)
+    except (ValueError, UnicodeError, RecursionError, DecimalException) as error:
+        raise InputFault(f"{side}:invalid_json") from error
+    if not isinstance(document, dict) or not isinstance(document.get("search"), dict):
+        raise InputFault(f"{side}:unrecognised_catalog")
+    search = document["search"]
+    if not ((search.get("type") == "object" and isinstance(search.get("properties"), dict)) or isinstance(search.get("$ref"), str)):
+        raise InputFault(f"{side}:unrecognised_search_schema")
+    if any(not isinstance(document[key], dict) for key in NON_SEARCH_SCHEMA_ENTRIES & document.keys()):
+        raise InputFault(f"{side}:unrecognised_tool_entry")
+    # Retain all shared metadata, including definitions and version fields. A
+    # reference into another tool makes that entry part of the search surface too.
+    surface = {key: value for key, value in document.items() if key not in NON_SEARCH_SCHEMA_ENTRIES}
+    pending = list(surface.values())
+    seen_refs: set[str] = set()
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, dict):
+            pending.extend(value.values())
+            for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
+                if keyword not in value:
+                    continue
+                ref = value[keyword]
+                if not isinstance(ref, str) or not ref.startswith("#/") or keyword != "$ref" or re.search(r"~(?![01])", ref):
+                    raise InputFault(f"{side}:unsupported_schema_reference")
+                if ref in seen_refs:
+                    continue
+                seen_refs.add(ref)
+                parts = [part.replace("~1", "/").replace("~0", "~") for part in ref[2:].split("/")]
+                target: Any = document
+                try:
+                    for part in parts:
+                        if isinstance(target, list) and not re.fullmatch(r"0|[1-9][0-9]*", part):
+                            raise ValueError("invalid_array_pointer")
+                        target = target[int(part)] if isinstance(target, list) else target[part]
+                except (KeyError, IndexError, TypeError, ValueError) as error:
+                    raise InputFault(f"{side}:unresolved_schema_reference") from error
+                key = parts[0]
+                if key not in surface:
+                    surface[key] = document[key]
+                    pending.append(document[key])
+    return surface
+
+
+def _tool_schema_fenced(schema_blobs: tuple[bytes | None, bytes | None] | None, notes: list[str]) -> bool:
+    try:
+        if schema_blobs is None:
+            raise InputFault("comparison_unavailable")
+        base = _search_schema_surface(schema_blobs[0], "base")
+        head = _search_schema_surface(schema_blobs[1], "head")
+        fenced = not _same_json_value(base, head)
+        reason = "search_or_shared_changed" if fenced else "other_tools_only_or_formatting"
+    except (InputFault, RecursionError, UnicodeError) as error:
+        fenced = True
+        reason = f"fail_closed:{error}"
+    notes.append(f"ranking_fence:{TOOL_SCHEMA_PATH}:{reason}")
+    return fenced
+
+
+def _same_json_value(left: Any, right: Any) -> bool:
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_same_json_value(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_same_json_value(a, b) for a, b in zip(left, right))
+    # JSON booleans are distinct from numbers, although Python's True equals 1.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    return left == right
+
+
+def derive_slice_class(paths: Sequence[str], *, schema_blobs: tuple[bytes | None, bytes | None] | None = None, notes: list[str] | None = None) -> str:
     if not isinstance(paths, list) or any(not isinstance(path, str) or path.startswith("/") or ".." in Path(path).parts for path in paths):
         raise InputFault("unresolvable_diff")
-    return "ranking" if any(any(path == prefix or path.startswith(prefix) for prefix in RANKING_FENCE_PREFIXES) for path in paths) else "non_ranking"
+    schema_fenced = TOOL_SCHEMA_PATH in paths and _tool_schema_fenced(schema_blobs, notes if notes is not None else [])
+    return "ranking" if schema_fenced or any(any(path == prefix or path.startswith(prefix) for prefix in RANKING_FENCE_PREFIXES) for path in paths) else "non_ranking"
 
 
 def validate_presentation_rows(descriptor: Mapping[str, Any]) -> None:
@@ -651,8 +769,8 @@ def validate_presentation_rows(descriptor: Mapping[str, Any]) -> None:
                 raise InputFault(f"malformed_descriptor:{field}.{side}:not_string_lines")
 
 
-def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str]) -> tuple[dict[str, Any], bool]:
-    derived = derive_slice_class(list(diff_paths))
+def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], *, schema_blobs: tuple[bytes | None, bytes | None] | None = None, notes: list[str] | None = None) -> tuple[dict[str, Any], bool]:
+    derived = derive_slice_class(list(diff_paths), schema_blobs=schema_blobs, notes=notes)
     missing_ranking = descriptor is None and derived == "ranking"
     if descriptor is None:
         return {"slice_class": derived, "targeted_mechanism": "none", "kind": "harness", "fixtures": ["harness-goldens"]}, missing_ranking
@@ -1129,7 +1247,7 @@ def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], d
 class GateResult:
     exit_code: int
     reasons: tuple[str, ...]
-    # Lines the gate prints on success too: waived unreachable split rows.
+    # Diagnostics printed on success too, including classification decisions.
     notes: tuple[str, ...] = ()
 
 
@@ -1171,9 +1289,10 @@ def validate_candidate_page_invariance(
             raise InputFault(f"page_invariance_failed:{row.get('episode_id')}:reference_miss_not_reproduced")
 
 
-def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], read_answer: Callable[[str], str | None] = read_pinned_answer) -> GateResult:
+def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str], read_answer: Callable[[str], str | None] = read_pinned_answer, *, schema_blobs: tuple[bytes | None, bytes | None] | None = None) -> GateResult:
+    notes: list[str] = []
     try:
-        resolved, missing = resolve_descriptor(descriptor, diff_paths)
+        resolved, missing = resolve_descriptor(descriptor, diff_paths, schema_blobs=schema_blobs, notes=notes)
         validate_candidate_page_invariance(reference, score, str(resolved["slice_class"]))
         if resolved["slice_class"] == "engine_unwired":
             difference = _engine_unwired_difference(reference, score, diff_paths, resolved.get("presentation_rows"))
@@ -1186,11 +1305,11 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
         validate_scored_population(manifest, score)
         validate_profile_score(score)
         reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)
-        notes: list[str] = []
         if resolved["slice_class"] == "ranking" and not missing:
-            reasons, notes = apply_unreachable_split_rows(reasons, score, manifest, resolved, read_answer)
+            reasons, waiver_notes = apply_unreachable_split_rows(reasons, score, manifest, resolved, read_answer)
+            notes.extend(waiver_notes)
     except InputFault as error:
-        return GateResult(2, (str(error),))
+        return GateResult(2, (str(error),), tuple(notes))
     return GateResult(1 if reasons else 0, tuple(reasons), tuple(notes))
 
 

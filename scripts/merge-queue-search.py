@@ -36,6 +36,15 @@ def paths(base: str, head: str) -> list[str]:
     return git("diff", "--name-only", "--no-renames", f"{base}...{head}").splitlines()
 
 
+def resolve_git_descriptor(descriptor: dict, changed: list[str], base: str, head: str) -> tuple[dict, bool]:
+    notes: list[str] = []
+    try:
+        return resolve_descriptor(descriptor, changed, schema_blobs=quality_lib.read_tool_schema_blobs(base, head, changed, root=Path.cwd()), notes=notes)
+    finally:
+        for note in notes:
+            print(note, file=sys.stderr)
+
+
 def member_pr(repository: str, head: str) -> dict:
     result = subprocess.run(
         ["gh", "api", "--paginate", "--slurp",
@@ -114,7 +123,7 @@ def plan(base: str, head: str, head_ref: str, repository: str) -> dict:
     for member in members:
         path, descriptor = member_descriptor(member["head"], member["branch"], head)
         member_base = git("merge-base", base, member["head"])
-        resolved, missing = resolve_descriptor(descriptor, paths(member_base, member["head"]))
+        resolved, missing = resolve_git_descriptor(descriptor, paths(member_base, member["head"]), member_base, member["head"])
         if missing:
             raise InputFault(f"missing_queue_descriptor:{member['number']}")
         member.update(descriptor=path, slice_class=resolved["slice_class"])
@@ -131,7 +140,7 @@ def plan(base: str, head: str, head_ref: str, repository: str) -> dict:
     evaluations = list(dict.fromkeys(member["descriptor"] for member in selected))
     group_paths = paths(base, head)
     for path in evaluations:
-        resolve_descriptor(descriptors[path], group_paths)
+        resolve_git_descriptor(descriptors[path], group_paths, base, head)
     return {"base": base, "head": head, "members": members, "evaluations": evaluations}
 
 

@@ -172,10 +172,12 @@ class MergeQueueDescriptorTests(unittest.TestCase):
         self.git("add", path)
         self.git("-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture")
 
-    def member(self, number: int, slice_class: str = "non_ranking", *, descriptor: bool = True) -> str:
+    def member(self, number: int, slice_class: str = "non_ranking", *, descriptor: bool = True, schema: dict | None = None) -> str:
         branch = f"train/member-{number}"
         self.git("checkout", "-qb", branch, self.base)
-        if slice_class in {"ranking", "engine_unwired"}:
+        if schema is not None:
+            self.commit_file("crates/aft/src/subc_tool_schemas.json", json.dumps(schema, indent=2))
+        elif slice_class in {"ranking", "engine_unwired"}:
             self.commit_file(f"crates/aft/src/commands/semantic_search/member{number}.rs", "ranking\n")
         else:
             self.commit_file(f"docs/member{number}.md", "delivery\n")
@@ -217,6 +219,34 @@ class MergeQueueDescriptorTests(unittest.TestCase):
         candidate = self.selected(self.select())
         self.assertEqual(candidate["evaluations"], [one, two, three])
         self.assertEqual([member["number"] for member in candidate["members"]], [1, 2, 3])
+
+    def schema_base(self) -> dict:
+        schema = {"search": {"type": "object", "properties": {}}, "zoom": {"type": "object", "properties": {}}}
+        self.commit_file("crates/aft/src/subc_tool_schemas.json", json.dumps(schema, indent=2))
+        self.base = self.git("rev-parse", "HEAD")
+        return schema
+
+    def test_zoom_schema_only_member_and_combined_queue_are_non_ranking(self) -> None:
+        schema = self.schema_base()
+        schema["zoom"]["description"] = "Batch-only zoom"
+        one = self.member(1, schema=schema)
+        two = self.member(2)
+        result = self.select()
+        candidate = self.selected(result)
+        self.assertEqual(candidate["evaluations"], [one, two])
+        self.assertEqual([member["slice_class"] for member in candidate["members"]], ["non_ranking", "non_ranking"])
+        self.assertIn("other_tools_only_or_formatting", result.stderr)
+
+    def test_search_schema_only_member_and_combined_queue_stay_ranking(self) -> None:
+        schema = self.schema_base()
+        schema["search"]["description"] = "New search guidance"
+        ranking = self.member(1, "ranking", schema=schema)
+        self.member(2)
+        result = self.select()
+        candidate = self.selected(result)
+        self.assertEqual(candidate["evaluations"], [ranking])
+        self.assertEqual(candidate["members"][0]["slice_class"], "ranking")
+        self.assertIn("search_or_shared_changed", result.stderr)
 
     def test_one_ranking_member_retains_its_exact_descriptor(self) -> None:
         self.member(1)

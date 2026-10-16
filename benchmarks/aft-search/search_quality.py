@@ -10,6 +10,7 @@ from search_quality_lib import (
     EVIDENCE_SHA, PAGE_SIZE, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
     aggregate_real_query, canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
     included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
+    read_tool_schema_blobs,
     resolve_descriptor, row_metrics, sample_plan, sha256_bytes, sha256_file, split_rows_not_applicable, total_gate,
     validate_manifest_maintenance_scores, validate_manifest_relabels, validate_profile_score, validate_scored_population,
 )
@@ -28,7 +29,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def diff_paths(base: str | None, head: str) -> list[str]:
     if not base: return []
-    result=subprocess.run(["git","diff","--name-only",f"{base}...{head}"],cwd=ROOT,text=True,capture_output=True,check=False)
+    result=subprocess.run(["git","diff","--name-only","--no-renames",f"{base}...{head}"],cwd=ROOT,text=True,capture_output=True,check=False)
     if result.returncode: raise InputFault(f"unresolvable_diff:{result.stderr.strip()}")
     return [line for line in result.stdout.splitlines() if line]
 
@@ -230,7 +231,11 @@ def run(args:argparse.Namespace)->int:
             print(f"missing branch-keyed descriptor for {args.branch}; the merge queue requires one for every PR", file=sys.stderr)
             return 1
         descriptor = read_json(path)
-        resolved, missing_ranking = resolve_descriptor(descriptor, paths)
+        notes: list[str] = []
+        try:
+            resolved, missing_ranking = resolve_descriptor(descriptor, paths, schema_blobs=read_tool_schema_blobs(args.base_ref, args.head, paths, root=ROOT), notes=notes)
+        finally:
+            for note in notes: print(note)
         if missing_ranking:
             print("missing ranking descriptor", file=sys.stderr)
             return 1
@@ -261,7 +266,9 @@ def run(args:argparse.Namespace)->int:
             old_score=read_json(Path(args.old_score))
             validate_manifest_maintenance_scores(old_manifest, manifest, old_score, score)
             old_descriptor_path=descriptor_path(None,args.branch); descriptor=read_json(old_descriptor_path) if old_descriptor_path else None
-            old_result=total_gate(old_reference,old_score,old_manifest,descriptor,diff_paths(args.base_ref,args.head))
+            paths=diff_paths(args.base_ref,args.head)
+            old_result=total_gate(old_reference,old_score,old_manifest,descriptor,paths,schema_blobs=read_tool_schema_blobs(args.base_ref,args.head,paths,root=ROOT))
+            for note in old_result.notes: print(note)
             if old_result.exit_code: raise InputFault("old_manifest_evaluation:"+";".join(old_result.reasons))
             delta=identity_delta(old_manifest,manifest)
         else: delta={"added":[row["episode_id"] for row in manifest["rows"] if "excluded_reason" not in row],"removed":[],"changed":[]}
@@ -295,7 +302,7 @@ def run(args:argparse.Namespace)->int:
     )
     if (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and score.get("model_id")!=reference.get("model_id"):
         raise InputFault("corpus_vector_model_mismatch")
-    result=total_gate(reference,evaluation_score,manifest,descriptor,paths)
+    result=total_gate(reference,evaluation_score,manifest,descriptor,paths,schema_blobs=read_tool_schema_blobs(args.base_ref,args.head,paths,root=ROOT))
     for note in result.notes: print(note)
     for reason in result.reasons: print(reason,file=sys.stderr)
     if result.exit_code or not args.rebaseline: return result.exit_code
