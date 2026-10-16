@@ -48,6 +48,8 @@ use portable_pty::CommandBuilder;
 
 use crate::config::SandboxMode;
 use crate::context::AppContext;
+#[cfg(unix)]
+use crate::sandbox_profile::resolved_env_deny_paths;
 use crate::sandbox_profile::SandboxProfile;
 
 #[cfg(unix)]
@@ -1854,17 +1856,12 @@ fn build_relaxed_profile(
         home.join(".local/state/cortexkit"),
         ctx.storage_dir(),
     ]);
-    for base in [
-        absolute_env_path("XDG_DATA_HOME"),
-        absolute_env_path("XDG_STATE_HOME"),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        stores.deny.push(base.join("cortexkit"));
-    }
-    if let Some(config) = absolute_env_path("XDG_CONFIG_HOME") {
-        stores.deny.push(config.join("cortexkit"));
+    for key in ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME"] {
+        if let Some(base) = absolute_env_path(key) {
+            stores
+                .deny
+                .extend(resolved_env_deny_paths(key, base.join("cortexkit")));
+        }
     }
     stores.read_allow = roots.to_vec();
     stores.write_allow = roots.to_vec();
@@ -1996,26 +1993,51 @@ fn build_relaxed_profile(
         cache_roots: Vec::new(),
         temp_dir: temp.to_path_buf(),
     };
-    for cargo_home in cargo_homes {
-        profile.deny_prefixes.push(cargo_home.join("credentials"));
-        // Resolve existing prefix matches too: a credentials file can itself be a
-        // symlink to a secret outside CARGO_HOME.
-        if let Ok(entries) = std::fs::read_dir(&cargo_home) {
-            for entry in entries.flatten().filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .starts_with("credentials")
-            }) {
-                profile.read_deny.push(entry.path());
-                profile.write_deny.push(entry.path());
-            }
-        }
-    }
+    add_relaxed_cargo_credential_denies(&mut profile, cargo_homes);
     profile
         .canonicalize_for_launch()
         .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+fn add_relaxed_cargo_credential_denies(profile: &mut SandboxProfile, cargo_homes: Vec<PathBuf>) {
+    for cargo_home in cargo_homes {
+        profile.deny_prefixes.extend(resolved_env_deny_paths(
+            "CARGO_HOME",
+            cargo_home.join("credentials"),
+        ));
+        // Resolve existing prefix matches too: a credentials file can itself be a
+        // symlink to a secret outside CARGO_HOME.
+        match std::fs::read_dir(&cargo_home) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            log::warn!("cannot inspect CARGO_HOME credential entry: {error}");
+                            continue;
+                        }
+                    };
+                    if !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .starts_with("credentials")
+                    {
+                        continue;
+                    }
+                    let paths = resolved_env_deny_paths("CARGO_HOME", entry.path());
+                    profile.read_deny.extend(paths.iter().cloned());
+                    profile.write_deny.extend(paths);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "cannot inspect CARGO_HOME credentials in {}: {error}",
+                cargo_home.display()
+            ),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2026,40 +2048,47 @@ fn relaxed_credential_paths(
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
     // Relative tool settings are resolved from the shell's checkout, not the
     // daemon's working directory. Keep the default denies as well as overrides.
-    let resolve = |value: OsString| {
+    let resolve = |key: &str, value: OsString, suffix: &str| {
         let path = PathBuf::from(value);
-        if path.is_absolute() {
+        let paths = if path.is_absolute() {
             vec![path]
         } else {
             roots.iter().map(|root| root.join(&path)).collect()
-        }
+        };
+        paths
+            .into_iter()
+            .flat_map(|path| {
+                let path = if suffix.is_empty() {
+                    path
+                } else {
+                    path.join(suffix)
+                };
+                resolved_env_deny_paths(key, path)
+            })
+            .collect::<Vec<_>>()
     };
-    let paths = |key: &str| {
+    let paths = |key: &str, suffix: &str| {
         getenv(key)
             .filter(|value| !value.is_empty())
-            .map(&resolve)
+            .map(|value| resolve(key, value, suffix))
             .unwrap_or_default()
     };
     let mut cargo_homes = vec![home.join(".cargo")];
-    cargo_homes.extend(paths("CARGO_HOME"));
+    cargo_homes.extend(paths("CARGO_HOME", ""));
     let mut denies = vec![home.join(".kube/config")];
     for key in ["GNUPGHOME", "GH_CONFIG_DIR", "CLOUDSDK_CONFIG"] {
-        denies.extend(paths(key));
+        denies.extend(paths(key, ""));
     }
     for key in ["AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"] {
-        denies.extend(paths(key));
+        denies.extend(paths(key, ""));
     }
-    denies.extend(
-        paths("DOCKER_CONFIG")
-            .into_iter()
-            .map(|dir| dir.join("config.json")),
-    );
-    for dir in paths("XDG_CONFIG_HOME") {
-        denies.extend([dir.join("gh"), dir.join("gcloud")]);
+    denies.extend(paths("DOCKER_CONFIG", "config.json"));
+    for suffix in ["gh", "gcloud"] {
+        denies.extend(paths("XDG_CONFIG_HOME", suffix));
     }
     if let Some(value) = getenv("KUBECONFIG") {
         for path in std::env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()) {
-            denies.extend(resolve(path.into_os_string()));
+            denies.extend(resolve("KUBECONFIG", path.into_os_string(), ""));
         }
     }
     // RUSTUP_HOME holds toolchains and settings, not a credential store. Denying
@@ -4703,6 +4732,174 @@ mod tests {
                 "empty entries must not deny the checkout"
             );
         }
+    }
+
+    fn credential_profile(
+        temp: &Path,
+        denies: Vec<PathBuf>,
+        cargo_homes: Vec<PathBuf>,
+    ) -> SandboxProfile {
+        let mut profile = SandboxProfile::build(
+            vec![temp.to_path_buf()],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            temp.to_path_buf(),
+        )
+        .unwrap();
+        profile.mode = SandboxMode::Relaxed;
+        profile.read_deny = denies.clone();
+        profile.write_deny = denies;
+        add_relaxed_cargo_credential_denies(&mut profile, cargo_homes);
+        profile.canonicalize_for_launch().unwrap()
+    }
+
+    #[test]
+    fn relaxed_credentials_existing_dotdot_resolves_before_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("target/nested")).unwrap();
+        std::fs::write(base.join("target/config"), "secret").unwrap();
+        std::os::unix::fs::symlink(base.join("target/nested"), base.join("alias")).unwrap();
+        let input = base.join("alias/../config");
+        let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
+            (key == "AWS_CONFIG_FILE").then(|| input.clone().into_os_string())
+        });
+        assert!(denies.contains(&base.join("target/config")), "{denies:?}");
+        assert!(!denies.contains(&input), "unnormalized alias: {denies:?}");
+        let profile = credential_profile(&base, denies, cargo);
+        assert!(profile.read_deny.contains(&base.join("target/config")));
+    }
+
+    #[test]
+    fn relaxed_credentials_missing_dotdot_resolves_existing_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("target/nested")).unwrap();
+        std::os::unix::fs::symlink(base.join("target/nested"), base.join("alias")).unwrap();
+        let input = base.join("alias/../missing/config");
+        let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
+            (key == "AWS_SHARED_CREDENTIALS_FILE").then(|| input.clone().into_os_string())
+        });
+        assert!(
+            denies.contains(&base.join("target/missing/config")),
+            "{denies:?}"
+        );
+        let profile = credential_profile(&base, denies, cargo);
+        assert!(profile
+            .read_deny
+            .contains(&base.join("target/missing/config")));
+    }
+
+    #[test]
+    fn relaxed_credentials_symlink_target_and_literal_are_denied() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("target")).unwrap();
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(base.join("target"), &alias).unwrap();
+        let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
+            (key == "GH_CONFIG_DIR").then(|| alias.clone().into_os_string())
+        });
+        assert!(denies.contains(&base.join("target")), "{denies:?}");
+        assert!(denies.contains(&alias), "{denies:?}");
+        let profile = credential_profile(&base, denies, cargo);
+        assert!(profile.read_deny.contains(&base.join("target")));
+        assert!(profile.write_deny.contains(&alias));
+    }
+
+    #[test]
+    fn relaxed_credentials_all_environment_denies_resolve_dotdot() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("nested")).unwrap();
+        for (key, suffixes) in [
+            ("CARGO_HOME", vec!["credentials"]),
+            ("GNUPGHOME", vec![""]),
+            ("GH_CONFIG_DIR", vec![""]),
+            ("CLOUDSDK_CONFIG", vec![""]),
+            ("AWS_CONFIG_FILE", vec![""]),
+            ("AWS_SHARED_CREDENTIALS_FILE", vec![""]),
+            ("DOCKER_CONFIG", vec!["config.json"]),
+            ("XDG_CONFIG_HOME", vec!["gh", "gcloud"]),
+            ("KUBECONFIG", vec![""]),
+        ] {
+            let input = PathBuf::from("nested/../missing");
+            let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |name| {
+                (name == key).then(|| input.clone().into_os_string())
+            });
+            let profile = credential_profile(&base, denies, cargo);
+            for suffix in suffixes {
+                let expected = if suffix.is_empty() {
+                    base.join("missing")
+                } else {
+                    base.join("missing").join(suffix)
+                };
+                let paths = if key == "CARGO_HOME" {
+                    &profile.deny_prefixes
+                } else {
+                    &profile.read_deny
+                };
+                assert!(paths.contains(&expected), "{key}: {paths:?}");
+            }
+        }
+        for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+            let paths = resolved_env_deny_paths(key, base.join("nested/../missing/cortexkit"));
+            assert_eq!(paths, vec![base.join("missing/cortexkit")], "{key}");
+        }
+    }
+
+    #[test]
+    fn relaxed_credentials_unresolvable_entry_keeps_other_denies() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let link = base.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let input = std::env::join_paths([link.clone(), base.join("safe")]).unwrap();
+        let error = crate::sandbox_profile::resolve_env_deny_paths(link.clone(), "KUBECONFIG")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("KUBECONFIG"), "{error}");
+        let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
+            (key == "KUBECONFIG").then(|| input.clone())
+        });
+        assert!(denies.contains(&base.join("safe")), "{denies:?}");
+        assert!(!denies.contains(&link), "{denies:?}");
+        credential_profile(&base, denies, cargo);
+    }
+
+    #[test]
+    fn relaxed_credentials_never_collapse_dotdot_across_unresolved_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(base.join("missing/child"), base.join("alias")).unwrap();
+        let paths = resolved_env_deny_paths("AWS_CONFIG_FILE", base.join("alias/../config"));
+        assert!(paths.is_empty(), "unsafe lexical resolution: {paths:?}");
+    }
+
+    #[test]
+    fn relaxed_credentials_cargo_entries_skip_unresolvable_and_deny_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let cargo_home = base.join("cargo");
+        std::fs::create_dir(&cargo_home).unwrap();
+        let secret = base.join("secret");
+        std::fs::write(&secret, "cargo-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, cargo_home.join("credentials.toml")).unwrap();
+        let looping = cargo_home.join("credentials");
+        std::os::unix::fs::symlink(&looping, &looping).unwrap();
+        let (denies, cargo) = relaxed_credential_paths(&base, &[base.clone()], |key| {
+            (key == "CARGO_HOME").then(|| cargo_home.clone().into_os_string())
+        });
+        let profile = credential_profile(&base, denies, cargo);
+        assert!(profile.read_deny.contains(&secret), "{profile:?}");
+        assert!(profile
+            .write_deny
+            .contains(&cargo_home.join("credentials.toml")));
+        assert!(!profile.deny_prefixes.contains(&looping));
     }
 
     struct SupervisorRun {

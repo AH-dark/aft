@@ -485,6 +485,42 @@ fn canonicalize_optional_paths(
     Ok(canonical)
 }
 
+/// Resolve an environment deny before profile validation, retaining a normalized
+/// alias as well as its target so replacing a config symlink stays forbidden.
+#[cfg(unix)]
+pub(crate) fn resolve_env_deny_paths(
+    path: PathBuf,
+    variable: &str,
+) -> Result<Vec<PathBuf>, SandboxProfileError> {
+    validate_absolute(&path, variable)?;
+    let resolved = match canonicalize_path(&path) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Resolve the existing ancestor before appending missing components.
+            // In particular, do not remove `..` before following symlinks.
+            canonicalize_missing_path(path.clone(), variable)?
+        }
+        Err(error) => return Err(canonicalization_error(&path, variable, &error)),
+    };
+    validate_normalized(&resolved, variable)?;
+    let mut paths = vec![resolved];
+    if paths[0] != path && validate_normalized(&path, variable).is_ok() {
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+#[cfg(unix)]
+pub(crate) fn resolved_env_deny_paths(variable: &str, path: PathBuf) -> Vec<PathBuf> {
+    match resolve_env_deny_paths(path, variable) {
+        Ok(paths) => paths,
+        Err(error) => {
+            log::warn!("skipping sandbox deny from {variable}: {error}");
+            Vec::new()
+        }
+    }
+}
+
 fn canonicalize_missing_path(path: PathBuf, field: &str) -> Result<PathBuf, SandboxProfileError> {
     let original = path.clone();
     let mut ancestor = path;

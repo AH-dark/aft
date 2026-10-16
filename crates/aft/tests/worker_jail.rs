@@ -123,6 +123,11 @@ impl Jail {
         Self::start_with_profile(None, None, true, "relaxed", standalone).await
     }
 
+    #[cfg(target_os = "macos")]
+    async fn relaxed_with_env(configure: impl FnOnce(&Path, &mut Command)) -> Self {
+        Self::start_with_layout_and_env(None, None, true, "relaxed", false, false, configure).await
+    }
+
     async fn start_with_profile(
         port: Option<u16>,
         uds: Option<&Path>,
@@ -140,6 +145,27 @@ impl Jail {
         profile: &str,
         standalone: bool,
         custom_layout: bool,
+    ) -> Self {
+        Self::start_with_layout_and_env(
+            port,
+            uds,
+            pack_refs,
+            profile,
+            standalone,
+            custom_layout,
+            |_, _| {},
+        )
+        .await
+    }
+
+    async fn start_with_layout_and_env(
+        port: Option<u16>,
+        uds: Option<&Path>,
+        pack_refs: bool,
+        profile: &str,
+        standalone: bool,
+        custom_layout: bool,
+        configure: impl FnOnce(&Path, &mut Command),
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
@@ -353,6 +379,7 @@ impl Jail {
         if let Some(uds) = uds {
             command.env("SCCACHE_SERVER_UDS", uds);
         }
+        configure(&base, &mut command);
         let child = command.spawn().unwrap();
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
             .await
@@ -533,6 +560,75 @@ impl Jail {
     async fn bash(&mut self, command: &str) -> String {
         self.tool("bash", json!({"command": command, "timeout": 300_000}))
             .await
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_env_dotdot_existing_credential_is_denied() {
+    let mut jail = Jail::relaxed_with_env(|base, command| {
+        std::fs::create_dir_all(base.join("credential-config/nested")).unwrap();
+        std::fs::write(base.join("credential-config/secret"), "env-dotdot-secret").unwrap();
+        command.env(
+            "AWS_CONFIG_FILE",
+            base.join("credential-config/nested/../secret"),
+        );
+    })
+    .await;
+    let reply = jail
+        .bash(&format!(
+            "echo ENV_SHELL_RAN; cat {}",
+            quote(&jail.base.join("credential-config/secret"))
+        ))
+        .await;
+    assert!(reply.contains("ENV_SHELL_RAN"), "{reply}");
+    assert!(reply.contains("Operation not permitted"), "{reply}");
+    assert!(!reply.contains("env-dotdot-secret"), "{reply}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_env_dotdot_missing_credential_does_not_refuse_shell() {
+    let mut jail = Jail::relaxed_with_env(|base, command| {
+        std::fs::create_dir(base.join("credential-config")).unwrap();
+        command.env(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            base.join("credential-config/../future/credentials"),
+        );
+    })
+    .await;
+    let reply = jail.bash("printf 'MISSING_ENV_SHELL_RAN\\n'").await;
+    assert!(reply.contains("MISSING_ENV_SHELL_RAN"), "{reply}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn relaxed_env_symlink_config_target_is_denied() {
+    let mut jail = Jail::relaxed_with_env(|base, command| {
+        std::fs::create_dir(base.join("credential-target")).unwrap();
+        std::fs::write(
+            base.join("credential-target/hosts.yml"),
+            "env-symlink-secret",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            base.join("credential-target"),
+            base.join("credential-alias"),
+        )
+        .unwrap();
+        command.env("GH_CONFIG_DIR", base.join("credential-alias"));
+    })
+    .await;
+    for name in ["credential-target", "credential-alias"] {
+        let reply = jail
+            .bash(&format!(
+                "echo SYMLINK_ENV_SHELL_RAN; cat {}",
+                quote(&jail.base.join(name).join("hosts.yml"))
+            ))
+            .await;
+        assert!(reply.contains("SYMLINK_ENV_SHELL_RAN"), "{reply}");
+        assert!(reply.contains("Operation not permitted"), "{reply}");
+        assert!(!reply.contains("env-symlink-secret"), "{reply}");
     }
 }
 
