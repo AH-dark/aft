@@ -86,6 +86,11 @@ const V14_GOVERNED_TUPLES: &[&str] = &["issue create", "issue edit"];
 // the bot identity, the same class as `issue create`. The head branch must live
 // in the target repository; a fork head (`owner:branch`) is refused.
 const V16_GOVERNED_TUPLES: &[&str] = &["pr create"];
+// Marking a pull request ready (or draft again) changes its public state as
+// the bot; creating or renaming a repository remains operator administration.
+const V19_GOVERNED_TUPLES: &[&str] = &["pr ready"];
+const V19_ADMIN_TUPLES: &[&str] = &["repo rename", "repo create"];
+const PRIVATE_REPORTING_PATH_GLOB: &str = "/repos/*/*/private-vulnerability-reporting";
 /// The body fields the `pr create` reader produces, in the order the manifest
 /// declares them. The reader is purpose-built for this list, so a signed
 /// declaration naming any other list is refused rather than half-honoured.
@@ -4242,6 +4247,7 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 11 && V11_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 13 && V13_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 15 && V15_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 19 && V19_ADMIN_TUPLES.contains(&tuple))
 }
 
 fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -4249,6 +4255,7 @@ fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 12 && V12_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 14 && V14_GOVERNED_TUPLES.contains(&tuple))
         || (manifest_version >= 16 && V16_GOVERNED_TUPLES.contains(&tuple))
+        || (manifest_version >= 19 && V19_GOVERNED_TUPLES.contains(&tuple))
 }
 
 /// True for a governed tuple whose label-only form the operator bypass may run
@@ -4425,7 +4432,7 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         .filter(|rule| {
             rule.method.eq_ignore_ascii_case(&method)
                 && platform_matches(&rule.platform, platform)
-                && glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(&path))
+                && api_rule_matches_path(rule, &path)
         })
         .collect::<Vec<_>>();
     if matches.is_empty() && method.eq_ignore_ascii_case("GET") && !has_fields {
@@ -4438,6 +4445,11 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     }
     let rule = matches[0];
     if rule.tier == Tier::Admin {
+        if rule.path_glob == PRIVATE_REPORTING_PATH_GLOB
+            && (manifest.manifest_version < 19 || !matches!(method.as_str(), "PUT" | "DELETE"))
+        {
+            return Classification::Unclassified;
+        }
         return Classification::Admin {
             tuple: api_tuple(rule),
         };
@@ -4471,6 +4483,17 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
         Tier::Governed => Classification::Unclassified,
         Tier::Admin => unreachable!("admin API rules return before field protection"),
     }
+}
+
+fn api_rule_matches_path(rule: &ApiRule, path: &str) -> bool {
+    if rule.path_glob == PRIVATE_REPORTING_PATH_GLOB {
+        // glob's `*` can span slashes. This setting is a single repository
+        // endpoint, not a subtree or a similarly named neighbouring setting.
+        let segments = path.split('/').collect::<Vec<_>>();
+        return matches!(segments.as_slice(), ["", "repos", owner, repo, "private-vulnerability-reporting"]
+            if !owner.is_empty() && !repo.is_empty());
+    }
+    glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(path))
 }
 
 /// Stable name for an API rule, shared by admin bypass audit records and the
@@ -4665,7 +4688,7 @@ impl GithubReadMutation {
             "issue comment" | "issue edit" | "issue reaction" | "issue close" | "issue reopen" => {
                 GithubReadResourceKind::Issue
             }
-            "pr comment" | "pr review" | "pr close" | "pr reopen" => {
+            "pr comment" | "pr review" | "pr close" | "pr reopen" | "pr ready" => {
                 GithubReadResourceKind::PullRequest
             }
             _ => return None,
@@ -4753,6 +4776,17 @@ fn canonicalize_governed_from<R: Read>(
         );
     }
     let target_and_state = is_target_and_state(canonical);
+    let pr_ready = tuple == "pr ready";
+    if pr_ready
+        && (manifest_version < 19
+            || canonical.argv_forms != [TARGET_AND_STATE_FORM]
+            || canonical.target_fields != ["number"]
+            || canonical.body_fields != ["undo"])
+    {
+        return Err(CanonicalizeError::unclassified(
+            "pr ready requires the declared target-and-state number/undo form at v19 or later",
+        ));
+    }
     let fields_only = is_fields_only(canonical);
     let mut positional = Vec::new();
     let mut body = Map::new();
@@ -4762,6 +4796,7 @@ fn canonicalize_governed_from<R: Read>(
     let mut explicit_repository = None;
     let mut close_reason = None;
     let mut edit_last = false;
+    let mut undo = false;
     let mut index = subcommand_index + 1;
     while index < args.len() {
         let value = args[index].to_str().ok_or_else(|| {
@@ -4817,7 +4852,14 @@ fn canonicalize_governed_from<R: Read>(
                 continue;
             }
         }
-        if value == "--edit-last" {
+        if pr_ready && value == "--undo" {
+            if undo {
+                return Err(CanonicalizeError::unclassified(
+                    "--undo may be provided only once",
+                ));
+            }
+            undo = true;
+        } else if value == "--edit-last" {
             if !is_reviewed_edit_last_tuple(manifest_version, tuple) {
                 return Err(CanonicalizeError::unclassified(
                     "undeclared flag --edit-last",
@@ -4858,6 +4900,13 @@ fn canonicalize_governed_from<R: Read>(
             } else {
                 positional.push(value.to_string());
             }
+        } else if pr_ready {
+            if value.starts_with('-') {
+                return Err(CanonicalizeError::unclassified(format!(
+                    "undeclared flag {value}"
+                )));
+            }
+            positional.push(value.to_string());
         } else if target_and_state {
             if let Some(supplied) = declared_reason_value(value, args.get(index + 1), tuple)? {
                 if close_reason.replace(supplied).is_some() {
@@ -4903,6 +4952,9 @@ fn canonicalize_governed_from<R: Read>(
         index += 1;
     }
 
+    if pr_ready {
+        body.insert("undo".into(), Value::Bool(undo));
+    }
     if positional.len() != canonical.target_fields.len() {
         return Err(CanonicalizeError::unclassified(
             "target positional form is undeclared",
@@ -6450,9 +6502,10 @@ fn governed_wire_request(
         "agent_id": agent_id,
         "pid": std::process::id(),
     });
-    if V12_GOVERNED_TUPLES.contains(&request.action.as_str()) {
-        // Thread-state verbs use verb/repository/number/reason/comment instead of
-        // action/target/body so a delete-branch flag cannot appear on the wire.
+    if V12_GOVERNED_TUPLES.contains(&request.action.as_str()) || request.action == "pr ready" {
+        // Thread-state verbs name the verb and number directly, with only the
+        // parsed reason, comment or undo fields. Arbitrary argv such as branch
+        // deletion must never reach the bot's request.
         let mut wire = json!({
             "operation": ROUTING_OPERATION,
             "gh_route_schema": 1,
@@ -6463,6 +6516,9 @@ fn governed_wire_request(
             "rung_as_of_unix_secs": determination.as_of_unix_secs,
             "metadata": metadata,
         });
+        if request.action == "pr ready" {
+            wire["undo"] = request.body["undo"].clone();
+        }
         if request.action == "issue close" {
             if let Some(reason) = request.body.get("reason").cloned() {
                 wire["reason"] = reason;
@@ -7280,6 +7336,10 @@ fn unix_seconds() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+#[cfg(test)]
+#[path = "gh_shim/v19_tests.rs"]
+mod v19_tests;
 
 #[cfg(test)]
 // Release-profile test builds carry no dev key in the trust set, so the tests
