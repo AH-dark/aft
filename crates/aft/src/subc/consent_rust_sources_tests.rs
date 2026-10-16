@@ -26,6 +26,8 @@ fn in_rust_home(test: &str, overrides: bool) -> bool {
         (&cargo, "config.toml"),
         (&cargo, "registry/cache/example.crate"),
         (&cargo, "registry/index/config.json"),
+        (&cargo, "git/checkouts/example-1a2b3c/abcdef0/src/lib.rs"),
+        (&cargo, "git/db/example-1a2b3c/config"),
         (
             &rustup,
             "toolchains/stable/lib/rustlib/src/rust/library/core/src/lib.rs",
@@ -143,6 +145,31 @@ async fn worker_toolchain_grep_no_ask() {
     )
     .await;
     assert_no_ask(&f, &response);
+}
+
+#[tokio::test]
+async fn worker_git_checkout_read_no_ask() {
+    if !in_rust_home("worker_git_checkout_read_no_ask", false) {
+        return;
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = rust_fixture();
+    let response = f
+        .read(
+            &f.worker,
+            &cargo_root().join("git/checkouts/example-1a2b3c/abcdef0/src/lib.rs"),
+            1,
+        )
+        .await;
+    assert_no_ask(&f, &response);
+}
+
+#[tokio::test]
+async fn worker_cargo_git_db_still_ask() {
+    if !in_rust_home("worker_cargo_git_db_still_ask", false) {
+        return;
+    }
+    cargo_read_asks("git/db/example-1a2b3c/config").await;
 }
 
 async fn cargo_read_asks(relative: &str) {

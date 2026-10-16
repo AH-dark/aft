@@ -48,12 +48,15 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
 /// crate downloaded on a fresh machine) is retried on the next policy build
 /// instead of being skipped until AFT restarts.
 pub(crate) fn worker_rust_read_grants() -> Vec<AccessGrant> {
-    const ROOTS: [(&str, &str, &str); 2] = [
+    // Published crate sources (registry and git dependencies) and toolchains:
+    // immutable package sources workers read when changing code against them.
+    const ROOTS: [(&str, &str, &str); 3] = [
         ("CARGO_HOME", ".cargo", "registry/src"),
+        ("CARGO_HOME", ".cargo", "git/checkouts"),
         ("RUSTUP_HOME", ".rustup", "toolchains"),
     ];
-    static RESOLVED: std::sync::Mutex<[Option<AccessGrant>; 2]> =
-        std::sync::Mutex::new([None, None]);
+    static RESOLVED: std::sync::Mutex<[Option<AccessGrant>; 3]> =
+        std::sync::Mutex::new([None, None, None]);
     let mut resolved = RESOLVED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
