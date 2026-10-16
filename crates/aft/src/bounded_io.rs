@@ -32,11 +32,27 @@ struct Failure {
     code: &'static str,
     message: String,
 }
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+impl std::error::Error for Failure {}
+
+/// Keep admission timeouts distinct when callers turn I/O errors into responses.
+pub(crate) fn timeout_code(error: &io::Error) -> &'static str {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<Failure>())
+        .map_or("read_blocked", |failure| failure.code)
+}
+
 #[derive(Clone)]
 struct ProbeError {
     kind: io::ErrorKind,
     message: String,
     raw_os_error: Option<i32>,
+    failure: Option<Failure>,
 }
 impl ProbeError {
     fn from(error: &io::Error) -> Self {
@@ -44,9 +60,16 @@ impl ProbeError {
             kind: error.kind(),
             message: error.to_string(),
             raw_os_error: error.raw_os_error(),
+            failure: error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<Failure>())
+                .cloned(),
         }
     }
     fn error(&self) -> io::Error {
+        if let Some(failure) = &self.failure {
+            return io::Error::new(self.kind, failure.clone());
+        }
         self.raw_os_error
             .map(io::Error::from_raw_os_error)
             .unwrap_or_else(|| io::Error::new(self.kind, self.message.clone()))
@@ -205,7 +228,7 @@ fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
         observe_permission(&folder, &Err(io::Error::from_raw_os_error(1)), true);
         return Response::error_with_data(req_id, "macos_permission_denied", format!("macOS denied access to {}; grant ck-aft access in System Settings → Privacy & Security, then retry", folder.display()), serde_json::json!({"folder":folder,"program":"ck-aft"}));
     } else if error.kind() == io::ErrorKind::TimedOut {
-        "read_blocked"
+        timeout_code(&error)
     } else {
         "path_access_denied"
     };
@@ -290,7 +313,7 @@ fn failure(path: &Path, code: &'static str, reason: &str) -> io::Error {
             });
         budget.failed.store(true, Ordering::Release);
     }
-    io::Error::new(io::ErrorKind::TimedOut, message)
+    io::Error::new(io::ErrorKind::TimedOut, Failure { code, message })
 }
 fn prior_failure() -> Option<io::Error> {
     CURRENT.with(|current| {
@@ -304,7 +327,7 @@ fn prior_failure() -> Option<io::Error> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|failure| io::Error::new(io::ErrorKind::TimedOut, failure.message.clone()));
+            .map(|failure| io::Error::new(io::ErrorKind::TimedOut, failure.clone()));
         error
     })
 }
@@ -443,6 +466,8 @@ fn run_with_limiter<T: Send + 'static>(
     #[cfg(test)]
     let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let running = Arc::new(Mutex::new(false));
+    let helper_running = Arc::clone(&running);
     #[cfg(test)]
     if let Some(counts) = &measurements {
         counts.round_trips.fetch_add(1, Ordering::Relaxed);
@@ -451,8 +476,20 @@ fn run_with_limiter<T: Send + 'static>(
         .name("aft-filesystem-probe".into())
         .spawn(move || {
             let _permit = permit;
+            #[cfg(test)]
+            regression_tests::before_helper(&owned);
             HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
-            let result = with_budget(budget, || work(owned));
+            let result = with_budget(budget, || {
+                // Owning a slot does not mean the OS has scheduled this helper.
+                // Never start expired work or blame its scheduling delay on I/O.
+                let mut running = helper_running.lock().unwrap_or_else(|e| e.into_inner());
+                if Instant::now() >= at {
+                    return Err(failure(&owned, "read_io_queue_timeout", "filesystem helper did not start before the deadline; this call did not start"));
+                }
+                *running = true;
+                drop(running);
+                work(owned)
+            });
             let _ = tx.send(result);
         })?;
     #[cfg(test)]
@@ -461,9 +498,31 @@ fn run_with_limiter<T: Send + 'static>(
     }
     match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(failure(path, "read_blocked", &format!(
-            "OS access did not finish within {:.3} s; on macOS, check ck-aft access in Privacy & Security, then retry", at.saturating_duration_since(started).as_secs_f64()))),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other("filesystem helper stopped")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
+                return Err(failure(
+                    path,
+                    "read_io_queue_timeout",
+                    "filesystem helper did not start before the deadline; this call did not start",
+                ));
+            }
+            let hint = if cfg!(target_os = "macos") {
+                "; on macOS, check ck-aft access in Privacy & Security, then retry"
+            } else {
+                ""
+            };
+            Err(failure(
+                path,
+                "read_blocked",
+                &format!(
+                    "OS access did not finish within {:.3} s{hint}",
+                    at.saturating_duration_since(started).as_secs_f64()
+                ),
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("filesystem helper stopped"))
+        }
     }
 }
 fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
@@ -496,6 +555,8 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
     };
     let access = if owner {
         let result = run(path, at, |path| {
+            #[cfg(test)]
+            regression_tests::before_directory_probe(&path)?;
             #[cfg(all(test, unix))]
             tests::before_directory_probe(&path)?;
             // Opening and advancing ReadDir probes consent, not just existence.
@@ -722,16 +783,28 @@ pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     if cached_directory(path).is_some_and(|access| access.direct) {
         return std::fs::canonicalize(path);
     }
-    let access = parent(path, None)?;
-    if access.direct && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
+    // Resolving a path needs traversal, not permission to enumerate its parent.
+    // Reuse a known-safe parent, otherwise isolate only canonicalize itself.
+    if path
+        .parent()
+        .and_then(cached_directory)
+        .is_some_and(|access| access.direct)
+        && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink())
+    {
         std::fs::canonicalize(path)
     } else {
         run(path, None, std::fs::canonicalize)
     }
 }
 pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
-    let access = parent(path, None)?;
-    if access.direct {
+    if let Some(error) = prior_failure() {
+        return Err(error);
+    }
+    // A stat must not turn into an unrelated ancestor's directory listing.
+    if cached_directory(path)
+        .or_else(|| path.parent().and_then(cached_directory))
+        .is_some_and(|access| access.direct)
+    {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.file_type().is_symlink() {
             return Ok(metadata);
@@ -739,6 +812,10 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
     }
     run(path, None, std::fs::metadata)
 }
+
+#[cfg(test)]
+#[path = "bounded_io_tests.rs"]
+mod regression_tests;
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {

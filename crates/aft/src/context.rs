@@ -11989,7 +11989,7 @@ impl AppContext {
         let resolved_root = if crate::bounded_io::current().is_some() {
             match crate::bounded_io::canonicalize(root) {
                 Ok(root) => root,
-                // The request will return read_blocked; do not cache a lexical
+                // The request will report a filesystem timeout; do not cache a lexical
                 // root identity from a timed-out probe for subsequent requests.
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                     return root.to_path_buf()
@@ -12129,7 +12129,11 @@ impl AppContext {
             })
         })
         .map_err(|error| {
-            crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+            crate::protocol::Response::error(
+                req_id,
+                crate::bounded_io::timeout_code(&error),
+                error.to_string(),
+            )
         })??;
         let resolved = normalize_path(&resolved_parent.join(file_name));
 
@@ -12196,7 +12200,11 @@ impl AppContext {
                 Ok(resolve(&id, &path, &owned_resolved_root, &owned_raw_root))
             })
             .map_err(|error| {
-                crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+                crate::protocol::Response::error(
+                    req_id,
+                    crate::bounded_io::timeout_code(&error),
+                    error.to_string(),
+                )
             })??
         } else {
             resolve(req_id, &path_for_resolution, &resolved_root, &raw_root)?
@@ -12269,7 +12277,11 @@ impl AppContext {
         };
         if crate::bounded_io::current().is_some() {
             crate::bounded_io::run(Path::new("."), None, move |_| Ok(build())).map_err(|error| {
-                crate::protocol::Response::error(req_id, "read_blocked", error.to_string())
+                crate::protocol::Response::error(
+                    req_id,
+                    crate::bounded_io::timeout_code(&error),
+                    error.to_string(),
+                )
             })
         } else {
             Ok(build())
@@ -12353,7 +12365,13 @@ impl AppContext {
         };
         let identity = if crate::bounded_io::current().is_some() {
             crate::bounded_io::run(resolved, None, move |path| Ok(identify(path))).map_err(
-                |error| crate::protocol::Response::error(req_id, "read_blocked", error.to_string()),
+                |error| {
+                    crate::protocol::Response::error(
+                        req_id,
+                        crate::bounded_io::timeout_code(&error),
+                        error.to_string(),
+                    )
+                },
             )?
         } else {
             identify(resolved.to_path_buf())
