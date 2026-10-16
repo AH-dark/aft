@@ -395,6 +395,7 @@ fn read_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     crate::commands::read::handle_read(&request, ctx)
 }
 
+#[cfg(unix)]
 fn scope_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
     match request.command.as_str() {
         "read" => read_dispatch(request, ctx),
@@ -435,6 +436,7 @@ impl Fixture {
             .await
     }
 
+    #[cfg(unix)]
     async fn tool(&self, name: &str, arguments: Value, corr: u64) -> Value {
         let mut replies = self
             .send_tool(&self.worker, name, arguments, corr, scope_dispatch)
@@ -527,6 +529,7 @@ impl Fixture {
         crate::db::access_grants::list(&conn, &access_grants::scope_key(&self.worker)).unwrap()
     }
 
+    #[cfg(unix)]
     async fn allow_read_scope(&self) {
         set_hold_budget_for_test(Some(Duration::from_millis(100)));
         let target = self.head_root.join("shared.txt");
@@ -973,6 +976,197 @@ async fn consent_scope_write_cards_keep_the_original_capability() {
         assert_eq!(advertised_scope(&prep), grant);
         FakeAccessRequest::decode(&prep.request).unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_home_file_stays_file_only() {
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+        .map(PathBuf::from)
+        .expect("the test runner supplies a home directory");
+    assert_file_only_read_scope(crate::access_policy::policy_path(&home).join("x"));
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_etc_hosts_stays_file_only() {
+    assert_file_only_read_scope(crate::access_policy::policy_path(Path::new("/etc/hosts")));
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_root_file_stays_file_only() {
+    assert_file_only_read_scope(PathBuf::from("/x"));
+}
+
+#[cfg(unix)]
+fn assert_file_only_read_scope(path: PathBuf) {
+    let original = AccessGrant {
+        path,
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let scope = read_directory_scope(&original);
+    assert_eq!(scope, original);
+    assert_eq!(scope_reason(&scope), "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.");
+    assert_eq!(pattern(&scope), original.path.to_string_lossy());
+}
+
+#[test]
+fn consent_scope_nested_file_still_offers_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("nested/src");
+    std::fs::create_dir_all(&parent).unwrap();
+    let parent = crate::access_policy::policy_path(&parent);
+    let scope = read_directory_scope(&AccessGrant {
+        path: parent.join("lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    });
+    assert_eq!(scope.path, parent);
+    assert_eq!(scope.kind, GrantKind::Subtree);
+    assert_eq!(scope.operation, AccessOperation::Read);
+    assert_eq!(scope_reason(&scope), "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.");
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_rejects_home_ancestors() {
+    let home = Path::new("/srv/users/alice");
+    for directory in ["/srv/users", "/srv/users/alice"] {
+        assert!(
+            !directory_scope_is_narrow(Path::new(directory), home, Path::new("/")),
+            "{directory}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_rejects_volume_boundaries() {
+    let home = Path::new("/srv/users/alice");
+    let volume = Path::new("/mnt/data");
+    for directory in ["/mnt/data", "/mnt/data/etc"] {
+        assert!(
+            !directory_scope_is_narrow(Path::new(directory), home, volume),
+            "{directory}"
+        );
+    }
+    assert!(directory_scope_is_narrow(
+        Path::new("/mnt/data/crates/src"),
+        home,
+        volume
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn consent_scope_rejects_drive_and_unc_volume_boundaries() {
+    for (root, home) in [
+        (r"C:\", r"C:\Users\alice"),
+        (r"\\server\share\", r"\\server\share\Users\alice"),
+    ] {
+        let root = Path::new(root);
+        let home = Path::new(home);
+        for directory in [
+            root.to_path_buf(),
+            root.join("etc"),
+            home.to_path_buf(),
+            home.parent().unwrap().to_path_buf(),
+        ] {
+            assert!(
+                !directory_scope_is_narrow(&directory, home, root),
+                "{}",
+                directory.display()
+            );
+        }
+        assert!(directory_scope_is_narrow(
+            &root.join("crates/src"),
+            home,
+            root
+        ));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_rejects_canonical_root_alias() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let target = root.join("private/etc");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, root.join("etc")).unwrap();
+    std::os::unix::fs::symlink(root.join("missing"), root.join("unavailable")).unwrap();
+    let target = crate::access_policy::policy_path(&target);
+    assert_eq!(directory_is_root_alias(&target, &root), Some(true));
+    assert_eq!(
+        directory_is_root_alias(&root.join("private/other"), &root),
+        Some(false)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn consent_scope_rejects_physical_directory_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = dir.path().join("volume");
+    let home = volume.join("users/alice");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(volume.join("etc")).unwrap();
+    for (name, target) in [
+        ("volume-alias", volume.as_path()),
+        ("home-alias", home.as_path()),
+        ("ancestor-alias", home.parent().unwrap()),
+    ] {
+        let alias = dir.path().join(name);
+        std::os::unix::fs::symlink(target, &alias).unwrap();
+        assert_eq!(
+            directory_is_protected_alias(&alias, &home, &volume),
+            Some(true),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        directory_is_protected_alias(&dir.path().join("volume-alias/etc"), &home, &volume),
+        Some(true)
+    );
+    let nested = volume.join("crates/src");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(
+        directory_is_protected_alias(&nested, &home, &volume),
+        Some(false)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_old_broad_card_is_restricted_to_file() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let db = f.ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    let grant = AccessGrant {
+        path: PathBuf::from("/x"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let Prep::Ask(mut prep) = prepare(
+        &conn,
+        &f.ctx,
+        &f.worker,
+        "read",
+        &json!({"path":"/x"}),
+        &grant,
+        None,
+    )
+    .unwrap() else {
+        panic!("expected a file-only scope card");
+    };
+    assert_eq!(prep.request["pattern"], "/x");
+    assert_eq!(prep.request["reason"], "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.");
+    prep.request["pattern"] = json!("/**");
+    assert_eq!(advertised_scope(&prep), grant);
 }
 
 #[tokio::test]

@@ -687,19 +687,86 @@ fn scope_reason(grant: &AccessGrant) -> &'static str {
     }
 }
 
-/// Read-file scopes cover only the immediate containing directory. The original
-/// file grant remains the allow-once capability.
+/// Offer a read-file's immediate directory only when it is not a home ancestor
+/// or a root-level system directory. Unknown home/volume identity stays file-only.
 fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
     if grant.operation == AccessOperation::Read && grant.kind == GrantKind::File {
         if let Some(parent) = grant.path.parent() {
-            return AccessGrant {
-                path: parent.to_path_buf(),
-                kind: GrantKind::Subtree,
-                operation: AccessOperation::Read,
-            };
+            let home = crate::environment::non_empty_os_var("HOME")
+                .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|path| crate::access_policy::policy_path(&path));
+            if let (Some(home), Some((volume, _))) =
+                (home, crate::storage_retention::volume_anchor(parent))
+            {
+                let volume = crate::access_policy::policy_path(&volume);
+                let root = parent.ancestors().last().unwrap_or(parent);
+                if directory_scope_is_narrow(parent, &home, &volume)
+                    && directory_is_protected_alias(parent, &home, &volume) == Some(false)
+                    && directory_is_root_alias(parent, root) == Some(false)
+                    && (root == volume || directory_is_root_alias(parent, &volume) == Some(false))
+                {
+                    return AccessGrant {
+                        path: parent.to_path_buf(),
+                        kind: GrantKind::Subtree,
+                        operation: AccessOperation::Read,
+                    };
+                }
+            }
         }
     }
     grant.clone()
+}
+
+/// Inputs are canonical policy identities, including home aliases and native
+/// volume roots. Exclude root-level system directories and all home ancestors.
+fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
+    directory.is_absolute()
+        && directory.parent().and_then(Path::parent).is_some()
+        && !home.starts_with(directory)
+        && directory != volume
+        && directory.parent() != Some(volume)
+}
+
+/// Bind mounts can preserve a protected directory's identity without preserving
+/// its path spelling. Device/inode checks also catch same-device volume aliases.
+#[cfg(unix)]
+fn directory_is_protected_alias(directory: &Path, home: &Path, volume: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |path: &Path| {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    let candidate = identity(directory)?;
+    for ancestor in home.ancestors().chain(std::iter::once(volume)) {
+        if identity(ancestor)? == candidate {
+            return Some(true);
+        }
+    }
+    Some(identity(directory.parent()?)? == identity(volume)?)
+}
+
+#[cfg(not(unix))]
+fn directory_is_protected_alias(_directory: &Path, _home: &Path, _volume: &Path) -> Option<bool> {
+    Some(false)
+}
+
+/// A canonical directory can still be a root-level alias, such as /etc pointing
+/// to /private/etc. Only resolvable aliases have a target identity to compare.
+fn directory_is_root_alias(directory: &Path, root: &Path) -> Option<bool> {
+    for entry in std::fs::read_dir(root).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_type().ok()?.is_symlink() {
+            let Ok(target) = entry.path().canonicalize() else {
+                continue;
+            };
+            if crate::access_policy::policy_path(&target) == directory {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
 /// A pending card can outlive a daemon upgrade. Widen only when its persisted
