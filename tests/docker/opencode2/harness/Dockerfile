@@ -51,7 +51,21 @@ RUN bun install --frozen-lockfile && \
     mkdir -p /packs /plugin/node_modules/@cortexkit/aft-opencode /plugin/node_modules && \
     npm pack ./packages/opencode-plugin --pack-destination /packs >/dev/null && \
     tar -xzf /packs/*.tgz -C /plugin/node_modules/@cortexkit/aft-opencode --strip-components=1 && \
-    cp -a node_modules/.bun/effect@4.0.0-rc.112/node_modules/effect /plugin/node_modules/effect
+    effect_dir= && \
+    effect_candidates= && \
+    effect_dir_count=0 && \
+    for effect_candidate in node_modules/.bun/effect@*/node_modules/effect; do \
+      if [ -d "$effect_candidate" ]; then \
+        effect_dir="$effect_candidate"; \
+        effect_candidates="$effect_candidates $effect_candidate"; \
+        effect_dir_count=$((effect_dir_count + 1)); \
+      fi; \
+    done && \
+    if [ "$effect_dir_count" -ne 1 ]; then \
+      printf 'expected exactly one installed effect package under node_modules/.bun; found %s:%s\n' "$effect_dir_count" "${effect_candidates:- none}" >&2; \
+      exit 1; \
+    fi && \
+    cp -a "$effect_dir" /plugin/node_modules/effect
 
 FROM --platform=linux/amd64 node:24-bookworm-slim AS runtime
 ARG OPENCODE2_VERSION
