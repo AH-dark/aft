@@ -10,7 +10,13 @@ import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { conflictTools } from "../../tools/conflicts.js";
 import { searchTools } from "../../tools/search.js";
 import type { PluginContext } from "../../types.js";
-import { cleanupHarnesses, createHarness, type E2EHarness, prepareBinary } from "./helpers.js";
+import {
+  cleanupHarnesses,
+  configureParamsFromLegacyOverrides,
+  createHarness,
+  type E2EHarness,
+  prepareBinary,
+} from "./helpers.js";
 
 const initialBinary = await prepareBinary();
 const maybeDescribe = describe.skipIf(!initialBinary.binaryPath);
@@ -82,6 +88,42 @@ maybeDescribe("glob/conflicts tool_call e2e", () => {
       rmSync(external, { recursive: true, force: true });
     }
   });
+
+  test("exact absolute project-file glob returns the file with a ready index", async () => {
+    const h = await harness();
+    await writeGlobFixture(h.tempDir);
+    const configured = await h.bridge.send(
+      "configure",
+      configureParamsFromLegacyOverrides({
+        project_root: h.tempDir,
+        harness: "opencode",
+        indexes: { trigram: true },
+      }),
+    );
+    expect(configured.success).toBe(true);
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      const probe = await h.bridge.send("grep", { pattern: "main", path: "src" });
+      expect(probe.success).toBe(true);
+      if (String(probe.index_status).toLowerCase() === "ready") {
+        expect(probe.matches).toHaveLength(1);
+        break;
+      }
+      if (Date.now() >= deadline) throw new Error(`Index not ready: ${probe.index_status}`);
+      await Bun.sleep(100);
+    }
+
+    const askCalls: AskCall[] = [];
+    const glob = searchTools(pluginContext(h)).glob;
+    const output = await glob.execute(
+      { pattern: h.path("src", "main.ts") },
+      runtime(h, recordingAsk(askCalls)),
+    );
+    expect(resultText(output)).toContain("1 file matching main.ts");
+    expect(resultText(output)).toContain("src/main.ts");
+    expect(resultText(output)).not.toContain("helper.ts");
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toHaveLength(0);
+  }, 20_000);
 
   test("conflicts reports a clean repository", async () => {
     const h = await harness();

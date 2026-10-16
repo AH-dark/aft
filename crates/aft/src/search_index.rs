@@ -3467,6 +3467,7 @@ impl SearchIndexSnapshot {
         // pattern is matched relative to whichever root contained the entry.
         let raw_root = search_root.to_path_buf();
         let canonical_root = canonicalize_for_search_membership(search_root);
+        let file_scope = search_root.is_file();
         let containing_root = |path: &Path| -> Option<&Path> {
             if is_within_search_root(&raw_root, path) {
                 Some(raw_root.as_path())
@@ -3490,7 +3491,16 @@ impl SearchIndexSnapshot {
             // project root. When a caller passes `{path: "src", pattern:
             // "a.rs"}`, the pattern must match `a.rs` (the path relative to
             // `src`), not `src/a.rs` (the path relative to the project root).
-            .filter(|(file, root)| filters.matches(root, &file.path))
+            .filter(|(file, root)| {
+                // A file scope must match its basename, not the empty path
+                // relative to itself. Containment above still excludes siblings.
+                let filter_root = if file_scope {
+                    root.parent().unwrap_or(root)
+                } else {
+                    root
+                };
+                filters.matches(filter_root, &file.path)
+            })
             .map(|(file, _)| {
                 scope_has_files = true;
                 (file.path.clone(), file.modified)
