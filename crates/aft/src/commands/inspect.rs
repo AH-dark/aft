@@ -278,13 +278,31 @@ fn capture_inspect_root_stats_until(
     root: &Path,
     deadline: Option<InspectRequestDeadline>,
 ) -> Result<InspectRootStatSnapshot, String> {
-    let mut files = Vec::new();
-    for file in crate::callgraph::walk_project_files(root) {
-        if deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
-            return Err(deadline
+    capture_inspect_root_stats_while(
+        root,
+        move || deadline.is_none_or(InspectRequestDeadline::has_work_budget),
+        move || {
+            deadline
                 .expect("checked request deadline")
-                .timeout_detail(InspectPhaseId::StatVerification));
+                .timeout_detail(InspectPhaseId::StatVerification)
+        },
+    )
+}
+
+fn capture_inspect_root_stats_while(
+    root: &Path,
+    has_work_budget: impl Fn() -> bool + Send + Sync + 'static,
+    timeout_detail: impl Fn() -> String,
+) -> Result<InspectRootStatSnapshot, String> {
+    let mut files = Vec::new();
+    let has_work_budget = Arc::new(has_work_budget);
+    let walk_budget = Arc::clone(&has_work_budget);
+    for file in crate::callgraph::walk_project_files_while(root, move || walk_budget()) {
+        if !has_work_budget() {
+            return Err(timeout_detail());
         }
+        #[cfg(test)]
+        INSPECT_STAT_CALLS.with(|count| count.set(count.get() + 1));
         match std::fs::metadata(&file) {
             Ok(metadata) => files.push((
                 file,
@@ -302,8 +320,18 @@ fn capture_inspect_root_stats_until(
             }
         }
     }
+    // An exhausted iterator may mean timeout, including roots with no source
+    // files at all. Never mistake a partial census for a fresh empty snapshot.
+    if !has_work_budget() {
+        return Err(timeout_detail());
+    }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(InspectRootStatSnapshot(files))
+}
+
+#[cfg(test)]
+thread_local! {
+    static INSPECT_STAT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn verify_final_root_stats(
@@ -7090,6 +7118,44 @@ mod fresh_payload_tests {
 #[cfg(test)]
 mod deferred_terminal_tests {
     use super::*;
+
+    #[test]
+    fn inspect_stats_deadline_bounds_unsupported_walk() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..32 {
+            let dir = root.path().join(format!("dir{i}"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("unsupported.xyz"), "not source").unwrap();
+        }
+        crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.set(0));
+        INSPECT_STAT_CALLS.with(|count| count.set(0));
+        let result = capture_inspect_root_stats_while(
+            root.path(),
+            || crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.get() < 8),
+            || "inspect_request_timeout".to_string(),
+        );
+        let visited = crate::callgraph::PROJECT_WALK_ENTRIES.with(std::cell::Cell::get);
+        assert!(
+            visited <= 8,
+            "walk visited {visited} entries after its budget"
+        );
+        assert_eq!(result.unwrap_err(), "inspect_request_timeout");
+        assert_eq!(INSPECT_STAT_CALLS.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn inspect_stats_unchanged_root_keeps_two_fresh_stat_passes() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["lib.rs", "README.md", "app.ts", "unsupported.xyz"] {
+            std::fs::write(root.path().join(name), "fixture").unwrap();
+        }
+        INSPECT_STAT_CALLS.with(|count| count.set(0));
+        let initial = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        let final_stats = capture_inspect_root_stats_until(root.path(), None).unwrap();
+        assert_eq!(initial, final_stats);
+        assert_eq!(initial.0.len(), 3);
+        assert_eq!(INSPECT_STAT_CALLS.with(std::cell::Cell::get), 6);
+    }
 
     #[test]
     fn inspect_test_delay_holds_until_elapsed() {

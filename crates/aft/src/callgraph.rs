@@ -3859,6 +3859,23 @@ fn walk_project_files_filtered(
     root: &Path,
     include: impl Fn(&Path) -> bool + Send + Sync + 'static,
 ) -> impl Iterator<Item = PathBuf> {
+    walk_project_files_filtered_while(root, include, || true)
+}
+
+/// Stop before advancing the directory iterator, not just between source files.
+/// Unsupported files and directories still consume a caller's walk budget.
+pub(crate) fn walk_project_files_while(
+    root: &Path,
+    keep_walking: impl Fn() -> bool,
+) -> impl Iterator<Item = PathBuf> {
+    walk_project_files_filtered_while(root, |_| true, keep_walking)
+}
+
+fn walk_project_files_filtered_while(
+    root: &Path,
+    include: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    keep_walking: impl Fn() -> bool,
+) -> impl Iterator<Item = PathBuf> {
     use ignore::WalkBuilder;
 
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
@@ -3867,8 +3884,10 @@ fn walk_project_files_filtered(
     builder.same_file_system(true).hidden(true); // skip hidden files/dirs
                                                  // .gitignore (also outside a git repository), global excludes,
                                                  // .git/info/exclude and .aftignore (e.g. submodules).
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, root)
+    let mut walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(move |entry| {
+            #[cfg(test)]
+            PROJECT_WALK_ENTRIES.with(|count| count.set(count.get() + 1));
             if !include(entry.path()) {
                 return false;
             }
@@ -3881,11 +3900,19 @@ fn walk_project_files_filtered(
         })
         .build();
 
-    walker
+    // Filtering to source paths first can hide arbitrarily many directory/file
+    // visits inside a single next() call. Check before each raw walker advance.
+    std::iter::from_fn(move || keep_walking().then(|| walker.next()).flatten())
+        .fuse()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
         .filter(|entry| detect_language(entry.path()).is_some())
         .map(|entry| entry.into_path())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROJECT_WALK_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether [`walk_project_files`] can yield the file at this root-relative
