@@ -176,6 +176,111 @@ fn lane_paused_view_wait_releases_admission_refresh_and_family_claims() {
     });
 }
 
+#[test]
+fn normal_view_fill_has_zero_checkpoint_work() {
+    use crate::semantic_index::{with_checkpoint_work, PauseRetryScope};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("checkout");
+    write_tree(&root, FILES);
+    let runtime = open(
+        &directory.path().join("storage"),
+        "normal-no-checkpoints",
+        &root,
+    );
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, _wake) = slot.begin();
+    let model = Model::default();
+    let (outcome, work) = with_checkpoint_work(|| {
+        let _policy =
+            PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+        catch_up(
+            &Arc::downgrade(&slot),
+            epoch,
+            &runtime,
+            &fast_schedule(&root),
+            FillBudget::default(),
+            &mut |texts| model.embed(texts),
+        )
+    });
+    assert!(matches!(outcome, FillOutcome::Settled));
+    assert!(model.calls() > 0);
+    assert_eq!(
+        work,
+        Default::default(),
+        "healthy view fill copied pause checkpoints"
+    );
+}
+
+#[test]
+fn lane_paused_view_cursor_retains_completed_and_unattempted_chunks() {
+    use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
+    use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("checkout");
+    write_tree(
+        &root,
+        &[
+            ("a.rs", "/// First.\npub fn first(x: u64) -> u64 { x + 1 }\n/// Second.\npub fn second(x: u64) -> u64 { x + 2 }\n"),
+            ("b.rs", "/// Third.\npub fn third(x: u64) -> u64 { x + 3 }\n/// Fourth.\npub fn fourth(x: u64) -> u64 { x + 4 }\n"),
+            ("c.rs", "/// Fifth.\npub fn fifth(x: u64) -> u64 { x + 5 }\n/// Sixth.\npub fn sixth(x: u64) -> u64 { x + 6 }\n"),
+        ],
+    );
+    let runtime = open(
+        &directory.path().join("storage"),
+        "paused-owned-cursor",
+        &root,
+    );
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, _wake) = slot.begin();
+    with_lane_pause_clock(START, |clock| {
+        let _policy =
+            PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+        let before = lane_pause_chunk_calls();
+        let mut inputs = Vec::new();
+        let outcome = catch_up(
+            &Arc::downgrade(&slot),
+            epoch,
+            &runtime,
+            &fast_schedule(&root),
+            FillBudget {
+                max_batch: 1,
+                ..FillBudget::default()
+            },
+            &mut |texts: Vec<String>| {
+                inputs.extend(texts.clone());
+                if inputs.len() == 2 && clock.load(Ordering::SeqCst) == START {
+                    Err(SynapseEmbeddingError::LanePaused(LanePause {
+                        lane_id: MODEL.into(),
+                        fingerprint: Some("pinned".into()),
+                        retry_after_ms: Some(PAUSE_MS),
+                        paused_until_ms: START + PAUSE_MS,
+                        reason: "maintenance".into(),
+                    })
+                    .to_string())
+                } else {
+                    Ok(vec![vec![1.0, 0.0]; texts.len()])
+                }
+            },
+        );
+        assert!(matches!(outcome, FillOutcome::Settled));
+        assert_eq!(
+            runtime
+                .search(&[1.0, 0.0], 100, &|_| true)
+                .unwrap()
+                .results
+                .len(),
+            9
+        );
+        assert_eq!(inputs.len(), 10, "a completed vector was embedded twice");
+        assert_eq!(inputs[1], inputs[2]);
+        assert_eq!(
+            lane_pause_chunk_calls() - before,
+            3,
+            "unattempted prepared files were re-chunked"
+        );
+    });
+}
+
 const FILES: &[(&str, &str)] = &[
     (
         "src/alpha.rs",

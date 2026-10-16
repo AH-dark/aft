@@ -945,11 +945,29 @@ impl SemanticPlane {
                     }
                 }
                 Err(error) => {
+                    crate::semantic_index::retain_view_pause_chunks(
+                        &root,
+                        self.producer.caps,
+                        to_embed
+                            .iter()
+                            .map(|(item, relative, _, _)| (relative.clone(), item.content)),
+                        &error,
+                    );
                     if crate::synapse_embed::LanePause::from_error(&error).is_none() {
                         transient.extend(to_embed.into_iter().map(|(_, _, full_key, _)| full_key));
+                        report.deferred += pending.count();
+                    } else {
+                        report.deferred += pending.len();
+                        crate::semantic_index::retain_unattempted_view_chunks(
+                            &root,
+                            self.producer.caps,
+                            pending.map(|((item, relative, _, _claim), chunks)| {
+                                (relative, item.content, chunks)
+                            }),
+                            &error,
+                        );
                     }
                     report.errors.push(error);
-                    report.deferred += pending.count();
                     break;
                 }
             }

@@ -1337,7 +1337,7 @@ where
                 limiter,
                 kind,
                 &schedule.root,
-                || is_current(slot, epoch) && !(schedule.paused)(),
+                || is_current(slot, epoch),
             );
             admission_wait += wait_started.elapsed();
             let permit = permit.ok_or_else(|| "semantic lane superseded".to_owned())?;
