@@ -18,4 +18,10 @@ jobs:
     # The gate runs every write on the job's GITHUB_TOKEN and needs no App
     # secrets, so none are passed: the org CI App key must stay reachable
     # only from private repositories.
-    uses: cortexkit/subconscious/.github/workflows/design-gate.yml@6ffa19030c20bdd3816ad809d3c5e0123e07e8a8
+    uses: cortexkit/subconscious/.github/workflows/design-gate.yml@242a03bfe752409717aed4a25237ac77b9042f90
+    with:
+      # Pull requests this repository's own bot opens to land reviewed work
+      # skip the gate. Login and numeric id must both match, the author must
+      # be a Bot, and the branch must be in this repository; the list is read
+      # from the base branch, so a pull request cannot add itself.
+      owner-bots: 'aft-alfonso[bot]:318960130'
