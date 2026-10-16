@@ -36,6 +36,7 @@ import {
   WORKER_SESSION_FIELD,
 } from "@cortexkit/aft-bridge";
 import { tool } from "@opencode-ai/plugin";
+import { forwardPendingBashWaitDetach } from "../bash-wait-detach.js";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import { getSessionDirectory, getSessionDirectoryCached } from "../shared/session-directory.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
@@ -315,6 +316,7 @@ export async function callBridge(
   let response: Awaited<ReturnType<AftProjectTransport["send"]>>;
   try {
     const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
+    await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID);
     const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
     response = ctx.pool.sendForCanonicalRoot
       ? await ctx.pool.sendForCanonicalRoot(root, command, merged, opts)
@@ -371,6 +373,7 @@ export async function callToolCall(
   let response: Awaited<ReturnType<AftProjectTransport["toolCall"]>>;
   try {
     const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
+    await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID);
     const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
     response = ctx.pool.toolCallForCanonicalRoot
       ? await ctx.pool.toolCallForCanonicalRoot(root, runtime.sessionID, name, rawArgs, opts)

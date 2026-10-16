@@ -12,10 +12,31 @@ import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 
 const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 
-type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot"> &
-  Partial<Pick<AftTransportPool, "getBridge">>;
+type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot">;
 
 const pendingOperations = new WeakMap<ActiveBridgePool, Map<string, Promise<void>>>();
+const pendingRequests = new WeakMap<ActiveBridgePool, Map<string, PendingRequest>>();
+const PENDING_DETACH_TTL_MS = 120_000;
+
+interface PendingRequest {
+  expiresAt: number;
+  bridges: Set<AftProjectTransport>;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+function rememberPendingRequest(pool: ActiveBridgePool, sessionID: string): PendingRequest {
+  let sessions = pendingRequests.get(pool);
+  if (!sessions) pendingRequests.set(pool, (sessions = new Map()));
+  const request: PendingRequest = sessions.get(sessionID) ?? { expiresAt: 0, bridges: new Set() };
+  clearTimeout(request.timer);
+  request.expiresAt = Date.now() + PENDING_DETACH_TTL_MS;
+  request.timer = setTimeout(() => {
+    if (sessions.get(sessionID) === request) sessions.delete(sessionID);
+  }, PENDING_DETACH_TTL_MS);
+  request.timer.unref();
+  sessions.set(sessionID, request);
+  return request;
+}
 
 function queuePendingOperation(
   pool: ActiveBridgePool,
@@ -25,8 +46,8 @@ function queuePendingOperation(
   let sessions = pendingOperations.get(pool);
   if (!sessions) pendingOperations.set(pool, (sessions = new Map()));
   const previous = sessions.get(sessionID);
-  // Serialize admission with turn_start clearing so a delayed RPC cannot
-  // re-arm a detach request for an already-delivered message.
+  // Serialize admission, delivery clears and later admissions without making
+  // the host's model step wait for an RPC. A late clear must not erase new input.
   const operation = (previous ? previous.then(run, run) : run()).catch((error) => {
     warn(`[bash_wait_detach] request failed for session ${sessionID}: ${String(error)}`);
   });
@@ -40,22 +61,47 @@ function queuePendingOperation(
 /** Pi starts the next turn after including messages queued while tools were running. */
 export async function clearPendingBashWaitDetach(
   pool: ActiveBridgePool,
-  projectRoot: string,
+  _projectRoot: string,
   sessionID: string | undefined,
 ): Promise<void> {
   if (!sessionID) return;
+  const sessions = pendingRequests.get(pool);
+  const request = sessions?.get(sessionID);
+  if (!request) return;
+  sessions?.delete(sessionID);
+  clearTimeout(request.timer);
+  void queuePendingOperation(pool, sessionID, async () => {
+    await Promise.all(
+      [...request.bridges].map(async (bridge) => {
+        try {
+          await bridge.send(
+            "bash_wait_detach",
+            { session_id: sessionID, clear_pending: true },
+            { keepBridgeOnTimeout: true, transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS },
+          );
+        } catch (error) {
+          warn(
+            `[bash_wait_detach] delivery clear failed for session ${sessionID}: ${String(error)}`,
+          );
+        }
+      }),
+    );
+  });
+}
+
+/** A real tool may open a cold bridge; deliver cached input before sending that tool. */
+export async function forwardPendingBashWaitDetach(
+  pool: ActiveBridgePool,
+  bridge: AftProjectTransport,
+  sessionID: string | undefined,
+): Promise<void> {
+  if (!sessionID) return;
+  const request = pendingRequests.get(pool)?.get(sessionID);
+  if (!request || request.expiresAt <= Date.now()) return;
   await queuePendingOperation(pool, sessionID, async () => {
-    const bridge = pool.getActiveBridgeForRoot(projectRoot);
-    if (!bridge) return;
-    try {
-      await bridge.send(
-        "bash_wait_detach",
-        { session_id: sessionID, clear_pending: true },
-        { keepBridgeOnTimeout: true, transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS },
-      );
-    } catch (error) {
-      warn(`[bash_wait_detach] delivery clear failed for session ${sessionID}: ${String(error)}`);
-    }
+    if (request.expiresAt <= Date.now() || request.bridges.has(bridge)) return;
+    request.bridges.add(bridge);
+    await sendBashWaitDetach(bridge, sessionID, true);
   });
 }
 
@@ -103,10 +149,7 @@ export function interruptBashWaitsForInput(
 ): string {
   if (shouldDetachBashWaitOnUserMessage(config, event.text)) {
     signalSyncWatchAbort(sessionID);
-    if (sessionID)
-      void queuePendingOperation(pool, sessionID, () =>
-        signalBashWaitDetachForProject(pool, projectRoot, sessionID, true),
-      );
+    void signalBashWaitDetachForProject(pool, projectRoot, sessionID, true);
   }
   return stripUserMessageDetachKeyword(event.text);
 }
@@ -133,15 +176,22 @@ export async function signalBashWaitDetachForProject(
   pending = false,
 ): Promise<void> {
   if (!sessionID) return;
-  const bridge =
-    pool.getActiveBridgeForRoot(projectRoot) ??
-    (pending ? pool.getBridge?.(projectRoot) : undefined);
-  if (!bridge) return;
-  try {
-    await sendBashWaitDetach(bridge, sessionID, pending);
-  } catch (err) {
-    warn(
-      `[bash_wait_detach] failed for session ${sessionID}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
+  const request = pending ? rememberPendingRequest(pool, sessionID) : undefined;
+  const run = async () => {
+    if (request && request.expiresAt <= Date.now()) return;
+    // Message admission never creates a bridge. A later tool forwards cached
+    // input if it opens this session's first bridge before delivery or expiry.
+    const bridge = pool.getActiveBridgeForRoot(projectRoot);
+    if (!bridge) return;
+    request?.bridges.add(bridge);
+    try {
+      await sendBashWaitDetach(bridge, sessionID, pending);
+    } catch (err) {
+      warn(
+        `[bash_wait_detach] failed for session ${sessionID}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+  if (pending) await queuePendingOperation(pool, sessionID, run);
+  else await run();
 }

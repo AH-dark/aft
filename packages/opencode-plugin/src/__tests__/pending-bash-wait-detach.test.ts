@@ -1,103 +1,261 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Effect } from "effect";
 import {
   clearPendingBashWaitDetachForMessages,
   interruptBashWaitsForChatMessage,
 } from "../bash-wait-detach.js";
+import { callBridge, callToolCall } from "../tools/_shared.js";
 import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
 
-function fixture() {
-  const calls: Record<string, unknown>[] = [];
-  let release!: () => void;
-  const admitted = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+const projectRoot = process.cwd();
+let nextSession = 0;
+
+function fixture(open = true) {
+  const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+  let opened = open;
+  let creations = 0;
+  let hold: Promise<void> | undefined;
+  let release = () => {};
+  let secondOpen = false;
+  let secondCalls = 0;
   const bridge = {
     send: async (command: string, params: Record<string, unknown>) => {
-      expect(command).toBe("bash_wait_detach");
-      calls.push(params);
-      if (params.pending) await admitted;
-      return { success: true, detached: false };
+      calls.push({ command, params });
+      if (params.pending || params.clear_pending) await hold;
+      return { success: true, detached: false, text: "ok" };
+    },
+    toolCall: async (sessionID: string, name: string, args: Record<string, unknown>) =>
+      bridge.send("tool_call", { session_id: sessionID, name, args }),
+  };
+  const second = {
+    send: () => {
+      secondCalls += 1;
+      return new Promise<never>(() => {});
     },
   };
   const pool = {
-    getActiveBridgeForRoot: () => bridge,
-    activeBridges: () => [bridge],
-  } as unknown as Parameters<typeof interruptBashWaitsForChatMessage>[0];
-  return { pool, calls, release };
-}
-
-test("V1 remembers admission and clears on model input after the admission RPC settles", async () => {
-  const { pool, calls, release } = fixture();
-  interruptBashWaitsForChatMessage(pool, {}, "/repo", "v1", {
-    parts: [{ type: "text", text: "hello" }],
-  });
-  expect(calls).toEqual([{ session_id: "v1", pending: true }]);
-  const delivered = clearPendingBashWaitDetachForMessages(pool, {
-    messages: [{ info: { sessionID: "v1" } }],
-  });
-  expect(calls).toHaveLength(1);
-  release();
-  await delivered;
-  expect(calls).toEqual([
-    { session_id: "v1", pending: true },
-    { session_id: "v1", clear_pending: true },
-  ]);
-});
-
-test("V2 prompt admission persists until its context delivery hook", async () => {
-  const { pool, calls, release } = fixture();
-  const hooks = new Map<string, (event: never) => Effect.Effect<void>>();
-  await Effect.runPromise(
-    registerV2PromptDetachHook(
-      {
-        session: {
-          hook: (name: string, callback: (event: never) => Effect.Effect<void>) => {
-            hooks.set(name, callback);
-            return Effect.void;
-          },
-        },
-      },
-      { pool, projectRoot: "/repo", getConfig: () => ({}) },
-    ) as Effect.Effect<boolean>,
-  );
-  await Effect.runPromise(
-    hooks.get("prompt")?.({
-      sessionID: "v2",
-      prompt: { text: "hello" },
-    } as never) as Effect.Effect<void>,
-  );
-  expect(calls).toEqual([{ session_id: "v2", pending: true }]);
-  const delivered = Effect.runPromise(
-    hooks.get("context")?.({ sessionID: "v2" } as never) as Effect.Effect<void>,
-  );
-  expect(calls).toHaveLength(1);
-  release();
-  await delivered;
-  expect(calls).toEqual([
-    { session_id: "v2", pending: true },
-    { session_id: "v2", clear_pending: true },
-  ]);
-});
-
-test("admission opens a bridge before the session's first tool call", async () => {
-  const { pool, calls, release } = fixture();
-  const bridge = pool.getActiveBridgeForRoot("/repo");
-  let opened = false;
-  const lazy = {
     getActiveBridgeForRoot: () => (opened ? bridge : null),
     getBridge: () => {
+      if (!opened) creations += 1;
       opened = true;
       return bridge;
     },
-    activeBridges: () => (opened ? [bridge] : []),
-  } as unknown as typeof pool;
-  interruptBashWaitsForChatMessage(lazy, {}, "/repo", "new-session", {
-    parts: [{ type: "text", text: "hello" }],
+    activeBridges: () => [...(opened ? [bridge] : []), ...(secondOpen ? [second] : [])],
+  } as unknown as Parameters<typeof interruptBashWaitsForChatMessage>[0];
+  return {
+    pool,
+    calls,
+    creations: () => creations,
+    secondCalls: () => secondCalls,
+    openSecond: () => {
+      secondOpen = true;
+    },
+    block: () => {
+      hold = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    },
+    release: () => release(),
+  };
+}
+
+async function host(version: "V1" | "V2", pool: ReturnType<typeof fixture>["pool"]) {
+  const sessionID = `pending-${version}-${++nextSession}`;
+  const hooks = new Map<string, (event: never) => Effect.Effect<void>>();
+  if (version === "V2") {
+    await Effect.runPromise(
+      registerV2PromptDetachHook(
+        {
+          session: {
+            hook: (name: string, callback: (event: never) => Effect.Effect<void>) => {
+              hooks.set(name, callback);
+              return Effect.void;
+            },
+          },
+        },
+        { pool, projectRoot, getConfig: () => ({}) },
+      ) as Effect.Effect<boolean>,
+    );
+  }
+  const client = { session: { get: async () => ({ data: { directory: projectRoot } }) } };
+  const ctx = { pool, client } as unknown as Parameters<typeof callBridge>[0];
+  const runtime = { sessionID, directory: projectRoot, directoryIsSessionRoot: true };
+  return {
+    sessionID,
+    admit: async () => {
+      if (version === "V1")
+        interruptBashWaitsForChatMessage(pool, {}, projectRoot, sessionID, {
+          parts: [{ type: "text", text: "hello" }],
+        });
+      else
+        await Effect.runPromise(
+          hooks.get("prompt")?.({
+            sessionID,
+            prompt: { text: "hello" },
+          } as never) as Effect.Effect<void>,
+        );
+    },
+    step: () =>
+      version === "V1"
+        ? clearPendingBashWaitDetachForMessages(pool, { messages: [{ info: { sessionID } }] })
+        : Effect.runPromise(hooks.get("context")?.({ sessionID } as never) as Effect.Effect<void>),
+    tool: () =>
+      callBridge(ctx, runtime, "bash", { command: "echo ready", block_to_completion: true }),
+    hoistedTool: () => callToolCall(ctx, runtime, "read", { path: "README.md" }),
+  };
+}
+
+async function promptly(operation: Promise<unknown>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("model step waited for a bridge")), 200);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function drain() {
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+}
+
+for (const version of ["V1", "V2"] as const) {
+  test(`${version} cold admission creates no bridge and forwards pending before the first bash`, async () => {
+    const f = fixture(false);
+    const h = await host(version, f.pool);
+    await h.admit();
+    expect(f.creations()).toBe(0);
+    expect(f.calls).toEqual([]);
+    f.block();
+    const tool = h.tool();
+    try {
+      await drain();
+      expect(f.calls.map(({ command }) => command)).toEqual(["bash_wait_detach"]);
+    } finally {
+      f.release();
+    }
+    await tool;
+    expect(f.creations()).toBe(1);
+    expect(f.calls.map(({ command }) => command)).toEqual(["bash_wait_detach", "bash"]);
+    expect(f.calls[0].params).toEqual({ session_id: h.sessionID, pending: true });
   });
-  expect(calls).toEqual([{ session_id: "new-session", pending: true }]);
-  release();
-  await clearPendingBashWaitDetachForMessages(lazy, {
-    messages: [{ info: { sessionID: "new-session" } }],
+
+  test(`${version} cold pending is also forwarded before a hoisted tool call`, async () => {
+    const f = fixture(false);
+    const h = await host(version, f.pool);
+    await h.admit();
+    await h.hoistedTool();
+    expect(f.calls.map(({ command }) => command)).toEqual(["bash_wait_detach", "tool_call"]);
   });
-});
+
+  test(`${version} model step with no pending request makes zero bridge calls`, async () => {
+    const f = fixture();
+    const h = await host(version, f.pool);
+    await h.step();
+    expect(f.calls).toEqual([]);
+    expect(f.secondCalls()).toBe(0);
+  });
+
+  test(`${version} model step clears only its pending recipient, never a hung second project`, async () => {
+    const f = fixture();
+    const h = await host(version, f.pool);
+    await h.admit();
+    await drain();
+    f.openSecond();
+    await promptly(h.step());
+    await drain();
+    expect(f.calls.map(({ params }) => params)).toEqual([
+      { session_id: h.sessionID, pending: true },
+      { session_id: h.sessionID, clear_pending: true },
+    ]);
+    expect(f.secondCalls()).toBe(0);
+  });
+
+  test(`${version} model step never waits for admission and preserves later admission order`, async () => {
+    const f = fixture();
+    const h = await host(version, f.pool);
+    f.block();
+    await h.admit();
+    try {
+      await promptly(h.step());
+      await h.admit();
+      expect(f.calls).toHaveLength(1);
+    } finally {
+      f.release();
+    }
+    await drain();
+    expect(f.calls.map(({ params }) => params)).toEqual([
+      { session_id: h.sessionID, pending: true },
+      { session_id: h.sessionID, clear_pending: true },
+      { session_id: h.sessionID, pending: true },
+    ]);
+  });
+
+  test(`${version} model step never waits for a hung clear`, async () => {
+    const f = fixture();
+    const h = await host(version, f.pool);
+    await h.admit();
+    await drain();
+    f.block();
+    try {
+      await promptly(h.step());
+      await h.admit();
+      expect(f.calls.map(({ params }) => params)).toEqual([
+        { session_id: h.sessionID, pending: true },
+        { session_id: h.sessionID, clear_pending: true },
+      ]);
+    } finally {
+      f.release();
+    }
+    await drain();
+    expect(f.calls[2].params).toEqual({ session_id: h.sessionID, pending: true });
+  });
+
+  test(`${version} delivery clears cold pending without opening a bridge`, async () => {
+    const f = fixture(false);
+    const h = await host(version, f.pool);
+    await h.admit();
+    await h.step();
+    await h.tool();
+    expect(f.creations()).toBe(1);
+    expect(f.calls.map(({ command }) => command)).toEqual(["bash"]);
+  });
+
+  test(`${version} cold pending expires after 120 seconds`, async () => {
+    const f = fixture(false);
+    const h = await host(version, f.pool);
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await h.admit();
+      clock.mockReturnValue(now + 120_000);
+      await h.tool();
+      expect(f.calls.map(({ command }) => command)).toEqual(["bash"]);
+      await h.step();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test(`${version} pending is session-scoped and not re-armed for every tool`, async () => {
+    const f = fixture(false);
+    const admitted = await host(version, f.pool);
+    const other = await host(version, f.pool);
+    await admitted.admit();
+    await other.step();
+    await other.tool();
+    await admitted.tool();
+    await admitted.tool();
+    expect(f.calls.map(({ command }) => command)).toEqual([
+      "bash",
+      "bash_wait_detach",
+      "bash",
+      "bash",
+    ]);
+    expect(f.calls[1].params).toEqual({ session_id: admitted.sessionID, pending: true });
+  });
+}
