@@ -6322,52 +6322,11 @@ fn search_cut_envelope(
     more_available: bool,
     engine_capped: bool,
 ) -> Option<ListEnvelope> {
-    if !more_available && !engine_capped {
-        return None;
-    }
-    let mut causes = Vec::with_capacity(2);
-    if engine_capped {
-        causes.push(crate::list_envelope::Reason::Budget);
-    }
-    if more_available {
-        causes.push(crate::list_envelope::Reason::Cap);
-    }
-    Some(ListEnvelope::new(
+    crate::list_surfaces::search::build_fallback_search_envelope(
         shown,
-        crate::list_envelope::Total::AtLeast(if more_available {
-            shown.saturating_add(1)
-        } else {
-            shown
-        }),
-        crate::list_envelope::Unit::Results,
-        causes,
-        crate::list_surfaces::search::SEARCH_NARROW,
-    ))
-}
-
-fn bounded_walk_search_envelope(
-    shown: usize,
-    more_available: bool,
-    engine_capped: bool,
-) -> crate::list_envelope::ListEnvelope {
-    let mut causes = vec![crate::list_envelope::Reason::Walk];
-    if engine_capped {
-        causes.push(crate::list_envelope::Reason::Budget);
-    }
-    if more_available {
-        causes.push(crate::list_envelope::Reason::Cap);
-    }
-    let total = if more_available {
-        crate::list_envelope::Total::AtLeast(shown.saturating_add(1))
-    } else {
-        crate::list_envelope::Total::AtLeast(shown)
-    };
-    crate::list_envelope::ListEnvelope::new(
-        shown,
-        total,
-        crate::list_envelope::Unit::Results,
-        causes,
-        crate::list_surfaces::search::SEARCH_NARROW,
+        false,
+        more_available,
+        engine_capped,
     )
 }
 
@@ -6377,15 +6336,12 @@ fn fallback_search_envelope(
     engine_capped: bool,
     walk_limited: bool,
 ) -> Option<crate::list_envelope::ListEnvelope> {
-    if walk_limited {
-        Some(bounded_walk_search_envelope(
-            shown,
-            more_available,
-            engine_capped,
-        ))
-    } else {
-        search_cut_envelope(shown, more_available, engine_capped)
-    }
+    crate::list_surfaces::search::build_fallback_search_envelope(
+        shown,
+        walk_limited,
+        more_available,
+        engine_capped,
+    )
 }
 
 fn execute_degraded_grep_fallback(

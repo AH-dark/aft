@@ -311,13 +311,9 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
         ("callgraph", "trace_data") => build_trace_data_envelope(5, has(Reason::Depth)),
         // An exhausted list is cut only when the page shows part of it; the
         // whole list on one page is complete and carries no reason.
-        ("search", "") if has(Reason::Walk) => Some(ListEnvelope::new(
-            10,
-            Total::AtLeast(20),
-            Unit::Results,
-            vec![Reason::Walk],
-            aft::list_surfaces::search::SEARCH_NARROW,
-        )),
+        ("search", "") if has(Reason::Walk) => {
+            aft::list_surfaces::search::build_fallback_search_envelope(10, true, true, false)
+        }
         ("search", "") if has(Reason::Depth) => Some(
             SearchTrailer {
                 shown: 10,
@@ -383,7 +379,7 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
             }
         }
         ("callgraph", "trace_data") => Total::AtLeast(5),
-        ("search", "") if has(Reason::Walk) => Total::AtLeast(20),
+        ("search", "") if has(Reason::Walk) => Total::AtLeast(11),
         ("search", "") if has(Reason::Depth) => Total::AtLeast(10),
         ("search", "") => Total::AtLeast(if has(Reason::Cap) { 11 } else { 10 }),
         ("grep", "") => {
@@ -432,7 +428,12 @@ pub fn kind_bound_cases() -> Vec<KindBoundCase> {
                 .filter(|(index, _)| mask & (1 << index) != 0)
                 .map(|(_, spec)| spec.reason)
                 .collect::<Vec<_>>();
-            let expected_causes = sorted_causes(&fired);
+            let expected_causes = if surface.command == "search" && fired == [Reason::Walk] {
+                // A known next result contributes Cap alongside Walk, while Walk remains primary.
+                sorted_causes(&[Reason::Walk, Reason::Cap])
+            } else {
+                sorted_causes(&fired)
+            };
             if surface.command == "search"
                 && (fired.contains(&Reason::Walk) || fired.contains(&Reason::Depth))
                 && fired.len() != 1
