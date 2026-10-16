@@ -30,6 +30,15 @@ def output(*args: str) -> str:
     return subprocess.check_output(args, cwd=ROOT, text=True).strip()
 
 
+def manifest_digest() -> str:
+    # Hash the committed Cargo.toml, not the checked-out file: Windows runners
+    # check out with CRLF line endings, so working-tree bytes differ by platform
+    # for the same commit and a Windows build could never match publication on
+    # Linux.
+    blob = subprocess.check_output(["git", "show", "HEAD:Cargo.toml"], cwd=ROOT)
+    return hashlib.sha256(blob).hexdigest()
+
+
 def facts(target: str) -> dict:
     rust = output("rustc", "--version", "--verbose")
     version = rust.splitlines()[0].split()[1]
@@ -38,7 +47,7 @@ def facts(target: str) -> dict:
     package = next(p for p in cargo["packages"] if p["name"] == "agent-file-tools")
     return {"schema": 1, "git_sha": output("git", "rev-parse", "HEAD"), "profile": "release",
             "target": target or host, "rust_version": version, "rust_verbose": rust,
-            "package_version": package["version"], "profile_manifest_sha256": digest(ROOT / "Cargo.toml"),
+            "package_version": package["version"], "profile_manifest_sha256": manifest_digest(),
             "env": {name: os.environ.get(name, "") for name in ENV_KEYS}}
 
 
@@ -113,7 +122,7 @@ def unpack_published(archive: Path, target: str, executable: Path, dsym: Path | 
         data = json.loads((root / "native-release-manifest.json").read_text())
         expected = {"schema": 1, "git_sha": output("git", "rev-parse", "HEAD"),
                     "profile": "release", "target": target,
-                    "profile_manifest_sha256": digest(ROOT / "Cargo.toml")}
+                    "profile_manifest_sha256": manifest_digest()}
         for name, value in expected.items():
             if data.get(name) != value:
                 raise ValueError(f"release artifact mismatch: {name}")
