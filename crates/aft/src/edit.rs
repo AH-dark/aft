@@ -1032,7 +1032,7 @@ mod tests {
                 format_on_edit: false,
                 ..Config::default()
             };
-            let result =
+            let mut result =
                 write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
             assert!(!result.rolled_back);
             assert_eq!(result.syntax_valid, Some(true));
