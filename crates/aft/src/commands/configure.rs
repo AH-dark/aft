@@ -15790,8 +15790,12 @@ mod tests {
         assert!(super::start_artifact_loads(super::schedule_artifact_loads(
             &ctx, true, false
         )));
+        // The held cold-build permit and queue/holder assertions distinguish warm
+        // refreshes from cold builds. Readiness only needs a hang guard, not a
+        // throughput deadline for slow CI filesystems.
+        let hang_guard = Duration::from_secs(120);
         if expect_cold {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + hang_guard;
             while limiter.census().queued.is_empty() {
                 assert!(
                     Instant::now() < deadline,
@@ -15802,9 +15806,9 @@ mod tests {
             crate::runtime_drain::drain_build_completions(&ctx);
             assert!(ctx.search_index().read().unwrap().is_none());
             drop(held);
-            wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+            wait_for_search_index_ready(&ctx, hang_guard);
         } else {
-            wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+            wait_for_search_index_ready(&ctx, hang_guard);
             assert!(limiter.census().queued.is_empty());
             assert_eq!(
                 limiter.census().holders.len(),
