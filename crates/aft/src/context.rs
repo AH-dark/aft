@@ -15223,11 +15223,8 @@ mod callgraph_store_for_ops_tests {
         let _guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            crate::callgraph_store::flush_callgraph_store_refreshes_with_budget(
-                Duration::from_secs(12)
-            )
-        );
+        // Other roots may legitimately be waiting for a store or writer lease.
+        // The gate proves this fixture's batch started without flushing that work.
         let (_busy_dirs, busy_ctx) = cold_build_context();
         let busy_root = std::fs::canonicalize(busy_ctx.config().project_root.as_ref().unwrap())
             .expect("canonical busy root");
@@ -15250,7 +15247,8 @@ mod callgraph_store_for_ops_tests {
 
         release.send(()).expect("release busy process worker");
         assert!(
-            crate::callgraph_store::flush_callgraph_store_refreshes_with_budget(
+            crate::callgraph_store::wait_for_process_callgraph_refresh_for_test(
+                &busy_root,
                 Duration::from_secs(12)
             )
         );

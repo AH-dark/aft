@@ -2211,6 +2211,26 @@ fn refresh_writer_available(root: &RefreshRoot) -> bool {
         .unwrap_or(false)
 }
 
+fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
+    use notify::{event::ModifyKind, EventKind};
+    let named_release = matches!(
+        event.kind,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    ) && event.paths.iter().any(|path| path == lease);
+    // Native watchers can report SQLite sidecar writes without the adjacent
+    // lease deletion. Those writes are readiness hints only if the lease is
+    // gone; the worker still checks writer liveness before reopening the store.
+    let sibling_change = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) && event
+        .paths
+        .iter()
+        .any(|path| path.parent() == lease.parent())
+        && !lease.exists();
+    named_release || sibling_change
+}
+
 fn refresh_readiness_watch(
     shared: &Arc<RefreshWorkerShared>,
     root: &RefreshRoot,
@@ -2232,10 +2252,7 @@ fn refresh_readiness_watch(
     );
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
-        let lease_released = matches!(
-            event.kind,
-            EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-        ) && event.paths.contains(&lease);
+        let lease_released = refresh_lease_release_event(&event, &lease);
         #[cfg(test)]
         let lease_released =
             lease_released && !refresh_worker_test_seam(&root.project_root).ignore_lease_release;
@@ -2399,6 +2416,31 @@ impl Drop for RefreshWorkerWatchdog {
 }
 
 impl RefreshWorker {
+    #[cfg(test)]
+    fn wait_for_root_with_budget(&self, project_root: &Path, budget: Duration) -> bool {
+        let root_busy = |queue: &RefreshQueue| {
+            queue
+                .active
+                .as_ref()
+                .is_some_and(|batch| batch.root.project_root == project_root)
+                || queue
+                    .queued
+                    .keys()
+                    .any(|root| root.project_root == project_root)
+                || queue
+                    .waiting
+                    .keys()
+                    .any(|root| root.project_root == project_root)
+        };
+        let queue = self.shared.queue.lock().unwrap();
+        let (queue, _) = self
+            .shared
+            .wake
+            .wait_timeout_while(queue, budget, |queue| root_busy(queue))
+            .unwrap();
+        !root_busy(&queue)
+    }
+
     fn spawn() -> Arc<Self> {
         let shared = Arc::new(RefreshWorkerShared {
             queue: Mutex::new(RefreshQueue::default()),
@@ -2827,6 +2869,19 @@ pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
         }
     }
     drained
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_process_callgraph_refresh_for_test(
+    project_root: &Path,
+    budget: Duration,
+) -> bool {
+    // A fixture's completion must not depend on other roots' parked refreshes.
+    // Unlike shutdown, this wait neither discards their work nor stops the worker.
+    let worker = CALLGRAPH_REFRESH_WORKER
+        .get()
+        .and_then(|slot| slot.lock().unwrap().clone());
+    worker.is_none_or(|worker| worker.wait_for_root_with_budget(project_root, budget))
 }
 
 fn idle_checkpoint_due(last: Option<Instant>, now: Instant) -> bool {
@@ -22174,6 +22229,87 @@ mod refresh_worker_tests {
 
     fn pending_paths() -> PendingCallGraphStorePaths {
         Arc::new(parking_lot::Mutex::new(BTreeSet::new()))
+    }
+
+    #[test]
+    fn root_refresh_wait_ignores_parked_sibling() {
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let (_other_temp, other_root, other_dir, other_source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(other_root.clone(), Duration::ZERO, false);
+        set_callgraph_refresh_worker_test_open_failure(other_root.clone(), true);
+        assert!(worker.worker.enqueue(
+            RefreshRoot {
+                callgraph_dir: other_dir,
+                project_root: other_root.clone(),
+            },
+            vec![other_source.clone()],
+            Arc::clone(&pending),
+            Vec::new(),
+            None,
+            None,
+        ));
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert!(worker
+            .worker
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .waiting
+            .keys()
+            .any(|root| root.project_root == other_root));
+        assert!(pending.lock().contains(&other_source));
+
+        let (held, release) = install_callgraph_refresh_worker_test_gate(root.clone());
+        assert!(enqueue_callgraph_store_refresh(
+            dir,
+            root.clone(),
+            vec![source],
+            pending_paths()
+        ));
+        held.recv_timeout(Duration::from_secs(12)).unwrap();
+        assert!(!worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::ZERO));
+        release.send(()).unwrap();
+        assert!(worker
+            .worker
+            .wait_for_root_with_budget(&root, Duration::from_secs(12)));
+        assert!(worker
+            .worker
+            .shared
+            .queue
+            .lock()
+            .unwrap()
+            .waiting
+            .keys()
+            .any(|root| root.project_root == other_root));
+        assert!(pending.lock().contains(&other_source));
+        clear_callgraph_refresh_worker_test_seam(&other_root);
+    }
+
+    #[test]
+    fn sibling_write_signals_released_lease_but_not_live_writer() {
+        use notify::{
+            event::{DataChange, ModifyKind},
+            Event, EventKind,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let lease = temp.path().join("writer.lease");
+        fs::write(&lease, b"live writer").unwrap();
+        let sidecar = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(temp.path().join("generation.sqlite-shm"));
+        assert!(!refresh_lease_release_event(&sidecar, &lease));
+        fs::remove_file(&lease).unwrap();
+        assert!(refresh_lease_release_event(&sidecar, &lease));
+        let access = Event::new(EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(temp.path().join("generation.sqlite-shm"));
+        assert!(!refresh_lease_release_event(&access, &lease));
+        let unrelated = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+            .add_path(temp.path().join("another-cache/generation.sqlite-shm"));
+        assert!(!refresh_lease_release_event(&unrelated, &lease));
     }
 
     #[test]
