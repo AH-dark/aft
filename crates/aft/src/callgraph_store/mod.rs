@@ -23264,9 +23264,16 @@ mod refresh_worker_tests {
         idle_writer_rx
             .recv_timeout(Duration::from_secs(12))
             .unwrap();
-        assert!(CallGraphStore::open_readonly(dir.clone(), root.clone())
-            .unwrap()
-            .is_none());
+        // The foreign lease is gone, but the idle-writer seam now holds an
+        // exclusive SQLite lock. A readiness probe must report contention, not
+        // claim that the published generation is absent.
+        assert!(
+            matches!(
+                CallGraphStore::open_readonly(dir.clone(), root.clone()),
+                Err(error) if error.is_transient_lock_contention()
+            ),
+            "the held idle writer must make the published generation busy, not absent"
+        );
         // Queue idle proves the replay committed, not that idle maintenance has
         // closed its writer. Request readers deliberately fail fast on a locked
         // generation, so join this fixture's worker before asserting a fresh open.
