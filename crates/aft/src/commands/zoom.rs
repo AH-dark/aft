@@ -276,7 +276,7 @@ fn resolve_zoom_file(
             "file_not_found",
             deterministic_zoom_refusal(
                 format!("file not found: {file}"),
-                "Set `file` to an existing path or use a reachable `url`.",
+                "Set `path` to an existing path or use a reachable `url`.",
             ),
         ));
     }
@@ -289,7 +289,7 @@ fn resolve_zoom_file(
             "file_not_found",
             deterministic_zoom_refusal(
                 format!("cannot read {file}: {error}"),
-                "Choose a readable `file` path.",
+                "Choose a readable `path`.",
             ),
         )
     })?;
@@ -375,7 +375,7 @@ fn zoom_target_fields(
     };
     let Some(file) = file else {
         return Err(invalid(deterministic_zoom_refusal(
-            format!("zoom: targets[{index}].file must be a non-empty string"),
+            format!("zoom: targets[{index}].path must be a non-empty string"),
             "Provide a file path for every target.",
         )));
     };
@@ -401,7 +401,7 @@ fn handle_zoom_targets(
             "invalid_request",
             deterministic_zoom_refusal(
                 "zoom: 'targets' must be a non-empty array",
-                "Pass at least one `{ file, symbol }` target.",
+                "Pass at least one `{ path, symbol }` target.",
             ),
         );
     }
@@ -517,7 +517,7 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 "invalid_request",
                 deterministic_zoom_refusal(
                     "zoom: 'targets' must be a non-empty array",
-                    "Pass a non-empty `targets` array or use `file` with `symbol`.",
+                    "Pass a non-empty `targets` array or use `path` with `symbols`.",
                 ),
             );
         };
@@ -547,8 +547,8 @@ fn handle_zoom_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "invalid_request",
                 deterministic_zoom_refusal(
-                    "zoom: missing required param 'file'",
-                    "Provide `file` or `url` with the symbol to inspect.",
+                    "zoom: missing required param 'path' or 'url'",
+                    "Provide `path` or `url` with `symbols` to inspect.",
                 ),
             );
         }
@@ -941,7 +941,7 @@ fn symbol_not_found_message(symbol_name: &str, all_symbols: &[Symbol], is_headin
         return deterministic_zoom_refusal(
             format!("{item_label} '{symbol_name}' not found"),
             &format!(
-                "This {container_label} has {symbol_count} {item_plural}; closest is {}. The requested {item_label} may be in another file, so change `file` or `symbol`.",
+                "This {container_label} has {symbol_count} {item_plural}; closest is {}. The requested {item_label} may be in another file, so change `path` or `symbols`.",
                 format_outline_symbol_labeled(closest, is_heading)
             ),
         );
@@ -949,7 +949,7 @@ fn symbol_not_found_message(symbol_name: &str, all_symbols: &[Symbol], is_headin
 
     deterministic_zoom_refusal(
         format!("{item_label} '{symbol_name}' not found"),
-        "Use line-range mode for a symbol-less file or choose a different `file` and `symbol`.",
+        "Use line-range mode for a symbol-less file or choose a different `path` and `symbols`.",
     )
 }
 
@@ -1285,7 +1285,7 @@ fn zoom_one_symbol_inner(
             Ok(all_symbols) => symbol_not_found_message(symbol_name, &all_symbols, is_heading),
             Err(_) => deterministic_zoom_refusal(
                 format!("symbol '{symbol_name}' not found"),
-                "List the file outline, then change `file` or `symbol`.",
+                "List the file outline, then change `path` or `symbols`.",
             ),
         };
         return Response::error(&req.id, "symbol_not_found", msg);
@@ -3770,6 +3770,9 @@ def local():
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["success"], false);
         assert_eq!(json["code"], "invalid_request");
+        let message = json["message"].as_str().unwrap();
+        assert!(message.contains("Provide `path` or `url` with `symbols`"));
+        assert!(!message.contains("`file`"));
     }
 
     #[test]
@@ -3860,6 +3863,7 @@ def local():
         assert!(message.contains("This file has"));
         assert!(message.contains("closest is `"));
         assert!(message.contains("may be in another file"));
+        assert!(message.contains("change `path` or `symbols`"));
     }
 
     #[test]
@@ -3887,7 +3891,8 @@ def local():
         let message = response["message"].as_str().unwrap();
         assert_eq!(response["code"], "file_not_found");
         assert!(message.contains(RETRY_UNCHANGED_ZOOM_MESSAGE));
-        assert!(message.contains("Set `file` to an existing path"));
+        assert!(message.contains("Set `path` to an existing path"));
+        assert!(!message.contains("`file`"));
     }
 
     #[test]

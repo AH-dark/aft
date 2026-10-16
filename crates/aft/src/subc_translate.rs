@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::url_fetch::is_http_url;
+
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,7 +121,40 @@ fn normalize_zoom_target_aliases(target: &mut Value, index: usize) -> Result<(),
     };
     // Not required here: an entry with only a symbol still reaches the zoom
     // command, which reports it as its own per-target error line.
-    normalize_path_alias_pair(object, "path", "filePath", false)
+    normalize_path_alias_pair(object, "path", "filePath", false)?;
+    normalize_zoom_http_path(object, &format!("targets[{index}]."))?;
+    if zoom_field_present(object.get("path")) && zoom_field_present(object.get("url")) {
+        return Err(invalid_request(format!(
+            "Provide exactly ONE of 'targets[{index}].path' or 'targets[{index}].url' — not both"
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_zoom_http_path(
+    map: &mut Map<String, Value>,
+    prefix: &str,
+) -> Result<(), TranslateError> {
+    let Some(path) = map
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|s| is_http_url(s))
+    else {
+        return Ok(());
+    };
+    if zoom_field_present(map.get("url")) {
+        let url = path_string(map.get("url"), &format!("{prefix}url"))?;
+        if path != url {
+            return Err(invalid_request(format!(
+                "Conflicting '{prefix}path' URL '{path}' and '{prefix}url' '{url}': provide the same URL or only one location"
+            )));
+        }
+    }
+    // Preserve the URL before filesystem resolution can collapse its scheme
+    // and join it onto the project root. Equal aliases describe one location.
+    let url = map.remove("path").expect("HTTP path is present");
+    map.insert("url".to_string(), url);
+    Ok(())
 }
 
 fn parse_stringified_collection(
@@ -147,6 +182,7 @@ fn parse_stringified_collection(
 
 fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
     normalize_path_alias_pair(map, "path", "filePath", false)?;
+    normalize_zoom_http_path(map, "")?;
     let Some(targets) = map.get_mut("targets") else {
         return Ok(());
     };
@@ -1581,6 +1617,12 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
         .filter(|s| !s.is_empty())
         .ok_or_else(|| invalid_request("'path' is required"))?;
 
+    if is_http_url(file_path) {
+        return Err(invalid_request(format!(
+            "read does not fetch HTTP/HTTPS URLs: '{file_path}'. Use aft_outline with 'target' or aft_zoom with 'url' to inspect a remote document."
+        )));
+    }
+
     let mut out = Map::new();
     insert_file_or_github_target(&mut out, project_root, file_path);
 
@@ -2481,11 +2523,7 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     }
 
     if let Some(url) = target.as_str() {
-        if !files_flag
-            && (url.starts_with("http://")
-                || url.starts_with("https://")
-                || is_github_resource_target(url))
-        {
+        if !files_flag && (is_http_url(url) || is_github_resource_target(url)) {
             out.insert("file".to_string(), Value::String(url.to_string()));
             return Ok(Translated {
                 command: "outline".into(),
@@ -2535,7 +2573,7 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
 }
 
 /// True when a `targets` entry carries nothing: null, or an object whose
-/// path and symbol are both missing, null, or blank. Models that fill every
+/// location and symbol are both missing, null, or blank. Models that fill every
 /// declared property send such entries (`{path: "", symbol: ""}`) when they
 /// mean "no targets". Any other value is real input and is validated.
 fn zoom_target_entry_is_empty(entry: &Value) -> bool {
@@ -2547,7 +2585,10 @@ fn zoom_target_entry_is_empty(entry: &Value) -> bool {
     match entry {
         Value::Null => true,
         Value::Object(obj) => {
-            blank(obj.get("path")) && blank(obj.get("filePath")) && blank(obj.get("symbol"))
+            blank(obj.get("path"))
+                && blank(obj.get("filePath"))
+                && blank(obj.get("url"))
+                && blank(obj.get("symbol"))
         }
         _ => false,
     }
@@ -2589,13 +2630,17 @@ fn translate_zoom_targets(targets_value: &Value, project_root: &Path) -> Vec<Val
                 .filter(|value| !value.is_empty())
         };
         let file_path = field("path");
+        let url = field("url");
         let symbol = field("symbol");
         let mut target_out = Map::new();
-        match file_path {
-            Some(file_path) => {
+        match (file_path, url) {
+            (_, Some(url)) => {
+                target_out.insert("file".to_string(), Value::String(url.to_string()));
+            }
+            (Some(file_path), None) => {
                 insert_file_or_github_target(&mut target_out, project_root, file_path);
             }
-            None => {
+            (None, None) => {
                 target_out.insert("file".to_string(), Value::String(String::new()));
             }
         }
@@ -2605,7 +2650,7 @@ fn translate_zoom_targets(targets_value: &Value, project_root: &Path) -> Vec<Val
         );
         target_out.insert(
             "target_label".to_string(),
-            Value::String(file_path.unwrap_or("(no path)").to_string()),
+            Value::String(url.or(file_path).unwrap_or("(no path)").to_string()),
         );
         out.push(Value::Object(target_out));
     }
@@ -2641,7 +2686,7 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
         // not resolve reports its own error line.
         if has_file_path && has_url {
             return Err(invalid_request(
-                "Provide exactly ONE of 'filePath' or 'url' — not both",
+                "Provide exactly ONE of 'path' or 'url' — not both",
             ));
         }
         let targets_value = map_in
@@ -2727,12 +2772,12 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
     match (file_path, url) {
         (None, None) => {
             return Err(invalid_request(
-                "Provide exactly one of 'filePath', 'url', or 'targets'",
+                "Provide exactly one of 'path', 'url', or 'targets'",
             ));
         }
         (Some(_), Some(_)) => {
             return Err(invalid_request(
-                "Provide exactly ONE of 'filePath' or 'url' — not both",
+                "Provide exactly ONE of 'path' or 'url' — not both",
             ));
         }
         _ => {}
@@ -3236,6 +3281,119 @@ mod tests {
             Some(expected.to_string_lossy().as_ref()),
             "a plain relative target must still resolve against the project root"
         );
+    }
+
+    #[test]
+    fn zoom_http_path_matches_url_translation() {
+        let project = Path::new("/project");
+        for url in ["http://localhost/docs", "https://example.test/docs"] {
+            let expected = subc_translate_owned(
+                "zoom",
+                serde_json::json!({ "url": url, "symbols": "Public extension interfaces" }),
+                project,
+            )
+            .unwrap();
+            for key in ["path", "filePath"] {
+                let actual = subc_translate_owned(
+                    "zoom",
+                    serde_json::json!({ key: url, "symbols": "Public extension interfaces" }),
+                    project,
+                )
+                .unwrap();
+                assert_eq!(actual.command, expected.command);
+                assert_eq!(actual.args, expected.args, "URL supplied via {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_http_path_url_conflicts_name_both_values() {
+        let project = Path::new("/project");
+        let path = "https://example.test/path";
+        let url = "https://example.test/url";
+        for key in ["path", "filePath"] {
+            for args in [
+                serde_json::json!({ key: path, "url": url, "symbols": "Heading" }),
+                serde_json::json!({ "targets": [{ key: path, "url": url, "symbol": "Heading" }] }),
+                serde_json::json!({ key: path, "url": url, "symbols": "Heading", "targets": [{ "path": "src/lib.rs", "symbol": "main" }] }),
+            ] {
+                let err = subc_translate_owned("zoom", args, project).unwrap_err();
+                assert_eq!(err.code, "invalid_request");
+                assert!(err.message.contains("path"), "{}", err.message);
+                assert!(err.message.contains("url"), "{}", err.message);
+                assert!(err.message.contains(path), "{}", err.message);
+                assert!(err.message.contains(url), "{}", err.message);
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_http_path_and_equal_url_are_one_location() {
+        let project = Path::new("/project");
+        let url = "https://example.test/docs";
+        let expected = subc_translate_owned(
+            "zoom",
+            serde_json::json!({ "url": url, "symbols": "Heading" }),
+            project,
+        )
+        .unwrap();
+        let actual = subc_translate_owned(
+            "zoom",
+            serde_json::json!({ "path": url, "url": url, "symbols": "Heading" }),
+            project,
+        )
+        .unwrap();
+        assert_eq!(actual.args, expected.args);
+        let batch = subc_translate_owned(
+            "zoom",
+            serde_json::json!({ "targets": [{ "path": url, "url": url, "symbol": "Heading" }, { "filePath": "http://localhost/docs", "symbol": "Other" }] }),
+            project,
+        )
+        .unwrap();
+        assert_eq!(batch.args["targets"][0]["file"], url);
+        assert_eq!(batch.args["targets"][1]["file"], "http://localhost/docs");
+    }
+
+    #[test]
+    fn http_prefixed_relative_paths_remain_files() {
+        let project = Path::new("/project");
+        let expected = resolve_path_from_project_root(project, "http_client.rs")
+            .to_string_lossy()
+            .into_owned();
+        for (tool, args) in [
+            (
+                "zoom",
+                serde_json::json!({ "path": "http_client.rs", "symbols": "client" }),
+            ),
+            ("outline", serde_json::json!({ "target": "http_client.rs" })),
+            ("read", serde_json::json!({ "path": "http_client.rs" })),
+        ] {
+            let translated = subc_translate_owned(tool, args, project).unwrap();
+            assert_eq!(translated.args["file"], expected, "{tool}");
+        }
+        let batch = subc_translate_owned(
+            "zoom",
+            serde_json::json!({ "targets": [{ "path": "http_client.rs", "symbol": "client" }] }),
+            project,
+        )
+        .unwrap();
+        assert_eq!(batch.args["targets"][0]["file"], expected);
+    }
+
+    #[test]
+    fn read_http_paths_report_unsupported_url_fetching() {
+        let project = Path::new("/project");
+        for url in ["http://localhost/docs", "https://example.test/docs"] {
+            for key in ["path", "filePath"] {
+                let err = subc_translate_owned("read", serde_json::json!({ key: url }), project)
+                    .unwrap_err();
+                assert_eq!(err.code, "invalid_request");
+                assert!(err.message.contains("read does not fetch HTTP/HTTPS URLs"));
+                assert!(err.message.contains(url), "{}", err.message);
+                assert!(err.message.contains("aft_zoom"), "{}", err.message);
+                assert!(!err.message.contains("file not found"), "{}", err.message);
+            }
+        }
     }
 
     #[test]

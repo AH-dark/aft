@@ -701,6 +701,80 @@ fn relative_import_operations_edit_the_project_root_file() {
     assert!(status.success());
 }
 
+#[test]
+fn tool_call_read_http_path_explains_url_fetching_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for key in ["path", "filePath"] {
+        let response = placeholder_tool_call(
+            &mut aft,
+            "read-http-path",
+            "read",
+            json!({ key: "https://example.test/docs" }),
+        );
+        assert_eq!(response["success"], false, "{response:#}");
+        assert_eq!(response["code"], "invalid_request", "{response:#}");
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("read does not fetch HTTP/HTTPS URLs"),
+            "{message}"
+        );
+        assert!(message.contains("https://example.test/docs"), "{message}");
+        assert!(!message.contains("file not found"), "{message}");
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn tool_call_zoom_conflicting_http_locations_name_both_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let path = "https://example.test/path";
+    let url = "https://example.test/url";
+    for args in [
+        json!({ "path": path, "url": url, "symbols": "Heading" }),
+        json!({ "targets": [{ "path": path, "url": url, "symbol": "Heading" }] }),
+    ] {
+        let response = placeholder_tool_call(&mut aft, "zoom-conflict", "zoom", args);
+        assert_eq!(response["success"], false, "{response:#}");
+        assert_eq!(response["code"], "invalid_request", "{response:#}");
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(message.contains(path) && message.contains(url), "{message}");
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_and_outline_errors_name_agent_location_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let response = placeholder_tool_call(
+        &mut aft,
+        "zoom-missing-path",
+        "zoom",
+        json!({ "path": "missing.rs", "symbols": "client" }),
+    );
+    assert_eq!(response["success"], false, "{response:#}");
+    let message = response["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Set `path` to an existing path"),
+        "{message}"
+    );
+    assert!(!message.contains("`file`"), "{message}");
+
+    let response =
+        aft.send(&json!({ "id": "outline-missing-target", "command": "outline" }).to_string());
+    assert_eq!(response["success"], false, "{response:#}");
+    assert_eq!(
+        response["message"],
+        "outline: missing required param 'target'"
+    );
+    assert!(aft.shutdown().success());
+}
+
 // Replays a `read` call recorded from a model that fills every property:
 // the line range is inverted, and offset/limit carry their own values. It
 // used to come back as an empty SUCCESS, and a reader concluded code "was not
