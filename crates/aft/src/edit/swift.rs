@@ -9,7 +9,36 @@ use std::time::{Duration, Instant};
 use crate::format::{FormatError, SubprocessOutcome};
 
 const PARSE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(test, target_os = "macos"))]
+const NATIVE_SWIFTC_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 static SWIFTC: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static PARSE_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_timeout() -> Duration {
+    #[cfg(all(test, target_os = "macos"))]
+    if let Some(timeout) = PARSE_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    PARSE_TIMEOUT
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn with_parse_timeout<T>(timeout: Duration, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PARSE_TIMEOUT_OVERRIDE.with(|value| value.set(self.0));
+        }
+    }
+
+    let previous = PARSE_TIMEOUT_OVERRIDE.with(|value| value.replace(Some(timeout)));
+    let _restore = Restore(previous);
+    f()
+}
 
 #[derive(Debug)]
 enum ParseOutcome {
@@ -76,7 +105,7 @@ fn find_swiftc() -> &'static Result<PathBuf, String> {
         {
             let mut command = Command::new("xcrun");
             command.args(["--find", "swiftc"]);
-            match run_command(command, "", Instant::now() + PARSE_TIMEOUT) {
+            match run_command(command, "", Instant::now() + parse_timeout()) {
                 Ok(result) if result.status.success() => {
                     let path = PathBuf::from(result.stdout.trim());
                     if path.is_absolute() && path.is_file() {
@@ -95,16 +124,30 @@ fn find_swiftc() -> &'static Result<PathBuf, String> {
 
 #[cfg(all(test, target_os = "macos"))]
 pub(super) fn available() -> bool {
-    if let Err(reason) = find_swiftc() {
-        eprintln!("swiftc discovery failed: {reason}");
-        return false;
-    }
-    let outcome = parse("");
-    assert!(
-        matches!(outcome, ParseOutcome::Exited(Some(0))),
-        "discovered swiftc failed to parse empty input: {outcome:?}"
-    );
-    true
+    with_parse_timeout(NATIVE_SWIFTC_TEST_TIMEOUT, || {
+        if let Err(reason) = find_swiftc() {
+            eprintln!("swiftc discovery failed: {reason}");
+            return false;
+        }
+        // Warm up the compiler under the same generous guard as the native tests.
+        let outcome = parse("");
+        assert!(
+            matches!(outcome, ParseOutcome::Exited(Some(0))),
+            "discovered swiftc failed to parse empty input: {outcome:?}"
+        );
+        true
+    })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn with_native_swiftc<T>(f: impl FnOnce() -> T) -> Option<T> {
+    with_parse_timeout(NATIVE_SWIFTC_TEST_TIMEOUT, || {
+        if available() {
+            Some(f())
+        } else {
+            None
+        }
+    })
 }
 
 fn parse(source: &str) -> ParseOutcome {
@@ -124,7 +167,11 @@ fn parse(source: &str) -> ParseOutcome {
     let mut command = Command::new(path);
     // Parsing stdin avoids temporary files. -parse performs no type checking or imports.
     command.args(["-parse", "-"]);
-    parse_outcome(run_command(command, source, Instant::now() + PARSE_TIMEOUT))
+    parse_outcome(run_command(
+        command,
+        source,
+        Instant::now() + parse_timeout(),
+    ))
 }
 
 fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome {
@@ -526,25 +573,28 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn swift_parser_native_two_edits_preserve_rollback() {
-        if !available() {
+        let Some(()) = with_native_swiftc(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("tuple.swift");
+            std::fs::write(&path, ORIGINAL).unwrap();
+            let config = Config {
+                format_on_edit: false,
+                ..Config::default()
+            };
+            let first =
+                write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
+            assert!(!first.rolled_back);
+            assert_eq!(first.syntax_valid, Some(true));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+            let second =
+                write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
+            assert!(second.rolled_back);
+            assert_eq!(second.syntax_valid, Some(false));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+        }) else {
             eprintln!("skipping native Swift parser test: swiftc is unavailable");
             return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("tuple.swift");
-        std::fs::write(&path, ORIGINAL).unwrap();
-        let config = Config {
-            format_on_edit: false,
-            ..Config::default()
         };
-        let first = write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
-        assert!(!first.rolled_back);
-        assert_eq!(first.syntax_valid, Some(true));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
-        let second = write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
-        assert!(second.rolled_back);
-        assert_eq!(second.syntax_valid, Some(false));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -574,67 +624,88 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn swift_parser_rejects_broken_swift() {
-        if !available() {
+        let Some(()) = with_native_swiftc(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("broken.swift");
+            std::fs::write(&path, ORIGINAL).unwrap();
+            let result = write_format_validate(
+                &path,
+                BROKEN,
+                &Config {
+                    format_on_edit: false,
+                    ..Config::default()
+                },
+                &serde_json::json!({}),
+            )
+            .unwrap();
+            assert!(result.rolled_back);
+            assert_eq!(result.syntax_valid, Some(false));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), ORIGINAL);
+        }) else {
             eprintln!("skipping native Swift parser test: swiftc is unavailable");
             return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("broken.swift");
-        std::fs::write(&path, ORIGINAL).unwrap();
-        let result = write_format_validate(
-            &path,
-            BROKEN,
-            &Config {
-                format_on_edit: false,
-                ..Config::default()
-            },
-            &serde_json::json!({}),
-        )
-        .unwrap();
-        assert!(result.rolled_back);
-        assert_eq!(result.syntax_valid, Some(false));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), ORIGINAL);
+        };
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn swift_parser_does_not_typecheck_or_load_imports() {
-        if !available() {
+        let Some(()) = with_native_swiftc(|| {
+            assert!(matches!(
+                parse("import AFTModuleThatDoesNotExist\n_ = undefinedName\n"),
+                ParseOutcome::Exited(Some(0))
+            ));
+        }) else {
             eprintln!("skipping native Swift parser test: swiftc is unavailable");
             return;
-        }
-        assert!(matches!(
-            parse("import AFTModuleThatDoesNotExist\n_ = undefinedName\n"),
-            ParseOutcome::Exited(Some(0))
-        ));
+        };
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn swift_parser_available_fails_for_discovered_broken_compiler() {
-        if find_swiftc().is_err() {
-            eprintln!("skipping native Swift parser test: swiftc is unavailable");
-            return;
-        }
-        for outcome in [ParseOutcome::Exited(Some(1)), ParseOutcome::Missing] {
-            let mut outcome = Some(outcome);
-            let failure = std::panic::catch_unwind(|| {
-                with_runner(
-                    Box::new(move |source| {
-                        assert!(source.is_empty());
-                        outcome.take().expect("only one availability parse")
-                    }),
-                    available,
-                )
-            });
-            let failure = failure.expect_err("a discovered broken compiler must fail, not skip");
-            let message = failure
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| failure.downcast_ref::<&str>().copied())
-                .expect("panic should explain the broken compiler");
-            assert!(message.contains("discovered swiftc failed to parse empty input"));
-        }
+        with_parse_timeout(NATIVE_SWIFTC_TEST_TIMEOUT, || {
+            if find_swiftc().is_err() {
+                eprintln!("skipping native Swift parser test: swiftc is unavailable");
+                return;
+            }
+            for outcome in [ParseOutcome::Exited(Some(1)), ParseOutcome::Missing] {
+                let mut outcome = Some(outcome);
+                let failure = std::panic::catch_unwind(|| {
+                    with_runner(
+                        Box::new(move |source| {
+                            assert!(source.is_empty());
+                            outcome.take().expect("only one availability parse")
+                        }),
+                        available,
+                    )
+                });
+                let failure =
+                    failure.expect_err("a discovered broken compiler must fail, not skip");
+                let message = failure
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| failure.downcast_ref::<&str>().copied())
+                    .expect("panic should explain the broken compiler");
+                assert!(message.contains("discovered swiftc failed to parse empty input"));
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_parser_test_deadline_override_covers_slow_first_call() {
+        with_parse_timeout(NATIVE_SWIFTC_TEST_TIMEOUT, || {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 6"]);
+            let started = Instant::now();
+            let outcome = parse_outcome(run_command(command, "", Instant::now() + parse_timeout()));
+            assert!(
+                matches!(outcome, ParseOutcome::Exited(Some(0))),
+                "test-only deadline should let a slow compiler startup finish: {outcome:?}"
+            );
+            assert!(started.elapsed() >= Duration::from_secs(5));
+        });
     }
 
     #[test]

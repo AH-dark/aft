@@ -1021,26 +1021,27 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn swift_parser_accepts_tuple_metatype() {
-        if !swift::available() {
+        let Some(()) = swift::with_native_swiftc(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("tuple.swift");
+            let original = "let value = 1\n";
+            let updated = "_ = (Int, Result<String, Error>).self\n";
+            std::fs::write(&path, original).unwrap();
+            assert_eq!(validate_syntax_str(updated, &path), Some(false));
+            let config = Config {
+                format_on_edit: false,
+                ..Config::default()
+            };
+            let result =
+                write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+            assert!(!result.rolled_back);
+            assert_eq!(result.syntax_valid, Some(true));
+            assert_eq!(result.final_content(&path), Some(updated));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+        }) else {
             eprintln!("skipping native Swift parser test: swiftc is unavailable");
             return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("tuple.swift");
-        let original = "let value = 1\n";
-        let updated = "_ = (Int, Result<String, Error>).self\n";
-        std::fs::write(&path, original).unwrap();
-        assert_eq!(validate_syntax_str(updated, &path), Some(false));
-        let config = Config {
-            format_on_edit: false,
-            ..Config::default()
         };
-        let mut result =
-            write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
-        assert!(!result.rolled_back);
-        assert_eq!(result.syntax_valid, Some(true));
-        assert_eq!(result.final_content(&path), Some(updated));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
     }
 
     use super::*;
