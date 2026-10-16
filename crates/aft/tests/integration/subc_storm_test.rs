@@ -2891,6 +2891,9 @@ fn health_has_ready_roots(
     let Some(metrics) = report.metrics.as_ref() else {
         return false;
     };
+    if metrics.get("stale").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
     let Some(entries) = metrics.get("roots").and_then(Value::as_array) else {
         return false;
     };
@@ -2979,6 +2982,26 @@ fn readiness_fixture() -> (Vec<tempfile::TempDir>, Vec<PathBuf>, HealthReport, V
         "semantic_index": {"status": "ready"}
     });
     (dirs, roots, report, omitted)
+}
+
+#[test]
+fn subc_storm_readiness_rejects_stale_or_unknown_census() {
+    let (_dirs, roots, mut report, omitted) = readiness_fixture();
+    report.metrics.as_mut().unwrap()["stale"] = json!(true);
+    assert!(!health_has_ready_roots(
+        &report,
+        &roots,
+        &HashSet::from([1]),
+        |_| Some(omitted.clone())
+    ));
+    report.metrics.as_mut().unwrap()["stale"] = json!(false);
+    report.metrics.as_mut().unwrap()["roots"] = Value::Null;
+    assert!(!health_has_ready_roots(
+        &report,
+        &roots,
+        &HashSet::from([1]),
+        |_| panic!("unknown roots cannot prove readiness")
+    ));
 }
 
 #[test]

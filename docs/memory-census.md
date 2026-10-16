@@ -67,7 +67,15 @@ The `data` payload is:
 }
 ```
 
-`roots` is never capped. `semantic_worker_bytes` is the private index payload
+`roots` is never capped. Before the first successful health-worker census,
+`roots` is null, not an empty map: no roots have been measured. Process I/O can
+still be present because its kernel counters do not require the executor. A
+contended scheduler retains the last successfully sampled memory census rather
+than replacing it with an empty one; the accompanying `health.check` metrics
+describe its freshness with `stale`, `stale_reason`, `generated_at_ms`, and
+`age_ms` (see [health freshness](ops/aft-health-sentinel.md#census-freshness-and-unknown-values)).
+
+`semantic_worker_bytes` is the private index payload
 owned by semantic refresh threads for that root and is **already included** in
 `planes.semantic` and the attributed totals. It sums overlapping retiring and
 replacement workers until they exit; detaching a worker handle does not erase

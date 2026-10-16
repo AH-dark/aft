@@ -29,6 +29,7 @@ import {
   detectWakes,
   detectWatcher,
   healthBytesWritten,
+  healthMemoryCensus,
   reconcile,
   STATE_DIR,
   writeGrowthAttribution,
@@ -377,6 +378,34 @@ describe("health sentinel pure detectors", () => {
     const root = "/repo";
     const input = sample({ health: { metrics: { roots: [{ project_root: root, watcher: { rescans_kernel_dropped_total: 2, rescans_user_dropped_total: 1 } }] } } });
     expect(detectWatcher(input, { findings: {}, previous: { watcher: { [root]: [1, 1] } } })[0].fingerprint).toBe(`watcher:${root}`);
+  });
+
+  test("unavailable health censuses preserve baselines without judging old metrics", () => {
+    const root = "/repo";
+    const state: SentinelState = { findings: {}, previous: { watcher: { [root]: [1, 1] } } };
+    for (const roots of [null, [{ project_root: root, search_index: { status: "building", since_ms: NOW - 30 * 60_000 }, watcher: { rescans_kernel_dropped_total: 2, rescans_user_dropped_total: 1 } }]]) {
+      const input = sample({ health: { metrics: { stale: true, stale_reason: "executor_contended", roots,
+        memory: { phys_footprint_bytes: 777 },
+        embedding_backend: { available: false }, bash_task_retention: { eligible_but_unpruned_rows: 500, steady_state_ceiling: 250 },
+        dispatch_liveness: { executor_zombie_reader: 1, running: { interactive: 0, maintenance: 0 } },
+      } } });
+      const findings = detectAll(input, state);
+      expect(findings.some((value) => value.fingerprint === "instrument:health-census")).toBe(true);
+      expect(rules(findings)).not.toContain("index.stuck");
+      expect(rules(findings)).not.toContain("embedding.backend_down");
+      expect(rules(findings)).not.toContain("retention.backlog");
+      expect(rules(findings)).not.toContain("watcher.overflow");
+      expect(rules(findings)).toContain("executor.phantom");
+      expect(nextPrevious(input, state)?.watcher).toEqual(state.previous?.watcher);
+      expect(healthMemoryCensus(input).roots).toBeNull();
+      expect(collectProcessMetrics(process.pid, input).phys_footprint_bytes).not.toBe(777);
+      const prior = { last_alerted_at: NOW, last_seen_at: NOW, severity: "CRITICAL" as const, rule: "index.stuck", text: "last measured stuck index" };
+      const retained = detectAll(input, { ...state, findings: { "index:/repo:search": prior } });
+      expect(reconcile(retained, { "index:/repo:search": prior }, NOW).cleared).toEqual([]);
+    }
+    const unknown = sample({ health: { metrics: { roots: null, embedding_backend: { available: null } } } });
+    expect(detectIndexes(unknown)[0]?.fingerprint).toBe("instrument:health-census");
+    expect(healthMemoryCensus(unknown).roots).toBeNull();
   });
 
   test("disk thresholds and per-path growth raise and clear", () => {

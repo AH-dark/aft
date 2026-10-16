@@ -181,7 +181,16 @@ export function healthBytesWritten(sample: SentinelSample): { available: boolean
     : { available: true };
 }
 
-function roots(sample: SentinelSample): RootHealth[] { return Array.isArray(metrics(sample).roots) ? metrics(sample).roots : []; }
+function censusUnavailableReason(sample: SentinelSample): string | undefined {
+  const census = metrics(sample);
+  if (census.stale === true) return `health census is stale: ${census.stale_reason ?? "unknown"}; age_ms=${census.age_ms ?? "unknown"}`;
+  if (!Array.isArray(census.roots)) return "health census roots are unknown";
+  return undefined;
+}
+function roots(sample: SentinelSample): RootHealth[] { return censusUnavailableReason(sample) ? [] : metrics(sample).roots; }
+export function healthMemoryCensus(sample: SentinelSample): Record<string, any> {
+  return { roots: censusUnavailableReason(sample) ? null : Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", root])) };
+}
 function rootFrom(line: string): string {
   return line.match(/\broot=(.+?)(?:\s+(?:key|category|session|kind|outcome|files|ms)=|$)/)?.[1]
     ?? line.match(/route\.bind within[^:]*:\s*(\/[^ ]+)/)?.[1]
@@ -322,6 +331,7 @@ export function detectLimiter(sample: SentinelSample, state: SentinelState): Fin
 }
 
 export function detectRetention(sample: SentinelSample): Finding[] {
+  if (metrics(sample).stale === true) return [];
   const retention = metrics(sample).bash_task_retention;
   const eligible = retention?.eligible_but_unpruned_rows;
   const steadyCeiling = retention?.steady_state_ceiling;
@@ -336,6 +346,8 @@ export function detectRetention(sample: SentinelSample): Finding[] {
 }
 
 export function detectIndexes(sample: SentinelSample): Finding[] {
+  const unavailable = censusUnavailableReason(sample);
+  if (unavailable) return [instrument("health-census", unavailable)];
   const out: Finding[] = [];
   const healthMetrics = metrics(sample);
   const backend = healthMetrics.embedding_backend;
@@ -676,6 +688,7 @@ export function detectSearchAndTools(sample: SentinelSample, state?: SentinelSta
 
 export function detectDeadSessions(sample: SentinelSample): Finding[] {
   if (sample.memory_error) return [instrument("memory-census", sample.memory_error)];
+  if (censusUnavailableReason(sample)) return [];
   const censusRoots = Object.values(sample.memory_census?.roots ?? {}) as Array<Record<string, any>>;
   return censusRoots.filter((root) => Number(root.bound_routes ?? 0) > 0 && Number(root.idle_ms ?? 0) > Number(root.root_ttl_ms ?? Infinity)).map((root) => {
     const path = String(root.project_root ?? root.root ?? "unknown");
@@ -817,11 +830,19 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
 }
 
 export function detectAll(sample: SentinelSample, state: SentinelState): Finding[] {
+  // Missing observations cannot verify recovery. Retain last-known census
+  // findings until a fresh census can evaluate them again.
+  const censusRules = new Set(["index.stuck", "tier2.refresh_overdue", "embedding.backend_down", "retention.backlog", "watcher.overflow", "routes.dead_sessions"]);
+  const retained = censusUnavailableReason(sample)
+    ? Object.entries(state.findings).filter(([, prior]) => !prior.cleared_at && censusRules.has(prior.rule))
+      .map(([fingerprint, prior]) => ({ ...prior, fingerprint, clears_when: "a fresh census verifies recovery" }))
+    : [];
   return [
     ...detectDaemon(sample, state), ...detectLogHealth(sample), ...detectLimiter(sample, state), ...detectRetention(sample),
     ...detectIndexes(sample), ...detectTier2Overlong(sample), ...detectExecutor(sample, state), ...detectWakes(sample), ...detectWatcher(sample, state),
     ...detectStorage(sample, state), ...detectProcess(sample, state), ...detectSearchAndTools(sample, state), ...detectDeadSessions(sample), ...detectDsym(sample),
     ...detectScheduledCi(sample),
+    ...retained,
   ].filter((value, index, all) => all.findIndex((other) => other.fingerprint === value.fingerprint) === index);
 }
 
@@ -1091,7 +1112,7 @@ export function collectProcessMetrics(pid: number, sample: SentinelSample): NonN
   return {
     pid,
     cpu_percent: Number(match[1]),
-    phys_footprint_bytes: Number(metrics(sample).memory?.phys_footprint_bytes ?? Number(match[2]) * 1024),
+    phys_footprint_bytes: Number((censusUnavailableReason(sample) ? undefined : metrics(sample).memory?.phys_footprint_bytes) ?? Number(match[2]) * 1024),
     bytes_written: bytesWritten,
     image: match[3],
   };
@@ -1186,7 +1207,7 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     if (!pid) throw new Error("AFT pid unavailable");
     sample.process = collectProcessMetrics(pid, sample);
   } catch (error) { sample.process_error = String(error); }
-  sample.memory_census = { roots: Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", root])) };
+  sample.memory_census = healthMemoryCensus(sample);
   try {
     const image = sample.process?.image;
     if (!image) throw new Error("AFT image unavailable");
@@ -1289,7 +1310,7 @@ function notify(title: string, body: string): void {
   spawnSync("osascript", ["-e", `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`], { timeout: 5_000 });
 }
 export function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelState["previous"] {
-  const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
+  const watcher = censusUnavailableReason(sample) ? state.previous?.watcher : Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
   const executor = executorHealth(sample);
   const previous = state.previous;
   return { pid: sample.supervisor?.pid, free_bytes: sample.disk?.free_bytes, available_bytes: sample.disk?.available_bytes, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, tool_slow_roots: slowToolRoots(sample.log_lines ?? []), ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
