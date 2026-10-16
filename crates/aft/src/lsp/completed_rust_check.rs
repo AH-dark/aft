@@ -1447,18 +1447,22 @@ impl CompletedRustCheck {
     }
 
     pub(crate) fn begin(&mut self, began: SystemTime) {
-        self.began = Some(began);
-        self.started = SystemTime::now()
-            .duration_since(began)
-            .ok()
-            .and_then(|elapsed| Instant::now().checked_sub(elapsed));
-        self.finished = false;
         let deadline = Instant::now()
             + if self.saved.is_none() {
                 INITIAL_CAPTURE_BUDGET
             } else {
                 BUDGET
             };
+        self.begin_until(began, deadline);
+    }
+
+    fn begin_until(&mut self, began: SystemTime, deadline: Instant) {
+        self.began = Some(began);
+        self.started = SystemTime::now()
+            .duration_since(began)
+            .ok()
+            .and_then(|elapsed| Instant::now().checked_sub(elapsed));
+        self.finished = false;
         #[cfg(unix)]
         {
             self.pending = self.runtime.capture(
@@ -1757,6 +1761,11 @@ fn duration(seconds: u64) -> String {
 mod tests {
     use super::super::diagnostics::DiagnosticSeverity;
     use super::*;
+
+    // Shared fixtures seed a completed check; scheduler delays should not decide
+    // whether tests reach the behavior they are meant to exercise.
+    #[cfg(unix)]
+    const LIVE_FIXTURE_CAPTURE_BUDGET: Duration = Duration::from_secs(60);
 
     fn write(root: &Path, path: &str, content: &str) {
         let path = root.join(path);
@@ -2547,13 +2556,16 @@ mod tests {
         );
         cache.saved = None;
         fs::remove_file(&cache.path).unwrap();
-        cache.begin(begin_after_fixture_inputs());
+        cache.begin_until(
+            begin_after_fixture_inputs(),
+            Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET,
+        );
         assert!(
             cache.pending.is_some(),
             "control: the check has known inputs"
         );
         cache.finished = true;
-        cache.complete();
+        let _ = cache.complete_until(Instant::now() + LIVE_FIXTURE_CAPTURE_BUDGET, false);
         assert!(
             cache.path.is_file(),
             "control: a completed unchanged check is actually saved"
