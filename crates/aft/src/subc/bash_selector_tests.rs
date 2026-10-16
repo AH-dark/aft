@@ -87,6 +87,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         false,
         1024 * 1024,
         &drain::ModuleDrainWindow::default(),
+        None,
     )
     .await
     .unwrap();
@@ -200,6 +201,7 @@ async fn route_bash(
         false,
         1024 * 1024,
         &drain::ModuleDrainWindow::default(),
+        None,
     )
     .await
     .unwrap();
@@ -446,6 +448,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         false,
         1024 * 1024,
         &drain::ModuleDrainWindow::default(),
+        None,
     )
     .await
     .unwrap();
