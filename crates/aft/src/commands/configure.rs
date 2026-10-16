@@ -5021,12 +5021,31 @@ fn schedule_artifact_loads_admitted(
                         }
                         index
                     }
-                    mut baseline => {
-                        drop(warm_permit.take());
-                        // A valid same-HEAD cache only needs warm verification.
-                        // Do not queue that reopen behind unrelated cold builds;
-                        // absent or incompatible generations still need a permit.
-                        let Some(_permit) =
+                    baseline => {
+                        let strategy = match verify_plan {
+                            WarmVerifyPlan::Strict => VerifyStrategy::Strict,
+                            WarmVerifyPlan::Skip | WarmVerifyPlan::StatFirst => {
+                                VerifyStrategy::StatFirst
+                            }
+                        };
+                        // A different HEAD can still reuse the saved index through
+                        // git's file delta. Only a full rebuild needs a cold slot.
+                        let refreshed = baseline.and_then(|baseline| {
+                            SearchIndex::refresh_cached_with_strategy(
+                                baseline,
+                                &root_for_search,
+                                search_index_max_file_size,
+                                current_head.clone(),
+                                strategy,
+                            )
+                        });
+                        if let Some(index) = refreshed {
+                            index
+                        } else {
+                            drop(warm_permit.take());
+                            // No reusable cache remains. A full project build still
+                            // shares the process-wide limit with embedding builds.
+                            let Some(_permit) =
                             crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
                                 &search_cold_build_limiter,
                                 "search index post-configure load",
@@ -5041,28 +5060,20 @@ fn schedule_artifact_loads_admitted(
                         else {
                             return;
                         };
-                        if search_persist_epoch_flag.current() != search_persist_epoch {
-                            return;
-                        }
-                        if let Some(index) = baseline.as_mut() {
-                            index.set_ready(false);
-                        }
-                        let strategy = match verify_plan {
-                            WarmVerifyPlan::Strict => VerifyStrategy::Strict,
-                            WarmVerifyPlan::Skip | WarmVerifyPlan::StatFirst => {
-                                VerifyStrategy::StatFirst
+                            if search_persist_epoch_flag.current() != search_persist_epoch {
+                                return;
                             }
-                        };
-                        let index = SearchIndex::rebuild_or_refresh_with_strategy(
-                            &root_for_search,
-                            search_index_max_file_size,
-                            current_head,
-                            baseline,
-                            Some(&cache_dir),
-                            strategy,
-                        );
-                        delay_search_rebuild_publish_for_debug();
-                        index
+                            let index = SearchIndex::rebuild_or_refresh_with_strategy(
+                                &root_for_search,
+                                search_index_max_file_size,
+                                current_head,
+                                None,
+                                Some(&cache_dir),
+                                strategy,
+                            );
+                            delay_search_rebuild_publish_for_debug();
+                            index
+                        }
                     }
                 };
                 // Once admitted, a build may finish generation-safe disk
@@ -15608,6 +15619,93 @@ mod tests {
     }
 
     #[test]
+    fn owner_changed_head_search_load_completes_while_four_semantic_builds_are_held() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        persist_search_index_fixture(root.path(), storage.path());
+        assert!(git_command(root.path())
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "new head with unchanged files",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let ctx = test_context();
+        ctx.isolate_cold_build_limiter_for_test(4);
+        let limiter = ctx.cold_build_limiter();
+        let admitted = Arc::new(std::sync::Barrier::new(5));
+        let (release, wait) = crossbeam_channel::bounded::<()>(0);
+        let builds = (0..4)
+            .map(|ordinal| {
+                let limiter = Arc::clone(&limiter);
+                let admitted = Arc::clone(&admitted);
+                let wait = wait.clone();
+                let build_root = root.path().join(format!("heavy-{ordinal}"));
+                std::thread::spawn(move || {
+                    let _permit =
+                        crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                            &limiter,
+                            super::SEMANTIC_COLD_BUILD_LIMITER_KIND,
+                            &build_root,
+                            || true,
+                        )
+                        .unwrap();
+                    admitted.wait();
+                    let _ = wait.recv();
+                })
+            })
+            .collect::<Vec<_>>();
+        admitted.wait();
+        assert_eq!(limiter.census().holders.len(), 4);
+        let request = configure_request_with_params(json!({
+            "project_root": root.path(), "harness": "opencode", "storage_dir": storage.path(),
+            "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
+        }));
+        let rebound = Instant::now();
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        eprintln!(
+            "changed-head rebind_to_search_ready_ms={} heavy_semantic_slots_held=4",
+            rebound.elapsed().as_millis()
+        );
+        assert_eq!(
+            limiter.census().holders.len(),
+            4,
+            "no heavy build was released"
+        );
+        assert!(
+            limiter.census().queued.is_empty(),
+            "load must not request a cold slot"
+        );
+        assert_eq!(
+            ctx.search_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .stored_git_head(),
+            crate::search_index::current_git_head(root.path()).as_deref()
+        );
+        drop(release);
+        for build in builds {
+            build.join().unwrap();
+        }
+    }
+
+    #[test]
     fn owner_warm_search_reloads_queue_when_warm_pool_is_full() {
         let limiter = crate::cold_build_limiter::isolated_limiter(super::WARM_SEARCH_RELOAD_LIMIT);
         let held = (0..super::WARM_SEARCH_RELOAD_LIMIT)
@@ -15655,6 +15753,41 @@ mod tests {
         for ctx in &contexts {
             wait_for_search_index_ready(ctx, Duration::from_secs(5));
         }
+    }
+
+    #[test]
+    fn owner_incompatible_search_cache_still_waits_for_cold_build_permit() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        persist_search_index_fixture(root.path(), storage.path());
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.indexes.trigram = true;
+            config.search_index_max_file_size += 1;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_role(false, None);
+        ctx.set_cache_writer_capabilities(true, true);
+        ctx.isolate_cold_build_limiter_for_test(1);
+        let limiter = ctx.cold_build_limiter();
+        let held = limiter.try_acquire().unwrap();
+        assert!(super::start_artifact_loads(super::schedule_artifact_loads(
+            &ctx, true, false
+        )));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limiter.census().queued.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "incompatible cache did not request a build slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        crate::runtime_drain::drain_build_completions(&ctx);
+        assert!(ctx.search_index().read().unwrap().is_none());
+        drop(held);
+        wait_for_search_index_ready(&ctx, Duration::from_secs(2));
     }
 
     #[test]

@@ -2703,51 +2703,16 @@ impl SearchIndex {
         cache_dir: Option<&Path>,
         verify_strategy: cache_freshness::VerifyStrategy,
     ) -> Self {
-        if let Some(mut baseline) = baseline {
-            if baseline.max_file_size != max_file_size {
-                return match cache_dir {
-                    Some(cache_dir) => {
-                        SearchIndex::build_with_limit_to_cache_dir(root, max_file_size, cache_dir)
-                    }
-                    None => SearchIndex::build_with_limit(root, max_file_size),
-                };
-            }
-            baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
-            if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
-                return match cache_dir {
-                    Some(cache_dir) => {
-                        SearchIndex::build_with_limit_to_cache_dir(root, max_file_size, cache_dir)
-                    }
-                    None => SearchIndex::build_with_limit(root, max_file_size),
-                };
-            }
-            baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
-
-            if baseline.git_head == current_head || current_head.is_none() {
-                // HEAD matches, but files may have changed on disk since the index was
-                // last written (e.g., uncommitted edits, stash pop, manual file changes
-                // while OpenCode was closed). Verify mtimes and re-index stale files.
-                // Non-git projects also use this per-file (path, mtime, size)
-                // fingerprint so unchanged trees reuse the disk cache instead of
-                // rebuilding every configure.
-                baseline.git_head = current_head;
-                let _ = verify_file_mtimes(&mut baseline, verify_strategy);
-                baseline.ready = true;
-                return baseline;
-            }
-
-            if let (Some(previous), Some(current)) =
-                (baseline.git_head.clone(), current_head.clone())
-            {
-                let project_root = baseline.project_root.clone();
-                if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
-                    baseline.git_head = Some(current);
-                    let _ = verify_file_mtimes(&mut baseline, verify_strategy);
-                    baseline.ready = true;
-                    return baseline;
-                }
-            }
+        if let Some(index) = baseline.and_then(|baseline| {
+            Self::refresh_cached_with_strategy(
+                baseline,
+                root,
+                max_file_size,
+                current_head,
+                verify_strategy,
+            )
+        }) {
+            return index;
         }
 
         match cache_dir {
@@ -2756,6 +2721,50 @@ impl SearchIndex {
             }
             None => SearchIndex::build_with_limit(root, max_file_size),
         }
+    }
+
+    /// Verify or update an existing cache without falling through to a full
+    /// project build. The caller can acquire a cold-build permit on a miss.
+    pub(crate) fn refresh_cached_with_strategy(
+        mut baseline: Self,
+        root: &Path,
+        max_file_size: u64,
+        current_head: Option<String>,
+        verify_strategy: cache_freshness::VerifyStrategy,
+    ) -> Option<Self> {
+        if baseline.max_file_size != max_file_size {
+            return None;
+        }
+        baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
+        if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
+            return None;
+        }
+        baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
+
+        if baseline.git_head == current_head || current_head.is_none() {
+            // HEAD matches, but files may have changed on disk since the index was
+            // last written (e.g., uncommitted edits, stash pop, manual file changes
+            // while OpenCode was closed). Verify mtimes and re-index stale files.
+            // Non-git projects also use this per-file (path, mtime, size)
+            // fingerprint so unchanged trees reuse the disk cache instead of
+            // rebuilding every configure.
+            baseline.git_head = current_head;
+            let _ = verify_file_mtimes(&mut baseline, verify_strategy);
+            baseline.ready = true;
+            return Some(baseline);
+        }
+
+        if let (Some(previous), Some(current)) = (baseline.git_head.clone(), current_head.clone()) {
+            let project_root = baseline.project_root.clone();
+            if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
+                baseline.git_head = Some(current);
+                let _ = verify_file_mtimes(&mut baseline, verify_strategy);
+                baseline.ready = true;
+                return Some(baseline);
+            }
+        }
+        None
     }
 
     fn allocate_file_id_with_metadata(
