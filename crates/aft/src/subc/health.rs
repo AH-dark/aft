@@ -1606,6 +1606,9 @@ struct HealthDiagnosticRollup {
     status: HealthStatus,
     detail: Option<String>,
     generated_at_ms: Option<u64>,
+    /// Publication number of this census; 0 for the placeholder served before
+    /// the first one.
+    generation: u64,
     stale_reason: Option<&'static str>,
     metrics: Value,
     memory_census: Value,
@@ -1655,6 +1658,7 @@ impl HealthDiagnosticRollup {
             status: HealthStatus::Degraded,
             detail: Some("health diagnostic snapshot is being refreshed".to_string()),
             generated_at_ms: None,
+            generation: 0,
             stale_reason: Some("not_yet_sampled"),
             metrics,
             memory_census: placeholder_memory_census(),
@@ -1691,10 +1695,14 @@ pub(super) struct HealthRollupCache {
     clock_ms: AtomicU64,
     /// Count of completed refresh attempts, including scheduler contention.
     refreshes: AtomicU64,
-    /// Set when the latest refresh could not snapshot the scheduler. Kept
-    /// apart from the payload so a failed refresh marks the retained census
-    /// stale without copying it under the cache lock.
-    contended: AtomicBool,
+    /// Generation of the newest published census.
+    published_generation: AtomicU64,
+    /// One more than the highest census generation that a contended refresh
+    /// found still being served, or 0 if no refresh has been contended. The
+    /// offset lets a contention before the first census mark the placeholder
+    /// (generation 0). It only grows, so a reader holding an older census
+    /// cannot see it reported fresh after a later recovery.
+    stale_through_generation: AtomicU64,
     #[cfg(test)]
     root_details_assembled: AtomicUsize,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
@@ -1710,7 +1718,8 @@ impl HealthRollupCache {
             #[cfg(test)]
             clock_ms: AtomicU64::new(u64::MAX),
             refreshes: AtomicU64::new(0),
-            contended: AtomicBool::new(false),
+            published_generation: AtomicU64::new(0),
+            stale_through_generation: AtomicU64::new(0),
             #[cfg(test)]
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
@@ -1742,17 +1751,22 @@ impl HealthRollupCache {
             // Keep the timestamp with its payload so a reader cannot pair two
             // different publications when a refresh races with a probe.
             rollup.generated_at_ms = Some(self.now_ms());
+            rollup.generation = self.published_generation.load(Ordering::Acquire) + 1;
+            let generation = rollup.generation;
             let rollup = Arc::new(rollup);
             let mut snapshot = self
                 .snapshot
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
             *snapshot = rollup;
-            // Cleared under the write lock so no reader pairs the fresh census
-            // with the previous refresh's contention mark.
-            self.contended.store(false, Ordering::Release);
+            self.published_generation
+                .store(generation, Ordering::Release);
         } else {
-            self.contended.store(true, Ordering::Release);
+            // Mark the census being served now as stale, without touching it.
+            self.stale_through_generation.fetch_max(
+                self.published_generation.load(Ordering::Acquire) + 1,
+                Ordering::AcqRel,
+            );
         }
         self.refreshes.fetch_add(1, Ordering::AcqRel);
     }
@@ -1838,10 +1852,11 @@ impl HealthRollupCache {
         (snapshot, age_ms)
     }
 
-    /// Whether the latest refresh could not snapshot the scheduler, so the
-    /// retained census is stale.
-    fn latest_refresh_contended(&self) -> bool {
-        self.contended.load(Ordering::Acquire)
+    /// Whether a contended refresh has found this census still being served.
+    /// Judged by the census's own generation, so a reader holding an older
+    /// census never pairs it with a later recovery.
+    fn census_contended(&self, rollup: &HealthDiagnosticRollup) -> bool {
+        rollup.generation < self.stale_through_generation.load(Ordering::Acquire)
     }
 
     fn annotate_plane_timings(&self, root: &str, value: &mut Value) {
@@ -2613,6 +2628,7 @@ fn build_health_diagnostic_rollup_from_actors(
         },
         detail,
         generated_at_ms: None,
+        generation: 0,
         stale_reason: None,
         metrics,
         memory_census,
@@ -2669,7 +2685,7 @@ fn build_health_report_with_indexing(
     let (rollup, snapshot_age_ms) = cache.snapshot();
     // A contended refresh, now or at the last rollup, leaves the retained
     // census in place and reports it as stale.
-    let scheduler_busy = executor.try_actor_count().is_none() || cache.latest_refresh_contended();
+    let scheduler_busy = executor.try_actor_count().is_none() || cache.census_contended(&rollup);
     let stale_reason = if scheduler_busy {
         Some("executor_contended")
     } else {
@@ -4274,6 +4290,21 @@ mod tests {
             );
         }
         assert_eq!(cache.memory_census()["roots"], Value::Null);
+    }
+
+    #[test]
+    fn a_census_read_before_recovery_stays_stale_after_it() {
+        let (_dir, executor, cache, app) = contended_health_fixture();
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        // A probe takes the stale census, then a refresh recovers before the
+        // probe judges its freshness.
+        let held = cache.snapshot().0;
+        cache.refresh_for_test(&executor, &app);
+        assert!(
+            cache.census_contended(&held),
+            "a census read before recovery was reported fresh after it"
+        );
+        assert!(!cache.census_contended(&cache.snapshot().0));
     }
 
     #[test]
