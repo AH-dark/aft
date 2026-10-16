@@ -30,12 +30,12 @@ DEFAULT_REPOS = (
     "spark", "kubernetes", "elasticsearch", "llvm", "linux", "_nongit-24k", "chromium",
 )
 PLANES = ("search", "callgraph")
-CSV_FIELDS = (
+CSV_FIELDS: tuple[str, ...] = (
     "repo", "path", "git", "files", "top_languages", "semantic", "search_status",
     "callgraph_status", "search_wall_ms", "search_first_query_ms", "callgraph_wall_ms",
     "callgraph_first_query_ms", "callgraph_resolution_share_pct", "callgraph_resolution_ms", "search_superseded", "search_failed", "search_suspended",
     "callgraph_superseded", "callgraph_failed", "callgraph_suspended", "waiting_on",
-    "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "disk_write_bytes", "outcome", "log_path", "gaps",
+    "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "cpu_precision", "disk_write_bytes", "outcome", "log_path", "gaps",
 )
 TEXT_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt",
@@ -141,11 +141,19 @@ class ProcessSampler:
     # makes the difference between the two a direct measure of how much the
     # poll missed. Linux only, which is the only platform this gate compares on.
     peak_rss_hwm_kb: int = 0
-    cpu_seconds: float = 0.0
+    cpu_seconds: float | None = None
     disk_write_bytes: int | None = None
     gaps: list[str] = field(default_factory=list)
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
+
+    @property
+    def cpu_precision(self) -> str:
+        return "0.01-second" if sys.platform.startswith("linux") else "whole-second"
+
+    def _add_gap(self, message: str) -> None:
+        if message not in self.gaps:
+            self.gaps.append(message)
 
     def start(self) -> None:
         if sys.platform == "darwin":
@@ -166,6 +174,7 @@ class ProcessSampler:
 
     def _sample_once(self) -> None:
         if self.proc.poll() is not None:
+            self._add_gap("CPU measurement gap: process exited before a sample")
             return
         try:
             completed = subprocess.run(
@@ -178,7 +187,9 @@ class ProcessSampler:
             fields = completed.stdout.split()
             if len(fields) >= 2:
                 self.peak_rss_kb = max(self.peak_rss_kb, int(fields[0]))
-                self.cpu_seconds = max(self.cpu_seconds, parse_cpu_time(fields[1]))
+                if not sys.platform.startswith("linux"):
+                    sampled_cpu = parse_cpu_time(fields[1])
+                    self.cpu_seconds = max(self.cpu_seconds or 0.0, sampled_cpu)
             elif "ps resource sampling unavailable" not in self.gaps:
                 self.gaps.append("ps resource sampling unavailable")
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -186,8 +197,12 @@ class ProcessSampler:
                 self.gaps.append("ps resource sampling unavailable")
         if sys.platform.startswith("linux"):
             try:
-                # Read while the process is alive: /proc entries vanish on exit,
-                # and the caller closes the client before stopping the sampler.
+                stat = Path(f"/proc/{self.proc.pid}/stat").read_text(encoding="utf-8")
+                sampled_cpu = parse_proc_stat_cpu_seconds(stat)
+                self.cpu_seconds = max(self.cpu_seconds or 0.0, sampled_cpu)
+            except (OSError, ValueError):
+                self._add_gap("CPU measurement gap: /proc/<pid>/stat unavailable during sampling")
+            try:
                 for line in Path(f"/proc/{self.proc.pid}/status").read_text(encoding="utf-8").splitlines():
                     if line.startswith("VmHWM:"):
                         self.peak_rss_hwm_kb = max(self.peak_rss_hwm_kb, int(line.split()[1]))
@@ -538,6 +553,26 @@ def parse_cpu_time(value: str) -> float:
     return 0.0
 
 
+def parse_proc_stat_cpu_seconds(stat: str, clock_ticks: int | None = None) -> float:
+    """Return cumulative user+system CPU time from one Linux proc stat row."""
+    close = stat.rfind(")")
+    if close < 0:
+        raise ValueError("/proc stat row has no closing comm delimiter")
+    fields = stat[close + 1 :].split()
+    # The remainder starts at field 3 (state), so fields 14 and 15 are indexes
+    # 11 and 12. The comm field may itself contain spaces and parentheses.
+    if len(fields) <= 12:
+        raise ValueError("/proc stat row does not contain CPU tick fields")
+    ticks = os.sysconf("SC_CLK_TCK") if clock_ticks is None else clock_ticks
+    if ticks <= 0:
+        raise ValueError("SC_CLK_TCK must be positive")
+    try:
+        user_ticks, system_ticks = int(fields[11]), int(fields[12])
+    except ValueError as error:
+        raise ValueError("/proc stat CPU tick fields are not integers") from error
+    return (user_ticks + system_ticks) / ticks
+
+
 def run_command(argv: list[str], *, cwd: Path | None = None, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, cwd=str(cwd) if cwd else None, text=True, capture_output=True, check=False, timeout=timeout)
 
@@ -711,6 +746,12 @@ def empty_row(repo: str, root: Path) -> dict[str, str]:
     }
 
 
+def close_after_final_sample(sampler: ProcessSampler | None, client: NdjsonClient | None) -> str | None:
+    if sampler is not None:
+        sampler.stop()
+    return client.close() if client is not None else None
+
+
 def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_seconds: float) -> dict[str, str]:
     row = empty_row(root.name, root)
     row["semantic"] = "disabled (matrix policy; no embedding backend)"
@@ -817,10 +858,9 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         gaps.append(str(error))
         outcome = "failed"
     finally:
-        if client is not None:
-            close_gap = client.close()
-            if close_gap:
-                gaps.append(close_gap)
+        close_gap = close_after_final_sample(sampler, client)
+        if close_gap:
+            gaps.append(close_gap)
         if phases is not None:
             phases.stop()
             gaps.extend(phases.gaps)
@@ -829,11 +869,11 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
             if phases.samples:
                 write_phase_trace(storage / "phase-memory.csv", phases.samples)
         if sampler is not None:
-            sampler.stop()
             gaps.extend(sampler.gaps)
             row["peak_rss_mb"] = f"{sampler.peak_rss_kb / 1024:.1f}"
             row["peak_rss_hwm_mb"] = f"{sampler.peak_rss_hwm_kb / 1024:.1f}" if sampler.peak_rss_hwm_kb else "n/a"
-            row["cpu_s"] = f"{sampler.cpu_seconds:.2f}"
+            row["cpu_s"] = f"{sampler.cpu_seconds:.2f}" if sampler.cpu_seconds is not None else "n/a"
+            row["cpu_precision"] = sampler.cpu_precision
             row["disk_write_bytes"] = str(sampler.disk_write_bytes) if sampler.disk_write_bytes is not None else "n/a"
     metrics = census_metrics(script_dir, root, storage, git, gaps)
     row.update({
