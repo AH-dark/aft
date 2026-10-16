@@ -6506,6 +6506,9 @@ fn collect_degraded_grep_files(
                     skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
+                if crate::project_content::is_excluded(entry.path()) {
+                    return false;
+                }
                 let name = entry.file_name().to_string_lossy();
                 if entry
                     .file_type()
