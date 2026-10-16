@@ -4,7 +4,7 @@
 //! directories stay on the caller's hot path. Network/removable/unknown volumes
 //! and symlinks retain per-file isolation. Helpers own no actor or epoch guard.
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -90,6 +90,7 @@ pub(crate) struct Budget {
     failure: Arc<Mutex<Option<Failure>>>,
     failed: Arc<AtomicBool>,
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
+    traversable: Arc<Mutex<HashSet<PathBuf>>>,
     permissions: Arc<Mutex<Vec<PermissionObservation>>>,
     #[cfg(test)]
     measurements: Arc<Measurements>,
@@ -107,6 +108,7 @@ impl Budget {
             failure: Arc::new(Mutex::new(None)),
             failed: Arc::new(AtomicBool::new(false)),
             directories: Arc::new(Mutex::new(HashMap::new())),
+            traversable: Arc::new(Mutex::new(HashSet::new())),
             permissions: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             measurements: Arc::new(Measurements::default()),
@@ -629,6 +631,50 @@ fn cached_directory(path: &Path) -> Option<Access> {
         (dirs.0 == id).then(|| dirs.1.get(path).copied()).flatten()
     })
 }
+fn traversal_parent(path: &Path) -> Option<&Path> {
+    path.parent().map(|parent| {
+        if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        }
+    })
+}
+// A successful stat on a local filesystem permits sibling stats, not directory
+// enumeration or file reads. Keep this weaker evidence out of the listing cache.
+fn cached_traversal(path: &Path) -> bool {
+    cached_directory(path).is_some_and(|access| access.direct)
+        || CURRENT.with(|current| {
+            current.borrow().as_ref().is_some_and(|budget| {
+                budget
+                    .traversable
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(path)
+            })
+        })
+}
+fn run_traversal<T: Send + 'static>(
+    path: &Path,
+    work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let (result, traversable) = run(path, None, move |path| {
+        let parent = traversal_parent(&path).map(Path::to_path_buf);
+        let result = work(path)?;
+        // Filesystem identification can itself block, so keep it in the helper.
+        let traversable = parent.filter(|parent| local_filesystem(parent).unwrap_or(false));
+        Ok((result, traversable))
+    })?;
+    // Publish only after the caller receives success, never from a late helper.
+    if let (Some(parent), Some(budget)) = (traversable, current()) {
+        budget
+            .traversable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(parent);
+    }
+    Ok(result)
+}
 fn probe_target(path: &Path) -> io::Result<()> {
     if cached_directory(path).is_some() {
         return Ok(());
@@ -785,15 +831,12 @@ pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     }
     // Resolving a path needs traversal, not permission to enumerate its parent.
     // Reuse a known-safe parent, otherwise isolate only canonicalize itself.
-    if path
-        .parent()
-        .and_then(cached_directory)
-        .is_some_and(|access| access.direct)
+    if traversal_parent(path).is_some_and(cached_traversal)
         && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink())
     {
         std::fs::canonicalize(path)
     } else {
-        run(path, None, std::fs::canonicalize)
+        run_traversal(path, std::fs::canonicalize)
     }
 }
 pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
@@ -801,16 +844,17 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
         return Err(error);
     }
     // A stat must not turn into an unrelated ancestor's directory listing.
-    if cached_directory(path)
-        .or_else(|| path.parent().and_then(cached_directory))
-        .is_some_and(|access| access.direct)
-    {
+    let direct = cached_directory(path).map_or_else(
+        || cached_traversal(path) || traversal_parent(path).is_some_and(cached_traversal),
+        |access| access.direct,
+    );
+    if direct {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.file_type().is_symlink() {
             return Ok(metadata);
         }
     }
-    run(path, None, std::fs::metadata)
+    run_traversal(path, std::fs::metadata)
 }
 
 #[cfg(test)]

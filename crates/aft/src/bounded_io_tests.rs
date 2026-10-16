@@ -69,6 +69,167 @@ fn metadata_and_canonicalize_do_not_enumerate_an_ancestor() {
     assert_eq!(blocked.1.load(Ordering::Relaxed), 0);
 }
 
+// Only macOS and Linux currently identify local filesystems for direct access;
+// Windows and unknown mounts retain per-file helper isolation.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn sibling_metadata_reuses_traversal_without_granting_listing_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(local_filesystem(&root).unwrap());
+    let paths: Vec<_> = (0..8).map(|n| root.join(format!("file-{n}"))).collect();
+    for path in &paths {
+        std::fs::write(path, "sibling").unwrap();
+    }
+    let blocked = BlockDirectory::new(&root);
+    let budget = Budget::after(IO_BUDGET);
+    with_budget(Some(budget.clone()), || {
+        for path in &paths {
+            assert!(metadata(path).unwrap().is_file());
+        }
+        assert_eq!(budget.measurements(), (1, 1), "one cold stat helper");
+        assert_eq!(blocked.1.load(Ordering::Relaxed), 0);
+        let error = read(&paths[0], None).unwrap_err();
+        assert!(error.to_string().contains("read_blocked"), "{error}");
+        assert_eq!(blocked.1.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            budget.measurements(),
+            (2, 2),
+            "reading still probes the parent"
+        );
+    });
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn canonicalize_warms_sibling_traversal_shared_only_within_the_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(local_filesystem(&root).unwrap());
+    let first = root.join("first");
+    let second = root.join("second");
+    std::fs::write(&first, "first").unwrap();
+    std::fs::write(&second, "second").unwrap();
+    let blocked = BlockDirectory::new(&root);
+    let budget = Budget::after(IO_BUDGET);
+    with_budget(Some(budget.clone()), || {
+        assert_eq!(canonicalize(&first).unwrap(), first);
+        assert_eq!(canonicalize(&second).unwrap(), second);
+        let worker_budget = budget.clone();
+        let worker_path = second.clone();
+        std::thread::spawn(move || {
+            with_budget(Some(worker_budget), || {
+                assert!(metadata(&worker_path).unwrap().is_file());
+            });
+        })
+        .join()
+        .unwrap();
+        assert_eq!(budget.measurements(), (1, 1));
+    });
+    assert!(!cached_traversal(&root), "no evidence outside the request");
+    let fresh_budget = Budget::after(IO_BUDGET);
+    with_budget(Some(fresh_budget.clone()), || {
+        assert!(metadata(&second).unwrap().is_file());
+        assert_eq!(
+            fresh_budget.measurements(),
+            (1, 1),
+            "a new request probes again"
+        );
+    });
+    assert_eq!(blocked.1.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn failed_stats_do_not_warm_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing");
+    let budget = Budget::after(IO_BUDGET);
+    with_budget(Some(budget.clone()), || {
+        assert_eq!(metadata(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            canonicalize(&path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!cached_traversal(dir.path()));
+        assert_eq!(budget.measurements(), (2, 2));
+        std::fs::write(&path, "now present").unwrap();
+        assert!(metadata(&path).unwrap().is_file());
+        assert_eq!(budget.measurements(), (3, 3));
+    });
+}
+
+#[test]
+fn traversal_does_not_answer_an_explicit_directory_access_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let path = root.join("file");
+    std::fs::write(&path, "contents").unwrap();
+    let blocked = BlockDirectory::new(&root);
+    with_budget(Some(Budget::after(IO_BUDGET)), || {
+        assert!(metadata(&path).unwrap().is_file());
+        let error = probe_target(&root).unwrap_err();
+        assert!(error.to_string().contains("read_blocked"), "{error}");
+        assert_eq!(blocked.1.load(Ordering::Relaxed), 1);
+    });
+}
+
+#[test]
+fn timed_out_traversal_does_not_publish_late_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let path = root.join("file");
+    std::fs::write(&path, "contents").unwrap();
+    let budget = Budget::after(Duration::from_millis(250));
+    let caller_budget = budget.clone();
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (finished_tx, finished_rx) = channel();
+    struct Finished(Sender<()>);
+    impl Drop for Finished {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let caller = std::thread::spawn(move || {
+        with_budget(Some(caller_budget), || {
+            run_traversal(&path, move |path| {
+                let result = std::fs::metadata(path)?;
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok((result, Finished(finished_tx)))
+            })
+            .err()
+            .unwrap()
+        })
+    });
+    let started = started_rx.recv_timeout(IO_BUDGET);
+    let error = caller.join().unwrap();
+    release_tx.send(()).unwrap();
+    finished_rx.recv_timeout(IO_BUDGET).unwrap();
+    started.expect("the stat must finish before holding its result past the deadline");
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(timeout_code(&error), "read_blocked");
+    with_budget(Some(budget), || assert!(!cached_traversal(&root)));
+}
+
+#[cfg(unix)]
+#[test]
+fn traversal_keeps_symlink_stats_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let file = root.join("file");
+    let link = root.join("link");
+    std::fs::write(&file, "contents").unwrap();
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    let budget = Budget::after(IO_BUDGET);
+    with_budget(Some(budget.clone()), || {
+        assert!(metadata(&file).unwrap().is_file());
+        assert!(metadata(&link).unwrap().is_file());
+        assert_eq!(canonicalize(&link).unwrap(), file);
+        assert_eq!(budget.measurements(), (3, 3));
+    });
+}
+
 #[test]
 fn delete_does_not_enumerate_project_root_parent() {
     let dir = tempfile::tempdir().unwrap();
