@@ -94,7 +94,7 @@ import {
 // Register our logger with @cortexkit/aft-bridge before any bridge code runs.
 setActiveLogger(bridgeLogger);
 
-import { interruptBashWaitsForInput } from "./bash-wait-detach.js";
+import { clearPendingBashWaitDetach, interruptBashWaitsForInput } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
 import { startPiLiveConfigReload } from "./config-live-reload.js";
 import { recordActiveExtensionApi } from "./harness.js";
@@ -952,6 +952,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // section where the host supports one. Always-on; conditional on the
   // registered tool surface so absent tools aren't advertised.
   registerWorkflowHints(pi, config, surface);
+
+  pi.on("turn_start", async (_event, extCtx) => {
+    await clearPendingBashWaitDetach(pool, extCtx.cwd ?? projectRoot, resolveSessionId(extCtx));
+  });
 
   // Slash command: /aft-status
   registerStatusCommand(pi, ctx);

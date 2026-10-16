@@ -870,14 +870,24 @@ pub(crate) struct RegistryInner {
     /// exception instead.
     live_delivery_sessions: Mutex<HashSet<String>>,
     live_delivery_lock_diagnostics: Arc<crate::lock_diagnostics::LockDiagnostics>,
-    wait_detach_sessions: Mutex<HashMap<String, HashSet<String>>>,
-    active_wait_sessions: Mutex<HashMap<String, HashSet<String>>>,
+    wait_detach: Mutex<WaitDetachState>,
     wait_registered_tasks: Mutex<HashMap<String, HashSet<String>>>,
     /// Per session, the tasks whose waiting call was cancelled and that the
     /// session has not been told about yet (`cancelled_call_unannounced`), so
     /// a bash-family reply finds them without locking every task.
     cancelled_call_tasks: Mutex<HashMap<String, HashSet<String>>>,
 }
+
+#[derive(Default)]
+struct WaitDetachState {
+    active: HashMap<String, HashSet<String>>,
+    detached: HashMap<String, HashSet<String>>,
+    // Delivery hooks normally clear these. Expiry also bounds hosts that stop
+    // emitting lifecycle events after a session is abandoned.
+    pending: HashMap<String, Instant>,
+}
+
+const PENDING_WAIT_DETACH_TTL: Duration = Duration::from_secs(120);
 
 pub(crate) struct BgTask {
     pub(crate) task_id: String,
@@ -1240,8 +1250,7 @@ impl BgTaskRegistry {
                 live_delivery_lock_diagnostics: crate::lock_diagnostics::LockDiagnostics::new(
                     file!(),
                 ),
-                wait_detach_sessions: Mutex::new(HashMap::new()),
-                active_wait_sessions: Mutex::new(HashMap::new()),
+                wait_detach: Mutex::new(WaitDetachState::default()),
                 wait_registered_tasks: Mutex::new(HashMap::new()),
                 cancelled_call_tasks: Mutex::new(HashMap::new()),
             }),
@@ -1543,11 +1552,35 @@ impl BgTaskRegistry {
     }
 
     pub fn begin_wait_mode_session(&self, session_id: &str, task_id: &str) {
-        if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
-            active
+        self.begin_wait_mode_session_at(session_id, task_id, || {});
+    }
+
+    fn begin_wait_mode_session_at(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        registered: impl FnOnce(),
+    ) {
+        if let Ok(mut state) = self.inner.wait_detach.lock() {
+            // Admission and registration share this lock: a message either
+            // marks this active task or leaves one request for it to consume.
+            let pending = state
+                .pending
+                .remove(session_id)
+                .is_some_and(|at| at.elapsed() < PENDING_WAIT_DETACH_TTL);
+            registered();
+            state
+                .active
                 .entry(session_id.to_string())
                 .or_default()
                 .insert(task_id.to_string());
+            if pending {
+                state
+                    .detached
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .insert(task_id.to_string());
+            }
         }
         self.register_foreground_task(session_id, task_id);
     }
@@ -1583,29 +1616,29 @@ impl BgTaskRegistry {
     }
 
     pub fn end_wait_mode_session(&self, session_id: &str, task_id: &str) {
-        let no_active_wait = if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
-            match active.get_mut(session_id) {
+        if let Ok(mut state) = self.inner.wait_detach.lock() {
+            match state.active.get_mut(session_id) {
                 Some(tasks) => {
                     tasks.remove(task_id);
                     if tasks.is_empty() {
-                        active.remove(session_id);
+                        state.active.remove(session_id);
                     }
                 }
                 None => {}
             }
-            !active.contains_key(session_id)
-        } else {
-            false
-        };
-        self.unregister_foreground_task(session_id, task_id);
-        if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
-            if let Some(tasks) = detach.get_mut(session_id) {
+            if let Some(tasks) = state.detached.get_mut(session_id) {
                 tasks.remove(task_id);
             }
-            if no_active_wait || detach.get(session_id).is_some_and(HashSet::is_empty) {
-                detach.remove(session_id);
+            if !state.active.contains_key(session_id)
+                || state
+                    .detached
+                    .get(session_id)
+                    .is_some_and(HashSet::is_empty)
+            {
+                state.detached.remove(session_id);
             }
         }
+        self.unregister_foreground_task(session_id, task_id);
     }
 
     /// Kill the foreground bash task(s) still registered for an in-flight
@@ -1618,11 +1651,10 @@ impl BgTaskRegistry {
             .lock()
             .map(|mut tasks| tasks.remove(session_id).unwrap_or_default())
             .map_err(|_| "wait registration lock poisoned".to_string())?;
-        if let Ok(mut active) = self.inner.active_wait_sessions.lock() {
-            active.remove(session_id);
-        }
-        if let Ok(mut detach) = self.inner.wait_detach_sessions.lock() {
-            detach.remove(session_id);
+        if let Ok(mut state) = self.inner.wait_detach.lock() {
+            state.active.remove(session_id);
+            state.detached.remove(session_id);
+            state.pending.remove(session_id);
         }
 
         let mut killed = 0;
@@ -1665,20 +1697,25 @@ impl BgTaskRegistry {
     }
 
     pub fn signal_wait_mode_detach(&self, session_id: &str) -> bool {
-        let active = self
-            .inner
-            .active_wait_sessions
-            .lock()
-            .map(|active| active.get(session_id).cloned().unwrap_or_default())
-            .unwrap_or_default();
-        if active.is_empty() {
-            return false;
-        }
+        self.signal_wait_detach(session_id, false)
+    }
+
+    fn signal_wait_detach(&self, session_id: &str, remember: bool) -> bool {
         self.inner
-            .wait_detach_sessions
+            .wait_detach
             .lock()
-            .map(|mut detach| {
-                let pending = detach.entry(session_id.to_string()).or_default();
+            .map(|mut state| {
+                let active = state.active.get(session_id).cloned().unwrap_or_default();
+                state
+                    .pending
+                    .retain(|_, at| at.elapsed() < PENDING_WAIT_DETACH_TTL);
+                if active.is_empty() {
+                    if remember {
+                        state.pending.insert(session_id.to_string(), Instant::now());
+                    }
+                    return false;
+                }
+                let pending = state.detached.entry(session_id.to_string()).or_default();
                 let before = pending.len();
                 pending.extend(active);
                 pending.len() > before
@@ -1686,36 +1723,51 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
-    /// Number of sessions currently blocked in a `wait: true` foreground bash.
+    pub fn request_wait_mode_detach(&self, session_id: &str) -> bool {
+        self.signal_wait_detach(session_id, true)
+    }
+
+    pub fn clear_pending_wait_detach(&self, session_id: &str) {
+        if let Ok(mut state) = self.inner.wait_detach.lock() {
+            state.pending.remove(session_id);
+        }
+    }
+
+    /// Number of sessions currently blocked in a detachable foreground bash.
     /// Diagnostic only (the detach-signal trace log).
     pub fn active_wait_session_count(&self) -> usize {
         self.inner
-            .active_wait_sessions
+            .wait_detach
             .lock()
-            .map(|active| active.len())
+            .map(|state| state.active.len())
             .unwrap_or(0)
     }
 
     pub fn take_wait_mode_detach(&self, session_id: &str) -> bool {
         let task_id = self
             .inner
-            .wait_detach_sessions
+            .wait_detach
             .lock()
             .ok()
-            .and_then(|detach| detach.get(session_id)?.iter().next().cloned());
+            .and_then(|state| state.detached.get(session_id)?.iter().next().cloned());
         task_id.is_some_and(|task_id| self.take_task_wait_mode_detach(session_id, &task_id))
     }
 
     pub fn take_task_wait_mode_detach(&self, session_id: &str, task_id: &str) -> bool {
         self.inner
-            .wait_detach_sessions
+            .wait_detach
             .lock()
-            .map(|mut detach| {
-                let removed = detach
+            .map(|mut state| {
+                let removed = state
+                    .detached
                     .get_mut(session_id)
                     .is_some_and(|tasks| tasks.remove(task_id));
-                if detach.get(session_id).is_some_and(HashSet::is_empty) {
-                    detach.remove(session_id);
+                if state
+                    .detached
+                    .get(session_id)
+                    .is_some_and(HashSet::is_empty)
+                {
+                    state.detached.remove(session_id);
                 }
                 removed
             })
@@ -1724,9 +1776,9 @@ impl BgTaskRegistry {
 
     pub(crate) fn wait_mode_detach_pending(&self, session_id: &str) -> bool {
         self.inner
-            .wait_detach_sessions
+            .wait_detach
             .lock()
-            .map(|detach| detach.contains_key(session_id))
+            .map(|state| state.detached.contains_key(session_id))
             .unwrap_or(false)
     }
 
@@ -12002,6 +12054,90 @@ mod tests {
         registry.end_wait_mode_session("session", "first");
         registry.end_wait_mode_session("session", "second");
         assert!(!registry.take_wait_mode_detach("session"));
+    }
+
+    #[test]
+    fn pending_detach_before_wait_start() {
+        let registry = BgTaskRegistry::default();
+        assert!(!registry.request_wait_mode_detach("session"));
+        registry.begin_wait_mode_session("session", "first");
+        assert!(registry.take_task_wait_mode_detach("session", "first"));
+        registry.begin_wait_mode_session("session", "second");
+        assert!(!registry.take_task_wait_mode_detach("session", "second"));
+    }
+
+    #[test]
+    fn pending_detach_during_wait() {
+        let registry = BgTaskRegistry::default();
+        registry.begin_wait_mode_session("session", "first");
+        assert!(registry.request_wait_mode_detach("session"));
+        assert!(registry.take_task_wait_mode_detach("session", "first"));
+    }
+
+    #[test]
+    fn pending_detach_delivery_clears_previous_turn() {
+        let registry = BgTaskRegistry::default();
+        registry.request_wait_mode_detach("session");
+        registry.clear_pending_wait_detach("session");
+        registry.begin_wait_mode_session("session", "next-turn");
+        assert!(!registry.take_task_wait_mode_detach("session", "next-turn"));
+    }
+
+    #[test]
+    fn pending_detach_is_session_scoped() {
+        let registry = BgTaskRegistry::default();
+        registry.request_wait_mode_detach("other");
+        registry.begin_wait_mode_session("session", "task");
+        assert!(!registry.take_task_wait_mode_detach("session", "task"));
+        registry.begin_wait_mode_session("other", "other-task");
+        assert!(registry.take_task_wait_mode_detach("other", "other-task"));
+    }
+
+    #[test]
+    fn pending_detach_registration_is_atomic_with_admission() {
+        let registry = BgTaskRegistry::default();
+        let other = registry.clone();
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let admission = std::thread::spawn(move || {
+            registered_rx.recv().unwrap();
+            // Probe the exact registration boundary, rather than relying on
+            // scheduler timing to land a message inside the critical section.
+            let locked = other.inner.wait_detach.try_lock().is_err();
+            if locked {
+                admitted_tx.send(locked).unwrap();
+                other.request_wait_mode_detach("session");
+            } else {
+                other.request_wait_mode_detach("session");
+                admitted_tx.send(locked).unwrap();
+            }
+        });
+        let mut admission_blocked = false;
+        registry.begin_wait_mode_session_at("session", "task", || {
+            registered_tx.send(()).unwrap();
+            admission_blocked = admitted_rx.recv().unwrap();
+        });
+        admission.join().unwrap();
+        assert!(registry.take_task_wait_mode_detach("session", "task"));
+        assert!(
+            admission_blocked,
+            "admission must share the registration lock"
+        );
+    }
+
+    #[test]
+    fn pending_detach_expires_without_delivery_hook() {
+        let registry = BgTaskRegistry::default();
+        registry.request_wait_mode_detach("session");
+        registry
+            .inner
+            .wait_detach
+            .lock()
+            .unwrap()
+            .pending
+            .insert("session".into(), Instant::now() - PENDING_WAIT_DETACH_TTL);
+        registry.begin_wait_mode_session("session", "task");
+        assert!(!registry.take_task_wait_mode_detach("session", "task"));
     }
 
     #[test]

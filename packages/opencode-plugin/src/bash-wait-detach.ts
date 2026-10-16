@@ -11,7 +11,67 @@ import { debug, log, warn } from "./logger.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { BASH_TRANSPORT_TIMEOUT_MS } from "./tools/_shared.js";
 
-type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activeBridges">;
+type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activeBridges"> &
+  Partial<Pick<AftTransportPool, "getBridge">>;
+
+const pendingOperations = new WeakMap<ActiveBridgePool, Map<string, Promise<void>>>();
+
+/** OpenCode 1 transforms the message list before each model step, after queued input is included. */
+export async function clearPendingBashWaitDetachForMessages(
+  pool: ActiveBridgePool,
+  output: { messages: { info: { sessionID: string } }[] },
+): Promise<void> {
+  await Promise.all(
+    [...new Set(output.messages.map((message) => message.info.sessionID))].map((sessionID) =>
+      clearPendingBashWaitDetach(pool, sessionID),
+    ),
+  );
+}
+
+function queuePendingOperation(
+  pool: ActiveBridgePool,
+  sessionID: string,
+  run: () => Promise<void>,
+): Promise<void> {
+  let sessions = pendingOperations.get(pool);
+  if (!sessions) pendingOperations.set(pool, (sessions = new Map()));
+  const previous = sessions.get(sessionID);
+  // Admission must not block the host, but its RPC must finish before the
+  // next model step clears it; otherwise a late RPC could re-arm a stale turn.
+  const operation = (previous ? previous.then(run, run) : run()).catch((error) => {
+    warn(`[bash_wait_detach] request failed for session ${sessionID}: ${String(error)}`);
+  });
+  sessions.set(sessionID, operation);
+  void operation.finally(() => {
+    if (sessions.get(sessionID) === operation) sessions.delete(sessionID);
+  });
+  return operation;
+}
+
+/** Before the next model step, discard requests that no foreground wait has consumed. */
+export async function clearPendingBashWaitDetach(
+  pool: ActiveBridgePool,
+  sessionID: string | undefined,
+): Promise<void> {
+  if (!sessionID) return;
+  await queuePendingOperation(pool, sessionID, async () => {
+    await Promise.all(
+      pool.activeBridges().map(async (bridge) => {
+        try {
+          await bridge.send(
+            "bash_wait_detach",
+            { session_id: sessionID, clear_pending: true },
+            { keepBridgeOnTimeout: true, transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS },
+          );
+        } catch (error) {
+          warn(
+            `[bash_wait_detach] delivery clear failed for session ${sessionID}: ${String(error)}`,
+          );
+        }
+      }),
+    );
+  });
+}
 
 export { BASH_WAIT_DETACH_MAGIC_KEYWORD } from "@cortexkit/aft-bridge";
 
@@ -62,7 +122,7 @@ export function stripUserMessageDetachKeyword(output: unknown): string {
 }
 
 /**
- * Decide whether a message should detach an active wait:true bash call and
+ * Decide whether a message should detach a foreground bash call and
  * abort a sync bash_watch. `messageText` is the operator-typed text from
  * `extractUserMessageText`, read before the keyword is stripped from it.
  */
@@ -77,7 +137,7 @@ export function shouldDetachBashWaitOnUserMessage(config: AftConfig, messageText
  * Handle OpenCode's chat.message output for the session's blocking waits:
  * decide, strip the `&detach` token from the mutable text parts, then (only
  * when the decision says so) abort any sync bash_watch and detach any
- * wait:true bash. Both waits follow the same decision, so
+ * foreground bash. Both waits follow the same decision, so
  * `bash.detach_on_user_message: false` protects a sync bash_watch as well.
  * Returns whether the waits were interrupted.
  */
@@ -87,13 +147,18 @@ export function interruptBashWaitsForChatMessage(
   projectRoot: string,
   sessionID: string | undefined,
   output: unknown,
+  remember = true,
 ): boolean {
   // Decide before stripping: stripping removes the token the decision reads.
   const interrupt = shouldDetachBashWaitOnUserMessage(config, extractUserMessageText(output));
   stripUserMessageDetachKeyword(output);
   if (interrupt) {
     signalSyncWatchAbort(sessionID);
-    void signalBashWaitDetachForProject(pool, projectRoot, sessionID);
+    if (sessionID && remember)
+      void queuePendingOperation(pool, sessionID, () =>
+        signalBashWaitDetachForProject(pool, projectRoot, sessionID, true),
+      );
+    else void signalBashWaitDetachForProject(pool, projectRoot, sessionID);
   }
   return interrupt;
 }
@@ -101,10 +166,11 @@ export function interruptBashWaitsForChatMessage(
 async function sendBashWaitDetach(
   bridge: AftProjectTransport,
   sessionID: string,
+  pending = false,
 ): Promise<boolean> {
   const response = await bridge.send(
     "bash_wait_detach",
-    { session_id: sessionID },
+    { session_id: sessionID, ...(pending ? { pending: true } : {}) },
     { keepBridgeOnTimeout: true, transportTimeoutMs: BASH_TRANSPORT_TIMEOUT_MS },
   );
   if (response.success === false) {
@@ -120,12 +186,15 @@ export async function signalBashWaitDetachForProject(
   pool: ActiveBridgePool,
   projectRoot: string,
   sessionID: string | undefined,
+  pending = false,
 ): Promise<void> {
   if (!sessionID) return;
   // Try the exact root first, but keep fanning out while no bridge reports an
   // actually-detached wait: success:true + detached:false from the exact-root
   // bridge means the wait lives elsewhere (root-key mismatch), not "done".
-  const exact = pool.getActiveBridgeForRoot(projectRoot);
+  const exact =
+    pool.getActiveBridgeForRoot(projectRoot) ??
+    (pending ? pool.getBridge?.(projectRoot) : undefined);
   const all = pool.activeBridges();
   const targets = exact ? [exact, ...all.filter((bridge) => bridge !== exact)] : all;
   if (targets.length === 0) {
@@ -142,11 +211,11 @@ export async function signalBashWaitDetachForProject(
   for (const bridge of targets) {
     try {
       signaled += 1;
-      if (await sendBashWaitDetach(bridge, sessionID)) {
+      if (await sendBashWaitDetach(bridge, sessionID, pending)) {
         log(
           `[bash_wait_detach] detached wait for session ${sessionID} (bridge ${signaled}/${targets.length})`,
         );
-        return;
+        if (!pending) return;
       }
     } catch (err) {
       lastError = err;
@@ -158,7 +227,7 @@ export async function signalBashWaitDetachForProject(
     );
   } else {
     log(
-      `[bash_wait_detach] no active wait found for session ${sessionID} (signaled ${signaled} bridge(s))`,
+      `[bash_wait_detach] ${pending ? "pending detach recorded" : "no active wait found"} for session ${sessionID} (signaled ${signaled} bridge(s))`,
     );
   }
 }

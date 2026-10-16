@@ -1053,7 +1053,7 @@ pub(super) fn submit_deferred_bash(
                     // standalone path (bash_orchestrate) does: without this, a
                     // bash_wait_detach signal finds no active wait and wait:true
                     // blocks through user messages.
-                    let detach_on_user_message = settings.wait && !server_completion;
+                    let detach_on_user_message = !server_completion;
                     ctx.bash_background()
                         .register_foreground_task(&session_for_spawn, &task_id);
                     if detach_on_user_message {
@@ -2995,6 +2995,40 @@ mod grant_path_tests {
         arguments: Value,
     ) -> mpsc::Receiver<BashDeferredCompletion> {
         deadline_test_call_received(executor, root, dispatch, arguments, Instant::now())
+    }
+
+    #[tokio::test]
+    async fn pending_message_detaches_subc_foreground_wait_modes() {
+        for wait in [true, false] {
+            let (_dir, root) = super::super::test_support::test_root("pending-bash-message");
+            let ctx = super::super::test_support::test_ctx();
+            let registry = ctx.bash_background().clone();
+            registry.request_wait_mode_detach("deadline-session");
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(root.clone(), ctx);
+            let mut replies = deadline_test_call(
+                &executor,
+                &root,
+                running_bash_stub,
+                json!({"command": "sleep 1", "wait": wait, "timeout": 10_000}),
+            );
+            let completion = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = completion.result.unwrap().response;
+            if let Some(task_id) = response.data["task_id"].as_str() {
+                let _ = registry.kill(task_id, "deadline-session");
+            }
+            assert!(response.success, "{response:?}");
+            assert!(
+                response
+                    .data
+                    .to_string()
+                    .contains("Detached because a user message arrived"),
+                "{response:?}"
+            );
+        }
     }
 
     fn deadline_test_call_received(

@@ -11,7 +11,10 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { Plugin } from "@opencode-ai/plugin";
 
-import { interruptBashWaitsForChatMessage } from "./bash-wait-detach.js";
+import {
+  clearPendingBashWaitDetachForMessages,
+  interruptBashWaitsForChatMessage,
+} from "./bash-wait-detach.js";
 import {
   appendInTurnBgCompletions,
   extractSessionID,
@@ -926,6 +929,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // bash so a new message (typed, or a completion the agent should act on)
       // is not blocked by a long-running wait.
       interruptBashWaitsForChatMessage(pool, projectConfig, sessionDir, sid, messageOutput);
+    },
+    "experimental.chat.messages.transform": async (
+      _input: unknown,
+      output: { messages: { info: { sessionID: string } }[] },
+    ) => {
+      await clearPendingBashWaitDetachForMessages(pool, output);
     },
     "tool.execute.before": async (
       toolInput: { tool: string; sessionID?: string },
