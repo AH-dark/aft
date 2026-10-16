@@ -2857,7 +2857,14 @@ pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
         return true;
     };
     let drained = worker.shutdown_with_budget(budget);
-    if drained {
+    // Parked paths make the flush incomplete even after shutdown has joined the
+    // thread. Detach that stopped worker so the next enqueue can start a new one.
+    let stopped = worker
+        .thread
+        .lock()
+        .expect("callgraph refresh worker thread mutex poisoned")
+        .is_none();
+    if stopped {
         let mut current = slot
             .lock()
             .expect("callgraph refresh worker mutex poisoned");
@@ -22310,6 +22317,62 @@ mod refresh_worker_tests {
         let unrelated = Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
             .add_path(temp.path().join("another-cache/generation.sqlite-shm"));
         assert!(!refresh_lease_release_event(&unrelated, &lease));
+    }
+
+    #[test]
+    fn deferred_shutdown_allows_next_process_worker_refresh() {
+        let _guard = REFRESH_WORKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(12));
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let pending = pending_paths();
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        set_callgraph_refresh_worker_test_open_failure(root.clone(), true);
+        assert!(enqueue_callgraph_store_refresh(
+            dir.clone(),
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending)
+        ));
+        let worker = CALLGRAPH_REFRESH_WORKER
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        let queue = worker.shared.queue.lock().unwrap();
+        let (queue, _) = worker
+            .shared
+            .wake
+            .wait_timeout_while(queue, Duration::from_secs(12), |queue| {
+                queue.active.is_some() || !queue.order.is_empty()
+            })
+            .unwrap();
+        assert!(queue
+            .waiting
+            .keys()
+            .any(|waiting| waiting.project_root == root));
+        drop(queue);
+        assert!(!flush_callgraph_store_refreshes_with_budget(
+            Duration::from_secs(12)
+        ));
+        assert!(pending.lock().contains(&source));
+        assert!(worker.thread.lock().unwrap().is_none());
+
+        set_callgraph_refresh_worker_test_open_failure(root.clone(), false);
+        assert!(
+            enqueue_callgraph_store_refresh(dir, root.clone(), vec![source], pending_paths()),
+            "deferred shutdown must detach its stopped worker"
+        );
+        assert!(wait_for_process_callgraph_refresh_for_test(
+            &root,
+            Duration::from_secs(12)
+        ));
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(12));
+        clear_callgraph_refresh_worker_test_seam(&root);
     }
 
     #[test]
