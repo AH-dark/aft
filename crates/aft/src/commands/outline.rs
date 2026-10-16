@@ -2420,6 +2420,9 @@ fn collect_outline_files_with_device_lookup<F>(
         let boundary_failed = Arc::clone(&boundary_failed);
         let boundary = *boundary;
         builder.filter_entry(move |entry| {
+            if !crate::bash_background::registry::safe_task_entry(entry.path()) {
+                return false;
+            }
             if entry.depth() == 0 {
                 return true;
             }
@@ -2526,6 +2529,9 @@ fn collect_outline_files_breadth_first_with_device_lookup(
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
         for entry in entries {
+            if !crate::bash_background::registry::safe_task_entry(&entry.path()) {
+                continue;
+            }
             let Ok(file_type) = entry.file_type() else {
                 *collection_truncated = true;
                 continue;

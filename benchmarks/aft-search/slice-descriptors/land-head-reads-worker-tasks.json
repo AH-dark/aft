@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/access_policy_task_tests.rs"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/search_index.rs. PathFilters excludes launch environments and unsafe links inside persisted bash task bundles, including indexed grep/glob candidates. This is a private-record access-policy change, not search ranking or routing: ordinary source-file eligibility and ranked rows in the quality corpus must remain byte-identical to the committed reference."
+}

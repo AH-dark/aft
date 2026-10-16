@@ -68,6 +68,15 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let storage_dir = crate::bash_background::task_storage_dir(ctx);
+    let worker_owner = ctx
+        .bash_background()
+        .readable_worker_task_owner(&task_id, &storage_dir);
+    let task_session = worker_owner.as_deref().unwrap_or(req.session());
+    let config = ctx.config();
+    let project_root = config
+        .project_root
+        .as_deref()
+        .filter(|_| worker_owner.is_none());
     let store_unavailable = ctx.database_runtime_unavailable_reason();
     // A delegated worker reading a task's status is waiting on it (its
     // `bash_watch` polls this): keep the task's default hard kill at least one
@@ -89,12 +98,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut disk_paths = None;
     let snapshot = if store_unavailable.is_some() {
         ctx.bash_background()
-            .terminal_status_from_disk(
-                &task_id,
-                req.session(),
-                ctx.config().project_root.as_deref(),
-                &storage_dir,
-            )
+            .terminal_status_from_disk(&task_id, task_session, project_root, &storage_dir)
             .map(|(snapshot, paths)| {
                 disk_paths = Some(paths);
                 snapshot
@@ -102,8 +106,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         ctx.bash_background().status_settled(
             &task_id,
-            req.session(),
-            ctx.config().project_root.as_deref(),
+            task_session,
+            project_root,
             Some(&storage_dir),
             PREVIEW_BYTES,
         )
@@ -112,7 +116,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         Some(mut snapshot) => {
             let pty_raw = maybe_render_pty_screen(
                 ctx,
-                req.session(),
+                task_session,
                 &task_id,
                 &mut snapshot,
                 output_mode.as_deref(),
@@ -166,7 +170,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                         ctx,
                         disk_paths.as_ref(),
                         &task_id,
-                        req.session(),
+                        task_session,
                         artifact,
                         offset,
                     ) {
@@ -190,7 +194,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                             ctx,
                             disk_paths.as_ref(),
                             &task_id,
-                            req.session(),
+                            task_session,
                             crate::bash_background::persistence::TaskArtifact::Stderr,
                             offset,
                         ) {

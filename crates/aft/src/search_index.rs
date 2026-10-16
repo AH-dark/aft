@@ -7364,6 +7364,9 @@ pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usiz
 
 impl PathFilters {
     pub(crate) fn matches(&self, root: &Path, path: &Path) -> bool {
+        if !crate::bash_background::registry::safe_task_entry(path) {
+            return false;
+        }
         if self.includes.is_none() && self.excludes.is_none() {
             return true;
         }

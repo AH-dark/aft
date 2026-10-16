@@ -756,6 +756,10 @@ pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
 }
 
+#[path = "task_access.rs"]
+mod task_access;
+pub(crate) use task_access::{is_task_environment, safe_task_entry};
+
 /// What woke the watchdog pass in which a task was observed terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchdogPassCause {
@@ -787,6 +791,7 @@ pub(crate) struct RegistryInner {
     /// Directory handles prevent cached permissions from following a replaced I/O directory.
     persisted_artifact_owners:
         Mutex<HashMap<PathBuf, (String, Arc<super::persistence::PinnedDir>)>>,
+    task_read_records: Mutex<HashMap<PathBuf, Arc<task_access::TaskReadRecord>>>,
     /// Failed finished-task bundle deletions and their bounded retry count.
     finished_delete_attempts: Mutex<HashMap<String, usize>>,
     cleanup_queue: Mutex<VecDeque<String>>,
@@ -1189,6 +1194,7 @@ impl BgTaskRegistry {
                 before_promotion_commit: Mutex::new(None),
                 tasks: Mutex::new(HashMap::new()),
                 persisted_artifact_owners: Mutex::new(HashMap::new()),
+                task_read_records: Mutex::new(HashMap::new()),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
                 cleanup_queue: Mutex::new(VecDeque::new()),
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
@@ -5675,7 +5681,7 @@ impl BgTaskRegistry {
     pub(super) fn status_relaxed(
         &self,
         task_id: &str,
-        _session_id: &str,
+        session_id: &str,
         project_root: &Path,
         storage_dir: &Path,
         preview_bytes: usize,
@@ -5691,6 +5697,13 @@ impl BgTaskRegistry {
         .flatten()
         .filter(|row| task_bundle_is_absent(storage_dir, &row.session_id, &row.task_id));
         if let Some(task) = self.status_relaxed_task(task_id, project_root, storage_dir) {
+            if task.session_id != session_id
+                && task
+                    .lock_state()
+                    .map_or(true, |state| state.metadata.scope.is_some())
+            {
+                return None;
+            }
             let _ = self.poll_task(&task);
             if !kill_wait.is_zero() && task.wait_for_kill_settled(kill_wait) {
                 let _ = self.poll_task(&task);
@@ -5699,6 +5712,9 @@ impl BgTaskRegistry {
         }
         let row = fallback_row?;
         let metadata = PersistedTask::from(row.clone());
+        if metadata.session_id != session_id && metadata.scope.is_some() {
+            return None;
+        }
         metadata
             .status
             .is_terminal()
@@ -5714,6 +5730,12 @@ impl BgTaskRegistry {
         let task = self
             .status_relaxed_task(task_id, project_root, storage_dir)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        if task
+            .lock_state()
+            .map_or(true, |state| state.metadata.scope.is_some())
+        {
+            return Err(format!("background task not found: {task_id}"));
+        }
         self.kill_with_status(task_id, &task.session_id, BgTaskStatus::Killed)
     }
 

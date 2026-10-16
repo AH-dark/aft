@@ -430,19 +430,9 @@ impl PinnedDir {
         }
     }
 
-    #[cfg(windows)]
-    fn ensure_current_identity(&self) -> io::Result<()> {
-        let current = OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .open(&self.path)?;
-        validate_directory_handle(&current)?;
-        let held = windows_file_information(&self.file)?;
-        let observed = windows_file_information(&current)?;
-        if held.volume_serial_number != observed.volume_serial_number
-            || held.file_index_high != observed.file_index_high
-            || held.file_index_low != observed.file_index_low
-        {
+    pub(crate) fn ensure_current_identity(&self) -> io::Result<()> {
+        let current = Self::open(&self.path)?;
+        if !self.same_identity(&current)? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "pinned directory path identity changed",
