@@ -559,12 +559,13 @@ pub(crate) fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<Pa
         .collect()
 }
 
-/// Ignore-derived exclusions last until the matcher changes. External paths
-/// describe filesystem topology instead: a link can become source code without
-/// any ignore rule changing, so events must recheck those paths with lstat.
+/// Installed exclusions retain their source so matcher changes invalidate only
+/// Gitignore entries. External paths describe filesystem topology instead: a
+/// link can become source code without any ignore rule changing, so events must
+/// recheck those paths with lstat.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) struct WatcherExclusionPaths {
-    lasting: Vec<PathBuf>,
+    lasting: Vec<WatcherExclusion>,
     external: BTreeSet<PathBuf>,
     boundary: Option<WatcherWalkBoundary>,
 }
@@ -586,7 +587,7 @@ impl WatcherExclusionPaths {
         self.lasting = exclusions
             .iter()
             .filter(|entry| entry.source() != WatcherExclusionSource::External)
-            .map(|entry| entry.path.clone())
+            .cloned()
             .collect();
         self.external = exclusions
             .iter()
@@ -606,8 +607,8 @@ impl WatcherExclusionPaths {
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.lasting
             .iter()
-            .chain(self.external.iter())
-            .cloned()
+            .map(|entry| entry.path.clone())
+            .chain(self.external.iter().cloned())
             .collect()
     }
 
@@ -615,20 +616,21 @@ impl WatcherExclusionPaths {
         let guard = matcher
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Installed paths are absolute directories. Evaluate the current ignore
-        // matcher without filesystem I/O: a stalled filesystem can block the
-        // planner, but removed ignore rules must still restore source watches
-        // or subsequent edits will be lost.
-        let ignored = |path: &PathBuf| {
-            guard.as_deref().is_some_and(|matcher| {
-                path.starts_with(matcher.path())
-                    && matcher.matched_path_or_any_parents(path, true).is_ignore()
-            })
-        };
-        let previous_len = self.lasting.len() + self.external.len();
-        self.lasting.retain(ignored);
-        self.external.retain(ignored);
-        self.lasting.len() + self.external.len() != previous_len
+        // Only Gitignore entries depend on the current ignore matcher. Keep
+        // exclusions with other sources, including external boundaries, until
+        // a completed plan or topology event changes them. Avoid filesystem I/O
+        // so a stalled drive cannot delay restoring newly unignored watches.
+        let previous_len = self.lasting.len();
+        self.lasting.retain(|entry| {
+            entry.source() != WatcherExclusionSource::Gitignore
+                || guard.as_deref().is_some_and(|matcher| {
+                    entry.path.starts_with(matcher.path())
+                        && matcher
+                            .matched_path_or_any_parents(&entry.path, true)
+                            .is_ignore()
+                })
+        });
+        self.lasting.len() != previous_len
     }
 
     pub(crate) fn refresh_event(&mut self, event: &notify::Event) -> Vec<PathBuf> {
@@ -1071,7 +1073,7 @@ impl WatcherExclusionRetry {
                 self.retry_at = Some(Instant::now() + backoff);
                 if self.attempts == 1 {
                     emit_exclusion_retry_log(format!(
-                        "watcher exclusion plan unavailable: root={} generation={generation} reason={}; retaining only current matcher exclusions during retry (limit={EXCLUSION_PLAN_MAX_ATTEMPTS})",
+                        "watcher exclusion plan unavailable: root={} generation={generation} reason={}; rechecking ignore-derived exclusions during retry (limit={EXCLUSION_PLAN_MAX_ATTEMPTS})",
                         root.display(), reason.as_str()
                     ));
                 }
@@ -2976,6 +2978,106 @@ mod tests {
     #[test]
     fn unavailable_generation_replan_keeps_ignored_exclusions_without_stream_restart() {
         assert_unavailable_generation_replan(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_generation_replan_preserves_non_gitignore_exclusions() {
+        let root = exclusion_tempdir();
+        let external = TempDir::new().unwrap();
+        let source = root.path().join("source");
+        let ecosystem = root.path().join("build-cache");
+        let observed = root.path().join("burst-cache");
+        let linked = root.path().join("external");
+        for path in [&source, &ecosystem, &observed] {
+            fs::create_dir(path).unwrap();
+        }
+        std::os::unix::fs::symlink(external.path(), &linked).unwrap();
+        let mut builder = GitignoreBuilder::new(root.path());
+        builder.add_line(None, "source/").unwrap();
+        let matcher: SharedGitignore = Arc::new(std::sync::RwLock::new(Some(Arc::new(
+            builder.build().unwrap(),
+        ))));
+        let initial = WatcherExclusionPlan {
+            selected: [
+                (&source, WatcherExclusionSource::Gitignore),
+                (&ecosystem, WatcherExclusionSource::Ecosystem),
+                (&observed, WatcherExclusionSource::Observed),
+                (&linked, WatcherExclusionSource::External),
+            ]
+            .into_iter()
+            .map(|(path, source)| WatcherExclusion {
+                path: path.clone(),
+                source,
+            })
+            .collect(),
+            dropped: Vec::new(),
+        };
+        let counters = crate::context::WatcherCounters::default();
+        let mut retry = WatcherExclusionRetry::default();
+        let initial = retry
+            .attempt(root.path(), 1, &counters, || Ok(initial))
+            .unwrap()
+            .unwrap();
+        let mut installed = WatcherExclusionPaths::new(root.path(), &initial.selected);
+        let mut stream_paths = installed.paths();
+        let mut watched = BTreeSet::from([root.path().to_path_buf()]);
+        let mut stream_restarts = 0;
+        *matcher.write().unwrap() = Some(Arc::new(
+            GitignoreBuilder::new(root.path()).build().unwrap(),
+        ));
+        EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
+        for attempt in 0..EXCLUSION_PLAN_MAX_ATTEMPTS {
+            if retry
+                .replacement_at(
+                    root.path(),
+                    2,
+                    &counters,
+                    &mut installed,
+                    &matcher,
+                    Instant::now() + Duration::from_secs((attempt as u64 + 1) * 10),
+                    || Err(ExclusionPlanUnavailable::CapacityDeadline),
+                )
+                .is_some()
+            {
+                let paths = installed.paths();
+                watched = [root.path(), &source, &ecosystem, &observed, &linked]
+                    .into_iter()
+                    .filter(|path| !paths.iter().any(|excluded| path.starts_with(excluded)))
+                    .map(Path::to_path_buf)
+                    .collect();
+                if stream_paths != paths {
+                    stream_paths = paths;
+                    stream_restarts += 1;
+                }
+            }
+            assert!(
+                watched.contains(&source),
+                "removed ignore rules must restore source watches"
+            );
+            assert!(
+                !watched.contains(&linked),
+                "an external symlink must remain excluded without an ignore rule"
+            );
+            assert!(
+                !watched.contains(&ecosystem),
+                "ecosystem exclusions must survive matcher changes"
+            );
+            assert!(
+                !watched.contains(&observed),
+                "observed-volume exclusions must survive matcher changes"
+            );
+            assert_eq!(
+                installed.paths(),
+                vec![ecosystem.clone(), observed.clone(), linked.clone()]
+            );
+            assert_eq!(stream_paths, installed.paths());
+            assert_eq!(stream_restarts, 1);
+        }
+        EXCLUSION_TEST_OPENS.with(|opens| assert!(opens.borrow().is_empty()));
+        let health = counters.snapshot().exclusion_planning.unwrap();
+        assert_eq!(health.attempts, EXCLUSION_PLAN_MAX_ATTEMPTS);
+        assert_eq!(health.status, "exhausted");
     }
 
     #[test]
