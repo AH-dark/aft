@@ -569,6 +569,39 @@
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2230,
+      "column": 46,
+      "token": "filePath",
+      "text": "// for read/write/edit instead requires `filePath`, so check an equivalent",
+      "location": "line 2230, column 46",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Provider schema admission normalizes older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2232,
+      "column": 33,
+      "token": "filePath",
+      "text": "if properties.contains_key(\"filePath\") && !properties.contains_key(\"path\") {",
+      "location": "line 2232, column 33",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Provider schema admission normalizes older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2234,
+      "column": 31,
+      "token": "filePath",
+      "text": "arguments.insert(\"filePath\".into(), path);",
+      "location": "line 2234, column 31",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Provider schema admission normalizes older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
       "line": 2460,
       "column": 44,
       "token": "filePath",
@@ -577,6 +610,83 @@
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2516,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"destination\": \"next.ts\"}),",
+      "location": "line 2516, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2520,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"organize\"}),",
+      "location": "line 2520, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2522,
+      "column": 32,
+      "token": "filePath",
+      "text": "(\"safety\", json!({\"filePath\": \"fixture.ts\", \"op\": \"history\"})),",
+      "location": "line 2522, column 32",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2525,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"callers\", \"symbol\": \"run\"}),",
+      "location": "line 2525, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2529,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"trace_to_symbol\", \"symbol\": \"run\", \"toSymbol\": \"next\", \"toFile\": \"next.ts\"}),",
+      "location": "line 2529, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2529,
+      "column": 113,
+      "token": "toFile",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"trace_to_symbol\", \"symbol\": \"run\", \"toSymbol\": \"next\", \"toFile\": \"next.ts\"}),",
+      "location": "line 2529, column 113",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2549,
+      "column": 24,
+      "token": "filePath",
+      "text": "arguments[\"filePath\"] = json!(\"fixture.ts\");",
+      "location": "line 2549, column 24",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
