@@ -2109,8 +2109,13 @@ impl RefreshBatch {
         if !ready_store_installed {
             return;
         }
-        if !refresh_writer_available(&self.root) {
-            return;
+        match refresh_writer_available(&self.root, false) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                crate::slog_warn!("could not determine writer lease availability: {error}");
+                return;
+            }
         }
 
         // A ready-store installation may drain the project's pending refresh
@@ -2186,8 +2191,26 @@ struct RefreshQueue {
 struct WaitingRefresh {
     batch: RefreshBatch,
     failure: RefreshOpenFailure,
+    lease_probe_error: Option<String>,
     identity: Arc<()>,
     next_recheck: Instant,
+}
+
+impl WaitingRefresh {
+    fn writer_available(&mut self, fallback: bool) -> bool {
+        match refresh_writer_available(&self.batch.root, fallback) {
+            Ok(available) => {
+                self.lease_probe_error = None;
+                available
+            }
+            Err(error) => {
+                self.lease_probe_error = Some(format!(
+                    "could not determine writer lease availability: {error}"
+                ));
+                false
+            }
+        }
+    }
 }
 
 struct RefreshOpenFailure {
@@ -2206,9 +2229,16 @@ impl RefreshOpenFailure {
     }
 }
 
-fn refresh_writer_available(root: &RefreshRoot) -> bool {
-    crate::fs_lock::lock_is_available(&crate::root_cache::writer_lease_path(&root.callgraph_dir))
-        .unwrap_or(false)
+fn refresh_writer_available(root: &RefreshRoot, fallback: bool) -> std::io::Result<bool> {
+    use crate::fs_lock::LockAvailability;
+    let lease = crate::root_cache::writer_lease_path(&root.callgraph_dir);
+    match crate::fs_lock::lock_availability(&lease)? {
+        LockAvailability::Available | LockAvailability::Stale => Ok(true),
+        LockAvailability::LiveOwner => Ok(false),
+        // Only the slow fallback retries malformed leases. Normal acquisition
+        // owns the grace-period reread and reclaim, including replacement checks.
+        LockAvailability::Malformed => Ok(fallback),
+    }
 }
 
 fn refresh_lease_release_event(event: &notify::Event, lease: &Path) -> bool {
@@ -2294,7 +2324,7 @@ pub(crate) fn callgraph_refresh_status(project_root: &Path) -> serde_json::Value
         .find(|waiting| waiting.batch.root.project_root == project_root);
     waiting.map_or(serde_json::Value::Null, |waiting| serde_json::json!({
         "state": "waiting",
-        "reason": if waiting.failure.writer_excluded { "waiting for writer lease held by another process" } else { "waiting for a ready callgraph store" },
+        "reason": waiting.lease_probe_error.as_deref().unwrap_or(if waiting.failure.writer_excluded { "waiting for writer lease held by another process" } else { "waiting for a ready callgraph store" }),
         "pending_paths": waiting.batch.paths.len(),
     }))
 }
@@ -2481,7 +2511,7 @@ impl RefreshWorker {
                 .batch
                 .merge(paths, pending_sink, refresh_states, ticket);
             waiting.batch.keepalive.extend(keepalive);
-            if !refresh_writer_available(&root) {
+            if !waiting.writer_available(false) {
                 waiting.batch.defer();
                 queue.waiting.insert(root, waiting);
                 self.shared.wake.notify_all();
@@ -3011,9 +3041,11 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
             Work::Shutdown => return,
             Work::Readiness { root, fallback } => {
                 let mut queue = shared.queue.lock().unwrap();
-                let changed = queue.waiting.get(&root).is_some_and(|waiting| {
-                    (fallback || waiting.failure.readiness_changed(&root))
-                        && refresh_writer_available(&root)
+                let changed = queue.waiting.get_mut(&root).is_some_and(|waiting| {
+                    if !fallback && !waiting.failure.readiness_changed(&root) {
+                        return false;
+                    }
+                    waiting.writer_available(fallback)
                 });
                 if !queue.waiting.contains_key(&root) {
                     drop(queue);
@@ -3158,6 +3190,7 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
                         WaitingRefresh {
                             batch: waiting_batch,
                             failure,
+                            lease_probe_error: None,
                             identity: Arc::new(()),
                             next_recheck: Instant::now() + REFRESH_WRITER_RECHECK_INTERVAL,
                         },
@@ -22597,6 +22630,103 @@ mod refresh_worker_tests {
         assert!(worker.wait(Duration::from_secs(12)));
         assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
         (temp, root, dir, source, worker, foreign, pending, ready)
+    }
+
+    #[test]
+    fn parked_refresh_recovers_from_empty_lease_on_fallback() {
+        assert_malformed_lease_refresh_recovers(b"");
+    }
+
+    #[test]
+    fn parked_refresh_recovers_from_partial_lease_on_fallback() {
+        assert_malformed_lease_refresh_recovers(b"{\"pid\":999999999,\"hostname\":");
+    }
+
+    fn assert_malformed_lease_refresh_recovers(contents: &[u8]) {
+        let (_temp, root, dir, source, worker, mut foreign, pending, ready) =
+            fallback_refresh_fixture(true);
+        foreign.kill();
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        fs::write(&lease, contents).unwrap();
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+        assert!(pending.lock().contains(&source));
+
+        run_refresh_fallback_probe(&worker);
+
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+        assert!(callgraph_refresh_status(&root).is_null());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
+    }
+
+    #[test]
+    fn parked_refresh_preserves_live_owner_on_fallback() {
+        let (_temp, root, dir, source, worker, foreign, pending, _ready) =
+            fallback_refresh_fixture(true);
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lease).unwrap()).unwrap();
+        metadata["heartbeat_at_ms"] = serde_json::json!(0);
+        fs::write(&lease, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        for _ in 0..2 {
+            run_refresh_fallback_probe(&worker);
+            assert_eq!(
+                callgraph_refresh_worker_test_counts(&root),
+                (1, 0),
+                "even a stale heartbeat must not cause a retry against a live owner"
+            );
+            assert!(pending.lock().contains(&source));
+            assert_eq!(callgraph_refresh_status(&root)["state"], "waiting");
+            let current: serde_json::Value =
+                serde_json::from_slice(&fs::read(&lease).unwrap()).unwrap();
+            assert_eq!(current["writer_epoch"], metadata["writer_epoch"]);
+        }
+        drop(worker);
+        drop(foreign);
+    }
+
+    #[test]
+    fn parked_refresh_retries_lease_io_error_on_next_fallback() {
+        let (_temp, root, dir, source, worker, mut foreign, pending, ready) =
+            fallback_refresh_fixture(true);
+        foreign.kill();
+        let lease = crate::root_cache::writer_lease_path(&dir);
+        fs::remove_file(&lease).unwrap();
+        // A directory at the lease path makes the read fail on every platform,
+        // including test runners whose privileges bypass file permission bits.
+        fs::create_dir(&lease).unwrap();
+        for _ in 0..2 {
+            run_refresh_fallback_probe(&worker);
+            assert_eq!(callgraph_refresh_worker_test_counts(&root), (1, 0));
+            assert!(pending.lock().contains(&source));
+            let status = callgraph_refresh_status(&root);
+            assert_eq!(status["state"], "waiting");
+            assert!(status["reason"]
+                .as_str()
+                .unwrap()
+                .contains("could not determine writer lease availability"));
+            assert!(lease.is_dir());
+        }
+        fs::remove_dir(&lease).unwrap();
+        run_refresh_fallback_probe(&worker);
+        assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
+        assert!(pending.lock().is_empty());
+        assert!(callgraph_refresh_status(&root).is_null());
+        assert_eq!(
+            ready
+                .call_tree(Path::new("main.rs"), "entry", 1)
+                .unwrap()
+                .children[0]
+                .name,
+            "new_leaf"
+        );
     }
 
     #[test]

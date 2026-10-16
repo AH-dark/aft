@@ -188,28 +188,62 @@ pub fn try_acquire(path: &Path, timeout: Duration) -> Result<LockGuard, AcquireE
 /// lock can be taken over.
 ///
 /// Read-only cache openers use this to switch to writer mode without waiting
-/// behind another process that is still building the cache.
+/// behind another process that is still building the cache. Malformed leases
+/// receive one poll interval of grace so a creator can finish writing before
+/// the existing guarded reclaim path is tried.
 pub fn try_acquire_once(path: &Path) -> Result<LockGuard, AcquireError> {
     try_acquire(path, Duration::ZERO)
 }
 
-/// True when no authoritative live owner blocks acquisition; unreadable or
-/// malformed metadata is an error, not evidence that the lease is available.
-/// This never takes or reclaims a lock. A subsequent acquisition must still
-/// verify ownership because another writer can arrive after this observation.
-pub(crate) fn lock_is_available(path: &Path) -> io::Result<bool> {
-    match read_lock_metadata(path) {
-        Ok(metadata) => Ok(!metadata_blocks_acquisition(
-            &metadata,
-            &current_hostname(),
-            LockConfig::default(),
-            now_ms(),
-        )),
-        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(ReadLockError::Io(error)) => Err(error),
-        Err(ReadLockError::Malformed(error)) => {
-            Err(io::Error::new(io::ErrorKind::InvalidData, error))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockAvailability {
+    Available,
+    LiveOwner,
+    Stale,
+    Malformed,
+}
+
+enum ObservedLock {
+    Available,
+    LiveOwner(LockMetadata),
+    Stale(LockMetadata),
+    Malformed(serde_json::Error),
+}
+
+impl ObservedLock {
+    fn availability(&self) -> LockAvailability {
+        match self {
+            Self::Available => LockAvailability::Available,
+            Self::LiveOwner(_) => LockAvailability::LiveOwner,
+            Self::Stale(_) => LockAvailability::Stale,
+            Self::Malformed(_) => LockAvailability::Malformed,
         }
+    }
+}
+
+/// Observe the same lease states used by acquisition, without taking a lock.
+/// Malformed contents are not proof of a dead owner: acquisition must still
+/// perform its grace-period reread and guarded reclaim. I/O failures remain
+/// errors rather than evidence about ownership.
+pub(crate) fn lock_availability(path: &Path) -> io::Result<LockAvailability> {
+    observe_lock(path, &current_hostname(), LockConfig::default())
+        .map(|observed| observed.availability())
+}
+
+fn observe_lock(path: &Path, hostname: &str, config: LockConfig) -> io::Result<ObservedLock> {
+    match read_lock_metadata(path) {
+        Ok(metadata) => {
+            if metadata_blocks_acquisition(&metadata, hostname, config, now_ms()) {
+                Ok(ObservedLock::LiveOwner(metadata))
+            } else {
+                Ok(ObservedLock::Stale(metadata))
+            }
+        }
+        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(ObservedLock::Available)
+        }
+        Err(ReadLockError::Io(error)) => Err(error),
+        Err(ReadLockError::Malformed(error)) => Ok(ObservedLock::Malformed(error)),
     }
 }
 
@@ -346,6 +380,7 @@ fn acquire_with_config(
     // A zero-timeout acquire still gets one immediate retry after it removes a
     // stale lock; otherwise it would reap the dead owner and report Timeout.
     let mut immediate_retry_budget = 0_u8;
+    let mut malformed_grace_used = false;
 
     loop {
         if attempted_once {
@@ -380,19 +415,15 @@ fn acquire_with_config(
         }
         transient_create_failures = 0;
 
-        let metadata = match read_lock_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                immediate_retry_budget = 1;
-                continue;
-            }
+        let observed = match observe_lock(path, &hostname, config) {
+            Ok(observed) => observed,
             // The same Windows contention the create arm above tolerates can
             // land here instead: a lock file pending deletion is visible to
             // the create attempt but denies the open that reads it. Only the
             // create path recognised that spelling of "busy", so a race that
             // was meant to be retried propagated as a hard failure and
             // panicked a caller mid-write (Windows CI, 2026-09-22).
-            Err(ReadLockError::Io(error)) if is_transient_create_contention(&error) => {
+            Err(error) if is_transient_create_contention(&error) => {
                 transient_create_failures += 1;
                 if transient_create_failures > MAX_TRANSIENT_CREATE_RETRIES {
                     return Err(error.into());
@@ -400,12 +431,28 @@ fn acquire_with_config(
                 sleep_until_retry(deadline, config.poll_interval_ms)?;
                 continue;
             }
-            Err(ReadLockError::Io(error)) => return Err(error.into()),
-            Err(ReadLockError::Malformed(error)) => {
+            Err(error) => return Err(error.into()),
+        };
+        let availability = observed.availability();
+        let metadata = match observed {
+            ObservedLock::LiveOwner(metadata) | ObservedLock::Stale(metadata) => metadata,
+            ObservedLock::Available => {
+                immediate_retry_budget = 1;
+                continue;
+            }
+            ObservedLock::Malformed(error) => {
                 // A just-created O_EXCL file is visible before its owner has
                 // finished writing JSON. Give that transient creation window
                 // one poll interval before treating malformed contents as stale.
-                sleep_until_retry(deadline, config.poll_interval_ms)?;
+                // Zero-timeout callers also need this one grace read to reach
+                // reclaim, but must not loop if another actor keeps corrupting
+                // the lease or prevents its removal.
+                if timeout == Some(Duration::ZERO) && !malformed_grace_used {
+                    malformed_grace_used = true;
+                    sleep_until_retry(None, config.poll_interval_ms)?;
+                } else {
+                    sleep_until_retry(deadline, config.poll_interval_ms)?;
+                }
                 match read_lock_metadata(path) {
                     Ok(_) => continue,
                     Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -438,7 +485,7 @@ fn acquire_with_config(
         if metadata.hostname != hostname {
             dead_reclaim_blocked_attempts = 0;
             let cross_host_stale_ms = config.cross_host_stale_heartbeat_ms();
-            if !metadata_blocks_acquisition(&metadata, &hostname, config, now) {
+            if availability == LockAvailability::Stale {
                 match reclaim_lock_file(path, &metadata)? {
                     ReclaimResult::Removed => {
                         slog_warn!(
@@ -464,7 +511,7 @@ fn acquire_with_config(
             continue;
         }
 
-        if !metadata_blocks_acquisition(&metadata, &hostname, config, now) {
+        if availability == LockAvailability::Stale {
             match reclaim_lock_file(path, &metadata)? {
                 ReclaimResult::Removed => {
                     slog_warn!(
@@ -2085,6 +2132,60 @@ mod tests {
     }
 
     #[test]
+    fn try_acquire_once_reclaims_malformed_after_one_grace_read() {
+        for contents in [
+            b"".as_slice(),
+            b"{\"pid\":999999999,\"hostname\":".as_slice(),
+        ] {
+            let (_dir, path) = test_lock_path();
+            fs::write(&path, contents).unwrap();
+            let sleeper_entries = Arc::new(AtomicUsize::new(0));
+            let _observer = observe_retry_sleeps_for_test(Arc::clone(&sleeper_entries));
+            let guard = try_acquire_once(&path).expect("stable malformed lease must be reclaimed");
+            assert!(guard.verify_writer_epoch().unwrap());
+            assert_eq!(sleeper_entries.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn try_acquire_once_malformed_reclaim_stops_when_token_is_held() {
+        let (_dir, path) = test_lock_path();
+        fs::write(&path, b"malformed").unwrap();
+        write_reclaim_token(&path, &current_process_metadata());
+        let sleeper_entries = Arc::new(AtomicUsize::new(0));
+        let _observer = observe_retry_sleeps_for_test(Arc::clone(&sleeper_entries));
+        assert!(matches!(
+            try_acquire_once(&path),
+            Err(AcquireError::Timeout)
+        ));
+        assert_eq!(sleeper_entries.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"malformed");
+    }
+
+    #[test]
+    fn try_acquire_once_malformed_reclaim_preserves_live_replacement() {
+        let (_dir, path) = test_lock_path();
+        fs::write(&path, b"malformed").unwrap();
+        let replacement = current_process_metadata();
+        let expected_epoch = replacement.writer_epoch.clone();
+        let replace_path = path.clone();
+        BEFORE_MALFORMED_RECLAIM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::remove_file(&replace_path).unwrap();
+                write_synthetic_lock(&replace_path, &replacement);
+            }))
+        });
+        assert!(matches!(
+            try_acquire_once(&path),
+            Err(AcquireError::Timeout)
+        ));
+        assert_eq!(
+            read_lock_metadata(&path).unwrap().writer_epoch,
+            expected_epoch
+        );
+    }
+
+    #[test]
     fn try_acquire_once_never_waits_behind_live_owner() {
         const OUTER_THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -2642,19 +2743,25 @@ mod tests {
         metadata.heartbeat_at_ms = 0;
         write_synthetic_lock(&path, &metadata);
         let original = fs::read(&path).unwrap();
-        assert!(!lock_is_available(&path).unwrap());
+        assert_eq!(
+            lock_availability(&path).unwrap(),
+            LockAvailability::LiveOwner
+        );
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]
     fn availability_probe_observes_dead_and_missing_owners_without_reclaiming() {
         let (_dir, path) = test_lock_path();
-        assert!(lock_is_available(&path).unwrap());
+        assert_eq!(
+            lock_availability(&path).unwrap(),
+            LockAvailability::Available
+        );
         assert!(!path.exists());
         let metadata = synthetic_metadata(999_999_999, current_hostname(), now_ms());
         write_synthetic_lock(&path, &metadata);
         let original = fs::read(&path).unwrap();
-        assert!(lock_is_available(&path).unwrap());
+        assert_eq!(lock_availability(&path).unwrap(), LockAvailability::Stale);
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 
@@ -2668,18 +2775,18 @@ mod tests {
         );
         write_synthetic_lock(&path, &metadata);
         assert!(
-            !lock_is_available(&path).unwrap(),
+            lock_availability(&path).unwrap() == LockAvailability::LiveOwner,
             "a local PID probe cannot attest a remote owner"
         );
         metadata.heartbeat_at_ms = now_ms().saturating_sub(STALE_HEARTBEAT_MS * 2);
         fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
         assert!(
-            !lock_is_available(&path).unwrap(),
+            lock_availability(&path).unwrap() == LockAvailability::LiveOwner,
             "cross-host reclamation needs the extended threshold"
         );
         metadata.heartbeat_at_ms = now_ms().saturating_sub(STALE_HEARTBEAT_MS * 5 + 1_000);
         fs::write(&path, serde_json::to_vec(&metadata).unwrap()).unwrap();
-        assert!(lock_is_available(&path).unwrap());
+        assert_eq!(lock_availability(&path).unwrap(), LockAvailability::Stale);
         assert_eq!(read_lock_metadata(&path).unwrap(), metadata);
     }
 
@@ -2688,10 +2795,23 @@ mod tests {
         let (_dir, path) = test_lock_path();
         fs::write(&path, b"not-json").unwrap();
         assert_eq!(
-            lock_is_available(&path).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
+            lock_availability(&path).unwrap(),
+            LockAvailability::Malformed
         );
         assert_eq!(fs::read(&path).unwrap(), b"not-json");
+    }
+
+    #[test]
+    fn availability_probe_keeps_io_errors_distinct_and_can_retry() {
+        let (_dir, path) = test_lock_path();
+        fs::create_dir(&path).unwrap();
+        assert!(lock_availability(&path).is_err());
+        assert!(path.is_dir());
+        fs::remove_dir(&path).unwrap();
+        assert_eq!(
+            lock_availability(&path).unwrap(),
+            LockAvailability::Available
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
