@@ -421,6 +421,20 @@ advance_origin_main() {
 
 LAST_OUT=""
 LAST_RC=0
+# A stacked train runs in the background, and its output is otherwise read only
+# after it exits. TRAIN_PUSH_TEST_LIVE also copies it to a file as it is
+# printed, so a test can wait on a line the train itself announces.
+run_train_command() {
+  if [ -n "${TRAIN_PUSH_TEST_LIVE:-}" ]; then
+    (
+      set -o pipefail
+      "$TRAIN_PUSH" "$@" 2>&1 | tee -a "$TRAIN_PUSH_TEST_LIVE"
+    )
+  else
+    "$TRAIN_PUSH" "$@" 2>&1
+  fi
+}
+
 run_train() {
   local dir="$1"
   shift
@@ -438,9 +452,9 @@ run_train() {
        WATCH_CI_POLL_SLEEP=0.02 \
        TRAIN_PUSH_PARENT_ATTEMPTS="${TRAIN_PUSH_TEST_PARENT_ATTEMPTS:-200}" \
        TRAIN_PUSH_PARENT_SLEEP=0.02 \
-      TRAIN_PUSH_PROBE_ATTEMPTS=2 \
-      TRAIN_PUSH_PROBE_SLEEP=0 \
-      "$TRAIN_PUSH" "$@" 2>&1
+       TRAIN_PUSH_PROBE_ATTEMPTS=2 \
+       TRAIN_PUSH_PROBE_SLEEP=0 \
+       run_train_command "$@"
   )"
   LAST_RC=$?
   set -e
@@ -645,7 +659,7 @@ start_stack_train() {
   local dir="$1" worktree="$2" name="$3"
   shift 3
   (
-    TRAIN_PUSH_TEST_CWD="$dir/$worktree" run_train "$dir" "$name" "$@"
+    TRAIN_PUSH_TEST_LIVE="$dir/$name.live" TRAIN_PUSH_TEST_CWD="$dir/$worktree" run_train "$dir" "$name" "$@"
     printf '%s\n' "$LAST_OUT" > "$dir/$name.out"
     printf '%s\n' "$LAST_RC" > "$dir/$name.rc"
   ) &
@@ -897,11 +911,22 @@ test_stack_chain() {
   if wait_stack_push "$dir" grandchild; then complete_stack_ci "$dir" grandchild success; fi
   complete_stack_ci "$dir" child success
   # Green descendants cannot land while their parent is running. Wait until
-  # the child has actually reached the landing guard (not just the CI watch).
-  for _ in $(seq 1 100); do
-    grep -q 'headBranch=="train/parent"' "$dir/ci-state/gh-calls" && break
+  # the child itself reports that it is waiting at the parent landing guard
+  # before letting the parent finish; otherwise the parent can land first and
+  # the child never reaches that wait. The parent's own CI watch issues the
+  # same gh queries, so only the child's announcement is a reliable signal.
+  # The deadline only guards against a hang.
+  reached_guard=0
+  for _ in $(seq 1 3000); do
+    if grep -q 'waiting for parent parent' "$dir/child.live" 2>/dev/null; then
+      reached_guard=1
+      break
+    fi
     sleep 0.02
   done
+  if [ "$reached_guard" -ne 1 ]; then
+    fail "stacked child reached the parent landing guard within 60 s"
+  fi
   if [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base" ] &&
     kill -0 "$p1" && kill -0 "$p2" && kill -0 "$p3"; then
     ok "stacked child waits while parent CI runs; all three CI runs started in parallel"
