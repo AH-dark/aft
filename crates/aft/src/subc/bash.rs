@@ -2381,6 +2381,9 @@ struct BashTimingForTest {
     task_id: std::sync::Mutex<Option<String>>,
     admission: (std::sync::Mutex<bool>, std::sync::Condvar),
     result: (std::sync::Mutex<bool>, std::sync::Condvar),
+    dispatch: Option<DispatchFn>,
+    checkpoint: tokio::sync::Notify,
+    finished: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -3343,6 +3346,11 @@ mod grant_path_tests {
         running_bash_stub(req, ctx)
     }
 
+    fn held_before_spawn_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        hold_startup_checkpoint();
+        running_bash_stub(req, ctx)
+    }
+
     fn disk_full_stub(req: RawRequest, ctx: &AppContext) -> Response {
         use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(TaskIoFault::LayoutEnospc, || running_bash_stub(req, ctx))
@@ -3350,58 +3358,48 @@ mod grant_path_tests {
 
     fn running_disk_full_stub(req: RawRequest, ctx: &AppContext) -> Response {
         use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
-        with_task_io_fault(TaskIoFault::RunningEnospc, || running_bash_stub(req, ctx))
+        with_task_io_fault(TaskIoFault::RunningHook(held_running_enospc), || {
+            running_bash_stub(req, ctx)
+        })
     }
 
     fn slow_running_write_stub(req: RawRequest, ctx: &AppContext) -> Response {
         use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
-        with_task_io_fault(
-            TaskIoFault::RunningDelay(Duration::from_millis(2500)),
-            || running_bash_stub(req, ctx),
-        )
+        with_task_io_fault(TaskIoFault::RunningHook(held_running_write), || {
+            running_bash_stub(req, ctx)
+        })
     }
 
     async fn startup_case(
         dispatch: DispatchFn,
         window: u64,
-    ) -> (tempfile::TempDir, Arc<AppContext>, BashDeferredCompletion) {
-        let (dir, root) = super::super::test_support::test_root("bash-startup");
-        let ctx = super::super::test_support::test_ctx();
-        ctx.update_config(|config| {
-            config.foreground_wait_window_ms = window;
-            config.project_root = Some(root.as_path().into());
-            config.storage_dir = Some(dir.path().join("storage"));
-            config.sandbox.enabled = false;
-        });
-        let executor = Arc::new(Executor::new());
-        executor.register_actor(root.clone(), ctx.clone());
-        let mut rx = deadline_test_call(
-            &executor,
-            &root,
+    ) -> (ControlledStartup, BashDeferredCompletion) {
+        let mut startup = ControlledStartup::new(
             dispatch,
-            json!({"command":"printf ran > started-command; sleep 3", "timeout":60000}),
+            window,
+            "printf ran > started-command",
+            Instant::now(),
+            false,
+            false,
         );
-        let done = tokio::time::timeout(Duration::from_millis(window + 400), rx.recv())
-            .await
-            .expect("bash must answer within the receipt-based reply budget")
-            .unwrap();
-        (dir, ctx, done)
+        let done = startup.reply_at_checkpoint().await;
+        (startup, done)
     }
 
     #[tokio::test]
     async fn bash_deadline_fences_slow_startup_before_process_creation() {
-        let (dir, _ctx, done) = startup_case(slow_start_stub, 80).await;
+        let (mut startup, done) = startup_case(held_before_spawn_stub, 80).await;
         assert_eq!(done.response_for_test().data["code"], "bash_start_deadline");
-        tokio::time::sleep(Duration::from_millis(450)).await;
+        startup.finish().await;
         assert!(
-            !dir.path().join("started-command").exists(),
+            !startup.call.dir.path().join("started-command").exists(),
             "a startup refusal must fence late process creation"
         );
     }
 
     #[tokio::test]
     async fn bash_deadline_names_enospc_during_task_directory_creation() {
-        let (dir, _ctx, done) = startup_case(disk_full_stub, 1500).await;
+        let (mut startup, done) = startup_case(disk_full_stub, 1500).await;
         let response = done.response_for_test();
         assert!(!response.success);
         assert!(
@@ -3411,33 +3409,44 @@ mod grant_path_tests {
                 .contains("No space left on device"),
             "{response:?}"
         );
-        assert!(!dir.path().join("started-command").exists());
+        startup.finish().await;
+        assert!(!startup.call.dir.path().join("started-command").exists());
     }
 
     #[tokio::test]
     async fn bash_deadline_retains_task_when_running_metadata_hits_enospc() {
-        let (_dir, ctx, done) = startup_case(running_disk_full_stub, 1000).await;
+        let (mut startup, done) = startup_case(running_disk_full_stub, 1000).await;
         let response = done.response_for_test();
         assert!(response.success, "{response:?}");
         let task_id = response.data["task_id"].as_str().expect("live task id");
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        startup.finish().await;
         assert!(
-            ctx.bash_background().task_for_test(task_id).is_some(),
+            startup
+                .call
+                .ctx
+                .bash_background()
+                .task_for_test(task_id)
+                .is_some(),
             "running process must be registered despite ENOSPC"
         );
     }
 
     #[tokio::test]
     async fn bash_deadline_hands_off_before_running_metadata_write_settles() {
-        let (_dir, ctx, done) = startup_case(slow_running_write_stub, 1000).await;
+        let (mut startup, done) = startup_case(slow_running_write_stub, 1000).await;
         let response = done.response_for_test();
         assert!(response.success, "{response:?}");
         let task_id = response.data["task_id"]
             .as_str()
             .expect("committed task id");
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        startup.finish().await;
         assert!(
-            ctx.bash_background().task_for_test(task_id).is_some(),
+            startup
+                .call
+                .ctx
+                .bash_background()
+                .task_for_test(task_id)
+                .is_some(),
             "receipt must name the actual late-registered task"
         );
     }
@@ -3457,6 +3466,108 @@ mod grant_path_tests {
         dir: tempfile::TempDir,
         ctx: Arc<AppContext>,
         rx: mpsc::Receiver<BashDeferredCompletion>,
+    }
+
+    // Freeze receipt time and stop dispatch at a named write/commit boundary.
+    // The timer cannot win admission just because a shell or the executor is slow.
+    struct ControlledStartup {
+        call: StartupCall,
+        timing: Arc<BashTimingForTest>,
+    }
+
+    impl ControlledStartup {
+        fn new(
+            dispatch: DispatchFn,
+            window: u64,
+            command: &str,
+            received_at: Instant,
+            server_completion: bool,
+            rewrite: bool,
+        ) -> Self {
+            let mut timing = BashTimingForTest::new(received_at);
+            Arc::get_mut(&mut timing).unwrap().dispatch = Some(dispatch);
+            let call = with_bash_timing_for_test(Some(timing.clone()), || {
+                startup_call(
+                    controlled_startup_dispatch,
+                    window,
+                    command,
+                    received_at,
+                    server_completion,
+                    rewrite,
+                )
+            });
+            Self { call, timing }
+        }
+
+        async fn reply_at_checkpoint(&mut self) -> BashDeferredCompletion {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::select! {
+                    _ = self.timing.checkpoint.notified() => {
+                        self.timing.startup.armed.notified().await;
+                        self.timing.startup.fire.notify_one();
+                    }
+                    // A layout failure or prompt rewrite has no held write.
+                    _ = self.timing.finished.notified() => {}
+                }
+                self.call.rx.recv().await.expect("startup reply")
+            })
+            .await
+            .expect("startup checkpoint/reply hang guard")
+        }
+
+        async fn finish(&mut self) {
+            BashTimingForTest::release(&self.timing.result);
+            // Channel closure joins the late dispatch and reply path. An empty
+            // quiet window would not prove that a refused job cannot run later.
+            let extra = tokio::time::timeout(Duration::from_secs(20), self.call.rx.recv())
+                .await
+                .expect("late startup dispatch hang guard");
+            assert!(extra.is_none(), "only one terminal reply");
+        }
+    }
+
+    impl Drop for ControlledStartup {
+        fn drop(&mut self) {
+            BashTimingForTest::release(&self.timing.result);
+        }
+    }
+
+    fn controlled_startup_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+        let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
+        let response = timing.dispatch.unwrap()(req, ctx);
+        timing.finished.notify_one();
+        response
+    }
+
+    fn hold_startup_checkpoint() {
+        let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
+        timing.checkpoint.notify_one();
+        let _released = timing
+            .result
+            .1
+            .wait_while(timing.result.0.lock().unwrap(), |released| !*released)
+            .unwrap();
+    }
+
+    fn held_running_write() -> std::io::Result<()> {
+        hold_startup_checkpoint();
+        Ok(())
+    }
+
+    fn held_running_enospc() -> std::io::Result<()> {
+        hold_startup_checkpoint();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "No space left on device",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn held_starting_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        with_task_io_fault(TaskIoFault::StartingHook(hold_startup_checkpoint), || {
+            running_bash_stub(req, ctx)
+        })
     }
 
     fn startup_call(
@@ -3757,17 +3868,15 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_deadline_during_control_file_write_says_not_started_and_never_starts() {
-        // The starting-record write (before the commit) outlasts the 80 ms
-        // budget, so the deadline refuses the receipt while the job is busy.
-        let mut call = startup_call(
-            slow_starting_record_stub,
+        let mut startup = ControlledStartup::new(
+            held_starting_record_stub,
             80,
             "printf ran > started-command",
             Instant::now(),
             false,
             false,
         );
-        let done = first_reply(&mut call, Duration::from_millis(480)).await;
+        let done = startup.reply_at_checkpoint().await;
         let response = done.response_for_test();
         assert_not_started_refusal(&response);
         assert!(
@@ -3777,33 +3886,22 @@ mod grant_path_tests {
                 .contains("before process creation committed"),
             "{response:?}"
         );
-        // Let the delayed startup job run to the end; it must find the
-        // receipt refused and create nothing.
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        assert_never_started(&call);
-        assert!(
-            !matches!(
-                tokio::time::timeout(Duration::from_millis(100), call.rx.recv()).await,
-                Ok(Some(_))
-            ),
-            "only one terminal reply"
-        );
+        startup.finish().await;
+        assert_never_started(&startup.call);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_deadline_after_commit_hands_off_the_task_and_it_completes() {
-        // The commit lands well inside the 500 ms budget; the running-record
-        // write after process creation then holds the job past the deadline.
-        let mut call = startup_call(
-            slow_running_record_stub,
+        let mut startup = ControlledStartup::new(
+            slow_running_write_stub,
             500,
             "printf ran > started-command",
             Instant::now(),
             false,
             false,
         );
-        let done = first_reply(&mut call, Duration::from_millis(1000)).await;
+        let done = startup.reply_at_checkpoint().await;
         let response = done.response_for_test();
         assert!(
             response.success,
@@ -3818,11 +3916,12 @@ mod grant_path_tests {
             response.data["output"].as_str().unwrap().contains(&task_id),
             "{response:?}"
         );
+        startup.finish().await;
         assert_eq!(
-            wait_for_terminal(&call.ctx, &task_id).await,
+            wait_for_terminal(&startup.call.ctx, &task_id).await,
             crate::bash_background::BgTaskStatus::Completed
         );
-        assert!(call.dir.path().join("started-command").exists());
+        assert!(startup.call.dir.path().join("started-command").exists());
     }
 
     #[cfg(unix)]
@@ -3910,17 +4009,15 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn server_owned_bash_committed_at_deadline_is_outcome_unknown_with_task_id() {
-        // A server-owned call's startup budget is a fixed 20 s; receive it
-        // 19.5 s ago so the deadline falls 500 ms from now, after the commit.
-        let mut call = startup_call(
-            slow_running_record_stub,
+        let mut startup = ControlledStartup::new(
+            slow_running_write_stub,
             500,
-            "printf ran > started-command; sleep 3",
+            "printf ran > started-command",
             Instant::now() - Duration::from_millis(19_500),
             true,
             false,
         );
-        let done = first_reply(&mut call, Duration::from_millis(1000)).await;
+        let done = startup.reply_at_checkpoint().await;
         let response = done.response_for_test();
         assert!(!response.success, "{response:?}");
         assert_eq!(response.data["code"], "outcome_unknown_startup_deadline");
@@ -3933,11 +4030,12 @@ mod grant_path_tests {
             "{message}"
         );
         assert!(!message.contains("not started"), "{message}");
+        startup.finish().await;
     }
 
     #[cfg(unix)]
     fn slow_rewrite_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        std::thread::sleep(Duration::from_millis(300));
+        hold_startup_checkpoint();
         crate::bash_rewrite::try_rewrite_for_request(
             "echo fenced >> notes.txt",
             &req.id,
@@ -3966,7 +4064,7 @@ mod grant_path_tests {
     #[tokio::test]
     async fn in_process_rewrite_is_fenced_like_process_creation() {
         // Control: inside the budget the rewrite runs and appends.
-        let mut call = startup_call(
+        let mut startup = ControlledStartup::new(
             prompt_rewrite_stub,
             2000,
             "unused",
@@ -3974,20 +4072,22 @@ mod grant_path_tests {
             false,
             true,
         );
-        let done = first_reply(&mut call, Duration::from_millis(2500)).await;
+        let done = startup.reply_at_checkpoint().await;
         let response = done.response_for_test();
         assert!(response.success, "{response:?}");
-        assert!(call.dir.path().join("notes.txt").exists());
+        startup.finish().await;
+        assert!(startup.call.dir.path().join("notes.txt").exists());
 
         // Past the budget the rewrite must not run once the caller was told
         // the command was not started.
-        let mut call = startup_call(slow_rewrite_stub, 80, "unused", Instant::now(), false, true);
-        let done = first_reply(&mut call, Duration::from_millis(480)).await;
+        let mut startup =
+            ControlledStartup::new(slow_rewrite_stub, 80, "unused", Instant::now(), false, true);
+        let done = startup.reply_at_checkpoint().await;
         let response = done.response_for_test();
         assert_not_started_refusal(&response);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        startup.finish().await;
         assert!(
-            !call.dir.path().join("notes.txt").exists(),
+            !startup.call.dir.path().join("notes.txt").exists(),
             "a refused rewrite must never append"
         );
     }
@@ -4003,6 +4103,9 @@ mod grant_path_tests {
                 task_id: Default::default(),
                 admission: Default::default(),
                 result: Default::default(),
+                dispatch: None,
+                checkpoint: tokio::sync::Notify::new(),
+                finished: tokio::sync::Notify::new(),
             })
         }
 

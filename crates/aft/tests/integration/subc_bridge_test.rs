@@ -1160,6 +1160,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         },
         "bash" => aft::commands::bash::handle(&req, ctx),
         "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_kill" => aft::commands::bash_kill::handle(&req, ctx),
         "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
@@ -3224,12 +3225,19 @@ fn subc_bridge_bash_fast_foreground_returns_terminal_response() {
     );
 }
 
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_promotes_after_wait_window_and_remains_tracked() {
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_promotes_after_wait_window_and_remains_tracked",
         Duration::from_secs(30),
-        || vec![set_test_foreground_wait_ms(200)],
+        || {
+            vec![
+                set_test_foreground_wait_ms(200),
+                // This tests promotion of a started command, not shell startup speed.
+                set_test_env("AFT_TEST_SUBC_BASH_STARTUP_CLOCK", "frozen"),
+            ]
+        },
         drive_bash_promotion_daemon,
         |_, _, _| {},
     );
@@ -4152,13 +4160,225 @@ async fn bind_routes_1_and_4(stream: &mut tokio::net::TcpStream, root1: &std::pa
     expect_route_bind_ack(stream, 44).await;
 }
 
+#[tokio::test]
+async fn connection_goodbye_waits_for_module_eof() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().unwrap();
+    let (accepted, connected) =
+        tokio::join!(listener.accept(), tokio::net::TcpStream::connect(address));
+    let (mut daemon, _) = accepted.expect("daemon socket");
+    let mut module = connected.expect("module socket");
+    let goodbye = send_connection_goodbye(&mut daemon);
+    tokio::pin!(goodbye);
+    let request = tokio::select! {
+        biased;
+        _ = &mut goodbye => panic!("daemon closed before the module consumed the health fence"),
+        frame = read_subc_frame(&mut module) => frame.expect("module reads health fence").expect("health fence before EOF"),
+    };
+    assert_eq!(request.header.ty, FrameType::Request);
+    assert_eq!(request.header.channel, 0);
+    assert_eq!(request.header.corr, CONNECTION_GOODBYE_FENCE_CORR);
+    assert_eq!(
+        serde_json::from_slice::<ModuleControlRequest>(&request.body).unwrap(),
+        ModuleControlRequest::HealthCheck {}
+    );
+    let frame = tokio::select! {
+        biased;
+        _ = &mut goodbye => panic!("daemon closed before the module consumed Goodbye"),
+        frame = read_subc_frame(&mut module) => frame.expect("module reads Goodbye").expect("Goodbye before EOF"),
+    };
+    assert_eq!(frame.header.ty, FrameType::Goodbye);
+
+    let mut byte = [0];
+    tokio::select! {
+        biased;
+        _ = &mut goodbye => panic!("daemon closed before the module drained its writer"),
+        read = module.read(&mut byte) => assert_eq!(read.expect("daemon half-close"), 0),
+    }
+    // The module may still have reliable output queued when it accepts Goodbye.
+    write_frame(&mut module, &connection_goodbye_health_response())
+        .await
+        .expect("module drains its writer");
+    drop(module);
+    goodbye.await;
+}
+
+const CONNECTION_GOODBYE_FENCE_CORR: u64 = u64::MAX;
+
 pub(super) async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
+    // Goodbye is one-way. Require a terminal response to this last request so
+    // a Windows reset cannot silently stand in for missing module output. Each
+    // driver must still assert its own scenario's terminals: this health fence
+    // proves only that its request was processed, not that unrelated async work
+    // finished. Send no data frames after Goodbye for the exiting reader to lose.
+    send_control_request(
+        stream,
+        CONNECTION_GOODBYE_FENCE_CORR,
+        ModuleControlRequest::HealthCheck {},
+    )
+    .await;
     send_frame(
         stream,
         Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
             .expect("goodbye frame"),
     )
     .await;
+    // FIN ends daemon-to-module input, not module-to-daemon output. Keep reading
+    // the writer tail; Windows can report reset rather than EOF at module close.
+    tokio::io::AsyncWriteExt::shutdown(stream)
+        .await
+        .expect("daemon half-closes after Goodbye");
+    drain_connection_goodbye_output(stream)
+        .await
+        .expect("drain complete module output through teardown health fence");
+}
+
+async fn drain_connection_goodbye_output<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+
+    let mut output = Vec::new();
+    let end = stream.read_to_end(&mut output).await;
+    if let Err(error) = &end {
+        if error.kind() != ErrorKind::ConnectionReset {
+            return Err(end.unwrap_err());
+        }
+    }
+
+    // read_to_end retains bytes preceding an error. Decode all of them, including
+    // any tail after the fence, so a reset mid-frame is never accepted as a close.
+    let mut frames = std::io::Cursor::new(output.as_slice());
+    let mut fence_seen = false;
+    while frames.position() < output.len() as u64 {
+        let frame = read_subc_frame(&mut frames)
+            .await
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "truncated module output frame"))?;
+        if frame.header.ty == FrameType::Response
+            && frame.header.channel == 0
+            && frame.header.epoch == 0
+            && frame.header.corr == CONNECTION_GOODBYE_FENCE_CORR
+        {
+            let response: ModuleControlResponse = serde_json::from_slice(&frame.body)?;
+            if response.health_report().is_none() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid teardown health response",
+                ));
+            }
+            fence_seen = true;
+        }
+    }
+    if !fence_seen {
+        return Err(Error::new(
+            end.err()
+                .map_or(ErrorKind::UnexpectedEof, |error| error.kind()),
+            "connection closed before teardown health.check terminal response",
+        ));
+    }
+    Ok(())
+}
+
+fn connection_goodbye_health_response() -> Frame {
+    let report = HealthReport {
+        status: subc_protocol::session::HealthStatus::Ok,
+        detail: None,
+        metrics: None,
+    };
+    Frame::build(
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        CONNECTION_GOODBYE_FENCE_CORR,
+        serde_json::to_vec(&ModuleControlResponse::from(report)).unwrap(),
+    )
+    .unwrap()
+}
+
+struct ConnectionGoodbyeOutput {
+    bytes: std::io::Cursor<Vec<u8>>,
+    end: std::io::ErrorKind,
+}
+
+impl tokio::io::AsyncRead for ConnectionGoodbyeOutput {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.bytes.position() == self.bytes.get_ref().len() as u64 {
+            return std::task::Poll::Ready(Err(self.end.into()));
+        }
+        std::pin::Pin::new(&mut self.bytes).poll_read(cx, buf)
+    }
+}
+
+async fn connection_goodbye_output(frames: &[Frame]) -> ConnectionGoodbyeOutput {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        write_frame(&mut bytes, frame).await.unwrap();
+    }
+    ConnectionGoodbyeOutput {
+        bytes: std::io::Cursor::new(bytes),
+        end: std::io::ErrorKind::ConnectionReset,
+    }
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_accepts_reset_after_terminal_response() {
+    let tail = Frame::build(FrameType::StreamEnd, control_flags(), 1, 1, 101, Vec::new()).unwrap();
+    let mut output = connection_goodbye_output(&[connection_goodbye_health_response(), tail]).await;
+    drain_connection_goodbye_output(&mut output).await.unwrap();
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_reset_before_terminal_response() {
+    let mut unrelated = connection_goodbye_health_response();
+    unrelated.header.corr -= 1;
+    for frames in [Vec::new(), vec![unrelated]] {
+        let mut output = connection_goodbye_output(&frames).await;
+        let error = drain_connection_goodbye_output(&mut output)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert!(error
+            .to_string()
+            .contains("before teardown health.check terminal response"));
+    }
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_eof_before_terminal_response() {
+    let error = drain_connection_goodbye_output(&mut std::io::Cursor::new(Vec::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_reset_mid_frame() {
+    let fence = connection_goodbye_health_response();
+    let tail = Frame::build(FrameType::StreamEnd, control_flags(), 1, 1, 101, Vec::new()).unwrap();
+    for frames in [vec![fence.clone()], vec![fence, tail]] {
+        let mut output = connection_goodbye_output(&frames).await;
+        output.bytes.get_mut().pop();
+        let error = drain_connection_goodbye_output(&mut output)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
+#[tokio::test]
+async fn connection_goodbye_drain_rejects_other_io_errors_after_terminal_response() {
+    let mut output = connection_goodbye_output(&[connection_goodbye_health_response()]).await;
+    output.end = std::io::ErrorKind::ConnectionAborted;
+    let error = drain_connection_goodbye_output(&mut output)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
 }
 
 async fn drive_oversized_tool_response_daemon(input: FakeDaemonInput) {
@@ -4388,18 +4608,30 @@ async fn drive_bash_fast_foreground_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+#[cfg(feature = "test-timing-hooks")]
 async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
-        mut stream, root1, ..
+        mut stream,
+        root1,
+        executor,
+        ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("bound root id");
+    executor
+        .actor_context(&root_id)
+        .expect("bound root actor context")
+        .update_config(|config| config.storage_dir = Some(root1.join("task-storage")));
+    let marker = root1.join("promotion-started");
+    let release = root1.join("promotion-release");
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     send_tool_call(
         &mut stream,
         1,
         101,
         "bash",
         json!({
-            "command": "sleep 2; printf 'promoted-done\\n'",
+            "command": hold_bash_until_release_command(&marker, &release, "promoted-done"),
             "foreground_orchestrate": true,
             "compressed": false,
         }),
@@ -4431,6 +4663,8 @@ async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
     let response = tool_response_json(&status);
     assert_eq!(response["success"].as_bool(), Some(true));
     assert_eq!(response["task_id"].as_str(), Some(task_id.as_str()));
+    assert_eq!(response["status"], "running", "{response:?}");
+    std::fs::write(&release, "release").expect("release promoted command");
     send_connection_goodbye(&mut stream).await;
 }
 
@@ -4893,6 +5127,7 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
     for (corr, mode) in [(140_u64, "wait"), (141_u64, "block_to_completion")] {
         let marker = root1.join(format!("worker-{mode}-started"));
         let release = root1.join(format!("worker-{mode}-release"));
+        let _release_guard = ReleaseOnDrop::new(release.clone());
         let mut arguments = json!({
             "command": format!("{}; {}", print_line_command("started"), hold_bash_until_release_command(&marker, &release, "worker-done")),
             "foreground_orchestrate": true,
@@ -4936,21 +5171,49 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             text.contains("its default background limit"),
             "{mode} should name the default deadline source: {text:?}"
         );
-        assert!(text.contains("Recent output:\nstarted"), "{mode}: {text:?}");
+        // The wait cap starts at request receipt, not at shell startup. A slow
+        // shell can legitimately hand back before producing its first output.
+        // Check that output causally via status below, without moving the cap.
+        assert!(
+            text.contains("Recent output:\nstarted") || text.contains("No output yet."),
+            "{mode}: {text:?}"
+        );
         let task_id = extract_bash_task_id(&text);
-        send_tool_call(
-            &mut stream,
-            1,
-            corr + 100,
-            "bash_status",
-            json!({ "params": { "task_id": task_id } }),
-        )
-        .await;
-        let status =
-            tool_response_json(&read_frame_timeout(&mut stream, "worker limit status").await);
-        assert_eq!(
-            status["status"], "running",
-            "{mode}: the command keeps running: {status:?}"
+        let status = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "{mode}: command never started"
+            );
+            send_tool_call(
+                &mut stream,
+                1,
+                corr + 100,
+                "bash_status",
+                json!({ "params": { "task_id": task_id } }),
+            )
+            .await;
+            let frame = read_frame_timeout(&mut stream, "worker limit status").await;
+            assert_eq!(frame.header.corr, corr + 100);
+            assert!(
+                !tool_result_is_error(&frame),
+                "{mode}: {}",
+                tool_result_text(&frame)
+            );
+            let status = tool_response_json(&frame);
+            assert_eq!(
+                status["status"], "running",
+                "{mode}: the command keeps running: {status:?}"
+            );
+            if marker.exists()
+                && status["output_preview"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("started"))
+            {
+                break status;
+            }
+        };
+        let child = WorkerBashChild::observe(
+            status["child_pid"].as_u64().expect("worker bash child pid") as u32,
         );
         send_tool_call(
             &mut stream,
@@ -4960,9 +5223,93 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
             json!({ "params": { "task_id": task_id } }),
         )
         .await;
-        let _ = read_frame_timeout(&mut stream, "worker limit bash kill").await;
+        let killed = read_frame_timeout(&mut stream, "worker limit bash kill").await;
+        assert_eq!(killed.header.corr, corr + 200);
+        assert!(
+            !tool_result_is_error(&killed),
+            "{mode}: {}",
+            tool_result_text(&killed)
+        );
+        assert_eq!(tool_response_json(&killed)["status"], "killed", "{mode}");
+        child.assert_reaped();
     }
     send_connection_goodbye(&mut stream).await;
+}
+
+struct WorkerBashChild {
+    #[cfg(unix)]
+    pid: libc::pid_t,
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl WorkerBashChild {
+    fn observe(pid: u32) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pid: pid as libc::pid_t,
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+            use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+            // Retain the live process object so PID reuse or a failed lookup
+            // cannot masquerade as exit after the kill response.
+            const SYNCHRONIZE_RIGHT: u32 = 0x0010_0000;
+            let handle = unsafe { OpenProcess(SYNCHRONIZE_RIGHT, 0, pid) };
+            assert!(
+                !handle.is_null(),
+                "open worker child: {}",
+                std::io::Error::last_os_error()
+            );
+            let child = Self { handle };
+            assert_eq!(
+                unsafe { WaitForSingleObject(handle, 0) },
+                WAIT_TIMEOUT,
+                "worker child must be live before kill"
+            );
+            child
+        }
+    }
+
+    fn assert_reaped(&self) {
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), libc::WNOHANG) };
+            assert_eq!(
+                result, -1,
+                "bash_kill must already have reaped its direct child"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+        #[cfg(windows)]
+        {
+            // bash_kill returns after waiting for its direct child. Independently
+            // require that same process object to be signaled, not merely that
+            // the task's metadata says it was killed.
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            assert_eq!(
+                unsafe { WaitForSingleObject(self.handle, 0) },
+                WAIT_OBJECT_0,
+                "worker child still live after bash_kill"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WorkerBashChild {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
 }
 
 async fn drive_bash_background_daemon(input: FakeDaemonInput) {
