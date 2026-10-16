@@ -7633,10 +7633,15 @@ mod guard_tests {
             "off categories must not even open their cache"
         );
         // Positive control: the unchanged Metrics scanner actually dispatches.
-        assert!(matches!(
-            manager.submit_category(snapshot, InspectCategory::Metrics, scope),
-            JobOutcome::Fresh { .. }
-        ));
+        // The short soft deadline of `submit_category` can expire on a loaded
+        // runner before the scan finishes, so wait on a hang-guard deadline.
+        let outcome = manager.submit_category_until(
+            snapshot,
+            InspectCategory::Metrics,
+            scope,
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(matches!(outcome, JobOutcome::Fresh { .. }), "{outcome:?}");
         assert!(manager.next_job_id.load(Ordering::Relaxed) > initial);
     }
 
