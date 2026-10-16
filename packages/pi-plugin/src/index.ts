@@ -201,11 +201,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.59.0";
+const ANNOUNCEMENT_VERSION = "0.60.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Config keys retired in 0.58 keep working: AFT updates your user config file to the current keys (keeping a backup) and translates a project's in memory; `npx @cortexkit/aft doctor --fix` updates a project file.",
-  "New: live pull-request diffs with `read` on `pr://N/diff`, a `pattern` argument for `aft_search`, and per-category switches for `aft_inspect`.",
-  "Fixes for issues reported on OpenCode 2, Pi and OMP, and much less repeated indexing and disk work.",
+  "Call graphs stay current cheaply: a one-file edit updates a project's graph in seconds instead of minutes, and linked worktrees reuse their main checkout's graph until they change.",
+  "`aft_inspect` dead-code and unused-export results are more accurate on Rust, Go and TypeScript, and inspect uses far less memory on large projects.",
+  "OpenCode 2 gets native `shell` and `patch` tools, and stopped subagents are no longer woken by their own background commands.",
 ];
 
 /**
