@@ -134,18 +134,34 @@ impl ProjectWatcher {
                         }
                     }
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    if let Some(replacement_plan) =
-                        planning.replacement(&root, generation, &counters, || {
+                    if let Some(update) = planning.replacement(
+                        &root,
+                        generation,
+                        &counters,
+                        &mut exclusion_state,
+                        &matcher,
+                        || {
                             derive_watcher_exclusion_plan(
                                 &root,
                                 &matcher,
                                 Some(WATCHER_EXCLUSION_LIMIT),
                             )
-                        })
-                    {
-                        let replacement_exclusions = replacement_plan.selected;
-                        exclusion_state.replace(&replacement_exclusions);
+                        },
+                    ) {
                         let replacement_paths = exclusion_state.paths();
+                        let replacement_exclusions = match update {
+                            crate::watcher_filter::WatcherExclusionUpdate::Planned(plan) => {
+                                dropped_paths = watcher_exclusion_paths(&plan.dropped);
+                                plan.selected
+                            }
+                            crate::watcher_filter::WatcherExclusionUpdate::Reduced => exclusions
+                                .iter()
+                                .filter(|entry| {
+                                    replacement_paths.iter().any(|path| path == entry.path())
+                                })
+                                .cloned()
+                                .collect(),
+                        };
                         let desired =
                             exclusion_state
                                 .boundary()
@@ -177,7 +193,6 @@ impl ProjectWatcher {
                         thread_count.store(watched_directories.len(), Ordering::Release);
                         observed_generation = Some(generation);
 
-                        dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(
                             observed_generation.unwrap_or(0),
                             replacement_paths.clone(),

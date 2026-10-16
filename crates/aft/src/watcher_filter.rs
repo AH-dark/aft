@@ -600,15 +600,35 @@ impl WatcherExclusionPaths {
         self.boundary.as_ref()
     }
 
-    // Only the Linux and macOS watcher backends, and the unix-only tests,
+    // Only the Linux and macOS watcher backends, plus tests on all platforms,
     // read the combined exclusion list.
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.lasting
             .iter()
             .chain(self.external.iter())
             .cloned()
             .collect()
+    }
+
+    fn retain_ignored(&mut self, matcher: &SharedGitignore) -> bool {
+        let guard = matcher
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Installed paths are absolute directories. Evaluate the current ignore
+        // matcher without filesystem I/O: a stalled filesystem can block the
+        // planner, but removed ignore rules must still restore source watches
+        // or subsequent edits will be lost.
+        let ignored = |path: &PathBuf| {
+            guard.as_deref().is_some_and(|matcher| {
+                path.starts_with(matcher.path())
+                    && matcher.matched_path_or_any_parents(path, true).is_ignore()
+            })
+        };
+        let previous_len = self.lasting.len() + self.external.len();
+        self.lasting.retain(ignored);
+        self.external.retain(ignored);
+        self.lasting.len() + self.external.len() != previous_len
     }
 
     pub(crate) fn refresh_event(&mut self, event: &notify::Event) -> Vec<PathBuf> {
@@ -954,17 +974,33 @@ pub(crate) struct WatcherExclusionRetry {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) enum WatcherExclusionUpdate {
+    Planned(WatcherExclusionPlan),
+    Reduced,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl WatcherExclusionRetry {
-    /// Only completed plans may replace installed exclusions. Unavailable
-    /// attempts update retry health but leave native watches and streams intact.
+    /// Install completed plans, or remove stale exclusions when a new matcher
+    /// cannot be planned yet. Retrying the full plan keeps its own budget.
     pub(crate) fn replacement(
         &mut self,
         root: &Path,
         generation: u64,
         counters: &crate::context::WatcherCounters,
+        installed: &mut WatcherExclusionPaths,
+        matcher: &SharedGitignore,
         derive: impl FnOnce() -> ExclusionPlanOutcome,
-    ) -> Option<WatcherExclusionPlan> {
-        self.replacement_at(root, generation, counters, Instant::now(), derive)
+    ) -> Option<WatcherExclusionUpdate> {
+        self.replacement_at(
+            root,
+            generation,
+            counters,
+            installed,
+            matcher,
+            Instant::now(),
+            derive,
+        )
     }
 
     fn replacement_at(
@@ -972,11 +1008,22 @@ impl WatcherExclusionRetry {
         root: &Path,
         generation: u64,
         counters: &crate::context::WatcherCounters,
+        installed: &mut WatcherExclusionPaths,
+        matcher: &SharedGitignore,
         now: Instant,
         derive: impl FnOnce() -> ExclusionPlanOutcome,
-    ) -> Option<WatcherExclusionPlan> {
-        self.attempt_at(root, generation, counters, now, derive)
-            .and_then(Result::ok)
+    ) -> Option<WatcherExclusionUpdate> {
+        let new_generation = self.generation != Some(generation);
+        match self.attempt_at(root, generation, counters, now, derive)? {
+            Ok(plan) => {
+                installed.replace(&plan.selected);
+                Some(WatcherExclusionUpdate::Planned(plan))
+            }
+            Err(_) if new_generation && installed.retain_ignored(matcher) => {
+                Some(WatcherExclusionUpdate::Reduced)
+            }
+            Err(_) => None,
+        }
     }
 
     pub(crate) fn attempt(
@@ -1024,7 +1071,7 @@ impl WatcherExclusionRetry {
                 self.retry_at = Some(Instant::now() + backoff);
                 if self.attempts == 1 {
                     emit_exclusion_retry_log(format!(
-                        "watcher exclusion plan unavailable: root={} generation={generation} reason={}; retaining installed exclusions during retry (limit={EXCLUSION_PLAN_MAX_ATTEMPTS})",
+                        "watcher exclusion plan unavailable: root={} generation={generation} reason={}; retaining only current matcher exclusions during retry (limit={EXCLUSION_PLAN_MAX_ATTEMPTS})",
                         root.display(), reason.as_str()
                     ));
                 }
@@ -2829,6 +2876,108 @@ mod tests {
         });
     }
 
+    fn assert_unavailable_generation_replan(keep_target_ignored: bool) {
+        let root = TempDir::new().unwrap();
+        let target = root.path().join("target");
+        let modules = root.path().join("node_modules");
+        for path in [&target, &modules] {
+            fs::create_dir(path).unwrap();
+        }
+        let make_matcher = |rules: &[&str]| {
+            let mut builder = GitignoreBuilder::new(root.path());
+            for rule in rules {
+                builder.add_line(None, rule).unwrap();
+            }
+            Some(Arc::new(builder.build().unwrap()))
+        };
+        let matcher: SharedGitignore = Arc::new(std::sync::RwLock::new(make_matcher(&[
+            "target/",
+            "node_modules/",
+        ])));
+        let initial = WatcherExclusionPlan {
+            selected: [&target, &modules]
+                .into_iter()
+                .map(|path| WatcherExclusion {
+                    path: path.clone(),
+                    source: WatcherExclusionSource::Gitignore,
+                })
+                .collect(),
+            dropped: Vec::new(),
+        };
+        let counters = crate::context::WatcherCounters::default();
+        let mut retry = WatcherExclusionRetry::default();
+        let initial = retry
+            .attempt(root.path(), 1, &counters, || Ok(initial))
+            .unwrap()
+            .unwrap();
+        let mut installed = WatcherExclusionPaths::new(root.path(), &initial.selected);
+        let mut stream_paths = installed.paths();
+        let mut watched = BTreeSet::from([root.path().to_path_buf()]);
+        let mut stream_restarts = 0;
+        *matcher.write().unwrap() = make_matcher(if keep_target_ignored {
+            &["target/", "node_modules/"]
+        } else {
+            &["node_modules/"]
+        });
+        for attempt in 0..EXCLUSION_PLAN_MAX_ATTEMPTS {
+            if retry
+                .replacement_at(
+                    root.path(),
+                    2,
+                    &counters,
+                    &mut installed,
+                    &matcher,
+                    Instant::now() + Duration::from_secs((attempt as u64 + 1) * 10),
+                    || Err(ExclusionPlanUnavailable::CapacityDeadline),
+                )
+                .is_some()
+            {
+                let paths = installed.paths();
+                // Inotify watches the directories outside the exclusion set;
+                // FSEvents restarts its stream only if that set changes.
+                watched = [root.path().to_path_buf(), target.clone(), modules.clone()]
+                    .into_iter()
+                    .filter(|path| !paths.contains(path))
+                    .collect();
+                if stream_paths != paths {
+                    stream_paths = paths;
+                    stream_restarts += 1;
+                }
+            }
+            assert_eq!(
+                watched.contains(&target),
+                !keep_target_ignored,
+                "a removed ignore rule must restore the directory watch even without a plan"
+            );
+            assert!(
+                !watched.contains(&modules),
+                "still-ignored directories stay excluded"
+            );
+            let expected = if keep_target_ignored {
+                vec![target.clone(), modules.clone()]
+            } else {
+                vec![modules.clone()]
+            };
+            assert_eq!(installed.paths(), expected);
+            assert_eq!(stream_paths, expected);
+            assert_eq!(stream_restarts, usize::from(!keep_target_ignored));
+        }
+        let health = counters.snapshot().exclusion_planning.unwrap();
+        assert_eq!(health.matcher_generation, 2);
+        assert_eq!(health.attempts, EXCLUSION_PLAN_MAX_ATTEMPTS);
+        assert_eq!(health.status, "exhausted");
+    }
+
+    #[test]
+    fn unavailable_generation_replan_reincludes_unignored_directory() {
+        assert_unavailable_generation_replan(false);
+    }
+
+    #[test]
+    fn unavailable_generation_replan_keeps_ignored_exclusions_without_stream_restart() {
+        assert_unavailable_generation_replan(true);
+    }
+
     #[test]
     fn unavailable_replans_preserve_installed_exclusions_until_success() {
         struct FakeBackend {
@@ -2839,8 +2988,13 @@ mod tests {
             stream_restarts: usize,
         }
         impl FakeBackend {
-            fn replace(&mut self, plan: WatcherExclusionPlan) {
-                self.exclusions.replace(&plan.selected);
+            fn apply(&mut self, update: WatcherExclusionUpdate) {
+                if let WatcherExclusionUpdate::Planned(plan) = update {
+                    assert_eq!(
+                        self.exclusions.paths(),
+                        watcher_exclusion_paths(&plan.selected)
+                    );
+                }
                 let paths = self.exclusions.paths();
                 self.watch_set = paths.iter().cloned().collect();
                 self.watch_swaps += 1;
@@ -2851,6 +3005,12 @@ mod tests {
             }
         }
         let root = TempDir::new().unwrap();
+        let mut builder = GitignoreBuilder::new(root.path());
+        builder.add_line(None, "target/").unwrap();
+        builder.add_line(None, "node_modules/").unwrap();
+        let matcher = Arc::new(std::sync::RwLock::new(Some(Arc::new(
+            builder.build().unwrap(),
+        ))));
         let make_plan = |names: &[&str]| WatcherExclusionPlan {
             selected: names
                 .iter()
@@ -2890,10 +3050,12 @@ mod tests {
                 root.path(),
                 2,
                 &counters,
+                &mut backend.exclusions,
+                &matcher,
                 Instant::now() + Duration::from_secs((index as u64 + 1) * 10),
                 || Err(reason),
             ) {
-                backend.replace(plan);
+                backend.apply(plan);
             }
             assert_eq!(
                 backend.exclusions.paths(),
@@ -2923,11 +3085,13 @@ mod tests {
                 root.path(),
                 2,
                 &counters,
+                &mut backend.exclusions,
+                &matcher,
                 Instant::now() + Duration::from_secs(60),
                 || Ok(replacement),
             )
             .expect("completed replacement");
-        backend.replace(plan);
+        backend.apply(plan);
         assert_eq!(backend.exclusions.paths(), replacement_paths);
         assert_eq!(
             backend.watch_set,
@@ -2941,6 +3105,8 @@ mod tests {
                 root.path(),
                 2,
                 &counters,
+                &mut backend.exclusions,
+                &matcher,
                 Instant::now() + Duration::from_secs(120),
                 || panic!("generation was consumed")
             )

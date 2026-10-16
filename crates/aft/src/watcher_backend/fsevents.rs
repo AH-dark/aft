@@ -137,19 +137,35 @@ impl ProjectWatcher {
 
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    if let Some(replacement_plan) =
-                        planning.replacement(&root, generation, &counters, || {
+                    let previous_paths = exclusion_state.paths();
+                    if let Some(update) = planning.replacement(
+                        &root,
+                        generation,
+                        &counters,
+                        &mut exclusion_state,
+                        &matcher,
+                        || {
                             derive_watcher_exclusion_plan(
                                 &root,
                                 &matcher,
                                 Some(WATCHER_EXCLUSION_LIMIT),
                             )
-                        })
-                    {
-                        let replacement_exclusions = replacement_plan.selected;
-                        let previous_paths = exclusion_state.paths();
-                        exclusion_state.replace(&replacement_exclusions);
+                        },
+                    ) {
                         let replacement_paths = exclusion_state.paths();
+                        let replacement_exclusions = match update {
+                            crate::watcher_filter::WatcherExclusionUpdate::Planned(plan) => {
+                                dropped_paths = watcher_exclusion_paths(&plan.dropped);
+                                plan.selected
+                            }
+                            crate::watcher_filter::WatcherExclusionUpdate::Reduced => exclusions
+                                .iter()
+                                .filter(|entry| {
+                                    replacement_paths.iter().any(|path| path == entry.path())
+                                })
+                                .cloned()
+                                .collect(),
+                        };
                         // Starting a replacement with SinceNow can lose file events
                         // delivered between the old stream's last callback and the
                         // new stream's first callback. A new matcher generation alone
@@ -168,7 +184,6 @@ impl ProjectWatcher {
                             }
                         }
                         observed_generation = Some(generation);
-                        dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(
                             observed_generation.unwrap_or(0),
                             replacement_paths,

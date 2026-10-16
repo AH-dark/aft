@@ -18129,6 +18129,7 @@ mod tests {
             installed.push((root.clone(), Arc::clone(&plan)));
             let created_tx = created_tx.clone();
             install_project_watcher_with(ctx, root, Vec::new(), move |root, _extra, tx| {
+                let retry_matcher = Arc::clone(&matcher);
                 let derive = move |root: &Path| {
                     crate::watcher_filter::derive_watcher_exclusion_plan(
                         root,
@@ -18148,20 +18149,25 @@ mod tests {
                     crate::watcher_filter::watcher_exclusion_paths(&initial.selected),
                 );
                 created_tx.send(observed).unwrap();
+                let mut exclusion_state =
+                    crate::watcher_filter::WatcherExclusionPaths::new(&root, &initial.selected);
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread_stop = Arc::clone(&stop);
                 let join = std::thread::spawn(move || {
                     while !thread_stop.load(Ordering::SeqCst) {
                         let current = generation.load(Ordering::Acquire);
-                        if let Some(replacement) =
-                            planning.replacement(&root, current, &counters, || derive(&root))
-                        {
-                            *plan.lock().unwrap() = (
+                        if planning
+                            .replacement(
+                                &root,
                                 current,
-                                crate::watcher_filter::watcher_exclusion_paths(
-                                    &replacement.selected,
-                                ),
-                            );
+                                &counters,
+                                &mut exclusion_state,
+                                &retry_matcher,
+                                || derive(&root),
+                            )
+                            .is_some()
+                        {
+                            *plan.lock().unwrap() = (current, exclusion_state.paths());
                         }
                         std::thread::sleep(Duration::from_millis(5));
                     }
