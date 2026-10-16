@@ -1494,6 +1494,8 @@ struct WatcherFilterThread {
     raw_paths: BTreeSet<PathBuf>,
     recent_paths: VecDeque<(PathBuf, Instant)>,
     flush_deadline: Option<Instant>,
+    #[cfg(test)]
+    delay_before_rescan_for_test: Duration,
 }
 
 impl WatcherFilterThread {
@@ -1513,6 +1515,8 @@ impl WatcherFilterThread {
             raw_paths: BTreeSet::new(),
             recent_paths: VecDeque::with_capacity(WATCHER_ATTRIBUTION_RING_CAPACITY),
             flush_deadline: None,
+            #[cfg(test)]
+            delay_before_rescan_for_test: Duration::ZERO,
         }
     }
 
@@ -1538,6 +1542,13 @@ impl WatcherFilterThread {
                 Ok(Ok(event)) => {
                     self.config.counters.note_raw_event();
                     if event.need_rescan() {
+                        // Delay only this test's overflow notification so its
+                        // timeout is exercised against worker scheduling.
+                        #[cfg(test)]
+                        if !self.delay_before_rescan_for_test.is_zero() {
+                            thread::sleep(self.delay_before_rescan_for_test);
+                        }
+
                         let reason = RescanReason::from_event_info(event.info());
                         let during_rescan = self.log_overflow(reason);
                         self.raw_paths.clear();
@@ -2788,6 +2799,7 @@ mod tests {
             dispatch_tx,
             Arc::clone(&shutdown),
         );
+        filter.delay_before_rescan_for_test = Duration::from_millis(2_500);
         let handle = thread::spawn(move || filter.run(raw_rx));
 
         let mut burst = Vec::new();
@@ -2815,7 +2827,10 @@ mod tests {
         // The filter flushes a path batch when its window expires. Under load
         // that batch can legitimately arrive before it consumes the overflow
         // event, so wait for the rescan rather than assuming it is first.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Wait for the filter's rescan-required dispatch, not for the
+        // downstream filesystem scan. Under load, Windows CI needs a generous
+        // hang guard while the worker consumes and sends the control event.
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
