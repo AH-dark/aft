@@ -2811,18 +2811,31 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut holder_stdout = BufReader::new(holder.stdout.take().unwrap());
-        let mut wait_for_signal = |expected: &str| {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                assert_ne!(
-                    holder_stdout.read_line(&mut line).unwrap(),
-                    0,
-                    "lock holder exited before signaling {expected}"
-                );
-                if line.trim_end() == expected {
+        // Lines arrive on a reader thread so each handshake step can carry a
+        // deadline: a holder that never acquires (or a parent that never
+        // releases) fails the test with the missing signal instead of hanging.
+        let holder_stdout = BufReader::new(holder.stdout.take().unwrap());
+        let mut holder_stdin = holder.stdin.take().unwrap();
+        let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in holder_stdout.lines().map_while(Result::ok) {
+                if lines_tx.send(line).is_err() {
                     break;
+                }
+            }
+        });
+        let mut wait_for_signal = |expected: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match lines_rx.recv_timeout(remaining) {
+                    Ok(line) if line.trim_end() == expected => break,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        let _ = holder.kill();
+                        let _ = holder.wait();
+                        panic!("lock holder did not signal {expected} within 30 s ({error})");
+                    }
                 }
             }
         };
@@ -2839,8 +2852,9 @@ mod tests {
         drop(guard);
         wait_for_signal(ACQUIRED);
         let blocked_while_child_holds = try_is_blocked(&other);
-        writeln!(holder.stdin.as_mut().unwrap(), "release").unwrap();
+        writeln!(holder_stdin, "release").unwrap();
         wait_for_signal(RELEASED);
+        drop(wait_for_signal);
         assert!(holder.wait().unwrap().success());
         assert!(blocked_while_guard_held);
         assert!(blocked_while_child_holds);
