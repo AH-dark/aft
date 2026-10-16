@@ -2768,6 +2768,29 @@ mod tests {
 
     #[test]
     fn hook_maintenance_holds_a_cross_process_lock() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+
+        const HOLDER_ENV: &str = "AFT_TEST_HOOK_MAINTENANCE_HOLDER";
+        const WAITING: &str = "HOOK_MAINTENANCE_WAITING";
+        const ACQUIRED: &str = "HOOK_MAINTENANCE_ACQUIRED";
+        const RELEASED: &str = "HOOK_MAINTENANCE_RELEASED";
+
+        if let Some(hooks) = std::env::var_os(HOLDER_ENV) {
+            println!("{WAITING}");
+            std::io::stdout().flush().unwrap();
+            let guard = lock_hook_maintenance(&PathBuf::from(hooks)).unwrap();
+            println!("{ACQUIRED}");
+            std::io::stdout().flush().unwrap();
+            let mut release = String::new();
+            std::io::stdin().lock().read_line(&mut release).unwrap();
+            assert_eq!(release.trim_end(), "release");
+            drop(guard);
+            println!("{RELEASED}");
+            std::io::stdout().flush().unwrap();
+            return;
+        }
+
         let temp = tempfile::tempdir().unwrap();
         let hooks = temp
             .path()
@@ -2779,11 +2802,48 @@ mod tests {
             .write(true)
             .open(hooks.parent().unwrap().join(".maintenance.lock"))
             .unwrap();
-        assert!(matches!(
-            other.try_lock(),
-            Err(std::fs::TryLockError::WouldBlock)
-        ));
+        let mut holder = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("agent_child_env::tests::hook_maintenance_holds_a_cross_process_lock")
+            .arg("--nocapture")
+            .env(HOLDER_ENV, &hooks)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut holder_stdout = BufReader::new(holder.stdout.take().unwrap());
+        let mut wait_for_signal = |expected: &str| {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(
+                    holder_stdout.read_line(&mut line).unwrap(),
+                    0,
+                    "lock holder exited before signaling {expected}"
+                );
+                if line.trim_end() == expected {
+                    break;
+                }
+            }
+        };
+        let try_is_blocked = |file: &fs::File| {
+            let result = file.try_lock();
+            let blocked = matches!(&result, Err(std::fs::TryLockError::WouldBlock));
+            if result.is_ok() {
+                file.unlock().unwrap();
+            }
+            blocked
+        };
+        wait_for_signal(WAITING);
+        let blocked_while_guard_held = try_is_blocked(&other);
         drop(guard);
+        wait_for_signal(ACQUIRED);
+        let blocked_while_child_holds = try_is_blocked(&other);
+        writeln!(holder.stdin.as_mut().unwrap(), "release").unwrap();
+        wait_for_signal(RELEASED);
+        assert!(holder.wait().unwrap().success());
+        assert!(blocked_while_guard_held);
+        assert!(blocked_while_child_holds);
         other.try_lock().unwrap();
     }
 
