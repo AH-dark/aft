@@ -1987,6 +1987,17 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
+      "line": 2295,
+      "column": 26,
+      "token": "filePath",
+      "text": "json!({ \"filePath\": \"kept.ts\" }),",
+      "location": "line 2295, column 26",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The transport regression fixture uses the existing read-tool argument to inspect retained index state after deletion; no emitted schema or agent wording changes."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_bridge_test.rs",
       "line": 9367,
       "column": 17,
       "token": "filePath",
