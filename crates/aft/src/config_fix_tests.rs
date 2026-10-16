@@ -726,5 +726,30 @@ fn doctor_fix_removes_opencode_prompt_transport_keys() {
         assert!(migrated.text.contains("Keep unrelated"));
         assert!(migrated.text.contains("format_on_edit"));
         assert!(!migrate_config_text(&migrated.text, tier).unwrap().changed);
+
+        let tier_name = if tier == FixTier::User {
+            "user"
+        } else {
+            "project"
+        };
+        let mut tiers = Vec::new();
+        if tier == FixTier::Project {
+            tiers.push(ConfigTier {
+                tier: "user".to_string(),
+                source: "user".to_string(),
+                doc: "{}".to_string(),
+            });
+        }
+        tiers.push(ConfigTier {
+            tier: tier_name.to_string(),
+            source: tier_name.to_string(),
+            doc: migrated.text.clone(),
+        });
+        let loaded = resolve_config_for_harness(&tiers, Some(&Harness::Opencode));
+        assert!(
+            loaded.errors.is_empty(),
+            "fixed file did not load: {:?}",
+            loaded.errors
+        );
     }
 }

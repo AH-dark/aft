@@ -870,6 +870,64 @@ describe("loadAftConfig", () => {
     }
   });
 
+  test("removed OpenCode prompt-server keys reject first-level harness blocks", () => {
+    for (const tier of ["user", "project"]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.userConfigPath, "{}");
+      writeFileSync(fixture.projectConfigPath, "{}");
+      writeFileSync(
+        tier === "user" ? fixture.userConfigPath : fixture.projectConfigPath,
+        JSON.stringify({
+          harnesses: {
+            opencode: {
+              opencode: { server_url: "http://127.0.0.1:4096", server_password_env: "PW" },
+            },
+          },
+        }),
+      );
+      const result = spawnConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(result.stderr).toContain("removed_config_key:harnesses.opencode.opencode.server_url");
+      expect(result.stderr).toContain(
+        "removed_config_key:harnesses.opencode.opencode.server_password_env",
+      );
+      expect(result.status).not.toBe(0);
+    }
+  });
+
+  test("removed keys under ignored deeper harness blocks do not reject config", () => {
+    for (const tier of ["user", "project"]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.userConfigPath, "{}");
+      writeFileSync(fixture.projectConfigPath, "{}");
+      writeFileSync(
+        tier === "user" ? fixture.userConfigPath : fixture.projectConfigPath,
+        JSON.stringify({
+          harnesses: {
+            opencode: {
+              harnesses: {
+                pi: {
+                  opencode: {
+                    server_url: "http://127.0.0.1:4096",
+                    server_password_env: "PW",
+                  },
+                },
+              },
+            },
+          },
+        }),
+      );
+      const result = runConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(JSON.parse(result.stdout)).toBeDefined();
+      expect(result.stderr).not.toContain("removed_config_key:");
+    }
+  });
+
   // v0.27.2 bash graduation: nested `experimental.bash.*` legacy values are
   // migrated to the top-level `bash` block during load, and the resulting
   // in-memory config exposes them under `bash.*`. The user's on-disk file

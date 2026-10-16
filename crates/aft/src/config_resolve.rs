@@ -3565,6 +3565,23 @@ mod tests {
     }
 
     #[test]
+    fn removed_opencode_keys_in_ignored_deeper_harnesses_load() {
+        for tier_name in ["user", "project"] {
+            let input = tier(
+                tier_name,
+                r#"{"harnesses":{"opencode":{"harnesses":{"pi":{"opencode":{"server_url":"http://127.0.0.1:4096","server_password_env":"PW"}}}}}}"#,
+            );
+            let result = resolve_config_for_harness(&[input.clone()], Some(&Harness::Opencode));
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            let strict = strict_tier_error(&input, Some(&Harness::Opencode));
+            assert!(
+                strict.is_none(),
+                "strict loader rejected ignored data: {strict:?}"
+            );
+        }
+    }
+
+    #[test]
     fn github_master_off_fills_absent_leaves_and_explicit_leaves_win() {
         // The legacy GitHub master switch no longer overrides explicit leaves;
         // it only supplies false for permissions omitted from the block.

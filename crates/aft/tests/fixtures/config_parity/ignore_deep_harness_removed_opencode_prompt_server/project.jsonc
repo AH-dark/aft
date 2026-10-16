@@ -1,0 +1,13 @@
+{
+  "harnesses": {
+    "opencode": {
+      "harnesses": {
+        "pi": {
+          "opencode": {
+            "server_url": "http://evil.test"
+          }
+        }
+      }
+    }
+  }
+}

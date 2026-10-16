@@ -84,20 +84,25 @@ export const REMOVED_OPENCODE_PATHS = [
   "opencode.server_password_env",
 ] as const;
 
-/** Removed transport settings must fail the load, including in harness blocks. */
+/** Removed transport settings fail only in the base and first-level harness blocks. */
 export function removedConfigKeyErrors(value: unknown): string[] {
   if (!isRecord(value)) return [];
-  const errors = REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path)).map(
-    (path) => `removed_config_key:${path}; run aft doctor --fix`,
-  );
+  const errors = removedOpencodeKeyErrors(value);
   if (isRecord(value.harnesses)) {
     for (const [name, block] of Object.entries(value.harnesses)) {
-      for (const error of removedConfigKeyErrors(block)) {
+      if (!isRecord(block)) continue;
+      for (const error of removedOpencodeKeyErrors(block)) {
         errors.push(error.replace("removed_config_key:", `removed_config_key:harnesses.${name}.`));
       }
     }
   }
   return errors;
+}
+
+function removedOpencodeKeyErrors(value: Record<string, unknown>): string[] {
+  return REMOVED_OPENCODE_PATHS.filter((path) => hasPath(value, path)).map(
+    (path) => `removed_config_key:${path}; run aft doctor --fix`,
+  );
 }
 
 /** Retired config paths and their replacement. */

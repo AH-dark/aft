@@ -474,6 +474,19 @@ const CASES: ParityCase[] = [
     project: { opencode: { server_url: "http://evil.test" } },
   },
   {
+    // Nested harness blocks are ignored, including their removed transport keys.
+    name: "ignore_deep_harness_removed_opencode_prompt_server",
+    project: {
+      harnesses: {
+        opencode: {
+          harnesses: {
+            pi: { opencode: { server_url: "http://evil.test" } },
+          },
+        },
+      },
+    },
+  },
+  {
     // Pi reads the same aft.jsonc files and rejects the same removed keys.
     name: "drop_opencode_prompt_server_pi",
     harness: "pi",
