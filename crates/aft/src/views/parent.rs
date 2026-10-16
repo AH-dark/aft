@@ -291,6 +291,9 @@ fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
             let path = entry.path();
             if kind.is_dir() {
                 if !boundary.allows_directory(&path) {
+                    // Another drive or filesystem: never opened, but reported
+                    // as unsearched so results over it don't read as complete.
+                    note_outside(&mut found, root, &path);
                     continue;
                 }
                 if name

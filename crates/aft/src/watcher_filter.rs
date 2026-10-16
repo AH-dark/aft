@@ -600,6 +600,9 @@ impl WatcherExclusionPaths {
         self.boundary.as_ref()
     }
 
+    // Only the Linux and macOS watcher backends, and the unix-only tests,
+    // read the combined exclusion list.
+    #[cfg(unix)]
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.lasting
             .iter()
