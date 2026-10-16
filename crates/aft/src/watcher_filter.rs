@@ -566,23 +566,38 @@ pub(crate) fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<Pa
 pub(crate) struct WatcherExclusionPaths {
     lasting: Vec<PathBuf>,
     external: BTreeSet<PathBuf>,
+    boundary: Option<WatcherWalkBoundary>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl WatcherExclusionPaths {
-    pub(crate) fn new(exclusions: &[WatcherExclusion]) -> Self {
-        Self {
-            lasting: exclusions
-                .iter()
-                .filter(|entry| entry.source() != WatcherExclusionSource::External)
-                .map(|entry| entry.path.clone())
-                .collect(),
-            external: exclusions
-                .iter()
-                .filter(|entry| entry.source() == WatcherExclusionSource::External)
-                .map(|entry| entry.path.clone())
-                .collect(),
-        }
+    pub(crate) fn new(root: &Path, exclusions: &[WatcherExclusion]) -> Self {
+        let mut state = Self {
+            lasting: Vec::new(),
+            external: BTreeSet::new(),
+            // Matcher publications do not change the bound root or its device.
+            boundary: WatcherWalkBoundary::for_root(root),
+        };
+        state.replace(exclusions);
+        state
+    }
+
+    pub(crate) fn replace(&mut self, exclusions: &[WatcherExclusion]) {
+        self.lasting = exclusions
+            .iter()
+            .filter(|entry| entry.source() != WatcherExclusionSource::External)
+            .map(|entry| entry.path.clone())
+            .collect();
+        self.external = exclusions
+            .iter()
+            .filter(|entry| entry.source() == WatcherExclusionSource::External)
+            .map(|entry| entry.path.clone())
+            .collect();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn boundary(&self) -> Option<&WatcherWalkBoundary> {
+        self.boundary.as_ref()
     }
 
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
@@ -593,11 +608,40 @@ impl WatcherExclusionPaths {
             .collect()
     }
 
+    pub(crate) fn refresh_event(&mut self, event: &notify::Event) -> Vec<PathBuf> {
+        // Content, metadata and access events cannot replace a directory.
+        // Keep their high-volume path free of filesystem probes.
+        if !event.need_rescan()
+            && !matches!(
+                event.kind,
+                notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+                    | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+            )
+        {
+            return Vec::new();
+        }
+        let previous = self.external.clone();
+        if event.need_rescan() {
+            // Overflow events may have no paths. Recheck every known external
+            // boundary, including replacements whose topology event was lost.
+            let mut paths = event.paths.clone();
+            paths.extend(self.external.iter().cloned());
+            self.refresh_touched(&paths);
+        } else {
+            self.refresh_touched(&event.paths);
+        }
+        self.external
+            .symmetric_difference(&previous)
+            .cloned()
+            .collect()
+    }
+
     /// Use lexical event paths, before downstream canonicalization. Checking
     /// ancestors also handles a renamed parent of an excluded path, without
     /// probing descendants through a link or a different-device directory.
-    pub(crate) fn refresh_touched(&mut self, root: &Path, paths: &[PathBuf]) -> bool {
-        let Some(boundary) = WatcherWalkBoundary::for_root(root) else {
+    pub(crate) fn refresh_touched(&mut self, paths: &[PathBuf]) -> bool {
+        let Some(boundary) = self.boundary.as_ref() else {
             return false;
         };
         let previous = self.external.clone();
@@ -787,8 +831,13 @@ fn exclusion_device(path: &Path, metadata: &fs::Metadata) -> Option<u64> {
 }
 
 impl WatcherWalkBoundary {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn for_root(root: &Path) -> Option<Self> {
-        let metadata = fs::symlink_metadata(root).ok()?;
+        let metadata = watcher_boundary_metadata(root).ok()?;
         if !metadata.is_dir() {
             return None;
         }
@@ -803,6 +852,8 @@ impl WatcherWalkBoundary {
     }
 
     fn classify(&self, path: &Path) -> (ExclusionPathKind, Option<PathBuf>) {
+        #[cfg(test)]
+        EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(calls.get() + 1));
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return (ExclusionPathKind::Other, None);
         };
@@ -812,7 +863,7 @@ impl WatcherWalkBoundary {
                 return (ExclusionPathKind::Other, None);
             }
             current.push(component);
-            let metadata = match fs::symlink_metadata(&current) {
+            let metadata = match watcher_boundary_metadata(&current) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return (ExclusionPathKind::Absent, None)
@@ -841,6 +892,12 @@ impl WatcherWalkBoundary {
     pub(crate) fn allows_directory(&self, path: &Path) -> bool {
         self.kind(path) == ExclusionPathKind::LocalDirectory
     }
+}
+
+fn watcher_boundary_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    EXCLUSION_TEST_LSTATS.with(|calls| calls.set(calls.get() + 1));
+    fs::symlink_metadata(path)
 }
 
 /// The exclusion set an OS watcher should install, plus what the cap cost.
@@ -882,6 +939,8 @@ pub(crate) fn exclusion_read_dir(path: &Path) -> std::io::Result<fs::ReadDir> {
 #[cfg(test)]
 thread_local! {
     pub(crate) static EXCLUSION_TEST_OPENS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static EXCLUSION_TEST_LSTATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static EXCLUSION_TEST_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EXCLUSION_TEST_DEVICE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -2304,6 +2363,104 @@ mod tests {
         tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
     }
 
+    #[test]
+    fn data_modify_burst_does_not_probe_external_paths() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("a/b/c/d/e/f/g/h/i/j/k");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("source.rs");
+        fs::write(&path, "pub fn source() {}\n").unwrap();
+        let mut state = WatcherExclusionPaths::new(root.path(), &[]);
+        let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(path);
+        EXCLUSION_TEST_LSTATS.with(|calls| calls.set(0));
+        EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(0));
+        for _ in 0..2_000 {
+            assert!(state.refresh_event(&event).is_empty());
+        }
+        let calls = (
+            EXCLUSION_TEST_LSTATS.with(|calls| calls.get()),
+            EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.get()),
+        );
+        assert_eq!(calls, (0, 0), "data writes must not lstat or classify");
+    }
+
+    #[test]
+    fn metadata_and_access_events_do_not_probe_external_paths() {
+        use notify::event::{AccessKind, MetadataKind, ModifyKind};
+        let root = TempDir::new().unwrap();
+        let mut state = WatcherExclusionPaths::new(root.path(), &[]);
+        EXCLUSION_TEST_LSTATS.with(|calls| calls.set(0));
+        EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(0));
+        for kind in [
+            notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            notify::EventKind::Access(AccessKind::Any),
+        ] {
+            let event = notify::Event::new(kind).add_path(root.path().join("source.rs"));
+            assert!(state.refresh_event(&event).is_empty());
+        }
+        EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 0));
+        EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn topology_refresh_and_matcher_replacement_reuse_the_root_boundary() {
+        let root = TempDir::new().unwrap();
+        let source = root.path().join("source.rs");
+        fs::write(&source, "pub fn source() {}\n").unwrap();
+        EXCLUSION_TEST_LSTATS.with(|calls| calls.set(0));
+        let mut state = WatcherExclusionPaths::new(root.path(), &[]);
+        EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 1));
+        state.replace(&[]);
+        EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 1));
+        EXCLUSION_TEST_LSTATS.with(|calls| calls.set(0));
+        EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(0));
+        let event = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+            .add_path(source);
+        for _ in 0..100 {
+            assert!(state.refresh_event(&event).is_empty());
+        }
+        // Each create probes its file once, never the already-bound root.
+        EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 100));
+        EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| assert_eq!(calls.get(), 100));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topology_and_pathless_rescan_events_refresh_external_paths() {
+        use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
+        for kind in [
+            notify::EventKind::Create(CreateKind::Folder),
+            notify::EventKind::Create(CreateKind::File),
+            notify::EventKind::Remove(RemoveKind::File),
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            notify::EventKind::Other,
+        ] {
+            let root = exclusion_tempdir();
+            let external = TempDir::new().unwrap();
+            let foo = root.path().join("foo");
+            std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+            let mut state = WatcherExclusionPaths::new(
+                root.path(),
+                &[WatcherExclusion {
+                    path: foo.clone(),
+                    source: WatcherExclusionSource::External,
+                }],
+            );
+            fs::remove_file(&foo).unwrap();
+            fs::create_dir(&foo).unwrap();
+            let event = if kind == notify::EventKind::Other {
+                notify::Event::new(kind).set_flag(Flag::Rescan)
+            } else {
+                notify::Event::new(kind).add_path(foo.clone())
+            };
+            assert_eq!(state.refresh_event(&event), vec![foo]);
+            assert!(state.paths().is_empty());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn external_refresh_preserves_lasting_exclusions_and_rechecks_renamed_parents() {
@@ -2330,18 +2487,18 @@ mod tests {
             path: linked.clone(),
             source: WatcherExclusionSource::External,
         });
-        let mut state = WatcherExclusionPaths::new(&entries);
+        let mut state = WatcherExclusionPaths::new(root.path(), &entries);
         fs::remove_file(&linked).unwrap();
         fs::create_dir(&linked).unwrap();
         let mut touched = watcher_exclusion_paths(&lasting);
         touched.push(parent);
-        assert!(state.refresh_touched(root.path(), &touched));
+        assert!(state.refresh_touched(&touched));
         assert_eq!(state.paths(), watcher_exclusion_paths(&lasting));
 
         fs::remove_dir(&linked).unwrap();
         std::os::unix::fs::symlink(external.path(), &linked).unwrap();
         EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
-        assert!(state.refresh_touched(root.path(), &[linked.join("not-probed/deep")]));
+        assert!(state.refresh_touched(&[linked.join("not-probed/deep")]));
         assert!(state.paths().contains(&linked));
         EXCLUSION_TEST_OPENS.with(|opens| assert!(opens.borrow().is_empty()));
     }
@@ -2352,14 +2509,14 @@ mod tests {
         let root = exclusion_tempdir();
         let mounted = root.path().join("mounted");
         fs::create_dir_all(mounted.join("deep")).unwrap();
-        let mut state = WatcherExclusionPaths::new(&[]);
+        let mut state = WatcherExclusionPaths::new(root.path(), &[]);
         EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = Some(mounted.clone()));
         EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
-        assert!(state.refresh_touched(root.path(), &[mounted.join("deep")]));
+        assert!(state.refresh_touched(&[mounted.join("deep")]));
         assert_eq!(state.paths(), vec![mounted.clone()]);
-        assert!(!state.refresh_touched(root.path(), &[mounted.clone()]));
+        assert!(!state.refresh_touched(&[mounted.clone()]));
         EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = None);
-        assert!(state.refresh_touched(root.path(), &[mounted]));
+        assert!(state.refresh_touched(&[mounted]));
         assert!(state.paths().is_empty());
         EXCLUSION_TEST_OPENS.with(|opens| assert!(opens.borrow().is_empty()));
     }
@@ -2375,10 +2532,10 @@ mod tests {
                 source: WatcherExclusionSource::Gitignore,
             })
             .collect();
-        let mut state = WatcherExclusionPaths::new(&entries);
+        let mut state = WatcherExclusionPaths::new(root.path(), &entries);
         let linked = root.path().join("foo");
         std::os::unix::fs::symlink(external.path(), &linked).unwrap();
-        assert!(!state.refresh_touched(root.path(), &[linked.clone()]));
+        assert!(!state.refresh_touched(&[linked.clone()]));
         assert_eq!(state.paths(), watcher_exclusion_paths(&entries));
         assert!(!WatcherWalkBoundary::for_root(root.path())
             .unwrap()

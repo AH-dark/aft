@@ -81,7 +81,7 @@ impl ProjectWatcher {
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusions = plan.selected;
-        let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&exclusions);
+        let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &exclusions);
         let exclusion_paths = exclusion_state.paths();
         super::log_exclusions(&root, &exclusions, observed_generation);
 
@@ -137,16 +137,15 @@ impl ProjectWatcher {
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
                         let replacement_exclusions = replacement_plan.selected;
-                        let replacement_state = crate::watcher_filter::WatcherExclusionPaths::new(
-                            &replacement_exclusions,
-                        );
-                        let replacement_paths = replacement_state.paths();
+                        let previous_paths = exclusion_state.paths();
+                        exclusion_state.replace(&replacement_exclusions);
+                        let replacement_paths = exclusion_state.paths();
                         // Starting a replacement with SinceNow can lose file events
                         // delivered between the old stream's last callback and the
                         // new stream's first callback. A new matcher generation alone
                         // does not require a new stream when its backend exclusions
                         // are unchanged.
-                        if replacement_paths != exclusion_state.paths() {
+                        if replacement_paths != previous_paths {
                             if let Err(error) = replace_stream_exclusions(
                                 &mut stream,
                                 &root,
@@ -158,7 +157,6 @@ impl ProjectWatcher {
                                 return;
                             }
                         }
-                        exclusion_state = replacement_state;
                         observed_generation = generation;
                         dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(
@@ -179,7 +177,7 @@ impl ProjectWatcher {
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(event) => {
                             if let Ok(event) = &event {
-                                if exclusion_state.refresh_touched(&root, &event.paths) {
+                                if !exclusion_state.refresh_event(event).is_empty() {
                                     let paths = exclusion_state.paths();
                                     if let Err(error) = replace_stream_exclusions(
                                         &mut stream,
@@ -979,6 +977,73 @@ mod tests {
         let wrapped = translate_event(fs::kFSEventStreamEventFlagEventIdsWrapped, path);
         assert!(wrapped[0].need_rescan());
         assert!(translate_event(fs::kFSEventStreamEventFlagHistoryDone, path).is_empty());
+    }
+
+    #[test]
+    fn fsevents_item_topology_flags_refresh_exclusions_even_with_modified_flag() {
+        for (flag, expected_kind) in [
+            (
+                fs::kFSEventStreamEventFlagItemCreated,
+                EventKind::Create(CreateKind::Folder),
+            ),
+            (
+                fs::kFSEventStreamEventFlagItemRemoved,
+                EventKind::Remove(RemoveKind::Folder),
+            ),
+            (
+                fs::kFSEventStreamEventFlagItemRenamed,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let foo = root.join("foo");
+            std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+            let selected = derive_excluded_subtrees(&root, &Arc::new(RwLock::new(None)), None);
+            let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &selected);
+            std::fs::remove_file(&foo).unwrap();
+            std::fs::create_dir(&foo).unwrap();
+            let events = translate_event(
+                flag | fs::kFSEventStreamEventFlagItemModified
+                    | fs::kFSEventStreamEventFlagItemIsDir,
+                &foo,
+            );
+            assert!(events.iter().any(|event| event.kind == expected_kind));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))));
+            let changed: Vec<_> = events
+                .iter()
+                .flat_map(|event| state.refresh_event(event))
+                .collect();
+            assert_eq!(changed, vec![foo]);
+            assert!(state.paths().is_empty());
+        }
+    }
+
+    #[test]
+    fn fsevents_plain_modified_and_metadata_flags_do_not_probe_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let path = root.join("a/b/c/d/e/source.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "pub fn source() {}\n").unwrap();
+        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &[]);
+        crate::watcher_filter::EXCLUSION_TEST_LSTATS.with(|calls| calls.set(0));
+        crate::watcher_filter::EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(0));
+        for flag in [
+            fs::kFSEventStreamEventFlagItemModified,
+            fs::kFSEventStreamEventFlagItemInodeMetaMod,
+            fs::kFSEventStreamEventFlagItemModified | fs::kFSEventStreamEventFlagItemXattrMod,
+        ] {
+            for event in translate_event(flag, &path) {
+                assert!(state.refresh_event(&event).is_empty());
+            }
+        }
+        crate::watcher_filter::EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 0));
+        crate::watcher_filter::EXCLUSION_TEST_CLASSIFICATIONS
+            .with(|calls| assert_eq!(calls.get(), 0));
     }
 
     #[test]

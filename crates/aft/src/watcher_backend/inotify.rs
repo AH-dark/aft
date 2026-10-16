@@ -67,13 +67,17 @@ impl ProjectWatcher {
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusions = plan.selected;
-        let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&exclusions);
+        let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &exclusions);
         let exclusion_paths = exclusion_state.paths();
         super::log_exclusions(&root, &exclusions, observed_generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
-        let mut watched_directories = collect_watch_directories(&root, &matcher, &exclusion_paths);
+        let mut watched_directories = exclusion_state
+            .boundary()
+            .map_or_else(BTreeSet::new, |boundary| {
+                collect_watch_directories(boundary, &matcher, &exclusion_paths)
+            });
         let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(
             observed_generation,
@@ -130,12 +134,18 @@ impl ProjectWatcher {
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
                         let replacement_exclusions = replacement_plan.selected;
-                        exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(
-                            &replacement_exclusions,
-                        );
+                        exclusion_state.replace(&replacement_exclusions);
                         let replacement_paths = exclusion_state.paths();
                         let desired =
-                            collect_watch_directories(&root, &matcher, &replacement_paths);
+                            exclusion_state
+                                .boundary()
+                                .map_or_else(BTreeSet::new, |boundary| {
+                                    collect_watch_directories(
+                                        boundary,
+                                        &matcher,
+                                        &replacement_paths,
+                                    )
+                                });
                         watched_directories = match reconcile_watch_directories(
                             &watched_directories,
                             &desired,
@@ -176,9 +186,8 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
-                            let exclusions_changed =
-                                exclusion_state.refresh_touched(&root, &event.paths);
-                            if exclusions_changed {
+                            let changed_paths = exclusion_state.refresh_event(&event);
+                            if !changed_paths.is_empty() {
                                 exclusion_paths = exclusion_state.paths();
                                 counters.set_backend_exclusions(
                                     observed_generation,
@@ -217,23 +226,17 @@ impl ProjectWatcher {
                                 );
                                 thread_count.store(watched_directories.len(), Ordering::Release);
                             }
-                            // Events can arrive after a path has already been replaced.
-                            // Scan its current local tree even for an earlier remove or
-                            // rename event; the boundary check rejects files and links.
-                            if exclusions_changed
-                                || matches!(
-                                    event.kind,
-                                    EventKind::Create(_)
-                                        | EventKind::Remove(_)
-                                        | EventKind::Modify(ModifyKind::Name(_))
-                                )
+                            let scan_paths = new_tree_event_paths(&event, &changed_paths);
+                            if let Some(boundary) = exclusion_state
+                                .boundary()
+                                .filter(|_| !scan_paths.is_empty())
                             {
                                 let deadline = Instant::now() + NEW_DIRECTORY_SCAN_BUDGET;
                                 let mut scan = NewDirectoryScan::Complete;
-                                for path in &event.paths {
+                                for path in &scan_paths {
                                     match watch_new_tree(
                                         path,
-                                        &root,
+                                        boundary,
                                         &matcher,
                                         &exclusion_paths,
                                         &mut watched_directories,
@@ -396,6 +399,20 @@ impl PendingNewDirectoryFiles {
     }
 }
 
+fn new_tree_event_paths(event: &Event, changed_external_paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut paths: BTreeSet<_> = changed_external_paths.iter().cloned().collect();
+    // Only directory creates and untyped renames can introduce a local tree.
+    // A remove needs a scan only when an external boundary changed: the old
+    // link may already have been replaced before its remove event is handled.
+    if matches!(
+        event.kind,
+        EventKind::Create(CreateKind::Folder) | EventKind::Modify(ModifyKind::Name(_))
+    ) {
+        paths.extend(event.paths.iter().cloned());
+    }
+    paths
+}
+
 /// Watches `root` and every directory under it that is not watched yet, and
 /// queues the non-ignored files found in them.
 ///
@@ -410,7 +427,7 @@ impl PendingNewDirectoryFiles {
 /// rescan instead of reporting a partial list.
 fn watch_new_tree(
     root: &Path,
-    project_root: &Path,
+    boundary: &crate::watcher_filter::WatcherWalkBoundary,
     matcher: &SharedGitignore,
     exclusions: &[PathBuf],
     watched: &mut BTreeSet<PathBuf>,
@@ -419,12 +436,10 @@ fn watch_new_tree(
     deadline: Instant,
     mut watch: impl FnMut(&Path) -> notify::Result<bool>,
 ) -> notify::Result<NewDirectoryScan> {
+    let project_root = boundary.root();
     let excluded = |path: &Path| {
         exclusions.iter().any(|excluded| path.starts_with(excluded))
             || watcher_path_is_ignored_by_matcher(matcher, path, project_root)
-    };
-    let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(project_root) else {
-        return Ok(NewDirectoryScan::Complete);
     };
     let mut stack = vec![root.to_path_buf()];
     let mut found = 0usize;
@@ -512,15 +527,12 @@ fn reconcile_watch_directories(
 }
 
 fn collect_watch_directories(
-    root: &Path,
+    boundary: &crate::watcher_filter::WatcherWalkBoundary,
     matcher: &SharedGitignore,
     exclusions: &[PathBuf],
 ) -> BTreeSet<PathBuf> {
-    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = boundary.root().to_path_buf();
     let mut directories = BTreeSet::new();
-    let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(&root) else {
-        return directories;
-    };
     let mut stack = vec![root.clone()];
 
     while let Some(directory) = stack.pop() {
@@ -555,6 +567,36 @@ mod tests {
     use ignore::gitignore::GitignoreBuilder;
 
     #[test]
+    fn new_tree_scans_only_directory_creates_renames_and_changed_boundaries() {
+        let path = PathBuf::from("/project/deep/source.rs");
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
+            EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::Any)),
+        ] {
+            let event = Event::new(kind).add_path(path.clone());
+            assert!(new_tree_event_paths(&event, &[]).is_empty());
+        }
+        for kind in [
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        ] {
+            let event = Event::new(kind).add_path(path.clone());
+            assert_eq!(
+                new_tree_event_paths(&event, &[]),
+                BTreeSet::from([path.clone()])
+            );
+        }
+        let removed = Event::new(EventKind::Remove(notify::event::RemoveKind::File));
+        assert_eq!(
+            new_tree_event_paths(&removed, &[path.clone()]),
+            BTreeSet::from([path])
+        );
+    }
+
+    #[test]
     fn watcher_scans_skip_different_devices_and_symlinks() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
@@ -565,7 +607,11 @@ mod tests {
         let matcher = Arc::new(RwLock::new(None));
         crate::watcher_filter::EXCLUSION_TEST_DEVICE
             .with(|device| *device.borrow_mut() = Some(mounted));
-        let initial = collect_watch_directories(&root, &matcher, &[]);
+        let initial = collect_watch_directories(
+            &crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap(),
+            &matcher,
+            &[],
+        );
         let (_, added, _) = walk_new_tree(
             &root,
             &matcher,
@@ -592,7 +638,7 @@ mod tests {
         let mut pending = PendingNewDirectoryFiles::default();
         watch_new_tree(
             &link,
-            &root,
+            &crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap(),
             &Arc::new(RwLock::new(None)),
             &[],
             &mut watched,
@@ -657,7 +703,11 @@ mod tests {
             GitignoreBuilder::new(&root).build().unwrap(),
         ))));
         assert_eq!(
-            collect_watch_directories(&root, &matcher, &[]),
+            collect_watch_directories(
+                &crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap(),
+                &matcher,
+                &[]
+            ),
             BTreeSet::from([root.clone(), root.join("src")])
         );
     }
@@ -890,7 +940,7 @@ mod tests {
         std::os::unix::fs::symlink(first.path(), &foo).unwrap();
         let matcher = Arc::new(RwLock::new(None));
         let selected = crate::watcher_filter::derive_excluded_subtrees(&root, &matcher, None);
-        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&selected);
+        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &selected);
         assert_eq!(state.paths(), vec![foo.clone()]);
         let (tx, rx) = mpsc::channel();
         let watcher = ProjectWatcher::create(
@@ -918,7 +968,7 @@ mod tests {
         std::fs::create_dir(&foo).unwrap();
         let matcher = Arc::new(RwLock::new(None));
         let selected = crate::watcher_filter::derive_excluded_subtrees(&root, &matcher, None);
-        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&selected);
+        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &selected);
         assert!(state.paths().is_empty());
         let (tx, rx) = mpsc::channel();
         let watcher = ProjectWatcher::create(
@@ -960,9 +1010,9 @@ mod tests {
         state: &mut crate::watcher_filter::WatcherExclusionPaths,
     ) {
         crate::watcher_filter::EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
-        state.refresh_touched(root, &[foo.to_path_buf()]);
+        state.refresh_touched(&[foo.to_path_buf()]);
         assert_eq!(state.paths(), vec![foo.to_path_buf()]);
-        let initial = collect_watch_directories(root, matcher, &state.paths());
+        let initial = collect_watch_directories(state.boundary().unwrap(), matcher, &state.paths());
         let (_, added, files) = walk_new_tree(
             root,
             matcher,
@@ -1073,7 +1123,7 @@ mod tests {
         let mut pending = PendingNewDirectoryFiles::default();
         let scan = watch_new_tree(
             root,
-            root,
+            &crate::watcher_filter::WatcherWalkBoundary::for_root(root).unwrap(),
             matcher,
             exclusions,
             &mut watched,
