@@ -560,6 +560,79 @@ fn bash_background_launch_response(
     )
 }
 
+// Large worktrees and busy runners can take time to capture inputs. Bound the
+// acknowledgement wait at one minute, charged from receipt against any shorter
+// command timeout rather than appended to the caller's existing budget.
+const REMOTE_INPUT_CAPTURE_WAIT: Duration = Duration::from_secs(60);
+const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirmed the inputs were copied yet. Do not change or delete input files until bash_status shows the job queued or running.";
+
+async fn await_runon_launch_reply(
+    registry: crate::bash_background::BgTaskRegistry,
+    session: &str,
+    response: &Response,
+    deadline: Option<Instant>,
+) -> Option<Response> {
+    let deadline = deadline?;
+    let task_id = response.data.get("task_id")?.as_str()?.to_owned();
+    loop {
+        let registry = registry.clone();
+        let task_id = task_id.clone();
+        let session = session.to_owned();
+        let request_id = response.id.clone();
+        // Task-state and artifact access can block on disk or mutexes. Keep it
+        // off the frame runtime and release every lock before polling again.
+        let observation = tokio::task::spawn_blocking(move || {
+            let pending = registry.runon_launch_pending(&task_id, &session);
+            let refusal = if pending == Some(false) {
+                registry
+                    .observed_status(&task_id, &session, 8192)
+                    .filter(|snapshot| snapshot.remote_refusal.is_some())
+                    .and_then(|snapshot| {
+                        let now = Instant::now();
+                        match crate::commands::bash_orchestrate::decide_bash_step(
+                            snapshot,
+                            now,
+                            false,
+                            false,
+                            now,
+                            &request_id,
+                        ) {
+                            crate::commands::bash_orchestrate::BashStep::Done(response) => {
+                                Some(response)
+                            }
+                            _ => None,
+                        }
+                    })
+            } else {
+                None
+            };
+            (pending == Some(true), refusal)
+        });
+        match tokio::time::timeout_at(deadline.into(), observation).await {
+            Ok(Ok((false, refusal))) => return refusal,
+            Ok(Ok((true, _))) if Instant::now() < deadline => {
+                tokio::time::sleep_until(
+                    (Instant::now() + Duration::from_millis(20))
+                        .min(deadline)
+                        .into(),
+                )
+                .await;
+            }
+            _ => {
+                let mut response = Response {
+                    id: response.id.clone(),
+                    success: response.success,
+                    data: response.data.clone(),
+                };
+                let output = response.data["output"].as_str().unwrap_or("");
+                response.data["output"] =
+                    json!(format!("{output}\n{REMOTE_INPUT_CAPTURE_WARNING}"));
+                return Some(response);
+            }
+        }
+    }
+}
+
 fn finish_bash_spawn_immediate(
     response: Response,
     ctx: &AppContext,
@@ -654,9 +727,9 @@ pub(super) fn submit_deferred_bash(
     let scope_stamp = cancel.scope.clone();
     let run_scoped = run_scope.is_some();
     let server_completion = server_completion || run_scoped;
-    // Leave room for writer queueing and the daemon relay under the shortest
-    // supported client transport deadline (25 s). Explicit waits only extend
-    // execution, never startup admission or control-file creation.
+    // Local startup must answer early enough for its reply to be queued and
+    // relayed before the client's deadline. OpenCode and Pi extend their reply
+    // deadlines for runon calls to allow input capture after task registration.
     let grant_scope = crate::access_policy::current_scope();
     // The attested scope decides confinement independently of consent routing:
     // heads and workers both ask, but only worker shells require the jail.
@@ -708,6 +781,23 @@ pub(super) fn submit_deferred_bash(
         blocking_intent,
         crate::commands::bash_orchestrate::worker_wait_max_ms(&spawn_ctx),
     );
+    let capture_deadline = raw_args
+        .get("runon")
+        .filter(|value| !value.is_null())
+        .map(|_| {
+            received_at
+                + raw_args
+                    .get("timeout")
+                    .and_then(Value::as_u64)
+                    .map(Duration::from_millis)
+                    .unwrap_or(REMOTE_INPUT_CAPTURE_WAIT)
+                    .min(REMOTE_INPUT_CAPTURE_WAIT)
+                    .min(
+                        blocking_cap_ms
+                            .map(Duration::from_millis)
+                            .unwrap_or(REMOTE_INPUT_CAPTURE_WAIT),
+                    )
+        });
     // The short foreground window belongs only to nonblocking calls. A blocking
     // call keeps the existing 15 s startup admission budget, then waits for a
     // committed command until its blocking cap, even if startup bookkeeping is slow.
@@ -1160,6 +1250,7 @@ pub(super) fn submit_deferred_bash(
                     Some(response) => response,
                     None => {
                         let response = startup_deadline_response(&request_id, &outcome, startup_window, blocking_cap_ms, server_completion, worker_session, format_context.bash_watch_available.unwrap_or(worker_session), &executor, &root_for_task, admitted.load(Ordering::Relaxed));
+                        let response = await_runon_launch_reply(spawn_ctx.bash_background().clone(), &session_id, &response, capture_deadline).await.unwrap_or(response);
                         log::warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"));
                         send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), Some(bash_result_from_response(response, &format_context)), false).await;
                         answered_startup = true;
@@ -1168,6 +1259,31 @@ pub(super) fn submit_deferred_bash(
                 }
             }
         };
+        if !answered_startup {
+            if let Some(response) = await_runon_launch_reply(
+                spawn_ctx.bash_background().clone(),
+                &session_id,
+                &spawn_response,
+                capture_deadline,
+            )
+            .await
+            {
+                send_bash_deferred_completion(
+                    &completion_tx,
+                    &task_metrics,
+                    route,
+                    corr,
+                    flags,
+                    ver,
+                    root_for_task.clone(),
+                    request_id.clone(),
+                    Some(bash_result_from_response(response, &format_context)),
+                    false,
+                )
+                .await;
+                answered_startup = true;
+            }
+        }
         let spawn_control = spawn_control_rx.await;
         if answered_startup {
             // A slow startup may settle after its caller has already received
@@ -3132,8 +3248,9 @@ mod grant_path_tests {
     /// The fake runner's connection file for [`remote_runon_stub`]; a dispatch
     /// function is a plain `fn`, so it cannot capture one.
     #[cfg(unix)]
-    static REMOTE_RUNON_CONNECTION: std::sync::Mutex<Option<std::path::PathBuf>> =
-        std::sync::Mutex::new(None);
+    static REMOTE_RUNON_CONNECTION: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
     /// Runs the bash handler with a remote policy pointing at the fake runner.
     #[cfg(unix)]
@@ -3148,7 +3265,11 @@ mod grant_path_tests {
             requested_platform: None,
             requested_vcpus: None,
             requested_network: false,
-            connection_file: REMOTE_RUNON_CONNECTION.lock().unwrap().clone(),
+            connection_file: REMOTE_RUNON_CONNECTION
+                .lock()
+                .unwrap()
+                .get(ctx.config().project_root.as_ref().unwrap())
+                .cloned(),
             harness: "broca".into(),
             session: "session".into(),
             params: crate::exec_remote::FrozenParams {
@@ -3169,18 +3290,22 @@ mod grant_path_tests {
     async fn subc_blocking_runon_queued_past_its_timeout_answers_with_job_and_phase() {
         use crate::exec_remote::wire_tests::{daemon, id, Script};
         // The runner accepts the job at queue position 7 and keeps it queued
-        // well past the call's `timeout`.
+        // well past the call's `timeout`. Allow time for input capture on busy
+        // test hosts so this fixture tests queued handback, not capture expiry.
         let daemon = daemon(
             Script::Staged {
                 position: 7,
-                queue: Duration::from_secs(4),
+                queue: Duration::from_secs(20),
                 run: Duration::ZERO,
             },
             "exec-remote/v1",
         )
         .await;
-        *REMOTE_RUNON_CONNECTION.lock().unwrap() = Some(daemon.connection.clone());
         let (dir, root) = super::super::test_support::test_root("remote-handback");
+        REMOTE_RUNON_CONNECTION
+            .lock()
+            .unwrap()
+            .insert(dir.path().into(), daemon.connection.clone());
         assert!(std::process::Command::new("git")
             .args(["init", "--quiet"])
             .current_dir(dir.path())
@@ -3198,7 +3323,7 @@ mod grant_path_tests {
         });
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx.clone());
-        let timeout_ms = 1_500;
+        let timeout_ms = 10_000;
         let received = Instant::now();
         let mut rx = deadline_test_call(
             &executor,
@@ -3236,7 +3361,7 @@ mod grant_path_tests {
         // The queued runon job still leaves the queue and completes in the
         // background after the call returned.
         let task_id = response.data["task_id"].as_str().unwrap().to_string();
-        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+        let finished = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let snapshot = ctx
                     .bash_background()
@@ -3255,6 +3380,205 @@ mod grant_path_tests {
             crate::bash_background::BgTaskStatus::Completed
         );
         assert_eq!(cancels(), 0);
+    }
+
+    #[cfg(unix)]
+    async fn capture_fixture(
+        script: crate::exec_remote::wire_tests::Script,
+    ) -> (
+        crate::exec_remote::wire_tests::Daemon,
+        tempfile::TempDir,
+        ProjectRootId,
+        Arc<Executor>,
+        Arc<AppContext>,
+    ) {
+        let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
+        let (dir, root) = super::super::test_support::test_root("runon-capture");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .status()
+            .unwrap()
+            .success());
+        REMOTE_RUNON_CONNECTION
+            .lock()
+            .unwrap()
+            .insert(dir.path().into(), daemon.connection.clone());
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.bash.runon_enabled = true;
+            config.sandbox.enabled = false;
+            config.foreground_wait_window_ms = 15_000;
+            config.experimental_bash_background = true;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        (daemon, dir, root, executor, ctx)
+    }
+
+    #[cfg(unix)]
+    fn capture_call(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        arguments: Value,
+    ) -> mpsc::Receiver<BashDeferredCompletion> {
+        // These tests control the runner's first record, not how long AFT takes
+        // to register the command. Freeze that startup deadline so a busy host
+        // cannot refuse the fixture.
+        with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
+            deadline_test_call(executor, root, remote_runon_stub, arguments)
+        })
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_capture_submission(
+        daemon: &crate::exec_remote::wire_tests::Daemon,
+        rx: &mut mpsc::Receiver<BashDeferredCompletion>,
+    ) {
+        let submitted = tokio::time::timeout(Duration::from_secs(10), async {
+            while !daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| body["method"] == "exec.run")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            submitted.is_ok(),
+            "fake executor must receive the run request; early reply: {:?}",
+            rx.try_recv()
+                .ok()
+                .map(|done| format!("{:?}", done.response_for_test()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_delays_background_reply_and_foreground_promotion() {
+        use crate::exec_remote::wire_tests::Script;
+        for background in [true, false] {
+            let (daemon, _dir, root, executor, ctx) =
+                capture_fixture(Script::GatedAcceptance).await;
+            ctx.update_config(|config| config.foreground_wait_window_ms = 1_000);
+            let mut rx = capture_call(
+                &executor,
+                &root,
+                json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
+            );
+            wait_for_capture_submission(&daemon, &mut rx).await;
+            assert!(tokio::time::timeout(Duration::from_millis(1_100), rx.recv()).await.is_err(),
+                "neither launch nor promotion may reply before the first stream record (background={background})");
+            daemon.acceptance_gate.notify_one();
+            let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = done.response_for_test();
+            assert!(response.success, "{response:?}");
+            let task = response.data["task_id"].as_str().unwrap();
+            assert!(ctx
+                .bash_background()
+                .remote_progress(task, "deadline-session")
+                .unwrap()
+                .job_id
+                .is_some());
+            assert!(!done.text_for_test().unwrap().contains("hasn't confirmed"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_refusal_preserves_existing_error() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, _ctx) = capture_fixture(Script::KnownRefused).await;
+        let mut rx = capture_call(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+        );
+        wait_for_capture_submission(&daemon, &mut rx).await;
+        let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "remote_unavailable");
+        assert_eq!(response.data["message"], "runon refused: remote refused: unreachable; command was not run; retry, or omit runon to run locally");
+        assert!(response.data["task_id"].as_str().is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_deadline_shares_timeout_and_warns_with_task_id() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedAcceptance).await;
+        let started = Instant::now();
+        let mut rx = capture_call(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":500}),
+        );
+        wait_for_capture_submission(&daemon, &mut rx).await;
+        let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "capture must share the call timeout, not add 60 seconds"
+        );
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task = response.data["task_id"].as_str().unwrap();
+        assert!(response.data["output"].as_str().unwrap().ends_with(
+            "The runner hasn't confirmed the inputs were copied yet. Do not change or delete input files until bash_status shows the job queued or running."), "{response:?}");
+        assert!(ctx
+            .bash_background()
+            .remote_progress(task, "deadline-session")
+            .unwrap()
+            .job_id
+            .is_none());
+        daemon.acceptance_gate.notify_one();
+    }
+
+    #[tokio::test]
+    async fn local_background_reply_does_not_wait_for_remote_capture() {
+        let (_dir, root) = super::super::test_support::test_root("local-no-capture-wait");
+        let ctx = super::super::test_support::test_ctx();
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut rx = deadline_test_call(
+            &executor,
+            &root,
+            running_bash_stub,
+            json!({"command":"sleep 5", "background":true, "timeout":5000}),
+        );
+        let done = tokio::time::timeout(Duration::from_millis(750), rx.recv())
+            .await
+            .expect("a local background launch must not wait for capture or command completion")
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert!(!done.text_for_test().unwrap().contains("hasn't confirmed"));
+        let task = response.data["task_id"].as_str().unwrap();
+        assert!(!ctx
+            .bash_background()
+            .observed_status(task, "deadline-session", 0)
+            .unwrap()
+            .info
+            .status
+            .is_terminal());
+        let _ = ctx.bash_background().kill(task, "deadline-session");
     }
 
     #[tokio::test]

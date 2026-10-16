@@ -921,6 +921,9 @@ pub(crate) struct BgTask {
     #[cfg(unix)]
     adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
     pub(crate) state: Mutex<BgTaskState>,
+    /// The remote worker has observed a stream record or settled a submission
+    /// failure. Kept in memory: launch callers need this only in this process.
+    pub(crate) remote_launch_ready: AtomicBool,
     /// Cache construction is serialized independently of task state: renderers
     /// can read artifacts and invoke callbacks without holding the state lock.
     terminal_render: Mutex<()>,
@@ -1992,6 +1995,19 @@ impl BgTaskRegistry {
         let task = self.task_for_session(task_id, session)?;
         let state = task.lock_state().ok()?;
         rendered_execution_note(&state.metadata)
+    }
+
+    /// `None` means this was not an explicit runon request. Local commands and
+    /// commands routed remotely by legacy configuration retain immediate launches.
+    pub(crate) fn runon_launch_pending(&self, task_id: &str, session: &str) -> Option<bool> {
+        let task = self.task_for_session(task_id, session)?;
+        let state = task.lock_state().ok()?;
+        state
+            .metadata
+            .remote
+            .as_ref()
+            .filter(|r| r.explicit_runon)?;
+        Some(!task.remote_launch_ready.load(Ordering::Acquire))
     }
 
     pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
@@ -3404,6 +3420,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -3743,6 +3760,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -3987,6 +4005,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -7762,6 +7781,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,

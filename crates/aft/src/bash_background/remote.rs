@@ -932,7 +932,11 @@ impl OutputSink for TaskSink {
             *existing = note + &suffix;
         }
         self.registry
-            .persist_task_locked(&self.task, &state.metadata, &mut db)
+            .persist_task_locked(&self.task, &state.metadata, &mut db)?;
+        // The remote executor's Accepted record confirms inputs were captured.
+        // Refusals skip Accepted; those callers wait for a settled terminal error.
+        self.task.remote_launch_ready.store(true, Ordering::Release);
+        Ok(())
     }
     fn started(&mut self, started: &Started) -> io::Result<()> {
         // Runner wall-clock time is display data, not a local watchdog deadline.
@@ -1360,6 +1364,9 @@ impl BgTaskRegistry {
                         .unwrap_or(Verdict::OutcomeUnknown);
                     registry.remote_terminal(&task, verdict, Some(error));
                 }
+                // Refusals must be rendered from their settled terminal state,
+                // not raced against the worker that is still recording them.
+                task.remote_launch_ready.store(true, Ordering::Release);
             })
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -1591,6 +1598,7 @@ impl BgTaskRegistry {
                         refusal_detail: refusal_detail.clone(),
                     };
                     if retries_draining(&remote, &verdict) {
+                        task.remote_launch_ready.store(true, Ordering::Release);
                         if self.wait_draining_retry(&task, &root).await?.is_some() {
                             let Some(next) =
                                 self.submit_draining_retry(&client, &task, &root).await?

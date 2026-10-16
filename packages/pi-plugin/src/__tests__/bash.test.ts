@@ -462,6 +462,44 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("runon launch transport covers capture without extending local budgets", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({
+      output: "queued",
+      status: "running",
+      task_id: "bash-capture",
+    });
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"]),
+    );
+    for (const [runon, timeout, expected] of [
+      ["linux", undefined, 70_000],
+      ["linux", 20_000, 30_000],
+      [undefined, undefined, 25_000],
+    ] as const) {
+      await tools
+        .get("bash")!
+        .execute(
+          "test-call",
+          { command: "uname -s", background: true, runon, timeout },
+          undefined,
+          undefined,
+          { cwd: projectRoot, hasUI: false },
+        );
+      const call = calls.at(-1) as [
+        string,
+        Record<string, unknown>,
+        { transportTimeoutMs?: number },
+      ];
+      expect(call[2].transportTimeoutMs).toBe(expected);
+    }
+  });
+
   test("blocking runon transport outlasts the engine's remote hand-back at the timeout or wait cap", async () => {
     // The engine hands a blocking runon call back after its `timeout` (or the
     // worker wait limit, at most 30 minutes) even while the job is still

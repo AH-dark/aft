@@ -399,6 +399,30 @@ describe("OpenCode bash adapter", () => {
     }
   });
 
+  test("runon launch transport covers capture without extending local budgets", async () => {
+    const { calls, tool: bash } = createHarness(
+      () => ({ success: true, output: "queued", status: "running", task_id: "bash-capture" }),
+      undefined,
+      false,
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"],
+    );
+    for (const [runon, timeout, expected] of [
+      ["linux", undefined, 70_000],
+      ["linux", 20_000, 30_000],
+      [undefined, undefined, 25_000],
+    ] as const) {
+      await bash.execute(
+        { command: "uname -s", background: true, runon, timeout },
+        createMockSdkContext({}),
+      );
+      expect(calls.at(-1)?.options?.transportTimeoutMs).toBe(expected);
+    }
+  });
+
   test("schema omits wait, background and PTY args when bash.background is disabled", () => {
     const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
       bash: { background: false },
