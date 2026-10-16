@@ -92,11 +92,10 @@ impl SearchTrailer {
 
     /// Projects the engine stop state into the shared list-envelope grammar.
     ///
-    /// An exhausted stop whose page holds the whole list cut nothing, so it
-    /// carries no reason and renders no trailer. Tool descriptions promise that
-    /// a missing `shown N of M` line means the list is complete; printing
-    /// `shown 1 of 1 results (walk)` under a complete reply broke that promise
-    /// and read as if a bounded filesystem walk had replaced the index.
+    /// An exhausted ranked list has an exact total; if the requested page omits
+    /// results, the page limit is the selecting cause. A filesystem walk is a
+    /// separate bounded-input path and reports `walk` where that walk is known
+    /// to have limited coverage.
     pub fn shared_envelope_projection(&self) -> ListEnvelope {
         let complete = self.stop_state == StopState::S2Exhausted
             && self.total == SearchTotal::Exact(self.shown);
@@ -105,7 +104,7 @@ impl SearchTrailer {
         } else {
             vec![match self.stop_state {
                 StopState::S1MoreAtDepth => Reason::Cap,
-                StopState::S2Exhausted => Reason::Walk,
+                StopState::S2Exhausted => Reason::Cap,
                 StopState::S3DepthCap => Reason::Depth,
             }]
         };

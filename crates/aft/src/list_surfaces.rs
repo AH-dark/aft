@@ -149,7 +149,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S2Exhausted, execute_fallback_mode, ExternalFallbackBody, external_fallback_response",
+                predicate_name: "bounded_walk_search_envelope, fallback_search_envelope, execute_fallback_mode, ExternalFallbackBody, external_fallback_response, external_exact::sweep, walk_truncated",
             },
             ReasonEntry {
                 reason: Reason::Depth,
@@ -169,7 +169,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
+                predicate_name: "SearchTrailer::shared_envelope_projection, StopState::S1MoreAtDepth, StopState::S2Exhausted, more_available, handle_external_semantic_or_hybrid_search, handle_external_grep_search, handle_semantic_or_hybrid_search, handle_grep_search, from_matches, run_engine_ranking, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars, split_semantic_results, handle_split_search, rank_hits",
             },
         ],
     },
