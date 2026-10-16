@@ -9,8 +9,9 @@ use notify::event::{CreateKind, Flag, ModifyKind, RenameMode};
 use notify::{ErrorKind, Event, EventKind, RecursiveMode, Watcher};
 
 use crate::watcher_filter::{
-    derive_watcher_exclusion_plan, watcher_exclusion_paths, watcher_path_is_ignored_by_matcher,
-    SharedGitignore, WATCHER_EXCLUSION_LIMIT,
+    derive_watcher_exclusion_plan, start_watcher_rebuild, watcher_exclusion_paths,
+    watcher_path_is_ignored_by_matcher, ExclusionPlanUnavailable, SharedGitignore,
+    WATCHER_EXCLUSION_LIMIT,
 };
 
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -54,10 +55,43 @@ impl ProjectWatcher {
         tx: mpsc::Sender<notify::Result<Event>>,
         matcher: SharedGitignore,
         matcher_generation: Arc<AtomicU64>,
-        mut watch: F,
+        watch: F,
     ) -> notify::Result<Self>
     where
         F: FnMut(&mut notify::RecommendedWatcher, &Path) -> notify::Result<()> + Send + 'static,
+    {
+        Self::create_with_plan(
+            root,
+            extra_watch_paths,
+            tx,
+            matcher,
+            matcher_generation,
+            watch,
+            |root, matcher| {
+                derive_watcher_exclusion_plan(root, matcher, Some(WATCHER_EXCLUSION_LIMIT))
+            },
+        )
+    }
+
+    fn create_with_plan<F, P>(
+        root: PathBuf,
+        extra_watch_paths: Vec<PathBuf>,
+        tx: mpsc::Sender<notify::Result<Event>>,
+        matcher: SharedGitignore,
+        matcher_generation: Arc<AtomicU64>,
+        mut watch: F,
+        mut derive: P,
+    ) -> notify::Result<Self>
+    where
+        F: FnMut(&mut notify::RecommendedWatcher, &Path) -> notify::Result<()> + Send + 'static,
+        P: FnMut(
+                &Path,
+                &SharedGitignore,
+            ) -> Result<
+                crate::watcher_filter::WatcherExclusionPlan,
+                crate::watcher_filter::ExclusionPlanUnavailable,
+            > + Send
+            + 'static,
     {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         // The watch set below describes the matcher at this generation. Capture
@@ -68,9 +102,7 @@ impl ProjectWatcher {
         let counters = crate::context::watcher_counters_for_root(&root);
         let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
         let outcome = planning
-            .attempt(&root, generation, &counters, || {
-                derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT))
-            })
+            .attempt(&root, generation, &counters, || derive(&root, &matcher))
             .expect("initial exclusion attempt is due");
         let observed_generation = outcome.is_ok().then_some(generation);
         let plan = outcome.unwrap_or_default();
@@ -126,6 +158,8 @@ impl ProjectWatcher {
                 // a generator that creates a directory and fills it straight
                 // away). Enumerating the directory once recovers those files.
                 let mut new_directory_files = PendingNewDirectoryFiles::default();
+                let mut pending_rebuild: Option<PendingWatchRebuild> = None;
+                let mut rebuild_needed = false;
 
                 while !thread_shutdown.load(Ordering::Acquire) {
                     if new_directory_files.due() {
@@ -134,20 +168,76 @@ impl ProjectWatcher {
                         }
                     }
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    if let Some(update) = planning.replacement(
-                        &root,
-                        generation,
-                        &counters,
-                        &mut exclusion_state,
-                        &matcher,
-                        || {
-                            derive_watcher_exclusion_plan(
-                                &root,
-                                &matcher,
-                                Some(WATCHER_EXCLUSION_LIMIT),
-                            )
-                        },
-                    ) {
+                    if pending_rebuild
+                        .as_ref()
+                        .is_some_and(|work| work.generation != generation)
+                    {
+                        // An old matcher's result must not restore its watch set.
+                        pending_rebuild = None;
+                    }
+                    if let Some(outcome) = pending_rebuild.as_ref().and_then(|work| work.poll()) {
+                        pending_rebuild = None;
+                        match outcome {
+                            Ok(mut desired) => {
+                                // Events can install new directories while the helper walks.
+                                // Do not discard those watches when its older snapshot arrives.
+                                desired.extend(watched_directories.iter().cloned());
+                                desired.retain(|directory| {
+                                    !exclusion_paths
+                                        .iter()
+                                        .any(|path| directory.starts_with(path))
+                                        && !watcher_path_is_ignored_by_matcher(
+                                            &matcher, directory, &root,
+                                        )
+                                });
+                                watched_directories = match reconcile_watch_directories(
+                                    &watched_directories,
+                                    &desired,
+                                    |directory, install| {
+                                        if install {
+                                            watch_directory(
+                                                &mut watcher,
+                                                directory,
+                                                &mut watch,
+                                                &counters,
+                                            )
+                                        } else {
+                                            let _ = watcher.unwatch(directory);
+                                            Ok(false)
+                                        }
+                                    },
+                                ) {
+                                    Ok(installed) => installed,
+                                    Err(error) => {
+                                        let _ = tx.send(Err(error));
+                                        return;
+                                    }
+                                };
+                                thread_count.store(watched_directories.len(), Ordering::Release);
+                                rebuild_needed = false;
+                            }
+                            Err(reason) => {
+                                planning.walk_unavailable(&root, generation, &counters, reason)
+                            }
+                        }
+                    }
+                    let mut attempted = false;
+                    let update = if pending_rebuild.is_none() {
+                        planning.replacement(
+                            &root,
+                            generation,
+                            &counters,
+                            &mut exclusion_state,
+                            &matcher,
+                            || {
+                                attempted = true;
+                                derive(&root, &matcher)
+                            },
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(update) = update {
                         let replacement_paths = exclusion_state.paths();
                         let replacement_exclusions = match update {
                             crate::watcher_filter::WatcherExclusionUpdate::Planned(plan) => {
@@ -162,35 +252,15 @@ impl ProjectWatcher {
                                 .cloned()
                                 .collect(),
                         };
-                        let desired =
-                            exclusion_state
-                                .boundary()
-                                .map_or_else(BTreeSet::new, |boundary| {
-                                    collect_watch_directories(
-                                        boundary,
-                                        &matcher,
-                                        &replacement_paths,
-                                    )
-                                });
-                        watched_directories = match reconcile_watch_directories(
-                            &watched_directories,
-                            &desired,
-                            |directory, install| {
-                                if install {
-                                    watch_directory(&mut watcher, directory, &mut watch, &counters)
-                                } else {
-                                    let _ = watcher.unwatch(directory);
-                                    Ok(false)
-                                }
+                        forget_removed_watch_paths(
+                            &mut watched_directories,
+                            &replacement_paths,
+                            |directory| {
+                                let _ = watcher.unwatch(directory);
                             },
-                        ) {
-                            Ok(installed) => installed,
-                            Err(error) => {
-                                let _ = tx.send(Err(error));
-                                return;
-                            }
-                        };
+                        );
                         thread_count.store(watched_directories.len(), Ordering::Release);
+                        rebuild_needed = true;
                         observed_generation = Some(generation);
 
                         counters.set_backend_exclusions(
@@ -203,6 +273,27 @@ impl ProjectWatcher {
                             exclusions = replacement_exclusions;
                         }
                         exclusion_paths = replacement_paths;
+                    }
+                    if attempted && rebuild_needed {
+                        let boundary = exclusion_state.boundary().cloned();
+                        let walk_matcher = matcher.clone();
+                        let walk_exclusions = exclusion_paths.clone();
+                        match start_watcher_rebuild(move || {
+                            boundary.map_or_else(BTreeSet::new, |boundary| {
+                                collect_watch_directories(
+                                    &boundary,
+                                    &walk_matcher,
+                                    &walk_exclusions,
+                                )
+                            })
+                        }) {
+                            Ok(result) => {
+                                pending_rebuild = Some(PendingWatchRebuild { generation, result })
+                            }
+                            Err(reason) => {
+                                planning.walk_unavailable(&root, generation, &counters, reason)
+                            }
+                        }
                     }
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
@@ -323,6 +414,23 @@ impl ProjectWatcher {
     #[cfg(test)]
     fn watched_directory_count(&self) -> usize {
         self.watched_directory_count.load(Ordering::Acquire)
+    }
+}
+
+struct PendingWatchRebuild {
+    generation: u64,
+    result: mpsc::Receiver<Result<BTreeSet<PathBuf>, ExclusionPlanUnavailable>>,
+}
+
+impl PendingWatchRebuild {
+    fn poll(&self) -> Option<Result<BTreeSet<PathBuf>, ExclusionPlanUnavailable>> {
+        match self.result.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err(ExclusionPlanUnavailable::WorkerDisconnected))
+            }
+        }
     }
 }
 
@@ -568,6 +676,8 @@ fn collect_watch_directories(
             continue;
         }
         directories.insert(directory.clone());
+        #[cfg(test)]
+        tests::block_watch_walk(&directory);
         let Ok(entries) = crate::watcher_filter::exclusion_read_dir(&directory) else {
             continue;
         };
@@ -582,10 +692,189 @@ fn collect_watch_directories(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::RwLock;
+    use std::sync::{Condvar, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
     use ignore::gitignore::GitignoreBuilder;
+
+    #[derive(Default)]
+    struct WalkGate {
+        state: Mutex<(bool, usize)>,
+        changed: Condvar,
+    }
+
+    fn walk_gates() -> &'static Mutex<std::collections::BTreeMap<PathBuf, Arc<WalkGate>>> {
+        static GATES: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, Arc<WalkGate>>>> =
+            OnceLock::new();
+        GATES.get_or_init(Mutex::default)
+    }
+
+    pub(super) fn block_watch_walk(path: &Path) {
+        let gate = walk_gates().lock().unwrap().get(path).cloned();
+        if let Some(gate) = gate {
+            let mut state = gate.state.lock().unwrap();
+            state.1 += 1;
+            gate.changed.notify_all();
+            while !state.0 {
+                state = gate.changed.wait(state).unwrap();
+            }
+        }
+    }
+
+    struct WalkBlock {
+        path: PathBuf,
+        gate: Arc<WalkGate>,
+    }
+
+    impl WalkBlock {
+        fn release(&self) {
+            self.gate.state.lock().unwrap().0 = true;
+            self.gate.changed.notify_all();
+        }
+
+        fn wait_for_walks(&self, count: usize) {
+            let (state, _) = self
+                .gate
+                .changed
+                .wait_timeout_while(
+                    self.gate.state.lock().unwrap(),
+                    Duration::from_secs(5),
+                    |state| state.1 < count,
+                )
+                .unwrap();
+            let started = state.1;
+            drop(state);
+            assert!(started >= count, "re-inclusion walk {count} never started");
+        }
+    }
+
+    impl Drop for WalkBlock {
+        fn drop(&mut self) {
+            self.release();
+            walk_gates().lock().unwrap().remove(&self.path);
+        }
+    }
+
+    struct ReincludeFixture {
+        // Release blocked helpers before joining the watcher, including on panic.
+        block: WalkBlock,
+        watcher: ProjectWatcher,
+        root: tempfile::TempDir,
+        rx: mpsc::Receiver<notify::Result<Event>>,
+        counters: Arc<crate::context::WatcherCounters>,
+    }
+
+    impl ReincludeFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("generated/nested")).unwrap();
+            std::fs::create_dir(root.path().join("healthy")).unwrap();
+            let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+            std::fs::write(root.path().join(".gitignore"), "generated/\n").unwrap();
+            let mut builder = GitignoreBuilder::new(&canonical_root);
+            builder.add(root.path().join(".gitignore"));
+            let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+            let generation = Arc::new(AtomicU64::new(1));
+            let counters = crate::context::watcher_counters_for_root(&canonical_root);
+            let (tx, rx) = mpsc::channel();
+            let mut initial = true;
+            let watcher = ProjectWatcher::create_with_plan(
+                canonical_root.clone(),
+                Vec::new(),
+                tx,
+                matcher.clone(),
+                generation.clone(),
+                |watcher, path| watcher.watch(path, RecursiveMode::NonRecursive),
+                move |root, matcher| {
+                    if std::mem::take(&mut initial) {
+                        derive_watcher_exclusion_plan(root, matcher, Some(WATCHER_EXCLUSION_LIMIT))
+                    } else {
+                        Err(crate::watcher_filter::ExclusionPlanUnavailable::WorkerDisconnected)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(watcher.watched_directory_count(), 2);
+            let path = canonical_root.join("generated");
+            let gate = Arc::new(WalkGate::default());
+            walk_gates()
+                .lock()
+                .unwrap()
+                .insert(path.clone(), gate.clone());
+            let block = WalkBlock { path, gate };
+            *matcher.write().unwrap() = None;
+            generation.fetch_add(1, Ordering::Release);
+            block.wait_for_walks(1);
+            Self {
+                block,
+                watcher,
+                root,
+                rx,
+                counters,
+            }
+        }
+
+        fn wait_until_watched(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.watcher.watched_directory_count() != 4 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(self.watcher.watched_directory_count(), 4);
+        }
+    }
+
+    #[test]
+    fn reinclude_blocked_walk_keeps_healthy_events_flowing() {
+        let fixture = ReincludeFixture::new();
+        let path = fixture.root.path().join("healthy/still-watched.rs");
+        std::fs::write(&path, "source").unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let event = fixture
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("healthy folder event stalled behind the re-inclusion walk")
+                .unwrap();
+            if event.paths.contains(&path) {
+                break;
+            }
+        }
+        assert!(!fixture.block.gate.state.lock().unwrap().0);
+        fixture.block.release();
+        fixture.wait_until_watched();
+    }
+
+    #[test]
+    fn reinclude_completed_walk_restores_descendant_events() {
+        let fixture = ReincludeFixture::new();
+        fixture.block.release();
+        fixture.wait_until_watched();
+        let path = fixture.root.path().join("generated/nested/restored.rs");
+        std::fs::write(&path, "source").unwrap();
+        wait_for_paths(&fixture.rx, &[path]);
+    }
+
+    #[test]
+    fn reinclude_walk_timeout_is_visible_and_retried() {
+        let fixture = ReincludeFixture::new();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let health = fixture.counters.snapshot().exclusion_planning.unwrap();
+            if health.last_failure == Some("io_deadline") {
+                assert_eq!(health.status, "retrying");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "walk timeout missing from health: {health:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fixture.watcher.watched_directory_count(), 2);
+        fixture.block.wait_for_walks(2);
+        fixture.block.release();
+        fixture.wait_until_watched();
+    }
 
     #[test]
     fn new_tree_scans_only_directory_creates_renames_and_changed_boundaries() {

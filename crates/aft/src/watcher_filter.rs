@@ -824,6 +824,7 @@ fn exclusion_manifest_is_file(path: &Path) -> bool {
 
 /// Classify every component before probing descendants: lstat of a deep path
 /// alone would still follow a symlink in one of its parent components.
+#[derive(Clone)]
 pub(crate) struct WatcherWalkBoundary {
     root: PathBuf,
     device: Option<u64>,
@@ -1060,13 +1061,38 @@ impl WatcherExclusionRetry {
         }
         self.attempts += 1;
         let outcome = derive();
-        let (status, last_failure) = match &outcome {
+        self.record_outcome(root, generation, counters, &outcome);
+        Some(outcome)
+    }
+
+    /// A plan is not installed on inotify until its directory walk completes.
+    /// Retry a failed walk with the same generation's planning budget and health.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn walk_unavailable(
+        &mut self,
+        root: &Path,
+        generation: u64,
+        counters: &crate::context::WatcherCounters,
+        reason: ExclusionPlanUnavailable,
+    ) {
+        self.record_outcome(root, generation, counters, &Err::<(), _>(reason));
+    }
+
+    fn record_outcome<T>(
+        &mut self,
+        root: &Path,
+        generation: u64,
+        counters: &crate::context::WatcherCounters,
+        outcome: &Result<T, ExclusionPlanUnavailable>,
+    ) {
+        let (status, last_failure) = match outcome {
             Ok(_) => {
                 self.consumed = true;
                 self.retry_at = None;
                 ("planned", None)
             }
             Err(reason) => {
+                self.consumed = false;
                 // Back off after completion, not from the start of an attempt
                 // that may have spent its entire deadline in filesystem I/O.
                 let backoff = Duration::from_millis(250 * (1_u64 << (self.attempts - 1).min(4)));
@@ -1094,7 +1120,6 @@ impl WatcherExclusionRetry {
             status,
             last_failure,
         });
-        Some(outcome)
     }
 }
 
@@ -1201,14 +1226,11 @@ pub(crate) fn derive_watcher_exclusion_plan(
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> ExclusionPlanOutcome {
-    static PLANNERS: std::sync::OnceLock<Arc<ExclusionPlannerPool>> = std::sync::OnceLock::new();
     let root = root.to_path_buf();
     let matcher = matcher.clone();
     run_bounded_exclusion_planner(
         Duration::from_secs(2),
-        PLANNERS
-            .get_or_init(|| Arc::new(ExclusionPlannerPool::default()))
-            .clone(),
+        exclusion_planner_pool(),
         move || {
             derive_exclusion_plan(
                 &root,
@@ -1218,6 +1240,36 @@ pub(crate) fn derive_watcher_exclusion_plan(
             )
         },
     )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn exclusion_planner_pool() -> Arc<ExclusionPlannerPool> {
+    static PLANNERS: std::sync::OnceLock<Arc<ExclusionPlannerPool>> = std::sync::OnceLock::new();
+    PLANNERS
+        .get_or_init(|| Arc::new(ExclusionPlannerPool::default()))
+        .clone()
+}
+
+/// Wait for bounded filesystem work away from the event-forwarding thread.
+/// The coordinator never does filesystem I/O; the inner helper shares the
+/// planner's two permits, including permits held by timed-out, stuck workers.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_watcher_rebuild<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<mpsc::Receiver<Result<T, ExclusionPlanUnavailable>>, ExclusionPlanUnavailable> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("aft-watch-rebuild".into())
+        .spawn(move || {
+            let result = run_bounded_exclusion_planner(
+                Duration::from_secs(2),
+                exclusion_planner_pool(),
+                work,
+            );
+            let _ = tx.send(result);
+        })
+        .map_err(|_| ExclusionPlanUnavailable::SpawnFailed)?;
+    Ok(rx)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1235,11 +1287,11 @@ struct ExclusionPlannerPool {
 /// generation only after a successful plan. Deadline and worker failures are
 /// unavailable outcomes, not successful empty plans; the backend can retry them.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn run_bounded_exclusion_planner(
+fn run_bounded_exclusion_planner<T: Send + 'static>(
     timeout: Duration,
     pool: Arc<ExclusionPlannerPool>,
-    plan: impl FnOnce() -> WatcherExclusionPlan + Send + 'static,
-) -> ExclusionPlanOutcome {
+    plan: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ExclusionPlanUnavailable> {
     let deadline = Instant::now() + timeout;
     let mut in_flight = pool.in_flight.lock().unwrap_or_else(|e| e.into_inner());
     loop {
