@@ -35,10 +35,23 @@ pub(crate) fn register_storage_root(path: &Path) {
 /// storage is also excluded wholesale so its generated source and cache files
 /// never feed back into project indexing.
 pub(crate) fn is_excluded(path: &Path) -> bool {
+    is_excluded_file(path)
+        || storage_roots()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|root| path.starts_with(root))
+}
+
+fn is_excluded_file(path: &Path) -> bool {
     if crate::os_metadata::is_os_metadata_path(path) {
         return true;
     }
-    if let Some(name) = path.file_name().map(|n| n.as_encoded_bytes()) {
+    if let Some(name) = path
+        .file_name()
+        .filter(|_| !path.is_dir())
+        .map(|n| n.as_encoded_bytes())
+    {
         if [
             b"-wal".as_slice(),
             b"-shm",
@@ -56,11 +69,35 @@ pub(crate) fn is_excluded(path: &Path) -> bool {
         }
     }
     crate::db::file_identity::is_registered_file_path(path)
-        || storage_roots()
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|root| path.starts_with(root))
+}
+
+/// Authorized task content is not project source, but must still be checked
+/// before a pinned-directory permission probe opens and closes its descriptor.
+pub(crate) fn is_sqlite_or_metadata(path: &Path) -> bool {
+    is_excluded_file(path) || crate::db::file_identity::is_live_sqlite_file(path)
+}
+
+/// Only explicit, ownership-checked registered task artifacts may bypass the
+/// storage root exclusion. SQLite names and aliases remain forbidden.
+pub(crate) fn read_bounded(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+    authorized_task_artifact: bool,
+) -> std::io::Result<Vec<u8>> {
+    if authorized_task_artifact {
+        if is_sqlite_or_metadata(path) || std::fs::symlink_metadata(path)?.file_type().is_symlink()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SQLite files and aliases are not readable task content",
+            ));
+        }
+    } else {
+        admit(path)?;
+    }
+    #[cfg(test)]
+    record_open(path);
+    crate::bounded_io::read(path, deadline)
 }
 
 /// Guard direct source reads as well as enumeration. Watcher deltas and queued
@@ -156,6 +193,50 @@ pub(crate) use open_probe::{record_open, Probe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_named_directories_remain_project_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut expected = Vec::new();
+        for name in [
+            "models.db",
+            "models.SQLITE",
+            "models.sqlite3",
+            "event-wal",
+            "event-shm",
+            "event-journal",
+        ] {
+            let directory = root.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let source = directory.join("source.rs");
+            std::fs::write(&source, "fn user_source() {}\n").unwrap();
+            assert!(!is_excluded(&directory), "excluded directory {directory:?}");
+            assert!(!is_excluded(&source));
+            expected.push(source);
+        }
+        let storage = root.join("internal.db");
+        std::fs::create_dir(&storage).unwrap();
+        register_storage_root(&storage);
+        std::fs::write(storage.join("internal.rs"), "fn internal() {}\n").unwrap();
+        assert!(is_excluded(&storage));
+        let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        walked.sort();
+        expected.sort();
+        assert_eq!(walked, expected);
+        for name in [
+            "fixture.db",
+            "fixture.sqlite",
+            "fixture.sqlite3",
+            "fixture-wal",
+            "fixture-shm",
+            "fixture-journal",
+        ] {
+            let file = root.join(name);
+            std::fs::write(&file, "not source").unwrap();
+            assert!(is_excluded(&file), "admitted file {file:?}");
+        }
+    }
 
     #[test]
     fn direct_project_reads_reject_storage_and_sqlite_before_open() {

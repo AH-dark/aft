@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Exclude AFT storage and live SQLite files before project walkers open source bytes, while retaining source directories with SQLite-like names. The ranking-fenced search_index.rs, semantic_index.rs, semantic_search and lib.rs changes only guard corpus admission and reads; ranking and routing are unchanged. Real-query rows and exact/concept recall must remain byte-identical."
+}

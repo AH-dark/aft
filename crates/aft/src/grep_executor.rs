@@ -152,6 +152,7 @@ pub struct ResolvedRoot {
     pub use_index: bool,
     pub is_external: bool,
     pub ignored_target: bool,
+    authorized_task_artifact: bool,
 }
 
 pub fn project_root(ctx: &AppContext) -> PathBuf {
@@ -189,13 +190,36 @@ pub fn resolve_grep_scope(
 
     let roots = search_roots
         .into_iter()
-        .map(|search_root| {
+        .flat_map(|search_root| {
+            let outputs = paths.filter(|paths| !paths.is_null()).and_then(|_| {
+                ctx.bash_background()
+                    .explicit_task_artifacts(session_id, &search_root)
+            });
+            match outputs {
+                Some(outputs) => {
+                    let filter_root = if search_root.is_dir() {
+                        search_root
+                    } else {
+                        search_root.parent().unwrap_or(&search_root).to_path_buf()
+                    };
+                    outputs
+                        .into_iter()
+                        .map(|path| (path, Some(filter_root.clone())))
+                        .collect::<Vec<_>>()
+                }
+                None => vec![(search_root, None)],
+            }
+        })
+        .map(|(search_root, task_filter_root)| {
             let scope = resolve_search_scope(&project_root, Some(&search_root.to_string_lossy()));
             let is_external = !scope.use_index;
             let ignored_target = paths.is_some_and(|paths| !paths.is_null())
                 && !is_same_directory(&scope.root, &project_root)
                 && target_is_ignored(&scope.root);
-            let filter_root = if ignored_target {
+            let authorized_task_artifact = task_filter_root.is_some();
+            let filter_root = if let Some(filter_root) = task_filter_root {
+                filter_root
+            } else if ignored_target {
                 // An ignored target is outside the index's project-relative
                 // catalog. Like glob's fallback, interpret its include/exclude
                 // patterns relative to the directory the caller explicitly named.
@@ -209,6 +233,7 @@ pub fn resolve_grep_scope(
                 use_index: scope.use_index,
                 is_external,
                 ignored_target,
+                authorized_task_artifact,
             }
         })
         .collect::<Vec<_>>();
@@ -484,13 +509,21 @@ fn execute_root_profiled(
         } else {
             IndexStatus::Fallback
         };
-        let result = if params
-            .path_exclusion
-            .is_some_and(|exclude| exclude(&root.search_root, project_root))
+        let result = if (root.authorized_task_artifact
+            && !filters.matches(&root.filter_root, &root.search_root))
+            || params
+                .path_exclusion
+                .is_some_and(|exclude| exclude(&root.search_root, project_root))
         {
             empty_grep_result(index_status, false)
         } else {
-            grep_explicit_file(&root.search_root, pattern, max_results, index_status)
+            grep_explicit_file_with_output(
+                &root.search_root,
+                pattern,
+                max_results,
+                index_status,
+                root.authorized_task_artifact,
+            )
         };
         return (result, GrepExecutionPhaseTimings::default());
     }
@@ -626,11 +659,22 @@ fn empty_grep_result(index_status: IndexStatus, fully_degraded: bool) -> GrepRes
 /// is searched even when it is gitignored, `.aftignore`d, or not yet indexed.
 /// Binary detection and UTF-8 guards still apply (via `read_searchable_text`
 /// inside `fallback_search_file`).
+#[cfg(test)]
 fn grep_explicit_file(
     file: &Path,
     pattern: &CompiledPattern,
     max_results: usize,
     index_status: IndexStatus,
+) -> GrepResult {
+    grep_explicit_file_with_output(file, pattern, max_results, index_status, false)
+}
+
+fn grep_explicit_file_with_output(
+    file: &Path,
+    pattern: &CompiledPattern,
+    max_results: usize,
+    index_status: IndexStatus,
+    authorized_task_artifact: bool,
 ) -> GrepResult {
     let _io_scope = crate::bounded_io::enter_if_absent(FALLBACK_WALK_BUDGET);
     let total_matches = AtomicUsize::new(0);
@@ -656,6 +700,7 @@ fn grep_explicit_file(
         &engine_capped,
         job_cancellation.as_ref(),
         Some(deadline),
+        authorized_task_artifact,
     );
     let engine_capped = engine_capped.load(Ordering::Relaxed);
     let files_searched = files_searched.load(Ordering::Relaxed);
@@ -766,6 +811,9 @@ fn fallback_target_walk_builder(
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(true)
         .filter_entry(move |entry| {
+            if crate::project_content::is_excluded(entry.path()) {
+                return false;
+            }
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
                 return false;
             }
@@ -781,9 +829,6 @@ fn fallback_target_walk_builder(
                     Some(Err(_)) => return false,
                     _ => {}
                 }
-            }
-            if crate::project_content::is_excluded(entry.path()) {
-                return false;
             }
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -1460,6 +1505,7 @@ fn fallback_grep_with_limits_counted(
                         &engine_capped,
                         job_cancellation.as_ref(),
                         Some(scan_deadline),
+                        false,
                     );
                     if truncated.load(Ordering::Relaxed)
                         && total_matches.load(Ordering::Relaxed) >= stop_after
@@ -1538,6 +1584,7 @@ fn fallback_search_file(
     engine_capped: &AtomicBool,
     job_cancellation: Option<&crate::executor::JobCancellation>,
     deadline: Option<Instant>,
+    authorized_task_artifact: bool,
 ) -> Vec<GrepMatch> {
     if deadline.is_some_and(|deadline| Instant::now() >= deadline)
         || should_stop_fallback_search(truncated, total_matches, stop_after, job_cancellation)
@@ -1546,7 +1593,8 @@ fn fallback_search_file(
         return Vec::new();
     }
 
-    let bytes = match crate::bounded_io::read(file, deadline) {
+    let bytes = match crate::project_content::read_bounded(file, deadline, authorized_task_artifact)
+    {
         Ok(bytes) => bytes,
         Err(error) => {
             if error.kind() == std::io::ErrorKind::TimedOut {
@@ -1943,6 +1991,7 @@ mod tests {
                 &capped,
                 None,
                 Some(Instant::now() + Duration::from_millis(80)),
+                false,
             );
             tx.send((
                 matches,
@@ -2194,6 +2243,7 @@ mod tests {
                 use_index: true,
                 is_external: false,
                 ignored_target: false,
+                authorized_task_artifact: false,
             }],
             multi_root: false,
             per_root_max: 10,
@@ -2792,6 +2842,7 @@ mod tests {
                     use_index: true,
                     is_external: false,
                     ignored_target: false,
+                    authorized_task_artifact: false,
                 })
                 .collect(),
             multi_root: true,

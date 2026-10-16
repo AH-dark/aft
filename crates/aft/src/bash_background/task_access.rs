@@ -153,6 +153,9 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
     if task_directory(path).is_none() {
         return true;
     }
+    if crate::project_content::is_sqlite_or_metadata(path) {
+        return false;
+    }
     if is_task_environment(path) {
         return false;
     }
@@ -163,6 +166,8 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
         return false;
     }
     if metadata.is_file() {
+        #[cfg(test)]
+        crate::project_content::record_open(path);
         return path
             .parent()
             .and_then(|parent| PinnedDir::open(parent).ok())
@@ -175,6 +180,32 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
 }
 
 impl BgTaskRegistry {
+    /// Expand only an explicitly named bundle directory or registered file,
+    /// never a storage ancestor. Recheck session/head access for each exact name.
+    pub(crate) fn explicit_task_artifacts(
+        &self,
+        session: &str,
+        path: &Path,
+    ) -> Option<Vec<PathBuf>> {
+        let record = self.task_read_record(task_directory(path)?)?;
+        let paths = &record.resolved.paths;
+        if ![&paths.dir, &paths.control_dir, &paths.io_dir]
+            .into_iter()
+            .any(|directory| path == directory)
+            && !paths.readable_files().any(|file| path == file)
+        {
+            return None;
+        }
+        Some(
+            paths
+                .readable_files()
+                .filter(|file| file.starts_with(path))
+                .filter(|file| self.is_readable_task_path(session, file))
+                .map(Path::to_path_buf)
+                .collect(),
+        )
+    }
+
     pub(super) fn task_namespaces(&self, storage: &Path) -> std::io::Result<fs::ReadDir> {
         #[cfg(test)]
         self.inner

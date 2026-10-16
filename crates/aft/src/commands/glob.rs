@@ -143,6 +143,10 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             pattern,
             DEFAULT_MAX_RESULTS + 1,
             ignored_targets[0],
+            req.params
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(|_| req.session()),
         );
         indexed_mtimes = discovery.indexed_mtimes;
         (
@@ -167,6 +171,10 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     pattern,
                     DEFAULT_MAX_RESULTS + 1,
                     *ignored,
+                    req.params
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .map(|_| req.session()),
                 )
             })
             .collect();
@@ -338,7 +346,35 @@ fn glob_root(
     pattern: &str,
     max_results: usize,
     ignored_target: bool,
+    explicit_session: Option<&str>,
 ) -> GlobDiscovery {
+    if let Some(outputs) = explicit_session.and_then(|session| {
+        ctx.bash_background()
+            .explicit_task_artifacts(session, search_root)
+    }) {
+        let filters = build_path_filters(&[pattern.to_owned()], &[]).unwrap_or_default();
+        let filter_root = if search_root.is_file() {
+            search_root.parent().unwrap_or(search_root)
+        } else {
+            search_root
+        };
+        let entries_visited = outputs.len();
+        let files: Vec<_> = outputs
+            .into_iter()
+            .filter(|path| filters.matches(filter_root, path))
+            .collect();
+        return GlobDiscovery {
+            scope_has_files: !files.is_empty(),
+            files,
+            indexed_mtimes: HashMap::new(),
+            walk_truncated: false,
+            source: "task-output",
+            entries_visited,
+            walk_time: Duration::ZERO,
+            scope_probe: Duration::ZERO,
+            skipped_foreign_mounts: 0,
+        };
+    }
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
     let indexed_snapshot = {

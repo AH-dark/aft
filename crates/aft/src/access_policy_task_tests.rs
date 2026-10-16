@@ -343,6 +343,109 @@ fn access_policy_own_task_io_folder_grep_and_glob() {
 }
 
 #[test]
+fn explicit_task_io_grep_opens_only_registered_nonsecret_artifacts() {
+    let f = fixture();
+    for name in ["fixture.db", "fixture.db-shm", "unregistered.txt"] {
+        std::fs::write(f.worker.io_dir.join(name), "worker-output\n").unwrap();
+    }
+    let probe = crate::project_content::Probe::new(&f.worker.io_dir);
+    for (session, scope) in [
+        ("worker-session", None),
+        ("head-session", Some(f.head.clone())),
+    ] {
+        crate::access_policy::with_scope(scope, || {
+            let mut req = request(
+                "grep",
+                json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+            );
+            req.session_id = Some(session.into());
+            let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["total_matches"], 1, "{:?}", response.data);
+        });
+    }
+    let mut expected = vec![
+        f.worker.stdout.clone(),
+        f.worker.stderr.clone(),
+        f.worker.exit.clone(),
+    ];
+    expected.sort();
+    let mut opened = probe.paths();
+    opened.sort();
+    opened.dedup();
+    assert_eq!(opened, expected);
+    let mut req = request("glob", json!({"path": f.worker.io_dir, "pattern": "*"}));
+    req.session_id = Some("worker-session".into());
+    let response = crate::commands::glob::handle_glob(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total"], 3, "{:?}", response.data);
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+    );
+    req.session_id = Some("unrelated-session".into());
+    assert_floor(
+        crate::commands::grep::handle_grep(&req, &f.ctx),
+        &f.worker.io_dir,
+    );
+    let mut opened = probe.paths();
+    opened.sort();
+    opened.dedup();
+    assert_eq!(opened, expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_task_io_grep_rejects_stdout_alias_to_live_sqlite() {
+    let f = fixture();
+    std::fs::remove_file(&f.worker.stdout).unwrap();
+    std::fs::hard_link(
+        f.ctx.config().storage_dir.as_ref().unwrap().join("aft.db"),
+        &f.worker.stdout,
+    )
+    .unwrap();
+    let probe = crate::project_content::Probe::new(&f.worker.io_dir);
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+    );
+    req.session_id = Some("worker-session".into());
+    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total_matches"], 0, "{:?}", response.data);
+    let mut opened = probe.paths();
+    opened.sort();
+    opened.dedup();
+    let mut expected = vec![f.worker.stderr, f.worker.exit];
+    expected.sort();
+    assert_eq!(opened, expected);
+}
+
+#[test]
+fn explicit_task_artifacts_keep_filters_and_do_not_widen_project_walks() {
+    let f = fixture();
+    std::fs::write(&f.worker.stderr, "stderr-output\n").unwrap();
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "output", "include": ["stderr"]}),
+    );
+    req.session_id = Some("worker-session".into());
+    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total_matches"], 1, "{:?}", response.data);
+    assert!(response.data["matches"][0]["file"]
+        .as_str()
+        .unwrap()
+        .ends_with("stderr"));
+    f.ctx
+        .update_config(|config| config.project_root = Some(f._dir.path().to_path_buf()));
+    req.params = json!({"pattern": "worker-output|stderr-output"});
+    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total_matches"], 0, "{:?}", response.data);
+}
+
+#[test]
 fn access_policy_head_status_is_read_only_for_worker_tasks() {
     let f = fixture();
     crate::access_policy::with_scope(Some(f.head.clone()), || {

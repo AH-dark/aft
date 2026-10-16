@@ -129,6 +129,25 @@ impl TaskPaths {
         }
     }
 
+    /// Exact bundle files visible to authorized readers. The launch environment
+    /// is intentionally absent even when the caller may inspect task records.
+    pub(crate) fn readable_files(&self) -> impl Iterator<Item = &Path> {
+        [
+            &self.json,
+            &self.command,
+            &self.wrapper,
+            &self.manifest,
+            &self.sandbox_profile,
+        ]
+        .into_iter()
+        .map(PathBuf::as_path)
+        .chain(
+            TaskArtifact::ALL
+                .into_iter()
+                .map(|artifact| self.artifact_path(artifact)),
+        )
+    }
+
     fn artifact_name(&self, artifact: TaskArtifact) -> OsString {
         match self.layout {
             TaskLayout::Directory => OsString::from(artifact.file_name()),
