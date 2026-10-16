@@ -1005,13 +1005,13 @@ pub(crate) fn derive_watcher_exclusion_plan(
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> WatcherExclusionPlan {
-    static IN_FLIGHT: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
+    static PLANNERS: std::sync::OnceLock<Arc<ExclusionPlannerPool>> = std::sync::OnceLock::new();
     let root = root.to_path_buf();
     let matcher = matcher.clone();
     run_bounded_exclusion_planner(
         Duration::from_secs(2),
-        IN_FLIGHT
-            .get_or_init(|| Arc::new(AtomicU64::new(0)))
+        PLANNERS
+            .get_or_init(|| Arc::new(ExclusionPlannerPool::default()))
             .clone(),
         move || {
             derive_exclusion_plan(
@@ -1024,32 +1024,59 @@ pub(crate) fn derive_watcher_exclusion_plan(
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Default)]
+struct ExclusionPlannerPool {
+    in_flight: Mutex<usize>,
+    available: std::sync::Condvar,
+}
+
 /// Directory opens and even lstat can stall in the kernel. A deadline in the
 /// walking loop cannot interrupt them, so isolate the entire optional plan.
 /// Timed-out workers retain their permit until they exit; at most two can be
-/// stuck across all roots, and later binds fall back to no kernel exclusions.
+/// stuck across all roots. Wait for capacity within the same caller deadline:
+/// a restart can re-derive many roots at once, and backends consume each matcher
+/// generation only once. Brief contention must not publish an empty plan for it.
+/// Callers still fall back to no kernel exclusions when the deadline expires.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn run_bounded_exclusion_planner(
     timeout: Duration,
-    in_flight: Arc<AtomicU64>,
+    pool: Arc<ExclusionPlannerPool>,
     plan: impl FnOnce() -> WatcherExclusionPlan + Send + 'static,
 ) -> WatcherExclusionPlan {
     let empty = || WatcherExclusionPlan {
         selected: Vec::new(),
         dropped: Vec::new(),
     };
-    if in_flight.fetch_add(1, Ordering::AcqRel) >= 2 {
-        in_flight.fetch_sub(1, Ordering::AcqRel);
-        log::warn!("watcher exclusion planners busy; proceeding without exclusions");
-        return empty();
+    let deadline = Instant::now() + timeout;
+    let mut in_flight = pool.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            log::warn!(
+                "watcher exclusion planners busy past deadline; proceeding without exclusions"
+            );
+            return empty();
+        }
+        if *in_flight < 2 {
+            break;
+        }
+        (in_flight, _) = pool
+            .available
+            .wait_timeout(in_flight, remaining)
+            .unwrap_or_else(|e| e.into_inner());
     }
-    struct Permit(Arc<AtomicU64>);
+    *in_flight += 1;
+    drop(in_flight);
+    struct Permit(Arc<ExclusionPlannerPool>);
     impl Drop for Permit {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::AcqRel);
+            let mut in_flight = self.0.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            *in_flight -= 1;
+            self.0.available.notify_one();
         }
     }
-    let permit = Permit(in_flight);
+    let permit = Permit(pool);
     let (tx, rx) = mpsc::sync_channel(1);
     if thread::Builder::new()
         .name("aft-exclusion-plan".into())
@@ -1061,12 +1088,13 @@ fn run_bounded_exclusion_planner(
     {
         return empty();
     }
-    rx.recv_timeout(timeout).unwrap_or_else(|error| {
-        log::warn!(
-            "watcher exclusion planning unavailable ({error}); proceeding without exclusions"
-        );
-        empty()
-    })
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "watcher exclusion planning unavailable ({error}); proceeding without exclusions"
+            );
+            empty()
+        })
 }
 
 /// The selected exclusions of [`derive_watcher_exclusion_plan`].
@@ -2546,8 +2574,76 @@ mod tests {
     }
 
     #[test]
+    fn exclusion_planner_waits_for_capacity_before_publishing_generation_plan() {
+        let root = TempDir::new().unwrap();
+        let root_path = fs::canonicalize(root.path()).unwrap();
+        fs::write(root_path.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::create_dir_all(root_path.join("target/debug")).unwrap();
+        let mut builder = GitignoreBuilder::new(&root_path);
+        builder.add_line(None, "/target/").unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let in_flight = Arc::new(ExclusionPlannerPool::default());
+        let mut releases = Vec::new();
+        let mut callers = Vec::new();
+        for _ in 0..2 {
+            let (release, blocked) = mpsc::channel::<()>();
+            releases.push(release);
+            let (started_tx, started_rx) = mpsc::channel();
+            let permits = in_flight.clone();
+            callers.push(thread::spawn(move || {
+                run_bounded_exclusion_planner(Duration::from_secs(2), permits, move || {
+                    started_tx.send(()).unwrap();
+                    let _ = blocked.recv();
+                    WatcherExclusionPlan {
+                        selected: Vec::new(),
+                        dropped: Vec::new(),
+                    }
+                })
+            }));
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+
+        // Backends consume each matcher generation once. A busy pool must not
+        // turn that generation's only derivation into an empty exclusion set.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let target = root_path.join("target");
+        let caller = thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let plan =
+                run_bounded_exclusion_planner(Duration::from_secs(2), in_flight, move || {
+                    derive_exclusion_plan(
+                        &root_path,
+                        &matcher,
+                        Some(WATCHER_EXCLUSION_LIMIT),
+                        crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+                    )
+                });
+            let _ = result_tx.send(plan);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "busy planners must wait within the caller deadline, not publish an empty plan"
+        );
+        drop(releases);
+        let plan = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            watcher_exclusion_paths(&plan.selected).contains(&target),
+            "the waiting generation must install target/: {plan:?}"
+        );
+        caller.join().unwrap();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+    }
+
+    #[test]
     fn exclusion_planner_deadline_and_worker_limit_survive_blocked_io() {
-        let in_flight = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(ExclusionPlannerPool::default());
         let mut releases = Vec::new();
         for _ in 0..2 {
             let (release, blocked) = mpsc::channel::<()>();
@@ -2574,7 +2670,7 @@ mod tests {
             assert!(result.selected.is_empty());
             caller.join().unwrap();
         }
-        assert_eq!(in_flight.load(Ordering::Acquire), 2);
+        assert_eq!(*in_flight.in_flight.lock().unwrap(), 2);
         let (started_tx, started_rx) = mpsc::channel();
         let result =
             run_bounded_exclusion_planner(Duration::from_millis(20), in_flight, move || {
