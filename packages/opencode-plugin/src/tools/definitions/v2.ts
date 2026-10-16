@@ -73,7 +73,11 @@ export interface V2ToolConsumers {
   /** A resumed session can discover pending wakes without starting another shell. */
   registerSession?: (sessionID: string | undefined) => void;
   /** Maps legacy tool permission requests to the V2 session permission service. */
-  requestPermission?: (request: V2PermissionRequest, context: V2ExecutionContext) => Promise<void>;
+  requestPermission?: (
+    request: V2PermissionRequest,
+    context: V2ExecutionContext,
+    signal?: AbortSignal,
+  ) => Promise<void>;
   /** Runs bash through the dedicated V2 executor while preserving the shared schema. */
   executeBash?: (execution: V2BashExecution) => Promise<ToolResult>;
 }
@@ -338,7 +342,7 @@ function runtimeFor(
     ask: (asked) => {
       const request = v2PermissionRequest(name, asked);
       if (consumers.requestPermission) {
-        return consumers.requestPermission(request, context).catch((error) => {
+        return consumers.requestPermission(request, context, signal).catch((error) => {
           if (error instanceof PermissionStepAbort) onStepAbort(error.original);
           throw error;
         });

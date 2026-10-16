@@ -142,4 +142,43 @@ describe("OpenCode 2 in-process permission assertion", () => {
   test("capability probe accepts assert without a host version string", () => {
     expect(typeof hoistedV2ToolConsumers(fixture().host).requestPermission).toBe("function");
   });
+
+  test("caller cancellation interrupts the host assertion rather than leaving a pending prompt", async () => {
+    const { host } = fixture();
+    const controller = new AbortController();
+    let started = false;
+    let interrupted = false;
+    host.permission.assert = () =>
+      Effect.suspend(() => {
+        started = true;
+        return Effect.never.pipe(
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              interrupted = true;
+            }),
+          ),
+        );
+      });
+    const projected = projectV2Tool(
+      "edit",
+      {
+        description: "edit",
+        args: {},
+        execute: async (_input, runtime) => {
+          await (runtime as unknown as V2DefinitionRuntime).ask(request);
+          return "allowed";
+        },
+      },
+      { directory: "/project" },
+      hoistedV2ToolConsumers(host),
+    );
+    const pending = Effect.runPromiseExit(projected.execute({}, context), {
+      signal: controller.signal,
+    });
+    for (let turn = 0; turn < 20 && !started; turn++) await Promise.resolve();
+    expect(started).toBe(true);
+    controller.abort();
+    await pending;
+    expect(interrupted).toBe(true);
+  });
 });

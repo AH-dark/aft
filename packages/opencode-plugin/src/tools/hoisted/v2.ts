@@ -37,7 +37,7 @@ export function hoistedV2ToolConsumers(host: V2PermissionHostContext | object): 
     );
   }
   return {
-    requestPermission: (request, context) =>
-      requestPermission(host as V2PermissionHostContext, request, context),
+    requestPermission: (request, context, signal) =>
+      requestPermission(host as V2PermissionHostContext, request, context, signal),
   };
 }

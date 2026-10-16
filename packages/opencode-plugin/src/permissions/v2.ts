@@ -226,6 +226,7 @@ export async function requestPermission(
   host: V2PermissionHostContext,
   request: V2PermissionRequest,
   context: V2ExecutionContext,
+  signal?: AbortSignal,
 ): Promise<void> {
   let rules: readonly V2PermissionRule[];
   try {
@@ -257,6 +258,7 @@ export async function requestPermission(
         id: requiredContextID(context, "id"),
       },
     }),
+    { signal },
   );
   if (result._tag === "Failure") {
     const error = Cause.squash(result.cause);
