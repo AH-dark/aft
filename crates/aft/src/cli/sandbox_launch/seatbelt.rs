@@ -256,7 +256,13 @@ fn relaxed_filter(path: &Path, prefix: bool) -> Result<String, String> {
         .ok_or_else(|| "Seatbelt path is not UTF-8".to_string())?;
     let mut pattern = String::from("^");
     for character in text.chars() {
-        if character.is_ascii_alphabetic() {
+        if character.is_control() {
+            return Err(format!(
+                "Seatbelt path contains a control character: {text:?}"
+            ));
+        } else if character == '"' {
+            pattern.push_str("\\\"");
+        } else if character.is_ascii_alphabetic() {
             pattern.push_str(&format!(
                 "[{}{}]",
                 character.to_ascii_lowercase(),
@@ -267,10 +273,9 @@ fn relaxed_filter(path: &Path, prefix: bool) -> Result<String, String> {
         }
     }
     pattern.push_str(if prefix { "[^/]*($|/)" } else { "($|/)" });
-    Ok(format!(
-        "(regex #\"{}\")",
-        escape_path(Path::new(&pattern))?
-    ))
+    // SBPL #"..." retains regex backslashes. Ordinary string escaping would
+    // turn \. into \\. and match a backslash instead of a literal dot.
+    Ok(format!("(regex #\"{pattern}\")"))
 }
 
 fn render_data_denies(
@@ -339,6 +344,19 @@ fn escape_path(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaxed_regex_literal_escapes_dot_once() {
+        assert_eq!(
+            relaxed_filter(Path::new("/tmp/a.b"), false).unwrap(),
+            r##"(regex #"^/[tT][mM][pP]/[aA]\.[bB]($|/)")"##
+        );
+        assert_eq!(
+            relaxed_filter(Path::new("/tmp/a.b"), true).unwrap(),
+            r##"(regex #"^/[tT][mM][pP]/[aA]\.[bB][^/]*($|/)")"##
+        );
+        assert!(relaxed_filter(Path::new("/tmp/a\nb"), false).is_err());
+    }
 
     #[test]
     fn optional_exact_file_carve_outs_are_literal_even_when_not_regular_files() {
