@@ -1303,7 +1303,7 @@ fn standalone_undo_is_fresh_without_watcher_delivery() {
     assert!(aft.shutdown().success());
 }
 
-/// Diagnostics wait budget the warming-analyzer tests give inspect.
+/// How long the warming-analyzer tests allow inspect to wait for diagnostics.
 const WARMING_DIAGNOSTICS_BUDGET_MS: u64 = 10_000;
 
 /// A warming analyzer must not make inspect wait out its diagnostics budget.
