@@ -4156,9 +4156,11 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     for actor_ctx in actor_contexts {
         let ctx = Arc::clone(actor_ctx);
         let tx = tx.clone();
-        std::thread::spawn(move || {
+        let _worker = std::thread::spawn(move || {
             let _ = tx.send(ctx.flush_search_index_on_graceful_shutdown());
         });
+        #[cfg(test)]
+        tests::record_exit_index_flush_worker(_worker);
     }
     drop(tx);
     let started = Instant::now();
@@ -12916,6 +12918,15 @@ mod tests {
         )
     }
 
+    thread_local! {
+        static EXIT_INDEX_FLUSH_WORKERS: std::cell::RefCell<Vec<std::thread::JoinHandle<()>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_exit_index_flush_worker(worker: std::thread::JoinHandle<()>) {
+        EXIT_INDEX_FLUSH_WORKERS.with(|workers| workers.borrow_mut().push(worker));
+    }
+
     fn actor_ctx_with_dirty_search_index(
         root: &Path,
         storage: &Path,
@@ -12943,6 +12954,10 @@ mod tests {
 
         std::fs::write(&file, new_contents).expect("edit source");
         index.update_file(&file);
+        assert!(
+            index.has_pending_disk_changes(),
+            "fixture must have a delta to flush"
+        );
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
@@ -12998,6 +13013,16 @@ mod tests {
         assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
 
         flush_actor_indexes_on_graceful_shutdown(&executor.actor_contexts(), Instant::now());
+
+        // Shutdown deliberately stops waiting after its shared flush budget.
+        // Join the actual workers before checking persistence: this tests that
+        // every actor was flushed, not that disk writes always fit that budget.
+        let workers =
+            EXIT_INDEX_FLUSH_WORKERS.with(|workers| std::mem::take(&mut *workers.borrow_mut()));
+        assert_eq!(workers.len(), 2, "one flush worker per actor");
+        for worker in workers {
+            worker.join().expect("search index flush worker");
+        }
 
         let mut restored1 =
             crate::search_index::SearchIndex::read_from_disk(&cache_dir1, &canonical_root1)

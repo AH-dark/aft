@@ -1423,7 +1423,11 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
 pub(crate) enum TaskIoFault {
     LayoutEnospc,
     RunningEnospc,
+    #[cfg(unix)]
     RunningDelay(std::time::Duration),
+    RunningHook(fn() -> io::Result<()>),
+    #[cfg(unix)]
+    StartingHook(fn()),
     /// Delays the starting-record write, which happens before the spawn
     /// receipt commits, so a test can push that commit past the reply deadline.
     /// Only the Unix startup tests construct it.
@@ -1454,16 +1458,22 @@ fn task_io_fault_for_test(running: bool) -> io::Result<()> {
     TASK_IO_FAULT.with(|slot| match slot.get() {
         Some(TaskIoFault::LayoutEnospc) if !running => Err(task_storage_full_for_test()),
         Some(TaskIoFault::RunningEnospc) if running => Err(task_storage_full_for_test()),
+        #[cfg(unix)]
         Some(TaskIoFault::RunningDelay(delay)) if running => {
             std::thread::sleep(delay);
             Ok(())
         }
+        Some(TaskIoFault::RunningHook(hook)) if running => hook(),
         _ => Ok(()),
     })
 }
 
 #[cfg(test)]
 fn starting_write_delay_for_test() {
+    #[cfg(unix)]
+    if let Some(TaskIoFault::StartingHook(hook)) = TASK_IO_FAULT.with(std::cell::Cell::get) {
+        hook();
+    }
     if let Some(TaskIoFault::StartingDelay(delay)) = TASK_IO_FAULT.with(std::cell::Cell::get) {
         std::thread::sleep(delay);
     }

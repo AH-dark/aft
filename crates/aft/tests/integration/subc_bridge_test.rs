@@ -3224,12 +3224,19 @@ fn subc_bridge_bash_fast_foreground_returns_terminal_response() {
     );
 }
 
+#[cfg(feature = "test-timing-hooks")]
 #[test]
 fn subc_bridge_bash_promotes_after_wait_window_and_remains_tracked() {
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_promotes_after_wait_window_and_remains_tracked",
         Duration::from_secs(30),
-        || vec![set_test_foreground_wait_ms(200)],
+        || {
+            vec![
+                set_test_foreground_wait_ms(200),
+                // This tests promotion of a started command, not shell startup speed.
+                set_test_env("AFT_TEST_SUBC_BASH_STARTUP_CLOCK", "frozen"),
+            ]
+        },
         drive_bash_promotion_daemon,
         |_, _, _| {},
     );
@@ -4152,6 +4159,37 @@ async fn bind_routes_1_and_4(stream: &mut tokio::net::TcpStream, root1: &std::pa
     expect_route_bind_ack(stream, 44).await;
 }
 
+#[tokio::test]
+async fn connection_goodbye_waits_for_module_eof() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().unwrap();
+    let (accepted, connected) =
+        tokio::join!(listener.accept(), tokio::net::TcpStream::connect(address));
+    let (mut daemon, _) = accepted.expect("daemon socket");
+    let mut module = connected.expect("module socket");
+    let goodbye = send_connection_goodbye(&mut daemon);
+    tokio::pin!(goodbye);
+    let frame = tokio::select! {
+        biased;
+        _ = &mut goodbye => panic!("daemon closed before the module consumed Goodbye"),
+        frame = read_subc_frame(&mut module) => frame.expect("module reads Goodbye").expect("Goodbye before EOF"),
+    };
+    assert_eq!(frame.header.ty, FrameType::Goodbye);
+
+    let mut byte = [0];
+    tokio::select! {
+        biased;
+        _ = &mut goodbye => panic!("daemon closed before the module drained its writer"),
+        read = module.read(&mut byte) => assert_eq!(read.expect("daemon half-close"), 0),
+    }
+    // The module may still have reliable output queued when it accepts Goodbye.
+    tokio::io::AsyncWriteExt::write_all(&mut module, b"queued writer tail")
+        .await
+        .expect("module drains its writer");
+    drop(module);
+    goodbye.await;
+}
+
 pub(super) async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) {
     send_frame(
         stream,
@@ -4159,6 +4197,14 @@ pub(super) async fn send_connection_goodbye(stream: &mut tokio::net::TcpStream) 
             .expect("goodbye frame"),
     )
     .await;
+    // Keep reading until the module closes its writer. Dropping a socket with
+    // unread reliable output can reset it before the module consumes Goodbye.
+    tokio::io::AsyncWriteExt::shutdown(stream)
+        .await
+        .expect("daemon half-closes after Goodbye");
+    tokio::io::copy(stream, &mut tokio::io::sink())
+        .await
+        .expect("drain module output through EOF");
 }
 
 async fn drive_oversized_tool_response_daemon(input: FakeDaemonInput) {
@@ -4388,18 +4434,30 @@ async fn drive_bash_fast_foreground_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+#[cfg(feature = "test-timing-hooks")]
 async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
-        mut stream, root1, ..
+        mut stream,
+        root1,
+        executor,
+        ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("bound root id");
+    executor
+        .actor_context(&root_id)
+        .expect("bound root actor context")
+        .update_config(|config| config.storage_dir = Some(root1.join("task-storage")));
+    let marker = root1.join("promotion-started");
+    let release = root1.join("promotion-release");
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     send_tool_call(
         &mut stream,
         1,
         101,
         "bash",
         json!({
-            "command": "sleep 2; printf 'promoted-done\\n'",
+            "command": hold_bash_until_release_command(&marker, &release, "promoted-done"),
             "foreground_orchestrate": true,
             "compressed": false,
         }),
@@ -4431,6 +4489,8 @@ async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
     let response = tool_response_json(&status);
     assert_eq!(response["success"].as_bool(), Some(true));
     assert_eq!(response["task_id"].as_str(), Some(task_id.as_str()));
+    assert_eq!(response["status"], "running", "{response:?}");
+    std::fs::write(&release, "release").expect("release promoted command");
     send_connection_goodbye(&mut stream).await;
 }
 
