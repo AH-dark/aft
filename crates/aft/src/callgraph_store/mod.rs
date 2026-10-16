@@ -3179,6 +3179,8 @@ fn callgraph_refresh_worker_loop(shared: &Arc<RefreshWorkerShared>) {
                 idle_checkpoint_due(last_idle_checkpoints.get(&root).copied(), Instant::now());
             if checkpoint_due {
                 if let Some(store) = store {
+                    #[cfg(test)]
+                    hold_idle_writer_for_test(shared, &root.project_root, &store);
                     if store.checkpoint_wal_truncate() {
                         last_idle_checkpoints.insert(root.clone(), Instant::now());
                     }
@@ -3411,6 +3413,8 @@ fn workspace_crate_prefix_cache_for_root(
 #[derive(Clone, Default)]
 struct RefreshWorkerTestSeam {
     #[cfg(test)]
+    idle_writer_held: Option<crossbeam_channel::Sender<()>>,
+    #[cfg(test)]
     fail_watch: bool,
     #[cfg(test)]
     ignore_lease_release: bool,
@@ -3433,6 +3437,34 @@ struct RefreshWorkerTestSeam {
 
 static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
     OnceLock::new();
+
+#[cfg(test)]
+fn hold_idle_writer_for_test(
+    shared: &RefreshWorkerShared,
+    project_root: &Path,
+    store: &CallGraphStore,
+) {
+    let Some(held) = refresh_worker_test_seam(project_root).idle_writer_held else {
+        return;
+    };
+    // Queue idle precedes checkpointing and closing the writer connection. Hold
+    // an exclusive SQLite lock in that window so a fail-fast reader cannot win
+    // a scheduling race; shutdown is the fixture's signal to finish maintenance.
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;")
+        .unwrap();
+    held.send(()).unwrap();
+    let queue = shared.queue.lock().unwrap();
+    drop(
+        shared
+            .wake
+            .wait_while(queue, |queue| !queue.shutdown_requested)
+            .unwrap(),
+    );
+}
 
 struct RefreshWorkerTestGate {
     held_tx: crossbeam_channel::Sender<()>,
@@ -22976,6 +23008,7 @@ mod refresh_worker_tests {
     fn publication_with_released_writer_settles_with_exactly_one_open() {
         let (_temp, root, dir, source, worker, mut foreign, pending, _ready) =
             fallback_refresh_fixture(false);
+        let (idle_writer_tx, idle_writer_rx) = crossbeam_channel::bounded(1);
         REFRESH_WORKER_TEST_SEAMS
             .get()
             .unwrap()
@@ -22984,6 +23017,14 @@ mod refresh_worker_tests {
             .get_mut(&root)
             .unwrap()
             .ignore_lease_release = true;
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .idle_writer_held = Some(idle_writer_tx);
         // Hold the queue until the foreign process publishes a new callgraph
         // generation and releases its writer lease. Ignore lease-release events
         // so the generation-pointer event is the only possible immediate wake.
@@ -23009,6 +23050,16 @@ mod refresh_worker_tests {
         assert_eq!(callgraph_refresh_worker_test_counts(&root), (2, 0));
         assert_eq!(refresh_worker_test_seam(&root).fallback_checks, 0);
         assert!(!pending.lock().contains(&source));
+        idle_writer_rx
+            .recv_timeout(Duration::from_secs(12))
+            .unwrap();
+        assert!(CallGraphStore::open_readonly(dir.clone(), root.clone())
+            .unwrap()
+            .is_none());
+        // Queue idle proves the replay committed, not that idle maintenance has
+        // closed its writer. Request readers deliberately fail fast on a locked
+        // generation, so join this fixture's worker before asserting a fresh open.
+        assert!(worker.worker.shutdown_with_budget(Duration::from_secs(12)));
         let current = CallGraphStore::open_readonly(dir, root).unwrap().unwrap();
         assert_eq!(
             current
