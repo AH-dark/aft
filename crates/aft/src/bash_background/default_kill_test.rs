@@ -102,12 +102,17 @@ fn head_message_detach_preserves_default_hard_kill() {
 }
 
 #[test]
-fn pending_message_detach_hands_off_both_foreground_wait_modes() {
+fn pending_message_detach_preserves_wait_mode_eligibility() {
     for wait in [true, false] {
         let (_dir, ctx, task) = wait_fixture(None);
+        let params = if wait {
+            serde_json::json!({"wait": true})
+        } else {
+            serde_json::json!({})
+        };
         let request = serde_json::from_value(serde_json::json!({
             "id": "pending-message", "command": "bash", "session_id": task.session_id,
-            "params": { "wait": wait }
+            "params": params
         }))
         .unwrap();
         let admission = serde_json::from_value(serde_json::json!({
@@ -124,6 +129,20 @@ fn pending_message_detach_hands_off_both_foreground_wait_modes() {
                 serde_json::json!({"task_id": task.task_id, "status": "running"}),
             ),
         );
+        if !wait {
+            let crate::response_finalize::DispatchOutcome::Deferred(mut pending) = outcome else {
+                panic!("a plain foreground command must keep waiting despite pending input");
+            };
+            assert!(!ctx
+                .bash_background()
+                .request_wait_mode_detach(&task.session_id));
+            assert!(
+                (pending.poll)(&ctx).is_none(),
+                "a message during a plain foreground wait must not detach it"
+            );
+            assert_eq!(ctx.bash_background().active_wait_session_count(), 0);
+            continue;
+        }
         let response = match outcome {
             crate::response_finalize::DispatchOutcome::Immediate(response) => response,
             crate::response_finalize::DispatchOutcome::Deferred(mut pending) => {

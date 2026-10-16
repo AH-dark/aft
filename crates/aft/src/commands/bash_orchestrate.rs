@@ -497,7 +497,7 @@ pub fn build_bash_outcome(
     let request_id = req.id.clone();
     let session_id = req.session().to_string();
     let attach_command = "bash".to_string();
-    let detach_on_user_message = true;
+    let detach_on_user_message = params.wait;
     // The polling closure owns registration, including cancellation paths
     // that drop it without ever polling a terminal response.
     let mut wait_registration = Some(ctx.bash_background().foreground_wait_guard(
