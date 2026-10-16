@@ -90,6 +90,8 @@ if a[:2] == ['pr', 'merge']:
                                   env={**os.environ, 'GIT_AUTHOR_NAME': 'GitHub', 'GIT_AUTHOR_EMAIL': 'noreply@github.com',
                                        'GIT_COMMITTER_NAME': 'GitHub', 'GIT_COMMITTER_EMAIL': 'noreply@github.com'}).strip()
     s['group'] = oid; s['polls'] = 0; s['admitted'] = True
+    if s.get('auto_merge') and s.get('checks_pending'): s['auto_merge_armed'] = True
+    if s.get('remove'): s['queued'] = True
     if not s.get('remove'):
         g('--git-dir', s['origin'], 'update-ref', 'refs/heads/main', oid)
         s['merged'] = True; s['merge_oid'] = oid
@@ -103,26 +105,62 @@ if a[:2] == ['run', 'view']:
     answer({'jobs': [{'name': 'Landing policy', 'status': 'completed',
                      'conclusion': 'failure' if s.get('failed_required') else 'success'}]})
 if not a or a[0] != 'api': raise SystemExit('unhandled fake gh: '+str(a))
+endpoint = next((x for x in a[1:] if x.startswith('repos/')), '')
+if endpoint.endswith('/check-runs?per_page=100'):
+    s['greptile_polls'] = s.get('greptile_polls', 0) + 1
+    pending = s.get('greptile_never_completes', False) or s['greptile_polls'] <= s.get('greptile_pending_polls', 0)
+    persist()
+    answer({'check_runs': [{'name': 'Greptile Review', 'app': {'slug': 'greptile-apps'},
+                            'head_sha': head(), 'status': 'in_progress' if pending else 'completed'}]})
 if 'graphql' in a:
     q = a[a.index('-f')+1]
     if 'reviewThreads' in q:
+        unresolved = s.get('unresolved', 0)
+        if s.get('unresolved_after_admission') and s.get('admitted'): unresolved = 1
         answer({'data': {'repository': {'pullRequest': {'reviewThreads': {'nodes':
-                [{'isResolved': False}]*s.get('unresolved', 0)}}}}})
+                [{'isResolved': False}]*unresolved}}}}})
+    if 'dequeuePullRequest' in q:
+        s['dequeued'] = s.get('dequeued', 0) + 1
+        s['queued'] = False; persist()
+        answer({'data': {'dequeuePullRequest': {'clientMutationId': None}}})
+    if 'disablePullRequestAutoMerge' in q:
+        s['auto_merge_armed'] = False; s['disabled_auto_merge'] = s.get('disabled_auto_merge', 0) + 1
+        persist()
+        answer({'data': {'disablePullRequestAutoMerge': {'clientMutationId': None}}})
+    if 'isInMergeQueue' in q and 'autoMergeRequest' in q and 'mergeQueueEntry' not in q:
+        answer({'data': {'repository': {'pullRequest': {
+                'id': s.get('pull_id', 'PR_fixture'),
+                'isInMergeQueue': s.get('queued', False),
+                'autoMergeRequest': {'enabledAt': now()} if s.get('auto_merge_armed') else None}}}})
     if 'mergeQueueEntry' not in q:
         answer({'data': {'repository': {'pullRequest': {'baseRefName': 'main',
                 'isMergeQueueEnabled': s.get('queue', True)}}}})
+    if s.get('null_admission_then_merge'):
+        s['queue_snapshot_polls'] = s.get('queue_snapshot_polls', 0) + 1
+        persist()
+        if s['queue_snapshot_polls'] == 1:
+            answer({'data': {'repository': {'pullRequest': {
+                    'state': 'OPEN', 'baseRefName': 'main', 'headRefOid': head(),
+                    'isMergeQueueEnabled': True, 'isInMergeQueue': True,
+                    'autoMergeRequest': None, 'mergeCommit': None,
+                    'mergeQueueEntry': None, 'timelineItems': {'nodes': []}}}}})
+        answer({'data': {'repository': {'pullRequest': {
+                'state': 'MERGED', 'baseRefName': 'main', 'headRefOid': head(),
+                'isMergeQueueEnabled': True, 'isInMergeQueue': False,
+                'autoMergeRequest': None, 'mergeCommit': {'oid': 'a'*40},
+                'mergeQueueEntry': None, 'timelineItems': {'nodes': []}}}}})
     removed = s.get('remove') and s.get('admitted') and s.get('polls', 0) > 0
     queued = s.get('remove') and s.get('admitted') and not removed
     value = {'state': 'MERGED' if s.get('merged') else 'OPEN', 'baseRefName': 'main',
              'headRefOid': 'f'*40 if s.get('wrong_head') else head(),
-             'isMergeQueueEnabled': s.get('queue', True), 'isInMergeQueue': bool(queued),
-             'autoMergeRequest': None, 'mergeCommit': {'oid': s.get('merge_oid')} if s.get('merged') else None,
-             'mergeQueueEntry': {'headCommit': {'oid': head() if s.get('raw_entry_head') else s['group']}, 'enqueuedAt': now(), 'state': 'AWAITING_CHECKS'} if queued else None,
+              'isMergeQueueEnabled': s.get('queue', True), 'isInMergeQueue': bool(queued or (s.get('queued') and not removed)),
+              'autoMergeRequest': {'enabledAt': now()} if s.get('auto_merge_armed') else None,
+              'mergeCommit': {'oid': s.get('merge_oid')} if s.get('merged') else None,
+              'mergeQueueEntry': {'headCommit': {'oid': head() if s.get('raw_entry_head') else s['group']}, 'enqueuedAt': now(), 'state': 'AWAITING_CHECKS'} if queued else None,
              'timelineItems': {'nodes': [{'createdAt': now(), 'reason': 'required check failed',
                                          'beforeCommit': {'oid': head() if s.get('raw_entry_head') else s['group']}}] if removed else []}}
     if s.get('admitted'): s['polls'] = s.get('polls', 0)+1; persist()
     answer({'data': {'repository': {'pullRequest': value}}})
-endpoint = next(x for x in a[1:] if x.startswith('repos/'))
 slurp = '--slurp' in a
 if endpoint == 'repos/example/repo/pulls/7':
     answer({'user': s.get('author', {'login': 'aft-alfonso[bot]', 'type': 'Bot', 'id': 318960130})})
@@ -172,6 +210,8 @@ class PRFixture(unittest.TestCase):
                     and not key.startswith("GIT_COMMITTER_")}
         self.env.update(HOME=str(root / "home"), PR_TEST_STATE=str(self.state_path),
                         LAND_PR_POLL_SECONDS="0", LAND_PR_TIMEOUT_SECONDS="5",
+                        AFT_MERGE_PR_GREPTILE_POLL_SECONDS="0.01",
+                        AFT_MERGE_PR_GREPTILE_TIMEOUT_SECONDS="60",
                         OPERATOR_GH_FALLBACK_PATHS="")
         Path(self.env["HOME"]).mkdir()
         for file in ("merge-pr.sh", "land-pr.sh", "landing-policy.py", "merge-queue-search.py",
@@ -260,6 +300,16 @@ else:
     def merge(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
         return self.run_script("merge-pr.sh", "7", *args, env=env)
 
+    def prepare_existing_pr_head(self) -> str:
+        descriptor = self.repo / "benchmarks/aft-search/slice-descriptors/land-delivery.json"
+        descriptor.parent.mkdir(parents=True, exist_ok=True)
+        descriptor.write_text(json.dumps({"slice_class": "non_ranking", "targeted_mechanism": "none",
+                                          "kind": "harness", "fixtures": ["harness-goldens"]}, indent=2) + "\n")
+        self.git("add", str(descriptor.relative_to(self.repo)))
+        self.git("commit", "-qm", "add existing landing descriptor\n\n" + COAUTHOR)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/land/delivery")
+        return self.git("rev-parse", "HEAD")
+
 
 class MergeAdmissionTests(PRFixture):
     def test_queue_admission_preserves_head_pin_and_operator_boundary(self) -> None:
@@ -300,8 +350,34 @@ class MergeAdmissionTests(PRFixture):
         self.assertEqual(self.merges(), [])
 
     def test_unresolved_threads_refuse_admission(self) -> None:
-        self.write_state(unresolved=1)
-        self.assertNotEqual(self.merge().returncode, 0)
+        self.write_state(unresolved=1, auto_merge_armed=True, queued=True)
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.merges(), [])
+        calls = [call["args"] for call in self.calls()]
+        self.assertTrue(any("disablePullRequestAutoMerge" in " ".join(args) for args in calls))
+        self.assertTrue(any("dequeuePullRequest" in " ".join(args) for args in calls))
+
+    def test_merge_waits_until_greptile_review_of_exact_head_completes(self) -> None:
+        self.write_state(greptile_pending_polls=2)
+        result = self.merge()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state.get("greptile_polls", 0), 3)
+        calls = self.calls()
+        review_calls = [call for call in calls if "/check-runs?per_page=100" in " ".join(call["args"])]
+        self.assertTrue(review_calls)
+        self.assertTrue(all(f"/commits/{self.git('rev-parse', 'HEAD')}/check-runs?" in " ".join(call["args"])
+                            for call in review_calls))
+        merge_index = next(i for i, call in enumerate(calls) if call["args"][:2] == ["pr", "merge"])
+        last_review_index = max(i for i, call in enumerate(calls) if "/check-runs?per_page=100" in " ".join(call["args"]))
+        self.assertLess(last_review_index, merge_index)
+
+    def test_greptile_review_timeout_refuses_without_submitting(self) -> None:
+        self.write_state(greptile_never_completes=True)
+        result = self.merge(env={"AFT_MERGE_PR_GREPTILE_TIMEOUT_SECONDS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Greptile Review did not complete", result.stderr)
         self.assertEqual(self.merges(), [])
 
     def test_post_head_findings_require_acknowledgment(self) -> None:
@@ -429,6 +505,29 @@ class DeliveryTests(PRFixture):
         self.assertLess(create_index, merge_index)
         self.assertTrue((self.repo / "benchmarks/aft-search/slice-descriptors/land-delivery.json").exists())
 
+    def test_new_thread_after_auto_merge_arming_disables_and_dequeues(self) -> None:
+        head = self.prepare_existing_pr_head()
+        self.write_state(exists=True, admitted=True, remove=True, queued=True,
+                         auto_merge_armed=True, raw_entry_head=True, unresolved_after_admission=True)
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unresolved review threads", result.stderr)
+        self.assertNotIn("merge-pr: REFUSED", result.stderr)
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state.get("disabled_auto_merge"), 1)
+        self.assertEqual(state.get("dequeued"), 1)
+        self.assertFalse(state["auto_merge_armed"])
+        self.assertFalse(state["queued"])
+        self.assertEqual(head, self.git("rev-parse", "HEAD"))
+
+    def test_queued_null_admission_fields_do_not_refuse(self) -> None:
+        self.prepare_existing_pr_head()
+        self.write_state(exists=True, null_admission_then_merge=True)
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "a" * 40)
+        self.assertNotIn("REFUSED", result.stderr)
+
     def test_existing_open_pr_is_reused_and_text_stays_unchanged(self) -> None:
         self.write_state(exists=True)
         result = self.run_script("land-pr.sh", "delivery", "--title", "accepted revision")
@@ -438,6 +537,20 @@ class DeliveryTests(PRFixture):
                              ("--title" in call["args"] or "--body" in call["args"])
                              for call in self.calls()))
         self.assertIn("leaving its current title and body unchanged", result.stderr)
+
+    def test_new_head_push_disarms_armed_auto_merge_and_dequeues(self) -> None:
+        self.write_state(exists=True, auto_merge_armed=True, queued=True)
+        result = self.run_script("land-pr.sh", "delivery")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state["disabled_auto_merge"], 1)
+        self.assertEqual(state["dequeued"], 1)
+        self.assertFalse(state["auto_merge_armed"])
+        self.assertFalse(state["queued"])
+        calls = [call["args"] for call in self.calls()]
+        disable_index = next(i for i, args in enumerate(calls) if "disablePullRequestAutoMerge" in " ".join(args))
+        merge_index = next(i for i, args in enumerate(calls) if args[:2] == ["pr", "merge"])
+        self.assertLess(disable_index, merge_index)
 
     def test_new_pr_receives_title_and_body_at_creation(self) -> None:
         body_file = Path(self.temp.name) / "body.md"

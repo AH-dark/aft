@@ -34,6 +34,51 @@ def gh(*args: str) -> str:
     return subprocess.check_output(["gh", *args], env=env, text=True).strip()
 
 
+def operator_gh(*args: str) -> str:
+    resolver = ROOT / "scripts/lib/operator-gh.sh"
+    command = 'source "$1" >/dev/null; printf "%s" "$OPERATOR_GH"'
+    path = subprocess.check_output(["bash", "-c", command, "bash", str(resolver)], text=True).strip()
+    env = {**os.environ, "GH_SHIM_BYPASS": "operator"}
+    return subprocess.check_output([path, *args], env=env, text=True).strip()
+
+
+def disarm_auto_merge(repo: str, number: int, reason: str) -> None:
+    owner, name = repo.split("/")
+    query = ("query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){"
+             "pullRequest(number:$pr){id isInMergeQueue autoMergeRequest{enabledAt}}}}")
+    response = json.loads(operator_gh("api", "graphql", "-f", f"query={query}",
+                                      "-F", f"owner={owner}", "-F", f"repo={name}", "-F", f"pr={number}"))
+    pull = response.get("data", {}).get("repository", {}).get("pullRequest") or {}
+    pull_id = pull.get("id")
+    if not pull_id:
+        raise ValueError(f"could not identify PR #{number} before disarming auto-merge")
+    if pull.get("isInMergeQueue"):
+        mutation = ("mutation($id:ID!){dequeuePullRequest(input:{pullRequestId:$id}){clientMutationId}}")
+        operator_gh("api", "graphql", "-f", f"query={mutation}", "-F", f"id={pull_id}")
+        log(f"dequeued PR #{number} before {reason}")
+    if pull.get("autoMergeRequest") is not None:
+        mutation = ("mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}")
+        operator_gh("api", "graphql", "-f", f"query={mutation}", "-F", f"id={pull_id}")
+        log(f"disabled auto-merge for PR #{number} before {reason}")
+
+
+def unresolved_review_threads(repo: str, number: int) -> int:
+    owner, name = repo.split("/")
+    query = ("query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){"
+             "pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved}}}}}")
+    response = json.loads(operator_gh("api", "graphql", "-f", f"query={query}",
+                                      "-F", f"owner={owner}", "-F", f"repo={name}", "-F", f"pr={number}"))
+    pull = response.get("data", {}).get("repository", {}).get("pullRequest") or {}
+    threads = pull.get("reviewThreads") or {}
+    return sum(not thread.get("isResolved", True) for thread in threads.get("nodes") or [])
+
+
+def admission_timestamp(current: dict) -> str | None:
+    entry = current.get("mergeQueueEntry") or {}
+    auto_merge = current.get("autoMergeRequest") or {}
+    return entry.get("enqueuedAt") or auto_merge.get("enabledAt")
+
+
 def verify_governed_gh() -> None:
     shim_dir = os.environ.get("AFT_GH_SHIMS_DIR")
     shim_path = shutil.which("gh")
@@ -190,6 +235,9 @@ def report_removed(repo: str, state: dict, removal: dict | None) -> None:
 
 
 def wait_merged(repo: str, state: dict, path: Path, deadline: float, poll: float) -> str:
+    state.setdefault("groups", [])
+    state.setdefault("seen_queued", False)
+    state.setdefault("removed", False)
     while time.monotonic() < deadline:
         current = snapshot(repo, state["pr"])
         if current["headRefOid"] != state["head"] or current["baseRefName"] != "main":
@@ -204,15 +252,25 @@ def wait_merged(repo: str, state: dict, path: Path, deadline: float, poll: float
             return oid
         if current["state"] != "OPEN":
             raise ValueError("PR closed without merging")
-        entry = current["mergeQueueEntry"]
+        entry = current.get("mergeQueueEntry") or {}
         if entry:
             state["seen_queued"] = True
-            group = entry["headCommit"]["oid"]
-            if group not in state["groups"]:
+            group = (entry.get("headCommit") or {}).get("oid")
+            if group and group not in state["groups"]:
                 state["groups"].append(group)
-            save(path, state)
-        removals = current["timelineItems"]["nodes"]
-        removal = removals[-1] if removals and stamp(removals[-1]["createdAt"]) >= stamp(state["admitted_at"]) else None
+                save(path, state)
+        if not state.get("admitted_at"):
+            admitted_at = admission_timestamp(current)
+            if admitted_at:
+                state["admitted_at"] = admitted_at
+                save(path, state)
+        if unresolved_review_threads(repo, state["pr"]):
+            disarm_auto_merge(repo, state["pr"], "unresolved review threads")
+            raise ValueError(f"PR #{state['pr']} has unresolved review threads; auto-merge disabled and queue entry removed")
+        removals = (current.get("timelineItems") or {}).get("nodes") or []
+        admitted_at = state.get("admitted_at")
+        removal = removals[-1] if (removals and admitted_at and
+                                   stamp(removals[-1]["createdAt"]) >= stamp(admitted_at)) else None
         if not current["isInMergeQueue"] and (state.get("seen_queued") or removal):
             state["removed"] = True
             save(path, state)
@@ -238,6 +296,7 @@ def submit(args: argparse.Namespace) -> str:
            and pr["base"]["ref"] == "main"]
     if len(prs) > 1:
         raise ValueError("ambiguous existing PRs for delivery branch")
+    existing_head = prs[0]["head"]["sha"] if prs else None
     if prs and prs[0]["state"] == "closed":
         current = snapshot(repo, prs[0]["number"])
         if current["state"] != "MERGED" or current["headRefOid"] != git("rev-parse", "HEAD"):
@@ -288,6 +347,8 @@ def submit(args: argparse.Namespace) -> str:
         raise ValueError("governed gh shim must provide alfonso-aft co-author identity for PR speech")
     state.update(repo=repo, branch=branch, head=head)
     save(path, state)
+    if existing_head is not None and existing_head != head:
+        disarm_auto_merge(repo, prs[0]["number"], "pushing a new PR head")
     git("push", "origin", f"HEAD:refs/heads/{branch}")
     created = False
     if not prs:
@@ -331,9 +392,14 @@ def submit(args: argparse.Namespace) -> str:
             command.append("--legacy-merge")
         subprocess.run(command, stdout=sys.stderr, check=True)
     elif "admitted_at" not in state:
-        state.update(admitted_at=(current["mergeQueueEntry"] or {}).get("enqueuedAt") or current["autoMergeRequest"]["enabledAt"],
-                     groups=[], seen_queued=False)
-        save(path, state)
+        admitted_at = admission_timestamp(current)
+        if admitted_at:
+            state["admitted_at"] = admitted_at
+            state.setdefault("groups", [])
+            state.setdefault("seen_queued", False)
+            save(path, state)
+        else:
+            log(f"PR #{state['pr']} is queued but its admission timestamp is not available yet; continuing to wait")
     return wait_merged(repo, state, path, deadline, poll)
 
 

@@ -34,7 +34,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/operator-gh.sh" || exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/operator-gh.sh" || exit 1
 
 OWNER_REPO=$("$OPERATOR_GH" repo view --json nameWithOwner --jq .nameWithOwner)
 OWNER="${OWNER_REPO%%/*}"
@@ -54,7 +55,65 @@ hard_refuse() {
   exit 1
 }
 
-# --- 1. Unresolved review threads ------------------------------------------
+disarm_auto_merge() {
+  local state pull_request_id queued auto_merge
+  state=$("$OPERATOR_GH" api graphql -f query='
+    query($owner:String!,$repo:String!,$pr:Int!){
+      repository(owner:$owner,name:$repo){
+        pullRequest(number:$pr){id isInMergeQueue autoMergeRequest{enabledAt}}
+      }
+    }' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" \
+    --jq '[.data.repository.pullRequest.id, .data.repository.pullRequest.isInMergeQueue, (.data.repository.pullRequest.autoMergeRequest != null)] | @tsv') ||
+    hard_refuse "could not inspect auto-merge/queue state before refusing unresolved review threads"
+  IFS=$'\t' read -r pull_request_id queued auto_merge <<< "$state"
+  [[ -n "$pull_request_id" ]] || hard_refuse "could not identify PR #$PR to disarm auto-merge"
+  if [[ "$queued" == true ]]; then
+    "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){dequeuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
+      -F id="$pull_request_id" >/dev/null || hard_refuse "could not dequeue PR #$PR after finding unresolved review threads"
+    echo "merge-pr: dequeued #$PR because it has unresolved review threads" >&2
+  fi
+  if [[ "$auto_merge" == true ]]; then
+    "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}' \
+      -F id="$pull_request_id" >/dev/null || hard_refuse "could not disable auto-merge for PR #$PR after finding unresolved review threads"
+    echo "merge-pr: disabled auto-merge for #$PR because it has unresolved review threads" >&2
+  fi
+}
+
+wait_for_greptile_review() {
+  local head_sha="$1" timeout poll started now review_status
+  timeout="${AFT_MERGE_PR_GREPTILE_TIMEOUT_SECONDS:-1200}"
+  poll="${AFT_MERGE_PR_GREPTILE_POLL_SECONDS:-15}"
+  started=$(date -u +%s)
+  while :; do
+    review_status=$("$OPERATOR_GH" api "repos/$OWNER_REPO/commits/$head_sha/check-runs?per_page=100" \
+      --jq '[.check_runs[] | select(.head_sha == "'"$head_sha"'" and .name == "Greptile Review" and .app.slug == "greptile-apps")] | sort_by(.started_at // .created_at // "") | if length == 0 then "" else .[-1].status end') ||
+      hard_refuse "could not read Greptile Review status for head $head_sha"
+    if [[ "$review_status" == completed ]]; then
+      echo "merge-pr: Greptile Review completed for head $head_sha" >&2
+      return 0
+    fi
+    now=$(date -u +%s)
+    if (( now - started >= timeout )); then
+      hard_refuse "Greptile Review did not complete for head $head_sha within ${timeout}s; refusing blind submission"
+    fi
+    sleep "$poll"
+  done
+}
+
+# --- 1. Wait for the automated review of the exact current head -------------
+HEAD_SHA=$("$OPERATOR_GH" pr view "$PR" --json headRefOid --jq .headRefOid)
+if [[ -n "$EXPECTED_HEAD" && "$HEAD_SHA" != "$EXPECTED_HEAD" ]]; then
+  echo "merge-pr: REFUSED - PR head changed from the accepted delivery; not overridable" >&2
+  exit 1
+fi
+wait_for_greptile_review "$HEAD_SHA"
+CURRENT_HEAD=$("$OPERATOR_GH" pr view "$PR" --json headRefOid --jq .headRefOid)
+if [[ "$CURRENT_HEAD" != "$HEAD_SHA" ]]; then
+  echo "merge-pr: REFUSED - PR head changed while waiting for Greptile Review; not overridable" >&2
+  exit 1
+fi
+
+# --- 2. Unresolved review threads ------------------------------------------
 UNRESOLVED=$("$OPERATOR_GH" api graphql -f query='
   query($owner:String!,$repo:String!,$pr:Int!){
     repository(owner:$owner,name:$repo){
@@ -64,14 +123,12 @@ UNRESOLVED=$("$OPERATOR_GH" api graphql -f query='
     }
   }' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" \
   --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false)] | length')
-[ "$UNRESOLVED" -eq 0 ] || refuse "$UNRESOLVED unresolved review thread(s); resolve or let the author finish"
-
-# --- 2. Findings newer than the head commit --------------------------------
-HEAD_SHA=$("$OPERATOR_GH" pr view "$PR" --json headRefOid --jq .headRefOid)
-if [[ -n "$EXPECTED_HEAD" && "$HEAD_SHA" != "$EXPECTED_HEAD" ]]; then
-  echo "merge-pr: REFUSED - PR head changed from the accepted delivery; not overridable" >&2
-  exit 1
+if [ "$UNRESOLVED" -ne 0 ]; then
+  disarm_auto_merge
+  refuse "$UNRESOLVED unresolved review thread(s); resolve or let the author finish"
 fi
+
+# --- 3. Findings newer than the head commit --------------------------------
 HEAD_TS=$("$OPERATOR_GH" api "repos/$OWNER_REPO/commits/$HEAD_SHA" --jq .commit.committer.date)
 # Fetch comments and reviews separately so a failed comments query cannot be
 # hidden by the successful reviews query or the counting pipeline.
@@ -91,13 +148,13 @@ if [ "$NEWER" -ne 0 ]; then
   fi
 fi
 
-# --- 3. Author mid-iteration (head pushed too recently) --------------------
+# --- 4. Author mid-iteration (head pushed too recently) --------------------
 NOW_EPOCH=$(date -u +%s)
 HEAD_EPOCH=$(python3 -c "import datetime;print(int(datetime.datetime.fromisoformat('$HEAD_TS'.replace('Z','+00:00')).timestamp()))")
 AGE_MIN=$(( (NOW_EPOCH - HEAD_EPOCH) / 60 ))
 [ "$AGE_MIN" -ge "$SETTLE_MIN" ] || refuse "head commit is ${AGE_MIN}m old (< ${SETTLE_MIN}m settle window) - author may be mid-iteration"
 
-# --- 4. Queue admission (upstream gh enforces required checks) -------------
+# --- 5. Queue admission (upstream gh enforces required checks) -------------
 # REST's branch-protection response omits merge-queue policy. The PR's
 # isMergeQueueEnabled GraphQL field is the effective base-ref policy used by
 # the real GitHub CLI; an absent/error response never permits a legacy merge.
