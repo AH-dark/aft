@@ -67,7 +67,8 @@ impl ProjectWatcher {
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusions = plan.selected;
-        let exclusion_paths = watcher_exclusion_paths(&exclusions);
+        let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&exclusions);
+        let exclusion_paths = exclusion_state.paths();
         super::log_exclusions(&root, &exclusions, observed_generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
@@ -103,6 +104,8 @@ impl ProjectWatcher {
             .spawn(move || {
                 let mut exclusions = exclusions;
                 let mut exclusion_paths = exclusion_paths;
+                let mut exclusion_state = exclusion_state;
+                let mut dropped_paths = watcher_exclusion_paths(&plan.dropped);
                 let mut observed_generation = observed_generation;
                 // Files found in directories that appeared after the watch was
                 // set up, waiting to be reported. inotify watches each
@@ -127,7 +130,10 @@ impl ProjectWatcher {
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
                         let replacement_exclusions = replacement_plan.selected;
-                        let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
+                        exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(
+                            &replacement_exclusions,
+                        );
+                        let replacement_paths = exclusion_state.paths();
                         let desired =
                             collect_watch_directories(&root, &matcher, &replacement_paths);
                         watched_directories = match reconcile_watch_directories(
@@ -151,10 +157,11 @@ impl ProjectWatcher {
                         thread_count.store(watched_directories.len(), Ordering::Release);
                         observed_generation = generation;
 
+                        dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(
                             observed_generation,
                             replacement_paths.clone(),
-                            watcher_exclusion_paths(&replacement_plan.dropped),
+                            dropped_paths.clone(),
                         );
                         if replacement_exclusions != exclusions {
                             super::log_exclusions(
@@ -169,6 +176,23 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
+                            let exclusions_changed =
+                                exclusion_state.refresh_touched(&root, &event.paths);
+                            if exclusions_changed {
+                                exclusion_paths = exclusion_state.paths();
+                                counters.set_backend_exclusions(
+                                    observed_generation,
+                                    exclusion_paths.clone(),
+                                    dropped_paths.clone(),
+                                );
+                                forget_removed_watch_paths(
+                                    &mut watched_directories,
+                                    &exclusion_paths,
+                                    |directory| {
+                                        let _ = watcher.unwatch(directory);
+                                    },
+                                );
+                            }
                             if matches!(
                                 event.kind,
                                 EventKind::Remove(_)
@@ -193,13 +217,17 @@ impl ProjectWatcher {
                                 );
                                 thread_count.store(watched_directories.len(), Ordering::Release);
                             }
-                            // A move into the root is reported as Rename(To), not Create.
-                            // Scan its descendants too so their later writes are watched.
-                            if matches!(
-                                event.kind,
-                                EventKind::Create(CreateKind::Folder)
-                                    | EventKind::Modify(ModifyKind::Name(RenameMode::To))
-                            ) {
+                            // Events can arrive after a path has already been replaced.
+                            // Scan its current local tree even for an earlier remove or
+                            // rename event; the boundary check rejects files and links.
+                            if exclusions_changed
+                                || matches!(
+                                    event.kind,
+                                    EventKind::Create(_)
+                                        | EventKind::Remove(_)
+                                        | EventKind::Modify(ModifyKind::Name(_))
+                                )
+                            {
                                 let deadline = Instant::now() + NEW_DIRECTORY_SCAN_BUDGET;
                                 let mut scan = NewDirectoryScan::Complete;
                                 for path in &event.paths {
@@ -419,7 +447,7 @@ fn watch_new_tree(
                 return Err(error);
             }
         }
-        let Ok(entries) = std::fs::read_dir(&directory) else {
+        let Ok(entries) = crate::watcher_filter::exclusion_read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -507,7 +535,7 @@ fn collect_watch_directories(
             continue;
         }
         directories.insert(directory.clone());
-        let Ok(entries) = std::fs::read_dir(&directory) else {
+        let Ok(entries) = crate::watcher_filter::exclusion_read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -811,6 +839,166 @@ mod tests {
         }
 
         assert_eq!(watcher.watched_directory_count(), 2);
+    }
+
+    #[test]
+    fn symlink_replaced_by_source_directory_reports_later_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let foo = root.join("foo");
+        std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            Vec::new(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+        assert_eq!(watcher.watched_directory_count(), 1);
+
+        std::fs::remove_file(&foo).unwrap();
+        std::fs::create_dir(&foo).unwrap();
+        let source = foo.join("source.rs");
+        std::fs::write(&source, "pub fn before() {}\n").unwrap();
+        wait_for_event(&rx, "replacement directory creation", |event| {
+            event.kind == EventKind::Create(CreateKind::Folder) && event.paths.contains(&foo)
+        });
+        // A write racing the directory's watch installation may already have
+        // queued a data event. Drain it before checking the later edit.
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+            event.expect("backend should remain available");
+        }
+        std::fs::write(&source, "pub fn after() {}\n").unwrap();
+        wait_for_event(&rx, "later edit inside replacement directory", |event| {
+            matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
+                && event.paths.contains(&source)
+        });
+        assert_eq!(watcher.watched_directory_count(), 2);
+    }
+
+    #[test]
+    fn symlink_replaced_by_symlink_stays_excluded_and_unopened() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::create_dir(second.path().join("nested")).unwrap();
+        let foo = root.join("foo");
+        std::os::unix::fs::symlink(first.path(), &foo).unwrap();
+        let matcher = Arc::new(RwLock::new(None));
+        let selected = crate::watcher_filter::derive_excluded_subtrees(&root, &matcher, None);
+        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&selected);
+        assert_eq!(state.paths(), vec![foo.clone()]);
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            Vec::new(),
+            tx,
+            matcher.clone(),
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+
+        std::fs::remove_file(&foo).unwrap();
+        std::os::unix::fs::symlink(second.path(), &foo).unwrap();
+        assert_external_replacement_unopened(&root, &foo, &matcher, &mut state);
+        wait_for_external_replacement(&root, &foo, &rx, &watcher);
+    }
+
+    #[test]
+    fn source_directory_replaced_by_symlink_becomes_excluded_and_unopened() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let external = tempfile::tempdir().unwrap();
+        std::fs::create_dir(external.path().join("nested")).unwrap();
+        let foo = root.join("foo");
+        std::fs::create_dir(&foo).unwrap();
+        let matcher = Arc::new(RwLock::new(None));
+        let selected = crate::watcher_filter::derive_excluded_subtrees(&root, &matcher, None);
+        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&selected);
+        assert!(state.paths().is_empty());
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            Vec::new(),
+            tx,
+            matcher.clone(),
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+        assert_eq!(watcher.watched_directory_count(), 2);
+
+        std::fs::remove_dir(&foo).unwrap();
+        std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+        assert_external_replacement_unopened(&root, &foo, &matcher, &mut state);
+        wait_for_external_replacement(&root, &foo, &rx, &watcher);
+    }
+
+    fn wait_for_external_replacement(
+        root: &Path,
+        foo: &Path,
+        rx: &mpsc::Receiver<notify::Result<Event>>,
+        watcher: &ProjectWatcher,
+    ) {
+        wait_for_event(rx, "replacement symlink creation", |event| {
+            matches!(event.kind, EventKind::Create(_)) && event.paths.iter().any(|path| path == foo)
+        });
+        assert_eq!(watcher.watched_directory_count(), 1);
+        assert!(crate::context::watcher_counters_for_root(root)
+            .backend_exclusions()
+            .paths
+            .contains(&foo.to_path_buf()));
+    }
+
+    fn assert_external_replacement_unopened(
+        root: &Path,
+        foo: &Path,
+        matcher: &SharedGitignore,
+        state: &mut crate::watcher_filter::WatcherExclusionPaths,
+    ) {
+        crate::watcher_filter::EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
+        state.refresh_touched(root, &[foo.to_path_buf()]);
+        assert_eq!(state.paths(), vec![foo.to_path_buf()]);
+        let initial = collect_watch_directories(root, matcher, &state.paths());
+        let (_, added, files) = walk_new_tree(
+            root,
+            matcher,
+            &state.paths(),
+            100,
+            Instant::now() + Duration::from_secs(1),
+            |_| {},
+        );
+        assert_eq!(initial, BTreeSet::from([root.to_path_buf()]));
+        assert_eq!(added, initial);
+        assert!(files.files.is_empty());
+        crate::watcher_filter::EXCLUSION_TEST_OPENS.with(|opens| {
+            let opens = opens.borrow();
+            assert!(opens.iter().any(|path| path == root));
+            assert!(
+                !opens.iter().any(|path| path.starts_with(foo)),
+                "replacement symlink must not be opened: {opens:?}"
+            );
+        });
+    }
+
+    fn wait_for_event(
+        rx: &mpsc::Receiver<notify::Result<Event>>,
+        description: &str,
+        matches: impl Fn(&Event) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("never reported: {description}"))
+                .expect("backend should remain available");
+            if matches(&event) {
+                return;
+            }
+        }
     }
 
     /// Waits until events have named each of `expected`.

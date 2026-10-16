@@ -81,7 +81,8 @@ impl ProjectWatcher {
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusions = plan.selected;
-        let exclusion_paths = watcher_exclusion_paths(&exclusions);
+        let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&exclusions);
+        let exclusion_paths = exclusion_state.paths();
         super::log_exclusions(&root, &exclusions, observed_generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
@@ -123,6 +124,8 @@ impl ProjectWatcher {
                 let mut stream = stream;
                 let _external_watcher = external_watcher;
                 let mut exclusions = exclusions;
+                let mut exclusion_state = exclusion_state;
+                let mut dropped_paths = watcher_exclusion_paths(&plan.dropped);
                 let mut observed_generation = observed_generation;
 
                 while !thread_shutdown.load(Ordering::Acquire) {
@@ -134,52 +137,34 @@ impl ProjectWatcher {
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
                         let replacement_exclusions = replacement_plan.selected;
-                        let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
+                        let replacement_state = crate::watcher_filter::WatcherExclusionPaths::new(
+                            &replacement_exclusions,
+                        );
+                        let replacement_paths = replacement_state.paths();
                         // Starting a replacement with SinceNow can lose file events
                         // delivered between the old stream's last callback and the
                         // new stream's first callback. A new matcher generation alone
                         // does not require a new stream when its backend exclusions
                         // are unchanged.
-                        if replacement_paths != watcher_exclusion_paths(&exclusions) {
-                            let since_when = last_delivered_id.load(Ordering::Acquire);
-                            #[cfg(test)]
-                            write_during_stream_handoff_for_test(&root);
-                            let replacement = match FsEventsStream::start(
+                        if replacement_paths != exclusion_state.paths() {
+                            if let Err(error) = replace_stream_exclusions(
+                                &mut stream,
                                 &root,
                                 &replacement_paths,
-                                stream.sender(),
-                                if since_when == 0 {
-                                    fs::kFSEventStreamEventIdSinceNow
-                                } else {
-                                    since_when
-                                },
-                                Arc::clone(&last_delivered_id),
+                                &last_delivered_id,
+                                &tx,
                             ) {
-                                Ok(replacement) => replacement,
-                                Err(error) => {
-                                    let _ = tx.send(Err(error));
-                                    return;
-                                }
-                            };
-                            // The old stream stays active until the replacement
-                            // starts. Replaying from the last delivered event ID
-                            // covers events still buffered by the old stream.
-                            stream = replacement;
-                            if since_when == 0
-                                && tx
-                                    .send(Ok(Event::new(EventKind::Other)
-                                        .set_flag(Flag::Rescan)
-                                        .set_info("rescan: missing event cursor")))
-                                    .is_err()
-                            {
+                                let _ = tx.send(Err(error));
                                 return;
                             }
                         }
+                        exclusion_state = replacement_state;
                         observed_generation = generation;
+                        dropped_paths = watcher_exclusion_paths(&replacement_plan.dropped);
                         counters.set_backend_exclusions(
                             observed_generation,
                             replacement_paths,
-                            watcher_exclusion_paths(&replacement_plan.dropped),
+                            dropped_paths.clone(),
                         );
                         if replacement_exclusions != exclusions {
                             super::log_exclusions(
@@ -193,6 +178,37 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(event) => {
+                            if let Ok(event) = &event {
+                                if exclusion_state.refresh_touched(&root, &event.paths) {
+                                    let paths = exclusion_state.paths();
+                                    if let Err(error) = replace_stream_exclusions(
+                                        &mut stream,
+                                        &root,
+                                        &paths,
+                                        &last_delivered_id,
+                                        &tx,
+                                    ) {
+                                        let _ = tx.send(Err(error));
+                                        return;
+                                    }
+                                    counters.set_backend_exclusions(
+                                        observed_generation,
+                                        paths,
+                                        dropped_paths.clone(),
+                                    );
+                                    // Writes made while a newly local directory still
+                                    // had an external exclusion may be missing from
+                                    // its replacement event; rescan to recover them.
+                                    if tx
+                                        .send(Ok(Event::new(EventKind::Other)
+                                            .set_flag(Flag::Rescan)
+                                            .set_info("rescan: external watcher boundary changed")))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
                             if tx.send(event).is_err() {
                                 return;
                             }
@@ -211,6 +227,38 @@ impl ProjectWatcher {
             raw_sender: stream_sender_for_test,
         })
     }
+}
+
+fn replace_stream_exclusions(
+    stream: &mut FsEventsStream,
+    root: &Path,
+    paths: &[PathBuf],
+    last_delivered_id: &Arc<AtomicU64>,
+    tx: &mpsc::Sender<notify::Result<Event>>,
+) -> notify::Result<()> {
+    let since_when = last_delivered_id.load(Ordering::Acquire);
+    #[cfg(test)]
+    write_during_stream_handoff_for_test(root);
+    let replacement = FsEventsStream::start(
+        root,
+        paths,
+        stream.sender(),
+        if since_when == 0 {
+            fs::kFSEventStreamEventIdSinceNow
+        } else {
+            since_when
+        },
+        Arc::clone(last_delivered_id),
+    )?;
+    // Keep the old stream active until its replacement starts, then replay
+    // from its last delivered cursor to cover events buffered during handoff.
+    *stream = replacement;
+    if since_when == 0 {
+        let _ = tx.send(Ok(Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .set_info("rescan: missing event cursor")));
+    }
+    Ok(())
 }
 
 impl Drop for ProjectWatcher {
@@ -762,6 +810,105 @@ mod tests {
             }
         }
         Ok(count)
+    }
+
+    fn wait_for_raw_path(rx: &mpsc::Receiver<notify::Result<Event>>, path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("never reported: {}", path.display()))
+                .expect("backend should remain available");
+            if event.paths.iter().any(|reported| reported == path) {
+                return;
+            }
+        }
+    }
+
+    fn symlink_replacement_fixture(
+        starts_as_directory: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        ProjectWatcher,
+        mpsc::Receiver<notify::Result<Event>>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let foo = root.join("foo");
+        if starts_as_directory {
+            std::fs::create_dir(&foo).unwrap();
+        } else {
+            std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+        }
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            Vec::new(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+        let marker = root.join("ready.rs");
+        std::fs::write(&marker, "ready\n").unwrap();
+        wait_for_raw_path(&rx, &marker);
+        (temp, external, root, watcher, rx)
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fsevents_symlink_replaced_by_source_directory_reports_later_edits() {
+        let (_temp, _external, root, _watcher, rx) = symlink_replacement_fixture(false);
+        let foo = root.join("foo");
+        std::fs::remove_file(&foo).unwrap();
+        std::fs::create_dir(&foo).unwrap();
+        let source = foo.join("source.rs");
+        std::fs::write(&source, "pub fn before() {}\n").unwrap();
+        wait_for_raw_path(&rx, &foo);
+        assert!(!crate::context::watcher_counters_for_root(&root)
+            .backend_exclusions()
+            .paths
+            .contains(&foo));
+        // Drain creation events and journal replay before writing again. A
+        // queued event for the first write must not satisfy the assertion
+        // that the second write is reported.
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+            event.expect("backend should remain available");
+        }
+        std::fs::write(&source, "pub fn after() {}\n").unwrap();
+        wait_for_raw_path(&rx, &source);
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fsevents_symlink_replaced_by_symlink_stays_excluded() {
+        let (_temp, _first, root, _watcher, rx) = symlink_replacement_fixture(false);
+        let second = tempfile::tempdir().unwrap();
+        let foo = root.join("foo");
+        std::fs::remove_file(&foo).unwrap();
+        std::os::unix::fs::symlink(second.path(), &foo).unwrap();
+        wait_for_raw_path(&rx, &foo);
+        assert!(crate::context::watcher_counters_for_root(&root)
+            .backend_exclusions()
+            .paths
+            .contains(&foo));
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fsevents_source_directory_replaced_by_symlink_becomes_excluded() {
+        let (_temp, external, root, _watcher, rx) = symlink_replacement_fixture(true);
+        let foo = root.join("foo");
+        std::fs::remove_dir(&foo).unwrap();
+        std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+        wait_for_raw_path(&rx, &foo);
+        assert!(crate::context::watcher_counters_for_root(&root)
+            .backend_exclusions()
+            .paths
+            .contains(&foo));
     }
 
     struct LinkedWorktree {
