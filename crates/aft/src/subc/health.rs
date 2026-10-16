@@ -3141,13 +3141,16 @@ mod tests {
         executor: &Executor,
         build_report: impl FnOnce() -> HealthReport,
     ) -> HealthReport {
-        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
-        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
         std::thread::scope(|scope| {
-            let holder = scope.spawn(|| {
+            // Both channel ends live inside the scope closure, so a panic here
+            // drops the release sender before the scope joins the holder, and
+            // the holder's recv returns instead of blocking forever.
+            let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+            let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+            let holder = scope.spawn(move || {
                 executor.hold_state_lock_for_test(|| {
                     held_tx.send(()).expect("signal held scheduler lock");
-                    release_rx.recv().expect("release held scheduler lock");
+                    let _ = release_rx.recv();
                 });
             });
             held_rx
@@ -4525,7 +4528,9 @@ mod tests {
                 }
             },
         );
-        assert_eq!(reads, 4, "the test must retry the three contended reads");
+        // The scheduler thread itself may also hold the lock on a later read, so
+        // more retries are valid; three forced collisions need at least four.
+        assert!(reads >= 4, "the test must retry the three contended reads");
 
         assert_ne!(
             report.status,
