@@ -2737,6 +2737,56 @@ fn refresh_search_index_path(ctx: &AppContext, path: &Path) {
     }
 }
 
+/// Reconcile the final disk state when an AFT mutation finishes, including
+/// partial failures and rollback. Keep this guard outside batch validation so
+/// a queued query never depends on delivery of an OS file notification.
+#[must_use]
+pub(crate) struct FileMutationGuard<'a> {
+    ctx: &'a AppContext,
+    roots: Vec<PathBuf>,
+    paths: std::collections::BTreeSet<PathBuf>,
+    _view_intent: crate::views::intent::IntentGuard,
+}
+
+fn collect_mutation_paths(roots: &[PathBuf], paths: &mut std::collections::BTreeSet<PathBuf>) {
+    let mut pending = roots.to_vec();
+    while let Some(path) = pending.pop() {
+        paths.insert(path.clone());
+        // Capture descendants before deletion and after restoration. Do not
+        // follow links into trees that the mutation does not own.
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                pending.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+            }
+        }
+    }
+}
+
+pub(crate) fn record_file_mutation<'a, 'p>(
+    ctx: &'a AppContext,
+    paths: impl IntoIterator<Item = &'p Path>,
+) -> FileMutationGuard<'a> {
+    let roots = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
+    let view_intent = crate::views::intent::record_paths(roots.iter().map(PathBuf::as_path));
+    let mut paths = std::collections::BTreeSet::new();
+    collect_mutation_paths(&roots, &mut paths);
+    FileMutationGuard {
+        ctx,
+        roots,
+        paths,
+        _view_intent: view_intent,
+    }
+}
+
+impl Drop for FileMutationGuard<'_> {
+    fn drop(&mut self) {
+        collect_mutation_paths(&self.roots, &mut self.paths);
+        for path in &self.paths {
+            refresh_search_index_after_write(self.ctx, path);
+        }
+    }
+}
+
 /// Publish AFT's own completed writes before a queued query can use the index.
 /// OS notifications can arrive after the edit response, so they cannot provide
 /// read-after-write ordering. Preparation reads at most the index's file-size
@@ -5515,6 +5565,90 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn own_mutation_patch_delete_retires_index_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let old = root.join("deleted.ts");
+        std::fs::write(&old, "const value = 'qqqq_deleted_token';\n").unwrap();
+        std::fs::write(root.join("kept.ts"), "const value = 'zzzz_kept_token';\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        let req = serde_json::from_value(serde_json::json!({
+            "id": "delete", "command": "apply_patch",
+            "patch_text": "*** Begin Patch\n*** Delete File: deleted.ts\n*** End Patch"
+        }))
+        .unwrap();
+        let response = crate::commands::apply_patch::handle_apply_patch(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        let search = ctx.search_index().read().unwrap();
+        let index = search.as_ref().unwrap();
+        let fresh = index.grep("zzzz_kept_token", true, &[], &[], &root, 10);
+        assert_eq!(fresh.matches.len(), 1);
+        assert!(fresh.files_searched > 0);
+        assert!(index
+            .grep("qqqq_deleted_token", true, &[], &[], &root, 10)
+            .matches
+            .is_empty());
+        assert!(index.glob("**/*", &root).iter().all(|path| path != &old));
+    }
+
+    #[test]
+    fn own_mutation_refresh_reconciles_directory_delete_and_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let tree = root.join("src");
+        std::fs::create_dir(&tree).unwrap();
+        let old = tree.join("old.ts");
+        std::fs::write(&old, "const value = 'qqqq_deleted_token';\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::build(&root));
+        let stale = crate::search_index::SearchIndex::build(&root);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+
+        {
+            let _mutation = record_file_mutation(&ctx, [tree.as_path()]);
+            std::fs::remove_dir_all(&tree).unwrap();
+            std::fs::create_dir(&tree).unwrap();
+            std::fs::write(
+                tree.join("new.ts"),
+                "const value = 'zzzz_restored_token';\n",
+            )
+            .unwrap();
+        }
+        let assert_fresh = || {
+            let search = ctx.search_index().read().unwrap();
+            let index = search.as_ref().unwrap();
+            let fresh = index.grep("zzzz_restored_token", true, &[], &[], &root, 10);
+            assert_eq!(fresh.matches.len(), 1);
+            assert!(fresh.files_searched > 0);
+            assert!(index
+                .grep("qqqq_deleted_token", true, &[], &[], &root, 10)
+                .matches
+                .is_empty());
+            assert!(index.glob("**/*", &root).iter().all(|path| path != &old));
+        };
+        assert_fresh();
+        tx.send(stale).unwrap();
+        drain_search_index_events(&ctx);
+        assert_fresh();
     }
 
     #[test]

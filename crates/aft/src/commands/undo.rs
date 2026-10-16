@@ -80,8 +80,10 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         if let Some(reason) = backup.take_latest_skipped_reason_for_undo(req.session(), None) {
             return backup_skipped_response(req, reason);
         }
-        let _view_intent =
-            crate::views::intent::record_paths(intent_paths.iter().map(|path| path.as_path()));
+        let _mutation = crate::runtime_drain::record_file_mutation(
+            ctx,
+            intent_paths.iter().map(|path| path.as_path()),
+        );
         return match backup.restore_last_operation_preserving(req.session(), &mut save) {
             Ok(operation) => {
                 let mut result = serde_json::json!({
@@ -126,7 +128,7 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         return backup_skipped_response(req, reason);
     }
 
-    let _view_intent = crate::views::intent::record_paths([resolved.as_path()]);
+    let _mutation = crate::runtime_drain::record_file_mutation(ctx, [resolved.as_path()]);
     match backup.restore_latest_detailed(req.session(), &resolved, &mut save) {
         Ok(restored) => {
             let mut result = serde_json::json!({

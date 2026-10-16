@@ -557,6 +557,12 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    let _mutation = crate::runtime_drain::record_file_mutation(
+        ctx,
+        [source_path, dest_path]
+            .into_iter()
+            .chain(consumer_rewrites.iter().map(|(path, _, _)| path.as_path())),
+    );
     // --- Apply mutations ---
     // Track files for rollback
     let mut written_files: Vec<PathBuf> = Vec::new();

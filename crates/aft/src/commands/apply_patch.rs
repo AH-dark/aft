@@ -1149,7 +1149,8 @@ pub fn handle_apply_patch(req: &RawRequest, ctx: &AppContext) -> Response {
         return build_preview_response(req, &resolved, affected_abs, affected_rel);
     }
 
-    let _view_intent = crate::views::intent::record_paths(
+    let _mutation = crate::runtime_drain::record_file_mutation(
+        ctx,
         affected_abs.iter().map(|path| std::path::Path::new(path)),
     );
     apply_patch(req, ctx, &resolved)

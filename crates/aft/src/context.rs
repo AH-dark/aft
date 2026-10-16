@@ -11917,13 +11917,6 @@ impl AppContext {
         content: &str,
         params: &serde_json::Value,
     ) -> Option<crate::lsp::manager::PostEditWaitOutcome> {
-        if let Some(paths) = Self::multi_file_write_paths(params) {
-            for path in paths {
-                crate::runtime_drain::refresh_search_index_after_write(self, &path);
-            }
-        } else {
-            crate::runtime_drain::refresh_search_index_after_write(self, file_path);
-        }
         let wants_diagnostics = params
             .get("diagnostics")
             .and_then(|v| v.as_bool())
