@@ -438,8 +438,21 @@ impl Fixture {
         corr: u64,
         dispatch: DispatchFn,
     ) -> mpsc::Receiver<WriterFrame> {
-        self.send_tool_with(identity, "read", json!({"filePath": path}), corr, dispatch)
-            .await
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            41,
+            1,
+            corr,
+            serde_json::to_vec(&json!({
+                "name": "read",
+                "preset": if identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
+                "arguments": {"filePath": path},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        self.send_frame_with(identity, frame, dispatch).await
     }
 
     async fn tool(
@@ -468,11 +481,6 @@ impl Fixture {
         corr: u64,
         dispatch: DispatchFn,
     ) -> mpsc::Receiver<WriterFrame> {
-        if self.executor.actor_context(&identity.root).is_none() {
-            self.executor
-                .register_actor(identity.root.clone(), Arc::clone(&self.ctx));
-        }
-        let routes = HashMap::from([(route_key(41, 1), identity.clone())]);
         let frame = Frame::build(
             FrameType::Request,
             control_flags(),
@@ -487,6 +495,20 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap();
+        self.send_frame_with(identity, frame, dispatch).await
+    }
+
+    async fn send_frame_with(
+        &self,
+        identity: &RouteIdentity,
+        frame: Frame,
+        dispatch: DispatchFn,
+    ) -> mpsc::Receiver<WriterFrame> {
+        if self.executor.actor_context(&identity.root).is_none() {
+            self.executor
+                .register_actor(identity.root.clone(), Arc::clone(&self.ctx));
+        }
+        let routes = HashMap::from([(route_key(41, 1), identity.clone())]);
         let (writer, replies) = mpsc::channel(8);
         let (bash_tx, _bash_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
