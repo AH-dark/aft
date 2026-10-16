@@ -1,0 +1,7 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["crates/aft/tests/integration/tool_call_parity_test.rs"],
+  "reason": "search_index.rs is in the ranking path fence, but the changed hunks only profile artifact cache identity probes and persisted key memo operations. Query routing, candidate selection and scoring are unchanged."
+}

@@ -2446,7 +2446,6 @@ impl Drop for RefreshWorkerWatchdog {
 }
 
 impl RefreshWorker {
-    #[cfg(test)]
     fn wait_for_root_with_budget(&self, project_root: &Path, budget: Duration) -> bool {
         let root_busy = |queue: &RefreshQueue| {
             queue
@@ -2908,11 +2907,10 @@ pub fn flush_callgraph_store_refreshes_with_budget(budget: Duration) -> bool {
     drained
 }
 
-#[cfg(test)]
-pub(crate) fn wait_for_process_callgraph_refresh_for_test(
-    project_root: &Path,
-    budget: Duration,
-) -> bool {
+/// Wait for an enqueued root's refresh to settle without stopping the shared worker.
+/// Callers must observe the enqueue before waiting, or an idle root can return early.
+#[doc(hidden)]
+pub fn wait_for_process_callgraph_refresh_for_test(project_root: &Path, budget: Duration) -> bool {
     // A fixture's completion must not depend on other roots' parked refreshes.
     // Unlike shutdown, this wait neither discards their work nor stops the worker.
     let worker = CALLGRAPH_REFRESH_WORKER
