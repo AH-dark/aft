@@ -8,30 +8,67 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::thread;
 use std::time::Duration;
 
+use aft::config::SemanticBackendConfig;
 use aft::context::SemanticIndexStatus;
 use aft::search_index::SearchIndex;
-use aft::semantic_index::SemanticIndex;
+use aft::semantic_index::{EmbeddingModel, QueryBudget, SemanticIndex};
 use serde_json::{json, Value};
 
 use crate::helpers::{user_config, AftProcess};
+
+#[derive(Default)]
+struct RefreshGate {
+    // (request entered, response released)
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl RefreshGate {
+    fn hold(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_held(&self) {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(
+                self.state.lock().unwrap(),
+                Duration::from_secs(30),
+                |state| !state.0,
+            )
+            .unwrap();
+        let (entered, released) = *state;
+        drop(state);
+        assert!(entered, "refresh embedding request never reached the mock");
+        assert!(
+            !released,
+            "refresh must remain held until explicitly released"
+        );
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+}
 
 struct MockEmbeddingServer {
     base_url: String,
     addr: SocketAddr,
     running: Arc<AtomicBool>,
-    // Gate for the post-edit refresh embedding request. The refresh worker marks
-    // the file "refreshing" BEFORE calling embed and clears it AFTER, so blocking
-    // the embed response holds `refreshing_count == 1` open until the test has
-    // observed it and flips this flag. This makes the transient refreshing state
-    // deterministically observable instead of racing a fixed sleep window — the
-    // old 500ms delay could be missed entirely when the test's polling thread is
-    // starved under full-suite parallel load.
-    release_refresh: Arc<AtomicBool>,
+    // Keep the refresh in flight until explicit release, including during a
+    // slow query. Drop releases the gate if an assertion panics.
+    refresh_gate: Arc<RefreshGate>,
     // Read only by the linked-worktree quiet-window test, which needs the
     // `test-timing-hooks` feature; the server records into it regardless.
     #[cfg_attr(not(feature = "test-timing-hooks"), allow(dead_code))]
@@ -45,8 +82,8 @@ impl MockEmbeddingServer {
         let addr = listener.local_addr().expect("embedding server addr");
         let running = Arc::new(AtomicBool::new(true));
         let running_for_thread = Arc::clone(&running);
-        let release_refresh = Arc::new(AtomicBool::new(false));
-        let release_for_thread = Arc::clone(&release_refresh);
+        let refresh_gate = Arc::new(RefreshGate::default());
+        let release_for_thread = Arc::clone(&refresh_gate);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let requests_for_thread = Arc::clone(&requests);
         let handle = thread::spawn(move || {
@@ -73,7 +110,7 @@ impl MockEmbeddingServer {
             base_url: format!("http://{addr}"),
             addr,
             running,
-            release_refresh,
+            refresh_gate,
             requests,
             handle: Some(handle),
         }
@@ -82,7 +119,7 @@ impl MockEmbeddingServer {
     /// Release the held post-edit refresh embedding request. Call this once the
     /// test has observed `refreshing_count == 1` so the refresh can complete.
     fn release_refresh(&self) {
-        self.release_refresh.store(true, Ordering::SeqCst);
+        self.refresh_gate.release();
     }
 
     #[cfg(feature = "test-timing-hooks")]
@@ -112,9 +149,7 @@ impl MockEmbeddingServer {
 impl Drop for MockEmbeddingServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        // Unwedge any handler thread still holding a refresh request so it
-        // exits promptly instead of waiting out its 30s panic backstop.
-        self.release_refresh.store(true, Ordering::SeqCst);
+        self.release_refresh();
         let _ = TcpStream::connect(self.addr);
         if let Some(handle) = self.handle.take() {
             handle.join().expect("embedding server thread");
@@ -124,7 +159,7 @@ impl Drop for MockEmbeddingServer {
 
 fn handle_embedding_request(
     stream: &mut TcpStream,
-    release_refresh: &Arc<AtomicBool>,
+    refresh_gate: &RefreshGate,
     requests: &Arc<Mutex<Vec<Vec<String>>>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -180,15 +215,7 @@ fn handle_embedding_request(
         .iter()
         .any(|input| input.to_ascii_lowercase().contains("after edit refreshed"))
     {
-        // Hold the refresh open until the test observes `refreshing_count == 1`
-        // and releases it (see MockEmbeddingServer::release_refresh). The cap
-        // must exceed the test's observe-and-release latency even under heavy
-        // load (its status round-trips can be starved), so it's generous; it
-        // exists only to avoid wedging if the test panics before releasing.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !release_refresh.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
+        refresh_gate.hold();
     }
 
     let data = inputs
@@ -344,16 +371,59 @@ fn configure_semantic_openai_with_overlay(
                 "worktree": {
                     "ram_overlay": ram_overlay
                 },
-                "semantic": {
-                    "backend": "openai_compatible",
-                    "model": "test-embedding",
-                    "base_url": base_url,
-                    "timeout_ms": 30_000,
-                    "max_batch_size": 64
-                }
+                "semantic": semantic_backend_config(base_url)
             })),
         }),
     )
+}
+
+fn semantic_backend_config(base_url: &str) -> Value {
+    json!({
+        "backend": "openai_compatible",
+        "model": "test-embedding",
+        "base_url": base_url,
+        "timeout_ms": 30_000,
+        // Query embeddings have a separate 3s production deadline. This mock
+        // tests refresh queryability, not runner scheduling latency; use the
+        // maximum query budget as a hang guard, just like the build timeout.
+        "query_timeout_ms": 30_000,
+        "max_batch_size": 64,
+        "max_files": 20_000
+    })
+}
+
+#[test]
+fn semantic_refresh_fixture_uses_query_hang_guard() {
+    let config: SemanticBackendConfig =
+        serde_json::from_value(semantic_backend_config("http://127.0.0.1:9")).unwrap();
+    assert_eq!(config.timeout_ms, 30_000);
+    assert_eq!(
+        config.query_timeout_ms, 30_000,
+        "the watcher scenario tests queryability, not the interactive latency budget"
+    );
+}
+
+#[test]
+fn semantic_refresh_fixture_embeds_query_while_refresh_is_held() {
+    let server = MockEmbeddingServer::start();
+    let config: SemanticBackendConfig =
+        serde_json::from_value(semantic_backend_config(&server.base_url)).unwrap();
+    let mut refresh_model = EmbeddingModel::from_config(&config).unwrap();
+    let refresh = thread::spawn(move || {
+        refresh_model.embed(vec!["after edit refreshed content".to_string()])
+    });
+    server.refresh_gate.wait_until_held();
+
+    let mut query_model = EmbeddingModel::from_config_for_query(&config).unwrap();
+    let query = query_model
+        .embed_query_cached("alpha anchor", QueryBudget::from_config(&config))
+        .expect("query must embed independently of the held refresh");
+    assert_eq!(query, embedding_for("alpha anchor"));
+    server.refresh_gate.wait_until_held();
+    assert!(!refresh.is_finished(), "refresh completed before release");
+
+    server.release_refresh();
+    refresh.join().unwrap().expect("released refresh embeds");
 }
 
 fn status(aft: &mut AftProcess) -> Value {
@@ -831,6 +901,7 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
         },
     );
     assert_eq!(refreshing["semantic_index"]["refreshing_count"], 1);
+    server.refresh_gate.wait_until_held();
 
     // Mid-refresh queryability: while the edited file's embed is held open,
     // the index must stay fully queryable (Ready, not Building), serve results
@@ -852,8 +923,8 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
         mid_refresh["success"], true,
         "mid-refresh semantic search should succeed: {mid_refresh:?}"
     );
-    assert_eq!(mid_refresh["status"], "ready");
-    assert_eq!(mid_refresh["semantic_status"], "ready");
+    assert_eq!(mid_refresh["status"], "ready", "{mid_refresh:?}");
+    assert_eq!(mid_refresh["semantic_status"], "ready", "{mid_refresh:?}");
     assert_eq!(mid_refresh["interpreted_as"], "semantic");
     let mid_warnings = mid_refresh["warnings"].as_array().expect("warnings array");
     assert!(
@@ -874,6 +945,7 @@ fn semantic_refresh_watcher_reindexes_modified_file_and_clears_refreshing() {
     );
 
     // Observed and queried the refreshing state; let the refresh complete.
+    server.refresh_gate.wait_until_held();
     server.release_refresh();
 
     let refreshed = wait_for_semantic_status(&mut aft, "refresh completed", |response| {
