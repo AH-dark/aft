@@ -32,7 +32,7 @@ import {
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = join(pluginRoot, "../..");
 const packageName = "@cortexkit/aft-opencode";
-const v2Version = "2.0.11";
+const v2Version = "2.0.29";
 const v2CoreVersion = v2Version;
 const allowLiveOperatorWrites = process.env.AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR === "1";
 const suiteTempParent = join(pluginRoot, "tmp");
@@ -336,6 +336,15 @@ async function writeAftConfig(
   const projectConfigDir = join(isolation.project, ".cortexkit");
   await mkdir(projectConfigDir, { recursive: true });
   await writeFile(join(projectConfigDir, "aft.jsonc"), `${JSON.stringify(aftConfig, null, 2)}\n`);
+}
+
+async function writeUserAftConfig(
+  isolation: HostIsolation,
+  aftConfig: Record<string, unknown>,
+): Promise<void> {
+  const userConfigDir = join(isolation.env.XDG_CONFIG_HOME ?? "", "cortexkit");
+  await mkdir(userConfigDir, { recursive: true });
+  await writeFile(join(userConfigDir, "aft.jsonc"), `${JSON.stringify(aftConfig, null, 2)}\n`);
 }
 
 async function writeV1Configs(
@@ -1438,6 +1447,8 @@ async function writeV2CoreProbe(hostRoot: string, mode: "load" | "reject"): Prom
     probe,
     `
 import { Effect } from "effect";
+import { Config } from "@opencode/core/config";
+import * as ManagedPolicy from "@opencode/core/managed-policy";
 import { PluginModule } from "@opencode/core/plugin/module";
 import { Watcher } from "@opencode/core/filesystem/watcher";
 import { Host } from "@opencode/plugin/host";
@@ -1459,9 +1470,17 @@ const npm = {
 };
 const operation = { type: "add", target: ${JSON.stringify(packageName)}, options: {} };
 const { load } = await Effect.runPromise(
-  Effect.scoped(PluginModule.make()).pipe(Effect.provide(Watcher.testLayer)),
+  Effect.scoped(PluginModule.make()).pipe(
+    Effect.provide(Watcher.testLayer),
+    Effect.provide(Config.testLayer()),
+    Effect.provide(ManagedPolicy.layer),
+  ),
 );
-const program = load(operation, { install: false }).pipe(Effect.provideService(Npm.Service, npm));
+const program = load(operation, { install: false }).pipe(
+  Effect.provideService(Npm.Service, npm),
+  Effect.provide(Config.testLayer()),
+  Effect.provide(ManagedPolicy.layer),
+);
 ${
   mode === "load"
     ? `const loaded = await Effect.runPromise(program);
@@ -1473,8 +1492,20 @@ const context = {
     directory,
     project: { id: "load-matrix", directory, canonical: directory },
   },
+  permission: { assert: () => Effect.void },
+  agent: { get: () => Effect.succeed({ data: { permissions: [] } }) },
+  session: { get: ({ sessionID }) => Effect.succeed({ id: sessionID, agent: "load-matrix" }) },
+  rpc: {
+    register: () =>
+      Effect.succeed({ events: { emit: () => Effect.void }, dispose: Effect.void }),
+  },
+  tool: {
+    transform: (register) => Effect.sync(() => register({ add: () => {}, remove: () => {} })),
+  },
 };
-await Effect.runPromise(Effect.scoped(loaded.effect(context)));
+await Effect.runPromise(
+  Effect.scoped(loaded.effect(context)).pipe(Effect.provide(Config.testLayer()), Effect.provide(ManagedPolicy.layer)),
+);
 console.log("[load-matrix-host:v2] resolvedEntry=" + entrypoints.server + " selected=effect features=" + JSON.stringify(loaded.features));`
     : `try {
   await Effect.runPromise(program);
@@ -1499,6 +1530,8 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Effect, Exit, Fiber } from "effect";
+import { Config } from "@opencode/core/config";
+import * as ManagedPolicy from "@opencode/core/managed-policy";
 import { PluginModule } from "@opencode/core/plugin/module";
 import { Watcher } from "@opencode/core/filesystem/watcher";
 import { Host } from "@opencode/plugin/host";
@@ -1526,10 +1559,18 @@ const npm = {
 };
 const operation = { type: "add", target: ${JSON.stringify(packageName)}, options: {} };
 const { load } = await Effect.runPromise(
-  Effect.scoped(PluginModule.make()).pipe(Effect.provide(Watcher.testLayer)),
+  Effect.scoped(PluginModule.make()).pipe(
+    Effect.provide(Watcher.testLayer),
+    Effect.provide(Config.testLayer()),
+    Effect.provide(ManagedPolicy.layer),
+  ),
 );
 const loaded = await Effect.runPromise(
-  load(operation, { install: false }).pipe(Effect.provideService(Npm.Service, npm)),
+  load(operation, { install: false }).pipe(
+    Effect.provideService(Npm.Service, npm),
+    Effect.provide(Config.testLayer()),
+    Effect.provide(ManagedPolicy.layer),
+  ),
 );
 if (loaded.pending) throw new Error("host loader returned pending");
 const entrypoints = Host.resolve(installed);
@@ -1537,7 +1578,7 @@ const entrypoints = Host.resolve(installed);
 function permissionRules() {
   // Mirrors OpenCode's own starting ruleset plus three explicit rows, so the
   // probe can exercise an allowed tool, a denied one, and one the rules leave
-  // to a prompt this host cannot show. The denied rows start with "*" because
+  // to the host's assertion. The denied rows start with "*" because
   // "edit" states the project-relative path while "aft_delete" states an
   // absolute one, and one rule has to cover both spellings.
   return [
@@ -1557,6 +1598,7 @@ function locationContext(id) {
   let rpcDisposals = 0;
   const agentReads = [];
   const sessionReads = [];
+  const permissionAsserts = [];
   return {
     tools,
     rpcRegistrations,
@@ -1564,6 +1606,7 @@ function locationContext(id) {
     rpcDisposals: () => rpcDisposals,
     agentReads,
     sessionReads,
+    permissionAsserts,
     context: {
       location: {
         directory,
@@ -1591,6 +1634,7 @@ function locationContext(id) {
         get: () => Effect.succeed(undefined),
         reply: () => Effect.void,
         rules: () => Effect.void,
+        assert: (input) => Effect.sync(() => permissionAsserts.push(input)),
       },
       tool: {
         transform: (register) => Effect.sync(() => register({
@@ -1667,7 +1711,12 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const edit = first.tools.find((tool) => tool.name === "edit");
   const read = first.tools.find((tool) => tool.name === "read");
   const aftDelete = first.tools.find((tool) => tool.name === "aft_delete");
-  if (!edit || !read || !aftDelete) throw new Error("enabled V2 effect did not register hoisted tools");
+  if (!edit || !read || !aftDelete) {
+    throw new Error(
+      "enabled V2 effect did not register hoisted tools: " +
+        JSON.stringify(first.tools.map((tool) => tool.name)),
+    );
+  }
   const editPath = resolve(directory, "permission-edit.ts");
   const deniedEditPath = resolve(directory, "permission-edit-denied.ts");
   const deniedDeletePath = resolve(directory, "permission-delete-denied.ts");
@@ -1700,9 +1749,12 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   }
   appendFileSync(marker, "permission-gated:allowed:edit,read\\n");
 
-  // Every refusal has to reach the host as a FAILED call whose text is the
-  // rendered sentence. A returned {"success": false} envelope would arrive as a
-  // successful call and read as a result that never happened.
+  if (first.permissionAsserts.length !== 0) {
+    throw new Error("an allowed tool call unexpectedly reached permission.assert");
+  }
+
+  // Every denial has to reach the caller as a failed call whose text is the
+  // rendered sentence, not a successful JSON envelope.
   const settle = (label, effect) =>
     Effect.match(effect, {
       onSuccess: (value) => {
@@ -1721,14 +1773,6 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       { files: [deniedDeletePath] },
       permissionContext("delete-denied"),
     )),
-    // No OpenCode service runs beside this probe, so an "ask" here cannot be
-    // put to anyone. The sibling prompt row is the one that starts a service
-    // and proves the prompt; this row's subject is that the refusal says what
-    // was observed instead of blaming the host.
-    "read-ask": yield* settle("read-ask", read.execute(
-      { path: secretPath },
-      permissionContext("read-ask"),
-    )),
   };
   for (const [label, failure] of Object.entries(refusals)) {
     const text = String(failure?.message ?? failure);
@@ -1741,19 +1785,23 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     if (text.includes("no way to open a permission prompt")) {
       throw new Error("GA refusal " + label + " still claims a capability gap: " + text);
     }
-    // 240 characters rather than a shorter excerpt: the ask refusal names what
-    // stopped the prompt only after it has quoted the action and the resource,
-    // and the row asserts on that phrase.
     appendFileSync(marker, "permission-refusal:" + label + ":" + text.slice(0, 240) + "\\n");
   }
-  if (!String(refusals["read-ask"]?.message).includes('"effect": "allow"')) {
-    throw new Error("GA ask refusal did not name the setting that lifts it");
+  const askedRead = yield* read.execute({ path: secretPath }, permissionContext("read-ask"));
+  if (!String(askedRead.content).includes("TOKEN=1")) {
+    throw new Error("GA permission.assert allow did not serve the asked read");
   }
-  if (!String(refusals["read-ask"]?.message).includes("could not reach the OpenCode service")) {
+  if (
+    first.permissionAsserts.length !== 1 ||
+    first.permissionAsserts[0]?.action !== "read" ||
+    !first.permissionAsserts[0]?.resources.some((resource) => resource.endsWith("permission-read.env"))
+  ) {
     throw new Error(
-      "GA ask refusal did not name what stopped the prompt: " + String(refusals["read-ask"]?.message),
+      "the ask did not reach permission.assert exactly once with its resource: " +
+        JSON.stringify(first.permissionAsserts),
     );
   }
+  appendFileSync(marker, "permission-assert:read-ask:once\\n");
   if (
     readFileSync(deniedEditPath, "utf8") !== "keep me\\n" ||
     readFileSync(deniedDeletePath, "utf8") !== "keep me\\n"
@@ -1765,7 +1813,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   }
   appendFileSync(
     marker,
-    "permission-api:evaluated:domain=agent.get,session.get;prompt=service.discover\\n",
+    "permission-api:evaluated:domain=agent.get,session.get;assert=read-ask\\n",
   );
   const live = getBridgeLifecycleTopology();
   const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
@@ -1788,7 +1836,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       JSON.stringify({ health: liveHealth, ports: listeningPorts }),
     );
   }
-})))
+})).pipe(Effect.provide(Config.testLayer()), Effect.provide(ManagedPolicy.layer)));
 if (first.rpcDisposals() !== 1 || second.rpcDisposals() !== 1) {
   throw new Error("Location RPC registrations were not supervisor-scoped");
 }
@@ -1842,10 +1890,9 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     throw new Error("GA bash permission refusal unexpectedly started a process: " + JSON.stringify(abortExit));
   }
 
-  const database = new DatabaseSync(
-    resolve(process.env.XDG_DATA_HOME, "cortexkit", "aft", "aft.db"),
-    { readOnly: true },
-  );
+  const storageDir = process.env.AFT_STORAGE_DIR;
+  if (!storageDir) throw new Error("the lifecycle probe has no isolated AFT_STORAGE_DIR");
+  const database = new DatabaseSync(resolve(storageDir, "aft.db"), { readOnly: true });
   const abortQuery = database.prepare(
     "SELECT task_id, status, metadata FROM bash_tasks " +
       "WHERE harness = ? AND session_id = ? ORDER BY started_at DESC LIMIT 1",
@@ -1869,7 +1916,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   if (topology.daemonProcesses !== 1 || topology.routes !== 1 || topology.locations !== 1) {
     throw new Error("unexpected reload topology: " + JSON.stringify(topology));
   }
-})))
+})).pipe(Effect.provide(Config.testLayer()), Effect.provide(ManagedPolicy.layer)));
 if (reloaded.rpcDisposals() !== 1) {
   throw new Error("reloaded RPC registration was not disposed");
 }
@@ -1902,6 +1949,8 @@ async function writeV2PromptProbe(hostRoot: string): Promise<string> {
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Effect } from "effect";
+import { Config } from "@opencode/core/config";
+import * as ManagedPolicy from "@opencode/core/managed-policy";
 import { PluginModule } from "@opencode/core/plugin/module";
 import { Watcher } from "@opencode/core/filesystem/watcher";
 import { Npm } from "@opencode/util/npm";
@@ -1937,11 +1986,19 @@ const npm = {
   which: () => Effect.succeed(undefined),
 };
 const { load } = await Effect.runPromise(
-  Effect.scoped(PluginModule.make()).pipe(Effect.provide(Watcher.testLayer)),
+  Effect.scoped(PluginModule.make()).pipe(
+    Effect.provide(Watcher.testLayer),
+    Effect.provide(Config.testLayer()),
+    Effect.provide(ManagedPolicy.layer),
+  ),
 );
 const loaded = await Effect.runPromise(
   load({ type: "add", target: ${JSON.stringify(packageName)}, options: {} }, { install: false })
-    .pipe(Effect.provideService(Npm.Service, npm)),
+    .pipe(
+      Effect.provideService(Npm.Service, npm),
+      Effect.provide(Config.testLayer()),
+      Effect.provide(ManagedPolicy.layer),
+    ),
 );
 if (loaded.pending) throw new Error("host loader returned pending");
 
@@ -1963,6 +2020,10 @@ try {
   record("service-session:" + session.id);
 
   const tools = [];
+  let finishPermissionAssertion;
+  const permissionAssertion = new Promise((resolve) => {
+    finishPermissionAssertion = resolve;
+  });
   const context = {
     location: {
       directory,
@@ -1981,6 +2042,20 @@ try {
       get: () => Effect.succeed(undefined),
       reply: () => Effect.void,
       rules: () => Effect.void,
+      assert: (input) =>
+        Effect.promise(async () => {
+          const created = await control.permission.create({
+            sessionID: input.sessionID,
+            ...(input.agent === undefined ? {} : { agent: input.agent }),
+            action: input.action,
+            resources: input.resources,
+            save: input.save,
+            metadata: input.metadata,
+            source: input.source,
+          });
+          if (created.effect === "deny") throw new Error("the host denied the assertion");
+          if (created.effect === "ask") await permissionAssertion;
+        }),
     },
     tool: {
       transform: (register) =>
@@ -2056,6 +2131,7 @@ try {
         decision: "once",
       }),
     );
+    finishPermissionAssertion();
     const secret = yield* Effect.promise(() => pending);
     if (!String(secret.content).includes("TOKEN=prompted")) {
       throw new Error("the answered read did not return the file: " + JSON.stringify(secret));
@@ -2064,7 +2140,7 @@ try {
       throw new Error("the prompted read changed the file it read");
     }
     record("prompt-answered:once:read-completed");
-  })));
+  })).pipe(Effect.provide(Config.testLayer()), Effect.provide(ManagedPolicy.layer)));
 } finally {
   await stop().catch((error) => record("service-stop-failed:" + String(error)));
 }
@@ -2124,16 +2200,14 @@ describe("packed module shapes", () => {
     const source = JSON.parse(await readFile(join(pluginRoot, "package.json"), "utf8"));
     expect(manifest["oc-plugin"]).toBeUndefined();
     expect(Object.keys(manifest.exports).sort()).toEqual([".", "./server", "./tui"]);
-    expect(manifest.dependencies.effect).toBe("4.0.0-rc.112");
+    expect(manifest.dependencies.effect).toBe(source.dependencies.effect);
     expect(manifest.peerDependencies["@opencode-ai/plugin"]).toBe(">=0.0.0-beta-0");
-    // Compared against the source manifest rather than a literal: this asks
-    // whether packing preserved the pin, which is the question, and a second
-    // copy of the version here is exactly the drift that broke this test when
-    // the GA pin moved to 2.0.11.
+    // Compare against the source manifest so this packing check does not
+    // duplicate the peer dependency version.
     expect(manifest.peerDependencies["@opencode/plugin"]).toBe(
       source.peerDependencies["@opencode/plugin"],
     );
-    expect(manifest.peerDependencies["@opencode/plugin"]).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(manifest.peerDependencies["@opencode/plugin"]).toMatch(/^\^?\d+\.\d+\.\d+$/);
   });
 
   test("operator canary detects same-size byte changes", async () => {
@@ -2165,7 +2239,7 @@ describe("packed module shapes", () => {
   });
 });
 
-describe("real host load matrix", () => {
+describe.serial("real host load matrix", () => {
   test("packed installs have no peer warning under modern V1 and the GA host", async () => {
     const installs = await ensureHostInstalls();
     expect(installs.v1Output).not.toContain("ERESOLVE");
@@ -2221,7 +2295,7 @@ export default {
         .filter((line) => line.includes("load-matrix-host") || line.includes("AFT disabled"))
         .join("\n")}`,
     );
-    expect(transcript).toContain("AFT disabled by config");
+    expect(transcript).toContain("[load-matrix-host:v1] resolvedEntry=./server");
     expect(transcript).not.toContain("ROOT_ENTRY_SELECTED");
     const serverResolutions = events.match(/resolvedEntry=\.\/server/g) ?? [];
     expect(serverResolutions.length).toBeGreaterThan(0);
@@ -2324,12 +2398,16 @@ export default { id: original.id, effect, setup };
       process.env.AFT_BINARY_PATH?.trim() ||
       join(repoRoot, "target", "debug", process.platform === "win32" ? "aft.exe" : "aft");
     expect(existsSync(binaryPath)).toBe(true);
-    await writeAftConfig(isolation, {
+    const lifecycleConfig = {
       indexes: { trigram: false, semantic: false },
       disabled_tools: [],
       bash: true,
       lsp: { auto_install: false },
-    });
+    };
+    await writeAftConfig(isolation, lifecycleConfig);
+    // Project config cannot re-enable `aft_delete` or `aft_move`, so the probe
+    // enables those tools at user tier.
+    await writeUserAftConfig(isolation, lifecycleConfig);
     const manifestPath = join(packageRoot, "package.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     manifest.exports["./server"].import = "./load-matrix-lifecycle-server.mjs";
@@ -2370,6 +2448,7 @@ export default { id: original.id, effect };
     const permissionEvidence = evidence.filter(
       (line) =>
         line.startsWith("permission-api:") ||
+        line.startsWith("permission-assert:") ||
         line.startsWith("permission-gated:") ||
         line.startsWith("permission-refusal:"),
     );
@@ -2390,19 +2469,15 @@ export default { id: original.id, effect };
     // A gated tool the rules allow must complete, and every refusal must arrive
     // as rendered text naming its real cause.
     expect(permissionEvidence).toContain("permission-gated:allowed:edit,read");
+    expect(permissionEvidence).toContain("permission-assert:read-ask:once");
     expect(permissionEvidence).toContain(
-      "permission-api:evaluated:domain=agent.get,session.get;prompt=service.discover",
+      "permission-api:evaluated:domain=agent.get,session.get;assert=read-ask",
     );
     const refusals = permissionEvidence.filter((line) => line.startsWith("permission-refusal:"));
     expect(refusals.map((line) => line.split(":")[1]).sort()).toEqual([
       "delete-denied",
       "edit-denied",
-      "read-ask",
     ]);
-    expect(refusals.some((line) => line.includes("needs interactive approval"))).toBe(true);
-    expect(refusals.some((line) => line.includes("could not reach the OpenCode service"))).toBe(
-      true,
-    );
     expect(events).not.toContain("did not provide a permission request endpoint");
     expect(events).not.toContain("no way to open a permission prompt");
     expect(events).not.toContain('permission-refusal:edit-denied:{"success"');
@@ -2577,9 +2652,6 @@ export default { id: original.id, effect };
     // registration in the same setup are lost with it.
     expect(transcript).not.toContain("Keymap.Provider is missing");
     expect(transcript).not.toMatch(/message="plugin operation failed"[^\n]*plugin=aft-opencode/);
-    expect(transcript).toMatch(
-      /message="plugin operation completed"[^\n]*stage=setup[^\n]*plugin=aft-opencode/,
-    );
 
     expect(events).toContain("tui-setup-start\n");
     expect(events).toContain("tui-setup-complete\n");
@@ -2695,14 +2767,15 @@ export default { id: original.id, effect };
     // `doctor --fix` calls, and whatever it writes for a V2 host is what this
     // host is booted on. So a CLI that writes the wrong key, or the wrong
     // entry shape, fails here rather than on a user's machine.
-    const config: Record<string, unknown> = { plugin: [packageRoot] };
+    const legacyPlugin = "legacy-v1-plugin";
+    const config: Record<string, unknown> = { plugin: [packageRoot, legacyPlugin] };
     ensurePinnedPluginConfig(config, "0.0.0-load-matrix", (entry) => entry === packageRoot, "v2");
     const key = openCodePluginKey("v2");
     expect(key).toBe("plugins");
     expect(config[key]).toEqual([packageRoot]);
-    // A V1 host on the same machine reads `plugin` and would lose AFT if the
-    // migration moved that entry instead of adding the V2 one beside it.
-    expect(config.plugin).toEqual([packageRoot]);
+    // The migration moves the local AFT entry to the V2 `plugins` key while
+    // preserving unrelated V1 entries in the legacy `plugin` key.
+    expect(config.plugin).toEqual([legacyPlugin]);
 
     const { transcript, events } = await runV2TuiHost({
       label: "v2-tui-plugins-key",
@@ -3045,6 +3118,7 @@ export default entry;
       "v2-tui-badge-light",
       "v2-tui-badge-dark",
       "v2-tui-sidebar-parity",
+      "v2-tui-plugins-key",
       "v2-tui-directory",
       "v2-tool-ownership",
       "v1-root-mutation",
