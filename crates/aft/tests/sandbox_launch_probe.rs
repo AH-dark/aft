@@ -550,9 +550,12 @@ fn target_arguments_are_not_interpreted_as_global_aft_flags() {
     skip_if_landlock_absent!();
     let mut fixture = ProbeFixture::new();
     fixture.profile.rewind();
+    // The shell's builtin printf prints `--version` as data. An external
+    // printf is not portable here: uutils (Ubuntu 26.04's default coreutils)
+    // treats a trailing `--version` as its own option.
     let output = launcher_command(
         fixture.profile.fd(),
-        &["/usr/bin/printf", "%s\n", "--version"],
+        &["/bin/sh", "-c", "printf '%s\\n' \"$1\"", "sh", "--version"],
     )
     .output()
     .expect("launch target with version argument");
