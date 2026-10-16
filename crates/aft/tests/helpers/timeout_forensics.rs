@@ -7,6 +7,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const CAPTURE_BUDGET: Duration = Duration::from_secs(10);
+/// Collectors stop this long before the outer wait gives up, so a debugger
+/// that runs to its deadline still leaves time to hand back what was gathered
+/// (kernel stacks first) instead of the outer wait discarding it.
+const REPORT_MARGIN: Duration = Duration::from_secs(1);
 const OUTPUT_LIMIT: u64 = 256 * 1024;
 
 pub(super) fn capture_stacks(pid: u32) -> String {
@@ -17,7 +21,7 @@ pub(super) fn capture_stacks(pid: u32) -> String {
     let worker = std::thread::Builder::new()
         .name("aft-timeout-stacks".into())
         .spawn(move || {
-            let _ = sender.send(collect_stacks(pid, deadline));
+            let _ = sender.send(collect_stacks(pid, deadline - REPORT_MARGIN));
         });
     if let Err(error) = worker {
         return format!("stack capture unavailable: could not start worker: {error}");
