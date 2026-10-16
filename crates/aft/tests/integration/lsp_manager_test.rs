@@ -398,9 +398,14 @@ fn inspect_initialize_timeout_releases_reservation_and_allows_retry() {
     manager
         .lock()
         .override_binary(ServerKind::Rust, fake_server_path());
+    let initialize_log = temp.path().join("initialize-requests");
     manager
         .lock()
         .set_extra_env("AFT_TEST_LSP_INITIALIZE_TIMEOUT_MS", "350");
+    manager.lock().set_extra_env(
+        "AFT_FAKE_LSP_INITIALIZATION_LOG",
+        &initialize_log.display().to_string(),
+    );
     manager.lock().set_extra_env(
         "AFT_FAKE_LSP_INIT_NO_REPLY_ONCE",
         &temp.path().join("init-attempted").display().to_string(),
@@ -427,14 +432,27 @@ fn inspect_initialize_timeout_releases_reservation_and_allows_retry() {
         "timed-out server was not killed"
     );
 
+    // Keep the first handshake short to test expiry. The retry is a positive
+    // wait, so use the normal 30-second handshake bound as its hang guard; load
+    // in the Windows shard must not turn a valid response into a timeout.
+    manager
+        .lock()
+        .set_extra_env("AFT_TEST_LSP_INITIALIZE_TIMEOUT_MS", "30000");
     let retry = start_applicable_server_unlocked(
         &manager,
         &snapshot,
         &key,
         &config,
-        Instant::now() + Duration::from_secs(3),
+        Instant::now() + Duration::from_secs(35),
     );
     assert_eq!(retry.successful, vec![key.clone()], "retry: {retry:?}");
+    let initialization_requests = std::fs::read_to_string(&initialize_log)
+        .expect("the fake server should log both initialization requests");
+    assert_eq!(
+        initialization_requests.lines().count(),
+        2,
+        "retry should start a fresh server instead of reusing a cached result: {initialization_requests:?}"
+    );
     assert_eq!(manager.lock().active_server_keys(), vec![key]);
     manager.lock().shutdown_all();
 }
