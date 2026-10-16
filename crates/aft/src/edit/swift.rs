@@ -22,13 +22,22 @@ enum ParseOutcome {
 pub(super) fn confirm_if_needed(
     path: &Path,
     source: &str,
-    was_valid: Option<bool>,
+    original: Option<&str>,
+    was_valid: &mut Option<bool>,
     is_valid: Option<bool>,
 ) -> Option<bool> {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("swift")
-        || was_valid != Some(true)
-        || is_valid != Some(false)
+    if path.extension().and_then(|ext| ext.to_str()) != Some("swift") || is_valid != Some(false) {
+        return is_valid;
+    }
+
+    // Tree-sitter can also misread a previously accepted Swift file. Establish
+    // a safe original before deciding whether the new content needs rollback.
+    if *was_valid == Some(false)
+        && original.is_some_and(|source| matches!(parse(source), ParseOutcome::Exited(Some(0))))
     {
+        *was_valid = Some(true);
+    }
+    if *was_valid != Some(true) {
         return is_valid;
     }
 
@@ -86,13 +95,16 @@ fn find_swiftc() -> &'static Result<PathBuf, String> {
 
 #[cfg(all(test, target_os = "macos"))]
 pub(super) fn available() -> bool {
-    match parse("") {
-        ParseOutcome::Exited(Some(0)) => true,
-        outcome => {
-            eprintln!("swiftc availability check: {outcome:?}");
-            false
-        }
+    if let Err(reason) = find_swiftc() {
+        eprintln!("swiftc discovery failed: {reason}");
+        return false;
     }
+    let outcome = parse("");
+    assert!(
+        matches!(outcome, ParseOutcome::Exited(Some(0))),
+        "discovered swiftc failed to parse empty input: {outcome:?}"
+    );
+    true
 }
 
 fn parse(source: &str) -> ParseOutcome {
@@ -239,6 +251,178 @@ mod tests {
     }
 
     #[test]
+    fn swift_parser_two_edits_preserve_rollback() {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = calls.clone();
+        with_runner(
+            Box::new(move |source| {
+                recorded.borrow_mut().push(source.to_owned());
+                match source {
+                    TUPLE => ParseOutcome::Exited(Some(0)),
+                    BROKEN => ParseOutcome::Exited(Some(1)),
+                    _ => panic!("unexpected compiler input: {source}"),
+                }
+            }),
+            || {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("tuple.swift");
+                std::fs::write(&path, ORIGINAL).unwrap();
+                let config = Config {
+                    format_on_edit: false,
+                    ..Config::default()
+                };
+                assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
+                assert_eq!(validate_syntax_str(BROKEN, &path), Some(false));
+
+                let first =
+                    write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
+                assert!(!first.rolled_back);
+                assert_eq!(first.syntax_valid, Some(true));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+                assert_eq!(*calls.borrow(), [TUPLE]);
+
+                let mut second =
+                    write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
+                assert!(second.rolled_back);
+                assert_eq!(second.syntax_valid, Some(false));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+                assert_eq!(second.final_content(&path), Some(TUPLE));
+                assert_eq!(*calls.borrow(), [TUPLE, TUPLE, BROKEN]);
+            },
+        );
+    }
+
+    #[test]
+    fn swift_parser_invalid_original_keeps_edit_without_rollback() {
+        for outcome in [
+            ParseOutcome::Exited(Some(1)),
+            ParseOutcome::Missing,
+            ParseOutcome::TimedOut,
+            ParseOutcome::Unavailable("permission denied".into()),
+            ParseOutcome::Exited(None),
+        ] {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = calls.clone();
+            let mut outcome = Some(outcome);
+            with_runner(
+                Box::new(move |source| {
+                    count.set(count.get() + 1);
+                    assert_eq!(source, BROKEN, "only the original should be parsed");
+                    outcome.take().expect("only one compiler call")
+                }),
+                || {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("broken.swift");
+                    std::fs::write(&path, BROKEN).unwrap();
+                    let updated = BROKEN.repeat(2);
+                    let result = write_format_validate(
+                        &path,
+                        &updated,
+                        &Config {
+                            format_on_edit: false,
+                            ..Config::default()
+                        },
+                        &serde_json::json!({}),
+                    )
+                    .unwrap();
+                    assert!(!result.rolled_back);
+                    assert_eq!(result.syntax_valid, Some(false));
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+                    assert_eq!(calls.get(), 1);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn swift_parser_confirmed_original_uses_new_parse_result() {
+        for (outcome, rolled_back) in [
+            (ParseOutcome::Exited(Some(0)), false),
+            (ParseOutcome::Exited(Some(1)), true),
+            (ParseOutcome::Missing, true),
+            (ParseOutcome::TimedOut, true),
+            (ParseOutcome::Unavailable("permission denied".into()), true),
+        ] {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = calls.clone();
+            let updated = TUPLE.repeat(2);
+            let expected = updated.clone();
+            let mut outcome = Some(outcome);
+            with_runner(
+                Box::new(move |source| {
+                    count.set(count.get() + 1);
+                    match count.get() {
+                        1 => {
+                            assert_eq!(source, TUPLE);
+                            ParseOutcome::Exited(Some(0))
+                        }
+                        2 => {
+                            assert_eq!(source, expected);
+                            outcome.take().unwrap()
+                        }
+                        _ => panic!("only two compiler calls"),
+                    }
+                }),
+                || {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("tuple.swift");
+                    std::fs::write(&path, TUPLE).unwrap();
+                    let result = write_format_validate(
+                        &path,
+                        &updated,
+                        &Config {
+                            format_on_edit: false,
+                            ..Config::default()
+                        },
+                        &serde_json::json!({}),
+                    )
+                    .unwrap();
+                    assert_eq!(result.rolled_back, rolled_back);
+                    assert_eq!(result.syntax_valid, Some(!rolled_back));
+                    assert_eq!(
+                        std::fs::read_to_string(&path).unwrap(),
+                        if rolled_back { TUPLE } else { &updated }
+                    );
+                    assert_eq!(calls.get(), 2);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn swift_parser_valid_to_valid_skips_compiler() {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = calls.clone();
+        with_runner(
+            Box::new(move |_| {
+                count.set(count.get() + 1);
+                ParseOutcome::Exited(Some(0))
+            }),
+            || {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("valid.swift");
+                std::fs::write(&path, ORIGINAL).unwrap();
+                let updated = "let value = 2\n";
+                assert_eq!(validate_syntax_str(updated, &path), Some(true));
+                let result = write_format_validate(
+                    &path,
+                    updated,
+                    &Config {
+                        format_on_edit: false,
+                        ..Config::default()
+                    },
+                    &serde_json::json!({}),
+                )
+                .unwrap();
+                assert!(!result.rolled_back);
+                assert_eq!(result.syntax_valid, Some(true));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+                assert_eq!(calls.get(), 0);
+            },
+        );
+    }
+
+    #[test]
     fn swift_parser_nonzero_rolls_back() {
         let (result, text) = write_case(BROKEN, ParseOutcome::Exited(Some(1)));
         assert!(result.rolled_back);
@@ -302,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn swift_parser_runs_only_before_clean_to_invalid_rollback() {
+    fn swift_parser_skips_valid_new_content_and_unknown_original() {
         let calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let count = calls.clone();
         with_runner(
@@ -313,22 +497,54 @@ mod tests {
             || {
                 for (was_valid, is_valid) in [
                     (Some(true), Some(true)),
-                    (Some(false), Some(false)),
+                    (Some(false), Some(true)),
                     (None, Some(false)),
                     (Some(true), None),
                 ] {
+                    let mut original_valid = was_valid;
                     assert_eq!(
-                        confirm_if_needed(Path::new("test.swift"), TUPLE, was_valid, is_valid),
+                        confirm_if_needed(
+                            Path::new("test.swift"),
+                            TUPLE,
+                            Some(TUPLE),
+                            &mut original_valid,
+                            is_valid,
+                        ),
                         is_valid
                     );
+                    assert_eq!(original_valid, was_valid);
                 }
             },
         );
         assert_eq!(
             calls.get(),
             0,
-            "no parser call without a pending syntax rollback"
+            "no parser call for valid new content or an unknown original"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_parser_native_two_edits_preserve_rollback() {
+        if !available() {
+            eprintln!("skipping native Swift parser test: swiftc is unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tuple.swift");
+        std::fs::write(&path, ORIGINAL).unwrap();
+        let config = Config {
+            format_on_edit: false,
+            ..Config::default()
+        };
+        let first = write_format_validate(&path, TUPLE, &config, &serde_json::json!({})).unwrap();
+        assert!(!first.rolled_back);
+        assert_eq!(first.syntax_valid, Some(true));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+        let second = write_format_validate(&path, BROKEN, &config, &serde_json::json!({})).unwrap();
+        assert!(second.rolled_back);
+        assert_eq!(second.syntax_valid, Some(false));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -391,6 +607,34 @@ mod tests {
             parse("import AFTModuleThatDoesNotExist\n_ = undefinedName\n"),
             ParseOutcome::Exited(Some(0))
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_parser_available_fails_for_discovered_broken_compiler() {
+        if find_swiftc().is_err() {
+            eprintln!("skipping native Swift parser test: swiftc is unavailable");
+            return;
+        }
+        for outcome in [ParseOutcome::Exited(Some(1)), ParseOutcome::Missing] {
+            let mut outcome = Some(outcome);
+            let failure = std::panic::catch_unwind(|| {
+                with_runner(
+                    Box::new(move |source| {
+                        assert!(source.is_empty());
+                        outcome.take().expect("only one availability parse")
+                    }),
+                    available,
+                )
+            });
+            let failure = failure.expect_err("a discovered broken compiler must fail, not skip");
+            let message = failure
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| failure.downcast_ref::<&str>().copied())
+                .expect("panic should explain the broken compiler");
+            assert!(message.contains("discovered swiftc failed to parse empty input"));
+        }
     }
 
     #[test]

@@ -914,7 +914,7 @@ fn write_format_validate_impl(
     // Existing clean files are protected from invalid mutations. New files have
     // no safe prior content to restore, so their pre-write validity remains None
     // and invalid syntax is reported without rollback.
-    let was_syntax_valid = pre_write_content
+    let mut was_syntax_valid = pre_write_content
         .as_deref()
         .and_then(|source| validate_captured_syntax(path, source));
 
@@ -936,7 +936,13 @@ fn write_format_validate_impl(
         .map(|observed| observed.text.as_str())
         .and_then(|source| {
             let syntax_valid = validate_captured_syntax(path, source);
-            swift::confirm_if_needed(path, source, was_syntax_valid, syntax_valid)
+            swift::confirm_if_needed(
+                path,
+                source,
+                pre_write_content.as_deref(),
+                &mut was_syntax_valid,
+                syntax_valid,
+            )
         });
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
