@@ -848,7 +848,8 @@ fn retry_activation<T>(
         if !is_current(slot, epoch) {
             return Err(RefreshError::Superseded);
         }
-        match attempt().map_err(RefreshError::classify) {
+        match crate::semantic_index::retry_lane_pause(&mut attempt).map_err(RefreshError::classify)
+        {
             Ok(value) => {
                 clear_retry(slot, epoch);
                 return Ok(value);
@@ -922,6 +923,12 @@ pub(crate) fn run_worker(
     config: WorkerConfig,
 ) {
     let _counted = WorkerGuard::enter(&slot);
+    let pause_slot = slot.clone();
+    let _pause_retry = crate::semantic_index::PauseRetryScope::new(
+        config.schedule.retry_initial,
+        config.schedule.retry_max,
+        move || is_current(&pause_slot, epoch),
+    );
     // A lane cleared or restarted before this worker began (two quick
     // configures) does nothing at all: no model, no registration.
     if !is_current(&slot, epoch) {

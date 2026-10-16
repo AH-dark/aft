@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -24,6 +25,49 @@ const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(5);
 const RETRY_BACKOFF_MS: [u64; 3] = [100, 200, 400];
 static LIVE_CAPTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+const LANE_PAUSE_MARKER: &str = "[lane_paused] ";
+pub(crate) const MAX_LANE_PAUSE_MS: u64 = 120 * 60 * 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LanePause {
+    pub lane_id: String,
+    pub fingerprint: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub paused_until_ms: u64,
+    pub reason: String,
+}
+
+impl LanePause {
+    pub fn from_error(error: &str) -> Option<Self> {
+        let (_, payload) = error.split_once(LANE_PAUSE_MARKER)?;
+        serde_json::Deserializer::from_str(payload)
+            .into_iter::<Self>()
+            .next()?
+            .ok()
+    }
+
+    pub fn retry_delay(&self, backoff: Duration) -> Duration {
+        backoff.max(Duration::from_millis(self.retry_after_ms.unwrap_or(0)))
+    }
+}
+
+fn lane_pauses() -> &'static Mutex<HashMap<PathBuf, LanePause>> {
+    static PAUSES: OnceLock<Mutex<HashMap<PathBuf, LanePause>>> = OnceLock::new();
+    PAUSES.get_or_init(Mutex::default)
+}
+
+pub(crate) fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
+    let mut pauses = lane_pauses()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pause = pauses.get(root)?.clone();
+    if pause.paused_until_ms <= crate::semantic_index::unix_millis_now() {
+        pauses.remove(root);
+        return None;
+    }
+    Some(pause)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SynapseEmbeddingError {
     MissingConnectionFile,
@@ -36,6 +80,7 @@ pub enum SynapseEmbeddingError {
         served: Vec<String>,
     },
     ModelNotCertified(String),
+    LanePaused(LanePause),
     InvalidEnvelope(String),
     ContentHashMismatch {
         id: String,
@@ -84,6 +129,10 @@ impl fmt::Display for SynapseEmbeddingError {
             Self::ModelNotCertified(model) => {
                 write!(formatter, "synapse_model_not_certified: {model}")
             }
+            Self::LanePaused(pause) => write!(
+                formatter, "[transient] {LANE_PAUSE_MARKER}{}",
+                serde_json::to_string(pause).map_err(|_| fmt::Error)?
+            ),
             Self::InvalidEnvelope(error) => {
                 write!(formatter, "synapse_invalid_envelope: {error}")
             }
@@ -115,6 +164,124 @@ impl fmt::Display for SynapseEmbeddingError {
 }
 
 impl std::error::Error for SynapseEmbeddingError {}
+
+#[cfg(test)]
+pub(crate) mod pause_test_support {
+    use super::*;
+    use std::sync::{atomic::AtomicU64, Arc, Mutex};
+
+    pub(crate) const MODEL: &str = "qwen3-embedding-0.6b-ane";
+    pub(crate) const START: u64 = 100_000;
+    pub(crate) const PAUSE_MS: u64 = 45 * 60 * 1_000;
+    pub(crate) type Requests = Arc<Mutex<Vec<(u64, Value)>>>;
+
+    pub(crate) fn pause_reply(retry_after_ms: Value) -> Value {
+        json!({"error": {"code": "lane_paused", "transient": true,
+            "retry_after_ms": retry_after_ms,
+            "details": {"lane_id": MODEL, "fingerprint": "pinned",
+                "paused_until_ms": START + PAUSE_MS, "reason": "scheduled maintenance"}}})
+    }
+
+    pub(crate) fn with_fake_synapse<T>(
+        clock: Arc<AtomicU64>,
+        retry_after_ms: Option<Value>,
+        run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
+    ) -> T {
+        use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("connection.json");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let key = vec![0x42; subc_transport::KEY_LEN];
+        let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+        connection_file::write_atomic(
+            &path,
+            &ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: key.clone(),
+                daemon_id,
+                pid: std::process::id(),
+                daemon_ver: "synapse-test".into(),
+            },
+        )
+        .unwrap();
+        let requests = Requests::default();
+        let recorded = requests.clone();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+                tokio::time::timeout(Duration::from_secs(10), async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "synapse-test", Duration::from_secs(2)).await.unwrap();
+                    let catalog = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
+                    respond(&mut stream, &catalog, json!({"op":"catalog.list","generation":1,"modules":[{
+                        "module_id":"synapse","module_version":"1","roles":[{"role":"management_surface",
+                        "operations":[{"name":"models.list","kind":"query"},{"name":"embed.query","kind":"query"},{"name":"embed.batch","kind":"query"}],
+                        "config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}],"subc_ops":["catalog.list","route.open"]})).await;
+                    let route = subc_transport::read_frame(&mut stream).await.unwrap().unwrap();
+                    respond(&mut stream, &route, json!({"op":"route.open","route_channel":7,"route_epoch":1})).await;
+                    while let Some(request) = subc_transport::read_frame(&mut stream).await.unwrap() {
+                        let value: Value = serde_json::from_slice(&request.body).unwrap();
+                        let now = clock.load(Ordering::SeqCst);
+                        let mut requests = recorded.lock().unwrap();
+                        assert!(requests.len() < 512, "embedding requests hot-looped during the pause");
+                        requests.push((now, value.clone()));
+                        drop(requests);
+                        let params = &value["params"];
+                        let reply = if value["method"] == MODELS_LIST_OPERATION {
+                            json!({"models":[{"model":MODEL,"fingerprint":"pinned","table_epoch":1,"dims":2,
+                                "recommended_batch":{"rows":100,"token_budget":8192}}]})
+                        } else if now < START + PAUSE_MS {
+                            pause_reply(retry_after_ms.clone().unwrap_or_else(|| json!(START + PAUSE_MS - now)))
+                        } else {
+                            let items = params.get("items").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![params.clone()]);
+                            json!({"fingerprint":"pinned","table_epoch":1,"vectors":items.into_iter().map(|item|
+                                json!({"id":item["id"],"content_sha256":item["content_sha256"],"vector":[1.0,0.0]})).collect::<Vec<_>>()})
+                        };
+                        respond(&mut stream, &request, reply).await;
+                    }
+                }).await.expect("fake Synapse watchdog");
+            });
+        });
+        let config = SemanticBackendConfig {
+            backend: crate::config::SemanticBackend::Synapse,
+            model: MODEL.into(),
+            subc_connection_file: Some(path),
+            route_project_root: Some(directory.path().to_path_buf()),
+            timeout_ms: 1_000,
+            max_batch_size: 100,
+            query_instruction: "off".into(),
+            ..SemanticBackendConfig::default()
+        };
+        let result = run(config, requests);
+        server.join().unwrap();
+        result
+    }
+
+    async fn respond(
+        stream: &mut tokio::net::TcpStream,
+        request: &subc_protocol::Frame,
+        value: Value,
+    ) {
+        use subc_protocol::{Flags, Frame, FrameType, Priority};
+        let frame = Frame::build_with_version(
+            request.header.ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        subc_transport::write_frame(stream, &frame).await.unwrap();
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SynapseIdentity {
@@ -555,13 +722,30 @@ impl SynapseState {
                     );
                 match tokio::time::timeout(timeout, request).await {
                     Ok(Ok(response)) => {
-                        self.consecutive_timeouts = 0;
                         if response.len() > MAX_RESULT_PAGE_BYTES {
                             return Err(SynapseEmbeddingError::InvalidEnvelope(format!(
                                 "{operation} response exceeded 512KiB page bound"
                             )));
                         }
-                        return decode_result_envelope(response);
+                        let result = decode_result_envelope_for_request(response, Some(&params));
+                        match &result {
+                            Err(SynapseEmbeddingError::LanePaused(pause)) => {
+                                lane_pauses()
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .insert(self.route_project_root.clone(), pause.clone());
+                            }
+                            _ => {
+                                self.consecutive_timeouts = 0;
+                                if operation != MODELS_LIST_OPERATION {
+                                    lane_pauses()
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove(&self.route_project_root);
+                                }
+                            }
+                        }
+                        return result;
                     }
                     Ok(Err(error)) => {
                         last_error = error.to_string();
@@ -692,7 +876,15 @@ fn catalog_advertises_operations(
     })
 }
 
+#[cfg(test)]
 fn decode_result_envelope(response: Vec<u8>) -> Result<Vec<u8>, SynapseEmbeddingError> {
+    decode_result_envelope_for_request(response, None)
+}
+
+fn decode_result_envelope_for_request(
+    response: Vec<u8>,
+    request: Option<&Value>,
+) -> Result<Vec<u8>, SynapseEmbeddingError> {
     let value: Value = serde_json::from_slice(&response)
         .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))?;
     let result = value.get("result").cloned().unwrap_or(value);
@@ -706,6 +898,40 @@ fn decode_result_envelope(response: Vec<u8>) -> Result<Vec<u8>, SynapseEmbedding
             .and_then(Value::as_str)
             .unwrap_or("Synapse returned an unspecified error");
         return match code {
+            "lane_paused" => {
+                let details = &error["details"];
+                let lane_id = details["lane_id"].as_str().unwrap_or_default();
+                let fingerprint = details.get("fingerprint");
+                if let Some(request) = request {
+                    let model = request["model"].as_str().unwrap_or_default();
+                    let pinned = request["required_fingerprint"].as_str().unwrap_or_default();
+                    if lane_id != model
+                        || fingerprint.is_some_and(|value| value.as_str() != Some(pinned))
+                    {
+                        return Err(SynapseEmbeddingError::FingerprintMismatch {
+                            expected: format!("{model}:{pinned}"),
+                            served: format!("{lane_id}:{}", fingerprint.unwrap_or(&Value::Null)),
+                        });
+                    }
+                }
+                let paused_until_ms = details["paused_until_ms"].as_u64().ok_or_else(|| {
+                    SynapseEmbeddingError::InvalidEnvelope(
+                        "lane_paused omitted paused_until_ms".into(),
+                    )
+                })?;
+                let reason = details["reason"].as_str().ok_or_else(|| {
+                    SynapseEmbeddingError::InvalidEnvelope("lane_paused omitted reason".into())
+                })?;
+                Err(SynapseEmbeddingError::LanePaused(LanePause {
+                    lane_id: lane_id.to_owned(),
+                    fingerprint: fingerprint.and_then(Value::as_str).map(str::to_owned),
+                    retry_after_ms: error["retry_after_ms"]
+                        .as_u64()
+                        .filter(|ms| (1_000..=MAX_LANE_PAUSE_MS).contains(ms)),
+                    paused_until_ms,
+                    reason: reason.to_owned(),
+                }))
+            }
             "not_certified" => Err(SynapseEmbeddingError::ModelNotCertified(
                 message.to_string(),
             )),
@@ -1018,6 +1244,123 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lane_paused_identity_and_retry_bounds_are_validated() {
+        use super::pause_test_support::*;
+        let request = json!({"model": MODEL, "required_fingerprint": "pinned"});
+        for hint in [
+            json!(999),
+            json!(MAX_LANE_PAUSE_MS + 1),
+            json!(-1),
+            json!("1000"),
+            Value::Null,
+        ] {
+            let reply = pause_reply(hint);
+            let error = decode_result_envelope_for_request(
+                serde_json::to_vec(&reply).unwrap(),
+                Some(&request),
+            )
+            .unwrap_err();
+            let SynapseEmbeddingError::LanePaused(pause) = error else {
+                panic!("{error}");
+            };
+            assert_eq!(pause.retry_after_ms, None);
+            assert_eq!(
+                pause.retry_delay(Duration::from_secs(15)),
+                Duration::from_secs(15)
+            );
+        }
+        for hint in [1_000, MAX_LANE_PAUSE_MS] {
+            let reply = pause_reply(json!(hint));
+            let error = decode_result_envelope_for_request(
+                serde_json::to_vec(&reply).unwrap(),
+                Some(&request),
+            )
+            .unwrap_err();
+            assert_eq!(
+                LanePause::from_error(&error.to_string())
+                    .unwrap()
+                    .retry_after_ms,
+                Some(hint)
+            );
+        }
+        for (field, value) in [
+            ("lane_id", json!("another-lane")),
+            ("fingerprint", json!("equivalent-but-not-pinned")),
+            ("fingerprint", Value::Null),
+        ] {
+            let mut reply = pause_reply(json!(PAUSE_MS));
+            reply["error"]["details"][field] = value;
+            assert!(matches!(
+                decode_result_envelope_for_request(
+                    serde_json::to_vec(&reply).unwrap(),
+                    Some(&request)
+                ),
+                Err(SynapseEmbeddingError::FingerprintMismatch { .. })
+            ));
+        }
+        let mut legacy = pause_reply(json!(PAUSE_MS));
+        legacy["error"]["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint");
+        assert!(matches!(
+            decode_result_envelope_for_request(
+                serde_json::to_vec(&legacy).unwrap(),
+                Some(&request)
+            ),
+            Err(SynapseEmbeddingError::LanePaused(_))
+        ));
+        assert!(matches!(
+            decode_result_envelope(
+                br#"{"error":{"code":"future_code","transient":true}}"#.to_vec()
+            ),
+            Err(SynapseEmbeddingError::DaemonUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn lane_paused_fake_synapse_preserves_breaker_and_reports_health() {
+        use super::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            with_fake_synapse(clock.clone(), None, |config, requests| {
+                let mut client = SynapseEmbeddingClient::from_config(&config).unwrap();
+                client.state.consecutive_timeouts = 2;
+                let error = client
+                    .embed_query("query", Duration::from_secs(1))
+                    .unwrap_err();
+                assert!(matches!(error, SynapseEmbeddingError::LanePaused(_)));
+                assert_eq!(client.state.consecutive_timeouts, 2);
+                assert!(client.state.circuit_open_until.is_none());
+                assert_eq!(clock.load(Ordering::SeqCst), START);
+                let root = config.route_project_root.as_deref().unwrap();
+                let pause = lane_pause_for_root(root).unwrap();
+                assert_eq!(pause.paused_until_ms, START + PAUSE_MS);
+                assert_eq!(pause.reason, "scheduled maintenance");
+                clock.store(START + PAUSE_MS, Ordering::SeqCst);
+                assert!(lane_pause_for_root(root).is_none());
+                assert_eq!(
+                    client.embed_query("query", Duration::from_secs(1)).unwrap(),
+                    vec![1.0, 0.0]
+                );
+                assert_eq!(client.state.consecutive_timeouts, 0);
+                assert_eq!(requests.lock().unwrap().len(), 3);
+            });
+        });
+    }
+
+    #[test]
+    fn lane_paused_envelope_is_transient() {
+        let response = serde_json::to_vec(&json!({"error": {
+            "code": "lane_paused", "transient": true, "retry_after_ms": 2_700_000,
+            "details": {"lane_id": "qwen3-embedding-0.6b-ane", "fingerprint": "pinned",
+                "paused_until_ms": 2_800_000, "reason": "scheduled maintenance"}
+        }}))
+        .unwrap();
+        let error = decode_result_envelope(response).unwrap_err();
+        assert!(error.to_string().starts_with("[transient] "), "{error}");
+    }
+
     use super::*;
 
     #[test]

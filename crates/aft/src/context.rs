@@ -734,6 +734,8 @@ pub struct SemanticHealthComponentSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_retry_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_until_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedded_chunks: Option<usize>,
@@ -2002,6 +2004,7 @@ pub(crate) struct EmbeddingBackendHealthSnapshot {
     pub(crate) last_error: Option<String>,
     pub(crate) since_ms: Option<u64>,
     pub(crate) next_retry_ms: Option<u64>,
+    pub(crate) paused_until_ms: Option<u64>,
 }
 
 /// The refresh circuit only trips once an index exists and later refreshes
@@ -2014,6 +2017,13 @@ fn with_cold_build_backend_health(
     mut snapshot: EmbeddingBackendHealthSnapshot,
     root: Option<&Path>,
 ) -> EmbeddingBackendHealthSnapshot {
+    if let Some(pause) = root.and_then(crate::synapse_embed::lane_pause_for_root) {
+        snapshot.available = false;
+        snapshot.last_error = Some(pause.reason);
+        snapshot.paused_until_ms = Some(pause.paused_until_ms);
+        snapshot.next_retry_ms = Some(pause.paused_until_ms);
+        return snapshot;
+    }
     let Some(build) = root.and_then(crate::semantic_index::embedding_backend_build_health) else {
         return snapshot;
     };
@@ -4536,10 +4546,15 @@ impl AppContext {
         };
         let semantic_index = if !semantic_backend.available {
             SemanticHealthComponentSnapshot {
-                status: "backend_unavailable",
+                status: if semantic_backend.paused_until_ms.is_some() {
+                    "paused"
+                } else {
+                    "backend_unavailable"
+                },
                 reason: semantic_backend.last_error,
                 since_ms: semantic_backend.since_ms,
                 next_retry_ms: semantic_backend.next_retry_ms,
+                paused_until_ms: semantic_backend.paused_until_ms,
                 stage: None,
                 embedded_chunks: None,
                 total_chunks: None,
@@ -4560,6 +4575,7 @@ impl AppContext {
                     reason: None,
                     since_ms: None,
                     next_retry_ms: None,
+                    paused_until_ms: None,
                     stage: None,
                     embedded_chunks: None,
                     total_chunks: None,
@@ -4575,6 +4591,7 @@ impl AppContext {
                         reason: None,
                         since_ms: None,
                         next_retry_ms: None,
+                        paused_until_ms: None,
                         stage: Some(stage.clone()),
                         embedded_chunks: progress.as_ref().map(|progress| progress.embedded_chunks),
                         total_chunks: progress.as_ref().map(|progress| progress.total_chunks),
@@ -4587,6 +4604,7 @@ impl AppContext {
                     reason: None,
                     since_ms: None,
                     next_retry_ms: None,
+                    paused_until_ms: None,
                     stage: None,
                     embedded_chunks: None,
                     total_chunks: None,
@@ -4601,6 +4619,7 @@ impl AppContext {
                         reason: None,
                         since_ms: None,
                         next_retry_ms: None,
+                        paused_until_ms: None,
                         stage: None,
                         embedded_chunks: None,
                         total_chunks: None,
@@ -4613,6 +4632,7 @@ impl AppContext {
                     reason: None,
                     since_ms: None,
                     next_retry_ms: None,
+                    paused_until_ms: None,
                     stage: None,
                     embedded_chunks: None,
                     total_chunks: None,
@@ -10626,6 +10646,7 @@ impl AppContext {
                 last_error: Some(outage.last_error.clone()),
                 since_ms: Some(outage.since_ms),
                 next_retry_ms: Some(outage.next_retry_ms),
+                paused_until_ms: None,
             },
             None => EmbeddingBackendHealthSnapshot {
                 available: true,
@@ -10651,6 +10672,7 @@ impl AppContext {
                 last_error: Some(outage.last_error.clone()),
                 since_ms: Some(outage.since_ms),
                 next_retry_ms: Some(outage.next_retry_ms),
+                paused_until_ms: None,
             },
             None => EmbeddingBackendHealthSnapshot {
                 available: true,

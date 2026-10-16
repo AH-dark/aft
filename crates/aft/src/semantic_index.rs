@@ -251,12 +251,136 @@ fn embedding_backend_build_health_registry(
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn unix_millis_now() -> u64 {
+pub(crate) fn unix_millis_now() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = LANE_PAUSE_TEST_CLOCK.with(|clock| clock.borrow().clone()) {
+        return now.load(std::sync::atomic::Ordering::SeqCst);
+    }
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+thread_local! {
+    static LANE_PAUSE_RETRY_POLICY: std::cell::RefCell<Option<PauseRetryPolicy>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static LANE_PAUSE_TEST_CLOCK: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static LANE_PAUSE_CHUNK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn lane_pause_chunk_calls() -> usize {
+    LANE_PAUSE_CHUNK_CALLS.with(std::cell::Cell::get)
+}
+
+struct PauseRetryPolicy {
+    initial: Duration,
+    max: Duration,
+    current: Box<dyn Fn() -> bool>,
+}
+
+pub(crate) struct PauseRetryScope(Option<PauseRetryPolicy>);
+
+impl PauseRetryScope {
+    pub(crate) fn new(
+        initial: Duration,
+        max: Duration,
+        current: impl Fn() -> bool + 'static,
+    ) -> Self {
+        Self(LANE_PAUSE_RETRY_POLICY.with(|policy| {
+            policy.replace(Some(PauseRetryPolicy {
+                initial,
+                max,
+                current: Box::new(current),
+            }))
+        }))
+    }
+}
+
+impl Drop for PauseRetryScope {
+    fn drop(&mut self) {
+        LANE_PAUSE_RETRY_POLICY.with(|policy| policy.replace(self.0.take()));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_lane_pause_clock<T>(
+    start_ms: u64,
+    run: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicU64>) -> T,
+) -> T {
+    struct Restore(Option<std::sync::Arc<std::sync::atomic::AtomicU64>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LANE_PAUSE_TEST_CLOCK.with(|clock| clock.replace(self.0.take()));
+        }
+    }
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start_ms));
+    let _restore =
+        Restore(LANE_PAUSE_TEST_CLOCK.with(|current| current.replace(Some(clock.clone()))));
+    run(clock)
+}
+
+fn wait_lane_pause(delay: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + delay;
+    loop {
+        if !LANE_PAUSE_RETRY_POLICY.with(|policy| {
+            policy
+                .borrow()
+                .as_ref()
+                .is_none_or(|policy| (policy.current)())
+        }) {
+            return Err("semantic lane superseded".into());
+        }
+        #[cfg(test)]
+        if LANE_PAUSE_TEST_CLOCK.with(|clock| {
+            if let Some(clock) = clock.borrow().as_ref() {
+                clock.fetch_add(
+                    delay.as_millis() as u64,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                true
+            } else {
+                false
+            }
+        }) {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
+}
+
+/// Keep the prepared batch and completed work on the worker's stack. An announced
+/// pause is not a failed build: returning it would discard chunks and re-walk the
+/// corpus on every retry. Interactive query embeddings never use this wait.
+pub(crate) fn retry_lane_pause<T>(
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let (mut backoff, max) = LANE_PAUSE_RETRY_POLICY.with(|policy| {
+        policy
+            .borrow()
+            .as_ref()
+            .map(|policy| (policy.initial, policy.max))
+            .unwrap_or((Duration::from_secs(15), Duration::from_secs(60)))
+    });
+    loop {
+        match attempt() {
+            Err(error) => {
+                let Some(pause) = crate::synapse_embed::LanePause::from_error(&error) else {
+                    return Err(error);
+                };
+                wait_lane_pause(pause.retry_delay(backoff))?;
+                backoff = (backoff * 2).min(max);
+            }
+            success => return success,
+        }
+    }
 }
 
 /// Delay before the cold semantic build retries an unreachable embedding backend.
@@ -3904,7 +4028,7 @@ where
 {
     clear_http_build_metadata();
     let requested_texts = texts.clone();
-    let vectors = embed_fn(texts)?;
+    let vectors = retry_lane_pause(|| embed_fn(texts.clone()))?;
     let metadata = take_http_build_metadata();
     // Adaptive HTTP requests report their successful sub-batches immediately,
     // including when later requests fail. Generic/local providers report here.
@@ -9285,6 +9409,8 @@ fn collect_file_chunks_from_source_timed(
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<Vec<SemanticChunk>, String> {
+    #[cfg(test)]
+    LANE_PAUSE_CHUNK_CALLS.with(|count| count.set(count.get() + 1));
     let parse_started = Instant::now();
     let tree_result =
         parse_source_with_cached_parser(file, source, lang).map_err(|error| error.to_string());
@@ -9895,6 +10021,177 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lane_paused_cold_build_waits_without_rechunking_and_resumes() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            with_fake_synapse(clock.clone(), None, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("pause.ts");
+                fs::write(&file, "export function keyword() { return 1; }\n").unwrap();
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let before = lane_pause_chunk_calls();
+                let mut attempts = Vec::new();
+                let mut embed = |texts: Vec<String>| {
+                    attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
+                    model.embed(texts)
+                };
+                let index = SemanticIndex::build_with_progress_and_cancellation_caps(
+                    directory.path(),
+                    &[file],
+                    &mut embed,
+                    100,
+                    EmbedTextCaps::default(),
+                    &mut |_, _| {},
+                    &mut || true,
+                )
+                .unwrap();
+                assert!(index.len() > 0);
+                assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
+                assert_eq!(lane_pause_chunk_calls() - before, 1);
+                assert_eq!(
+                    requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == "embed.batch")
+                        .count(),
+                    2
+                );
+                assert!(embedding_backend_build_health(directory.path()).is_none());
+            });
+        });
+    }
+
+    #[test]
+    fn lane_paused_invalid_hint_uses_backoff_without_hot_loop() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            with_fake_synapse(
+                clock.clone(),
+                Some(serde_json::json!(
+                    crate::synapse_embed::MAX_LANE_PAUSE_MS + 1
+                )),
+                |config, requests| {
+                    let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                    let rows =
+                        execute_build_embedding_batch(vec!["keyword".into()], &mut |texts| {
+                            model.embed(texts)
+                        })
+                        .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    let times = requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == "embed.batch")
+                        .map(|(now, _)| *now - START)
+                        .collect::<Vec<_>>();
+                    assert_eq!(&times[..4], &[0, 15_000, 45_000, 105_000]);
+                    assert_eq!(
+                        times.len(),
+                        48,
+                        "45 minutes must not spin or hit a retry limit"
+                    );
+                    assert_eq!(times.last(), Some(&2_745_000));
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn lane_paused_wait_uses_maximum_of_hint_and_worker_backoff() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _scope =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+            let mut attempts = Vec::new();
+            let result = retry_lane_pause(|| {
+                attempts.push(unix_millis_now());
+                if attempts.len() == 4 {
+                    return Ok(4);
+                }
+                let reply = pause_reply(serde_json::json!(1_000));
+                let pause = crate::synapse_embed::LanePause {
+                    lane_id: MODEL.into(),
+                    fingerprint: Some("pinned".into()),
+                    retry_after_ms: Some(1_000),
+                    paused_until_ms: reply["error"]["details"]["paused_until_ms"]
+                        .as_u64()
+                        .unwrap(),
+                    reason: "maintenance".into(),
+                };
+                Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(pause).to_string())
+            });
+            assert_eq!(result, Ok(4));
+            assert_eq!(
+                attempts,
+                vec![START, START + 5_000, START + 15_000, START + 35_000]
+            );
+            assert_eq!(
+                clock.load(std::sync::atomic::Ordering::SeqCst),
+                START + 35_000
+            );
+        });
+    }
+
+    #[test]
+    fn lane_paused_live_refresh_retains_prepared_chunks_until_resume() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            with_fake_synapse(clock, None, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("live.ts");
+                fs::write(&file, "export function keyword() { return 2; }\n").unwrap();
+                let mut index = SemanticIndex::new(directory.path().to_path_buf(), 2);
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let before = lane_pause_chunk_calls();
+                let mut attempts = Vec::new();
+                let refresh = index
+                    .refresh_invalidated_files(
+                        directory.path(),
+                        &[file],
+                        &mut |texts| {
+                            attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
+                            model.embed(texts)
+                        },
+                        100,
+                        100,
+                        &mut |_, _| {},
+                    )
+                    .unwrap();
+                assert!(!refresh.added_entries.is_empty());
+                assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
+                assert_eq!(requests.lock().unwrap().len(), 3);
+            });
+        });
+    }
+
+    #[test]
+    fn lane_paused_wait_is_cancelled_when_worker_is_superseded() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |_clock| {
+            let _scope =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || false);
+            let mut attempts = 0;
+            let result: Result<(), String> = retry_lane_pause(|| {
+                attempts += 1;
+                Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+                    crate::synapse_embed::LanePause {
+                        lane_id: MODEL.into(),
+                        fingerprint: Some("pinned".into()),
+                        retry_after_ms: Some(PAUSE_MS),
+                        paused_until_ms: START + PAUSE_MS,
+                        reason: "maintenance".into(),
+                    },
+                )
+                .to_string())
+            });
+            assert_eq!(attempts, 1);
+            assert_eq!(result.unwrap_err(), "semantic lane superseded");
+        });
+    }
+
     #[test]
     fn durability_semantic_snapshot_count() {
         let project = tempfile::tempdir().unwrap();

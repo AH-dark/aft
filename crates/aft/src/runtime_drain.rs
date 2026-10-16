@@ -1574,6 +1574,9 @@ pub fn semantic_refresh_circuit_is_open(ctx: &AppContext) -> bool {
 }
 
 pub fn record_semantic_refresh_transient_failure(ctx: &AppContext, error: &str) -> bool {
+    if aft::synapse_embed::LanePause::from_error(error).is_some() {
+        return false;
+    }
     let reason = aft::semantic_index::strip_transient_embedding_marker(error);
     ctx.record_semantic_refresh_transient_failure(BREAKER_TRIP_THRESHOLD, &reason)
 }
@@ -6452,6 +6455,31 @@ mod tests {
         ));
         ctx.set_canonical_cache_root(root.to_path_buf());
         ctx
+    }
+
+    #[test]
+    fn lane_paused_refresh_does_not_advance_failure_breaker() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = semantic_owner_context(directory.path());
+        assert!(!record_semantic_refresh_transient_failure(
+            &ctx,
+            "[transient] connection refused"
+        ));
+        let error = crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+            crate::synapse_embed::LanePause {
+                lane_id: "qwen3-embedding-0.6b-ane".into(),
+                fingerprint: Some("pinned".into()),
+                retry_after_ms: Some(2_700_000),
+                paused_until_ms: 2_800_000,
+                reason: "maintenance".into(),
+            },
+        )
+        .to_string();
+        for _ in 0..100 {
+            assert!(!record_semantic_refresh_transient_failure(&ctx, &error));
+        }
+        assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 1);
+        assert!(!semantic_refresh_circuit_is_open(&ctx));
     }
 
     /// The daemon reproduction in `tests/daemon_malloc_small_growth_repro.rs`

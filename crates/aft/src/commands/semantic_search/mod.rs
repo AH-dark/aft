@@ -6907,8 +6907,16 @@ struct ClassifiedEmbedQueryError {
     footer_reason: &'static str,
 }
 
+const PAUSED_EMBEDDING_DETAIL: &str =
+    "Semantic search unavailable: the embedding model is paused; using keyword search only.";
+
 fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
-    if let Some(timeout_ms) = query_embedding_timeout_budget(error) {
+    if crate::synapse_embed::LanePause::from_error(error).is_some() {
+        ClassifiedEmbedQueryError {
+            detail: PAUSED_EMBEDDING_DETAIL.to_string(),
+            footer_reason: "unavailable",
+        }
+    } else if let Some(timeout_ms) = query_embedding_timeout_budget(error) {
         let clean = strip_query_embedding_timeout_marker(error);
         // Name the mechanism (the budget fired) and the remedy (raise the knob
         // for slow providers) so the agent can act, not just observe.
@@ -8744,6 +8752,55 @@ mod tests {
             "successful retry should install the constructed model"
         );
         handle.join().expect("embedding server thread");
+    }
+
+    #[test]
+    fn lane_paused_query_returns_lexical_results_with_approved_gap() {
+        use crate::synapse_embed::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+            with_fake_synapse(clock.clone(), None, |mut semantic, requests| {
+                let project = tempfile::tempdir().unwrap();
+                std::fs::write(project.path().join("remix-panel.ts"),
+                    "// where remix panel mounted option switching handled\nexport const panel = true;\n").unwrap();
+                let ctx = test_context(project.path());
+                semantic.route_project_root = Some(project.path().to_path_buf());
+                ctx.update_config(|config| config.semantic = semantic.clone());
+                ctx.set_canonical_cache_root(project.path().to_path_buf());
+                *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+                *ctx.semantic_index().write().unwrap() =
+                    Some(SemanticIndex::new(project.path().to_path_buf(), 2));
+                let response = response_value(handle_semantic_search(
+                    &semantic_request("where remix panel mounted option switching handled", 5),
+                    &ctx,
+                ));
+                assert_eq!(response["success"], true, "{response}");
+                assert_eq!(response["lexical_only_fallback"], true);
+                assert!(
+                    !response["results"].as_array().unwrap().is_empty(),
+                    "{response}"
+                );
+                let text = response["text"].as_str().unwrap();
+                assert!(text.contains("Semantic search unavailable: the embedding model is paused; using keyword search only."), "{text}");
+                assert!(text.contains(
+                    "Semantic search unavailable; returning lexical-only fallback results."
+                ));
+                assert!(text.contains("[semantic: unavailable]"));
+                assert!(!text.contains("semantic.query_timeout_ms"));
+                assert!(!text.contains("scheduled maintenance"));
+                assert_eq!(clock.load(Ordering::SeqCst), START);
+                assert_eq!(requests.lock().unwrap().len(), 2);
+                let health = ctx.semantic_backend_health_snapshot();
+                assert!(!health.available);
+                assert_eq!(health.paused_until_ms, Some(START + PAUSE_MS));
+                assert_eq!(health.last_error.as_deref(), Some("scheduled maintenance"));
+                let status = ctx.build_status_snapshot();
+                assert_eq!(status["semantic_index"]["state"], "paused", "{status}");
+                assert_eq!(
+                    status["semantic_index"]["paused_until_ms"],
+                    START + PAUSE_MS
+                );
+            });
+        });
     }
 
     #[test]

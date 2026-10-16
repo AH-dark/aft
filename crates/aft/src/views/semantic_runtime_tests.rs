@@ -8,6 +8,100 @@ use crate::semantic_index::{
 };
 use std::sync::atomic::AtomicUsize;
 
+#[test]
+fn lane_paused_view_fill_waits_without_rechunking_and_resumes() {
+    use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
+    use crate::synapse_embed::pause_test_support::*;
+    with_lane_pause_clock(START, |clock| {
+        with_fake_synapse(clock.clone(), None, |config, requests| {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("checkout");
+            let storage = directory.path().join("storage");
+            write_tree(
+                &root,
+                &[("pause.ts", "export function keyword() { return 3; }\n")],
+            );
+            let runtime = open(&storage, "paused", &root);
+            let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+            let before = lane_pause_chunk_calls();
+            let mut attempts = Vec::new();
+            let report = runtime
+                .refresh(FillBudget::default(), &mut |texts| {
+                    attempts.push((
+                        clock.load(Ordering::SeqCst),
+                        lane_pause_chunk_calls() - before,
+                    ));
+                    model.embed(texts)
+                })
+                .unwrap();
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.installed, 1);
+            assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
+            assert_eq!(lane_pause_chunk_calls() - before, 1);
+            assert_eq!(requests.lock().unwrap().len(), 3);
+            assert!(!runtime
+                .search(&[1.0, 0.0], 10, &|_| true)
+                .unwrap()
+                .results
+                .is_empty());
+        });
+    });
+}
+
+#[test]
+fn lane_paused_view_fingerprint_waits_before_checkout_preparation() {
+    use crate::semantic_index::{lane_pause_chunk_calls, with_lane_pause_clock, PauseRetryScope};
+    use crate::synapse_embed::pause_test_support::*;
+    with_lane_pause_clock(START, |clock| {
+        with_fake_synapse(clock.clone(), None, |semantic, requests| {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            write_tree(root.path(), FILES);
+            let slot = Arc::new(CheckoutSemanticSlot::default());
+            let (epoch, wake) = slot.begin();
+            let config = WorkerConfig {
+                root: root.path().to_path_buf(),
+                storage: storage.path().to_path_buf(),
+                family: "family".into(),
+                scope: "paused-fingerprint".into(),
+                semantic: semantic.clone(),
+                status: Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled)),
+                drivers: InstalledDriver::default(),
+                schedule: fast_schedule(root.path()),
+            };
+            let mut model = SemanticEmbeddingModel::from_config(&semantic).unwrap();
+            let before = lane_pause_chunk_calls();
+            let _policy = PauseRetryScope::new(
+                config.schedule.retry_initial,
+                config.schedule.retry_max,
+                || true,
+            );
+            let fingerprint = retry_activation(
+                &Arc::downgrade(&slot),
+                epoch,
+                &wake,
+                &config,
+                "embedding model",
+                || model.fingerprint_for_view(&semantic),
+            )
+            .unwrap();
+            assert_eq!(fingerprint.dimension, 2);
+            assert_eq!(lane_pause_chunk_calls(), before);
+            assert!(config.drivers.get().is_none());
+            let times = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, request)| request["method"] == "embed.query")
+                .map(|(time, _)| *time)
+                .collect::<Vec<_>>();
+            assert_eq!(times, vec![START, START + PAUSE_MS]);
+        });
+    });
+}
+
 const FILES: &[(&str, &str)] = &[
     (
         "src/alpha.rs",

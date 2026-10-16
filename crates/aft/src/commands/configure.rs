@@ -967,6 +967,16 @@ fn spawn_semantic_refresh_worker(
     let mut index_memory = SemanticWorkerMemory::new(worker_memory, &index);
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
+            let pause_lifecycle = lifecycle.clone();
+            let pause_generation = generation_flag.clone();
+            let _pause_retry = crate::semantic_index::PauseRetryScope::new(
+                semantic_build_retry_backoff(0),
+                semantic_build_retry_backoff(usize::MAX),
+                move || {
+                    !pause_lifecycle.unbound_past_grace()
+                        && pause_generation.load(Ordering::SeqCst) == generation
+                },
+            );
             let semantic_blob_store = open_semantic_view_blob_store(view_blob_source);
             // Work held back while no session had the root open; the first
             // batch after it is opened again folds it back in.
@@ -5321,6 +5331,16 @@ fn schedule_artifact_loads_admitted(
                 // server-side can raise it freely.
                 let max_semantic_files = semantic_config.max_files;
                 let mut semantic_retry_attempt: usize = 0;
+                let pause_lifecycle = semantic_lifecycle.clone();
+                let pause_epoch = semantic_build_epoch_flag.clone();
+                let _pause_retry = crate::semantic_index::PauseRetryScope::new(
+                    semantic_build_retry_backoff(0),
+                    semantic_build_retry_backoff(usize::MAX),
+                    move || {
+                        !pause_lifecycle.unbound_past_grace()
+                            && pause_epoch.load(Ordering::SeqCst) == semantic_build_epoch
+                    },
+                );
                 let set_cold_seed_active = || {
                     if semantic_cold_seed_generation_flag.load(std::sync::atomic::Ordering::SeqCst)
                         == semantic_cold_seed_generation_for_worker
@@ -5366,7 +5386,9 @@ fn schedule_artifact_loads_admitted(
                     });
                     let mut model =
                         crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
-                    let fingerprint = model.fingerprint(&semantic_config)?;
+                    let fingerprint = crate::semantic_index::retry_lane_pause(|| {
+                        model.fingerprint(&semantic_config)
+                    })?;
                     let embed_text_caps = fingerprint.embed_text_caps;
                     let fingerprint_key = fingerprint.as_string();
                     let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)

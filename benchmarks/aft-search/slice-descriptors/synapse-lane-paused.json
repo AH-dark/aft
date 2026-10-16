@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The ranking-fenced semantic_search/mod.rs changes only the error gap for an immediately refused query embedding. Successful query ranking and routing are unchanged; benchmark rows must remain byte-equal. Paused embeddings use the existing lexical fallback path with the approved fixed sentence."
+}
