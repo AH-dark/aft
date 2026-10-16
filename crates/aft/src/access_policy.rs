@@ -42,6 +42,34 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
 }
 
+/// Worker library reads use daemon-owned roots, never a caller's environment.
+/// Snapshot real directories once so later symlink changes cannot widen a grant.
+pub(crate) fn worker_rust_read_grants() -> &'static [AccessGrant] {
+    static GRANTS: std::sync::LazyLock<Vec<AccessGrant>> = std::sync::LazyLock::new(|| {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from);
+        [
+            ("CARGO_HOME", ".cargo", "registry/src"),
+            ("RUSTUP_HOME", ".rustup", "toolchains"),
+        ]
+        .into_iter()
+        .filter_map(|(variable, default, subtree)| {
+            let root = crate::environment::non_empty_os_var(variable)
+                .map(PathBuf::from)
+                .or_else(|| home.as_ref().map(|home| home.join(default)))?;
+            let path = root.join(subtree).canonicalize().ok()?;
+            path.is_dir().then(|| AccessGrant {
+                path: crate::inspect::job::normalize_path(&path),
+                kind: GrantKind::Subtree,
+                operation: AccessOperation::Read,
+            })
+        })
+        .collect()
+    });
+    &GRANTS
+}
+
 /// Who answers an `ask` decision for the call running on this thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AskRoute {

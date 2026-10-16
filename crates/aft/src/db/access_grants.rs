@@ -60,8 +60,26 @@ pub fn register_agent(
     agent_id: &str,
     head: bool,
 ) -> rusqlite::Result<()> {
-    conn.execute("INSERT OR REPLACE INTO access_scope_agents(owner,scope_ref,epoch,agent_id,kind) VALUES (?1,?2,?3,?4,?5)", params![key.owner,key.scope_ref,key.epoch.to_string(),agent_id,if head { "head" } else { "run" }])?;
+    register_agent_kind(conn, key, agent_id, if head { "head" } else { "run" })
+}
+
+pub fn register_worker(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<()> {
+    register_agent_kind(conn, key, "", "worker")
+}
+
+fn register_agent_kind(
+    conn: &Connection,
+    key: &ScopeKey,
+    agent_id: &str,
+    kind: &str,
+) -> rusqlite::Result<()> {
+    conn.execute("INSERT OR REPLACE INTO access_scope_agents(owner,scope_ref,epoch,agent_id,kind) VALUES (?1,?2,?3,?4,?5)", params![key.owner,key.scope_ref,key.epoch.to_string(),agent_id,kind])?;
     Ok(())
+}
+
+/// Only a live daemon-attested worker receives built-in worker capabilities.
+pub fn is_worker(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM access_scope_agents a JOIN access_scopes s ON s.owner=a.owner AND s.scope_ref=a.scope_ref AND s.epoch=a.epoch WHERE a.owner=?1 AND a.scope_ref=?2 AND a.epoch=?3 AND a.kind='worker' AND s.ended=0)", params![key.owner,key.scope_ref,key.epoch.to_string()], |row| row.get(0))
 }
 
 fn agent_head(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<ScopeKey>> {

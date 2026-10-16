@@ -107,6 +107,10 @@ fn register_on(
     store::register_scope(conn, &scope_key(identity), parent.as_ref(), &config)
         .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
     if let Some(stamp) = identity.scope.as_ref().filter(|s| alfonso(s)) {
+        if stamp.kind == subc_protocol::scope::ScopeKind::Worker {
+            store::register_worker(conn, &scope_key(identity))
+                .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
+        }
         if matches!(
             stamp.kind,
             subc_protocol::scope::ScopeKind::Head | subc_protocol::scope::ScopeKind::Ephemeral
@@ -321,6 +325,11 @@ pub(super) fn policy_for_scope(
     let mut policy = AccessPolicy::from_config(&config, &ctx.storage_dir(), roots, &home);
     policy.mode = store::mode(conn, key)?;
     policy.grants = store::list(conn, key)?;
+    if store::is_worker(conn, key)? {
+        policy
+            .grants
+            .extend_from_slice(crate::access_policy::worker_rust_read_grants());
+    }
     Ok(Some(policy))
 }
 

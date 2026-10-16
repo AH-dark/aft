@@ -1,5 +1,6 @@
 # Notes for the next release
 
+- 0.60.1: Worker file tools can read Cargo registry sources and Rust toolchains without permission cards; writes, credential/cache paths, permanent deny floors, and shell confinement are unchanged.
 - Daemon health: scheduler contention now preserves the last measured census and timestamp, marks it stale with an increasing age, and reports unmeasured startup metrics as null instead of empty/zero/available. The health sentinel treats stale or unknown census data as an instrument failure without losing watcher baselines or disabling live liveness checks.
 - Access policy: heads can read their own workers' bash task records and status, including revived workers, without gaining task control; launch environments remain private. Sessions can grep and glob their own task I/O folders.
 - Bash status: checking a session's own task no longer searches for worker records. When a primary agent checks a worker's task, AFT finds its owner in memory or the database instead of enumerating session folders. The added index keeps schema 18 and remains compatible with schema-18 database readers.

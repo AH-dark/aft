@@ -12267,7 +12267,7 @@ impl AppContext {
             .unwrap_or_default();
         let storage = self.storage_dir();
         let force_restrict = self.request_force_restrict(req_id);
-        let (grants, mode) = if let Some(scope) = crate::access_policy::current_scope() {
+        let (grants, mode, worker) = if let Some(scope) = crate::access_policy::current_scope() {
             match self.db() {
                 Some(db) => {
                     let conn = db.lock().map_err(|_| {
@@ -12292,16 +12292,29 @@ impl AppContext {
                             error.to_string(),
                         )
                     })?;
-                    (grants, mode)
+                    let worker =
+                        crate::db::access_grants::is_worker(&conn, &scope).map_err(|error| {
+                            crate::protocol::Response::error(
+                                req_id,
+                                "grants_unavailable",
+                                error.to_string(),
+                            )
+                        })?;
+                    (grants, mode, worker)
                 }
-                None => (Vec::new(), Default::default()),
+                None => (Vec::new(), Default::default(), false),
             }
         } else {
-            (Vec::new(), Default::default())
+            (Vec::new(), Default::default(), false)
         };
         let build = move || {
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
             policy.grants = grants;
+            if worker {
+                policy
+                    .grants
+                    .extend_from_slice(crate::access_policy::worker_rust_read_grants());
+            }
             policy.mode = mode;
             if force_restrict {
                 policy.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
