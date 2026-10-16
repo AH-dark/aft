@@ -677,6 +677,13 @@ pub struct InspectResult {
     pub config: Arc<Config>,
     pub outcome: Result<InspectScanSuccess, String>,
     pub duration: Duration,
+    // A transient dependency probe yielded no cacheable analysis result.
+    pub(crate) deferred: Option<InspectDeferral>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InspectDeferral {
+    CallgraphBusy,
 }
 
 impl InspectResult {
@@ -690,6 +697,7 @@ impl InspectResult {
             config: Arc::clone(&job.config),
             outcome: Ok(success),
             duration,
+            deferred: None,
         }
     }
 
@@ -703,7 +711,18 @@ impl InspectResult {
             config: Arc::clone(&job.config),
             outcome: Err(message.into()),
             duration,
+            deferred: None,
         }
+    }
+
+    pub(crate) fn callgraph_busy(
+        job: &InspectJob,
+        error: crate::callgraph_store::CallGraphStoreError,
+        duration: Duration,
+    ) -> Self {
+        let mut result = Self::failed(job, error.to_string(), duration);
+        result.deferred = Some(InspectDeferral::CallgraphBusy);
+        result
     }
 }
 
@@ -783,6 +802,17 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
+    pub(crate) fn callgraph_pending() -> Self {
+        // Fresh describes this observation, not a completed dead-code analysis.
+        // A count-free pending payload keeps scoped rendering from turning an
+        // inconclusive probe into an unavailable-capability claim.
+        Self::Fresh {
+            payload: serde_json::json!({
+                "status": "pending", "reason": "callgraph_building", "complete": false,
+            }),
+        }
+    }
+
     pub fn off() -> Self {
         Self::Fresh {
             payload: serde_json::json!({"off": true, "complete": true}),

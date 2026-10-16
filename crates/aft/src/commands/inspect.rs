@@ -763,7 +763,7 @@ fn handle_inspect_payload(
             // ready). Completion is owned by finish_tier2_phases from the
             // builder aggregate so this check cannot mark callgraph_ready
             // while the builder still reports callgraph_unavailable.
-            if !manager.callgraph_ready_for_snapshot(&snapshot) {
+            if matches!(manager.callgraph_ready_for_snapshot(&snapshot), Ok(false)) {
                 crate::slog_debug!("tier2 dead_code: callgraph store not ready at inspect start");
             }
             Some(phase_log.start(InspectPhaseEntry::category(
@@ -2693,11 +2693,7 @@ fn receive_tier2_completion_until(
         let now = std::time::Instant::now();
         if now >= deadline {
             if category == InspectCategory::DeadCode && manager.dead_code_build_is_pending() {
-                return Some(JobOutcome::Fresh {
-                    payload: serde_json::json!({
-                        "status": "pending", "reason": "callgraph_building", "complete": false,
-                    }),
-                });
+                return Some(JobOutcome::callgraph_pending());
             }
             if request_deadline.is_some_and(|request| now >= request.work_at()) {
                 return Some(JobOutcome::Failed {
@@ -5145,6 +5141,21 @@ mod status_bar_refresh_tests {
 #[cfg(test)]
 mod render_text_tests {
     use super::*;
+
+    #[test]
+    fn readonly_busy_dead_code_reuses_count_free_pending_wording() {
+        let pending = JobOutcome::callgraph_pending().payload().unwrap().clone();
+        let text = render(serde_json::json!({"dead_code": pending}));
+        assert_eq!(text, "PARTIAL — dead code incomplete: callgraph_building; retry aft_inspect.\nDead code: pending (callgraph_building)");
+        println!("BUSY INSPECT AFTER:\n{text}");
+        let unavailable = crate::inspect::scanners::dead_code::borrow_only_unavailable_aggregate(3);
+        let before = render(serde_json::json!({"dead_code": {
+            "status": "unavailable", "unavailable": true, "complete": false,
+            "gaps": incomplete_category_gaps(InspectCategory::DeadCode, &unavailable),
+        }}));
+        assert_eq!(before, "PARTIAL — dead code unavailable: dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout; retry aft_inspect.\nIncomplete dead_code: Tier-2 unavailable (dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout)");
+        println!("BUSY INSPECT BEFORE:\n{before}");
+    }
 
     fn summary_map(value: Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap_or_default()
