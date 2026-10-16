@@ -27,17 +27,23 @@ fn lane_paused_view_fill_waits_without_rechunking_and_resumes() {
                 PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
             let before = lane_pause_chunk_calls();
             let mut attempts = Vec::new();
-            let report = runtime
-                .refresh(FillBudget::default(), &mut |texts| {
+            let slot = Arc::new(CheckoutSemanticSlot::default());
+            let (epoch, _wake) = slot.begin();
+            let outcome = catch_up(
+                &Arc::downgrade(&slot),
+                epoch,
+                &runtime,
+                &fast_schedule(&root),
+                FillBudget::default(),
+                &mut |texts| {
                     attempts.push((
                         clock.load(Ordering::SeqCst),
                         lane_pause_chunk_calls() - before,
                     ));
                     model.embed(texts)
-                })
-                .unwrap();
-            assert!(report.errors.is_empty(), "{:?}", report.errors);
-            assert_eq!(report.installed, 1);
+                },
+            );
+            assert!(matches!(outcome, FillOutcome::Settled));
             assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
             assert_eq!(lane_pause_chunk_calls() - before, 1);
             assert_eq!(requests.lock().unwrap().len(), 3);
@@ -98,6 +104,74 @@ fn lane_paused_view_fingerprint_waits_before_checkout_preparation() {
                 .map(|(time, _)| *time)
                 .collect::<Vec<_>>();
             assert_eq!(times, vec![START, START + PAUSE_MS]);
+        });
+    });
+}
+
+#[test]
+fn lane_paused_view_wait_releases_admission_refresh_and_family_claims() {
+    use crate::semantic_index::{
+        with_lane_pause_clock, with_lane_pause_wait_hook, PauseRetryScope,
+    };
+    use crate::synapse_embed::pause_test_support::*;
+    with_lane_pause_clock(START, |clock| {
+        with_fake_synapse(clock.clone(), None, |config, _requests| {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("checkout");
+            let storage = directory.path().join("storage");
+            write_tree(
+                &root,
+                &[("pause.ts", "export function released() { return 3; }\n")],
+            );
+            let runtime = Arc::new(open(&storage, "paused-resources", &root));
+            let arena = super::super::semantic_arena::arena_for(&storage, "family");
+            let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+            let slot = Arc::new(CheckoutSemanticSlot::default());
+            let (epoch, _wake) = slot.begin();
+            let mut schedule = fast_schedule(&root);
+            schedule.limiter = crate::cold_build_limiter::isolated_limiter(1);
+            let preparation = crate::cold_build_limiter::isolated_limiter(1);
+            let cold_probe = schedule.limiter.clone();
+            let prep_probe = preparation.clone();
+            let runtime_probe = runtime.clone();
+            let clock_probe = clock.clone();
+            let waited = Arc::new(AtomicUsize::new(0));
+            let observed = waited.clone();
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+            let outcome = with_lane_pause_wait_hook(
+                move |delay| {
+                    let _cold = cold_probe
+                        .try_acquire()
+                        .expect("pause retained cold admission");
+                    let _preparation = prep_probe
+                        .try_acquire()
+                        .expect("pause retained preparation admission");
+                    let _refresh = runtime_probe
+                        .refresh
+                        .try_lock()
+                        .expect("pause retained refresh mutex");
+                    assert!(
+                        arena.pause_resources_are_free(),
+                        "pause retained a family gate or file claim"
+                    );
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    clock_probe.fetch_add(delay.as_millis() as u64, Ordering::SeqCst);
+                },
+                || {
+                    catch_up_with_preparation_limiter(
+                        &Arc::downgrade(&slot),
+                        epoch,
+                        &runtime,
+                        &schedule,
+                        FillBudget::default(),
+                        &mut |texts| model.embed(texts),
+                        &preparation,
+                    )
+                },
+            );
+            assert!(matches!(outcome, FillOutcome::Settled));
+            assert_eq!(waited.load(Ordering::SeqCst), 1);
         });
     });
 }

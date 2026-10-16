@@ -3859,7 +3859,16 @@ fn try_admit_actor(
     })
 }
 
+thread_local! {
+    static IS_EXECUTOR_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn current_thread_is_executor_worker() -> bool {
+    IS_EXECUTOR_WORKER.with(std::cell::Cell::get)
+}
+
 fn worker_loop(run_rx: Receiver<RunJob>) {
+    IS_EXECUTOR_WORKER.with(|worker| worker.set(true));
     while let Ok(mut run_job) = run_rx.recv() {
         let response =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_lane_job(&mut run_job)));

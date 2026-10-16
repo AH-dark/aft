@@ -269,6 +269,73 @@ thread_local! {
     static LANE_PAUSE_TEST_CLOCK: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static LANE_PAUSE_CHUNK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREPARED_PAUSE_JOB: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static LANE_PAUSE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(Duration)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Owned checkpoints contain data only, never permits, store handles or leases.
+/// Retrying an attempt can rebuild its local index without re-reading/chunking
+/// the corpus or asking the backend for batches that already succeeded.
+#[derive(Default)]
+struct PreparedPauseJob {
+    files: HashMap<PathBuf, Vec<PathBuf>>,
+    collected: HashMap<String, (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>)>,
+    file_chunks: HashMap<String, (IndexedFileMetadata, Vec<SemanticChunk>)>,
+    view_chunks: HashMap<String, Option<Vec<SemanticChunk>>>,
+    rows: HashMap<Vec<String>, Vec<BuildEmbeddingRow>>,
+    producer: Option<String>,
+}
+
+struct PreparedPauseJobScope(Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>>);
+
+impl PreparedPauseJobScope {
+    fn new() -> Self {
+        Self(PREPARED_PAUSE_JOB.with(|slot| {
+            let job = slot.borrow().clone().unwrap_or_default();
+            slot.replace(Some(job))
+        }))
+    }
+}
+
+impl Drop for PreparedPauseJobScope {
+    fn drop(&mut self) {
+        PREPARED_PAUSE_JOB.with(|slot| slot.replace(self.0.take()));
+    }
+}
+
+fn prepared_pause_job() -> Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>> {
+    PREPARED_PAUSE_JOB.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn pause_job_producer(producer: &str) {
+    if let Some(job) = prepared_pause_job() {
+        let mut job = job.borrow_mut();
+        if job.producer.as_deref().is_some_and(|old| old != producer) {
+            *job = PreparedPauseJob::default();
+        }
+        job.producer = Some(producer.to_owned());
+    }
+}
+
+pub(crate) fn pause_job_files(
+    root: &Path,
+    walk: impl FnOnce() -> Result<Vec<PathBuf>, usize>,
+) -> Result<Vec<PathBuf>, usize> {
+    let job = prepared_pause_job();
+    if let Some(files) = job
+        .as_ref()
+        .and_then(|job| job.borrow().files.get(root).cloned())
+    {
+        return Ok(files);
+    }
+    let files = walk()?;
+    if let Some(job) = job {
+        job.borrow_mut()
+            .files
+            .insert(root.to_path_buf(), files.clone());
+    }
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -323,16 +390,52 @@ pub(crate) fn with_lane_pause_clock<T>(
     run(clock)
 }
 
-fn wait_lane_pause(delay: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + delay;
-    loop {
-        if !LANE_PAUSE_RETRY_POLICY.with(|policy| {
+#[cfg(test)]
+pub(crate) fn with_lane_pause_wait_hook<T>(
+    hook: impl FnMut(Duration) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Box<dyn FnMut(Duration)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    run()
+}
+
+fn pause_job_is_current(local: &mut impl FnMut() -> bool) -> bool {
+    !crate::executor::current_job_cancelled()
+        && local()
+        && LANE_PAUSE_RETRY_POLICY.with(|policy| {
             policy
                 .borrow()
                 .as_ref()
-                .is_none_or(|policy| (policy.current)())
-        }) {
+                .is_some_and(|policy| (policy.current)())
+        })
+}
+
+fn wait_lane_pause(delay: Duration, local: &mut impl FnMut() -> bool) -> Result<(), String> {
+    let deadline = Instant::now() + delay;
+    loop {
+        if !pause_job_is_current(local) {
             return Err("semantic lane superseded".into());
+        }
+        #[cfg(test)]
+        if LANE_PAUSE_WAIT_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(delay);
+                true
+            } else {
+                false
+            }
+        }) {
+            return if pause_job_is_current(local) {
+                Ok(())
+            } else {
+                Err("semantic lane superseded".into())
+            };
         }
         #[cfg(test)]
         if LANE_PAUSE_TEST_CLOCK.with(|clock| {
@@ -356,12 +459,21 @@ fn wait_lane_pause(delay: Duration) -> Result<(), String> {
     }
 }
 
-/// Keep the prepared batch and completed work on the worker's stack. An announced
-/// pause is not a failed build: returning it would discard chunks and re-walk the
-/// corpus on every retry. Interactive query embeddings never use this wait.
-pub(crate) fn retry_lane_pause<T>(
+/// Retry a whole attempt on a dedicated semantic thread, after its resources
+/// have gone out of scope. Only owned data checkpoints survive between attempts.
+/// Executor jobs and callers without an explicit cancellation policy never sleep.
+pub(crate) fn retry_lane_pause<T>(attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    retry_lane_pause_while(attempt, &mut || true)
+}
+
+pub(crate) fn retry_lane_pause_while<T>(
     mut attempt: impl FnMut() -> Result<T, String>,
+    current: &mut impl FnMut() -> bool,
 ) -> Result<T, String> {
+    let _prepared = PreparedPauseJobScope::new();
+    let may_wait = LANE_PAUSE_RETRY_POLICY.with(|policy| policy.borrow().is_some())
+        && crate::executor::current_job_cancellation().is_none()
+        && !crate::executor::current_thread_is_executor_worker();
     let (mut backoff, max) = LANE_PAUSE_RETRY_POLICY.with(|policy| {
         policy
             .borrow()
@@ -370,12 +482,18 @@ pub(crate) fn retry_lane_pause<T>(
             .unwrap_or((Duration::from_secs(15), Duration::from_secs(60)))
     });
     loop {
+        if may_wait && !pause_job_is_current(current) {
+            return Err("semantic lane superseded".into());
+        }
         match attempt() {
             Err(error) => {
                 let Some(pause) = crate::synapse_embed::LanePause::from_error(&error) else {
                     return Err(error);
                 };
-                wait_lane_pause(pause.retry_delay(backoff))?;
+                if !may_wait {
+                    return Err(error);
+                }
+                wait_lane_pause(pause.retry_delay(backoff), current)?;
                 backoff = (backoff * 2).min(max);
             }
             success => return success,
@@ -400,6 +518,9 @@ pub(crate) fn build_backend_retry_delay_ms(attempt: usize) -> u64 {
 }
 
 fn record_embedding_backend_build_failure(project_root: &Path, error: &str) {
+    if crate::synapse_embed::LanePause::from_error(error).is_some() {
+        return;
+    }
     let now_ms = unix_millis_now();
     let clean = strip_transient_embedding_marker(error);
     let mut registry = embedding_backend_build_health_registry()
@@ -4008,6 +4129,7 @@ impl EmbeddingEntry {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum BuildEmbeddingRow {
     Embedded {
         embedded_text: String,
@@ -4027,8 +4149,15 @@ where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
 {
     clear_http_build_metadata();
+    let job = prepared_pause_job();
+    if let Some(rows) = job
+        .as_ref()
+        .and_then(|job| job.borrow().rows.get(&texts).cloned())
+    {
+        return Ok(rows);
+    }
     let requested_texts = texts.clone();
-    let vectors = retry_lane_pause(|| embed_fn(texts.clone()))?;
+    let vectors = embed_fn(texts.clone())?;
     let metadata = take_http_build_metadata();
     // Adaptive HTTP requests report their successful sub-batches immediately,
     // including when later requests fail. Generic/local providers report here.
@@ -4091,6 +4220,9 @@ where
                 .filter(|row| matches!(row, BuildEmbeddingRow::Embedded { .. }))
                 .count(),
         );
+    }
+    if let Some(job) = job {
+        job.borrow_mut().rows.insert(texts, rows.clone());
     }
     Ok(rows)
 }
@@ -5304,6 +5436,14 @@ impl SemanticIndex {
         files: &[PathBuf],
         embed_text_caps: EmbedTextCaps,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
+        let job = prepared_pause_job();
+        let key = format!("{project_root:?}:{files:?}:{embed_text_caps:?}");
+        if let Some(prepared) = job
+            .as_ref()
+            .and_then(|job| job.borrow().collected.get(&key).cloned())
+        {
+            return prepared;
+        }
         let collect_started = Instant::now();
         let progress = crate::cold_build_limiter::progress::counter();
         let collect_one = |file: &Path, sched: Duration| {
@@ -5396,6 +5536,11 @@ impl SemanticIndex {
             );
         }
 
+        if let Some(job) = job {
+            job.borrow_mut()
+                .collected
+                .insert(key, (chunks.clone(), file_metadata.clone()));
+        }
         (chunks, file_metadata)
     }
 
@@ -5687,7 +5832,7 @@ impl SemanticIndex {
         let embed_started = std::time::Instant::now();
         let batch_count = total_chunks.div_ceil(batch_size);
         for (batch_index, batch_start) in (0..chunks.len()).step_by(batch_size).enumerate() {
-            if !should_continue() {
+            if !should_continue() || crate::executor::current_job_cancelled() {
                 slog_info!(
                     "semantic embed superseded, stopping after {}/{} batches",
                     batch_index,
@@ -9291,6 +9436,27 @@ fn collect_semantic_file(
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+    let job = prepared_pause_job();
+    let key = format!("{project_root:?}:{file:?}:{embed_text_caps:?}");
+    if let Some(prepared) = job
+        .as_ref()
+        .and_then(|job| job.borrow().file_chunks.get(&key).cloned())
+    {
+        return Ok(prepared);
+    }
+    let prepared = collect_semantic_file_uncached(project_root, file, embed_text_caps, phases)?;
+    if let Some(job) = job {
+        job.borrow_mut().file_chunks.insert(key, prepared.clone());
+    }
+    Ok(prepared)
+}
+
+fn collect_semantic_file_uncached(
+    project_root: &Path,
+    file: &Path,
+    embed_text_caps: EmbedTextCaps,
+    phases: &mut SemanticCollectPhaseTimings,
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
     let read_hash_started = Instant::now();
     let read_result = (|| {
         let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
@@ -9761,6 +9927,30 @@ pub(crate) fn chunk_view_file(
     bytes: &[u8],
     embed_text_caps: EmbedTextCaps,
 ) -> Result<Option<Vec<SemanticChunk>>, String> {
+    let job = prepared_pause_job();
+    let key = format!(
+        "{project_root:?}:{rel_path:?}:{}:{embed_text_caps:?}",
+        blake3::hash(bytes)
+    );
+    if let Some(chunks) = job
+        .as_ref()
+        .and_then(|job| job.borrow().view_chunks.get(&key).cloned())
+    {
+        return Ok(chunks);
+    }
+    let chunks = chunk_view_file_uncached(project_root, rel_path, bytes, embed_text_caps)?;
+    if let Some(job) = job {
+        job.borrow_mut().view_chunks.insert(key, chunks.clone());
+    }
+    Ok(chunks)
+}
+
+fn chunk_view_file_uncached(
+    project_root: &Path,
+    rel_path: &Path,
+    bytes: &[u8],
+    embed_text_caps: EmbedTextCaps,
+) -> Result<Option<Vec<SemanticChunk>>, String> {
     let file = project_root.join(rel_path);
     if !is_semantic_indexed_extension(&file) {
         return Ok(None);
@@ -10025,6 +10215,8 @@ mod tests {
     fn lane_paused_cold_build_waits_without_rechunking_and_resumes() {
         use crate::synapse_embed::pause_test_support::*;
         with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
             with_fake_synapse(clock.clone(), None, |config, requests| {
                 let directory = tempfile::tempdir().unwrap();
                 let file = directory.path().join("pause.ts");
@@ -10036,19 +10228,32 @@ mod tests {
                     attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
                     model.embed(texts)
                 };
-                let index = SemanticIndex::build_with_progress_and_cancellation_caps(
-                    directory.path(),
-                    &[file],
-                    &mut embed,
-                    100,
-                    EmbedTextCaps::default(),
-                    &mut |_, _| {},
-                    &mut || true,
-                )
+                let walks = std::cell::Cell::new(0);
+                let index = retry_lane_pause(|| {
+                    let files = pause_job_files(directory.path(), || {
+                        walks.set(walks.get() + 1);
+                        Ok(fs::read_dir(directory.path())
+                            .unwrap()
+                            .map(|entry| entry.unwrap().path())
+                            .filter(|path| path.is_file())
+                            .collect())
+                    })
+                    .map_err(|_| "corpus walk failed".to_string())?;
+                    SemanticIndex::build_with_progress_and_cancellation_caps(
+                        directory.path(),
+                        &files,
+                        &mut embed,
+                        100,
+                        EmbedTextCaps::default(),
+                        &mut |_, _| {},
+                        &mut || true,
+                    )
+                })
                 .unwrap();
                 assert!(index.len() > 0);
                 assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
                 assert_eq!(lane_pause_chunk_calls() - before, 1);
+                assert_eq!(walks.get(), 1);
                 assert_eq!(
                     requests
                         .lock()
@@ -10067,6 +10272,8 @@ mod tests {
     fn lane_paused_invalid_hint_uses_backoff_without_hot_loop() {
         use crate::synapse_embed::pause_test_support::*;
         with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
             with_fake_synapse(
                 clock.clone(),
                 Some(serde_json::json!(
@@ -10074,11 +10281,12 @@ mod tests {
                 )),
                 |config, requests| {
                     let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
-                    let rows =
+                    let rows = retry_lane_pause(|| {
                         execute_build_embedding_batch(vec!["keyword".into()], &mut |texts| {
                             model.embed(texts)
                         })
-                        .unwrap();
+                    })
+                    .unwrap();
                     assert_eq!(rows.len(), 1);
                     let times = requests
                         .lock()
@@ -10139,6 +10347,8 @@ mod tests {
     fn lane_paused_live_refresh_retains_prepared_chunks_until_resume() {
         use crate::synapse_embed::pause_test_support::*;
         with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
             with_fake_synapse(clock, None, |config, requests| {
                 let directory = tempfile::tempdir().unwrap();
                 let file = directory.path().join("live.ts");
@@ -10147,10 +10357,10 @@ mod tests {
                 let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
                 let before = lane_pause_chunk_calls();
                 let mut attempts = Vec::new();
-                let refresh = index
-                    .refresh_invalidated_files(
+                let refresh = retry_lane_pause(|| {
+                    index.refresh_invalidated_files(
                         directory.path(),
-                        &[file],
+                        std::slice::from_ref(&file),
                         &mut |texts| {
                             attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
                             model.embed(texts)
@@ -10159,7 +10369,8 @@ mod tests {
                         100,
                         &mut |_, _| {},
                     )
-                    .unwrap();
+                })
+                .unwrap();
                 assert!(!refresh.added_entries.is_empty());
                 assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
                 assert_eq!(requests.lock().unwrap().len(), 3);
@@ -10187,8 +10398,115 @@ mod tests {
                 )
                 .to_string())
             });
-            assert_eq!(attempts, 1);
+            assert_eq!(attempts, 0);
             assert_eq!(result.unwrap_err(), "semantic lane superseded");
+        });
+    }
+
+    #[test]
+    fn lane_paused_cold_job_stops_on_quiesce_or_own_cancellation() {
+        use crate::synapse_embed::pause_test_support::*;
+        for quiesce in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("cancel.rs");
+            fs::write(&file, "pub fn cancelled() {}\n").unwrap();
+            let ctx = Arc::new(crate::context::AppContext::new(
+                crate::context::default_language_provider_factory(),
+                crate::config::Config::default(),
+            ));
+            let lifecycle = ctx.subc_lifecycle_admission();
+            let own = Arc::new(AtomicBool::new(true));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let at_cancel = Arc::new(AtomicUsize::new(0));
+            let _policy = PauseRetryScope::new(
+                Duration::from_secs(15),
+                Duration::from_secs(60),
+                move || lifecycle.is_bound(),
+            );
+            with_lane_pause_clock(START, |clock| {
+                let own_cancel = own.clone();
+                let checks_hook = checks.clone();
+                let at_cancel_hook = at_cancel.clone();
+                let ctx_hook = ctx.clone();
+                with_lane_pause_wait_hook(
+                    move |_| {
+                        at_cancel_hook.store(checks_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                        if quiesce {
+                            ctx_hook.mark_subc_unbound();
+                        } else {
+                            own_cancel.store(false, Ordering::SeqCst);
+                        }
+                    },
+                    || {
+                        let calls = std::cell::Cell::new(0);
+                        let result = retry_lane_pause_while(
+                            || {
+                                SemanticIndex::build_with_progress_and_cancellation_caps(
+                                    root.path(),
+                                    std::slice::from_ref(&file),
+                                    &mut |_| {
+                                        calls.set(calls.get() + 1);
+                                        assert_eq!(
+                                            calls.get(),
+                                            1,
+                                            "a quiesced paused build attempted more embedding work"
+                                        );
+                                        Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(crate::synapse_embed::LanePause {
+                                lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
+                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(),
+                            }).to_string())
+                                    },
+                                    100,
+                                    EmbedTextCaps::default(),
+                                    &mut |_, _| {},
+                                    &mut || own.load(Ordering::SeqCst),
+                                )
+                            },
+                            &mut || {
+                                checks.fetch_add(1, Ordering::SeqCst);
+                                own.load(Ordering::SeqCst)
+                            },
+                        );
+                        assert_eq!(result.err().as_deref(), Some("semantic lane superseded"));
+                        assert_eq!(
+                            checks.load(Ordering::SeqCst),
+                            at_cancel.load(Ordering::SeqCst) + 1
+                        );
+                        assert_eq!(calls.get(), 1, "a cancelled paused build did more indexing");
+                        assert_eq!(clock.load(Ordering::SeqCst), START);
+                    },
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn lane_paused_direct_cold_builder_has_no_implicit_wait() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            with_fake_synapse(clock.clone(), None, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("direct.rs");
+                fs::write(&file, "pub fn direct() {}\n").unwrap();
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let result = SemanticIndex::build_with_progress_and_cancellation_caps(
+                    directory.path(),
+                    &[file],
+                    &mut |texts| model.embed(texts),
+                    100,
+                    EmbedTextCaps::default(),
+                    &mut |_, _| {},
+                    &mut || true,
+                );
+                assert!(crate::synapse_embed::LanePause::from_error(
+                    &result
+                        .err()
+                        .expect("a direct builder must return its pause to its caller")
+                )
+                .is_some());
+                assert_eq!(clock.load(Ordering::SeqCst), START);
+                assert_eq!(requests.lock().unwrap().len(), 2);
+            });
         });
     }
 

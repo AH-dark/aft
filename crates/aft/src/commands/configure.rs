@@ -972,10 +972,7 @@ fn spawn_semantic_refresh_worker(
             let _pause_retry = crate::semantic_index::PauseRetryScope::new(
                 semantic_build_retry_backoff(0),
                 semantic_build_retry_backoff(usize::MAX),
-                move || {
-                    !pause_lifecycle.unbound_past_grace()
-                        && pause_generation.load(Ordering::SeqCst) == generation
-                },
+                move || pause_lifecycle.is_current(&pause_generation, generation),
             );
             let semantic_blob_store = open_semantic_view_blob_store(view_blob_source);
             // Work held back while no session had the root open; the first
@@ -1079,6 +1076,7 @@ fn spawn_semantic_refresh_worker(
                 }) else {
                     return;
                 };
+                let mut refresh_permit = Some(_refresh_permit);
 
                 if corpus_requested {
                     let mut current_files = match walk_semantic_project_files_bounded(
@@ -1170,16 +1168,26 @@ fn spawn_semantic_refresh_worker(
                         })
                     };
                     let mut recovery_paths = Vec::new();
-                    let refresh_result = index.refresh_stale_files_with_strategy_and_blob_reuse(
-                        &project_root,
-                        &current_files,
-                        &mut embed,
-                        max_batch_size,
-                        &mut progress,
-                        VerifyStrategy::Strict,
-                        &mut reuse_blob,
-                        Some(&mut recovery_paths),
-                    );
+                    let refresh_result = crate::semantic_index::retry_lane_pause(|| {
+                        let _permit = refresh_permit
+                            .take()
+                            .or_else(|| {
+                                limiter.acquire(&project_root, || {
+                                    lifecycle.is_current(&generation_flag, generation)
+                                })
+                            })
+                            .ok_or_else(|| SUPERSEDED_SEMANTIC_BUILD.to_string())?;
+                        index.refresh_stale_files_with_strategy_and_blob_reuse(
+                            &project_root,
+                            &current_files,
+                            &mut embed,
+                            max_batch_size,
+                            &mut progress,
+                            VerifyStrategy::Strict,
+                            &mut reuse_blob,
+                            Some(&mut recovery_paths),
+                        )
+                    });
                     index_memory.update(&index);
                     if embed_batches > 0 {
                         let files = refresh_result
@@ -1290,15 +1298,25 @@ fn spawn_semantic_refresh_worker(
                 };
                 let refresh_started = Instant::now();
                 let embedding_timing_scope = crate::semantic_index::EmbeddingTimingScope::new();
-                let refresh_result = index.refresh_invalidated_files_with_blob_reuse(
-                    &project_root,
-                    &paths,
-                    &mut embed,
-                    max_batch_size,
-                    max_files,
-                    &mut progress,
-                    &mut reuse_blob,
-                );
+                let refresh_result = crate::semantic_index::retry_lane_pause(|| {
+                    let _permit = refresh_permit
+                        .take()
+                        .or_else(|| {
+                            limiter.acquire(&project_root, || {
+                                lifecycle.is_current(&generation_flag, generation)
+                            })
+                        })
+                        .ok_or_else(|| SUPERSEDED_SEMANTIC_BUILD.to_string())?;
+                    index.refresh_invalidated_files_with_blob_reuse(
+                        &project_root,
+                        &paths,
+                        &mut embed,
+                        max_batch_size,
+                        max_files,
+                        &mut progress,
+                        &mut reuse_blob,
+                    )
+                });
                 let elapsed_ms = refresh_started.elapsed().as_millis();
                 let embedding_timing = embedding_timing_scope.snapshot();
                 drop(embedding_timing_scope);
@@ -5337,7 +5355,7 @@ fn schedule_artifact_loads_admitted(
                     semantic_build_retry_backoff(0),
                     semantic_build_retry_backoff(usize::MAX),
                     move || {
-                        !pause_lifecycle.unbound_past_grace()
+                        pause_lifecycle.is_bound()
                             && pause_epoch.load(Ordering::SeqCst) == semantic_build_epoch
                     },
                 );
@@ -5386,11 +5404,10 @@ fn schedule_artifact_loads_admitted(
                     });
                     let mut model =
                         crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
-                    let fingerprint = crate::semantic_index::retry_lane_pause(|| {
-                        model.fingerprint(&semantic_config)
-                    })?;
+                    let fingerprint = model.fingerprint(&semantic_config)?;
                     let embed_text_caps = fingerprint.embed_text_caps;
                     let fingerprint_key = fingerprint.as_string();
+                    crate::semantic_index::pause_job_producer(&fingerprint_key);
                     let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
                         .then(|| ())
                         .and_then(|_| semantic_storage.as_ref())
@@ -5630,6 +5647,10 @@ fn schedule_artifact_loads_admitted(
                                     return Err(error);
                                 }
                                 Err(error) => {
+                                    if crate::synapse_embed::LanePause::from_error(&error).is_some()
+                                    {
+                                        return Err(error);
+                                    }
                                     if crate::semantic_index::embedding_failure_is_transient(&error)
                                     {
                                         // TRANSIENT backend error (e.g. the embedding
@@ -5705,10 +5726,9 @@ fn schedule_artifact_loads_admitted(
                     };
                     set_cold_seed_active();
 
-                    let files = match walk_semantic_project_files_bounded(
-                        &root_clone,
-                        max_semantic_files,
-                    ) {
+                    let files = match crate::semantic_index::pause_job_files(&root_clone, || {
+                        walk_semantic_project_files_bounded(&root_clone, max_semantic_files)
+                    }) {
                         Ok(files) => {
                             let _ = tx_progress.send(SemanticIndexEvent::Progress {
                                 stage: "scanned_project_files".to_string(),
@@ -5825,7 +5845,17 @@ fn schedule_artifact_loads_admitted(
                         clear_cold_seed_active();
                         return;
                     }
-                    let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
+                    let attempt_result = catch_unwind(AssertUnwindSafe(|| {
+                        crate::semantic_index::retry_lane_pause(|| {
+                            let result = build_once();
+                            if result.as_ref().is_err_and(|error| {
+                                crate::synapse_embed::LanePause::from_error(error).is_some()
+                            }) {
+                                clear_cold_seed_gate_and_notify();
+                            }
+                            result
+                        })
+                    }));
                     match attempt_result {
                         // ONNX Runtime was missing when this process started,
                         // but the plugin may still be downloading it: a bridge
@@ -5938,7 +5968,7 @@ fn schedule_artifact_loads_admitted(
                 // unbound, and reporting the stop as a failure would be noise.
                 // A build that completed before noticing still takes the normal
                 // path below so its finished artifact can persist.
-                if !matches!(build_result, Ok(Ok(_))) && semantic_lifecycle.unbound_past_grace() {
+                if !matches!(build_result, Ok(Ok(_))) && !semantic_lifecycle.is_bound() {
                     crate::semantic_index::clear_embedding_backend_retry_status(&root_clone);
                     clear_cold_seed_active();
                     return;
@@ -6188,7 +6218,7 @@ fn start_checkout_semantic_lane(
             retry_initial: crate::views::semantic_runtime::RETRY_INITIAL,
             retry_max: crate::views::semantic_runtime::RETRY_MAX,
             limiter: ctx.cold_build_limiter(),
-            paused: Box::new(move || lifecycle.unbound_past_grace()),
+            paused: Box::new(move || !lifecycle.is_bound()),
             max_batch: semantic.max_batch_size,
         },
         semantic,

@@ -848,7 +848,10 @@ fn retry_activation<T>(
         if !is_current(slot, epoch) {
             return Err(RefreshError::Superseded);
         }
-        match crate::semantic_index::retry_lane_pause(&mut attempt).map_err(RefreshError::classify)
+        match crate::semantic_index::retry_lane_pause_while(&mut attempt, &mut || {
+            !(config.schedule.paused)()
+        })
+        .map_err(RefreshError::classify)
         {
             Ok(value) => {
                 clear_retry(slot, epoch);
@@ -1308,11 +1311,14 @@ where
         }
         let elapsed_started = Instant::now();
         let embedding_timing_scope = crate::semantic_index::EmbeddingTimingScope::new();
-        let mut cold_permit = None;
-        let mut preparation_permit = None;
         let mut admission_wait = Duration::ZERO;
         let mut cold_admitted = false;
-        let refresh = runtime.refresh_admitted(budget, embed, &mut |small| {
+        let refresh =
+            crate::semantic_index::retry_lane_pause_while(
+                || {
+                    let mut cold_permit = None;
+                    let mut preparation_permit = None;
+                    let report = runtime.refresh_admitted(budget, embed, &mut |small| {
             if cold_permit.is_some() {
                 return Ok(());
             }
@@ -1331,7 +1337,7 @@ where
                 limiter,
                 kind,
                 &schedule.root,
-                || is_current(slot, epoch),
+                || is_current(slot, epoch) && !(schedule.paused)(),
             );
             admission_wait += wait_started.elapsed();
             let permit = permit.ok_or_else(|| "semantic lane superseded".to_owned())?;
@@ -1350,7 +1356,19 @@ where
                 ));
             }
             Ok(())
-        });
+            }).map_err(|error| error.to_string())?;
+                    if let Some(pause) = report
+                        .errors
+                        .iter()
+                        .find(|error| crate::synapse_embed::LanePause::from_error(error).is_some())
+                    {
+                        return Err(pause.clone());
+                    }
+                    Ok(report)
+                },
+                &mut || is_current(slot, epoch) && !(schedule.paused)(),
+            )
+            .map_err(RefreshError::classify);
         let embedding_timing = embedding_timing_scope.snapshot();
         drop(embedding_timing_scope);
         // Keep elapsed_ms comparable to older summaries, which started after
@@ -1495,7 +1513,9 @@ pub enum RefreshError {
 
 impl RefreshError {
     fn classify(reason: String) -> Self {
-        if reason.contains(super::first_load::SUPERSEDED_PUBLISH) {
+        if reason.contains(super::first_load::SUPERSEDED_PUBLISH)
+            || reason == "semantic lane superseded"
+        {
             Self::Superseded
         } else if is_transient_reason(&reason) {
             Self::Transient(reason)

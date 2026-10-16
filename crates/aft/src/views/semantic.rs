@@ -945,7 +945,9 @@ impl SemanticPlane {
                     }
                 }
                 Err(error) => {
-                    transient.extend(to_embed.into_iter().map(|(_, _, full_key, _)| full_key));
+                    if crate::synapse_embed::LanePause::from_error(&error).is_none() {
+                        transient.extend(to_embed.into_iter().map(|(_, _, full_key, _)| full_key));
+                    }
                     report.errors.push(error);
                     report.deferred += pending.count();
                     break;
