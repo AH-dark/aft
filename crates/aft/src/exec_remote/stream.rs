@@ -40,8 +40,9 @@ impl ResumePoint {
 }
 
 /// Raw byte sink; task files can implement this without decoding output text.
-/// Persist acceptance before returning, and commit output with its sequence
-/// number atomically before returning, so a restart can reconstruct ResumePoint.
+/// Persist acceptance before returning. Output checkpoints must commit byte
+/// lengths and sequence together so restart can discard an uncheckpointed tail
+/// and replay it from ResumePoint. Terminal proof must be durable before success.
 pub trait OutputSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()>;
     fn started(&mut self, started: &Started) -> io::Result<()> {
@@ -59,8 +60,8 @@ pub trait OutputSink {
         self.truncated(before_seq)
     }
     /// A future stream record or output descriptor is not attributed to stdout
-    /// or stderr. Preserve its sequence (and raw bytes, when available) durably
-    /// so reattach does not replay it forever or silently mislabel output.
+    /// or stderr. Checkpoint its sequence and raw bytes together, without
+    /// attributing an unknown descriptor's bytes to either known stream.
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()>;
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()>;
 }
