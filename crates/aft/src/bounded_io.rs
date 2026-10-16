@@ -4,7 +4,7 @@
 //! directories stay on the caller's hot path. Network/removable/unknown volumes
 //! and symlinks retain per-file isolation. Helpers own no actor or epoch guard.
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -32,11 +32,27 @@ struct Failure {
     code: &'static str,
     message: String,
 }
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+impl std::error::Error for Failure {}
+
+/// Keep admission timeouts distinct when callers turn I/O errors into responses.
+pub(crate) fn timeout_code(error: &io::Error) -> &'static str {
+    error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<Failure>())
+        .map_or("read_blocked", |failure| failure.code)
+}
+
 #[derive(Clone)]
 struct ProbeError {
     kind: io::ErrorKind,
     message: String,
     raw_os_error: Option<i32>,
+    failure: Option<Failure>,
 }
 impl ProbeError {
     fn from(error: &io::Error) -> Self {
@@ -44,9 +60,16 @@ impl ProbeError {
             kind: error.kind(),
             message: error.to_string(),
             raw_os_error: error.raw_os_error(),
+            failure: error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<Failure>())
+                .cloned(),
         }
     }
     fn error(&self) -> io::Error {
+        if let Some(failure) = &self.failure {
+            return io::Error::new(self.kind, failure.clone());
+        }
         self.raw_os_error
             .map(io::Error::from_raw_os_error)
             .unwrap_or_else(|| io::Error::new(self.kind, self.message.clone()))
@@ -67,6 +90,7 @@ pub(crate) struct Budget {
     failure: Arc<Mutex<Option<Failure>>>,
     failed: Arc<AtomicBool>,
     directories: Arc<Mutex<HashMap<PathBuf, Arc<Probe>>>>,
+    traversable: Arc<Mutex<HashSet<PathBuf>>>,
     permissions: Arc<Mutex<Vec<PermissionObservation>>>,
     #[cfg(test)]
     measurements: Arc<Measurements>,
@@ -84,6 +108,7 @@ impl Budget {
             failure: Arc::new(Mutex::new(None)),
             failed: Arc::new(AtomicBool::new(false)),
             directories: Arc::new(Mutex::new(HashMap::new())),
+            traversable: Arc::new(Mutex::new(HashSet::new())),
             permissions: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             measurements: Arc::new(Measurements::default()),
@@ -205,7 +230,7 @@ fn access_error(req_id: &str, path: &Path, error: io::Error) -> Response {
         observe_permission(&folder, &Err(io::Error::from_raw_os_error(1)), true);
         return Response::error_with_data(req_id, "macos_permission_denied", format!("macOS denied access to {}; grant ck-aft access in System Settings → Privacy & Security, then retry", folder.display()), serde_json::json!({"folder":folder,"program":"ck-aft"}));
     } else if error.kind() == io::ErrorKind::TimedOut {
-        "read_blocked"
+        timeout_code(&error)
     } else {
         "path_access_denied"
     };
@@ -290,7 +315,7 @@ fn failure(path: &Path, code: &'static str, reason: &str) -> io::Error {
             });
         budget.failed.store(true, Ordering::Release);
     }
-    io::Error::new(io::ErrorKind::TimedOut, message)
+    io::Error::new(io::ErrorKind::TimedOut, Failure { code, message })
 }
 fn prior_failure() -> Option<io::Error> {
     CURRENT.with(|current| {
@@ -304,7 +329,7 @@ fn prior_failure() -> Option<io::Error> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|failure| io::Error::new(io::ErrorKind::TimedOut, failure.message.clone()));
+            .map(|failure| io::Error::new(io::ErrorKind::TimedOut, failure.clone()));
         error
     })
 }
@@ -443,6 +468,8 @@ fn run_with_limiter<T: Send + 'static>(
     #[cfg(test)]
     let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let running = Arc::new(Mutex::new(false));
+    let helper_running = Arc::clone(&running);
     #[cfg(test)]
     if let Some(counts) = &measurements {
         counts.round_trips.fetch_add(1, Ordering::Relaxed);
@@ -451,8 +478,20 @@ fn run_with_limiter<T: Send + 'static>(
         .name("aft-filesystem-probe".into())
         .spawn(move || {
             let _permit = permit;
+            #[cfg(test)]
+            regression_tests::before_helper(&owned);
             HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
-            let result = with_budget(budget, || work(owned));
+            let result = with_budget(budget, || {
+                // Owning a slot does not mean the OS has scheduled this helper.
+                // Never start expired work or blame its scheduling delay on I/O.
+                let mut running = helper_running.lock().unwrap_or_else(|e| e.into_inner());
+                if Instant::now() >= at {
+                    return Err(failure(&owned, "read_io_queue_timeout", "filesystem helper did not start before the deadline; this call did not start"));
+                }
+                *running = true;
+                drop(running);
+                work(owned)
+            });
             let _ = tx.send(result);
         })?;
     #[cfg(test)]
@@ -461,9 +500,31 @@ fn run_with_limiter<T: Send + 'static>(
     }
     match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(failure(path, "read_blocked", &format!(
-            "OS access did not finish within {:.3} s; on macOS, check ck-aft access in Privacy & Security, then retry", at.saturating_duration_since(started).as_secs_f64()))),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other("filesystem helper stopped")),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
+                return Err(failure(
+                    path,
+                    "read_io_queue_timeout",
+                    "filesystem helper did not start before the deadline; this call did not start",
+                ));
+            }
+            let hint = if cfg!(target_os = "macos") {
+                "; on macOS, check ck-aft access in Privacy & Security, then retry"
+            } else {
+                ""
+            };
+            Err(failure(
+                path,
+                "read_blocked",
+                &format!(
+                    "OS access did not finish within {:.3} s{hint}",
+                    at.saturating_duration_since(started).as_secs_f64()
+                ),
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(io::Error::other("filesystem helper stopped"))
+        }
     }
 }
 fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
@@ -496,6 +557,8 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
     };
     let access = if owner {
         let result = run(path, at, |path| {
+            #[cfg(test)]
+            regression_tests::before_directory_probe(&path)?;
             #[cfg(all(test, unix))]
             tests::before_directory_probe(&path)?;
             // Opening and advancing ReadDir probes consent, not just existence.
@@ -567,6 +630,50 @@ fn cached_directory(path: &Path) -> Option<Access> {
         let dirs = dirs.borrow();
         (dirs.0 == id).then(|| dirs.1.get(path).copied()).flatten()
     })
+}
+fn traversal_parent(path: &Path) -> Option<&Path> {
+    path.parent().map(|parent| {
+        if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        }
+    })
+}
+// A successful stat on a local filesystem permits sibling stats, not directory
+// enumeration or file reads. Keep this weaker evidence out of the listing cache.
+fn cached_traversal(path: &Path) -> bool {
+    cached_directory(path).is_some_and(|access| access.direct)
+        || CURRENT.with(|current| {
+            current.borrow().as_ref().is_some_and(|budget| {
+                budget
+                    .traversable
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(path)
+            })
+        })
+}
+fn run_traversal<T: Send + 'static>(
+    path: &Path,
+    work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let (result, traversable) = run(path, None, move |path| {
+        let parent = traversal_parent(&path).map(Path::to_path_buf);
+        let result = work(path)?;
+        // Filesystem identification can itself block, so keep it in the helper.
+        let traversable = parent.filter(|parent| local_filesystem(parent).unwrap_or(false));
+        Ok((result, traversable))
+    })?;
+    // Publish only after the caller receives success, never from a late helper.
+    if let (Some(parent), Some(budget)) = (traversable, current()) {
+        budget
+            .traversable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(parent);
+    }
+    Ok(result)
 }
 fn probe_target(path: &Path) -> io::Result<()> {
     if cached_directory(path).is_some() {
@@ -722,23 +829,37 @@ pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     if cached_directory(path).is_some_and(|access| access.direct) {
         return std::fs::canonicalize(path);
     }
-    let access = parent(path, None)?;
-    if access.direct && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
+    // Resolving a path needs traversal, not permission to enumerate its parent.
+    // Reuse a known-safe parent, otherwise isolate only canonicalize itself.
+    if traversal_parent(path).is_some_and(cached_traversal)
+        && std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink())
+    {
         std::fs::canonicalize(path)
     } else {
-        run(path, None, std::fs::canonicalize)
+        run_traversal(path, std::fs::canonicalize)
     }
 }
 pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
-    let access = parent(path, None)?;
-    if access.direct {
+    if let Some(error) = prior_failure() {
+        return Err(error);
+    }
+    // A stat must not turn into an unrelated ancestor's directory listing.
+    let direct = cached_directory(path).map_or_else(
+        || cached_traversal(path) || traversal_parent(path).is_some_and(cached_traversal),
+        |access| access.direct,
+    );
+    if direct {
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.file_type().is_symlink() {
             return Ok(metadata);
         }
     }
-    run(path, None, std::fs::metadata)
+    run_traversal(path, std::fs::metadata)
 }
+
+#[cfg(test)]
+#[path = "bounded_io_tests.rs"]
+mod regression_tests;
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
