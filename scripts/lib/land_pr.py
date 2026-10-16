@@ -34,13 +34,6 @@ def gh(*args: str) -> str:
     return subprocess.check_output(["gh", *args], env=env, text=True).strip()
 
 
-def gh_as_operator(*args: str) -> str:
-    # PR labels are administrative edits, so the governed gh shim requires operator approval.
-    env = {key: value for key, value in os.environ.items() if key != "GH_SHIM_BYPASS"}
-    env["GH_SHIM_BYPASS"] = "operator"
-    return subprocess.check_output(["gh", *args], env=env, text=True).strip()
-
-
 def verify_governed_gh() -> None:
     shim_dir = os.environ.get("AFT_GH_SHIMS_DIR")
     shim_path = shutil.which("gh")
@@ -318,10 +311,6 @@ def submit(args: argparse.Namespace) -> str:
     if not isinstance(author, dict) or (author.get("login"), author.get("type"), author.get("id")) != (
             "aft-alfonso[bot]", "Bot", 318960130):
         raise ValueError(f"PR #{state['pr']} author is not the aft-alfonso app")
-    try:
-        gh_as_operator("pr", "edit", str(state["pr"]), "--add-label", "trivial")
-    except subprocess.CalledProcessError as error:
-        raise ValueError(f"could not apply required trivial label to PR #{state['pr']}") from error
     if not created:
         log(f"PR #{state['pr']} already exists; leaving its current title and body unchanged")
     current = snapshot(repo, state["pr"])

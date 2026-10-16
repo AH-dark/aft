@@ -419,19 +419,14 @@ class DeliveryTests(PRFixture):
         created = [call for call in self.calls() if call["args"][:2] == ["pr", "create"]]
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0]["bypass"], "")
-        self.assertEqual(json.loads(self.state_path.read_text()).get("labels", []), ["trivial"])
-        label_edits = [call for call in self.calls()
-                       if call["args"][:2] == ["pr", "edit"] and "--add-label" in call["args"]]
-        self.assertEqual(len(label_edits), 1)
-        self.assertEqual(label_edits[0]["args"][-2:], ["--add-label", "trivial"])
-        self.assertEqual(label_edits[0]["bypass"], "operator")
+        # The design gate exempts the AFT bot by identity, so landing never
+        # labels its own PR as an exception to design approval.
+        self.assertEqual(json.loads(self.state_path.read_text()).get("labels", []), [])
+        self.assertFalse([call for call in self.calls() if call["args"][:2] == ["pr", "edit"]])
         call_args = [call["args"] for call in self.calls()]
         create_index = next(i for i, args in enumerate(call_args) if args[:2] == ["pr", "create"])
-        label_index = next(i for i, args in enumerate(call_args)
-                           if args[:2] == ["pr", "edit"] and "--add-label" in args)
         merge_index = next(i for i, args in enumerate(call_args) if args[:2] == ["pr", "merge"])
-        self.assertLess(create_index, label_index)
-        self.assertLess(label_index, merge_index)
+        self.assertLess(create_index, merge_index)
         self.assertTrue((self.repo / "benchmarks/aft-search/slice-descriptors/land-delivery.json").exists())
 
     def test_existing_open_pr_is_reused_and_text_stays_unchanged(self) -> None:
