@@ -2669,15 +2669,12 @@ fn handle_external_bounded_lexical_fallback(
         // No index exists, so nothing could rank this query; say so plainly,
         // with how much of the project the scan for its literal text covered.
         let text = unindexed_scan_text(&result, &display_root, external_root, &params.query);
-        let envelope = if result.walk_truncated {
-            Some(bounded_walk_search_envelope(
-                result_values.len(),
-                more_available,
-                result.engine_capped,
-            ))
-        } else {
-            search_cut_envelope(result_values.len(), more_available, result.engine_capped)
-        };
+        let envelope = fallback_search_envelope(
+            result_values.len(),
+            more_available,
+            result.engine_capped,
+            result.walk_truncated || result.skipped_foreign_mounts > 0,
+        );
         return external_fallback_response(
             req,
             params,
@@ -2698,8 +2695,12 @@ fn handle_external_bounded_lexical_fallback(
         );
     }
     let text = format_grep_search_text(&result, &display_root, interpreted_as);
-    let envelope =
-        bounded_walk_search_envelope(result_values.len(), more_available, result.engine_capped);
+    let envelope = fallback_search_envelope(
+        result_values.len(),
+        more_available,
+        result.engine_capped,
+        result.walk_truncated || result.skipped_foreign_mounts > 0,
+    );
     external_fallback_response(
         req,
         params,
@@ -2713,7 +2714,7 @@ fn handle_external_bounded_lexical_fallback(
             more_available,
             engine_capped: result.engine_capped,
             fully_degraded: true,
-            envelope: Some(envelope),
+            envelope,
             exact_sweep: None,
         },
     )
@@ -3619,19 +3620,22 @@ fn handle_grep_search(
     }
     let mut extras = serde_json::Map::new();
     if trigram_index_building {
-        let envelope = bounded_walk_search_envelope(
+        let envelope = fallback_search_envelope(
             result_values.len(),
             interval_has_more,
             result.engine_capped,
+            result.walk_truncated || result.skipped_foreign_mounts > 0,
         );
         // The trailer is not rendered here: the shared formatters append it
         // from the wire envelope below, and the contract keeps every trailer
         // on that one path so no tool can print it twice or word it differently.
         text = format!("{TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE}\n\n{text}");
-        extras.insert(
-            crate::list_surfaces::search::SEARCH_WIRE_KEY.to_string(),
-            serde_json::json!(envelope),
-        );
+        if let Some(envelope) = envelope {
+            extras.insert(
+                crate::list_surfaces::search::SEARCH_WIRE_KEY.to_string(),
+                serde_json::json!(envelope),
+            );
+        }
         extras.insert("lexical_only_fallback".to_string(), serde_json::json!(true));
         extras.insert("semantic_unavailable".to_string(), serde_json::json!(true));
     } else if let Some(envelope) =
@@ -6273,9 +6277,17 @@ fn semantic_unavailable_grep_fallback_response(
         );
     }
 
-    let envelope =
-        bounded_walk_search_envelope(result_values.len(), more_available, result.engine_capped);
-    crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
+    let envelope = fallback_search_envelope(
+        result_values.len(),
+        more_available,
+        result.engine_capped,
+        fallback.file_cap_reached
+            || fallback.walk_budget_reached
+            || result.skipped_foreign_mounts > 0,
+    );
+    if let Some(envelope) = envelope {
+        crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
+    }
 
     search_response(
         req,
@@ -6310,52 +6322,25 @@ fn search_cut_envelope(
     more_available: bool,
     engine_capped: bool,
 ) -> Option<ListEnvelope> {
-    if !more_available && !engine_capped {
-        return None;
-    }
-    let mut causes = Vec::with_capacity(2);
-    if engine_capped {
-        causes.push(crate::list_envelope::Reason::Budget);
-    }
-    if more_available {
-        causes.push(crate::list_envelope::Reason::Cap);
-    }
-    Some(ListEnvelope::new(
+    crate::list_surfaces::search::build_fallback_search_envelope(
         shown,
-        crate::list_envelope::Total::AtLeast(if more_available {
-            shown.saturating_add(1)
-        } else {
-            shown
-        }),
-        crate::list_envelope::Unit::Results,
-        causes,
-        crate::list_surfaces::search::SEARCH_NARROW,
-    ))
+        false,
+        more_available,
+        engine_capped,
+    )
 }
 
-fn bounded_walk_search_envelope(
+fn fallback_search_envelope(
     shown: usize,
     more_available: bool,
     engine_capped: bool,
-) -> crate::list_envelope::ListEnvelope {
-    let mut causes = vec![crate::list_envelope::Reason::Walk];
-    if engine_capped {
-        causes.push(crate::list_envelope::Reason::Budget);
-    }
-    if more_available {
-        causes.push(crate::list_envelope::Reason::Cap);
-    }
-    let total = if more_available {
-        crate::list_envelope::Total::AtLeast(shown.saturating_add(1))
-    } else {
-        crate::list_envelope::Total::AtLeast(shown)
-    };
-    crate::list_envelope::ListEnvelope::new(
+    walk_limited: bool,
+) -> Option<crate::list_envelope::ListEnvelope> {
+    crate::list_surfaces::search::build_fallback_search_envelope(
         shown,
-        total,
-        crate::list_envelope::Unit::Results,
-        causes,
-        crate::list_surfaces::search::SEARCH_NARROW,
+        walk_limited,
+        more_available,
+        engine_capped,
     )
 }
 
@@ -12851,8 +12836,47 @@ mod tests {
             1,
             "engine reply must render exactly one trailer: {rendered}"
         );
-        assert!(trailer_lines[0].ends_with(" · narrow: offset, topK, path, includeTests"));
+        assert_eq!(
+            trailer_lines[0],
+            "shown 3 of 6 results (cap) · narrow: offset, topK, path, includeTests"
+        );
         assert!(!rendered.contains("More results available; raise topK to see more."));
+    }
+
+    #[test]
+    fn fallback_walk_stopped_by_deadline_reports_walk() {
+        let project = tempfile::tempdir().expect("create project dir");
+        std::fs::create_dir_all(project.path().join("src")).expect("create source dir");
+        std::fs::write(project.path().join("src/lib.rs"), "pub fn marker() {}\n")
+            .expect("write source file");
+        let expired = Instant::now()
+            .checked_sub(DEGRADED_GREP_WALK_BUDGET + Duration::from_secs(1))
+            .expect("expired walk deadline");
+
+        let (files, file_cap_reached, walk_budget_reached, _) =
+            collect_degraded_grep_files(project.path(), false, expired);
+        assert!(files.is_empty(), "the expired walk must stop before a file");
+        assert!(!file_cap_reached);
+        assert!(
+            walk_budget_reached,
+            "the fallback walk stopped at its time bound"
+        );
+
+        let envelope = fallback_search_envelope(0, true, false, walk_budget_reached)
+            .expect("a stopped fallback walk has an envelope");
+        assert_eq!(envelope.reason, Some(crate::list_envelope::Reason::Walk));
+        assert_eq!(
+            crate::list_envelope::render_trailer(&envelope).as_deref(),
+            Some("shown 0 of ≥1 results (walk) · narrow: offset, topK, path, includeTests")
+        );
+
+        let page_cut = fallback_search_envelope(3, true, false, false)
+            .expect("a complete fallback page with more results has an envelope");
+        assert_eq!(page_cut.reason, Some(crate::list_envelope::Reason::Cap));
+        assert_eq!(
+            crate::list_envelope::render_trailer(&page_cut).as_deref(),
+            Some("shown 3 of ≥4 results (cap) · narrow: offset, topK, path, includeTests")
+        );
     }
 
     #[test]

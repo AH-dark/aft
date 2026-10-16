@@ -83,7 +83,7 @@ fn surface_registry_search_entry() {
     assert_eq!(surface.unit, Unit::Results);
     assert_eq!(surface.narrow, &["offset", "topK", "path", "includeTests"]);
 
-    // Engine projections emit Walk/Depth/Cap; legacy envelopes emit Budget/Cap.
+    // Ranked engine pages emit Cap/Depth; bounded fallback walks emit Walk.
     assert_eq!(surface.reasons.len(), 4);
     let walk_entry = surface
         .reasons
@@ -91,7 +91,10 @@ fn surface_registry_search_entry() {
         .find(|r| r.reason == Reason::Walk)
         .expect("walk reason registered");
     assert_eq!(walk_entry.kind, ReasonKind::Bounding);
-    assert!(walk_entry.predicate_name.contains("S2Exhausted"));
+    assert!(walk_entry
+        .predicate_name
+        .contains("bounded_walk_search_envelope"));
+    assert!(walk_entry.predicate_name.contains("walk_truncated"));
 
     let depth_entry = surface
         .reasons
@@ -116,6 +119,7 @@ fn surface_registry_search_entry() {
         .expect("cap reason registered");
     assert_eq!(cap_entry.kind, ReasonKind::Selecting);
     assert!(cap_entry.predicate_name.contains("more_available"));
+    assert!(cap_entry.predicate_name.contains("S2Exhausted"));
 }
 
 #[test]
@@ -585,6 +589,7 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
     assert_eq!(env.shown, 3);
     assert_eq!(env.total, Total::Exact(6));
     assert_eq!(env.unit, Unit::Results);
+    assert_eq!(env.reason, Some(Reason::Cap));
 
     // top_k = 10 (greater than 6 matches) -> the page is complete.
     let req_complete: aft::protocol::RawRequest = serde_json::from_value(json!({

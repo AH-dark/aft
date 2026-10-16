@@ -101,7 +101,7 @@ fn named_stop_forms_use_exhaustion_then_cap_then_more_precedence() {
     assert_eq!(exhausted.total, SearchTotal::Exact(8));
     assert_eq!(
         render_shared(&exhausted),
-        "shown 0 of 8 results (walk) · narrow: offset, topK, path, includeTests"
+        "shown 0 of 8 results (cap) · narrow: offset, topK, path, includeTests"
     );
 
     let depth_cap =
@@ -126,12 +126,12 @@ fn coincidence_forms_print_exactly_one_agreeing_reason() {
         (
             page("c2-exhaustion-wins-over-satisfied", 210, 200, 10),
             StopState::S2Exhausted,
-            "shown 10 of 210 results (walk) · narrow: offset, topK, path, includeTests",
+            "shown 10 of 210 results (cap) · narrow: offset, topK, path, includeTests",
         ),
         (
             page("c3-exhaustion-wins-over-cap", 3200, 3190, 10),
             StopState::S2Exhausted,
-            "shown 10 of 3200 results (walk) · narrow: offset, topK, path, includeTests",
+            "shown 10 of 3200 results (cap) · narrow: offset, topK, path, includeTests",
         ),
     ];
 
@@ -204,7 +204,7 @@ fn shared_projection_is_the_only_trailer_grammar() {
                 total: SearchTotal::Exact(8),
                 stop_state: StopState::S2Exhausted,
             },
-            "shown 0 of 8 results (walk) · narrow: offset, topK, path, includeTests",
+            "shown 0 of 8 results (cap) · narrow: offset, topK, path, includeTests",
         ),
         (
             SearchTrailer {
@@ -261,7 +261,7 @@ fn shared_projection_serializes_reason_and_total_for_every_stop_state() {
                 total: SearchTotal::Exact(8),
                 stop_state: StopState::S2Exhausted,
             },
-            "walk",
+            "cap",
             serde_json::json!({"kind": "exact", "value": 8}),
         ),
         (

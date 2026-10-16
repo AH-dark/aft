@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "This change only projects existing search results into truthful truncation reasons: complete ranked-list page cuts use cap, and walk is reserved for incomplete fallback traversal. Ranking and result contents are unchanged; the engine_unwired quality gate confirmed all 103 real-query rows are byte-identical."
+}
