@@ -395,11 +395,17 @@ fn watch_new_tree(
         exclusions.iter().any(|excluded| path.starts_with(excluded))
             || watcher_path_is_ignored_by_matcher(matcher, path, project_root)
     };
-    let mut stack = vec![std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())];
+    let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(project_root) else {
+        return Ok(NewDirectoryScan::Complete);
+    };
+    let mut stack = vec![root.to_path_buf()];
     let mut found = 0usize;
     let mut scan = NewDirectoryScan::Complete;
     while let Some(directory) = stack.pop() {
-        if excluded(&directory) || !directory.is_dir() || !watched.insert(directory.clone()) {
+        if excluded(&directory)
+            || !boundary.allows_directory(&directory)
+            || !watched.insert(directory.clone())
+        {
             continue;
         }
         match watch(&directory) {
@@ -484,6 +490,9 @@ fn collect_watch_directories(
 ) -> BTreeSet<PathBuf> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut directories = BTreeSet::new();
+    let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(&root) else {
+        return directories;
+    };
     let mut stack = vec![root.clone()];
 
     while let Some(directory) = stack.pop() {
@@ -494,7 +503,7 @@ fn collect_watch_directories(
         {
             continue;
         }
-        if !directory.is_dir() {
+        if !boundary.allows_directory(&directory) {
             continue;
         }
         directories.insert(directory.clone());
@@ -516,6 +525,57 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use ignore::gitignore::GitignoreBuilder;
+
+    #[test]
+    fn watcher_scans_skip_different_devices_and_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let mounted = root.join("mounted");
+        std::fs::create_dir_all(mounted.join("deep")).unwrap();
+        std::fs::create_dir(root.join("local")).unwrap();
+        std::os::unix::fs::symlink(&mounted, root.join("linked")).unwrap();
+        let matcher = Arc::new(RwLock::new(None));
+        crate::watcher_filter::EXCLUSION_TEST_DEVICE
+            .with(|device| *device.borrow_mut() = Some(mounted));
+        let initial = collect_watch_directories(&root, &matcher, &[]);
+        let (_, added, _) = walk_new_tree(
+            &root,
+            &matcher,
+            &[],
+            100,
+            Instant::now() + Duration::from_secs(1),
+            |_| {},
+        );
+        crate::watcher_filter::EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = None);
+        let expected = BTreeSet::from([root.clone(), root.join("local")]);
+        assert_eq!(initial, expected);
+        assert_eq!(added, expected);
+    }
+
+    #[test]
+    fn new_directory_scan_rejects_a_symlink_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let destination = root.join("real");
+        std::fs::create_dir(&destination).unwrap();
+        let link = root.join("linked");
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        let mut watched = BTreeSet::new();
+        let mut pending = PendingNewDirectoryFiles::default();
+        watch_new_tree(
+            &link,
+            &root,
+            &Arc::new(RwLock::new(None)),
+            &[],
+            &mut watched,
+            &mut pending,
+            100,
+            Instant::now() + Duration::from_secs(1),
+            |_| panic!("symlink must not be watched"),
+        )
+        .unwrap();
+        assert!(watched.is_empty());
+    }
 
     #[test]
     fn removed_directory_prunes_descendant_watches() {

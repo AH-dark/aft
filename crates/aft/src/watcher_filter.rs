@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -473,6 +472,7 @@ const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 17] = [
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatcherExclusionSource {
+    External,
     Ecosystem,
     Observed,
     Gitignore,
@@ -502,9 +502,10 @@ impl WatcherExclusionSource {
     /// Slot ranking between sources, best first.
     fn priority(self) -> u8 {
         match self {
-            Self::Ecosystem => 0,
-            Self::Observed => 1,
-            Self::Gitignore => 2,
+            Self::External => 0,
+            Self::Ecosystem => 1,
+            Self::Observed => 2,
+            Self::Gitignore => 3,
         }
     }
 
@@ -514,15 +515,17 @@ impl WatcherExclusionSource {
     /// ignore rule only says the directory is not tracked.
     fn evidence_rank(self) -> u8 {
         match self {
-            Self::Observed => 0,
-            Self::Ecosystem => 1,
-            Self::Gitignore => 2,
+            Self::External => 0,
+            Self::Observed => 1,
+            Self::Ecosystem => 2,
+            Self::Gitignore => 3,
         }
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::External => "external",
             Self::Ecosystem => "ecosystem",
             Self::Observed => "observed",
             Self::Gitignore => "gitignore",
@@ -619,7 +622,9 @@ impl GitignoreOrder {
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn root_has_python_manifest(root: &Path) -> bool {
-    if root.join("pyproject.toml").is_file() || root.join("requirements.txt").is_file() {
+    if exclusion_manifest_is_file(&root.join("pyproject.toml"))
+        || exclusion_manifest_is_file(&root.join("requirements.txt"))
+    {
         return true;
     }
     fs::read_dir(root).is_ok_and(|entries| {
@@ -664,13 +669,13 @@ fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
         .iter()
         .position(|candidate| *candidate == name)?;
     let enabled = match name {
-        ".git" => root.join(".git").is_dir(),
-        "target" => root.join("Cargo.toml").is_file(),
-        "node_modules" => root.join("package.json").is_file(),
+        ".git" => fs::symlink_metadata(root.join(".git")).is_ok_and(|metadata| metadata.is_dir()),
+        "target" => exclusion_manifest_is_file(&root.join("Cargo.toml")),
+        "node_modules" => exclusion_manifest_is_file(&root.join("package.json")),
         ".venv" | "venv" | "__pycache__" => root_has_python_manifest(root),
         ".gradle" => root_has_gradle_manifest(root),
-        ".dart_tool" => root.join("pubspec.yaml").is_file(),
-        "Pods" => root.join("Podfile").is_file(),
+        ".dart_tool" => exclusion_manifest_is_file(&root.join("pubspec.yaml")),
+        "Pods" => exclusion_manifest_is_file(&root.join("Podfile")),
         "DerivedData" => root_has_xcode_project(root),
         // Generic build outputs: too many ecosystems write these to gate on
         // one manifest (`build/` is Gradle, setuptools, and half of the JS
@@ -682,10 +687,93 @@ fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn exclusion_path_is_directory_or_absent(path: &Path) -> bool {
-    match fs::metadata(path) {
-        Ok(metadata) => metadata.is_dir(),
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+fn exclusion_manifest_is_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Classify every component before probing descendants: lstat of a deep path
+/// alone would still follow a symlink in one of its parent components.
+pub(crate) struct WatcherWalkBoundary {
+    root: PathBuf,
+    device: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExclusionPathKind {
+    LocalDirectory,
+    External,
+    Absent,
+    Other,
+}
+
+fn exclusion_device(path: &Path, metadata: &fs::Metadata) -> Option<u64> {
+    #[cfg(test)]
+    if EXCLUSION_TEST_DEVICE.with(|device| device.borrow().as_deref() == Some(path)) {
+        return Some(u64::MAX);
+    }
+    let _ = path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(metadata.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+impl WatcherWalkBoundary {
+    pub(crate) fn for_root(root: &Path) -> Option<Self> {
+        let metadata = fs::symlink_metadata(root).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        Some(Self {
+            root: root.to_path_buf(),
+            device: exclusion_device(root, &metadata),
+        })
+    }
+
+    fn kind(&self, path: &Path) -> ExclusionPathKind {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return ExclusionPathKind::Other;
+        };
+        let mut current = self.root.clone();
+        for component in relative.components() {
+            if !matches!(component, Component::Normal(_)) {
+                return ExclusionPathKind::Other;
+            }
+            current.push(component);
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return ExclusionPathKind::Absent
+                }
+                Err(_) => return ExclusionPathKind::Other,
+            };
+            if metadata.file_type().is_symlink() {
+                return ExclusionPathKind::External;
+            }
+            if !metadata.is_dir() {
+                return ExclusionPathKind::Other;
+            }
+            if self
+                .device
+                .zip(exclusion_device(&current, &metadata))
+                .is_some_and(|(root, child)| {
+                    !crate::walk_boundary::same_filesystem_device(root, child)
+                })
+            {
+                return ExclusionPathKind::External;
+            }
+        }
+        ExclusionPathKind::LocalDirectory
+    }
+
+    pub(crate) fn allows_directory(&self, path: &Path) -> bool {
+        self.kind(path) == ExclusionPathKind::LocalDirectory
     }
 }
 
@@ -708,11 +796,27 @@ pub(crate) struct WatcherExclusionPlan {
 /// capped `read_dir` is the one way to ask that on every platform (`st_blocks`
 /// is Unix-only).
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn directory_size_signal(path: &Path) -> usize {
-    match fs::read_dir(path) {
+fn directory_size_signal(boundary: &WatcherWalkBoundary, path: &Path) -> usize {
+    if !boundary.allows_directory(path) {
+        return 0;
+    }
+    match exclusion_read_dir(path) {
         Ok(entries) => entries.take(WATCHER_DIRECTORY_SIZE_SAMPLE_CAP).count(),
         Err(_) => 0,
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn exclusion_read_dir(path: &Path) -> std::io::Result<fs::ReadDir> {
+    #[cfg(test)]
+    EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().push(path.to_path_buf()));
+    fs::read_dir(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXCLUSION_TEST_OPENS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static EXCLUSION_TEST_DEVICE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Is this a directory the exclusion walk must never enter or seed by itself?
@@ -732,7 +836,10 @@ fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
 ///
 /// 1. A checkout's `.git` directory owns slot zero; linked worktrees use a
 ///    `.git` file and do not seed that path.
-/// 2. Once an overflow has recorded event volume, directories with observed
+/// 2. Symlinks and directories on another device are excluded without opening
+///    them; indexing does not traverse them either. They precede optional
+///    size/event-based choices within the backend's exclusion budget.
+/// 3. Once an overflow has recorded event volume, directories with observed
 ///    volume rank next, heaviest first, ahead of every unobserved candidate.
 ///    Observed volume is the only direct evidence of which directory fills
 ///    the kernel queue; an unobserved `node_modules` copy is only a guess.
@@ -746,16 +853,16 @@ fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
 ///    folders of one ignored directory costs a single slot; siblings under a
 ///    directory that is not itself ignored cannot collapse, since excluding
 ///    that parent would hide files it tracks.
-/// 3. When no candidate has observed event volume, one representative of
+/// 4. When no candidate has observed event volume, one representative of
 ///    every enabled ecosystem name ranks before a second copy of any name.
 ///    This fallback breadth keeps one workspace ecosystem from spending the
 ///    whole kernel budget on sibling directories. An absent representative is
 ///    deliberate: watcher backends accept absent exclusions, which begin
 ///    covering the path if a build creates it later.
-/// 4. Representatives follow ecosystem priority. On an exact-path backend the
+/// 5. Representatives follow ecosystem priority. On an exact-path backend the
 ///    representative is the largest existing copy; on a subtree backend it is
 ///    the shallowest copy because that path covers its descendants.
-/// 5. Remaining candidates preserve the ordinary storm ranking: directories
+/// 6. Remaining candidates preserve the ordinary storm ranking: directories
 ///    that exist before names that do not, then ecosystem names, observed
 ///    directories, and ignored boundaries in their source-specific order.
 ///
@@ -770,12 +877,68 @@ pub(crate) fn derive_watcher_exclusion_plan(
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> WatcherExclusionPlan {
-    derive_exclusion_plan(
-        root,
-        matcher,
-        max_paths,
-        crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+    static IN_FLIGHT: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::new();
+    let root = root.to_path_buf();
+    let matcher = matcher.clone();
+    run_bounded_exclusion_planner(
+        Duration::from_secs(2),
+        IN_FLIGHT
+            .get_or_init(|| Arc::new(AtomicU64::new(0)))
+            .clone(),
+        move || {
+            derive_exclusion_plan(
+                &root,
+                &matcher,
+                max_paths,
+                crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+            )
+        },
     )
+}
+
+/// Directory opens and even lstat can stall in the kernel. A deadline in the
+/// walking loop cannot interrupt them, so isolate the entire optional plan.
+/// Timed-out workers retain their permit until they exit; at most two can be
+/// stuck across all roots, and later binds fall back to no kernel exclusions.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn run_bounded_exclusion_planner(
+    timeout: Duration,
+    in_flight: Arc<AtomicU64>,
+    plan: impl FnOnce() -> WatcherExclusionPlan + Send + 'static,
+) -> WatcherExclusionPlan {
+    let empty = || WatcherExclusionPlan {
+        selected: Vec::new(),
+        dropped: Vec::new(),
+    };
+    if in_flight.fetch_add(1, Ordering::AcqRel) >= 2 {
+        in_flight.fetch_sub(1, Ordering::AcqRel);
+        log::warn!("watcher exclusion planners busy; proceeding without exclusions");
+        return empty();
+    }
+    struct Permit(Arc<AtomicU64>);
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    let permit = Permit(in_flight);
+    let (tx, rx) = mpsc::sync_channel(1);
+    if thread::Builder::new()
+        .name("aft-exclusion-plan".into())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = tx.send(plan());
+        })
+        .is_err()
+    {
+        return empty();
+    }
+    rx.recv_timeout(timeout).unwrap_or_else(|error| {
+        log::warn!(
+            "watcher exclusion planning unavailable ({error}); proceeding without exclusions"
+        );
+        empty()
+    })
 }
 
 /// The selected exclusions of [`derive_watcher_exclusion_plan`].
@@ -785,7 +948,13 @@ pub(crate) fn derive_excluded_subtrees(
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> Vec<WatcherExclusion> {
-    derive_watcher_exclusion_plan(root, matcher, max_paths).selected
+    derive_exclusion_plan(
+        root,
+        matcher,
+        max_paths,
+        crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+    )
+    .selected
 }
 
 /// [`derive_watcher_exclusion_plan`] for a stated backend coverage.
@@ -852,6 +1021,12 @@ fn derive_exclusion_plan(
     }
 
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Some(boundary) = WatcherWalkBoundary::for_root(&root) else {
+        return WatcherExclusionPlan {
+            selected: Vec::new(),
+            dropped: Vec::new(),
+        };
+    };
     let matcher = matcher
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -866,12 +1041,39 @@ fn derive_exclusion_plan(
     let mut stack = vec![(root.clone(), 0usize)];
 
     while let Some((directory, depth)) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&directory) else {
+        if !boundary.allows_directory(&directory) {
+            continue;
+        }
+        let Ok(entries) = exclusion_read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() && !file_type.is_symlink() {
+                continue;
+            }
+            let kind = boundary.kind(&path);
+            if kind == ExclusionPathKind::External {
+                let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
+                admit(
+                    &mut candidates,
+                    Candidate {
+                        path,
+                        relative,
+                        source: WatcherExclusionSource::External,
+                        exists: true,
+                        ecosystem_priority: usize::MAX,
+                        observed_count: 0,
+                        size_signal: 0,
+                        gitignore_order: GitignoreOrder::default(),
+                    },
+                );
+                continue;
+            }
+            if kind != ExclusionPathKind::LocalDirectory {
                 continue;
             }
             if exclusion_walk_skips_git_directory(&path) {
@@ -899,7 +1101,7 @@ fn derive_exclusion_plan(
                 WatcherExclusionSource::Gitignore
             };
             let size_signal = if ecosystem_priority.is_some() {
-                directory_size_signal(&path)
+                directory_size_signal(&boundary, &path)
             } else {
                 0
             };
@@ -919,7 +1121,7 @@ fn derive_exclusion_plan(
         }
     }
 
-    if root_git.is_dir() {
+    if boundary.allows_directory(&root_git) {
         let relative = PathBuf::from(".git");
         admit(
             &mut candidates,
@@ -940,12 +1142,16 @@ fn derive_exclusion_plan(
     if let Some(matcher) = matcher.as_deref() {
         for (relative, observed_count) in &observed {
             let path = root.join(relative);
-            if !exclusion_path_is_directory_or_absent(&path) {
+            let kind = boundary.kind(&path);
+            if !matches!(
+                kind,
+                ExclusionPathKind::LocalDirectory | ExclusionPathKind::Absent
+            ) {
                 continue;
             }
             match matcher.matched_path_or_any_parents(&path, true) {
                 ignore::Match::Ignore(glob) => {
-                    let exists = path.is_dir();
+                    let exists = kind == ExclusionPathKind::LocalDirectory;
                     admit(
                         &mut candidates,
                         Candidate {
@@ -967,12 +1173,15 @@ fn derive_exclusion_plan(
                     // `bun install` into `packages/plugin/node_modules`). A
                     // tracked directory can never be excluded, so credit its
                     // events one level down to the ignored children that can.
-                    let Ok(entries) = fs::read_dir(&path) else {
+                    if kind != ExclusionPathKind::LocalDirectory {
+                        continue;
+                    }
+                    let Ok(entries) = exclusion_read_dir(&path) else {
                         continue;
                     };
                     for entry in entries.flatten().take(WATCHER_OBSERVED_CHILD_SCAN_CAP) {
                         let child = entry.path();
-                        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                        if !boundary.allows_directory(&child) {
                             continue;
                         }
                         if exclusion_walk_skips_git_directory(&child) {
@@ -989,7 +1198,7 @@ fn derive_exclusion_plan(
                         let ecosystem_priority =
                             nested_ecosystem_priority(&root, &child, child_depth);
                         let size_signal = if ecosystem_priority.is_some() {
-                            directory_size_signal(&child)
+                            directory_size_signal(&boundary, &child)
                         } else {
                             0
                         };
@@ -1020,16 +1229,20 @@ fn derive_exclusion_plan(
             };
             let relative = PathBuf::from(name);
             let path = root.join(&relative);
-            if !exclusion_path_is_directory_or_absent(&path) {
+            let kind = boundary.kind(&path);
+            if !matches!(
+                kind,
+                ExclusionPathKind::LocalDirectory | ExclusionPathKind::Absent
+            ) {
                 continue;
             }
             let ignore::Match::Ignore(glob) = matcher.matched_path_or_any_parents(&path, true)
             else {
                 continue;
             };
-            let exists = path.is_dir();
+            let exists = kind == ExclusionPathKind::LocalDirectory;
             let size_signal = if exists {
-                directory_size_signal(&path)
+                directory_size_signal(&boundary, &path)
             } else {
                 0
             };
@@ -1135,6 +1348,10 @@ fn derive_exclusion_plan(
             !has_observed_candidates && ecosystem_representatives.contains(&right.relative);
         is_root_git(right)
             .cmp(&is_root_git(left))
+            .then_with(|| {
+                (right.source == WatcherExclusionSource::External)
+                    .cmp(&(left.source == WatcherExclusionSource::External))
+            })
             .then_with(|| observed_count(right).cmp(&observed_count(left)))
             .then_with(|| right_is_representative.cmp(&left_is_representative))
             .then_with(|| {
@@ -1147,6 +1364,7 @@ fn derive_exclusion_plan(
             .then_with(|| left.exists.cmp(&right.exists).reverse())
             .then_with(|| left.source.priority().cmp(&right.source.priority()))
             .then_with(|| match left.source {
+                WatcherExclusionSource::External => left.path.cmp(&right.path),
                 WatcherExclusionSource::Ecosystem => left
                     .ecosystem_priority
                     .cmp(&right.ecosystem_priority)
@@ -1193,7 +1411,7 @@ fn derive_exclusion_plan(
         Other,
     }
     let slot_kind = |candidate: &Candidate| {
-        if is_root_git(candidate) {
+        if is_root_git(candidate) || candidate.source == WatcherExclusionSource::External {
             SlotKind::RootGit
         } else if has_observed_candidates && existing_representatives.contains(&candidate.relative)
         {
@@ -1205,7 +1423,14 @@ fn derive_exclusion_plan(
         }
     };
     let limit = max_paths.unwrap_or(usize::MAX);
-    let available = limit.saturating_sub(usize::from(candidates.iter().any(is_root_git)));
+    let available = limit.saturating_sub(
+        candidates
+            .iter()
+            .filter(|candidate| {
+                is_root_git(candidate) || candidate.source == WatcherExclusionSource::External
+            })
+            .count(),
+    );
     let count_kind = |kind: SlotKind| {
         candidates
             .iter()
@@ -1223,7 +1448,10 @@ fn derive_exclusion_plan(
     for candidate in candidates {
         let kind = slot_kind(&candidate);
         if coverage == WatcherExclusionCoverage::Subtree
-            && candidate.source != WatcherExclusionSource::Observed
+            && !matches!(
+                candidate.source,
+                WatcherExclusionSource::Observed | WatcherExclusionSource::External
+            )
         {
             // With inherited coverage the watch walk never descends into an
             // excluded directory, and it skips every ignored directory anyway,
@@ -2004,6 +2232,157 @@ mod tests {
     use notify::EventKind;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn exclusion_tempdir() -> TempDir {
+        tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn exclusion_planner_deadline_and_worker_limit_survive_blocked_io() {
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let (release, blocked) = mpsc::channel::<()>();
+            releases.push(release);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let permits = in_flight.clone();
+            let caller = thread::spawn(move || {
+                let plan =
+                    run_bounded_exclusion_planner(Duration::from_millis(20), permits, move || {
+                        started_tx.send(()).unwrap();
+                        let _ = blocked.recv();
+                        WatcherExclusionPlan {
+                            selected: Vec::new(),
+                            dropped: Vec::new(),
+                        }
+                    });
+                let _ = result_tx.send(plan);
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let result = result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("planner must return while directory I/O is still blocked");
+            assert!(result.selected.is_empty());
+            caller.join().unwrap();
+        }
+        assert_eq!(in_flight.load(Ordering::Acquire), 2);
+        let (started_tx, started_rx) = mpsc::channel();
+        let result =
+            run_bounded_exclusion_planner(Duration::from_millis(20), in_flight, move || {
+                let _ = started_tx.send(());
+                WatcherExclusionPlan {
+                    selected: Vec::new(),
+                    dropped: Vec::new(),
+                }
+            });
+        assert!(result.selected.is_empty());
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a third blocked planner must not be spawned"
+        );
+        drop(releases);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_prefix_below_symlink_is_not_probed() {
+        let root = exclusion_tempdir();
+        let external = TempDir::new().unwrap();
+        fs::create_dir_all(external.path().join("packages/deep/target")).unwrap();
+        let link = root.path().join("linked");
+        std::os::unix::fs::symlink(external.path(), &link).unwrap();
+        let boundary = WatcherWalkBoundary::for_root(root.path()).unwrap();
+        assert!(!boundary.allows_directory(&link.join("packages/deep")));
+        assert_eq!(
+            directory_size_signal(&boundary, &link.join("packages/deep/target")),
+            0
+        );
+        let counters = crate::context::watcher_counters_for_root(root.path());
+        counters.set_observed_exclusion_prefixes(vec![crate::context::WatcherOverflowPrefix {
+            prefix: "linked/packages/deep".into(),
+            count: 42,
+        }]);
+        EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
+        let plan = derive_exclusion_plan(
+            root.path(),
+            &shared_matcher(root.path()),
+            None,
+            WatcherExclusionCoverage::ExactPath,
+        );
+        counters.set_observed_exclusion_prefixes(Vec::new());
+        EXCLUSION_TEST_OPENS
+            .with(|opens| assert!(!opens.borrow().iter().any(|path| path.starts_with(&link))));
+        assert!(plan.selected.iter().any(
+            |entry| entry.path() == link && entry.source() == WatcherExclusionSource::External
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_target_is_excluded_without_opening_it() {
+        let root = exclusion_tempdir();
+        let external = TempDir::new().unwrap();
+        fs::write(root.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(root.path().join(".gitignore"), "target/\n").unwrap();
+        let target = root.path().join("target");
+        std::os::unix::fs::symlink(external.path(), &target).unwrap();
+        EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
+        let plan = derive_exclusion_plan(
+            root.path(),
+            &shared_matcher(root.path()),
+            None,
+            WatcherExclusionCoverage::Subtree,
+        );
+        let opens = EXCLUSION_TEST_OPENS.with(|opens| opens.borrow().clone());
+        assert!(
+            !opens.iter().any(|path| path.starts_with(&target)),
+            "symlink target must never be opened: {opens:?}"
+        );
+        assert!(plan.selected.iter().any(|entry| entry.path() == target));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_large_tree_is_never_measured() {
+        let root = exclusion_tempdir();
+        let external = TempDir::new().unwrap();
+        for index in 0..1100 {
+            fs::create_dir(external.path().join(format!("package-{index}"))).unwrap();
+        }
+        let target = root.path().join("target");
+        std::os::unix::fs::symlink(external.path(), &target).unwrap();
+        let boundary = WatcherWalkBoundary::for_root(root.path()).unwrap();
+        assert_eq!(
+            directory_size_signal(&boundary, &target),
+            0,
+            "external contents are not a checkout size signal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn different_device_directory_is_excluded_without_opening_it() {
+        let root = exclusion_tempdir();
+        let mounted = root.path().join("mounted");
+        fs::create_dir_all(mounted.join("deep/source")).unwrap();
+        EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = Some(mounted.clone()));
+        EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
+        let plan = derive_exclusion_plan(
+            root.path(),
+            &shared_matcher(root.path()),
+            None,
+            WatcherExclusionCoverage::Subtree,
+        );
+        EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = None);
+        let opens = EXCLUSION_TEST_OPENS.with(|opens| opens.borrow().clone());
+        assert!(
+            !opens.iter().any(|path| path.starts_with(&mounted)),
+            "different filesystem must never be opened: {opens:?}"
+        );
+        assert!(plan.selected.iter().any(|entry| entry.path() == mounted));
+    }
 
     #[test]
     fn nested_ignore_rewrite_preserves_gitignore_syntax() {

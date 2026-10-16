@@ -2,6 +2,20 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn discovery_skips_repositories_on_different_devices() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    git_init(&root.join("local"));
+    git_init(&root.join("mounted").join("external"));
+    crate::watcher_filter::EXCLUSION_TEST_DEVICE
+        .with(|device| *device.borrow_mut() = Some(root.join("mounted")));
+    let found = walk(&root, &|_| false);
+    crate::watcher_filter::EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = None);
+    assert_eq!(found.repositories, vec![root.join("local")]);
+}
+
 fn git_init(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
     // Discovery only looks for the `.git` marker, so an empty one suffices.

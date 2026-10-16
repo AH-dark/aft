@@ -255,9 +255,15 @@ fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
         repositories: Vec::new(),
         outside: Vec::new(),
     };
+    let Some(boundary) = crate::watcher_filter::WatcherWalkBoundary::for_root(root) else {
+        return found;
+    };
     let mut examined = 0usize;
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = pending.pop() {
+        if !boundary.allows_directory(&dir) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -284,6 +290,9 @@ fn walk(root: &Path, stop: &dyn Fn(&Walk) -> bool) -> Walk {
             }
             let path = entry.path();
             if kind.is_dir() {
+                if !boundary.allows_directory(&path) {
+                    continue;
+                }
                 if name
                     .to_str()
                     .is_some_and(|name| SKIPPED_DIRECTORY_NAMES.contains(&name))
