@@ -223,13 +223,17 @@ mod tests {
         command
             .args([
                 "-c",
-                "sleep 2 & child=$!; printf '%s\\n' \"$child\" > \"$PID_FILE\"; printf 'sampler entered\\n'; wait \"$child\"",
+                "sleep 30 & child=$!; printf '%s\\n' \"$child\" > \"$PID_FILE\"; printf 'sampler entered\\n'; wait \"$child\"",
             ])
             .env("PID_FILE", &child_pid_file);
         let (ok, report) = run_sampler(
             "sleeping-sampler",
             command,
-            started + Duration::from_millis(100),
+            // The deadline must outlast shell startup on a loaded runner, or
+            // the sampler is killed before it records its child and the test
+            // checks nothing. The child sleeps far past it, so expiry still
+            // decides the outcome.
+            started + Duration::from_secs(2),
         );
         let child_pid: libc::pid_t = std::fs::read_to_string(&child_pid_file)
             .expect("sampler writes its child PID before waiting")
@@ -240,7 +244,7 @@ mod tests {
         assert!(!ok, "{report}");
         assert!(report.contains("timed out"), "{report}");
         assert!(report.contains("sampler entered"), "{report}");
-        assert!(started.elapsed() < Duration::from_secs(1), "{report}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{report}");
         let stopped = wait_for_process_stop(child_pid, Instant::now() + Duration::from_millis(300));
         if stopped {
             child_cleanup.0 = None;
