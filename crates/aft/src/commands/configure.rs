@@ -15706,6 +15706,86 @@ mod tests {
     }
 
     #[test]
+    fn owner_changed_head_diff_at_512_paths_stays_in_warm_lane() {
+        changed_head_diff_admission(512, false);
+    }
+
+    #[test]
+    fn owner_changed_head_diff_over_512_paths_requests_cold_slot() {
+        changed_head_diff_admission(513, true);
+    }
+
+    fn changed_head_diff_admission(changed_paths: usize, expect_cold: bool) {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "pub fn limiter_fixture_marker() {}\n",
+        )
+        .unwrap();
+        init_git_fixture(root.path());
+        persist_search_index_fixture(root.path(), storage.path());
+        for ordinal in 0..changed_paths {
+            std::fs::write(
+                root.path().join(format!("added_{ordinal}.rs")),
+                format!("pub fn added_{ordinal}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        git_commit_all(root.path(), "changed search files");
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.project_root = Some(root.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
+            config.indexes.trigram = true;
+        });
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_cache_role(false, None);
+        ctx.set_cache_writer_capabilities(true, true);
+        ctx.isolate_cold_build_limiter_for_test(1);
+        let limiter = ctx.cold_build_limiter();
+        let held = limiter.try_acquire().unwrap();
+        assert!(super::start_artifact_loads(super::schedule_artifact_loads(
+            &ctx, true, false
+        )));
+        if expect_cold {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while limiter.census().queued.is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "over-limit diff never requested a cold slot"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            crate::runtime_drain::drain_build_completions(&ctx);
+            assert!(ctx.search_index().read().unwrap().is_none());
+            drop(held);
+            wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        } else {
+            wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+            assert!(limiter.census().queued.is_empty());
+            assert_eq!(
+                limiter.census().holders.len(),
+                1,
+                "warm refresh must finish before the heavy holder releases"
+            );
+            drop(held);
+        }
+        assert_eq!(
+            ctx.search_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .stored_git_head(),
+            crate::search_index::current_git_head(root.path()).as_deref()
+        );
+    }
+
+    #[test]
     fn owner_warm_search_reloads_queue_when_warm_pool_is_full() {
         let limiter = crate::cold_build_limiter::isolated_limiter(super::WARM_SEARCH_RELOAD_LIMIT);
         let held = (0..super::WARM_SEARCH_RELOAD_LIMIT)

@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Changed-HEAD search caches use the bounded warm-load lane for at most 512 changed paths; larger diffs fall back to the existing cold-build permit and full refresh. Scoring and routing are unchanged; benchmark rows must remain byte-identical."
+}

@@ -64,6 +64,9 @@ pub enum ExactEvidenceScope {
 }
 
 pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+// Four warm workers can each apply at most 512 Git-diff paths. Larger branch
+// switches belong under the shared build limit, not the cheap disk-load lane.
+const WARM_GIT_DIFF_PATH_LIMIT: usize = 512;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
@@ -2704,12 +2707,13 @@ impl SearchIndex {
         verify_strategy: cache_freshness::VerifyStrategy,
     ) -> Self {
         if let Some(index) = baseline.and_then(|baseline| {
-            Self::refresh_cached_with_strategy(
+            Self::refresh_cached_with_diff_limit(
                 baseline,
                 root,
                 max_file_size,
                 current_head,
                 verify_strategy,
+                None,
             )
         }) {
             return index;
@@ -2726,11 +2730,29 @@ impl SearchIndex {
     /// Verify or update an existing cache without falling through to a full
     /// project build. The caller can acquire a cold-build permit on a miss.
     pub(crate) fn refresh_cached_with_strategy(
+        baseline: Self,
+        root: &Path,
+        max_file_size: u64,
+        current_head: Option<String>,
+        verify_strategy: cache_freshness::VerifyStrategy,
+    ) -> Option<Self> {
+        Self::refresh_cached_with_diff_limit(
+            baseline,
+            root,
+            max_file_size,
+            current_head,
+            verify_strategy,
+            Some(WARM_GIT_DIFF_PATH_LIMIT),
+        )
+    }
+
+    fn refresh_cached_with_diff_limit(
         mut baseline: Self,
         root: &Path,
         max_file_size: u64,
         current_head: Option<String>,
         verify_strategy: cache_freshness::VerifyStrategy,
+        max_changed_paths: Option<usize>,
     ) -> Option<Self> {
         if baseline.max_file_size != max_file_size {
             return None;
@@ -2757,7 +2779,13 @@ impl SearchIndex {
 
         if let (Some(previous), Some(current)) = (baseline.git_head.clone(), current_head.clone()) {
             let project_root = baseline.project_root.clone();
-            if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
+            if apply_git_diff_updates(
+                &mut baseline,
+                &project_root,
+                &previous,
+                &current,
+                max_changed_paths,
+            ) {
                 baseline.git_head = Some(current);
                 let _ = verify_file_mtimes(&mut baseline, verify_strategy);
                 baseline.ready = true;
@@ -7978,7 +8006,13 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: &str) -> bool {
+fn apply_git_diff_updates(
+    index: &mut SearchIndex,
+    root: &Path,
+    from: &str,
+    to: &str,
+    max_changed_paths: Option<usize>,
+) -> bool {
     if !crate::developer_tools::git_usable() {
         return false;
     }
@@ -8000,6 +8034,9 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
     let Ok(diff) = String::from_utf8(output.stdout) else {
         return false;
     };
+    if max_changed_paths.is_some_and(|limit| !git_diff_within_path_limit(&diff, limit)) {
+        return false;
+    }
     let mut canonical_parents = ParentCanonicalizationMemo::default();
 
     for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -8037,6 +8074,17 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
     }
 
     true
+}
+
+fn git_diff_within_path_limit(diff: &str, limit: usize) -> bool {
+    // Decide before touching source files. Renames name both an old and a new
+    // path, so the cheap line-count check is followed by an exact path count.
+    diff.lines().count() <= limit
+        && diff
+            .lines()
+            .map(|line| line.split('\t').skip(1).count())
+            .sum::<usize>()
+            <= limit
 }
 
 fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
@@ -8234,6 +8282,18 @@ mod tests {
                 "direct corpus read opened {path:?}"
             );
         }
+    }
+
+    #[test]
+    fn warm_git_diff_budget_counts_both_rename_paths() {
+        let mut diff = (0..510)
+            .map(|i| format!("M\tfile_{i}.rs\n"))
+            .collect::<String>();
+        diff.push_str("R100\told.rs\tnew.rs\n");
+        assert!(git_diff_within_path_limit(&diff, 512));
+        diff.push_str("A\textra.rs\n");
+        assert!(!git_diff_within_path_limit(&diff, 512));
+        assert!(git_diff_within_path_limit("", 512));
     }
 
     #[test]
