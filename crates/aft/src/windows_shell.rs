@@ -146,7 +146,7 @@ impl WindowsShell {
     /// Wrap a background command so the child writes its own exit marker.
     ///
     /// On Windows the sandbox is never active (`native_sandbox_enforced` is
-    /// `cfg!(unix)`-gated, so an enabled sandbox yields `SpawnPlan::Refused`),
+    /// `cfg!(unix)`-gated; strict refuses and relaxed reports unenforced denies),
     /// meaning every Windows bash child runs unconfined with full user rights
     /// and is authoritative for its own exit code. Windows also has no zombie
     /// reaping, so once the spawning daemon's child handle closes across a

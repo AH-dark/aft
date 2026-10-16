@@ -93,12 +93,21 @@ pub fn try_rewrite_for_request(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
 ) -> Option<Response> {
-    if native_sandbox_enforced(ctx, principal) {
+    // Windows relaxed shells must reach task capture to report that their
+    // filesystem denies are unenforced, even when a rewrite would otherwise fit.
+    let unenforced_relaxed = cfg!(windows)
+        && crate::sandbox_spawn::effective_sandbox_mode(ctx, principal)
+            == crate::config::SandboxMode::Relaxed;
+    if native_sandbox_enforced(ctx, principal) || unenforced_relaxed {
         dispatch::record_native(
             request_id,
             catalog::ControlRole::Sandbox,
             "dispatch.native.sandbox",
-            "native sandbox is enforced",
+            if unenforced_relaxed {
+                "relaxed sandbox must report unenforced denies"
+            } else {
+                "native sandbox is enforced"
+            },
         );
         return None;
     }

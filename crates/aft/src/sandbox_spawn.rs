@@ -295,6 +295,8 @@ impl PreparedTask {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnPlan {
     Unsandboxed,
+    /// Windows relaxed commands run without OS protection and must report it.
+    RelaxedUnenforced,
     Host {
         shell_path: PathBuf,
         environment: ChildEnvironment,
@@ -362,6 +364,9 @@ pub(crate) fn save_local_launch(
         .ok_or("local fallback payload absent")?;
     let policy = match plan.policy() {
         SpawnPlan::Unsandboxed => SavedSpawnPolicy::Unsandboxed,
+        SpawnPlan::RelaxedUnenforced => {
+            return Err("an unenforced Windows plan cannot be saved on Unix".into());
+        }
         SpawnPlan::Host { shell_path, .. } => SavedSpawnPolicy::Host {
             shell_path: shell_path.clone(),
         },
@@ -1284,10 +1289,30 @@ pub(crate) fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<S
 }
 
 fn unsupported_profile_sandbox_refusal(mode: SandboxMode) -> Option<SpawnPlan> {
-    if cfg!(unix) {
+    platform_sandbox_plan(mode, RequestedSandboxTier::Native, cfg!(unix))
+        .filter(|plan| plan.refusal_code().is_some())
+}
+
+fn platform_sandbox_plan(
+    mode: SandboxMode,
+    requested_tier: RequestedSandboxTier,
+    native_backend: bool,
+) -> Option<SpawnPlan> {
+    if native_backend {
         return None;
     }
-    (mode != SandboxMode::Off).then(|| SpawnPlan::Refused {
+    match mode {
+        SandboxMode::Off => return Some(SpawnPlan::Unsandboxed),
+        SandboxMode::Relaxed => {
+            return Some(if requested_tier == RequestedSandboxTier::Native {
+                SpawnPlan::RelaxedUnenforced
+            } else {
+                worker_jail_refusal("the command asked to leave the configured relaxed profile")
+            });
+        }
+        SandboxMode::Strict => {}
+    }
+    Some(SpawnPlan::Refused {
         code: "sandbox_unavailable",
         message: format!("sandbox profile {mode} is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"),
         mismatch_class: None,
@@ -1317,11 +1342,11 @@ pub fn resolve_sandbox_spawn(
         return plan;
     }
 
-    // An enabled policy must never degrade into an ordinary child merely
-    // because this build has no kernel sandbox backend.
+    // Strict must fail closed without a backend. Relaxed explicitly reports
+    // unenforced denies instead, so Windows workers can run their default profile.
     let mode = effective_sandbox_mode(ctx, principal);
-    if let Some(refusal) = unsupported_profile_sandbox_refusal(mode) {
-        return refusal;
+    if let Some(plan) = platform_sandbox_plan(mode, requested_tier, cfg!(unix)) {
+        return plan;
     }
     if requested_tier == RequestedSandboxTier::Host && principal_requires_strict(principal) {
         return SpawnPlan::Refused {
@@ -4296,7 +4321,7 @@ fn isolated_environment_for_plan(
             }
             Some(environment)
         }
-        SpawnPlan::Unsandboxed | SpawnPlan::Refused { .. } => None,
+        SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Refused { .. } => None,
         #[cfg(unix)]
         SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
     }
@@ -4492,7 +4517,7 @@ fn command_argv_for_plan(
     marker_fds: Option<(RawFd, RawFd)>,
 ) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
     match plan.policy() {
-        SpawnPlan::Unsandboxed | SpawnPlan::Host { .. } => {
+        SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {
             Ok((program.to_os_string(), args.to_vec(), None))
         }
         SpawnPlan::Refused { code, .. } => Err((*code).to_string()),
@@ -5780,6 +5805,33 @@ mod policy_tests {
                 ..crate::config::Config::default()
             },
         )
+    }
+
+    #[test]
+    fn windows_relaxed_profile_runs_unenforced_but_strict_refuses() {
+        assert_eq!(
+            platform_sandbox_plan(SandboxMode::Relaxed, RequestedSandboxTier::Native, false),
+            Some(SpawnPlan::RelaxedUnenforced)
+        );
+        assert_eq!(
+            platform_sandbox_plan(SandboxMode::Off, RequestedSandboxTier::Native, false),
+            Some(SpawnPlan::Unsandboxed)
+        );
+        let strict =
+            platform_sandbox_plan(SandboxMode::Strict, RequestedSandboxTier::Native, false)
+                .unwrap();
+        assert_eq!(strict.refusal_code(), Some("sandbox_unavailable"));
+        assert_eq!(strict.refusal_message(), Some("sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"));
+        for tier in [RequestedSandboxTier::Disabled, RequestedSandboxTier::Host] {
+            assert!(platform_sandbox_plan(SandboxMode::Relaxed, tier, false)
+                .unwrap()
+                .refusal_code()
+                .is_some());
+        }
+        assert_eq!(
+            platform_sandbox_plan(SandboxMode::Relaxed, RequestedSandboxTier::Native, true),
+            None
+        );
     }
 
     #[test]

@@ -614,7 +614,7 @@ Linux `strict` retains the existing Landlock allowlist and requires ABI V3 or ne
 - Project reads may be split around nested denies using children present at launch. Newly created root-level files may remain unreadable until the next command recomputes grants. Shared `/tmp` and sensitive runtime trees are not granted by strict.
 - `/proc` is readable for tooling. With Yama `ptrace_scope=0`, another same-UID process can expose environment or memory; missing/unreadable Yama configuration produces a conservative exposure warning.
 
-Windows has no OS sandbox backend. Profiles still resolve; selecting `relaxed` or `strict` refuses execution with `sandbox_unavailable` and names the profile as **not enforced on Windows**. `off` runs without an OS sandbox.
+Windows has no OS sandbox backend. `relaxed` runs with full user rights and reports `profile=relaxed unenforced=[all filesystem read/write denies]` in captured output, including PTY output. Like Linux relaxed, it is **not** a secret or write boundary. `strict` refuses execution with `sandbox_unavailable`: `sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux`. Untrusted and MCP routes are forced strict and therefore refuse. `off` runs without an OS sandbox or an unenforced-denies warning.
 
 ### Retired `sandbox.enabled`
 

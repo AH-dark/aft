@@ -3639,6 +3639,7 @@ impl BgTaskRegistry {
         }
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty, false)
             .map_err(|error| format!("failed to pre-open PTY output handles: {error}"))?;
+        write_unenforced_sandbox_warning(&spawn_plan, &io_handles, TaskArtifact::Pty)?;
 
         // Commit point; see `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
@@ -3888,6 +3889,7 @@ impl BgTaskRegistry {
         }
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes, false)
             .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
+        write_unenforced_sandbox_warning(&spawn_plan, &io_handles, TaskArtifact::Stderr)?;
 
         // Commit point; see the Unix `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
@@ -11041,6 +11043,22 @@ fn attach_sandbox_metadata(metadata: &mut PersistedTask, spawn_plan: &SpawnPlan)
     metadata.sandbox_temp_dir = spawn_plan.temp_dir().map(Path::to_path_buf);
 }
 
+fn write_unenforced_sandbox_warning(
+    plan: &SpawnPlan,
+    handles: &TaskIoHandles,
+    artifact: TaskArtifact,
+) -> Result<(), String> {
+    if !matches!(plan, SpawnPlan::RelaxedUnenforced) {
+        return Ok(());
+    }
+    // Write before the child starts, using the same capture handle offset so
+    // both pipes and PTYs retain the warning alongside the command's output.
+    handles
+        .clone_file(artifact)
+        .and_then(|mut file| file.write_all(b"sandbox: profile=relaxed unenforced=[all filesystem read/write denies] (Windows has no native sandbox backend; command runs with full user rights)\n"))
+        .map_err(|error| format!("failed to report unenforced sandbox denies: {error}"))
+}
+
 #[cfg(unix)]
 pub(crate) fn resolve_posix_shell() -> PathBuf {
     static POSIX_SHELL: OnceLock<PathBuf> = OnceLock::new();
@@ -11290,7 +11308,7 @@ fn spawn_detached_child(
         let _ = shell_path;
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
-            SpawnPlan::Unsandboxed | SpawnPlan::Host { .. } => {}
+            SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {}
             SpawnPlan::Refused { code, .. } => return Err((*code).to_string()),
             SpawnPlan::Launcher { .. } => return Err("sandbox_unavailable".to_string()),
         }
@@ -11482,6 +11500,40 @@ pub(crate) mod default_kill_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_relaxed_warning_survives_pipe_and_pty_capture() {
+        let root = tempfile::tempdir().unwrap();
+        for (mode, artifact) in [
+            (BgMode::Pipes, TaskArtifact::Stderr),
+            (BgMode::Pty, TaskArtifact::Pty),
+        ] {
+            let task = allocate_task_layout(root.path(), "warning-session").unwrap();
+            let handles = TaskIoHandles::create(&task, mode.clone(), false).unwrap();
+            write_unenforced_sandbox_warning(&SpawnPlan::Unsandboxed, &handles, artifact).unwrap();
+            let path = match mode {
+                BgMode::Pipes => &task.paths.stderr,
+                BgMode::Pty => &task.paths.pty,
+            };
+            assert_eq!(std::fs::read(path).unwrap(), b"");
+            write_unenforced_sandbox_warning(&SpawnPlan::RelaxedUnenforced, &handles, artifact)
+                .unwrap();
+            handles
+                .clone_file(artifact)
+                .unwrap()
+                .write_all(b"child-output\n")
+                .unwrap();
+            let output = std::fs::read_to_string(path).unwrap();
+            assert!(
+                output.contains("profile=relaxed unenforced=[all filesystem read/write denies]"),
+                "{output}"
+            );
+            assert!(
+                output.contains("command runs with full user rights"),
+                "{output}"
+            );
+            assert!(output.ends_with("child-output\n"), "{output}");
+        }
+    }
     use std::collections::HashMap;
     use std::fs;
     use std::io::Write;
