@@ -264,17 +264,21 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         }
     };
 
-    if let Err(error) = file_handle.write_all(append_content.as_bytes()) {
-        if !existed {
-            ctx.backup()
-                .lock()
-                .discard_operation_entries(req.session(), op_id);
+    let (bytes_written, write_error) = append_bytes(&mut file_handle, append_content.as_bytes());
+    let mut warnings = Vec::new();
+    if let Some(error) = write_error {
+        if bytes_written == 0 && existed {
+            return Response::error(
+                &req.id,
+                "write_error",
+                format!("edit_match append: no bytes written to {}: {}", file, error),
+            );
         }
-        return Response::error(
-            &req.id,
-            "write_error",
-            format!("edit_match append: failed to write {}: {}", file, error),
-        );
+        warnings.push(format!(
+            "Append {}wrote {} of {} bytes to {} before failing: {}. Inspect the file or undo before retrying.",
+            if existed { "" } else { "created the file and " },
+            bytes_written, append_content.len(), file, error,
+        ));
     }
 
     #[cfg(unix)]
@@ -283,14 +287,10 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         if let Err(error) =
             std::fs::set_permissions(path.as_path(), std::fs::Permissions::from_mode(0o644))
         {
-            return Response::error(
-                &req.id,
-                "write_error",
-                format!(
-                    "edit_match append: failed to set permissions on {}: {}",
-                    file, error
-                ),
-            );
+            warnings.push(format!(
+                "Append wrote {} bytes to {}, but setting permissions failed: {}. Do not retry the append.",
+                bytes_written, file, error,
+            ));
         }
     }
 
@@ -309,25 +309,41 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     // → notify LSP) and the diff in the response reflects what's actually
     // on disk. Reading once and reusing for LSP + diff also avoids a TOCTOU
     // window where the formatter could rewrite the file between reads.
-    let final_content = std::fs::read_to_string(path.as_path()).unwrap_or_default();
+    let final_content = match std::fs::read_to_string(path.as_path()) {
+        Ok(content) => Some(content),
+        Err(error) => {
+            warnings.push(format!(
+                "Append wrote {} bytes to {}, but reading the file after formatting failed: {}. Final contents could not be verified; inspect the file before retrying.",
+                bytes_written, file, error,
+            ));
+            None
+        }
+    };
 
     // Honor `diagnostics: true` like other write-style handlers (write,
     // edit_match, edit_symbol). When false/absent, this still notifies the
     // LSP layer that the file changed but doesn't wait for diagnostics.
-    let lsp_outcome = ctx.lsp_post_write(path.as_path(), &final_content, &req.params);
-    let syntax_valid = match edit::validate_syntax(path.as_path()) {
-        Ok(result) => result,
-        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
-    };
+    let lsp_outcome = final_content
+        .as_deref()
+        .and_then(|content| ctx.lsp_post_write(path.as_path(), content, &req.params));
+    // Validate the observed post-format bytes, as the shared write pipeline does.
+    // Path validation can cache a missing parent before append creates it; asking
+    // the file parser to stat that parent again would reuse the stale failure.
+    let syntax_valid = final_content
+        .as_deref()
+        .and_then(|content| edit::validate_syntax_str(content, path.as_path()));
 
     let mut result = serde_json::json!({
         "ok": true,
         "file": file,
         "created": !existed,
-        "bytes_written": append_content.len(),
+        "bytes_written": bytes_written,
         "syntax_valid": syntax_valid,
         "formatted": formatted,
     });
+    if !warnings.is_empty() {
+        result["warnings"] = serde_json::json!(warnings);
+    }
 
     if let Some(reason) = &format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -349,7 +365,7 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     // formatter-normalized whitespace), surface `no_op: true` so UIs can
     // render a clear "matched but no net change" instead of bare +0/-0.
     // See GitHub #45.
-    if existed && before_content == final_content {
+    if existed && final_content.as_deref() == Some(before_content.as_str()) {
         result["no_op"] = serde_json::json!(true);
     }
 
@@ -370,23 +386,34 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
             rolled_back: false,
             lsp_outcome,
             final_text: None,
-            reformatted_excerpt: edit::compute_reformatted_excerpt(
-                &format!("{before_content}{append_content}"),
-                &final_content,
-            ),
+            reformatted_excerpt: final_content.as_deref().and_then(|content| {
+                edit::compute_reformatted_excerpt(
+                    &format!("{before_content}{append_content}"),
+                    content,
+                )
+            }),
         };
         write_result.append_lsp_diagnostics_to(&mut result);
         write_result.append_reformatted_excerpt_to(&mut result);
     }
 
-    edit::attach_edit_diff(
-        &mut result,
-        &req.params,
-        file,
-        &before_content,
-        &final_content,
-    );
+    if let Some(content) = final_content.as_deref() {
+        edit::attach_edit_diff(&mut result, &req.params, file, &before_content, content);
+    }
     Response::success(&req.id, result)
+}
+
+fn append_bytes(writer: &mut impl Write, content: &[u8]) -> (usize, Option<std::io::Error>) {
+    let mut written = 0;
+    while written < content.len() {
+        match writer.write(&content[written..]) {
+            Ok(0) => return (written, Some(std::io::ErrorKind::WriteZero.into())),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return (written, Some(error)),
+        }
+    }
+    (written, None)
 }
 
 /// Returns true if the file path contains glob characters.
@@ -931,6 +958,33 @@ mod tests {
     use crate::protocol::RawRequest;
 
     use super::{handle_edit_match, restore_glob_checkpoint};
+
+    #[test]
+    fn append_bytes_preserves_partial_write_count() {
+        struct ShortWriter(Vec<u8>);
+        impl std::io::Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if !self.0.is_empty() {
+                    return Err(std::io::ErrorKind::StorageFull.into());
+                }
+                self.0.extend_from_slice(&bytes[..2]);
+                Ok(2)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = ShortWriter(Vec::new());
+        let (written, error) = super::append_bytes(&mut writer, b"hello");
+        assert_eq!(writer.0, b"he");
+        assert_eq!(written, 2);
+        assert_eq!(error.unwrap().kind(), std::io::ErrorKind::StorageFull);
+
+        let (written, error) =
+            super::append_bytes(&mut std::io::Cursor::new(&mut [][..]), b"hello");
+        assert_eq!(written, 0);
+        assert_eq!(error.unwrap().kind(), std::io::ErrorKind::WriteZero);
+    }
 
     #[test]
     fn glob_edit_reads_each_pre_edit_file_once_and_preserves_backup_bytes() {

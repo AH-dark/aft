@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde_json::json;
 
+#[cfg(unix)]
+use super::helpers::{link_cached_executable, warm_executable};
 use super::helpers::{user_config, AftProcess};
 
 fn configure(aft: &mut AftProcess, root: &Path) {
@@ -32,6 +34,18 @@ fn append_request(id: &str, file: &Path, append_content: &str) -> serde_json::Va
         "file": file.display().to_string(),
         "appendContent": append_content,
     })
+}
+
+fn tool_call(
+    aft: &mut AftProcess,
+    id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    aft.send(
+        &json!({ "id": id, "command": "tool_call", "name": name, "arguments": arguments })
+            .to_string(),
+    )
 }
 
 #[test]
@@ -109,6 +123,236 @@ fn append_creates_parent_directories() {
 
     let status = aft.shutdown();
     assert!(status.success());
+}
+
+#[test]
+fn append_tool_reports_nested_markdown_creation_and_identical_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(
+        ".cortexkit/internal-docs/investigations/new-investigation/permission-routing-correction.md",
+    );
+    let content = "# Permission routing\n\nCorrection recorded.\n";
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path());
+
+    let response = tool_call(
+        &mut aft,
+        "append-tool-create",
+        "edit",
+        json!({ "path": target, "appendContent": content }),
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), content);
+
+    let write_response = tool_call(
+        &mut aft,
+        "write-tool-identical",
+        "write",
+        json!({ "path": target, "content": content }),
+    );
+    assert_eq!(write_response["code"], "no_change", "{write_response:#}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), content);
+    assert_eq!(
+        response["success"], true,
+        "append wrote the file but failed: {response:#}"
+    );
+    assert_eq!(response["created"], true, "{response:#}");
+    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert!(
+        response["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Created file ("),
+        "{response:#}"
+    );
+    assert!(response.get("warnings").is_none(), "{response:#}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn append_tool_reports_markdown_creation_with_existing_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("new.md");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path());
+    let response = tool_call(
+        &mut aft,
+        "append-tool-new-file",
+        "edit",
+        json!({ "path": target, "appendContent": "# New file\n" }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["created"], true, "{response:#}");
+    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert_eq!(response["bytes_written"], "# New file\n".len());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "# New file\n");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn append_tool_reports_existing_markdown_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("existing.md");
+    fs::write(&target, "# Existing\n").unwrap();
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path());
+    let response = tool_call(
+        &mut aft,
+        "append-tool-existing",
+        "edit",
+        json!({ "path": target, "appendContent": "\nMore text.\n" }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["created"], false, "{response:#}");
+    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert_eq!(response["bytes_written"], "\nMore text.\n".len());
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "# Existing\n\nMore text.\n"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn append_tool_undo_removes_created_markdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("nested/undo/created.md");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path());
+    let response = tool_call(
+        &mut aft,
+        "append-tool-before-undo",
+        "edit",
+        json!({ "path": target, "appendContent": "# Undo creation\n" }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "# Undo creation\n");
+    let undo = tool_call(
+        &mut aft,
+        "append-tool-undo",
+        "safety",
+        json!({ "op": "undo" }),
+    );
+    assert_eq!(undo["success"], true, "{undo:#}");
+    assert!(
+        !target.exists(),
+        "undo must delete the created file: {undo:#}"
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn append_tool_write_and_batch_creation_contracts() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("nested/write/created.md");
+    let missing = dir.path().join("nested/batch/missing.md");
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, dir.path());
+    let response = tool_call(
+        &mut aft,
+        "append-tool-write-check",
+        "write",
+        json!({ "path": target, "content": "# Written\n" }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["created"], true, "{response:#}");
+    assert_eq!(response["syntax_valid"], true, "{response:#}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "# Written\n");
+
+    let rejected = tool_call(
+        &mut aft,
+        "append-tool-batch-missing",
+        "edit",
+        json!({ "path": missing, "edits": [{ "oldString": "# Missing", "newString": "# Not created\n" }] }),
+    );
+    assert_eq!(rejected["success"], false, "{rejected:#}");
+    assert_eq!(rejected["code"], "file_not_found", "{rejected:#}");
+    assert!(
+        !missing.exists(),
+        "edits[] must not create a missing target"
+    );
+    let edited = tool_call(
+        &mut aft,
+        "append-tool-batch-existing",
+        "edit",
+        json!({ "path": target, "edits": [{ "oldString": "Written", "newString": "Edited" }] }),
+    );
+    assert_eq!(edited["success"], true, "{edited:#}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "# Edited\n");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+#[cfg(unix)]
+fn append_tool_reports_written_bytes_when_post_format_read_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("biome.json"), "{}\n").unwrap();
+    let bin = root.join("node_modules/.bin");
+    fs::create_dir_all(&bin).unwrap();
+    let formatter = bin.join("biome");
+    link_cached_executable(
+        &formatter,
+        br##"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "biome 2.0.0"; exit 0; fi
+for file in "$@"; do :; done
+cp "$file" "$file.observed"
+rm "$file"
+"##,
+    )
+    .unwrap();
+    warm_executable(&formatter, &["--version"]);
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let configured = aft.send(
+        &json!({
+            "id": "append-post-format-config",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(json!({
+                "format_on_edit": true,
+                "formatter": { "typescript": "biome" }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(configured["success"], true, "{configured:#}");
+    let target = root.join("created.ts");
+    let content = "export const value = 1;\n";
+    let response = tool_call(
+        &mut aft,
+        "append-post-format",
+        "edit",
+        json!({ "path": target, "appendContent": content }),
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("created.ts.observed")).unwrap_or_else(|error| panic!(
+            "formatter did not capture bytes: {error}; {response:#}"
+        )),
+        content
+    );
+    assert!(!target.exists());
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["bytes_written"], content.len(), "{response:#}");
+    assert!(response["syntax_valid"].is_null(), "{response:#}");
+    assert!(response.get("diff").is_none(), "{response:#}");
+    let warning = response["warnings"][0]
+        .as_str()
+        .expect("post-write warning");
+    assert!(warning.contains("Append wrote 24 bytes"), "{warning}");
+    assert!(
+        warning.contains("reading the file after formatting failed"),
+        "{warning}"
+    );
+    assert!(
+        response["text"].as_str().unwrap().contains(warning),
+        "{response:#}"
+    );
+    assert!(aft.shutdown().success());
 }
 
 #[test]
