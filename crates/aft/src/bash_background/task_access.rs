@@ -1,5 +1,7 @@
 use super::*;
 use crate::bash_background::persistence::{PinnedDir, ResolvedTask, TaskLayout};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 pub(super) struct TaskReadRecord {
     resolved: ResolvedTask,
@@ -7,9 +9,22 @@ pub(super) struct TaskReadRecord {
     readers: Mutex<HashMap<(String, String, u64), bool>>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct WorkCounters {
+    owner_lookups: AtomicUsize,
+    namespace_reads: AtomicUsize,
+    task_folder_reads: AtomicUsize,
+}
+
 /// Recognize the task bundle structurally, without trusting a caller's session
 /// namespace or granting access to the enclosing private store.
 fn task_directory(path: &Path) -> Option<&Path> {
+    // Ordinary project paths never need ancestor-by-ancestor task validation.
+    // A marker match is only a fast prefilter; the component checks still win.
+    static MARKER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"bash-tasks"));
+    MARKER.find(path.as_os_str().as_encoded_bytes())?;
     path.ancestors().find(|ancestor| {
         ancestor
             .parent()
@@ -55,6 +70,41 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
 }
 
 impl BgTaskRegistry {
+    pub(super) fn task_namespaces(&self, storage: &Path) -> std::io::Result<fs::ReadDir> {
+        #[cfg(test)]
+        self.inner
+            .task_access_work
+            .namespace_reads
+            .fetch_add(1, Ordering::Relaxed);
+        fs::read_dir(storage.join("bash-tasks"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_task_access_work(&self) {
+        self.inner
+            .task_access_work
+            .owner_lookups
+            .store(0, Ordering::Relaxed);
+        self.inner
+            .task_access_work
+            .namespace_reads
+            .store(0, Ordering::Relaxed);
+        self.inner
+            .task_access_work
+            .task_folder_reads
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn task_access_work(&self) -> (usize, usize, usize) {
+        let work = &self.inner.task_access_work;
+        (
+            work.owner_lookups.load(Ordering::Relaxed),
+            work.namespace_reads.load(Ordering::Relaxed),
+            work.task_folder_reads.load(Ordering::Relaxed),
+        )
+    }
+
     fn task_read_record(&self, root: &Path) -> Option<Arc<TaskReadRecord>> {
         if let Some(record) = self.inner.task_read_records.lock().ok()?.get(root).cloned() {
             record.resolved.dirs.task.ensure_current_identity().ok()?;
@@ -67,6 +117,11 @@ impl BgTaskRegistry {
             record.resolved.dirs.io.ensure_current_identity().ok()?;
             return Some(record);
         }
+        #[cfg(test)]
+        self.inner
+            .task_access_work
+            .task_folder_reads
+            .fetch_add(1, Ordering::Relaxed);
         let resolved = resolve_task_layout(root.parent()?, root.file_name()?.to_str()?).ok()?;
         if resolved.paths.layout != TaskLayout::Directory {
             return None;
@@ -160,38 +215,33 @@ impl BgTaskRegistry {
         task_id: &str,
         storage: &Path,
     ) -> Option<String> {
+        #[cfg(test)]
+        self.inner
+            .task_access_work
+            .owner_lookups
+            .fetch_add(1, Ordering::Relaxed);
         validate_task_id(task_id).ok()?;
-        crate::access_policy::current_scope()?;
-        let cached = self
-            .inner
-            .task_read_records
-            .lock()
-            .ok()?
-            .values()
-            .find(|record| {
-                record.metadata.task_id == task_id && record.resolved.paths.dir.starts_with(storage)
-            })
-            .cloned();
-        if let Some(record) = cached {
-            let record = self.task_read_record(&record.resolved.paths.dir)?;
-            return self
-                .head_reads_record(&record)
-                .then(|| record.metadata.session_id.clone());
-        }
-        // Task IDs are unique, but a revived worker's session namespace changes.
-        // Resolve the persisted bundle rather than the worker's current session
-        // ID, and retain the folder decision for later reads.
-        for entry in fs::read_dir(storage.join("bash-tasks")).ok()?.flatten() {
-            let root = entry.path().join(task_id);
-            if !safe_task_entry(&root) {
-                continue;
-            }
-            if let Some(record) = self.task_read_record(&root) {
-                if self.head_reads_record(&record) {
-                    return Some(record.metadata.session_id.clone());
-                }
+        let caller = crate::access_policy::current_scope()?;
+        let pool = self.inner.db_pool.read().ok()?.clone()?;
+        {
+            let conn = pool.lock().ok()?;
+            if !crate::db::access_grants::is_head(&conn, &caller).ok()? {
+                return None;
             }
         }
-        None
+        let session = if let Some(task) = self.task(task_id) {
+            task.session_id.clone()
+        } else {
+            let harness = crate::bash_background::route_harness()
+                .map(|harness| harness.storage_segment())
+                .or_else(|| self.fallback_db_harness())?;
+            let conn = pool.lock().ok()?;
+            crate::db::bash_tasks::find_bash_task_session(&conn, &harness, task_id).ok()??
+        };
+        // The row or live task names one namespace, including an earlier worker
+        // session after revival. A missing row never causes a directory sweep.
+        let root = session_tasks_dir(storage, &session).join(task_id);
+        let record = self.task_read_record(&root)?;
+        self.head_reads_record(&record).then_some(session)
     }
 }

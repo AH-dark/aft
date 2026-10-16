@@ -55,6 +55,11 @@ fn record(
     metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
     metadata.completion_delivered = true;
     write_task(&paths.json, &metadata).unwrap();
+    crate::db::bash_tasks::upsert_bash_task(
+        &ctx.db().unwrap().lock().unwrap(),
+        &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+    )
+    .unwrap();
     std::fs::write(&paths.command, "printf worker-output\n").unwrap();
     std::fs::write(&paths.environment, "SECRET_CREDENTIAL=hidden-environment\n").unwrap();
     std::fs::write(&paths.stdout, "worker-output\n").unwrap();
@@ -83,6 +88,8 @@ fn fixture() -> Fixture {
     ));
     ctx.set_db(Arc::clone(&db));
     ctx.bash_background().set_db_pool(db);
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Opencode);
     let head = ScopeKey::from_stamp(&stamp("head", "head", 9, None));
     {
         let db = ctx.db().unwrap();
@@ -466,4 +473,132 @@ fn access_policy_head_cannot_control_live_worker_task() {
     );
     req.session_id = Some("worker-session".into());
     assert!(crate::commands::bash_kill::handle(&req, &f.ctx).success);
+}
+
+#[test]
+fn access_policy_status_owner_lookup_has_bounded_filesystem_work() {
+    let f = fixture();
+    let registry = f.ctx.bash_background();
+    let storage = f.ctx.config().storage_dir.clone().unwrap();
+    registry.replay_session(&storage, "worker-session").unwrap();
+    registry.reset_task_access_work();
+    let mut req = request("bash_status", json!({"task_id": f.worker.task_id}));
+    req.session_id = Some("worker-session".into());
+    let worker_scope = ScopeKey::from_stamp(&stamp("worker", "worker", 1, Some("head")));
+    crate::access_policy::with_scope(Some(worker_scope), || {
+        for _ in 0..3 {
+            let response = crate::commands::bash_status::handle(&req, &f.ctx);
+            assert!(response.success, "{:?}", response.data);
+        }
+    });
+    assert_eq!(
+        registry.task_access_work(),
+        (0, 0, 0),
+        "own status must not perform worker-owner lookups, namespace reads or task-folder probes"
+    );
+
+    let cold = fixture();
+    let storage = cold.ctx.config().storage_dir.clone().unwrap();
+    for index in 0..5100 {
+        std::fs::create_dir_all(
+            storage
+                .join("bash-tasks")
+                .join(format!("unrelated-{index:04}")),
+        )
+        .unwrap();
+    }
+    cold.ctx.bash_background().reset_task_access_work();
+    req.session_id = Some("head-session".into());
+    crate::access_policy::with_scope(Some(cold.head.clone()), || {
+        let response = crate::commands::bash_status::handle(&req, &cold.ctx);
+        assert!(response.success, "{:?}", response.data);
+    });
+    assert_eq!(
+        cold.ctx.bash_background().task_access_work(),
+        (1, 0, 1),
+        "a cold head lookup must use the persisted task row and probe only its one task folder"
+    );
+    crate::access_policy::with_scope(Some(cold.head.clone()), || {
+        let response = crate::commands::bash_status::handle(&req, &cold.ctx);
+        assert!(response.success, "{:?}", response.data);
+    });
+    assert_eq!(
+        cold.ctx.bash_background().task_access_work(),
+        (2, 0, 1),
+        "a repeated head lookup must use the live task and cached folder record"
+    );
+}
+
+#[test]
+fn access_policy_status_missing_row_or_non_head_never_probes_foreign_folders() {
+    let f = fixture();
+    let registry = f.ctx.bash_background();
+    registry.reset_task_access_work();
+    let mut req = request("bash_status", json!({"task_id": f.worker.task_id}));
+    req.session_id = Some("sibling-session".into());
+    let sibling = ScopeKey::from_stamp(&stamp("sibling", "worker", 1, Some("head")));
+    crate::access_policy::with_scope(Some(sibling), || {
+        let response = crate::commands::bash_status::handle(&req, &f.ctx);
+        assert_eq!(
+            response.data["code"], "task_not_found",
+            "{:?}",
+            response.data
+        );
+    });
+    assert_eq!(registry.task_access_work(), (1, 0, 0));
+    f.ctx
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM bash_tasks", [])
+        .unwrap();
+    registry.reset_task_access_work();
+    req.session_id = Some("head-session".into());
+    crate::access_policy::with_scope(Some(f.head.clone()), || {
+        let response = crate::commands::bash_status::handle(&req, &f.ctx);
+        assert_eq!(
+            response.data["code"], "task_not_found",
+            "{:?}",
+            response.data
+        );
+    });
+    assert_eq!(
+        registry.task_access_work(),
+        (1, 0, 0),
+        "an existing task bundle without its task row must not trigger filesystem discovery"
+    );
+}
+
+#[test]
+#[ignore = "manual 50k-file path-filter cost measurement"]
+fn access_policy_ordinary_project_path_filter_cost() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project/src/generated/modules");
+    let mut paths = Vec::with_capacity(50_000);
+    for group in 0..250 {
+        let group = root.join(format!("group-{group:03}"));
+        std::fs::create_dir_all(&group).unwrap();
+        for file in 0..200 {
+            let path = group.join(format!("source-{file:03}.rs"));
+            std::fs::write(&path, "").unwrap();
+            paths.push(path);
+        }
+    }
+    let filters = crate::search_index::PathFilters::default();
+    let measure = |probe: &dyn Fn(&Path) -> bool| {
+        let start = Instant::now();
+        for _ in 0..10 {
+            for path in &paths {
+                assert!(black_box(probe(black_box(path))));
+            }
+        }
+        start.elapsed().as_secs_f64() * 1000.0 / 10.0
+    };
+    let baseline = measure(&|_| true);
+    let entry_filter = measure(&crate::bash_background::registry::safe_task_entry);
+    let indexed_filter = measure(&|path| filters.matches(&root, path));
+    println!("TASK_PATH_FILTER_COST files=50000 baseline_ms={baseline:.3} safe_task_entry_ms={entry_filter:.3} path_filters_matches_ms={indexed_filter:.3}");
 }

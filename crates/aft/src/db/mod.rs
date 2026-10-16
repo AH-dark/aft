@@ -33,11 +33,17 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 18;
+pub const CURRENT_SCHEMA_VERSION: u32 = 19;
 
 const MIGRATION_VERSIONS: &[u32] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
 ];
+
+// Downgrading to schema 18 requires stopping AFT, dropping this index and
+// deleting version 19 from schema_version. No task rows or payloads change.
+const MIGRATION_V19: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_bash_tasks_task_owner ON bash_tasks(task_id, harness, session_id);
+"#;
 
 const MIGRATION_V14: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_exec_policies (
@@ -938,6 +944,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         16 => conn.execute_batch(access_grants::MIGRATION),
         17 => conn.execute_batch(access_asks::MIGRATION),
         18 => conn.execute_batch(access_grants::MODES_MIGRATION),
+        19 => conn.execute_batch(MIGRATION_V19),
         _ => Ok(()),
     }
 }
@@ -982,6 +989,7 @@ mod tests {
         "idx_bash_tasks_status",
         "idx_bash_tasks_session_status",
         "idx_bash_tasks_project_lookup",
+        "idx_bash_tasks_task_owner",
         "idx_bash_pattern_watches_session",
         "idx_bash_pattern_watches_task",
         "idx_bash_tasks_started_activity",
@@ -1423,6 +1431,23 @@ mod tests {
         // the bash-task lookup index on the way.
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
         assert!(sqlite_names(&conn, "index").contains(&"idx_bash_tasks_project_lookup".to_string()));
+    }
+
+    #[test]
+    fn migration_v19_adds_task_owner_index_to_v18_database() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..=18 {
+            apply_migration_statements(&conn, version).unwrap();
+            conn.execute("INSERT INTO schema_version(version) VALUES (?1)", [version])
+                .unwrap();
+        }
+        assert!(!sqlite_names(&conn, "index").contains(&"idx_bash_tasks_task_owner".to_string()));
+        drop(conn);
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert!(sqlite_names(&conn, "index").contains(&"idx_bash_tasks_task_owner".to_string()));
     }
 
     #[test]

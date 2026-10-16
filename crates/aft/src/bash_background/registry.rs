@@ -792,6 +792,8 @@ pub(crate) struct RegistryInner {
     persisted_artifact_owners:
         Mutex<HashMap<PathBuf, (String, Arc<super::persistence::PinnedDir>)>>,
     task_read_records: Mutex<HashMap<PathBuf, Arc<task_access::TaskReadRecord>>>,
+    #[cfg(test)]
+    task_access_work: task_access::WorkCounters,
     /// Failed finished-task bundle deletions and their bounded retry count.
     finished_delete_attempts: Mutex<HashMap<String, usize>>,
     cleanup_queue: Mutex<VecDeque<String>>,
@@ -1195,6 +1197,8 @@ impl BgTaskRegistry {
                 tasks: Mutex::new(HashMap::new()),
                 persisted_artifact_owners: Mutex::new(HashMap::new()),
                 task_read_records: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                task_access_work: task_access::WorkCounters::default(),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
                 cleanup_queue: Mutex::new(VecDeque::new()),
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
@@ -5384,6 +5388,7 @@ impl BgTaskRegistry {
             storage_dir,
             preview_bytes,
             Duration::ZERO,
+            true,
         )
     }
 
@@ -5453,6 +5458,26 @@ impl BgTaskRegistry {
             storage_dir,
             preview_bytes,
             KILL_IN_FLIGHT_WAIT,
+            true,
+        )
+    }
+
+    pub(crate) fn status_settled_owned(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        project_root: Option<&Path>,
+        storage_dir: &Path,
+        preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        self.status_with_kill_wait(
+            task_id,
+            session_id,
+            project_root,
+            Some(storage_dir),
+            preview_bytes,
+            KILL_IN_FLIGHT_WAIT,
+            false,
         )
     }
 
@@ -5464,6 +5489,7 @@ impl BgTaskRegistry {
         storage_dir: Option<&Path>,
         preview_bytes: usize,
         kill_wait: Duration,
+        allow_relaxed: bool,
     ) -> Option<BgTaskSnapshot> {
         validate_task_id(task_id).ok()?;
         let terminal_db_fallback_allowed = storage_dir
@@ -5486,6 +5512,9 @@ impl BgTaskRegistry {
                 }) {
                     return Some(snapshot);
                 }
+            }
+            if !allow_relaxed {
+                return None;
             }
             return self.status_relaxed(
                 task_id,
@@ -5569,8 +5598,7 @@ impl BgTaskRegistry {
                 );
             }
         }
-        let root = storage_dir.join("bash-tasks");
-        let entries = fs::read_dir(&root).ok()?;
+        let entries = self.task_namespaces(storage_dir).ok()?;
         for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.is_dir() {
