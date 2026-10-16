@@ -13,6 +13,9 @@ use super::{
 use crate::context::{App, AppContext, ArtifactEvictionBlocker};
 use crate::executor::BindBlockerSnapshot;
 
+const EXECUTOR_SCHEDULER_CONTENTION_DETAIL: &str =
+    "executor scheduler state could not be snapshotted without contention";
+
 /// Why the idle reaper kept an existing, unbound root that is past its idle
 /// TTL. Deleted roots are counted separately in the census's `blockers`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2220,9 +2223,7 @@ fn build_health_diagnostic_rollup_from_actors(
     let Some(actor_entries) = actor_entries else {
         return HealthDiagnosticRollup {
             status: HealthStatus::Degraded,
-            detail: Some(
-                "executor scheduler state could not be snapshotted without contention".to_string(),
-            ),
+            detail: Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string()),
             metrics: HealthDiagnosticRollup::unavailable().metrics,
             memory_census: placeholder_memory_census(),
         };
@@ -2723,7 +2724,7 @@ fn build_health_report_with_indexing(
 
     let scheduler_busy = executor.try_actor_count().is_none();
     let warning = if scheduler_busy {
-        Some("executor scheduler state could not be snapshotted without contention".to_string())
+        Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string())
     } else {
         rollup.detail.clone()
     };
@@ -3116,6 +3117,47 @@ mod tests {
                 },
             },
         )
+    }
+
+    const HEALTH_REPORT_CONTENTION_ATTEMPTS: usize = 200;
+
+    fn health_report_after_scheduler_contention(
+        test_name: &str,
+        mut read_report: impl FnMut() -> HealthReport,
+    ) -> HealthReport {
+        for _ in 0..HEALTH_REPORT_CONTENTION_ATTEMPTS {
+            let report = read_report();
+            if report.detail.as_deref() != Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL) {
+                return report;
+            }
+            std::thread::yield_now();
+        }
+        panic!(
+            "{test_name}: scheduler remained contended after {HEALTH_REPORT_CONTENTION_ATTEMPTS} health snapshots"
+        );
+    }
+
+    fn health_report_while_scheduler_locked(
+        executor: &Executor,
+        build_report: impl FnOnce() -> HealthReport,
+    ) -> HealthReport {
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(|| {
+                executor.hold_state_lock_for_test(|| {
+                    held_tx.send(()).expect("signal held scheduler lock");
+                    release_rx.recv().expect("release held scheduler lock");
+                });
+            });
+            held_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("scheduler lock holder starts");
+            let report = build_report();
+            release_tx.send(()).expect("release scheduler lock holder");
+            holder.join().expect("scheduler lock holder joins");
+            report
+        })
     }
 
     #[test]
@@ -3526,11 +3568,10 @@ mod tests {
             // Both the rollup and the live probe can skip a contended scheduler.
             // Wait for the roots, not the diagnostic values being asserted, so
             // a missing diagnostic still fails after a completed refresh.
-            let scheduler_busy = report.detail.as_deref().is_some_and(|detail| {
-                detail.contains(
-                    "executor scheduler state could not be snapshotted without contention",
-                )
-            });
+            let scheduler_busy = report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL));
             if report
                 .metrics
                 .as_ref()
@@ -4039,9 +4080,7 @@ mod tests {
         let detail = report.detail.unwrap();
         assert!(
             detail.contains("health diagnostic snapshot is being refreshed")
-                || detail.contains(
-                    "executor scheduler state could not be snapshotted without contention"
-                ),
+                || detail.contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL),
             "{detail}"
         );
 
@@ -4051,7 +4090,7 @@ mod tests {
         assert!(report
             .detail
             .unwrap()
-            .contains("executor scheduler state could not be snapshotted without contention"));
+            .contains(EXECUTOR_SCHEDULER_CONTENTION_DETAIL));
     }
 
     #[test]
@@ -4468,12 +4507,26 @@ mod tests {
         *ctx.callgraph_store_rx().lock() = Some(rx);
         assert!(executor.register_actor(root.clone(), ctx));
 
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &crate::context::App::default_shared(),
+        let app = crate::context::App::default_shared();
+        let cache = HealthRollupCache::new();
+        cache.refresh_for_test(&executor, &app);
+        let metrics = DispatchPathMetrics::new();
+        let mut reads = 0;
+        let report = health_report_after_scheduler_contention(
+            "disabled_callgraph_store_reports_disabled_despite_lingering_build_receiver",
+            || {
+                reads += 1;
+                let read_report =
+                    || build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
+                if reads <= 3 {
+                    health_report_while_scheduler_locked(&executor, read_report)
+                } else {
+                    read_report()
+                }
+            },
         );
+        assert_eq!(reads, 4, "the test must retry the three contended reads");
+
         assert_ne!(
             report.status,
             HealthStatus::Degraded,
