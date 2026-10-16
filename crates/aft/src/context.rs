@@ -5459,6 +5459,9 @@ impl AppContext {
     }
 
     pub fn completion_drains_have_work(&self) -> bool {
+        if self.bash_background.project_replay_has_work() {
+            return true;
+        }
         let search_pending = self
             .search_index_rx
             .try_read()

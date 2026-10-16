@@ -652,14 +652,28 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
     }
 }
 
-/// Drain all background build-completion receivers in standalone order.
+/// Advance restart recovery and drain background build-completion receivers.
 ///
 /// Search installs first so watcher/pending updates apply to the freshest index,
 /// followed by callgraph store and semantic index completion.
 pub fn drain_build_completions(ctx: &AppContext) {
+    drain_bash_project_replay(ctx);
     drain_search_index_events(ctx);
     drain_callgraph_store_events(ctx);
     drain_semantic_index_events(ctx);
+}
+
+/// Resume one bounded replay batch on the maintenance lane, never on bind.
+/// Lifecycle admission closes before unbind returns; pending sessions remain
+/// visible in health and resume on rebind without replacing live task handles.
+pub fn drain_bash_project_replay(ctx: &AppContext) {
+    if !ctx.bash_background().project_replay_has_work() {
+        return;
+    }
+    let generation = ctx.configure_generation();
+    ctx.run_if_subc_bound_generation(generation, || {
+        ctx.bash_background().continue_project_replay();
+    });
 }
 
 /// Return true when any background build-completion receiver is currently set.

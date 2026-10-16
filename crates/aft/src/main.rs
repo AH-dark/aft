@@ -778,6 +778,7 @@ fn main() {
 #[cfg(test)]
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
+        aft::runtime_drain::drain_bash_project_replay(runtime);
         aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::config_live::drain_config_reload(runtime);
@@ -818,6 +819,7 @@ fn drain_runtime_events_cooperatively(
 
 fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     let runtime = registry.current();
+    aft::runtime_drain::drain_bash_project_replay(runtime);
     // Preserve the dependency order: install finished search artifacts before
     // watcher deltas, then advance the other build channels and diagnostics.
     aft::runtime_drain::drain_configure_warning_events(runtime);

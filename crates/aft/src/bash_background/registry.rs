@@ -607,6 +607,9 @@ pub struct BgTaskSnapshot {
 pub struct BgTaskHealthCounts {
     pub running: usize,
     pub pending_completions: usize,
+    /// Sessions with persisted task history still awaiting restart recovery.
+    /// Scanning pauses while the project has no connected session route.
+    pub replay_pending_sessions: usize,
     /// Known task bundles without an aft.db row because their dual-write was
     /// skipped while this registry had no usable database pool.
     pub db_rows_missing: usize,
@@ -825,6 +828,13 @@ struct ProjectReplayDiskBatch {
     incomplete_reason: Option<&'static str>,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProjectReplayRequest {
+    storage_dir: PathBuf,
+    project_root: PathBuf,
+    session_id: String,
+}
+
 pub(crate) struct RegistryInner {
     #[cfg(unix)]
     db_hint_jobs:
@@ -886,9 +896,16 @@ pub(crate) struct RegistryInner {
     /// persisted GC so a sweep never judges a session that replay is in the
     /// middle of restoring.
     session_recovery: Mutex<HashMap<String, SessionRecovery>>,
-    /// Project replay resumes its bounded disk scan on the next replay call
-    /// rather than restarting at the first session after every bind.
+    /// Session binding and background maintenance share this saved task-directory
+    /// iterator so each bounded scan continues where the previous one stopped.
     project_replay_scan: Mutex<Option<ProjectReplayScanCursor>>,
+    /// One pending request per session; it remains visible through rehydration,
+    /// even after the disk iterator has reached the end of its last batch.
+    /// The value records whether the initial database replay has succeeded.
+    project_replay_pending: Mutex<BTreeMap<ProjectReplayRequest, bool>>,
+    /// Never wait for another batch on the bind path. A contending bind queues
+    /// its session for maintenance instead of starting a second replay worker.
+    project_replay_batch: Mutex<()>,
     #[cfg(test)]
     project_replay_scan_budget_for_test: Mutex<Option<(usize, Duration)>>,
     /// Output compression callback. Set by `AppContext` after construction.
@@ -1292,6 +1309,8 @@ impl BgTaskRegistry {
                 persisted_gc_thread: Mutex::new(None),
                 session_recovery: Mutex::new(HashMap::new()),
                 project_replay_scan: Mutex::new(None),
+                project_replay_pending: Mutex::new(BTreeMap::new()),
+                project_replay_batch: Mutex::new(()),
                 #[cfg(test)]
                 project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
@@ -4291,7 +4310,111 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: &Path,
     ) -> Result<(), String> {
-        self.replay_session_inner(storage_dir, session_id, Some(project_root))
+        self.record_live_delivery_session(session_id);
+        let request = ProjectReplayRequest {
+            storage_dir: storage_dir.to_path_buf(),
+            project_root: canonicalized_path(project_root),
+            session_id: session_id.to_string(),
+        };
+        self.inner
+            .project_replay_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(request.clone())
+            .or_insert(false);
+        let Ok(_batch) = self.inner.project_replay_batch.try_lock() else {
+            crate::slog_info!(
+                "bash task replay queued for session {session_id}: another bounded batch is active"
+            );
+            return Ok(());
+        };
+        self.run_project_replay_batch(&request, false)
+    }
+
+    pub(crate) fn project_replay_has_work(&self) -> bool {
+        self.inner
+            .project_replay_pending
+            .try_lock()
+            .map(|pending| !pending.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// Advance at most one saved disk batch. The caller checks that the project
+    /// still has a connected session route before starting recovery work.
+    pub(crate) fn continue_project_replay(&self) {
+        let Ok(_batch) = self.inner.project_replay_batch.try_lock() else {
+            return;
+        };
+        let request = self
+            .inner
+            .project_replay_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .first_key_value()
+            .map(|(request, disk_only)| (request.clone(), *disk_only));
+        if let Some((request, disk_only)) = request {
+            if let Err(error) = self.run_project_replay_batch(&request, disk_only) {
+                crate::slog_warn!(
+                    "bash task replay incomplete for session {}: {error}; maintenance will retry",
+                    request.session_id
+                );
+            }
+        }
+    }
+
+    fn run_project_replay_batch(
+        &self,
+        request: &ProjectReplayRequest,
+        disk_only: bool,
+    ) -> Result<(), String> {
+        if let Err(error) = self.replay_session_batch(
+            &request.storage_dir,
+            &request.session_id,
+            Some(&request.project_root),
+            disk_only,
+        ) {
+            // Recovery failed after the cursor may have passed task records not
+            // yet restored. Restart both DB and disk replay to recover them;
+            // already registered tasks retain their authoritative handles.
+            self.inner
+                .project_replay_scan
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            self.inner
+                .project_replay_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(request.clone(), false);
+            return Err(error);
+        }
+        if self
+            .inner
+            .project_replay_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            self.inner
+                .project_replay_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(request);
+            if disk_only {
+                crate::slog_info!(
+                    "bash task replay complete for session {} on {}",
+                    request.session_id,
+                    request.project_root.display()
+                );
+            }
+        } else {
+            self.inner
+                .project_replay_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(request.clone(), true);
+        }
+        Ok(())
     }
 
     fn retire_orphaned_watch_tombstones(&self, binding_session_id: &str) -> Result<(), String> {
@@ -4483,15 +4606,22 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
+        self.record_live_delivery_session(session_id);
+        self.replay_session_batch(storage_dir, session_id, project_root, false)
+    }
+
+    fn replay_session_batch(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        project_root: Option<&Path>,
+        disk_only: bool,
+    ) -> Result<(), String> {
         // Held for the whole call: from here on this session's task directory is
         // being rewritten, and the persisted GC below sweeps the same storage
         // root from another thread. Tasks belonging to other sessions are
         // guarded as they are recovered, once the replay set is known.
         let mut recovering = vec![self.begin_session_recovery(storage_dir, session_id)];
-        // Standalone NDJSON: every session for a project replays through the same
-        // bridge, so replay unions this session into live delivery routes.
-        // Only subc route synchronization (subc/mod.rs:2120) replaces the whole set.
-        self.record_live_delivery_session(session_id);
         self.retire_orphaned_watch_tombstones(session_id)?;
         self.start_watchdog();
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
@@ -4517,11 +4647,19 @@ impl BgTaskRegistry {
         // lookup that will be empty until a real session writes a task).
         //
         // We deliberately keep the empty-DB / empty-disk path silent — it's
-        // the normal startup case and would otherwise fire on every configure
-        // (see GitHub user report against v0.27.0). INFO-level logs only when
-        // disk actually returned tasks (real migration signal); WARN when the
+        // the normal startup case; logging every configure would be noisy.
+        // INFO-level logs only when
+        // disk returned tasks absent from DB; WARN when the
         // DB lookup itself errored.
-        let tasks = match self.replay_session_from_db(session_id, project_root) {
+        //
+        // DB replay has already restored its rows on bind. Continuations only
+        // advance the disk cursor, avoiding repeated project-wide DB queries.
+        let database_replay = if disk_only {
+            None
+        } else {
+            self.replay_session_from_db(session_id, project_root)
+        };
+        let tasks = match database_replay {
             Some(Ok(mut tasks)) if !tasks.is_empty() => {
                 // A task can be written to its disk bundle while this registry
                 // has no database pool. Preserve DB rows as authoritative for
@@ -4641,7 +4779,8 @@ impl BgTaskRegistry {
                 }
             }
             None => {
-                // DB pool unconfigured — common in tests + before harness is set.
+                // Continue scanning disk after DB recovery, or use disk alone
+                // when this registry has no configured database connection.
                 match project_root {
                     Some(project_root) => {
                         let batch = self.replay_session_from_disk_for_project(
@@ -4860,7 +4999,7 @@ impl BgTaskRegistry {
                     continue;
                 }
             }
-            self.rehydrate_resolved_task(metadata, resolved.paths, session_id)?;
+            self.rehydrate_resolved_task(metadata, resolved.paths, session_id, false)?;
         }
 
         // Every recovery write for this replay has landed; release the
@@ -4905,7 +5044,7 @@ impl BgTaskRegistry {
         {
             return Ok(());
         }
-        self.rehydrate_resolved_task(metadata, resolved.paths, session_id)?;
+        self.rehydrate_resolved_task(metadata, resolved.paths, session_id, true)?;
         self.start_watchdog();
         Ok(())
     }
@@ -4917,7 +5056,11 @@ impl BgTaskRegistry {
         mut metadata: PersistedTask,
         paths: TaskPaths,
         session_id: &str,
+        record_live_route: bool,
     ) -> Result<(), String> {
+        let insert = |metadata, paths| {
+            self.insert_rehydrated_task_with_delivery(metadata, paths, true, record_live_route)
+        };
         #[cfg(unix)]
         if metadata.remote.is_some() && metadata.is_terminal() {
             remote::persist_terminal_artifacts(&paths, &mut metadata);
@@ -4927,7 +5070,7 @@ impl BgTaskRegistry {
         #[cfg(unix)]
         if metadata.remote.is_some() && !metadata.is_terminal() {
             let task_id = metadata.task_id.clone();
-            self.insert_rehydrated_task(metadata, paths, true)?;
+            insert(metadata, paths)?;
             self.resume_remote_task(&task_id)?;
             return Ok(());
         }
@@ -4953,7 +5096,7 @@ impl BgTaskRegistry {
                 metadata.completion_delivered |= completion_was_delivered;
                 let _ = self.persist_task(&paths, &metadata);
                 self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
-                self.insert_rehydrated_task(metadata, paths, true)?;
+                insert(metadata, paths)?;
             }
             BgTaskStatus::Running | BgTaskStatus::Killing => {
                 if metadata.mode == BgMode::Pty {
@@ -4967,9 +5110,9 @@ impl BgTaskRegistry {
                             &paths,
                             session_id,
                         )?;
-                        self.insert_rehydrated_task(metadata, paths, true)?;
+                        insert(metadata, paths)?;
                     } else if metadata.status.is_terminal() {
-                        self.insert_rehydrated_task(metadata, paths, true)?;
+                        insert(metadata, paths)?;
                     } else {
                         let completion_was_delivered = metadata.completion_delivered;
                         metadata.mark_terminal(
@@ -4984,7 +5127,7 @@ impl BgTaskRegistry {
                             &paths,
                             session_id,
                         )?;
-                        self.insert_rehydrated_task(metadata, paths, true)?;
+                        insert(metadata, paths)?;
                     }
                 } else if let Ok(Some(marker)) = read_exit_marker(&paths) {
                     let reason = (metadata.status == BgTaskStatus::Killing)
@@ -4998,7 +5141,7 @@ impl BgTaskRegistry {
                     metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
-                    self.insert_rehydrated_task(metadata, paths, true)?;
+                    insert(metadata, paths)?;
                 } else if metadata.status == BgTaskStatus::Killing {
                     // Killing records intent, not proof that the daemon sent a
                     // signal. Finish that work before publishing its outcome.
@@ -5024,9 +5167,9 @@ impl BgTaskRegistry {
                     metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
-                    self.insert_rehydrated_task(metadata, paths, true)?;
+                    insert(metadata, paths)?;
                 } else if Self::persisted_task_process_is_alive(&metadata) {
-                    self.insert_rehydrated_task(metadata, paths, true)?;
+                    insert(metadata, paths)?;
                 } else {
                     let completion_was_delivered = metadata.completion_delivered;
                     metadata.mark_terminal(
@@ -5038,7 +5181,7 @@ impl BgTaskRegistry {
                     metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
-                    self.insert_rehydrated_task(metadata, paths, true)?;
+                    insert(metadata, paths)?;
                 }
             }
             _ if metadata.status.is_terminal() => {
@@ -5048,7 +5191,7 @@ impl BgTaskRegistry {
                 // reconstruct a tail preview, so it must see the same
                 // paths the rehydrated task will own.
                 self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
-                self.insert_rehydrated_task(metadata, paths, true)?;
+                insert(metadata, paths)?;
             }
             _ => {}
         }
@@ -8046,9 +8189,19 @@ impl BgTaskRegistry {
 
     fn insert_rehydrated_task(
         &self,
+        metadata: PersistedTask,
+        paths: TaskPaths,
+        detached: bool,
+    ) -> Result<(), String> {
+        self.insert_rehydrated_task_with_delivery(metadata, paths, detached, true)
+    }
+
+    fn insert_rehydrated_task_with_delivery(
+        &self,
         mut metadata: PersistedTask,
         paths: TaskPaths,
         detached: bool,
+        record_live_route: bool,
     ) -> Result<(), String> {
         let task_id = metadata.task_id.clone();
         let session_id = metadata.session_id.clone();
@@ -8124,7 +8277,11 @@ impl BgTaskRegistry {
                 pending_terminal_override: None,
             }),
         });
-        self.record_live_delivery_session(&task.session_id);
+        // Replay may adopt a task after its originating route has detached.
+        // Watchdog coverage is independent of whether that route is still live.
+        if record_live_route {
+            self.record_live_delivery_session(&task.session_id);
+        }
         self.remember_session_harness(&task);
         // A watch's single-record recovery can race configure replay. Keep the
         // first registered task and its runtime instead of replacing its state
@@ -9726,6 +9883,7 @@ impl BgTaskRegistry {
         Some(BgTaskHealthCounts {
             running,
             pending_completions,
+            replay_pending_sessions: self.inner.project_replay_pending.try_lock().ok()?.len(),
             db_rows_missing,
             db_persistence_warning,
             retired_undelivered_completions: self
@@ -13076,6 +13234,238 @@ mod tests {
                 .task_for_session(disk_task_id, disk_session)
                 .is_some(),
             "project replay must merge disk-only tasks from a session identified by its DB rows"
+        );
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_maintenance_recovers_tasks_beyond_the_bind_batch() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let registry = ctx.bash_background();
+        registry
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+        registry.set_project_replay_scan_budget_for_test(2, Duration::from_secs(5));
+        let session = "project-replay-continuation";
+        #[cfg(unix)]
+        struct Reap(Child);
+        #[cfg(unix)]
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        #[cfg(unix)]
+        let mut process = Reap(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        #[cfg(unix)]
+        let live_pid = process.0.id();
+        #[cfg(windows)]
+        let live_pid = std::process::id();
+        let task_ids = (0..520)
+            .map(|index| format!("bash-{index:016x}"))
+            .collect::<Vec<_>>();
+        for (index, task_id) in task_ids.iter().enumerate() {
+            let paths = task_paths(storage.path(), session, task_id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                task_id.clone(),
+                session.into(),
+                "echo recovered".into(),
+                project.path().to_path_buf(),
+                Some(project.path().to_path_buf()),
+                None,
+                true,
+                true,
+            );
+            if index >= 518 {
+                // With no kill deadline or process group, replay observes this
+                // PID without signaling it.
+                metadata.child_pid = Some(live_pid);
+                metadata.status = BgTaskStatus::Running;
+            } else {
+                metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                metadata.completion_delivered = index < 516;
+            }
+            write_task(&paths.json, &metadata).unwrap();
+            fs::write(&paths.stdout, "recovered\n").unwrap();
+            fs::write(&paths.stderr, "").unwrap();
+        }
+
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(
+            registry
+                .project_replay_scan_total_examined_for_test()
+                .unwrap()
+                <= 2
+        );
+        let later_task = task_ids[516..518]
+            .iter()
+            .find(|id| registry.task_for_session(id, session).is_none())
+            .expect("the bind batch must leave some task history unrecovered")
+            .clone();
+        let later_live = task_ids[518..520]
+            .iter()
+            .find(|id| registry.task_for_session(id, session).is_none())
+            .unwrap();
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            1
+        );
+        assert!(ctx.completion_drains_have_work());
+        {
+            let _active = registry.inner.project_replay_batch.lock().unwrap();
+            for _ in 0..2 {
+                registry
+                    .replay_session_for_project(storage.path(), session, project.path())
+                    .unwrap();
+            }
+            assert_eq!(
+                registry
+                    .try_health_counts()
+                    .unwrap()
+                    .replay_pending_sessions,
+                1
+            );
+        }
+
+        // No second configure or status request drives recovery: only the
+        // background maintenance pump may advance the saved scan.
+        registry.set_project_replay_scan_budget_for_test(64, Duration::from_secs(5));
+        for _ in 0..100 {
+            crate::runtime_drain::drain_build_completions(&ctx);
+        }
+        assert!(
+            registry.task_for_session(&later_task, session).is_some(),
+            "maintenance must recover a finished task beyond the bind batch"
+        );
+        let live_task = registry.task_for_session(later_live, session).unwrap();
+        assert!(registry
+            .inner
+            .watchdog_tasks
+            .lock()
+            .unwrap()
+            .contains_key(later_live));
+        assert_eq!(registry.pending_completions_for_session(session).len(), 2);
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            0
+        );
+        assert!(!ctx.completion_drains_have_work());
+        registry
+            .replay_session_for_project(storage.path(), session, project.path())
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &live_task,
+            &registry.task_for_session(later_live, session).unwrap()
+        ));
+        assert_eq!(registry.pending_completions_for_session(session).len(), 2);
+        #[cfg(unix)]
+        {
+            for task_id in &task_ids[518..520] {
+                let task = registry.task_for_session(task_id, session).unwrap();
+                fs::write(&task.paths.exit, "0\n").unwrap();
+            }
+            process.0.kill().unwrap();
+            process.0.wait().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while registry.pending_completions_for_session(session).len() < 4 {
+                assert!(
+                    Instant::now() < deadline,
+                    "the recovered live tasks must finish via their watchdog"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(registry.pending_completions_for_session(session).len(), 4);
+        }
+        registry.detach();
+    }
+
+    #[test]
+    fn project_replay_maintenance_pauses_while_root_is_unbound() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        let registry = ctx.bash_background();
+        registry
+            .inner
+            .persisted_gc_started
+            .store(true, Ordering::SeqCst);
+        registry.set_project_replay_scan_budget_for_test(2, Duration::from_secs(5));
+        for index in 0..4 {
+            write_running_project_task(
+                storage.path(),
+                project.path(),
+                "paused-session",
+                &format!("bash-{index:016x}"),
+            );
+        }
+        registry
+            .replay_session_for_project(storage.path(), "paused-session", project.path())
+            .unwrap();
+        let examined = registry.project_replay_scan_total_examined_for_test();
+        ctx.mark_subc_unbound();
+        registry.replace_live_delivery_sessions(HashSet::new());
+        crate::runtime_drain::drain_build_completions(&ctx);
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            examined,
+            "an unbound root must not advance replay maintenance"
+        );
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            1
+        );
+        assert!(registry
+            .inner
+            .live_delivery_sessions
+            .lock()
+            .unwrap()
+            .is_empty());
+        ctx.mark_subc_bound();
+        for _ in 0..20 {
+            crate::runtime_drain::drain_build_completions(&ctx);
+        }
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            0
+        );
+        assert_eq!(registry.running_tasks().len(), 4);
+        assert!(
+            registry
+                .inner
+                .live_delivery_sessions
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "continuing replay must not recreate a detached session route"
         );
         registry.detach();
     }

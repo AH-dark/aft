@@ -9562,6 +9562,7 @@ fn submit_maintenance_job(
                 }
             }
             MaintenanceDrainKind::CompletionDrains => {
+                runtime_drain::drain_bash_project_replay(ctx);
                 runtime_drain::drain_search_index_events(ctx);
                 runtime_drain::drain_callgraph_store_events(ctx);
                 runtime_drain::drain_semantic_index_events(ctx);
@@ -15131,6 +15132,94 @@ mod tests {
         assert!(due.is_empty());
         assert!(!deferred);
         assert!(!live_roots[&root].maintenance_pending);
+    }
+
+    #[tokio::test]
+    async fn bash_registry_replay_backlog_schedules_completion_maintenance_until_done() {
+        use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+        let (_dir, root) = test_root("maintenance-bash-replay");
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        let registry = ctx.bash_background();
+        registry.set_project_replay_scan_budget_for_test(2, Duration::from_secs(5));
+        for index in 0..4 {
+            let task_id = format!("bash-{index:016x}");
+            let paths = task_paths(storage.path(), "replay-session", &task_id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                task_id,
+                "replay-session".into(),
+                "echo recovered".into(),
+                root.as_path().to_path_buf(),
+                Some(root.as_path().to_path_buf()),
+                None,
+                true,
+                true,
+            );
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            write_task(&paths.json, &metadata).unwrap();
+            std::fs::write(&paths.stdout, "recovered\n").unwrap();
+            std::fs::write(&paths.stderr, "").unwrap();
+        }
+        registry
+            .replay_session_for_project(storage.path(), "replay-session", root.as_path())
+            .unwrap();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let mut batches = 0;
+        while ctx.completion_drains_have_work() && batches < 20 {
+            let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+            let (jobs, _) = due_maintenance_jobs(
+                &mut live_roots,
+                Some(&executor),
+                &BgSubsBySession::new(),
+                &BgWakePending::new(),
+                MAINTENANCE_SUBMIT_BUDGET,
+                &HashSet::new(),
+            );
+            assert_eq!(
+                jobs,
+                vec![(root.clone(), MaintenanceDrainKind::CompletionDrains)]
+            );
+            submit_maintenance_job(
+                &executor,
+                root.clone(),
+                jobs[0].1,
+                Vec::new(),
+                &completion_tx,
+                &metrics,
+            );
+            let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(completion.response.success);
+            batches += 1;
+        }
+        assert!(
+            batches > 1,
+            "replay must use multiple bounded maintenance jobs"
+        );
+        assert_eq!(
+            registry
+                .pending_completions_for_session("replay-session")
+                .len(),
+            4
+        );
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            0
+        );
+        assert!(!ctx.completion_drains_have_work());
+        registry.detach();
     }
 
     #[test]
