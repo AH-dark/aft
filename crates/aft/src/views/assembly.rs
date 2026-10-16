@@ -1738,7 +1738,7 @@ fn working_tree_io<T>(
 }
 
 pub(crate) fn read_working_tree_file(path: &Path) -> Result<Option<Vec<u8>>> {
-    working_tree_io(fs::read(path), "reading", path)
+    working_tree_io(crate::project_content::read(path), "reading", path)
 }
 
 fn read_symlink_bytes(path: &Path) -> Result<Option<Vec<u8>>> {

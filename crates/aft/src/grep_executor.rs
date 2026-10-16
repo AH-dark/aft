@@ -791,6 +791,9 @@ fn fallback_target_walk_builder(
                     _ => {}
                 }
             }
+            if crate::project_content::is_excluded(entry.path()) {
+                return false;
+            }
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
                 let descend = !matches!(
