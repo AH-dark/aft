@@ -4581,6 +4581,7 @@ mod grant_path_tests {
         let (poll_touch_tx, _poll_touch_rx) = mpsc::channel(16);
         let (_dir, root) = super::super::test_support::test_root("bash-wait-lock");
         executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+        let hang_timeout = Duration::from_secs(120);
 
         submit_deferred_bash(
             &executor,
@@ -4602,7 +4603,10 @@ mod grant_path_tests {
             json!({
                 "command": command,
                 "wait": true,
-                "timeout": 10_000,
+                // Only catch hangs: loaded Windows runners can spend the old
+                // 10-second budget starting Git Bash, before `sleep 2` runs.
+                // Frame-loop responsiveness is checked independently below.
+                "timeout": hang_timeout.as_millis() as u64,
             }),
             crate::subc_format::FormatContext::default(),
             BashWaitCancel {
@@ -4628,18 +4632,25 @@ mod grant_path_tests {
         );
 
         drop(completion_tx);
-        let started_by = Instant::now() + Duration::from_secs(3);
-        while metrics
-            .deferred_bash_waits_in_flight
-            .load(Ordering::Relaxed)
-            < 1
-        {
-            assert!(
-                Instant::now() < started_by,
-                "deferred bash wait never started"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Measure responsiveness only after the wait has actually entered, not
+        // against a shell-startup deadline. An early terminal reply would skip
+        // the held-lock observation and must not count as exercising the wait.
+        tokio::time::timeout(hang_timeout, async {
+            while metrics
+                .deferred_bash_waits_in_flight
+                .load(Ordering::Relaxed)
+                < 1
+            {
+                tokio::select! {
+                    _ = completion_rx.recv() => panic!(
+                        "bash completed before the deferred wait entered; task-state lock contention was not exercised"
+                    ),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        })
+        .await
+        .expect("bash startup hung before the deferred wait entered");
         let registry = executor
             .actor_context(&root)
             .expect("actor context")
@@ -4657,13 +4668,19 @@ mod grant_path_tests {
         let hold = Duration::from_millis(1_200);
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            let _state = task.state.lock().expect("task state");
-            held_tx.send(()).expect("held signal");
+            let state = task.state.lock().expect("task state");
+            held_tx
+                .send(state.metadata.status.is_terminal())
+                .expect("held signal");
             std::thread::sleep(hold);
         });
-        held_rx
+        let already_terminal = held_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("holder took the task state lock");
+        assert!(
+            !already_terminal,
+            "bash completed before task-state lock contention could be exercised"
+        );
 
         // Tick the runtime through several of the wait's poll intervals while
         // the lock is held. An inline snapshot parks the thread for the whole
