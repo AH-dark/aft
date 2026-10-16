@@ -294,11 +294,12 @@ async function makeIsolation(label: string): Promise<HostIsolation> {
   const home = join(root, "home");
   const config = join(root, "config");
   const data = join(root, "data");
+  const storage = join(data, "cortexkit", "aft");
   const state = join(root, "state");
   const cache = join(root, "cache");
   const temp = join(root, "tmp");
   await Promise.all(
-    [project, home, config, data, state, cache, temp].map((path) =>
+    [project, home, config, data, storage, state, cache, temp].map((path) =>
       mkdir(path, { recursive: true }),
     ),
   );
@@ -308,6 +309,9 @@ async function makeIsolation(label: string): Promise<HostIsolation> {
     HOME: home,
     XDG_CONFIG_HOME: config,
     XDG_DATA_HOME: data,
+    // Agent File Tools (AFT) stores its database at $XDG_DATA_HOME/cortexkit/aft by default.
+    // Set this host's root explicitly so its database remains private to the run.
+    AFT_STORAGE_DIR: storage,
     XDG_STATE_HOME: state,
     XDG_CACHE_HOME: cache,
     TMPDIR: temp,
@@ -319,6 +323,10 @@ async function makeIsolation(label: string): Promise<HostIsolation> {
   delete env.OPENCODE_CONFIG;
   delete env.OPENCODE_CONFIG_CONTENT;
   delete env.OPENCODE_SERVER;
+  // AFT_TEST_ISOLATION_ROOT makes the Bun test preload rewrite child storage paths
+  // to a suite-wide fixture. Matrix hosts already set their own AFT_STORAGE_DIR,
+  // so disable that rewrite for their children.
+  delete env.AFT_TEST_ISOLATION_ROOT;
   return { root, project, env };
 }
 
@@ -1526,8 +1534,8 @@ async function writeV2LifecycleProbe(hostRoot: string): Promise<string> {
   await writeFile(
     probe,
     `
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { appendFileSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Effect, Exit, Fiber } from "effect";
 import { Config } from "@opencode/core/config";
@@ -1544,6 +1552,7 @@ import {
 const packageRoot = process.argv[2];
 const directory = process.argv[3];
 const marker = process.env.AFT_LOAD_MATRIX_MARKER;
+if (!marker) throw new Error("the lifecycle probe has no isolated run marker");
 const installed = {
   directory: packageRoot,
   name: ${JSON.stringify(packageName)},
@@ -1892,7 +1901,21 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
 
   const storageDir = process.env.AFT_STORAGE_DIR;
   if (!storageDir) throw new Error("the lifecycle probe has no isolated AFT_STORAGE_DIR");
-  const database = new DatabaseSync(resolve(storageDir, "aft.db"), { readOnly: true });
+  const runRoot = realpathSync(dirname(marker));
+  const resolvedStorageDir = realpathSync(storageDir);
+  const storageRelativeToRun = relative(runRoot, resolvedStorageDir);
+  if (
+    storageRelativeToRun === "" ||
+    storageRelativeToRun === ".." ||
+    storageRelativeToRun.startsWith(".." + sep) ||
+    isAbsolute(storageRelativeToRun)
+  ) {
+    throw new Error(
+      "the lifecycle probe resolved AFT storage outside its temporary run root: " +
+        resolvedStorageDir,
+    );
+  }
+  const database = new DatabaseSync(resolve(resolvedStorageDir, "aft.db"), { readOnly: true });
   const abortQuery = database.prepare(
     "SELECT task_id, status, metadata FROM bash_tasks " +
       "WHERE harness = ? AND session_id = ? ORDER BY started_at DESC LIMIT 1",
