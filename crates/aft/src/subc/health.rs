@@ -1691,6 +1691,10 @@ pub(super) struct HealthRollupCache {
     clock_ms: AtomicU64,
     /// Count of completed refresh attempts, including scheduler contention.
     refreshes: AtomicU64,
+    /// Set when the latest refresh could not snapshot the scheduler. Kept
+    /// apart from the payload so a failed refresh marks the retained census
+    /// stale without copying it under the cache lock.
+    contended: AtomicBool,
     #[cfg(test)]
     root_details_assembled: AtomicUsize,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
@@ -1706,6 +1710,7 @@ impl HealthRollupCache {
             #[cfg(test)]
             clock_ms: AtomicU64::new(u64::MAX),
             refreshes: AtomicU64::new(0),
+            contended: AtomicBool::new(false),
             #[cfg(test)]
             root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
@@ -1733,22 +1738,22 @@ impl HealthRollupCache {
     }
 
     fn publish(&self, rollup: Option<HealthDiagnosticRollup>) {
-        let mut snapshot = self
-            .snapshot
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
         if let Some(mut rollup) = rollup {
             // Keep the timestamp with its payload so a reader cannot pair two
             // different publications when a refresh races with a probe.
             rollup.generated_at_ms = Some(self.now_ms());
-            *snapshot = Arc::new(rollup);
+            let rollup = Arc::new(rollup);
+            let mut snapshot = self
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            *snapshot = rollup;
+            // Cleared under the write lock so no reader pairs the fresh census
+            // with the previous refresh's contention mark.
+            self.contended.store(false, Ordering::Release);
         } else {
-            let rollup = Arc::make_mut(&mut snapshot);
-            rollup.status = HealthStatus::Degraded;
-            rollup.detail = Some(EXECUTOR_SCHEDULER_CONTENTION_DETAIL.to_string());
-            rollup.stale_reason = Some("executor_contended");
+            self.contended.store(true, Ordering::Release);
         }
-        drop(snapshot);
         self.refreshes.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -1831,6 +1836,12 @@ impl HealthRollupCache {
             .generated_at_ms
             .map(|generated| self.now_ms().saturating_sub(generated));
         (snapshot, age_ms)
+    }
+
+    /// Whether the latest refresh could not snapshot the scheduler, so the
+    /// retained census is stale.
+    fn latest_refresh_contended(&self) -> bool {
+        self.contended.load(Ordering::Acquire)
     }
 
     fn annotate_plane_timings(&self, root: &str, value: &mut Value) {
@@ -2656,7 +2667,9 @@ fn build_health_report_with_indexing(
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
     let (rollup, snapshot_age_ms) = cache.snapshot();
-    let scheduler_busy = executor.try_actor_count().is_none();
+    // A contended refresh, now or at the last rollup, leaves the retained
+    // census in place and reports it as stale.
+    let scheduler_busy = executor.try_actor_count().is_none() || cache.latest_refresh_contended();
     let stale_reason = if scheduler_busy {
         Some("executor_contended")
     } else {
@@ -4169,6 +4182,12 @@ mod tests {
         executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
 
         let stale = cache.snapshot().0;
+        // A failed refresh only marks the retained census stale. It must not
+        // replace or copy the payload while holding the cache lock.
+        assert!(
+            Arc::ptr_eq(&good, &stale),
+            "failed refresh copied the census"
+        );
         assert_eq!(
             stale.metrics, good.metrics,
             "last measured census must survive"
