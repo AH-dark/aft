@@ -892,6 +892,8 @@ pub(crate) fn write_format_validate_deferred(
     write_format_validate_impl(path, content, config, params, true, None)
 }
 
+mod swift;
+
 fn write_format_validate_impl(
     path: &Path,
     content: &str,
@@ -912,7 +914,7 @@ fn write_format_validate_impl(
     // Existing clean files are protected from invalid mutations. New files have
     // no safe prior content to restore, so their pre-write validity remains None
     // and invalid syntax is reported without rollback.
-    let was_syntax_valid = pre_write_content
+    let mut was_syntax_valid = pre_write_content
         .as_deref()
         .and_then(|source| validate_captured_syntax(path, source));
 
@@ -932,7 +934,16 @@ fn write_format_validate_impl(
     let syntax_valid = final_text
         .as_ref()
         .map(|observed| observed.text.as_str())
-        .and_then(|source| validate_captured_syntax(path, source));
+        .and_then(|source| {
+            let syntax_valid = validate_captured_syntax(path, source);
+            swift::confirm_if_needed(
+                path,
+                source,
+                pre_write_content.as_deref(),
+                &mut was_syntax_valid,
+                syntax_valid,
+            )
+        });
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
             std::fs::write(path, original.as_bytes()).map_err(|e| AftError::InvalidRequest {
@@ -1007,6 +1018,32 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_parser_accepts_tuple_metatype() {
+        let Some(()) = swift::with_native_swiftc(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("tuple.swift");
+            let original = "let value = 1\n";
+            let updated = "_ = (Int, Result<String, Error>).self\n";
+            std::fs::write(&path, original).unwrap();
+            assert_eq!(validate_syntax_str(updated, &path), Some(false));
+            let config = Config {
+                format_on_edit: false,
+                ..Config::default()
+            };
+            let mut result =
+                write_format_validate(&path, updated, &config, &serde_json::json!({})).unwrap();
+            assert!(!result.rolled_back);
+            assert_eq!(result.syntax_valid, Some(true));
+            assert_eq!(result.final_content(&path), Some(updated));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+        }) else {
+            eprintln!("skipping native Swift parser test: swiftc is unavailable");
+            return;
+        };
+    }
+
     use super::*;
 
     #[test]
