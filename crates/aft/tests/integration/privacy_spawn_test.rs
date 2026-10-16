@@ -10,6 +10,16 @@ use std::time::{Duration, Instant};
 
 const SESSION: &str = "privacy-spawn";
 
+fn macos_native_fixture_project() -> tempfile::TempDir {
+    // First-exec assessment of a new executable under macOS's /var/folders
+    // TMPDIR can consume the command's entire one-second timeout. Keep the
+    // compiled probe under /tmp, as the native bridge fixtures do.
+    tempfile::Builder::new()
+        .prefix("aft-privacy-spawn-")
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
 fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, sandbox: bool) {
     let response = aft.send(&json!({
         "id": "cfg-privacy", "session_id": SESSION, "command": "configure",
@@ -73,6 +83,7 @@ fn attribution_probe(project: &Path) {
 int main(int argc, char **argv) {
   /* getpgrp needs no process enumeration permission under Seatbelt. */
   if (argc == 2 && strcmp(argv[1], "group") == 0) { printf("%d\n", getpgrp()); return 0; }
+  if (argc == 2 && strcmp(argv[1], "identity") == 0) { printf("%d %d %d\n", getpgrp(), getppid(), getuid()); return 0; }
   int (*responsible)(int) = dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
   if (!responsible) return 41;
   int group = getpgrp();
@@ -98,7 +109,7 @@ int main(int argc, char **argv) {
 
 #[test]
 fn disclaimed_foreground_background_and_pty_preserve_attribution_io_and_exit_with_seatbelt() {
-    let project = tempfile::tempdir().unwrap();
+    let project = macos_native_fixture_project();
     let storage = tempfile::tempdir().unwrap();
     attribution_probe(project.path());
     let mut aft = AftProcess::spawn();
@@ -139,47 +150,86 @@ fn disclaimed_foreground_background_and_pty_preserve_attribution_io_and_exit_wit
     }
 }
 
+fn timeout_group_snapshot(group: i32) -> String {
+    match Command::new("/bin/ps")
+        .args(["-o", "pid,ppid,pgid,uid,stat,lstart,comm", "-g"])
+        .arg(group.to_string())
+        .output()
+    {
+        Ok(output) => format!(
+            "ps -g {group}: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(error) => format!("ps -g {group} failed: {error}"),
+    }
+}
+
 #[test]
 fn disclaimed_timeout_kills_foreground_background_and_pty_groups_with_seatbelt() {
-    let project = tempfile::tempdir().unwrap();
+    let project = macos_native_fixture_project();
     let storage = tempfile::tempdir().unwrap();
     attribution_probe(project.path());
-    let mut aft = AftProcess::spawn();
+    let mut aft = AftProcess::spawn_with_env(&[("RUST_LOG", std::ffi::OsStr::new("aft=debug"))]);
+    let only_sandboxed_foreground =
+        std::env::var("AFT_TEST_PRIVACY_TIMEOUT_ONLY_SANDBOXED_FOREGROUND").as_deref() == Ok("1");
     for sandbox in [false, true] {
         configure(&mut aft, project.path(), storage.path(), sandbox);
         for (background, pty) in [(false, false), (true, false), (true, true)] {
+            if only_sandboxed_foreground && (!sandbox || background || pty) {
+                continue;
+            }
+            let case = format!("sandbox={sandbox} background={background} pty={pty}");
+            eprintln!("timeout-group starting {case}");
             let group_file = project.path().join("group");
             let _ = std::fs::remove_file(&group_file);
             let response = request(
                 &mut aft,
                 json!({
-                    "command":"./probe group > group; printf started; trap '' TERM; sleep 30", "background":background, "pty":pty,
+                    "command":"./probe identity > group; printf started; trap '' TERM; sleep 30", "background":background, "pty":pty,
                     "compressed":false, "timeout":1000,
                 }),
             );
             assert_eq!(response["success"], true, "{response}");
-            let status = terminal(&mut aft, response);
+            let status = terminal(&mut aft, response.clone());
             assert_eq!(status["status"], "timed_out", "{status}");
             assert_eq!(status["exit_code"], 124, "{status}");
-            assert!(output(&status).contains("started"), "{status}");
-            let group: i32 = std::fs::read_to_string(group_file)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            if !output(&status).contains("started") {
+                let stderr = status["stderr_path"].as_str().map(std::fs::read_to_string);
+                eprintln!("{case}: no started marker; launch response={response:#}\ntask stderr={stderr:?}\ngroup file={:?}", std::fs::read_to_string(&group_file));
+                let (exit, stderr) = aft.stderr_output();
+                eprintln!("{case}: supervisor exit={exit}; sandbox startup diagnostics:\n{stderr}");
+                panic!("{case}: command did not reach the started marker: {status:#}");
+            }
+            let identity = std::fs::read_to_string(group_file).unwrap();
+            let ids: Vec<i32> = identity
+                .split_whitespace()
+                .map(|id| id.parse().unwrap())
+                .collect();
+            assert_eq!(ids.len(), 3, "{case}: {identity:?}");
+            let group = ids[0];
+            eprintln!(
+                "timeout-group {case}: pgid={group} shell_pid={} uid={}",
+                ids[1], ids[2]
+            );
             assert!(group > 0);
             let deadline = Instant::now() + Duration::from_secs(5);
-            while unsafe { libc::kill(-group, 0) } == 0 {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed-out process group {group} survived"
-                );
+            loop {
+                let result = unsafe { libc::kill(-group, 0) };
+                let error = std::io::Error::last_os_error().raw_os_error();
+                if result != 0 {
+                    if error != Some(libc::ESRCH) {
+                        eprintln!("timeout-group {case}: kill(-{group}, 0)={result}, errno={error:?}, identity={identity:?}\n{}\nstatus={status}", timeout_group_snapshot(group));
+                    }
+                    assert_eq!(error, Some(libc::ESRCH), "{case}, identity={identity:?}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    panic!("{case}: timed-out process group {group} survived, identity={identity:?}\n{}\nstatus={status}", timeout_group_snapshot(group));
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH)
-            );
         }
     }
 }
