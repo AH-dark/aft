@@ -39,8 +39,8 @@ const IGNORE_RULE_CHANGED_PATHS_LOGGED: usize = 3;
 const WATCHER_DRAIN_UNIT_WARN_AFTER: Duration = Duration::from_secs(5);
 const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
-const MUTATION_REFRESH_ENTRY_CAP: usize = 128;
-const MUTATION_REFRESH_BUDGET: Duration = Duration::from_millis(20);
+const MUTATION_REFRESH_ENTRY_CAP: usize = 1024;
+const MUTATION_REFRESH_BUDGET: Duration = Duration::from_millis(250);
 
 #[cfg(test)]
 thread_local! {
@@ -5766,7 +5766,14 @@ mod tests {
             let search = ctx.search_index().read().unwrap();
             let index = search.as_ref().unwrap();
             assert!(!index.ready);
-            let fresh = index.grep("zzzz_refreshed_token", true, &[], &[], &root, 1000);
+            let fresh = index.grep(
+                "zzzz_refreshed_token",
+                true,
+                &[],
+                &[],
+                &root,
+                MUTATION_REFRESH_ENTRY_CAP,
+            );
             assert_eq!(fresh.matches.len(), retained.len() - 1);
             assert!(fresh.files_searched > 0);
         }
