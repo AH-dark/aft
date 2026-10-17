@@ -76,12 +76,38 @@ fn resolve_worker_rust_root(variable: &str, default: &str, subtree: &str) -> Opt
                 .or_else(|| std::env::var_os("USERPROFILE"))
                 .map(|home| PathBuf::from(home).join(default))
         })?;
-    let path = root.join(subtree).canonicalize().ok()?;
+    // The root is retried while it is missing, and a worker shell can write in
+    // the Cargo cache, so it could create the subtree as a symlink to another
+    // project before the next policy build. Grant only a real directory reached
+    // without following any link below the configured home.
+    let joined = root.join(subtree);
+    if !no_symlink_below(&root, &joined) {
+        return None;
+    }
+    let path = joined.canonicalize().ok()?;
     path.is_dir().then(|| AccessGrant {
         path: crate::inspect::job::normalize_path(&path),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     })
+}
+
+/// True when every component of `path` below `root` exists and is a real
+/// directory, not a symlink or junction. `root` itself may be a link (a moved
+/// CARGO_HOME is normal); only what sits inside it must be genuine.
+fn no_symlink_below(root: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in rest.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Who answers an `ask` decision for the call running on this thread.

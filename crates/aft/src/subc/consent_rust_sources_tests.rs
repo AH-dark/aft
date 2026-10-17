@@ -172,6 +172,36 @@ async fn worker_cargo_git_db_still_ask() {
     cargo_read_asks("git/db/example-1a2b3c/config").await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_registry_symlink_created_later_is_not_granted() {
+    if !in_rust_home(
+        "worker_registry_symlink_created_later_is_not_granted",
+        false,
+    ) {
+        return;
+    }
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = rust_fixture();
+    let registry = cargo_root().join("registry/src");
+    let parked = cargo_root().join("registry/src-parked");
+    std::fs::rename(&registry, &parked).unwrap();
+    let elsewhere = f.dir.path().join("elsewhere-project");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("secret.rs"), "secret_marker").unwrap();
+    let before = f.read(&f.worker, &elsewhere.join("secret.rs"), 1).await;
+    assert_eq!(code(&before), "access_pending", "{before}");
+    std::os::unix::fs::symlink(&elsewhere, &registry).unwrap();
+    let after = f.read(&f.worker, &elsewhere.join("secret.rs"), 2).await;
+    std::fs::remove_file(&registry).unwrap();
+    std::fs::rename(&parked, &registry).unwrap();
+    assert_eq!(
+        code(&after),
+        "access_pending",
+        "a registry/src symlink must not grant its target: {after}"
+    );
+}
+
 async fn cargo_read_asks(relative: &str) {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = rust_fixture();
