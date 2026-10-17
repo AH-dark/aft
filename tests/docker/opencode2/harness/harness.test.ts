@@ -2907,8 +2907,8 @@ describe("a row that needs the callgraph waits for it", () => {
 });
 
 describe("abort controls wait for the call they interrupt", () => {
-  // The shape of a T4 abort row: the control is sent after the turn that
-  // hands the host the call.
+  // A scenario that interrupts a running call: the abort control is sent
+  // after the turn that hands the host the call.
   function abortRow(control: Partial<ApiControlPlan>): ScenarioDefinition {
     return {
       schema_version: 1,
@@ -2985,7 +2985,7 @@ describe("abort controls wait for the call they interrupt", () => {
     expect(findToolCalled(events, "inspect-abort")).toBeUndefined();
     const started = { type: "session.tool.called", data: { sessionID: "s", id: "inspect-abort" } };
     expect(findToolCalled([...events, started], "inspect-abort")).toBe(started);
-    // Later host releases name the call callID.
+    // Some host versions name the call identifier callID rather than id.
     const renamed = { type: "session.tool.called", data: { sessionID: "s", callID: "inspect-abort" } };
     expect(findToolCalled([...events, renamed], "inspect-abort")).toBe(renamed);
   });
