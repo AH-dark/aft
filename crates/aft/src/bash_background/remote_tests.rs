@@ -4368,19 +4368,11 @@ async fn blocking_runon_queued_past_its_timeout_answers_with_task_job_and_queue_
 
 #[tokio::test]
 async fn blocking_runon_still_running_at_its_wait_limit_answers_with_running_phase() {
-    let daemon = daemon(
-        Script::Staged {
-            position: 1,
-            queue: Duration::ZERO,
-            run: Duration::from_secs(4),
-        },
-        "exec-remote/v1",
-    )
-    .await;
+    let daemon = daemon(Script::Started, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
     let timeout_ms = 1_500;
-    let (reply, waited) = orchestrated_reply(
+    let (reply, waited) = orchestrated_reply_with_probe(
         &ctx,
         &daemon,
         serde_json::json!({
@@ -4391,6 +4383,11 @@ async fn blocking_runon_still_running_at_its_wait_limit_answers_with_running_pha
             "foreground_orchestrate": true,
             "compressed": false,
         }),
+        |task_id| {
+            ctx.bash_background()
+                .remote_progress(task_id, "session")
+                .is_some_and(|progress| progress.phase == RemotePhase::Running)
+        },
     )
     .await;
     assert!(reply.success, "{reply:?}");
@@ -4405,9 +4402,12 @@ async fn blocking_runon_still_running_at_its_wait_limit_answers_with_running_pha
         "{reply:?}"
     );
     assert_eq!(runner_cancels(&daemon), 0);
-    let task_id = reply.data["task_id"].as_str().unwrap();
-    let done = terminal(ctx.bash_background(), task_id).await;
-    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    let task_id = reply.data["task_id"].as_str().unwrap().to_string();
+    let registry = ctx.bash_background().clone();
+    tokio::task::spawn_blocking(move || registry.kill(&task_id, "session"))
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -5427,10 +5427,22 @@ async fn head_blocking_runon_uses_configured_cap_while_queued() {
 
 #[tokio::test]
 async fn head_blocking_runon_uses_configured_cap_before_any_stream_record() {
+    assert_blocking_runon_limit_before_acceptance(5_000, Some(250)).await;
+}
+
+#[tokio::test]
+async fn blocking_runon_wait_limit_before_accepted_reports_input_capture() {
+    assert_blocking_runon_limit_before_acceptance(250, None).await;
+}
+
+async fn assert_blocking_runon_limit_before_acceptance(timeout_ms: u64, cap_ms: Option<u64>) {
     let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
-    ctx.update_config(|config| config.bash.worker_wait_max_ms = 250);
+    if let Some(cap_ms) = cap_ms {
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = cap_ms);
+    }
+    let limit_ms = cap_ms.unwrap_or(timeout_ms);
     let (reply, waited) = orchestrated_reply_with_probe(
         &ctx,
         &daemon,
@@ -5438,7 +5450,7 @@ async fn head_blocking_runon_uses_configured_cap_before_any_stream_record() {
             "command": "uname -s",
             "runon": "linux",
             "wait": true,
-            "timeout": 5_000,
+            "timeout": timeout_ms,
             "foreground_orchestrate": true,
             "compressed": false,
         }),
@@ -5446,8 +5458,8 @@ async fn head_blocking_runon_uses_configured_cap_before_any_stream_record() {
     )
     .await;
     assert!(reply.success, "{reply:?}");
-    assert!(waited >= Duration::from_millis(250), "{waited:?}");
-    assert!(waited < plugin_transport_deadline(250), "{waited:?}");
+    assert!(waited >= Duration::from_millis(limit_ms), "{waited:?}");
+    assert!(waited < plugin_transport_deadline(limit_ms), "{waited:?}");
     assert_eq!(reply.data["status"], "starting", "{reply:?}");
     assert_eq!(reply.data["remote_phase"], "submitting", "{reply:?}");
     assert_eq!(reply.data["queue_position"], serde_json::Value::Null);
