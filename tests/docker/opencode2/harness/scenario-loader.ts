@@ -4,7 +4,12 @@ import { pathToFileURL } from "node:url";
 
 import { fail } from "./errors.js";
 import { CALLGRAPH_READY_TIMEOUT_MS } from "./readiness.js";
-import { TRAJECTORIES, type ScenarioDefinition, type ScenarioRegistration } from "./types.js";
+import {
+  TRAJECTORIES,
+  type ApiControlPlan,
+  type ScenarioDefinition,
+  type ScenarioRegistration,
+} from "./types.js";
 import { asRecord } from "./util.js";
 
 const REGISTRATION_NAMES = new Set([
@@ -72,6 +77,37 @@ function validateToolCall(
   }
   if (planned.non_mutating_evidence && !planned.non_mutating_evidence.reason) {
     fail("scenario_invalid", `${scenario.id}:${planned.id} has empty non_mutating_evidence`);
+  }
+}
+
+/**
+ * A tool-call gate must name a call the control's own turn hands the host,
+ * with a positive budget; a gate on a call that is never issued could only run
+ * out its timeout.
+ */
+function validateControlToolCallGate(
+  scenario: ScenarioDefinition,
+  control: ApiControlPlan,
+): void {
+  const gate = control.wait_for_tool_call;
+  if (gate === undefined) return;
+  if (
+    typeof gate.call_id !== "string" ||
+    gate.call_id.length === 0 ||
+    !Number.isInteger(gate.timeout_ms) ||
+    gate.timeout_ms < 1
+  ) {
+    fail("scenario_invalid", `${scenario.id}: control ${control.id} has invalid wait_for_tool_call`);
+  }
+  const turn = scenario.turns.find((candidate) => candidate.label === control.after_turn);
+  const issued =
+    turn?.response.kind === "tool_calls" &&
+    turn.response.calls.some((call) => call.id === gate.call_id);
+  if (!issued) {
+    fail(
+      "scenario_invalid",
+      `${scenario.id}: control ${control.id} waits for call ${gate.call_id}, which turn ${control.after_turn} does not issue`,
+    );
   }
 }
 
@@ -216,6 +252,21 @@ export function validateScenarioDefinition(
     }
   }
   for (const control of scenario.controls ?? []) {
+    validateControlToolCallGate(scenario, control);
+    // An abort sent the moment its turn is served races the host: the host
+    // has the call but has not started it, and an interrupt in that window
+    // ends the session without running the tool or reporting an abort. So an
+    // abort has to wait for evidence that the call it interrupts is running.
+    if (
+      control.purpose === "abort" &&
+      control.wait_for_task === undefined &&
+      control.wait_for_tool_call === undefined
+    ) {
+      fail(
+        "scenario_invalid",
+        `${scenario.id}: abort control ${control.id} declares neither wait_for_task nor wait_for_tool_call, so it would race the call it interrupts`,
+      );
+    }
     const wait = control.wait_for_task;
     if (!wait) continue;
     if (

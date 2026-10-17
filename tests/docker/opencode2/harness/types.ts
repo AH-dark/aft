@@ -127,6 +127,17 @@ export interface ApiControlPlan {
     status: string;
     timeout_ms: number;
   };
+  /**
+   * Hold the control until the host reports that it has started executing the
+   * named scripted call (`session.tool.called` on its event stream). Serving a
+   * turn only hands the host the call; the host still has to start a step and
+   * dispatch the tool, and a control sent in between lands before the call
+   * exists.
+   */
+  wait_for_tool_call?: {
+    call_id: string;
+    timeout_ms: number;
+  };
   method: string;
   path: string;
   body?: unknown;

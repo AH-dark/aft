@@ -12,7 +12,7 @@ import {
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
 import { fail, HarnessError } from "./errors.js";
-import { HostEventRecorder } from "./event-stream.js";
+import { awaitControlToolCall, HostEventRecorder } from "./event-stream.js";
 import { loadHarnessExtensions } from "./extensions.js";
 import { ScenarioForensics, parseArtifactRetention, pruneOldRunRoots } from "./forensics.js";
 import {
@@ -747,6 +747,11 @@ async function runOneScenario(options: {
               controlPathValues.task_id = readiness.task.id;
               if (control.purpose === "abort") abortTargetTaskId = readiness.task.id;
               await forensics.writeJson(`control-${control.id}-task-readiness.json`, readiness);
+            }
+            if (control.wait_for_tool_call) {
+              await awaitControlToolCall(scenario.id, control, hostEvents, (name, value) =>
+                forensics.writeJson(name, value),
+              );
             }
             await discoverActiveSessionId(control, controlPathValues, apiOptions);
             await emit({ kind: "control_started", control, at: Date.now() });

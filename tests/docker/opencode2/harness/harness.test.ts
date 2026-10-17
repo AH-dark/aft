@@ -35,7 +35,12 @@ import {
 } from "./disk-state.js";
 import { HarnessError, type HarnessFailureCode } from "./errors.js";
 import { parseArtifactRetention, pruneOldRunRoots } from "./forensics.js";
-import type { HostEvent } from "./event-stream.js";
+import {
+  awaitControlToolCall,
+  findToolCalled,
+  HostEventRecorder,
+  type HostEvent,
+} from "./event-stream.js";
 import { runApiControl, startScenarioClient, startSharedServer } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
@@ -92,6 +97,7 @@ import {
   addCallgraphWarmup,
   loadScenarios,
   materializeParityScenarios,
+  validateScenarioDefinition,
 } from "./scenario-loader.js";
 import { assertTurnLog } from "./turn-log.js";
 import {
@@ -100,7 +106,13 @@ import {
   pointTransportDeadStub,
 } from "./transport-stub.js";
 import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-window.js";
-import type { ScenarioDefinition, ScenarioResult, ScriptedTurn, ToolCallPlan } from "./types.js";
+import type {
+  ApiControlPlan,
+  ScenarioDefinition,
+  ScenarioResult,
+  ScriptedTurn,
+  ToolCallPlan,
+} from "./types.js";
 import {
   applyMutatingTestOverride,
   deriveListSurfaces,
@@ -2891,5 +2903,140 @@ describe("a row that needs the callgraph waits for it", () => {
     // A pointer naming a generation that is gone is not ready.
     await writeFile(join(directory, "key123.current"), "key123.g2.1.sqlite\n");
     expect(await callgraphStorePublished(storage)).toBe(false);
+  });
+});
+
+describe("abort controls wait for the call they interrupt", () => {
+  // The shape of a T4 abort row: the control is sent after the turn that
+  // hands the host the call.
+  function abortRow(control: Partial<ApiControlPlan>): ScenarioDefinition {
+    return {
+      schema_version: 1,
+      id: "inspect/T4/abort",
+      tool: "inspect",
+      trajectory: "T4",
+      execution: "shared-server",
+      prompt: "start and abort",
+      turns: [
+        {
+          label: "call-tool",
+          response: {
+            kind: "tool_calls",
+            calls: [
+              {
+                id: "inspect-abort",
+                name: "aft_inspect",
+                arguments: {},
+                non_mutating_evidence: { reason: "aborted inspection does not mutate" },
+                outlives_result: true,
+              },
+            ],
+          },
+        },
+        { label: "finish", response: { kind: "text", content: "done" } },
+      ],
+      controls: [
+        {
+          id: "abort-control",
+          after_turn: "call-tool",
+          method: "POST",
+          path: "/api/session/{{session_id}}/interrupt",
+          purpose: "abort",
+          ...control,
+        },
+      ],
+    };
+  }
+
+  test("an abort control with no gate is refused", () => {
+    expect(() => validateScenarioDefinition(abortRow({}), "inspect")).toThrow(
+      "declares neither wait_for_task nor wait_for_tool_call",
+    );
+  });
+
+  test("a tool-call gate must name a call its own turn issues", () => {
+    expect(() =>
+      validateScenarioDefinition(
+        abortRow({ wait_for_tool_call: { call_id: "another-call", timeout_ms: 1_000 } }),
+        "inspect",
+      ),
+    ).toThrow("waits for call another-call, which turn call-tool does not issue");
+    expect(() =>
+      validateScenarioDefinition(
+        abortRow({ wait_for_tool_call: { call_id: "inspect-abort", timeout_ms: 0 } }),
+        "inspect",
+      ),
+    ).toThrow("has invalid wait_for_tool_call");
+    expect(() =>
+      validateScenarioDefinition(
+        abortRow({ wait_for_tool_call: { call_id: "inspect-abort", timeout_ms: 1_000 } }),
+        "inspect",
+      ),
+    ).not.toThrow();
+  });
+
+  test("the start of a call is read from the host's session.tool.called", () => {
+    const events: HostEvent[] = [
+      { type: "session.step.started", data: { sessionID: "s" } },
+      { type: "session.tool.input.started", data: { sessionID: "s", id: "inspect-abort" } },
+      { type: "session.tool.called", data: { sessionID: "s", id: "other-call" } },
+    ];
+    // Streaming the call's input is not running it.
+    expect(findToolCalled(events, "inspect-abort")).toBeUndefined();
+    const started = { type: "session.tool.called", data: { sessionID: "s", id: "inspect-abort" } };
+    expect(findToolCalled([...events, started], "inspect-abort")).toBe(started);
+    // Later host releases name the call callID.
+    const renamed = { type: "session.tool.called", data: { sessionID: "s", callID: "inspect-abort" } };
+    expect(findToolCalled([...events, renamed], "inspect-abort")).toBe(renamed);
+  });
+
+  test("the gate holds until the host reports the call started, and gives up without it", async () => {
+    const recorder = new HostEventRecorder();
+    expect(await recorder.awaitToolCalled("inspect-abort", 60)).toBeUndefined();
+
+    let settled = false;
+    const waiting = recorder.awaitToolCalled("inspect-abort", 5_000).then((event) => {
+      settled = true;
+      return event;
+    });
+    recorder.events.push({ type: "session.tool.called", data: { id: "other-call" } });
+    await Bun.sleep(100);
+    expect(settled).toBe(false);
+    const started = { type: "session.tool.called", data: { id: "inspect-abort" } };
+    recorder.events.push(started);
+    expect(await waiting).toBe(started);
+  });
+
+  test("a control whose call never starts fails by name and records what the stream carried", async () => {
+    const control: ApiControlPlan = {
+      id: "abort-control",
+      after_turn: "call-tool",
+      wait_for_tool_call: { call_id: "inspect-abort", timeout_ms: 60 },
+      method: "POST",
+      path: "/api/session/{{session_id}}/interrupt",
+      purpose: "abort",
+    };
+    const recorder = new HostEventRecorder();
+    recorder.events.push({ type: "session.execution.interrupted", data: {} });
+    const recorded: Array<{ name: string; value: unknown }> = [];
+    const record = async (name: string, value: unknown) => {
+      recorded.push({ name, value });
+    };
+
+    await expect(
+      awaitControlToolCall("inspect/T4/abort", control, recorder, record),
+    ).rejects.toThrow("no session.tool.called for it arrived; the control was not sent");
+    expect(recorded.map((entry) => entry.name)).toEqual([
+      "control-abort-control-tool-readiness.json",
+    ]);
+    expect(recorded[0]?.value).toMatchObject({
+      call_id: "inspect-abort",
+      observed: null,
+      observed_types: ["session.execution.interrupted"],
+    });
+
+    recorder.events.push({ type: "session.tool.called", data: { id: "inspect-abort" } });
+    await awaitControlToolCall("inspect/T4/abort", control, recorder, record);
+    expect(recorded[1]?.value).toMatchObject({ observed: { data: { id: "inspect-abort" } } });
   });
 });

@@ -154,6 +154,10 @@
         {
           "id": "inspect-abort-control",
           "after_turn": "call-tool",
+          "wait_for_tool_call": {
+            "call_id": "inspect-abort",
+            "timeout_ms": 20000
+          },
           "method": "POST",
           "path": "/api/session/{{session_id}}/interrupt",
           "expected_status": 0,
