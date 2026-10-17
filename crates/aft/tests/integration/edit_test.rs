@@ -1157,6 +1157,171 @@ fn edit_match_handles_brackets_in_relative_literal_path() {
     assert!(status.success());
 }
 
+fn edit_tool_call(
+    aft: &mut AftProcess,
+    id: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    aft.send(
+        &serde_json::json!({ "id": id, "command": "tool_call", "name": "edit", "arguments": arguments })
+            .to_string(),
+    )
+}
+
+// Regression for #486: the agent-facing `edit` tool must send multi-item and
+// line-range edits on an existing bracketed path (a Next.js dynamic route) to
+// the single-file batch command instead of refusing it as a glob target.
+#[test]
+fn edit_tool_batches_and_line_ranges_on_existing_bracketed_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let route = root.join("app/[id]");
+    fs::create_dir_all(&route).unwrap();
+    let page = route.join("page.tsx");
+    fs::write(
+        &page,
+        "const first = 1;\nconst second = 2;\nconst third = 3;\n",
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let configured = aft.configure(root);
+    assert_eq!(configured["success"], true, "{configured:?}");
+
+    let batched = edit_tool_call(
+        &mut aft,
+        "bracketed-two-items",
+        serde_json::json!({
+            "path": "app/[id]/page.tsx",
+            "edits": [
+                { "oldString": "first = 1", "newString": "first = 10" },
+                { "oldString": "second = 2", "newString": "second = 20" },
+            ],
+        }),
+    );
+    assert_eq!(batched["success"], true, "two-item batch: {batched:?}");
+    assert_eq!(
+        fs::read_to_string(&page).unwrap(),
+        "const first = 10;\nconst second = 20;\nconst third = 3;\n"
+    );
+
+    let line_range = edit_tool_call(
+        &mut aft,
+        "bracketed-line-range",
+        serde_json::json!({
+            "path": "app/[id]/page.tsx",
+            "edits": [{ "startLine": 3, "endLine": 3, "content": "const third = 30;" }],
+        }),
+    );
+    assert_eq!(line_range["success"], true, "line range: {line_range:?}");
+    assert_eq!(
+        fs::read_to_string(&page).unwrap(),
+        "const first = 10;\nconst second = 20;\nconst third = 30;\n"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+// The other side of the #486 fix above: when nothing exists at the literal
+// bracketed path, the spelling is a glob and keeps today's behaviour. A single
+// find/replace edits every match; batches and line ranges are refused before
+// anything is written.
+#[test]
+fn edit_tool_keeps_glob_behaviour_when_bracketed_path_does_not_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let a = src.join("a.ts");
+    let b = src.join("b.ts");
+    fs::write(&a, "export const a = \"OLD\";\n").unwrap();
+    fs::write(&b, "export const b = \"OLD\";\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let configured = aft.configure(root);
+    assert_eq!(configured["success"], true, "{configured:?}");
+
+    for (label, pattern) in [("bracket class", "src/[ab].ts"), ("star", "src/*.ts")] {
+        for (shape, edits) in [
+            (
+                "two items",
+                serde_json::json!([
+                    { "oldString": "OLD", "newString": "NEW" },
+                    { "oldString": "export", "newString": "export" },
+                ]),
+            ),
+            (
+                "line range",
+                serde_json::json!([{ "startLine": 1, "endLine": 1, "content": "x" }]),
+            ),
+        ] {
+            let refused = edit_tool_call(
+                &mut aft,
+                "glob-refused",
+                serde_json::json!({ "path": pattern, "edits": edits }),
+            );
+            assert_eq!(refused["success"], false, "{label} {shape}: {refused:?}");
+            assert_eq!(
+                refused["code"], "invalid_request",
+                "{label} {shape}: {refused:?}"
+            );
+            assert!(
+                refused["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("glob targets support exactly one find/replace edit"),
+                "{label} {shape}: {refused:?}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&a).unwrap(),
+            "export const a = \"OLD\";\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&b).unwrap(),
+            "export const b = \"OLD\";\n"
+        );
+    }
+
+    let globbed = edit_tool_call(
+        &mut aft,
+        "bracket-glob-single",
+        serde_json::json!({
+            "path": "src/[ab].ts",
+            "edits": [{ "oldString": "OLD", "newString": "NEW" }],
+        }),
+    );
+    assert_eq!(globbed["success"], true, "{globbed:?}");
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "export const a = \"NEW\";\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "export const b = \"NEW\";\n"
+    );
+
+    let starred = edit_tool_call(
+        &mut aft,
+        "star-glob-single",
+        serde_json::json!({
+            "path": "src/*.ts",
+            "edits": [{ "oldString": "NEW", "newString": "DONE" }],
+        }),
+    );
+    assert_eq!(starred["success"], true, "{starred:?}");
+    assert_eq!(
+        fs::read_to_string(&a).unwrap(),
+        "export const a = \"DONE\";\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&b).unwrap(),
+        "export const b = \"DONE\";\n"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
 // ============================================================================
 // batch command tests
 // ============================================================================
