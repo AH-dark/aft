@@ -35,24 +35,27 @@ pub(crate) fn register_storage_root(path: &Path) {
 /// storage is also excluded wholesale so its generated source and cache files
 /// never feed back into project indexing.
 pub(crate) fn is_excluded(path: &Path) -> bool {
-    is_excluded_file(path)
-        || storage_roots()
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|root| path.starts_with(root))
+    is_excluded_file(path) || is_storage_path(path)
+}
+
+fn is_storage_path(path: &Path) -> bool {
+    storage_roots()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
 fn is_excluded_file(path: &Path) -> bool {
-    if crate::os_metadata::is_os_metadata_path(path) {
-        return true;
-    }
-    if let Some(name) = path
-        .file_name()
-        .filter(|_| !path.is_dir())
-        .map(|n| n.as_encoded_bytes())
-    {
-        if [
+    crate::os_metadata::is_os_metadata_path(path)
+        || has_sqlite_suffix(path) && !path.is_dir()
+        || crate::db::file_identity::is_registered_file_path(path)
+}
+
+fn has_sqlite_suffix(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        let name = name.as_encoded_bytes();
+        [
             b"-wal".as_slice(),
             b"-shm",
             b"-journal",
@@ -64,11 +67,14 @@ fn is_excluded_file(path: &Path) -> bool {
         .any(|suffix| {
             name.len() >= suffix.len()
                 && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-        }) {
-            return true;
-        }
-    }
-    crate::db::file_identity::is_registered_file_path(path)
+        })
+    })
+}
+
+fn is_excluded_file_with_metadata(path: &Path, metadata: Option<&std::fs::Metadata>) -> bool {
+    crate::os_metadata::is_os_metadata_path(path)
+        || has_sqlite_suffix(path) && !metadata.is_some_and(std::fs::Metadata::is_dir)
+        || crate::db::file_identity::is_registered_file_path(path)
 }
 
 /// Authorized task content is not project source, but must still be checked
@@ -124,17 +130,28 @@ pub(crate) fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
 }
 
 fn admit(path: &Path) -> std::io::Result<()> {
-    let excluded_alias = std::fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    let metadata = crate::db::file_identity::candidate_metadata(path).ok();
+    if is_excluded_file_with_metadata(path, metadata.as_ref()) || is_storage_path(path) {
+        return Err(excluded_error());
+    }
+    let excluded_alias = metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
         && path.canonicalize().is_ok_and(|target| is_excluded(&target));
-    if is_excluded(path) || excluded_alias || crate::db::file_identity::is_live_sqlite_file(path) {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "internal storage and SQLite files are not project source",
-        ))
+    if excluded_alias
+        || crate::db::file_identity::is_live_sqlite_file_with_metadata(path, metadata.as_ref())
+    {
+        Err(excluded_error())
     } else {
         Ok(())
     }
+}
+
+fn excluded_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "internal storage and SQLite files are not project source",
+    )
 }
 
 #[cfg(test)]
@@ -193,6 +210,42 @@ pub(crate) use open_probe::{record_open, Probe};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_project_reads_do_not_stat_registered_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let databases = (0..20)
+            .map(|index| {
+                crate::db::file_identity::IdentityConnection::open(
+                    root.join(format!("database_{index}.cache")),
+                    "source_read_stat_count",
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let source = root.join("source.rs");
+        std::fs::write(&source, "fn source() {}\n").unwrap();
+        let counts = crate::db::file_identity::stat_probe::count(|| {
+            for _ in 0..1_000 {
+                assert_eq!(read_to_string(&source).unwrap(), "fn source() {}\n");
+            }
+        });
+        let candidate_stats = counts.get(&source).copied().unwrap_or(0);
+        let registry_stats = counts
+            .iter()
+            .filter(|(path, _)| **path != source)
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        println!("1,000 source reads / 20 databases: {candidate_stats} candidate identity stats, {registry_stats} registry identity stats");
+        assert_eq!(
+            registry_stats, 0,
+            "source reads stat registered database files"
+        );
+        assert_eq!(candidate_stats, 1_000);
+        drop(databases);
+    }
 
     #[test]
     fn sqlite_named_directories_remain_project_source() {
@@ -293,6 +346,41 @@ mod tests {
         let walk = crate::views::live_delta::strict_walk(&root, &policy, 1);
         assert!(walk.gaps.is_empty(), "{:?}", walk.gaps);
         assert_eq!(probe.paths(), vec![source]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_created_shm_hard_link_is_refused_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let database = root.join("unconventional.cache");
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&database, "late_sidecar_read")
+                .unwrap();
+        let sidecar = root.join("unconventional.cache-shm");
+        assert!(!sidecar.exists());
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES ('alive');").unwrap();
+        assert!(sidecar.exists());
+        let alias = root.join("innocent.rs");
+        std::fs::hard_link(&sidecar, &alias).unwrap();
+        let probe = Probe::new(&root);
+        assert_eq!(
+            read(&alias).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let symlink = root.join("symlink.rs");
+        std::os::unix::fs::symlink(&alias, &symlink).unwrap();
+        assert_eq!(
+            open(&symlink).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(probe.paths().is_empty());
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM probe", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "alive"
+        );
     }
 
     #[cfg(unix)]
