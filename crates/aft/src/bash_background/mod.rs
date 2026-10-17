@@ -12,6 +12,7 @@ pub mod process;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
+mod temp_cleanup;
 pub mod watchdog;
 pub mod watches;
 
