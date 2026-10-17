@@ -659,6 +659,48 @@ async fn relaxed_denies_private_file_ancestor_rename() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn relaxed_denies_nested_sibling_parent_rename_but_allows_own_content_renames() {
+    let mut jail = Jail::relaxed_with_env(|base, _| {
+        let group = base.join("group");
+        std::fs::create_dir(&group).unwrap();
+        git(
+            &base.join("main"),
+            &[
+                "worktree",
+                "move",
+                base.join("sibling").to_str().unwrap(),
+                group.join("sibling").to_str().unwrap(),
+            ],
+        );
+    })
+    .await;
+    let group = jail.base.join("group");
+    let moved = jail.base.join("moved");
+    let own = jail.worktree.join("own-content");
+    let reply = jail
+        .bash(&format!(
+            "mkdir {own} && printf own > {own}/file && mv {own}/file {own}/renamed && \
+             mv {own} {own}-renamed && rm {own}-renamed/renamed && rmdir {own}-renamed && \
+             echo OWN_CONTENT_RENAMES_OK; \
+             if mv {group} {moved}; then printf tamper >> {moved}/sibling/README.md; fi",
+            own = quote(&own),
+            group = quote(&group),
+            moved = quote(&moved),
+        ))
+        .await;
+    assert!(reply.contains("OWN_CONTENT_RENAMES_OK"), "{reply}");
+    assert!(reply.contains("Operation not permitted"), "{reply}");
+    assert!(!moved.exists(), "sibling parent was renamed: {reply}");
+    assert!(!own.exists());
+    assert!(!jail.worktree.join("own-content-renamed").exists());
+    assert_eq!(
+        std::fs::read_to_string(group.join("sibling/README.md")).unwrap(),
+        "main\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn relaxed_denies_custom_cargo_home_credentials() {
     let mut jail = Jail::start_with_layout(None, None, true, "relaxed", false, true).await;
     for name in ["credentials", "credentials.toml"] {

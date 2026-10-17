@@ -19,7 +19,7 @@ use std::process::Command;
 
 #[cfg(target_os = "linux")]
 mod landlock_backend;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 mod seatbelt;
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;

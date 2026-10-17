@@ -36,7 +36,6 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(not(unix))]
 type RawFd = i32;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::process::Command;
 #[cfg(unix)]
 use std::sync::Arc;
@@ -4321,7 +4320,11 @@ fn isolated_environment_for_plan(
             }
             Some(environment)
         }
-        SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Refused { .. } => None,
+        SpawnPlan::RelaxedUnenforced => Some(sandboxed_child_environment(
+            request_environment,
+            &std::env::temp_dir(),
+        )),
+        SpawnPlan::Unsandboxed | SpawnPlan::Refused { .. } => None,
         #[cfg(unix)]
         SpawnPlan::Prepared { .. } => unreachable!("policy() unwraps prepared plans"),
     }
@@ -4363,6 +4366,25 @@ fn sandboxed_child_environment(
 
 fn sandbox_base_environment_key(key: &OsStr) -> bool {
     key.to_str().is_some_and(|key| {
+        #[cfg(windows)]
+        let key = key.to_ascii_uppercase();
+        #[cfg(windows)]
+        let key = key.as_str();
+        #[cfg(windows)]
+        if matches!(
+            key,
+            "SYSTEMROOT"
+                | "WINDIR"
+                | "COMSPEC"
+                | "PATHEXT"
+                | "USERPROFILE"
+                | "HOMEDRIVE"
+                | "HOMEPATH"
+                | "APPDATA"
+                | "LOCALAPPDATA"
+        ) {
+            return true;
+        }
         matches!(key, "HOME" | "USER" | "LOGNAME" | "SHELL" | "TERM" | "LANG")
             || key.starts_with("LC_")
     })
@@ -4419,15 +4441,14 @@ pub(crate) fn approved_environment_for_plan(
         .unwrap_or_else(|| approved_payload_environment(request_environment, &std::env::temp_dir()))
 }
 
-#[cfg(unix)]
 pub(crate) fn apply_sandbox_environment(
     plan: &SpawnPlan,
     command: &mut Command,
     request_environment: &HashMap<String, String>,
 ) {
     if let Some(environment) = isolated_environment_for_plan(plan, request_environment) {
-        // Host snapshots and native-launcher allowlists are complete child
-        // environments. Clear the daemon environment first so loader hooks,
+        // Isolated plans supply complete child environments even when file
+        // restrictions are unenforced. Clear the daemon environment so loader hooks,
         // shell startup hooks, and cloud credentials cannot leak around them.
         command.env_clear().envs(environment);
         if let Some(ticket) = memory_only_ticket(request_environment) {
@@ -4693,6 +4714,137 @@ mod windows_pty_environment_tests {
         .unwrap();
         assert_eq!(command.get_env("PATH"), Some(OsStr::new(&request["Path"])));
         assert_eq!(command.get_env("PATHEXT"), Some(OsStr::new(".AFT")));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod environment_tests {
+    use super::*;
+
+    const REENTRY: &str = "AFT_TEST_RELAXED_ENV_REENTRY";
+
+    // Plant daemon variables in a subprocess, not the parallel test runner's
+    // process-wide environment. Both adapters then see genuine inherited data.
+    pub(crate) fn with_daemon_environment(test: &str, check: impl FnOnce()) {
+        if std::env::var(REENTRY).as_deref() == Ok(test) {
+            assert_eq!(
+                std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
+                "daemon-secret"
+            );
+            check();
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(REENTRY, test)
+            .env("AWS_SECRET_ACCESS_KEY", "daemon-secret")
+            .env("TERM", "aft-inherited-term")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "environment regression subprocess failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    pub(crate) fn request_environment() -> HashMap<String, String> {
+        HashMap::from([
+            ("REQUEST_SENTINEL".to_string(), "request-value".to_string()),
+            ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+            ("GIT_CONFIG_KEY_0".to_string(), "core.autocrlf".to_string()),
+            ("GIT_CONFIG_VALUE_0".to_string(), "false".to_string()),
+        ])
+    }
+
+    pub(crate) fn assert_stripped_environment(
+        environment: HashMap<String, String>,
+        through_shell: bool,
+    ) {
+        assert!(
+            !environment.contains_key("AWS_SECRET_ACCESS_KEY"),
+            "daemon secret leaked into relaxed-unenforced child"
+        );
+        let path = environment.get("PATH").expect("child PATH");
+        let expected_path = crate::effective_path::effective_path().to_str().unwrap();
+        // PowerShell prepends its installation directory to PATH and may append
+        // extensions to PATHEXT. Direct adapter checks still require exact values.
+        assert!(
+            path == expected_path
+                || (through_shell && path.ends_with(&format!(";{expected_path}"))),
+            "child lost AFT's effective PATH"
+        );
+        assert_eq!(
+            environment.get("TERM").map(String::as_str),
+            Some("aft-inherited-term")
+        );
+        for (key, value) in request_environment() {
+            assert_eq!(environment.get(&key), Some(&value), "lost child key {key}");
+        }
+        for key in ["HOME", "USERPROFILE", "SYSTEMROOT", "COMSPEC", "PATHEXT"] {
+            if let Some((_, value)) = std::env::vars().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+                if through_shell && key == "PATHEXT" {
+                    let actual = environment.get(key).expect("child PATHEXT");
+                    assert!(actual == &value || actual.starts_with(&format!("{value};")));
+                    continue;
+                }
+                assert_eq!(environment.get(key), Some(&value), "lost base key {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn relaxed_unenforced_pipe_environment_is_stripped() {
+        with_daemon_environment(
+            "sandbox_spawn::environment_tests::relaxed_unenforced_pipe_environment_is_stripped",
+            || {
+                #[cfg(windows)]
+                let mut command = {
+                    let mut command = Command::new("cmd.exe");
+                    command.args(["/d", "/c", "set"]);
+                    command
+                };
+                #[cfg(not(windows))]
+                let mut command = Command::new("/usr/bin/env");
+                let request = request_environment();
+                crate::agent_child_env::apply_to_command(&mut command, &request);
+                apply_sandbox_environment(&SpawnPlan::RelaxedUnenforced, &mut command, &request);
+                let output = command.output().unwrap();
+                assert!(output.status.success());
+                let environment = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .map(|(key, value)| (key.to_ascii_uppercase(), value.to_string()))
+                    .collect();
+                assert_stripped_environment(environment, false);
+            },
+        );
+    }
+
+    #[test]
+    fn relaxed_unenforced_pty_environment_is_stripped() {
+        with_daemon_environment(
+            "sandbox_spawn::environment_tests::relaxed_unenforced_pty_environment_is_stripped",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let (command, _) = pty_command_for_plan(
+                    &SpawnPlan::RelaxedUnenforced,
+                    OsStr::new("unused-shell"),
+                    &[],
+                    &dir.path().join("task.json"),
+                    dir.path(),
+                    &request_environment(),
+                )
+                .unwrap();
+                let environment = command
+                    .iter_full_env_as_str()
+                    .map(|(key, value)| (key.to_ascii_uppercase(), value.to_string()))
+                    .collect();
+                assert_stripped_environment(environment, false);
+            },
+        );
     }
 }
 

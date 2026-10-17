@@ -5,16 +5,21 @@
 //! error buffers allocated by that API.
 
 use aft::sandbox_profile::SandboxProfile;
+#[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
+#[cfg(target_os = "macos")]
 use std::os::raw::c_char;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::ptr;
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
     fn sandbox_free_error(errorbuf: *mut c_char);
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn apply(profile: &SandboxProfile) -> Result<(), String> {
     let source = render_profile(profile)?;
     let source = CString::new(source)
@@ -145,6 +150,7 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
     let ancestors = profile
         .write_deny
         .iter()
+        .chain(&profile.write_deny_nested)
         .chain(&profile.deny_prefixes)
         .chain(&profile.read_deny)
         .chain(&profile.data_policy.deny)
@@ -369,6 +375,7 @@ mod tests {
         assert!(relaxed_filter(Path::new("/tmp/a\nb"), false).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn optional_exact_file_carve_outs_are_literal_even_when_not_regular_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -533,19 +540,62 @@ mod tests {
         for rule in [
             format!(
                 "(deny file-write* (subpath \"{}\"))",
-                profile.write_deny_nested[0].display()
+                escape_path(&profile.write_deny_nested[0]).unwrap()
             ),
             format!(
                 "(deny file-read* (subpath \"{}\"))",
-                profile.read_deny[0].display()
+                escape_path(&profile.read_deny[0]).unwrap()
             ),
             format!(
                 "(deny network-outbound (path \"{}\"))",
-                profile.socket_deny[0].display()
+                escape_path(&profile.socket_deny[0]).unwrap()
             ),
         ] {
             assert!(source.contains(&rule), "missing mandatory rule: {rule}");
         }
+    }
+
+    #[test]
+    fn relaxed_nested_checkout_ancestors_are_immutable_without_denying_own_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let work = root.join("Work");
+        let own = work.join("own");
+        let group = work.join("group");
+        let sibling = group.join("sibling");
+        let temp = root.join("temp");
+        for dir in [&own, &sibling, &temp] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut profile = SandboxProfile::build(
+            vec![own.clone()],
+            Vec::new(),
+            vec![work.clone(), sibling.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        profile.mode = aft::config::SandboxMode::Relaxed;
+        let source = render_profile(&profile).unwrap();
+        for ancestor in [&group, &work, &root] {
+            let rule = format!(
+                "(deny file-write-unlink (literal \"{}\"))",
+                escape_path(ancestor).unwrap()
+            );
+            assert!(source.contains(&rule), "missing ancestor rule: {rule}");
+        }
+        assert!(!source.contains(&format!(
+            "(deny file-write-unlink (literal \"{}\"))",
+            escape_path(&own).unwrap()
+        )));
+        assert!(source.contains(&format!(
+            "(deny file-write* (require-all {} (require-not {})))",
+            relaxed_filter(&work, false).unwrap(),
+            relaxed_filter(&own, false).unwrap()
+        )));
     }
 
     #[test]

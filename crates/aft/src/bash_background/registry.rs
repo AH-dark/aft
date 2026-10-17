@@ -11367,6 +11367,7 @@ fn spawn_detached_child(
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr));
                 crate::agent_child_env::apply_to_command(&mut cmd, env);
+                crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut cmd, env);
                 if let Some((key, value)) = shell.wrapper_environment(command) {
                     cmd.env(key, value);
                 }
@@ -16840,15 +16841,24 @@ mod tests {
     fn spawn_windows_registry_command(
         command: &str,
     ) -> (BgTaskRegistry, tempfile::TempDir, String) {
+        spawn_windows_registry_command_with_plan(SpawnPlan::Unsandboxed, command, HashMap::new())
+    }
+
+    #[cfg(windows)]
+    fn spawn_windows_registry_command_with_plan(
+        plan: SpawnPlan,
+        command: &str,
+        environment: HashMap<String, String>,
+    ) -> (BgTaskRegistry, tempfile::TempDir, String) {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
-                SpawnPlan::Unsandboxed,
+                plan,
                 command,
                 "session".to_string(),
                 dir.path().to_path_buf(),
-                HashMap::new(),
+                environment,
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
@@ -16858,6 +16868,33 @@ mod tests {
             )
             .unwrap();
         (registry, dir, task_id)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relaxed_unenforced_pipe_spawn_strips_daemon_environment() {
+        use crate::sandbox_spawn::environment_tests::{
+            assert_stripped_environment, request_environment, with_daemon_environment,
+        };
+        with_daemon_environment(
+            "bash_background::registry::tests::windows_relaxed_unenforced_pipe_spawn_strips_daemon_environment",
+            || {
+                let (registry, _dir, task_id) = spawn_windows_registry_command_with_plan(
+                    SpawnPlan::RelaxedUnenforced,
+                    "cmd /d /c set",
+                    request_environment(),
+                );
+                let task = registry.task_for_session(&task_id, "session").unwrap();
+                assert_eq!(wait_for_file(&task.paths.exit).trim(), "0");
+                let stdout = fs::read_to_string(&task.paths.stdout).unwrap();
+                let environment = stdout
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .map(|(key, value)| (key.to_ascii_uppercase(), value.to_string()))
+                    .collect();
+                assert_stripped_environment(environment, true);
+            },
+        );
     }
 
     #[cfg(windows)]
