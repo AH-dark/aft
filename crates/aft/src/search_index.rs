@@ -1859,9 +1859,30 @@ impl SearchIndex {
         path: &Path,
         canonical_parents: &mut ParentCanonicalizationMemo,
     ) {
-        let canonical_path =
-            canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
+        let canonical_path = self.respell_under_stored_root(
+            canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents),
+        );
         self.remove_resolved_file(path, &canonical_path);
+    }
+
+    /// Spell a filesystem-canonical path the way this index's stored keys are
+    /// spelled, so an exact key lookup can find it.
+    ///
+    /// On Windows, `fs::canonicalize` returns a verbatim (`\\?\`) path, but an
+    /// index loaded by a read-only caller keeps a plain root and plain keys.
+    /// Only the lookup key is respelled here; the stored root and the keys it
+    /// owns keep the caller's convention. Elsewhere canonical paths already
+    /// match the stored keys, so the path is returned unchanged.
+    fn respell_under_stored_root(&self, path: PathBuf) -> PathBuf {
+        #[cfg(windows)]
+        if !self.project_root.as_os_str().is_empty() {
+            let root = crate::windows_path::normalize_windows_path(&self.project_root);
+            let normalized = crate::windows_path::normalize_windows_path(&path);
+            if let Ok(relative) = normalized.strip_prefix(&root) {
+                return self.project_root.join(relative);
+            }
+        }
+        path
     }
 
     fn remove_resolved_file(&mut self, path: &Path, canonical_path: &Path) {
@@ -1957,18 +1978,8 @@ impl SearchIndex {
         let PreparedSearchUpdate { path, file } = update;
         // Prepared updates use filesystem-canonical paths, but borrowed indexes
         // can have a plain Windows root. Match the stored root's spelling before
-        // replacing its exact path key; normalize only the comparison operands.
-        #[cfg(windows)]
-        let path = if self.project_root.as_os_str().is_empty() {
-            path
-        } else {
-            let root = crate::windows_path::normalize_windows_path(&self.project_root);
-            let normalized = crate::windows_path::normalize_windows_path(&path);
-            normalized
-                .strip_prefix(&root)
-                .map(|relative| self.project_root.join(relative))
-                .unwrap_or(path)
-        };
+        // replacing its exact path key.
+        let path = self.respell_under_stored_root(path);
         self.remove_resolved_file(&path, &path);
         match file {
             PreparedSearchPath::Indexed(file) => {
@@ -11971,6 +11982,43 @@ mod tests {
 #[cfg(test)]
 mod warm_reload_verification_tests {
     use super::*;
+
+    /// `read_from_disk` resolves a root alias before deriving keys, so a caller
+    /// that removes a file by the alias spelling must still reach the cached
+    /// record. On Windows the alias is a case variant and the canonical
+    /// fallback is verbatim while a plain-root load stores plain keys.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn remove_file_through_root_alias_supersedes_the_cached_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("checkout");
+        fs::create_dir_all(&real_root).unwrap();
+        #[cfg(unix)]
+        let alias_root = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let alias_root = dir.path().join("CHECKOUT");
+        fs::write(real_root.join("cached.txt"), "AliasRemovalNeedle\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&real_root);
+        assert!(built.write_to_disk(cache.path(), None));
+
+        let mut index = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
+        #[cfg(windows)]
+        assert!(!index.project_root.to_string_lossy().starts_with(r"\\?\"));
+        let stored_key = index.project_root.join("cached.txt");
+        let cached_id = index.path_to_id[&stored_key];
+        assert!(cached_id < index.base_file_count);
+
+        index.remove_file(&alias_root.join("cached.txt"));
+
+        assert!(!index.path_to_id.contains_key(&stored_key));
+        assert!(index.delta.superseded.contains(&cached_id));
+        assert!(index.delta.superseded_paths.contains(&stored_key));
+    }
 
     #[test]
     #[cfg(any(unix, windows))]
