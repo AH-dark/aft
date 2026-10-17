@@ -634,6 +634,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal diagnostics scanner file resolution cap is an engine boundary, not a returned list",
     },
     ExclusionEntry {
+        file: "watcher_filter.rs",
+        enclosing_item: "derive_exclusion_plan, refresh_touched",
+        location_or_primitive: "WATCHER_EXCLUSION_LIMIT kernel exclusion slots",
+        reason: "internal watcher exclusion budget, not an agent-visible result list; paths without a kernel exclusion slot remain rejected at the walk boundary",
+    },
+    ExclusionEntry {
         file: "commands/bash_orchestrate.rs",
         enclosing_item: "format_seconds",
         location_or_primitive: "commands::bash_orchestrate::seconds.truncate",

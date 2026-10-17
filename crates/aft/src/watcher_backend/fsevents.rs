@@ -78,11 +78,20 @@ impl ProjectWatcher {
         // Same rule as the inotify backend: the exclusion set describes the
         // matcher at this generation, so the generation is captured beside it
         // rather than on the backend thread after spawn.
-        let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let generation = matcher_generation.load(Ordering::Acquire);
+        let counters = crate::context::watcher_counters_for_root(&root);
+        let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
+        let outcome = planning
+            .attempt(&root, generation, &counters, || {
+                derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT))
+            })
+            .expect("initial exclusion attempt is due");
+        let observed_generation = outcome.is_ok().then_some(generation);
+        let plan = outcome.unwrap_or_default();
         let exclusions = plan.selected;
-        let exclusion_paths = watcher_exclusion_paths(&exclusions);
-        super::log_exclusions(&root, &exclusions, observed_generation);
+        let exclusion_state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &exclusions);
+        let exclusion_paths = exclusion_state.paths();
+        super::log_exclusions(&root, &exclusions, generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         #[cfg(test)]
@@ -99,9 +108,8 @@ impl ProjectWatcher {
             fs::kFSEventStreamEventIdSinceNow,
             Arc::clone(&last_delivered_id),
         )?;
-        let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(
-            observed_generation,
+            observed_generation.unwrap_or(0),
             exclusion_paths,
             watcher_exclusion_paths(&plan.dropped),
         );
@@ -123,76 +131,103 @@ impl ProjectWatcher {
                 let mut stream = stream;
                 let _external_watcher = external_watcher;
                 let mut exclusions = exclusions;
+                let mut exclusion_state = exclusion_state;
+                let mut dropped_paths = watcher_exclusion_paths(&plan.dropped);
                 let mut observed_generation = observed_generation;
 
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    if generation != observed_generation {
-                        let replacement_plan = derive_watcher_exclusion_plan(
-                            &root,
-                            &matcher,
-                            Some(WATCHER_EXCLUSION_LIMIT),
-                        );
-                        let replacement_exclusions = replacement_plan.selected;
-                        let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
+                    let previous_paths = exclusion_state.paths();
+                    if let Some(update) = planning.replacement(
+                        &root,
+                        generation,
+                        &counters,
+                        &mut exclusion_state,
+                        &matcher,
+                        || {
+                            derive_watcher_exclusion_plan(
+                                &root,
+                                &matcher,
+                                Some(WATCHER_EXCLUSION_LIMIT),
+                            )
+                        },
+                    ) {
+                        let replacement_paths = exclusion_state.paths();
+                        let replacement_exclusions = match update {
+                            crate::watcher_filter::WatcherExclusionUpdate::Planned(plan) => {
+                                dropped_paths = watcher_exclusion_paths(&plan.dropped);
+                                plan.selected
+                            }
+                            crate::watcher_filter::WatcherExclusionUpdate::Reduced => exclusions
+                                .iter()
+                                .filter(|entry| {
+                                    replacement_paths.iter().any(|path| path == entry.path())
+                                })
+                                .cloned()
+                                .collect(),
+                        };
                         // Starting a replacement with SinceNow can lose file events
                         // delivered between the old stream's last callback and the
                         // new stream's first callback. A new matcher generation alone
                         // does not require a new stream when its backend exclusions
                         // are unchanged.
-                        if replacement_paths != watcher_exclusion_paths(&exclusions) {
-                            let since_when = last_delivered_id.load(Ordering::Acquire);
-                            #[cfg(test)]
-                            write_during_stream_handoff_for_test(&root);
-                            let replacement = match FsEventsStream::start(
+                        if replacement_paths != previous_paths {
+                            if let Err(error) = replace_stream_exclusions(
+                                &mut stream,
                                 &root,
                                 &replacement_paths,
-                                stream.sender(),
-                                if since_when == 0 {
-                                    fs::kFSEventStreamEventIdSinceNow
-                                } else {
-                                    since_when
-                                },
-                                Arc::clone(&last_delivered_id),
+                                &last_delivered_id,
+                                &tx,
                             ) {
-                                Ok(replacement) => replacement,
-                                Err(error) => {
-                                    let _ = tx.send(Err(error));
-                                    return;
-                                }
-                            };
-                            // The old stream stays active until the replacement
-                            // starts. Replaying from the last delivered event ID
-                            // covers events still buffered by the old stream.
-                            stream = replacement;
-                            if since_when == 0
-                                && tx
-                                    .send(Ok(Event::new(EventKind::Other)
-                                        .set_flag(Flag::Rescan)
-                                        .set_info("rescan: missing event cursor")))
-                                    .is_err()
-                            {
+                                let _ = tx.send(Err(error));
                                 return;
                             }
                         }
-                        observed_generation = generation;
+                        observed_generation = Some(generation);
                         counters.set_backend_exclusions(
-                            observed_generation,
+                            observed_generation.unwrap_or(0),
                             replacement_paths,
-                            watcher_exclusion_paths(&replacement_plan.dropped),
+                            dropped_paths.clone(),
                         );
                         if replacement_exclusions != exclusions {
-                            super::log_exclusions(
-                                &root,
-                                &replacement_exclusions,
-                                observed_generation,
-                            );
+                            super::log_exclusions(&root, &replacement_exclusions, generation);
                             exclusions = replacement_exclusions;
                         }
                     }
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(event) => {
+                            if let Ok(event) = &event {
+                                if !exclusion_state.refresh_event(event).is_empty() {
+                                    let paths = exclusion_state.paths();
+                                    if let Err(error) = replace_stream_exclusions(
+                                        &mut stream,
+                                        &root,
+                                        &paths,
+                                        &last_delivered_id,
+                                        &tx,
+                                    ) {
+                                        let _ = tx.send(Err(error));
+                                        return;
+                                    }
+                                    counters.set_backend_exclusions(
+                                        observed_generation.unwrap_or(0),
+                                        paths,
+                                        dropped_paths.clone(),
+                                    );
+                                    // Writes made while a newly local directory still
+                                    // had an external exclusion may be missing from
+                                    // its replacement event; rescan to recover them.
+                                    if tx
+                                        .send(Ok(Event::new(EventKind::Other)
+                                            .set_flag(Flag::Rescan)
+                                            .set_info("rescan: external watcher boundary changed")))
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
                             if tx.send(event).is_err() {
                                 return;
                             }
@@ -211,6 +246,38 @@ impl ProjectWatcher {
             raw_sender: stream_sender_for_test,
         })
     }
+}
+
+fn replace_stream_exclusions(
+    stream: &mut FsEventsStream,
+    root: &Path,
+    paths: &[PathBuf],
+    last_delivered_id: &Arc<AtomicU64>,
+    tx: &mpsc::Sender<notify::Result<Event>>,
+) -> notify::Result<()> {
+    let since_when = last_delivered_id.load(Ordering::Acquire);
+    #[cfg(test)]
+    write_during_stream_handoff_for_test(root);
+    let replacement = FsEventsStream::start(
+        root,
+        paths,
+        stream.sender(),
+        if since_when == 0 {
+            fs::kFSEventStreamEventIdSinceNow
+        } else {
+            since_when
+        },
+        Arc::clone(last_delivered_id),
+    )?;
+    // Keep the old stream active until its replacement starts, then replay
+    // from its last delivered cursor to cover events buffered during handoff.
+    *stream = replacement;
+    if since_when == 0 {
+        let _ = tx.send(Ok(Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .set_info("rescan: missing event cursor")));
+    }
+    Ok(())
 }
 
 impl Drop for ProjectWatcher {
@@ -764,6 +831,105 @@ mod tests {
         Ok(count)
     }
 
+    fn wait_for_raw_path(rx: &mpsc::Receiver<notify::Result<Event>>, path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("never reported: {}", path.display()))
+                .expect("backend should remain available");
+            if event.paths.iter().any(|reported| reported == path) {
+                return;
+            }
+        }
+    }
+
+    fn symlink_replacement_fixture(
+        starts_as_directory: bool,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        ProjectWatcher,
+        mpsc::Receiver<notify::Result<Event>>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let foo = root.join("foo");
+        if starts_as_directory {
+            std::fs::create_dir(&foo).unwrap();
+        } else {
+            std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+        }
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            root.clone(),
+            Vec::new(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+        )
+        .unwrap();
+        let marker = root.join("ready.rs");
+        std::fs::write(&marker, "ready\n").unwrap();
+        wait_for_raw_path(&rx, &marker);
+        (temp, external, root, watcher, rx)
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fsevents_symlink_replaced_by_source_directory_reports_later_edits() {
+        let (_temp, _external, root, _watcher, rx) = symlink_replacement_fixture(false);
+        let foo = root.join("foo");
+        std::fs::remove_file(&foo).unwrap();
+        std::fs::create_dir(&foo).unwrap();
+        let source = foo.join("source.rs");
+        std::fs::write(&source, "pub fn before() {}\n").unwrap();
+        wait_for_raw_path(&rx, &foo);
+        assert!(!crate::context::watcher_counters_for_root(&root)
+            .backend_exclusions()
+            .paths
+            .contains(&foo));
+        // Drain creation events and journal replay before writing again. A
+        // queued event for the first write must not satisfy the assertion
+        // that the second write is reported.
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+            event.expect("backend should remain available");
+        }
+        std::fs::write(&source, "pub fn after() {}\n").unwrap();
+        wait_for_raw_path(&rx, &source);
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fsevents_symlink_replaced_by_symlink_stays_excluded() {
+        let (_temp, _first, root, _watcher, rx) = symlink_replacement_fixture(false);
+        let second = tempfile::tempdir().unwrap();
+        let foo = root.join("foo");
+        std::fs::remove_file(&foo).unwrap();
+        std::os::unix::fs::symlink(second.path(), &foo).unwrap();
+        wait_for_raw_path(&rx, &foo);
+        assert!(crate::context::watcher_counters_for_root(&root)
+            .backend_exclusions()
+            .paths
+            .contains(&foo));
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fsevents_source_directory_replaced_by_symlink_becomes_excluded() {
+        let (_temp, external, root, _watcher, rx) = symlink_replacement_fixture(true);
+        let foo = root.join("foo");
+        std::fs::remove_dir(&foo).unwrap();
+        std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+        wait_for_raw_path(&rx, &foo);
+        assert!(crate::context::watcher_counters_for_root(&root)
+            .backend_exclusions()
+            .paths
+            .contains(&foo));
+    }
+
     struct LinkedWorktree {
         repository_root: PathBuf,
         path: PathBuf,
@@ -832,6 +998,73 @@ mod tests {
         let wrapped = translate_event(fs::kFSEventStreamEventFlagEventIdsWrapped, path);
         assert!(wrapped[0].need_rescan());
         assert!(translate_event(fs::kFSEventStreamEventFlagHistoryDone, path).is_empty());
+    }
+
+    #[test]
+    fn fsevents_item_topology_flags_refresh_exclusions_even_with_modified_flag() {
+        for (flag, expected_kind) in [
+            (
+                fs::kFSEventStreamEventFlagItemCreated,
+                EventKind::Create(CreateKind::Folder),
+            ),
+            (
+                fs::kFSEventStreamEventFlagItemRemoved,
+                EventKind::Remove(RemoveKind::Folder),
+            ),
+            (
+                fs::kFSEventStreamEventFlagItemRenamed,
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let external = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(temp.path()).unwrap();
+            let foo = root.join("foo");
+            std::os::unix::fs::symlink(external.path(), &foo).unwrap();
+            let selected = derive_excluded_subtrees(&root, &Arc::new(RwLock::new(None)), None);
+            let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &selected);
+            std::fs::remove_file(&foo).unwrap();
+            std::fs::create_dir(&foo).unwrap();
+            let events = translate_event(
+                flag | fs::kFSEventStreamEventFlagItemModified
+                    | fs::kFSEventStreamEventFlagItemIsDir,
+                &foo,
+            );
+            assert!(events.iter().any(|event| event.kind == expected_kind));
+            assert!(events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))));
+            let changed: Vec<_> = events
+                .iter()
+                .flat_map(|event| state.refresh_event(event))
+                .collect();
+            assert_eq!(changed, vec![foo]);
+            assert!(state.paths().is_empty());
+        }
+    }
+
+    #[test]
+    fn fsevents_plain_modified_and_metadata_flags_do_not_probe_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let path = root.join("a/b/c/d/e/source.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "pub fn source() {}\n").unwrap();
+        let mut state = crate::watcher_filter::WatcherExclusionPaths::new(&root, &[]);
+        crate::watcher_filter::EXCLUSION_TEST_LSTATS.with(|calls| calls.set(0));
+        crate::watcher_filter::EXCLUSION_TEST_CLASSIFICATIONS.with(|calls| calls.set(0));
+        for flag in [
+            fs::kFSEventStreamEventFlagItemModified,
+            fs::kFSEventStreamEventFlagItemInodeMetaMod,
+            fs::kFSEventStreamEventFlagItemModified | fs::kFSEventStreamEventFlagItemXattrMod,
+        ] {
+            for event in translate_event(flag, &path) {
+                assert!(state.refresh_event(&event).is_empty());
+            }
+        }
+        crate::watcher_filter::EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 0));
+        crate::watcher_filter::EXCLUSION_TEST_CLASSIFICATIONS
+            .with(|calls| assert_eq!(calls.get(), 0));
     }
 
     #[test]
@@ -1512,7 +1745,8 @@ mod tests {
         let mut builder = GitignoreBuilder::new(&root);
         builder.add(root.join(".gitignore"));
         let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
-        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let plan =
+            derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT)).unwrap();
         let exclusion_paths = watcher_exclusion_paths(&plan.selected);
 
         let (tx, rx) = mpsc::channel();

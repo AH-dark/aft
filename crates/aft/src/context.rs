@@ -1185,7 +1185,19 @@ impl Default for WatcherBackendExclusions {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WatcherExclusionPlanningSnapshot {
+    pub(crate) matcher_generation: u64,
+    pub(crate) attempts: u32,
+    pub(crate) attempt_limit: u32,
+    pub(crate) status: &'static str,
+    pub(crate) last_failure: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WatcherCountersSnapshot {
+    /// None on backends that do not plan exclusions. The exhausted retry budget
+    /// and last planning failure remain visible without further filesystem events.
+    pub(crate) exclusion_planning: Option<WatcherExclusionPlanningSnapshot>,
     /// Successful native stream allocations over this root's process lifetime,
     /// including its auxiliary paths and config-file fallback watch.
     pub(crate) fsevents_stream_creations_total: u64,
@@ -1234,6 +1246,7 @@ pub(crate) struct WatcherCounters {
     last_overflow_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
     observed_exclusion_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
     backend_exclusions: RwLock<WatcherBackendExclusions>,
+    exclusion_planning: RwLock<Option<WatcherExclusionPlanningSnapshot>>,
     rescan_state: AtomicU8,
     rescan_again_reason: AtomicU8,
     rescans_buffer_overflow_total: AtomicU64,
@@ -1420,6 +1433,14 @@ impl WatcherCounters {
         };
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    pub(crate) fn set_exclusion_planning(&self, snapshot: WatcherExclusionPlanningSnapshot) {
+        *self
+            .exclusion_planning
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
+    }
+
     pub(crate) fn backend_exclusions(&self) -> WatcherBackendExclusions {
         self.backend_exclusions
             .read()
@@ -1475,6 +1496,11 @@ impl WatcherCounters {
     pub(crate) fn snapshot(&self) -> WatcherCountersSnapshot {
         let last_rescan_at_ms = self.last_rescan_at_ms.load(Ordering::Acquire);
         WatcherCountersSnapshot {
+            exclusion_planning: self
+                .exclusion_planning
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             fsevents_stream_creations_total: self
                 .fsevents_stream_creations_total
                 .load(Ordering::Relaxed),
