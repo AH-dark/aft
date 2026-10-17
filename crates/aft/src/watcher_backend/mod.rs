@@ -8,6 +8,8 @@ use crate::watcher_filter::SharedGitignore;
 mod fsevents;
 #[cfg(target_os = "linux")]
 mod inotify;
+#[cfg(all(target_os = "linux", test))]
+pub(crate) use inotify::tests::block_watch_walk as block_path_resolution_for_test;
 #[cfg(windows)]
 mod windows;
 

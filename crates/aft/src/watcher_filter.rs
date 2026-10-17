@@ -351,6 +351,8 @@ impl WatcherBatchMetadata {
 }
 
 pub fn canonicalize_watcher_path(path: PathBuf) -> PathBuf {
+    #[cfg(all(target_os = "linux", test))]
+    crate::watcher_backend::block_path_resolution_for_test(&path);
     if let Ok(canonical) = std::fs::canonicalize(&path) {
         return canonical;
     }
@@ -370,6 +372,24 @@ pub(crate) fn watcher_path_is_ignored_by_matcher(
     path: &Path,
     root: &Path,
 ) -> bool {
+    watcher_path_is_ignored_by_matcher_with_kind(matcher, path, root, false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn watcher_directory_is_ignored_by_matcher(
+    matcher: &SharedGitignore,
+    path: &Path,
+    root: &Path,
+) -> bool {
+    watcher_path_is_ignored_by_matcher_with_kind(matcher, path, root, true)
+}
+
+fn watcher_path_is_ignored_by_matcher_with_kind(
+    matcher: &SharedGitignore,
+    path: &Path,
+    root: &Path,
+    is_dir: bool,
+) -> bool {
     if watcher_path_is_infra_skip_under(root, path) {
         return true;
     }
@@ -377,7 +397,7 @@ pub(crate) fn watcher_path_is_ignored_by_matcher(
     let guard = matcher
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    watcher_path_is_ignored(guard.as_deref(), path)
+    watcher_path_is_ignored(guard.as_deref(), path, is_dir)
 }
 
 pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
@@ -389,10 +409,10 @@ pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path:
     let guard = matcher
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    watcher_path_is_ignored(guard.as_deref(), path)
+    watcher_path_is_ignored(guard.as_deref(), path, false)
 }
 
-fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
+fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path, is_dir: bool) -> bool {
     matcher.is_some_and(|matcher| {
         let joined;
         let path = if path.is_relative() {
@@ -401,11 +421,12 @@ fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
         } else {
             path
         };
-        let canonical = std::fs::canonicalize(path).ok();
-        let path = canonical.as_deref().unwrap_or(path);
+        // Event paths and the matcher share the watch root's spelling. Keep
+        // matching lexical: resolving a replacement symlink (including via
+        // is_dir) could wait indefinitely for an unavailable drive.
         path.starts_with(matcher.path())
             && matcher
-                .matched_path_or_any_parents(path, path.is_dir())
+                .matched_path_or_any_parents(path, is_dir)
                 .is_ignore()
     })
 }
@@ -418,12 +439,7 @@ fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
 /// event paths, which are directories by construction, so it states that
 /// instead of asking the filesystem.
 fn watcher_directory_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
-    matcher.is_some_and(|matcher| {
-        let canonical = std::fs::canonicalize(path).ok();
-        let path = canonical.as_deref().unwrap_or(path);
-        path.starts_with(matcher.path())
-            && matcher.matched_path_or_any_parents(path, true).is_ignore()
-    })
+    watcher_path_is_ignored(matcher, path, true)
 }
 
 /// True when `path` is an in-tree ignore rule file inside an ignored directory.
@@ -2567,6 +2583,34 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lexical_matcher_preserves_directory_rules_without_stat() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(root.path());
+        builder.add_line(None, "generated/").unwrap();
+        builder.add_line(None, "*.tmp").unwrap();
+        let matcher = builder.build().unwrap();
+        let generated = root.path().join("generated");
+        assert!(watcher_directory_is_ignored(Some(&matcher), &generated));
+        assert!(!watcher_path_is_ignored(Some(&matcher), &generated, false));
+        assert!(watcher_path_is_ignored(
+            Some(&matcher),
+            &generated.join("source.rs"),
+            false
+        ));
+        assert!(watcher_path_is_ignored(
+            Some(&matcher),
+            Path::new("missing.tmp"),
+            false
+        ));
+        assert!(!watcher_path_is_ignored(
+            Some(&matcher),
+            &root.path().join("source.rs"),
+            false
+        ));
+    }
+
     #[test]
     fn expired_generation_wait_does_not_poll_forever() {
         use super::*;

@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -9,9 +10,9 @@ use notify::event::{CreateKind, Flag, ModifyKind, RenameMode};
 use notify::{ErrorKind, Event, EventKind, RecursiveMode, Watcher};
 
 use crate::watcher_filter::{
-    derive_watcher_exclusion_plan, start_watcher_rebuild, watcher_exclusion_paths,
-    watcher_path_is_ignored_by_matcher, ExclusionPlanUnavailable, SharedGitignore,
-    WATCHER_EXCLUSION_LIMIT,
+    derive_watcher_exclusion_plan, start_watcher_rebuild, watcher_directory_is_ignored_by_matcher,
+    watcher_exclusion_paths, watcher_path_is_ignored_by_matcher, ExclusionPlanUnavailable,
+    SharedGitignore, WATCHER_EXCLUSION_LIMIT,
 };
 
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -113,9 +114,9 @@ impl ProjectWatcher {
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
-        let mut watched_directories = exclusion_state
+        let walked_directories = exclusion_state
             .boundary()
-            .map_or_else(BTreeSet::new, |boundary| {
+            .map_or_else(BTreeMap::new, |boundary| {
                 collect_watch_directories(boundary, &matcher, &exclusion_paths)
             });
         counters.set_backend_exclusions(
@@ -124,14 +125,20 @@ impl ProjectWatcher {
             watcher_exclusion_paths(&plan.dropped),
         );
         let mut installed = BTreeSet::new();
-        for directory in &watched_directories {
-            if watch_directory(&mut watcher, directory, &mut watch, &counters)? {
+        for directory in desired_watch_directories(
+            walked_directories,
+            &BTreeSet::new(),
+            &matcher,
+            &exclusion_paths,
+            &root,
+        ) {
+            if watch_directory(&mut watcher, &directory, &mut watch, &counters)? {
                 installed.insert(directory.clone());
-            } else if directory == &root {
+            } else if directory == root {
                 return Err(notify::Error::path_not_found().add_path(root));
             }
         }
-        watched_directories = installed;
+        let mut watched_directories = installed;
         for path in extra_watch_paths {
             if path.exists() {
                 let _ = watch_directory(&mut watcher, &path, &mut watch, &counters)?;
@@ -178,18 +185,14 @@ impl ProjectWatcher {
                     if let Some(outcome) = pending_rebuild.as_ref().and_then(|work| work.poll()) {
                         pending_rebuild = None;
                         match outcome {
-                            Ok(mut desired) => {
-                                // Events can install new directories while the helper walks.
-                                // Do not discard those watches when its older snapshot arrives.
-                                desired.extend(watched_directories.iter().cloned());
-                                desired.retain(|directory| {
-                                    !exclusion_paths
-                                        .iter()
-                                        .any(|path| directory.starts_with(path))
-                                        && !watcher_path_is_ignored_by_matcher(
-                                            &matcher, directory, &root,
-                                        )
-                                });
+                            Ok(desired) => {
+                                let desired = desired_watch_directories(
+                                    desired,
+                                    &watched_directories,
+                                    &matcher,
+                                    &exclusion_paths,
+                                    &root,
+                                );
                                 watched_directories = match reconcile_watch_directories(
                                     &watched_directories,
                                     &desired,
@@ -279,7 +282,7 @@ impl ProjectWatcher {
                         let walk_matcher = matcher.clone();
                         let walk_exclusions = exclusion_paths.clone();
                         match start_watcher_rebuild(move || {
-                            boundary.map_or_else(BTreeSet::new, |boundary| {
+                            boundary.map_or_else(BTreeMap::new, |boundary| {
                                 collect_watch_directories(
                                     &boundary,
                                     &walk_matcher,
@@ -419,11 +422,13 @@ impl ProjectWatcher {
 
 struct PendingWatchRebuild {
     generation: u64,
-    result: mpsc::Receiver<Result<BTreeSet<PathBuf>, ExclusionPlanUnavailable>>,
+    result: mpsc::Receiver<Result<BTreeMap<PathBuf, DirectoryIdentity>, ExclusionPlanUnavailable>>,
 }
 
 impl PendingWatchRebuild {
-    fn poll(&self) -> Option<Result<BTreeSet<PathBuf>, ExclusionPlanUnavailable>> {
+    fn poll(
+        &self,
+    ) -> Option<Result<BTreeMap<PathBuf, DirectoryIdentity>, ExclusionPlanUnavailable>> {
         match self.result.try_recv() {
             Ok(result) => Some(result),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -566,15 +571,19 @@ fn watch_new_tree(
     mut watch: impl FnMut(&Path) -> notify::Result<bool>,
 ) -> notify::Result<NewDirectoryScan> {
     let project_root = boundary.root();
-    let excluded = |path: &Path| {
+    let excluded = |path: &Path, is_dir| {
         exclusions.iter().any(|excluded| path.starts_with(excluded))
-            || watcher_path_is_ignored_by_matcher(matcher, path, project_root)
+            || if is_dir {
+                watcher_directory_is_ignored_by_matcher(matcher, path, project_root)
+            } else {
+                watcher_path_is_ignored_by_matcher(matcher, path, project_root)
+            }
     };
     let mut stack = vec![root.to_path_buf()];
     let mut found = 0usize;
     let mut scan = NewDirectoryScan::Complete;
     while let Some(directory) = stack.pop() {
-        if excluded(&directory)
+        if excluded(&directory, true)
             || !boundary.allows_directory(&directory)
             || !watched.insert(directory.clone())
         {
@@ -607,7 +616,7 @@ fn watch_new_tree(
                 scan = NewDirectoryScan::Bounded;
                 continue;
             }
-            if excluded(&path) {
+            if excluded(&path, false) {
                 continue;
             }
             found += 1;
@@ -655,27 +664,46 @@ fn reconcile_watch_directories(
     Ok(installed)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        metadata.is_dir().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
 fn collect_watch_directories(
     boundary: &crate::watcher_filter::WatcherWalkBoundary,
     matcher: &SharedGitignore,
     exclusions: &[PathBuf],
-) -> BTreeSet<PathBuf> {
+) -> BTreeMap<PathBuf, DirectoryIdentity> {
     let root = boundary.root().to_path_buf();
-    let mut directories = BTreeSet::new();
+    let mut directories = BTreeMap::new();
     let mut stack = vec![root.clone()];
 
     while let Some(directory) = stack.pop() {
         if exclusions
             .iter()
             .any(|excluded| directory.starts_with(excluded))
-            || watcher_path_is_ignored_by_matcher(matcher, &directory, &root)
+            || watcher_directory_is_ignored_by_matcher(matcher, &directory, &root)
         {
             continue;
         }
         if !boundary.allows_directory(&directory) {
             continue;
         }
-        directories.insert(directory.clone());
+        let Some(identity) = DirectoryIdentity::read(&directory) else {
+            continue;
+        };
+        directories.insert(directory.clone(), identity);
         #[cfg(test)]
         tests::block_watch_walk(&directory);
         let Ok(entries) = crate::watcher_filter::exclusion_read_dir(&directory) else {
@@ -690,8 +718,46 @@ fn collect_watch_directories(
     directories
 }
 
+fn desired_watch_directories(
+    walked: BTreeMap<PathBuf, DirectoryIdentity>,
+    watched: &BTreeSet<PathBuf>,
+    matcher: &SharedGitignore,
+    exclusions: &[PathBuf],
+    root: &Path,
+) -> BTreeSet<PathBuf> {
+    let mut desired = BTreeSet::new();
+    let mut stale = Vec::new();
+    // Parents sort before descendants. Recheck each parent before lstat of its
+    // children, since even lstat follows symlinks in ancestor components.
+    for (directory, identity) in walked {
+        if (directory == root
+            || directory
+                .parent()
+                .is_some_and(|path| desired.contains(path)))
+            && DirectoryIdentity::read(&directory).as_ref() == Some(&identity)
+        {
+            desired.insert(directory);
+        } else {
+            stale.push(directory);
+        }
+    }
+    // Events can install new directories while the helper walks. Keep those
+    // watches, but never restore a stale helper entry through the live set.
+    desired.extend(
+        watched
+            .iter()
+            .filter(|path| !stale.iter().any(|changed| path.starts_with(changed)))
+            .cloned(),
+    );
+    desired.retain(|directory| {
+        !exclusions.iter().any(|path| directory.starts_with(path))
+            && !watcher_directory_is_ignored_by_matcher(matcher, directory, root)
+    });
+    desired
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::{Condvar, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
@@ -709,7 +775,7 @@ mod tests {
         GATES.get_or_init(Mutex::default)
     }
 
-    pub(super) fn block_watch_walk(path: &Path) {
+    pub(crate) fn block_watch_walk(path: &Path) {
         let gate = walk_gates().lock().unwrap().get(path).cloned();
         if let Some(gate) = gate {
             let mut state = gate.state.lock().unwrap();
@@ -727,6 +793,15 @@ mod tests {
     }
 
     impl WalkBlock {
+        fn new(path: PathBuf) -> Self {
+            let gate = Arc::new(WalkGate::default());
+            walk_gates()
+                .lock()
+                .unwrap()
+                .insert(path.clone(), gate.clone());
+            Self { path, gate }
+        }
+
         fn release(&self) {
             self.gate.state.lock().unwrap().0 = true;
             self.gate.changed.notify_all();
@@ -877,6 +952,141 @@ mod tests {
     }
 
     #[test]
+    fn completed_walk_rejects_symlink_replacement_before_apply() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let directory = root.join("collected");
+        let child = directory.join("nested");
+        std::fs::create_dir_all(&child).unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(
+            GitignoreBuilder::new(&root).build().unwrap(),
+        ))));
+        let walked = collect_watch_directories(
+            &crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap(),
+            &matcher,
+            &[],
+        );
+        let target = tempfile::tempdir().unwrap();
+        let moved = target.path().join("moved");
+        std::fs::rename(&directory, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &directory).unwrap();
+        let new_directory = root.join("newly-watched");
+        std::fs::create_dir(&new_directory).unwrap();
+        let desired = desired_watch_directories(
+            walked,
+            &BTreeSet::from([directory.clone(), child.clone(), new_directory.clone()]),
+            &matcher,
+            &[],
+            &root,
+        );
+        let mut installed = BTreeSet::new();
+        reconcile_watch_directories(&BTreeSet::new(), &desired, |path, install| {
+            if install {
+                installed.insert(path.to_path_buf());
+            }
+            Ok(install)
+        })
+        .unwrap();
+        assert!(installed.contains(&root), "unchanged root must be watched");
+        assert!(
+            installed.contains(&new_directory),
+            "new watches must survive"
+        );
+        assert!(
+            !installed.contains(&directory),
+            "stale helper result installed a watch on a replacement symlink"
+        );
+        assert!(
+            !installed.contains(&child),
+            "unchanged child inode below a replacement symlink must not be watched"
+        );
+    }
+
+    #[test]
+    fn completed_walk_rejects_replaced_directory_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let directory = root.join("collected");
+        std::fs::create_dir(&directory).unwrap();
+        let matcher = Arc::new(RwLock::new(None));
+        let walked = collect_watch_directories(
+            &crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap(),
+            &matcher,
+            &[],
+        );
+        std::fs::rename(&directory, root.join("old-directory")).unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            desired_watch_directories(walked, &BTreeSet::new(), &matcher, &[], &root),
+            BTreeSet::from([root]),
+            "a replacement directory must be planned from its own create event"
+        );
+    }
+
+    #[test]
+    fn matcher_symlink_resolution_does_not_block_healthy_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir(root.join("healthy")).unwrap();
+        let mut builder = GitignoreBuilder::new(&root);
+        builder.add_line(None, "*.tmp").unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let (tx, rx) = mpsc::channel();
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let _watcher = ProjectWatcher::create_with_watch(
+            root.clone(),
+            Vec::new(),
+            tx,
+            matcher.clone(),
+            Arc::new(AtomicU64::new(1)),
+            move |watcher, path| {
+                watcher.watch(path, RecursiveMode::NonRecursive)?;
+                installed_tx.send(path.to_path_buf()).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let incoming = tempfile::tempdir().unwrap();
+        std::fs::create_dir(incoming.path().join("tree")).unwrap();
+        let external_target = incoming.path().join("source.rs");
+        std::fs::write(&external_target, "external source").unwrap();
+        std::os::unix::fs::symlink(&external_target, incoming.path().join("tree/link.tmp"))
+            .unwrap();
+        // WalkBlock pauses canonicalize_watcher_path for this link to simulate
+        // an unavailable drive. Its Drop releases the pause before the watcher
+        // joins its backend thread, even when an assertion panics.
+        let link = root.join("incoming/link.tmp");
+        let block = WalkBlock::new(link.clone());
+        std::fs::rename(incoming.path().join("tree"), root.join("incoming")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let installed = installed_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("new directory was not watched");
+            if installed == root.join("incoming") {
+                break;
+            }
+        }
+        let healthy = root.join("healthy/change.rs");
+        std::fs::write(&healthy, "source").unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("healthy folder event stalled behind matcher symlink resolution")
+                .unwrap();
+            if event.paths.contains(&healthy) {
+                break;
+            }
+        }
+        assert_eq!(block.gate.state.lock().unwrap().1, 0);
+        assert!(
+            watcher_path_is_ignored_by_matcher(&matcher, &link, &root),
+            "matcher must use the link's lexical name, not its external target"
+        );
+    }
+
+    #[test]
     fn new_tree_scans_only_directory_creates_renames_and_changed_boundaries() {
         let path = PathBuf::from("/project/deep/source.rs");
         for kind in [
@@ -932,7 +1142,7 @@ mod tests {
         );
         crate::watcher_filter::EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = None);
         let expected = BTreeSet::from([root.clone(), root.join("local")]);
-        assert_eq!(initial, expected);
+        assert_eq!(initial.into_keys().collect::<BTreeSet<_>>(), expected);
         assert_eq!(added, expected);
     }
 
@@ -1017,7 +1227,9 @@ mod tests {
                 &crate::watcher_filter::WatcherWalkBoundary::for_root(&root).unwrap(),
                 &matcher,
                 &[]
-            ),
+            )
+            .into_keys()
+            .collect::<BTreeSet<_>>(),
             BTreeSet::from([root.clone(), root.join("src")])
         );
     }
@@ -1322,7 +1534,9 @@ mod tests {
         crate::watcher_filter::EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
         state.refresh_touched(&[foo.to_path_buf()]);
         assert_eq!(state.paths(), vec![foo.to_path_buf()]);
-        let initial = collect_watch_directories(state.boundary().unwrap(), matcher, &state.paths());
+        let initial = collect_watch_directories(state.boundary().unwrap(), matcher, &state.paths())
+            .into_keys()
+            .collect::<BTreeSet<_>>();
         let (_, added, files) = walk_new_tree(
             root,
             matcher,
