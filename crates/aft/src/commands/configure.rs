@@ -12416,11 +12416,12 @@ mod tests {
         init_git_fixture(&root);
         let canonical_root = std::fs::canonicalize(&root).unwrap();
         let probe_attempts = Arc::new(AtomicUsize::new(0));
+        let (release_probe, probe_release) = mpsc::channel();
         let _probe_guard =
-            crate::search_index::force_git_root_commit_probe_slow_transient_for_paths_for_test(
+            crate::search_index::force_git_root_commit_probe_held_transient_for_paths_for_test(
                 vec![canonical_root.clone()],
-                Duration::from_millis(150),
                 Arc::clone(&probe_attempts),
+                probe_release,
             );
 
         let ctx = Arc::new(AppContext::new(
@@ -12443,26 +12444,56 @@ mod tests {
             }))],
         }));
         let request_id = request.id.clone();
-        let (response_rx, cancellation) = executor.submit_cancellable_async(
+        let (mut response_rx, cancellation) = executor.submit_cancellable_async(
             root_id.clone(),
             crate::executor::Lane::Mutating,
             request_id,
             Box::new(move |ctx| super::handle_configure(&request, ctx)),
         );
+        // Rebound here so it is the last binding and drops first if the test
+        // panics: until it drops, the held probe attempt keeps the executor's
+        // worker busy (the executor joins it on drop) and keeps the
+        // probe-override lock that the probe guard's drop takes.
+        let release_probe = release_probe;
 
-        let probe_deadline = Instant::now() + Duration::from_secs(2);
+        // Cancelling only tests the ladder once the ladder is running, so wait
+        // for the first probe attempt. Everything configure does before it
+        // (real git spawns, storage setup) can take seconds on a loaded Windows
+        // runner, so the wait ends on one of the two events that settle it:
+        // the probe starting, or configure finishing without ever reaching it.
+        // The held stub cannot finish the ladder on its own, so the second
+        // event really does mean the probe was never reached. The deadline is
+        // only a hang guard.
+        let hang_guard = Instant::now() + Duration::from_secs(120);
         while probe_attempts.load(Ordering::SeqCst) == 0 {
+            match response_rx.try_recv() {
+                Ok(response) => panic!(
+                    "configure finished without reaching the stubbed git probe: {}",
+                    response.data
+                ),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!(
+                        "configure dropped its completion sender before the stubbed git probe ran"
+                    )
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            }
             assert!(
-                Instant::now() < probe_deadline,
-                "stubbed git probe did not start"
+                Instant::now() < hang_guard,
+                "configure neither reached the stubbed git probe nor finished"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        // The first attempt is held in flight, so it is the only one counted.
         let attempts_at_cancel = probe_attempts.load(Ordering::SeqCst);
+        assert_eq!(attempts_at_cancel, 1);
         assert_eq!(
             executor.cancel_job(&root_id, &cancellation),
             crate::executor::JobCancelOutcome::RunningSignalled
         );
+        release_probe
+            .send(())
+            .expect("held git probe is waiting for release");
 
         // The probe returns Transient, so an uncancelled configure keeps going
         // round the retry ladder. What cancellation has to do is stop it, and
@@ -12482,11 +12513,12 @@ mod tests {
             });
         assert!(!response.success);
         assert_eq!(response.data["code"], "request_cancelled");
-        // At most the attempt already in flight when the signal landed may
-        // finish; anything beyond that is the ladder continuing past a cancel.
+        // The cancel landed while the first attempt was held in flight, so the
+        // ladder must stop when that attempt returns; any further attempt is
+        // the ladder continuing past a cancel.
         let attempts_after = probe_attempts.load(Ordering::SeqCst);
-        assert!(
-            attempts_after <= attempts_at_cancel + 1,
+        assert_eq!(
+            attempts_after, attempts_at_cancel,
             "cancelled configure kept retrying the git probe: {attempts_at_cancel} attempts at cancel, {attempts_after} after"
         );
     }

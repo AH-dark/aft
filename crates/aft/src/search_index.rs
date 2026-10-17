@@ -7279,23 +7279,34 @@ pub(crate) fn force_git_root_commit_probe_transient_for_paths_for_test(
 }
 
 #[cfg(test)]
-/// Force the git root-commit probe to be slow and transient for the given
-/// roots, counting the attempts it makes.
+/// Force the git root-commit probe to return Transient for the given roots,
+/// counting the attempts it makes and holding the first attempt in flight
+/// until `release` delivers a message or its sender is dropped.
 ///
-/// The count is what lets a caller assert that cancellation actually stopped
-/// the retry ladder: a transient result sends the probe round again, so a
-/// cancelled configure must stop making attempts, which is observable without
-/// reference to how long anything took.
-pub(crate) fn force_git_root_commit_probe_slow_transient_for_paths_for_test(
+/// A transient result sends the probe round the retry ladder again, so a
+/// cancelled configure must stop making attempts. Holding the first attempt
+/// lets a test cancel while that attempt is known to be in flight, so the
+/// attempt count before and after the cancel is fixed by the order of events
+/// rather than by how fast the machine runs. Dropping the sender also releases
+/// the hold, so a test that panics never leaves the probing thread parked.
+pub(crate) fn force_git_root_commit_probe_held_transient_for_paths_for_test(
     roots: Vec<PathBuf>,
-    delay: Duration,
     attempts: Arc<AtomicUsize>,
+    release: std::sync::mpsc::Receiver<()>,
 ) -> GitRootCommitProbeOverrideGuard {
+    let release = Mutex::new(Some(release));
     install_git_root_commit_probe_override_for_test(move |project_root| {
         roots.iter().any(|root| root == project_root).then(|| {
             attempts.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(delay);
-            RootCommitProbe::Transient("stubbed slow git probe".to_string())
+            let first_attempt_hold = release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(release) = first_attempt_hold {
+                // Either outcome ends the hold: a message, or a dropped sender.
+                let _ = release.recv();
+            }
+            RootCommitProbe::Transient("stubbed held git probe".to_string())
         })
     })
 }

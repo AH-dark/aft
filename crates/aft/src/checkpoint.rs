@@ -2242,10 +2242,22 @@ mod tests {
         }
     }
 
+    /// A regular-file checkpoint entry built in memory, the shape a durable
+    /// checkpoint has after loading from disk (no captured metadata or mode).
+    ///
+    /// It deliberately touches no filesystem. Round-tripping through a scratch
+    /// file in the shared system temp directory made unrelated tests fail on
+    /// Windows CI whenever creating that file was refused with "Access is
+    /// denied", which happens there transiently, before any checkpoint code
+    /// runs.
     fn checkpoint_file(content: &str) -> CheckpointFile {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(file.path(), content).unwrap();
-        CheckpointFile::read(file.path()).unwrap()
+        CheckpointFile {
+            metadata: None,
+            mode: None,
+            kind: CheckpointFileKind::Regular {
+                bytes: content.as_bytes().into(),
+            },
+        }
     }
 
     #[cfg(unix)]
@@ -3424,9 +3436,16 @@ mod tests {
     fn checkpoint_restore_failure_removes_created_parent_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let missing_root = dir.path().join("created");
-        let path_a = missing_root.join("nested").join("a.txt");
-        let path_b = dir.path().join("blocking-dir");
-        fs::create_dir(&path_b).unwrap();
+        let nested = missing_root.join("nested");
+        let path_a = nested.join("a.txt");
+        // Neither path exists when the restore snapshots the current state, so
+        // both snapshots succeed and the restore starts writing. Restoring
+        // `path_a` creates `nested` as its parent directory; restoring `path_b`
+        // then fails because `path_b` is that same `nested`, now a directory,
+        // and a regular file cannot be written over it. A directory that
+        // already blocks a path would not do: the pre-restore snapshot refuses
+        // it before anything is written, so no rollback would run at all.
+        let path_b = nested.clone();
 
         let checkpoint = Checkpoint {
             name: "dir-cleanup".to_string(),
@@ -3442,14 +3461,17 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "second restore write should fail on directory"
+            "restoring a regular file over a directory must fail"
         );
         assert!(!path_a.exists(), "restored file should be rolled back");
         assert!(
             !missing_root.exists(),
             "new parent directories should be removed on rollback"
         );
-        assert!(path_b.is_dir(), "pre-existing blocking directory remains");
+        assert!(
+            dir.path().is_dir(),
+            "a parent directory that existed before the restore remains"
+        );
     }
 
     #[cfg(unix)]
