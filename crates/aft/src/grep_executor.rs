@@ -1528,6 +1528,7 @@ fn fallback_grep_with_limits_counted(
     let mut matches = Vec::new();
     let mut batch: Vec<PathBuf> = Vec::with_capacity(256);
     let io_budget = crate::bounded_io::current();
+    let confinement = crate::context::confinement::capture();
 
     let flush_batch = |batch: &mut Vec<PathBuf>, matches: &mut Vec<GrepMatch>| {
         if batch.is_empty() {
@@ -1539,34 +1540,42 @@ fn fallback_grep_with_limits_counted(
             .map_init(
                 || crate::bounded_io::enter(io_budget.clone()),
                 |_scope, file| {
-                    if stop_scan.load(Ordering::Relaxed)
-                        || Instant::now() >= scan_deadline
-                        || job_cancellation
-                            .as_ref()
-                            .is_some_and(|token| token.cancel_requested_before_commit())
-                    {
-                        return None;
-                    }
-                    let file_matches = fallback_search_file(
-                        file,
-                        pattern,
-                        max_results,
-                        stop_after,
-                        &total_matches,
-                        &files_searched,
-                        &files_with_matches,
-                        &truncated,
-                        &engine_capped,
-                        job_cancellation.as_ref(),
-                        Some(scan_deadline),
-                        false,
-                    );
-                    if truncated.load(Ordering::Relaxed)
-                        && total_matches.load(Ordering::Relaxed) >= stop_after
-                    {
-                        stop_scan.store(true, Ordering::Relaxed);
-                    }
-                    (!file_matches.is_empty()).then_some(file_matches)
+                    crate::context::confinement::inherit(confinement.clone(), || {
+                        #[cfg(test)]
+                        assert_eq!(
+                            crate::context::confinement::capture(),
+                            confinement,
+                            "grep scan worker lost the confinement fence"
+                        );
+                        if stop_scan.load(Ordering::Relaxed)
+                            || Instant::now() >= scan_deadline
+                            || job_cancellation
+                                .as_ref()
+                                .is_some_and(|token| token.cancel_requested_before_commit())
+                        {
+                            return None;
+                        }
+                        let file_matches = fallback_search_file(
+                            file,
+                            pattern,
+                            max_results,
+                            stop_after,
+                            &total_matches,
+                            &files_searched,
+                            &files_with_matches,
+                            &truncated,
+                            &engine_capped,
+                            job_cancellation.as_ref(),
+                            Some(scan_deadline),
+                            false,
+                        );
+                        if truncated.load(Ordering::Relaxed)
+                            && total_matches.load(Ordering::Relaxed) >= stop_after
+                        {
+                            stop_scan.store(true, Ordering::Relaxed);
+                        }
+                        (!file_matches.is_empty()).then_some(file_matches)
+                    })
                 },
             )
             .filter_map(|matches| matches)

@@ -506,3 +506,227 @@ fn confined_grants_and_owned_outputs_cannot_escape() {
         }
     }
 }
+
+fn pattern_cases(f: &Fixture) -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "glob-parent-pattern",
+            "glob",
+            json!({"pattern":"../live/**"}),
+        ),
+        (
+            "glob-absolute-pattern",
+            "glob",
+            json!({"pattern":format!("{}/*", f.live.display())}),
+        ),
+        (
+            "glob-nested-parent-pattern",
+            "glob",
+            json!({"pattern":"**/../../live/*"}),
+        ),
+        (
+            "grep-parent-include",
+            "grep",
+            json!({"pattern":"outside_secret|pinned_token", "include":"../live/*"}),
+        ),
+        (
+            "grep-outside-excludes",
+            "grep",
+            json!({"pattern":"outside_secret|pinned_token", "include":"**/*.rs", "exclude":["../live/*", "**/../../live/*", format!("{}/*", f.live.display())]}),
+        ),
+    ]
+}
+
+fn assert_pinned_results(f: &Fixture, name: &str, response: &Response) -> Vec<String> {
+    assert!(response.success, "{name}: {response:?}");
+    assert_eq!(response.data["complete"], true, "{name}: {response:?}");
+    assert_eq!(
+        response.data["fallback"], "filesystem",
+        "{name}: {response:?}"
+    );
+    let paths = if name == "grep" {
+        response.data["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["file"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        response.data["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    for path in &paths {
+        assert!(
+            Path::new(path).starts_with(&f.pin),
+            "{name} escaped through {path}"
+        );
+        assert_eq!(
+            Path::new(path).canonicalize().unwrap(),
+            f.pin.join("only.rs")
+        );
+    }
+    assert!(
+        !serde_json::to_string(response)
+            .unwrap()
+            .contains("outside_secret"),
+        "{name}: {response:?}"
+    );
+    paths
+}
+
+#[test]
+fn confined_patterns_filter_only_pinned_walk_candidates() {
+    let f = Fixture::new();
+    for (case, name, args) in pattern_cases(&f) {
+        let response = f.call(name, args);
+        let paths = assert_pinned_results(&f, name, &response);
+        if case == "grep-outside-excludes" {
+            assert_eq!(paths, [f.pin.join("only.rs").display().to_string()]);
+        } else {
+            assert!(paths.is_empty(), "{case}: {response:?}");
+        }
+    }
+    for name in ["grep", "glob"] {
+        assert_eq!(
+            assert_pinned_results(&f, name, &f.call(name, arguments(name, "."))),
+            [f.pin.join("only.rs").display().to_string()]
+        );
+    }
+}
+
+#[test]
+fn confined_grep_rayon_scans_inherit_fence() {
+    let f = Fixture::new();
+    let response = f.call("grep", arguments("grep", "."));
+    assert_eq!(
+        assert_pinned_results(&f, "grep", &response),
+        [f.pin.join("only.rs").display().to_string()]
+    );
+    assert!(response.data["files_searched"].as_u64().unwrap() > 0);
+}
+
+fn read_on_filesystem_helper(f: &Fixture, input: &str) -> Response {
+    let ctx = Arc::new(context(&f.pin, f.storage.path(), None));
+    ctx.update_config(|config| config.restrict_to_project_root = false);
+    let request = crate::protocol::RawRequest {
+        id: "confine-helper".into(),
+        command: "read".into(),
+        lsp_hints: None,
+        session_id: Some(f.route.session.clone()),
+        params: json!({"file":input}),
+    };
+    let helper_ctx = ctx.clone();
+    let caller_thread = std::thread::current().id();
+    with_call_policy(
+        &ctx,
+        &f.route,
+        &request.id.clone(),
+        "read",
+        json!({}),
+        |_| {
+            crate::bounded_io::run(&f.pin, None, move |_| {
+                assert_ne!(std::thread::current().id(), caller_thread);
+                assert!(
+                    confinement::for_request(&request.id),
+                    "filesystem helper lost the confinement fence"
+                );
+                assert!(helper_ctx.request_force_restrict(&request.id));
+                let asks = confinement::ask_calls();
+                let response = crate::commands::read::handle_read(&request, &helper_ctx);
+                assert_eq!(confinement::ask_calls(), asks);
+                Ok(response)
+            })
+            .unwrap()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn confined_read_helper_inherits_fence_and_refuses_symlink_targets() {
+    let f = Fixture::new();
+    for input in ["escape/sentinel.rs", "escape-file"] {
+        let response = read_on_filesystem_helper(&f, input);
+        assert_eq!(
+            response.data["code"], "path_outside_confined_root",
+            "{response:?}"
+        );
+        assert!(response.data["message"].as_str().unwrap().contains(input));
+        let text = serde_json::to_string(&response).unwrap();
+        assert!(!text.contains(f.live.to_str().unwrap()));
+        assert!(!text.contains("outside_secret"));
+    }
+}
+
+#[test]
+fn confined_in_root_symlink_is_allowed_and_walks_skip_outside_links() {
+    let f = Fixture::new();
+    std::os::unix::fs::symlink("only.rs", f.pin.join("safe-file.rs")).unwrap();
+    for name in ["read", "grep", "glob", "outline"] {
+        let response = f.call(name, arguments(name, "safe-file.rs"));
+        assert!(response.success, "{name}: {response:?}");
+        if name == "read" || name == "outline" {
+            assert!(
+                serde_json::to_string(&response)
+                    .unwrap()
+                    .contains("pinned_token"),
+                "{name}: {response:?}"
+            );
+        } else {
+            assert_eq!(
+                assert_pinned_results(&f, name, &response),
+                [f.pin.join("only.rs").display().to_string()]
+            );
+        }
+    }
+    std::os::unix::fs::symlink("../live/sentinel.rs", f.pin.join("outside-file.rs")).unwrap();
+    for name in ["grep", "glob"] {
+        let response = f.call(name, arguments(name, "."));
+        assert_eq!(
+            assert_pinned_results(&f, name, &response),
+            [f.pin.join("only.rs").display().to_string()]
+        );
+    }
+}
+
+#[test]
+fn confined_review_golden_vectors() {
+    let f = Fixture::new();
+    for (case, name, args) in pattern_cases(&f) {
+        let response = f.call(name, args);
+        assert_pinned_results(&f, name, &response);
+        vector(
+            &f,
+            &format!("review-{case}"),
+            serde_json::to_value(response).unwrap(),
+        );
+    }
+    for (case, input) in [
+        ("directory-symlink", "escape/sentinel.rs"),
+        ("file-symlink", "escape-file"),
+    ] {
+        let response = read_on_filesystem_helper(&f, input);
+        assert_eq!(response.data["code"], "path_outside_confined_root");
+        vector(
+            &f,
+            &format!("review-read-helper-{case}"),
+            serde_json::to_value(response).unwrap(),
+        );
+    }
+    for name in ["grep", "glob"] {
+        let response = f.call(name, arguments(name, "."));
+        assert_eq!(
+            assert_pinned_results(&f, name, &response),
+            [f.pin.join("only.rs").display().to_string()]
+        );
+        vector(
+            &f,
+            &format!("review-{name}-walk-encounters-outside-symlink"),
+            serde_json::to_value(response).unwrap(),
+        );
+    }
+}
