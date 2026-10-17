@@ -8408,7 +8408,7 @@ async fn handle_tool_call(
             return send_provider_error(tx, metrics, frame, error).await;
         }
     }
-    let route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
+    let mut route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
         note_route_tool_call(&identity, metrics);
         let mut call = match serde_json::from_value::<
             cortexkit_role_tool_provider::call::ToolCallRequest,
@@ -8428,19 +8428,8 @@ async fn handle_tool_call(
                 .await
             }
         };
-        let confinement = executor
-            .actor_context(&identity.root)
-            .ok_or_else(|| {
-                subc_protocol::ErrorBody::new(
-                    "confine_policy_unavailable",
-                    "session context unavailable",
-                )
-            })
-            .and_then(|ctx| remote_policy::admit_confined(&ctx, &identity, &call.name));
-        match confinement {
-            Ok(true) if call.name == "aft_outline" => call.name = "outline".into(),
-            Ok(_) => {}
-            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        if let Err(error) = admit_confined_call_name(executor, &identity, &mut call.name) {
+            return send_provider_error(tx, metrics, frame, error).await;
         }
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
             return send_provider_error(tx, metrics, frame, error).await;
@@ -8489,7 +8478,10 @@ async fn handle_tool_call(
         }
     };
     if identity.role == tool_provider::RouteRole::Legacy {
-        if let RouteRequest::ToolCall(call) = &route_request {
+        if let RouteRequest::ToolCall(call) = &mut route_request {
+            if let Err(error) = admit_confined_call_name(executor, &identity, &mut call.name) {
+                return send_provider_error(tx, metrics, frame, error).await;
+            }
             if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
                 return send_provider_error(tx, metrics, frame, error).await;
             }
@@ -8601,20 +8593,6 @@ async fn handle_tool_call(
         }
     };
     let worker_preset = role.is_worker() && call.preset.as_deref() == Some("worker");
-    // A call cannot escape a saved worker fence by claiming another preset or
-    // by sending a tool that was absent from its catalog.
-    let confinement = executor
-        .actor_context(&identity.root)
-        .ok_or_else(|| {
-            subc_protocol::ErrorBody::new(
-                "confine_policy_unavailable",
-                "session context unavailable",
-            )
-        })
-        .and_then(|ctx| remote_policy::admit_confined(&ctx, &identity, &call.name));
-    if let Err(error) = confinement {
-        return send_provider_error(tx, metrics, frame, error).await;
-    }
     if agent_tool && call.preset.is_none() && !scoped_route {
         metrics.record_presetless_tool_call(&identity.harness);
     }
@@ -9884,6 +9862,29 @@ async fn signal_fatal_teardown(
     }
     shutdown.notify_one();
 }
+/// Check a tool call against the route's saved root confinement, before any
+/// admission step that looks a tool up by name, on every route kind.
+///
+/// A call cannot escape a saved worker fence by claiming another preset or by
+/// sending a tool that was absent from its catalog. A confined catalog offers
+/// outline under the public name `aft_outline` (see
+/// `tool_provider::render_catalog`), so a confined call by that name is
+/// renamed to the internal `outline` command here; call-mode admission, the
+/// manifest check and dispatch only know `outline`.
+fn admit_confined_call_name(
+    executor: &Executor,
+    identity: &RouteIdentity,
+    name: &mut String,
+) -> Result<(), subc_protocol::ErrorBody> {
+    let ctx = executor.actor_context(&identity.root).ok_or_else(|| {
+        subc_protocol::ErrorBody::new("confine_policy_unavailable", "session context unavailable")
+    })?;
+    if remote_policy::admit_confined(&ctx, identity, name)? && name == "aft_outline" {
+        *name = "outline".into();
+    }
+    Ok(())
+}
+
 // Keep the management fallback only when typed legacy decoding fails. Ordinary
 // tool calls move their already-parsed arguments into the request without a clone.
 fn decode_legacy_route_request(envelope: Value) -> Result<RouteRequest, SubcError> {

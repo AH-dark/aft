@@ -4523,9 +4523,17 @@ mod route_tests {
         serde_json::from_value(json!({"owner": {"kind": "direct"}, "ref": "scope", "scope_epoch": 1, "kind": kind, "owner_authorized": true})).unwrap()
     }
 
-    #[tokio::test]
-    async fn confined_route_dispatch_uses_saved_policy_and_public_outline_name() {
-        let _guard = EXCHANGE_LOCK.lock().await;
+    /// A scoped worker route on its own project and aft.db, with `pin.rs` in
+    /// the project. The temporary directories must outlive the route.
+    fn worker_route(
+        role: RouteRole,
+        call_mode: subc_protocol::call_mode::CallMode,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<AppContext>,
+        RouteIdentity,
+    ) {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = project.path().canonicalize().unwrap();
@@ -4547,7 +4555,7 @@ mod route_tests {
             project_root: root.clone(),
             harness: "runner".into(),
             session: "designer".into(),
-            role: RouteRole::ToolProviderV1,
+            role,
             trust: BindTrust::FirstParty,
             spawn_principal: AuthenticatedPrincipal::RouteBind {
                 trust: PrincipalTrust::FirstParty,
@@ -4562,21 +4570,46 @@ mod route_tests {
             disabled_tools: Arc::new(vec![]),
             scope: Some(stamp("worker")),
             run_scope: OnceLock::new(),
-            call_mode: subc_protocol::call_mode::CallMode::Classic,
+            call_mode,
             made_tool_call: AtomicBool::new(false),
         }));
-        let metrics = Arc::new(DispatchPathMetrics::new());
+        (project, storage, ctx, identity)
+    }
+
+    /// Fetch the worker catalog with `confine: "root"`, which saves the fence.
+    async fn confine_route(
+        identity: &RouteIdentity,
+        ctx: &Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+    ) {
         let reply = exchange_with_actor(
             json!({"op":"tool.catalog","preset":"worker","params":{"confine":"root"}}),
             identity.clone(),
             ctx.clone(),
-            &metrics,
+            metrics,
             |_, _| panic!("catalog reached file dispatch"),
         )
         .await;
         assert_eq!(reply.header.ty, FrameType::Response);
         let catalog: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(catalog["tools"].as_array().unwrap().len(), 4);
+        let names = catalog["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["read", "grep", "glob", "aft_outline"]);
+    }
+
+    #[tokio::test]
+    async fn confined_route_dispatch_uses_saved_policy_and_public_outline_name() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let (_project, _storage, ctx, identity) = worker_route(
+            RouteRole::ToolProviderV1,
+            subc_protocol::call_mode::CallMode::Classic,
+        );
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        confine_route(&identity, &ctx, &metrics).await;
         let reply = exchange_with_actor(json!({"op":"tool.call", "preset":"worker", "name":"aft_outline", "arguments":{"target":"pin.rs"}}), identity.clone(), ctx.clone(), &metrics, |request, ctx| {
             assert_eq!(request.command, "outline");
             assert!(ctx.request_force_restrict(&request.id));
@@ -4596,6 +4629,62 @@ mod route_tests {
             )
             .await;
             assert_eq!(error_body(&reply).code, "tool_not_offered_confined");
+        }
+    }
+
+    /// A confined catalog offers outline as `aft_outline` on legacy routes
+    /// too. Every route kind and call mode must accept that offered name and
+    /// dispatch the internal `outline` command, while an unconfined worker,
+    /// whose catalog never offered `aft_outline`, is still refused it.
+    #[tokio::test]
+    async fn confined_public_outline_name_runs_on_every_route_and_call_mode() {
+        use subc_protocol::call_mode::CallMode;
+        let _guard = EXCHANGE_LOCK.lock().await;
+        for role in [RouteRole::Legacy, RouteRole::ToolProviderV1] {
+            for mode in [CallMode::Classic, CallMode::Codemode, CallMode::Flow] {
+                let label = format!("{role:?} {mode:?}");
+                let (_project, _storage, ctx, identity) = worker_route(role, mode.clone());
+                let metrics = Arc::new(DispatchPathMetrics::new());
+                let mut body = json!({"preset":"worker", "name":"aft_outline", "arguments":{"target":"pin.rs"}});
+                if role == RouteRole::ToolProviderV1 {
+                    body["op"] = json!("tool.call");
+                }
+                ACTIONS.store(0, Ordering::SeqCst);
+                let reply = exchange_with_actor(
+                    body.clone(),
+                    identity.clone(),
+                    ctx.clone(),
+                    &metrics,
+                    |request, _| {
+                        ACTIONS.fetch_add(1, Ordering::SeqCst);
+                        Response::success(request.id, json!({}))
+                    },
+                )
+                .await;
+                let text = String::from_utf8_lossy(&reply.body);
+                assert_eq!(ACTIONS.load(Ordering::SeqCst), 0, "{label} unconfined: {text}");
+                assert!(
+                    text.contains("unknown_tool") || text.contains("call_mode_unsupported"),
+                    "{label} unconfined: {text}"
+                );
+
+                confine_route(&identity, &ctx, &metrics).await;
+                let reply = exchange_with_actor(
+                    body,
+                    identity.clone(),
+                    ctx.clone(),
+                    &metrics,
+                    |request, ctx| {
+                        assert_eq!(request.command, "outline");
+                        assert!(ctx.request_force_restrict(&request.id));
+                        crate::commands::outline::handle_outline(&request, ctx)
+                    },
+                )
+                .await;
+                let text = String::from_utf8_lossy(&reply.body);
+                assert_eq!(reply.header.ty, FrameType::Response, "{label}: {text}");
+                assert!(text.contains("pinned_symbol"), "{label}: {text}");
+            }
         }
     }
 
