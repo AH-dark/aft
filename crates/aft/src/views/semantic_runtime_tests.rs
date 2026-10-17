@@ -1377,6 +1377,7 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
     runtime.driver().take_reconcile_work();
     runtime.plane().take_source_reads();
     let schedule = fast_schedule(root.path());
+    let cold = Arc::clone(&schedule.limiter);
     let held = schedule.limiter.try_acquire().unwrap();
     let (tx, rx) = crossbeam_channel::bounded(1);
     let worker = {
@@ -1401,10 +1402,21 @@ fn small_chunk_reuse_fill_completes_with_cold_cap_held() {
                 .unwrap();
         })
     };
-    let completed = rx.recv_timeout(Duration::from_secs(2));
-    if completed.is_err() {
-        slot.clear();
-    }
+    // Decide by what the fill does, not by how long it takes: it either
+    // finishes, or it queues on the held cold-build cap, which is the defect.
+    // A slow machine only makes the loop run longer; the test runner's
+    // overall timeout bounds a genuine hang elsewhere.
+    let completed = loop {
+        match rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(result) => break Some(result),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break None,
+        }
+        if !cold.census().queued.is_empty() {
+            slot.clear();
+            break None;
+        }
+    };
     drop(held);
     worker.join().unwrap();
     let (settled, lines) = completed.expect("reuse-only fill waited for the cold-build cap");
