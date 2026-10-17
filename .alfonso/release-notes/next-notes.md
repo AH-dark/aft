@@ -13,6 +13,7 @@
 - Callgraph stores sweep orphaned build temporaries (age-based, both layouts).
 - OpenCode 2 now requires 2.0.29 or newer. Permission prompts run in-process through OpenCode's own permission check, including on standalone hosts and hosts without a readable server password, and edit prompts keep the built-in diff view. The `opencode.server_url` and `opencode.server_password_env` settings are removed; `npx @cortexkit/aft doctor --fix` deletes them.
 - File watching no longer hangs on a project whose build folder is a link to an unresponsive or disconnected drive. Linked folders and folders on other drives are left out of watching without being opened.
+- Semantic search: when Synapse announces a timed embedding-model pause (`lane_paused`), indexing waits it out and resumes where it stopped instead of failing or re-embedding finished work, without holding build slots or locks. Searches meanwhile use keyword search with "Semantic search unavailable: the embedding model is paused; using keyword search only.", and health shows the semantic index as paused until the announced time.
 
 ## Sandbox profiles
 
