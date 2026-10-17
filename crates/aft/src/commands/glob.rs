@@ -301,6 +301,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         serde_json::Value::String("filesystem".to_string())
     };
     crate::views::parent::attach_gaps(&mut body, parent_gaps);
+    crate::context::confinement::disclose_denied(&mut body);
 
     let rendered_count =
         crate::subc_format::report_rendered_row_count("glob", &body).unwrap_or(files.len());

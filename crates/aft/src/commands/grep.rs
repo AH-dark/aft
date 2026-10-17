@@ -290,6 +290,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         serde_json::Value::String("filesystem".to_string())
     };
     crate::views::parent::attach_gaps(&mut body, parent_gaps);
+    crate::context::confinement::disclose_denied(&mut body);
 
     if let Some(envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
         body["matches_list_envelope"] = serde_json::to_value(&envelope).unwrap_or_default();

@@ -4662,7 +4662,11 @@ mod route_tests {
                 )
                 .await;
                 let text = String::from_utf8_lossy(&reply.body);
-                assert_eq!(ACTIONS.load(Ordering::SeqCst), 0, "{label} unconfined: {text}");
+                assert_eq!(
+                    ACTIONS.load(Ordering::SeqCst),
+                    0,
+                    "{label} unconfined: {text}"
+                );
                 assert!(
                     text.contains("unknown_tool") || text.contains("call_mode_unsupported"),
                     "{label} unconfined: {text}"

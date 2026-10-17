@@ -857,6 +857,12 @@ fn fallback_target_walk_builder(
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(search_root).ok();
+    // A confined walk loads none of the crate's ignore files (see
+    // `apply_project_ignore_rules`); it applies the confined root's own
+    // ignore files here and checks every entry against the read policy.
+    let confined = crate::context::confinement::ConfinedIgnoreRules::current(
+        crate::context::confinement::SEARCH_IGNORE_FILES,
+    );
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
@@ -871,7 +877,8 @@ fn fallback_target_walk_builder(
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
                 return false;
             }
-            if entry.depth() > 0 && file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
+            let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
+            if entry.depth() > 0 && is_dir {
                 match boundary
                     .as_ref()
                     .map(|boundary| boundary.should_descend(entry.path()))
@@ -885,8 +892,8 @@ fn fallback_target_walk_builder(
                 }
             }
             let name = entry.file_name().to_string_lossy();
-            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
-                let descend = !matches!(
+            let keep = if is_dir {
+                !matches!(
                     name.as_ref(),
                     "node_modules"
                         | "target"
@@ -897,10 +904,27 @@ fn fallback_target_walk_builder(
                         | ".tox"
                         | "dist"
                         | "build"
-                );
-                return descend && crate::bounded_io::probe_directory(entry.path(), None).is_ok();
+                )
+            } else {
+                !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            };
+            if !keep {
+                return false;
             }
-            !crate::os_metadata::is_os_metadata_file_name(entry.file_name())
+            // Checked before the directory is opened, and only for entries
+            // the walk would otherwise keep, so a denial is never counted for
+            // a path the walk skips anyway. Symlinks are never followed, so
+            // they need no read check.
+            if let Some(confined) = &confined {
+                let is_file = file_type.as_ref().is_some_and(std::fs::FileType::is_file);
+                if entry.depth() > 0
+                    && (is_dir || is_file)
+                    && (confined.is_ignored(entry.path(), is_dir) || !confined.admits(entry.path()))
+                {
+                    return false;
+                }
+            }
+            !is_dir || crate::bounded_io::probe_directory(entry.path(), None).is_ok()
         });
     if ignored_target {
         // Like outline, an explicitly ignored target also honors Git rules

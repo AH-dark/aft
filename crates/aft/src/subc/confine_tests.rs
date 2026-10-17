@@ -198,6 +198,119 @@ fn confined_keeps_in_root_denial_floors() {
         .contains("pinned_token"));
 }
 
+/// A pinned tree holding a `sandbox.read_deny` file and a denied directory
+/// beside readable files.
+fn denied_tree() -> Fixture {
+    let f = Fixture::new();
+    std::fs::write(
+        f.pin.join("secret.rs"),
+        "fn pinned_token() {} // denied_bytes\n",
+    )
+    .unwrap();
+    std::fs::create_dir(f.pin.join("vault")).unwrap();
+    std::fs::write(
+        f.pin.join("vault/inner.rs"),
+        "fn pinned_token() {} // denied_bytes\n",
+    )
+    .unwrap();
+    std::fs::create_dir(f.pin.join("open")).unwrap();
+    std::fs::write(f.pin.join("open/kept.rs"), "fn pinned_token() {}\n").unwrap();
+    f.ctx.update_config(|config| {
+        config.sandbox.read_deny = vec![f.pin.join("secret.rs"), f.pin.join("vault")]
+    });
+    f
+}
+
+fn directory_walks() -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        ("grep", "grep", arguments("grep", ".")),
+        ("glob", "glob", arguments("glob", ".")),
+        ("outline-directory", "outline", json!({"target":"."})),
+        (
+            "outline-files",
+            "outline",
+            json!({"target":".", "files":true}),
+        ),
+    ]
+}
+
+#[test]
+fn confined_directory_walks_skip_denied_files_without_reading_them() {
+    let f = denied_tree();
+    let watches = [
+        crate::bounded_io::tests::watch_opens(&f.pin.join("secret.rs")),
+        crate::bounded_io::tests::watch_opens(&f.pin.join("vault/inner.rs")),
+    ];
+    let kept = crate::bounded_io::tests::watch_opens(&f.pin.join("open/kept.rs"));
+    for (case, name, args) in directory_walks() {
+        let response = f.call(name, args);
+        assert!(response.success, "{case}: {response:?}");
+        let native = serde_json::to_string(&response).unwrap();
+        let text = crate::subc_format::format_response(name, &response, false);
+        for forbidden in ["secret.rs", "vault", "denied_bytes"] {
+            assert!(!native.contains(forbidden), "{case}: {native}");
+            assert!(!text.contains(forbidden), "{case}: {text}");
+        }
+        // The walk still ran: readable files beside the denied ones are listed.
+        assert!(native.contains("kept.rs"), "{case}: {native}");
+        // Both denied paths are counted, in the native reply and its text.
+        assert_eq!(response.data["skipped_denied"], 2, "{case}: {native}");
+        assert!(
+            text.contains("2 path(s) under the walked directory are denied by the read policy"),
+            "{case}: {text}"
+        );
+    }
+    for watch in &watches {
+        assert_eq!(watch.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+    // The open counter does see the walks reading an admitted file.
+    assert!(kept.opens.load(std::sync::atomic::Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn confined_directory_walk_golden_vectors() {
+    let f = denied_tree();
+    for (case, name, args) in directory_walks() {
+        let response = f.call(name, args);
+        assert!(response.success, "{case}: {response:?}");
+        let text = crate::subc_format::format_response(name, &response, false);
+        vector(
+            &f,
+            &format!("deny-{case}"),
+            json!({"native":serde_json::to_value(response).unwrap(),"text":text}),
+        );
+    }
+}
+
+#[test]
+fn confined_walks_honor_only_the_pinned_trees_own_ignore_files() {
+    let f = Fixture::new();
+    // Rules outside the pinned tree must not hide `only.rs`.
+    std::fs::write(f.repo.path().join(".gitignore"), "only.rs\n").unwrap();
+    std::fs::write(f.pin.join(".gitignore"), "tree_ignored.rs\n").unwrap();
+    std::fs::create_dir(f.pin.join("nested")).unwrap();
+    std::fs::write(f.pin.join("nested/.gitignore"), "nested_ignored.rs\n").unwrap();
+    for path in [
+        "tree_ignored.rs",
+        "nested/nested_ignored.rs",
+        "nested/kept.rs",
+    ] {
+        std::fs::write(f.pin.join(path), "fn pinned_token() {}\n").unwrap();
+    }
+    for (case, name, args) in directory_walks() {
+        let response = f.call(name, args);
+        assert!(response.success, "{case}: {response:?}");
+        let native = serde_json::to_string(&response).unwrap();
+        for forbidden in ["tree_ignored.rs", "nested_ignored.rs"] {
+            assert!(!native.contains(forbidden), "{case}: {native}");
+        }
+        for expected in ["only.rs", "kept.rs"] {
+            assert!(native.contains(expected), "{case}: {native}");
+        }
+        assert!(response.data.get("skipped_denied").is_none(), "{case}");
+    }
+}
+
 #[test]
 fn confined_call_time_tool_check() {
     let f = Fixture::new();

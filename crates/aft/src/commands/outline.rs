@@ -128,21 +128,20 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             files.len(),
             walk_incomplete,
         );
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "text": rendered.text,
-                "discovered": true,
-                "complete": !walk_incomplete && !rendered.truncated,
-                "output_truncated": rendered.truncated,
-                "files_shown": rendered.shown,
-                "structure_footer": rendered.footer,
-                "walk_truncated": discovery.walk_truncated,
-                "collection_truncated": discovery.collection_truncated,
-                "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
-                "skipped_files": skipped_files,
-            }),
-        );
+        let mut body = serde_json::json!({
+            "text": rendered.text,
+            "discovered": true,
+            "complete": !walk_incomplete && !rendered.truncated,
+            "output_truncated": rendered.truncated,
+            "files_shown": rendered.shown,
+            "structure_footer": rendered.footer,
+            "walk_truncated": discovery.walk_truncated,
+            "collection_truncated": discovery.collection_truncated,
+            "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
+            "skipped_files": skipped_files,
+        });
+        crate::context::confinement::disclose_denied(&mut body);
+        return Response::success(&req.id, body);
     }
 
     // Multi-file mode: if "files" array is present, outline each file
@@ -1138,6 +1137,9 @@ struct OutlineFileDiscovery {
 struct OutlineIgnoreStack {
     matchers: Vec<Arc<ignore::gitignore::Gitignore>>,
     target_root: PathBuf,
+    /// Set for a confined walk, which uses only the confined root's own
+    /// ignore files and checks entries against the read policy.
+    confined: Option<Arc<crate::context::confinement::ConfinedIgnoreRules>>,
 }
 
 impl OutlineIgnoreStack {
@@ -1148,8 +1150,11 @@ impl OutlineIgnoreStack {
             ..Self::default()
         };
         // Ignore discovery can open global files, ancestors, or symlinks outside
-        // the pinned tree. Confined outlines use only the walked entries.
+        // the pinned tree. Confined outlines read only the root's own files.
         if crate::context::confinement::active() {
+            stack.confined = crate::context::confinement::ConfinedIgnoreRules::current(
+                crate::context::confinement::OUTLINE_FILES_IGNORE_FILES,
+            );
             return stack;
         }
 
@@ -1189,6 +1194,9 @@ impl OutlineIgnoreStack {
     }
 
     fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        if let Some(confined) = &self.confined {
+            return confined.is_ignored(path, is_dir);
+        }
         let mut ignored = false;
         for matcher in &self.matchers {
             let mut current = path;
@@ -1212,6 +1220,14 @@ impl OutlineIgnoreStack {
             }
         }
         ignored
+    }
+
+    /// The confined read policy check for a walked entry; unconfined walks
+    /// admit everything.
+    fn admits(&self, path: &Path) -> bool {
+        self.confined
+            .as_ref()
+            .map_or(true, |confined| confined.admits(path))
     }
 }
 
@@ -1444,6 +1460,7 @@ fn handle_outline_files_mode(
     if let Some(env) = envelope {
         response_data["files_list_envelope"] = serde_json::to_value(&env).unwrap();
     }
+    crate::context::confinement::disclose_denied(&mut response_data);
     Response::success(&req.id, response_data)
 }
 
@@ -1895,6 +1912,8 @@ fn cached_symbol_count(
 }
 
 fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileContentStats> {
+    #[cfg(all(test, unix))]
+    crate::bounded_io::tests::note_open(path);
     let mut file = std::fs::File::open(path)?;
     let mut sample = [0u8; BINARY_SAMPLE_BYTES];
     let sample_len = file.read(&mut sample)?;
@@ -2433,6 +2452,11 @@ fn collect_outline_files_with_device_lookup<F>(
     let skipped_mounts = Arc::new(AtomicUsize::new(0));
     let boundary_failed = Arc::new(AtomicBool::new(false));
     let mut builder = outline_target_walk_builder(directory);
+    // A confined walk loads none of the crate's ignore files; it applies the
+    // confined root's own ignore files and the read policy here instead.
+    let confined = crate::context::confinement::ConfinedIgnoreRules::current(
+        crate::context::confinement::OUTLINE_IGNORE_FILES,
+    );
     {
         let skipped_mounts = Arc::clone(&skipped_mounts);
         let boundary_failed = Arc::clone(&boundary_failed);
@@ -2451,10 +2475,19 @@ fn collect_outline_files_with_device_lookup<F>(
                 return false;
             }
             if !file_type.is_dir() {
-                return true;
+                return confined.as_ref().map_or(true, |confined| {
+                    !file_type.is_file()
+                        || (!confined.is_ignored(entry.path(), false)
+                            && confined.admits(entry.path()))
+                });
             }
             if should_skip_directory(entry.path()) {
                 return false;
+            }
+            if let Some(confined) = &confined {
+                if confined.is_ignored(entry.path(), true) || !confined.admits(entry.path()) {
+                    return false;
+                }
             }
             match boundary.should_descend_with(entry.path(), device_lookup) {
                 Ok(true) => true,
@@ -2571,6 +2604,9 @@ fn collect_outline_files_breadth_first_with_device_lookup(
                 *ignored_entries += 1;
                 continue;
             }
+            if !ignore_stack.admits(&path) {
+                continue;
+            }
             match boundary.should_descend(&path) {
                 Ok(true) => {
                     directories.push(path.to_string_lossy().to_string());
@@ -2589,10 +2625,10 @@ fn collect_outline_files_breadth_first_with_device_lookup(
                 *walk_truncated = true;
                 return entries_examined;
             }
-            if !ignore_stack.is_ignored(&path, false) {
-                files.push(path.to_string_lossy().to_string());
-            } else {
+            if ignore_stack.is_ignored(&path, false) {
                 *ignored_entries += 1;
+            } else if ignore_stack.admits(&path) {
+                files.push(path.to_string_lossy().to_string());
             }
         }
         if *collection_truncated {
