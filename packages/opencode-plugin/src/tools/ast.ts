@@ -38,11 +38,15 @@ async function checkAstPathsPermission(
   ctx: PluginContext,
   context: Parameters<ToolDefinition["execute"]>[1],
   paths: string[] | undefined,
+  serverValidatedRead = false,
 ): Promise<string | undefined> {
   if (paths === undefined) return undefined;
   const uniquePaths = Array.from(new Set(paths));
   for (const p of uniquePaths) {
-    const denial = await assertExternalDirectoryPermission(ctx, context, p, { kind: "directory" });
+    const denial = await assertExternalDirectoryPermission(ctx, context, p, {
+      kind: "directory",
+      serverValidatedRead,
+    });
     if (denial) return denial;
   }
   return undefined;
@@ -83,7 +87,7 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     },
     execute: async (args, context): Promise<string> => {
       const paths = await resolveAstPaths(ctx, context, args.paths);
-      const externalDenied = await checkAstPathsPermission(ctx, context, paths);
+      const externalDenied = await checkAstPathsPermission(ctx, context, paths, true);
       if (externalDenied) return permissionDeniedResponse(externalDenied);
 
       const rawArgs: Record<string, unknown> = {

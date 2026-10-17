@@ -1,0 +1,12 @@
+{
+  "fixtures": [
+    "harness-goldens",
+    "crates/aft/src/commands/glob.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "packages/opencode-plugin/src/__tests__/e2e/glob-conflicts-toolcall.test.ts"
+  ],
+  "kind": "harness",
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "note": "Exact-file glob matching now uses the file's parent as the pattern root while retaining file-only containment. search_index.rs is ranking-fenced, but glob discovery does not feed search ranking; evaluation must reproduce byte-identical ranked rows."
+}

@@ -28,7 +28,7 @@ import {
   textResult,
   withPathAliasPreparation,
 } from "./_shared.js";
-import { assertExternalDirectoryPermission, resolvePathArg, whenGhReadEnabled } from "./hoisted.js";
+import { assertExternalReadPermission, resolvePathArg, whenGhReadEnabled } from "./hoisted.js";
 import {
   accentPath,
   asRecord,
@@ -126,9 +126,7 @@ async function assertReadPathPermissions(
   for (const target of targets) {
     if (!target || checked.has(target)) continue;
     checked.add(target);
-    await assertExternalDirectoryPermission(extCtx, target, {
-      restrictToProjectRoot: ctx.config.restrict_to_project_root ?? false,
-    });
+    await assertExternalReadPermission(ctx, extCtx, target);
   }
 }
 

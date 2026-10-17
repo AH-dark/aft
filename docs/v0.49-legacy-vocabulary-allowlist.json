@@ -6108,12 +6108,12 @@
     },
     {
       "path": "packages/pi-plugin/src/tools/hoisted.ts",
-      "line": 874,
+      "line": 644,
       "column": 59,
       "token": "filePath",
-      "text": "await assertExternalDirectoryPermission(extCtx, filePath, {",
-      "location": "line 874, column 59",
-      "ordinal": 3,
+      "text": "await assertExternalReadPermission(ctx, extCtx, filePath, surface.restrictToProjectRoot);",
+      "location": "line 644, column 59",
+      "ordinal": 1,
       "class": "compatibility-boundary",
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
     },

@@ -14,7 +14,11 @@ import type {
 import { type Static, Type } from "typebox";
 import type { PluginContext } from "../types.js";
 import { bridgeFor, callToolCall, isEmptyParam, optionalInt, textResult } from "./_shared.js";
-import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
+import {
+  assertExternalDirectoryPermission,
+  assertExternalReadPermission,
+  resolvePathArg,
+} from "./hoisted.js";
 import {
   asNumber,
   asRecord,
@@ -134,13 +138,18 @@ async function assertAstPathsPermission(
   extCtx: ExtensionContext,
   paths: string[] | undefined,
   restrictToProjectRoot: boolean,
+  readContext?: PluginContext,
 ): Promise<void> {
   if (paths === undefined || paths.length === 0) return;
   const checked = new Set<string>();
   for (const path of paths) {
     if (checked.has(path)) continue;
     checked.add(path);
-    await assertExternalDirectoryPermission(extCtx, path, { restrictToProjectRoot });
+    if (readContext) {
+      await assertExternalReadPermission(readContext, extCtx, path, restrictToProjectRoot);
+    } else {
+      await assertExternalDirectoryPermission(extCtx, path, { restrictToProjectRoot });
+    }
   }
 }
 
@@ -336,7 +345,12 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         extCtx,
       ) {
         const paths = await resolveAstPaths(extCtx, params.paths);
-        await assertAstPathsPermission(extCtx, paths, ctx.config.restrict_to_project_root ?? false);
+        await assertAstPathsPermission(
+          extCtx,
+          paths,
+          ctx.config.restrict_to_project_root ?? false,
+          ctx,
+        );
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const rawArgs: Record<string, unknown> = {

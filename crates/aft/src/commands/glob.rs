@@ -599,6 +599,62 @@ fn format_directory_label(directory: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
+    fn exact_file_glob_fixture() -> (tempfile::TempDir, AppContext, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        let file = project.join("src/main.ts");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "export const main = 1;\n").unwrap();
+        std::fs::write(project.join("src/other.ts"), "export const other = 2;\n").unwrap();
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project.clone()),
+                ..Default::default()
+            },
+        );
+        (dir, ctx, project, file)
+    }
+
+    #[test]
+    fn exact_file_glob_with_ready_index_matches_basename_without_widening_scope() {
+        let (_dir, ctx, project, file) = exact_file_glob_fixture();
+        let index = crate::search_index::SearchIndex::build(&project);
+        assert!(index.is_ready());
+        assert!(index.snapshot().has_file_in_scope(&file));
+        *ctx.search_index().write().unwrap() = Some(index);
+
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false);
+        assert_eq!(discovery.source, "index");
+        assert!(!discovery.walk_truncated);
+        assert_eq!(discovery.files, vec![file.clone()]);
+        assert_eq!(
+            glob_root(&ctx, &project, &file, "*.ts", 100, false).files,
+            vec![file.clone()]
+        );
+        assert!(glob_root(&ctx, &project, &file, "other.ts", 100, false)
+            .files
+            .is_empty());
+    }
+
+    #[test]
+    fn exact_file_glob_fallback_matches_basename_without_widening_scope() {
+        let (_dir, ctx, project, file) = exact_file_glob_fixture();
+        assert!(ctx.search_index().read().unwrap().is_none());
+
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false);
+        assert_eq!(discovery.source, "fallback");
+        assert!(!discovery.walk_truncated);
+        assert_eq!(discovery.files, vec![file.clone()]);
+        assert_eq!(
+            glob_root(&ctx, &project, &file, "*.ts", 100, false).files,
+            vec![file.clone()]
+        );
+        assert!(glob_root(&ctx, &project, &file, "other.ts", 100, false)
+            .files
+            .is_empty());
+    }
+
     #[test]
     fn perf_audit_glob_only_touches_returned_page() {
         let dir = tempfile::tempdir().unwrap();

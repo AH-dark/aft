@@ -195,6 +195,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
             target.target,
             {
               kind: target.kind,
+              serverValidatedRead: true,
             },
           );
           if (externalDenied) return permissionDeniedResponse(externalDenied);
@@ -269,7 +270,12 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
             globPattern = `**/${globPattern.slice(lastSlash + 1)}`;
           }
         } else if (metaIdx === -1) {
-          globPath = path.dirname(globPattern);
+          // Keep an exact file as the scope: its parent may contain artifacts
+          // owned by other sessions and cannot inherit the file's permission.
+          globPath =
+            searchPathKind(projectRoot, globPattern, "directory") === "file"
+              ? globPattern
+              : path.dirname(globPattern);
           globPattern = path.basename(globPattern);
         }
       }
@@ -291,6 +297,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
             target.target,
             {
               kind: target.kind,
+              serverValidatedRead: true,
             },
           );
           if (externalDenied) return permissionDeniedResponse(externalDenied);

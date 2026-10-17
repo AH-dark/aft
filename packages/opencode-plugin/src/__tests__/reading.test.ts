@@ -184,7 +184,7 @@ describe("reading tool adapters", () => {
     expect(externalAsks).toHaveLength(1);
     expect(externalAsks[0]?.patterns).toEqual([join(external, "*").replaceAll("\\", "/")]);
     expect(externalAsks[0]?.metadata?.filepath).toBe(external);
-    expect(sendCalls).toEqual([]);
+    expect(sendCalls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
     expect(toolCallCalls[0]).toMatchObject({
       sessionId: "reading-session",
       name: "outline",
@@ -218,7 +218,10 @@ describe("reading tool adapters", () => {
       join(first, "*").replaceAll("\\", "/"),
       join(second, "*").replaceAll("\\", "/"),
     ]);
-    expect(sendCalls).toEqual([]);
+    expect(sendCalls.map((call) => call.command)).toEqual([
+      "bash_artifact_owned",
+      "bash_artifact_owned",
+    ]);
     expect(toolCallCalls[0]).toMatchObject({
       sessionId: "reading-session",
       name: "outline",

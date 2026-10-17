@@ -5,9 +5,8 @@
  * knob, deliberately NOT conflated with any per-call permission prompt. Pi has
  * no host-level permission/allow-list to bubble to, so the knob is binary:
  *   - restrict_to_project_root: true  → ordinary out-of-root paths are
- *     HARD-BLOCKED before any bridge call. Hoisted reads are forwarded so Rust
- *     can recognize exact session-owned bash artifacts without duplicating its
- *     task registry in this plugin; Rust rejects every other external read.
+ *     HARD-BLOCKED before the tool runs. Read-only tools first query Rust's
+ *     registry to allow exact session-owned bash artifacts, not their directories.
  *   - restrict_to_project_root: false → external paths are allowed; the tool
  *     proceeds to the bridge (Rust accepts them).
  * In-root paths are always allowed and never blocked.
@@ -173,7 +172,7 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
     }
   });
 
-  test("restrict=true routes hoisted reads to Rust but blocks write/edit/grep external paths", async () => {
+  test("restrict=true blocks unowned hoisted reads and write/edit external paths", async () => {
     const pathForms = [
       "/outside/hoisted.ts",
       "../outside/hoisted.ts",
@@ -206,15 +205,13 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
           entry.params(form),
           makeExtContext(projectRoot),
         );
-        if (entry.toolName === "read") {
-          await execution;
+        await expect(execution).rejects.toThrow(BLOCK_MESSAGE);
+        if (entry.toolName === "read" || entry.toolName === "grep") {
           expect(calls).toHaveLength(1);
           expect(calls[0]).toMatchObject({
-            command: "tool_call",
-            params: { name: "read" },
+            command: "bash_artifact_owned",
           });
         } else {
-          await expect(execution).rejects.toThrow(BLOCK_MESSAGE);
           expect(calls).toHaveLength(0);
         }
       }
@@ -273,5 +270,101 @@ describe("AFT external-directory isolation (restrict_to_project_root)", () => {
     expect(
       calls.some((call) => call.command === "tool_call" && call.params.name === "import"),
     ).toBe(false);
+  });
+});
+
+describe("session-owned bash artifact reads", () => {
+  const artifact = "/aft-pi-artifact-fixture/bash-tasks/session/task/io/stdout";
+  const readers = [
+    { name: "read", args: (p: string) => ({ path: p }) },
+    { name: "grep", args: (p: string) => ({ path: p, pattern: "task" }) },
+    { name: "aft_outline", args: (p: string) => ({ target: p }) },
+    { name: "aft_zoom", args: (p: string) => ({ path: p, symbols: "task" }) },
+    { name: "aft_callgraph", args: (p: string) => ({ path: p, op: "callers", symbol: "task" }) },
+    { name: "aft_inspect", args: (p: string) => ({ scope: p, sections: ["todos"] }) },
+    {
+      name: "ast_grep_search",
+      args: (p: string) => ({ paths: [p], lang: "rust", pattern: "fn $F() { $$$ }" }),
+    },
+  ];
+
+  function harness() {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge((command, params) =>
+      command === "bash_artifact_owned"
+        ? {
+            success: true,
+            owned: params.path === artifact && params.session_id === "artifact-owner",
+          }
+        : { success: true, text: "task output" },
+    );
+    const ctx = restrictedContext(bridge);
+    registerHoistedTools(api, ctx, {
+      hoistRead: true,
+      hoistWrite: true,
+      hoistEdit: true,
+      hoistGrep: true,
+      restrictToProjectRoot: true,
+    });
+    registerReadingTools(api, ctx, { outline: true, zoom: true });
+    registerNavigateTool(api, ctx);
+    registerInspectTool(api, ctx);
+    registerAstTools(api, ctx, { astSearch: true, astReplace: true });
+    registerFsTools(api, ctx, { delete: true, move: true });
+    return { tools, calls };
+  }
+
+  for (const scenario of ["own", "foreign", "directory", "pattern"] as const) {
+    test(`exact-file readers ${scenario} artifact permission boundary`, async () => {
+      const observations: Record<string, string> = {};
+      for (const reader of readers) {
+        const { tools, calls } = harness();
+        const target =
+          scenario === "directory"
+            ? artifact.slice(0, artifact.lastIndexOf("/"))
+            : scenario === "pattern"
+              ? artifact.replace("stdout", "*")
+              : artifact;
+        try {
+          await executeTool(
+            tools.get(reader.name)!,
+            reader.args(target),
+            makeExtContext(
+              projectRoot,
+              scenario === "foreign" ? "other-session" : "artifact-owner",
+            ),
+          );
+          observations[reader.name] = "allowed";
+        } catch (error) {
+          observations[reader.name] =
+            error instanceof Error && BLOCK_MESSAGE.test(error.message) ? "blocked" : String(error);
+        }
+        if (observations[reader.name] === "allowed" && scenario === "own") {
+          expect(
+            calls.find((call) => call.command === "bash_artifact_owned")?.params,
+          ).toMatchObject({ path: artifact, session_id: "artifact-owner" });
+        }
+        if (observations[reader.name] === "blocked") {
+          expect(calls.some((call) => call.command === "tool_call")).toBe(false);
+        }
+      }
+      expect(observations).toEqual(
+        Object.fromEntries(
+          readers.map((reader) => [reader.name, scenario === "own" ? "allowed" : "blocked"]),
+        ),
+      );
+    });
+  }
+
+  test("write to own artifact remains blocked", async () => {
+    const { tools, calls } = harness();
+    await expect(
+      executeTool(
+        tools.get("write")!,
+        { path: artifact, content: "overwrite" },
+        makeExtContext(projectRoot, "artifact-owner"),
+      ),
+    ).rejects.toThrow(BLOCK_MESSAGE);
+    expect(calls).toEqual([]);
   });
 });

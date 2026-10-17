@@ -282,10 +282,14 @@ describe("hoisted tool adapters", () => {
     const root = await tempRoot();
     const artifactPath = join(root, "..", "bash-task.stdout");
     const { api, tools } = makeMockApi();
-    const { bridge, calls } = makeMockBridge(() => ({
-      success: true,
-      text: "1: full bash output\n",
-    }));
+    const { bridge, calls } = makeMockBridge((command) =>
+      command === "bash_artifact_owned"
+        ? { success: true, owned: true }
+        : {
+            success: true,
+            text: "1: full bash output\n",
+          },
+    );
     registerHoistedTools(api, makePluginContext(bridge), {
       hoistRead: true,
       hoistWrite: false,
@@ -300,8 +304,9 @@ describe("hoisted tool adapters", () => {
     } as never)) as { content: Array<{ text: string }> };
 
     expect(result.content[0].text).toContain("full bash output");
-    expect(calls).toHaveLength(1);
-    expect(toolArgs(calls[0])).toEqual({ filePath: artifactPath });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].command).toBe("bash_artifact_owned");
+    expect(toolArgs(calls[1])).toEqual({ filePath: artifactPath });
   });
 
   test("read accepts filePath as a compatibility alias and rejects unequal dual spelling", async () => {

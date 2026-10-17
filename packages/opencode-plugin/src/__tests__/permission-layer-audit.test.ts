@@ -12,11 +12,14 @@ import { astTools } from "../tools/ast.js";
 import { createBashTool } from "../tools/bash.js";
 import { hoistedTools } from "../tools/hoisted.js";
 import { importTools } from "../tools/imports.js";
+import { inspectTools } from "../tools/inspect.js";
+import { navigationTools } from "../tools/navigation.js";
 import {
   _permissionsInternalsForTest,
   assertExternalDirectoryPermission,
   classifyPermissionError,
 } from "../tools/permissions.js";
+import { readingTools } from "../tools/reading.js";
 import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
 import { semanticTools } from "../tools/semantic.js";
@@ -1414,7 +1417,7 @@ describe("permission audit regressions", () => {
     )) as string;
 
     expect(parsePermissionDenied(raw).message).toBe("external denied");
-    expect(calls).toHaveLength(0);
+    expect(calls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
   });
 
   test("ast_grep_replace dry-run denies external paths before bridge execution", async () => {
@@ -1563,14 +1566,121 @@ describe("session-owned bash artifact reads", () => {
   }
 
   function ownershipHarness(ownedPaths: Set<string>, fail = false) {
-    return createHarness(hoistedTools, (command, params) => {
-      if (command === "bash_artifact_owned") {
-        if (fail) throw new Error("bridge closed");
-        return { success: true, owned: ownedPaths.has(String(params.path)) };
+    return createHarness(
+      (ctx) => ({
+        ...hoistedTools(ctx),
+        ...searchTools(ctx),
+        ...readingTools(ctx),
+        ...navigationTools(ctx),
+        ...inspectTools(ctx),
+        ...astTools(ctx),
+      }),
+      (command, params) => {
+        if (command === "bash_artifact_owned") {
+          if (fail) throw new Error("bridge closed");
+          return { success: true, owned: ownedPaths.has(String(params.path)) };
+        }
+        return { success: true, text: "task output" };
+      },
+    );
+  }
+
+  const readers = [
+    { name: "grep", args: (p: string) => ({ path: p, pattern: "task" }) },
+    { name: "glob", args: (p: string) => ({ path: p, pattern: "*" }) },
+    { name: "aft_outline", args: (p: string) => ({ target: p }) },
+    { name: "aft_zoom", args: (p: string) => ({ path: p, symbols: "task" }) },
+    { name: "aft_callgraph", args: (p: string) => ({ path: p, op: "callers", symbol: "task" }) },
+    { name: "aft_inspect", args: (p: string) => ({ scope: p, sections: ["todos"] }) },
+    {
+      name: "ast_grep_search",
+      args: (p: string) => ({ paths: [p], lang: "rust", pattern: "fn $F() { $$$ }" }),
+    },
+  ];
+
+  for (const scenario of ["own", "foreign", "directory", "pattern"] as const) {
+    test(`exact-file readers ${scenario} artifact permission boundary`, async () => {
+      const { project, artifact } = await artifactFixture();
+      const target =
+        scenario === "directory"
+          ? path.dirname(artifact)
+          : scenario === "pattern"
+            ? path.join(path.dirname(artifact), "*")
+            : artifact;
+      const observations: Record<string, number> = {};
+      const queries: Record<string, unknown> = {};
+      for (const reader of readers) {
+        const asks: AskCall[] = [];
+        const { calls, tools } = ownershipHarness(
+          new Set(scenario === "foreign" ? [] : [artifact]),
+        );
+        await tools[reader.name].execute(
+          reader.args(target),
+          createSdkContext(project, recordingAsk(asks)),
+        );
+        observations[reader.name] = asks.filter(
+          (ask) => ask.permission === "external_directory",
+        ).length;
+        queries[reader.name] = calls.find((call) => call.command === "bash_artifact_owned")?.params;
       }
-      return { success: true, text: "task output" };
+      expect(observations).toEqual(
+        Object.fromEntries(readers.map((reader) => [reader.name, scenario === "own" ? 0 : 1])),
+      );
+      if (scenario === "own") {
+        expect(queries).toEqual(
+          Object.fromEntries(
+            readers.map((reader) => [
+              reader.name,
+              { path: artifact, session_id: "permission-audit-test" },
+            ]),
+          ),
+        );
+      }
     });
   }
+
+  for (const reader of readers) {
+    test(`${reader.name} restricted own artifact is allowed`, async () => {
+      const { project, artifact } = await artifactFixture();
+      const asks: AskCall[] = [];
+      const { tools } = createHarness(
+        (ctx) => {
+          ctx.config.restrict_to_project_root = true;
+          return {
+            ...searchTools(ctx),
+            ...readingTools(ctx),
+            ...navigationTools(ctx),
+            ...inspectTools(ctx),
+            ...astTools(ctx),
+          };
+        },
+        (command, params) =>
+          command === "bash_artifact_owned"
+            ? { success: true, owned: params.path === artifact }
+            : { success: true, text: "task output" },
+      );
+      const result = await tools[reader.name].execute(
+        reader.args(artifact),
+        createSdkContext(project, recordingAsk(asks)),
+      );
+      expect(typeof result === "string" ? result : result.output).not.toContain(
+        "permission_denied",
+      );
+      expect(asks.filter((ask) => ask.permission === "external_directory")).toEqual([]);
+    });
+  }
+
+  test("glob exact absolute artifact pattern stays file-scoped", async () => {
+    const { project, artifact } = await artifactFixture();
+    const asks: AskCall[] = [];
+    const { tools, calls } = ownershipHarness(new Set([artifact]));
+    await tools.glob.execute({ pattern: artifact }, createSdkContext(project, recordingAsk(asks)));
+    expect(asks.filter((ask) => ask.permission === "external_directory")).toEqual([]);
+    expect(calls.find((call) => call.command === "glob")?.params).toEqual({
+      path: artifact,
+      pattern: "stdout",
+    });
+  });
 
   test("reading the session's own artifact raises no external_directory prompt", async () => {
     const { project, artifact } = await artifactFixture();
