@@ -4367,6 +4367,37 @@ mod grant_path_tests {
         .await
         .expect("the accepted job must finish");
         assert_eq!(finished, crate::bash_background::BgTaskStatus::Completed);
+        // The launch reply above may have been decided before the job finished.
+        // Ask the capture wait again now that it has: an accepted job leaves
+        // the reply to the caller's ordinary launch or wait path, which owns
+        // completion delivery, rather than answering with the result itself.
+        let cancel = BashWaitCancel {
+            run_scope: None,
+            scope: None,
+            late_results: false,
+            connection: PersistentCancelSignal::new(),
+            route: PersistentCancelSignal::new(),
+            drain: drain::ModuleDrainWindow::default(),
+        };
+        let claim = drain::BashCallClaim::default();
+        let launch = Response::success(
+            "accepted-launch",
+            json!({"task_id":task_id, "status":"running"}),
+        );
+        let reply = await_runon_launch_reply(
+            ctx.bash_background().clone(),
+            "deadline-session",
+            &launch,
+            Some(Instant::now() + Duration::from_secs(5)),
+            &cancel,
+            &claim,
+            false,
+        )
+        .await;
+        assert!(
+            reply.is_none(),
+            "an accepted, finished job keeps the ordinary launch reply: {reply:?}"
+        );
     }
 
     #[cfg(unix)]
