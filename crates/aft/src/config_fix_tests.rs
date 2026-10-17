@@ -4,6 +4,50 @@ use crate::harness::Harness;
 use serde_json::json;
 
 #[test]
+fn sandbox_profile_cutover_matches_doctor_and_preserves_explicit_roles() {
+    for (enabled, worker, head) in [(true, "strict", "strict"), (false, "relaxed", "off")] {
+        let source = format!("{{\n// operator choice\n\"sandbox\":{{\"enabled\":{enabled},}},\n}}");
+        let migrated = migrate_config_text(&source, FixTier::User).unwrap();
+        assert!(migrated.changed);
+        assert!(migrated.text.contains("// operator choice"));
+        let value: Value =
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&migrated.text)).unwrap();
+        assert_eq!(
+            value["sandbox"]["profile"],
+            json!({"worker":worker,"head":head})
+        );
+        assert!(value["sandbox"].get("enabled").is_none());
+        assert!(
+            !migrate_config_text(&migrated.text, FixTier::User)
+                .unwrap()
+                .changed
+        );
+        let before = resolve_config_for_harness(
+            &[ConfigTier {
+                tier: "user".into(),
+                source: "user".into(),
+                doc: source,
+            }],
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(before.config.sandbox.profile).unwrap(),
+            value["sandbox"]["profile"]
+        );
+    }
+    let migrated = migrate_config_text(r#"{"sandbox":{"enabled":true,"profile":{"head":"off"}},"harnesses":{"pi":{"sandbox":{"enabled":false,"profile":{"worker":"strict"}}}}}"#, FixTier::User).unwrap();
+    let value: Value = serde_json::from_str(&migrated.text).unwrap();
+    assert_eq!(
+        value["sandbox"]["profile"],
+        json!({"worker":"strict","head":"off"})
+    );
+    assert_eq!(
+        value["harnesses"]["pi"]["sandbox"]["profile"],
+        json!({"worker":"strict","head":"off"})
+    );
+}
+
+#[test]
 fn inspect_cleanup_doctor_maps_idle_and_drops_inert_keys() {
     for (old, expected) in [(1, 5), (10, 10), (2000, 1440)] {
         let doc = json!({"idle":{"root_ttl_minutes":20,"lsp_ttl_minutes":old},"inspect":{"tier2_soft_deadline_ms":50,"max_drill_down_items":20,"enabled":false},"harnesses":{"pi":{"idle":{"lsp_ttl_minutes":old}}}}).to_string();

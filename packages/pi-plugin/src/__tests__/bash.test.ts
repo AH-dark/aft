@@ -236,7 +236,7 @@ describe("bash tool adapter", () => {
     const mockBridge = makeMockBridge();
     // `sandbox` is only offered while the native sandbox is enabled.
     const ctx = makeMockContext(mockBridge, {
-      sandbox: { enabled: true },
+      sandbox: { profile: { head: "strict" } },
     } as PluginContext["config"]);
 
     registerBashTool(api, ctx);

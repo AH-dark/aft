@@ -21,7 +21,7 @@ fn context(project: &Path, storage: &Path) -> AppContext {
         max_background_bash_tasks: MAX,
         ..crate::config::Config::default()
     };
-    config.sandbox.enabled = false;
+    config.sandbox.profile.head = crate::config::SandboxMode::Off;
     AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
@@ -45,6 +45,7 @@ fn launch(ctx: &AppContext, session: &str, command: &str, background: bool) -> R
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     )
@@ -163,6 +164,7 @@ fn refusal_lists_only_the_callers_own_holders_and_counts_other_sessions() {
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     );

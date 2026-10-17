@@ -332,11 +332,15 @@ function buildSchema(): Record<string, unknown> {
       sandbox: {
         type: "object",
         properties: {
-          enabled: {
-            type: "boolean",
-            default: false,
+          profile: {
+            type: "object",
+            properties: {
+              worker: { type: "string", enum: ["off", "relaxed", "strict"], default: "relaxed" },
+              head: { type: "string", enum: ["off", "relaxed", "strict"], default: "off" },
+            },
+            additionalProperties: false,
             description:
-              "Enable native macOS/Linux containment for first-party bash and PTY processes. User-scoped only; project config cannot enable or disable it.",
+              "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict).",
           },
           write_allow: {
             type: "array",
@@ -355,7 +359,7 @@ function buildSchema(): Record<string, unknown> {
         },
         additionalProperties: false,
         description:
-          "Native sandbox policy for first-party bash commands. Disabled by default during staged rollout.",
+          "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict.",
       },
 
       bash: {

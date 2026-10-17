@@ -1663,6 +1663,13 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     install_bridge_state(Arc::clone(&state));
 
     let roots = SubcBridgeTestRoots::new();
+    // Strict untrusted routes re-exec the native launcher. This fixture runs the
+    // bridge in libtest, so use the real binary without bypassing confinement.
+    #[cfg(unix)]
+    let _sandbox_launcher = aft::sandbox_spawn::install_sandbox_launcher_for_test(
+        roots.root1.path(),
+        crate::test_helpers::aft_binary::aft_binary(),
+    );
     let conn_path = roots.conn_dir.path().join("subc-connection.json");
     let user_config_path = roots.storage.path().join("user-aft.jsonc");
     // Written before the module connects, because the catalog it sends at
@@ -11173,11 +11180,22 @@ async fn drive_bash_elicitation_allow_daemon(input: FakeDaemonInput) {
     let frame = read_frame_timeout(&mut stream, "allowed bash response").await;
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 102);
-    assert!(!tool_result_is_error(&frame), "allow should run bash");
-    assert!(
-        touched.exists(),
-        "allowed bash should create the side-effect file"
-    );
+    if cfg!(windows) {
+        // Permission to run does not waive the untrusted route's strict sandbox.
+        assert!(tool_result_is_error(&frame));
+        assert_eq!(
+            tool_result_text(&frame),
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
+        );
+        assert!(!touched.exists(), "a refused command must not run");
+    } else {
+        assert!(!tool_result_is_error(&frame), "allow should run bash");
+        assert!(
+            touched.exists(),
+            "allowed bash should create the side-effect file: {:?}",
+            tool_result_text(&frame)
+        );
+    }
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -11456,7 +11474,11 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
     )
     .await;
     let first_party = read_frame_timeout(&mut stream, "first-party principal bash").await;
-    assert!(!tool_result_is_error(&first_party));
+    assert!(
+        !tool_result_is_error(&first_party),
+        "first-party bash failed: {}",
+        tool_result_text(&first_party)
+    );
 
     bind_untrusted_elicitation_route(&mut stream, 2, 201, &root1).await;
     send_tool_call(
@@ -11476,15 +11498,39 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
     )
     .await;
     let untrusted = read_frame_timeout(&mut stream, "untrusted principal bash").await;
-    assert!(!tool_result_is_error(&untrusted));
+    if cfg!(windows) {
+        // Permission approval cannot waive strict confinement for an untrusted route.
+        assert!(tool_result_is_error(&untrusted));
+        assert_eq!(
+            tool_result_text(&untrusted),
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
+        );
+    } else {
+        assert!(
+            !tool_result_is_error(&untrusted),
+            "untrusted bash failed: {}",
+            tool_result_text(&untrusted)
+        );
+    }
 
     let observations = sandbox_spawn_test_observations(&seam_root);
     clear_sandbox_spawn_test_seam(&seam_root);
-    assert_eq!(observations.len(), 2, "observations: {observations:?}");
-    assert!(observations.iter().all(|observation| {
-        observation.requested_tier == RequestedSandboxTier::Disabled
-            && observation.task_kind == SandboxTaskKind::BashForeground
-    }));
+    // Windows refuses strict before entering the spawn resolver, so only the
+    // first-party call reaches it. Both principals reach it on macOS/Linux.
+    assert_eq!(
+        observations.len(),
+        if cfg!(windows) { 1 } else { 2 },
+        "observations: {observations:?}"
+    );
+    assert!(observations
+        .iter()
+        .all(|observation| observation.task_kind == SandboxTaskKind::BashForeground));
+    // The head profile defaults to off, but an untrusted route must use strict
+    // confinement even when the user has not enabled sandboxing explicitly.
+    assert_eq!(
+        observations[0].requested_tier,
+        RequestedSandboxTier::Disabled
+    );
 
     match &observations[0].principal {
         AuthenticatedPrincipal::RouteBind {
@@ -11506,25 +11552,31 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
         }
         principal => panic!("expected bound first-party principal, got {principal:?}"),
     }
-    match &observations[1].principal {
-        AuthenticatedPrincipal::RouteBind {
-            trust,
-            route_channel,
-            route_epoch,
-            project_root,
-            harness,
-            session_id,
-            principal_id,
-        } => {
-            assert_eq!(*trust, PrincipalTrust::Untrusted);
-            assert_eq!(*route_channel, 2);
-            assert_eq!(*route_epoch, 1);
-            assert_eq!(project_root, &root1);
-            assert_eq!(harness, "runner");
-            assert_eq!(session_id, "elicitation-session-2");
-            assert_eq!(principal_id.as_deref(), Some("reserved:subc-mcp"));
+    if let Some(untrusted_observation) = observations.get(1) {
+        assert_eq!(
+            untrusted_observation.requested_tier,
+            RequestedSandboxTier::Native
+        );
+        match &untrusted_observation.principal {
+            AuthenticatedPrincipal::RouteBind {
+                trust,
+                route_channel,
+                route_epoch,
+                project_root,
+                harness,
+                session_id,
+                principal_id,
+            } => {
+                assert_eq!(*trust, PrincipalTrust::Untrusted);
+                assert_eq!(*route_channel, 2);
+                assert_eq!(*route_epoch, 1);
+                assert_eq!(project_root, &root1);
+                assert_eq!(harness, "runner");
+                assert_eq!(session_id, "elicitation-session-2");
+                assert_eq!(principal_id.as_deref(), Some("reserved:subc-mcp"));
+            }
+            principal => panic!("expected bound untrusted principal, got {principal:?}"),
         }
-        principal => panic!("expected bound untrusted principal, got {principal:?}"),
     }
 
     send_connection_goodbye(&mut stream).await;
@@ -11582,11 +11634,20 @@ async fn drive_principal_trust_enforcement_daemon(input: FakeDaemonInput) {
     let trusted_bash = read_frame_timeout(&mut stream, "trusted direct bash").await;
     assert_eq!(trusted_bash.header.channel, 1);
     assert_eq!(trusted_bash.header.corr, 103);
-    assert!(
-        !tool_result_is_error(&trusted_bash),
-        "trusted direct bash should reach spawn: {:?}",
-        tool_result_text(&trusted_bash)
-    );
+    if cfg!(windows) {
+        // The MCP harness forces strict confinement even for a verified Direct principal.
+        assert!(tool_result_is_error(&trusted_bash));
+        assert_eq!(
+            tool_result_text(&trusted_bash),
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
+        );
+    } else {
+        assert!(
+            !tool_result_is_error(&trusted_bash),
+            "trusted direct bash should reach spawn under strict confinement: {:?}",
+            tool_result_text(&trusted_bash)
+        );
+    }
 
     // Anti-spoof in the other direction: a runner harness is untrusted when the
     // daemon-stamped principal is the MCP facade id.

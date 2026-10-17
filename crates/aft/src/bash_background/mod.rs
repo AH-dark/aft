@@ -788,6 +788,7 @@ pub(crate) fn spawn(
     pty_rows: u16,
     pty_cols: u16,
     scanner_report: Vec<PermissionAsk>,
+    scanner_requires_approval: bool,
     host_escalation: Option<HostEscalationAttempt>,
     remote: Option<RemoteLaunch>,
 ) -> Response {
@@ -844,7 +845,13 @@ pub(crate) fn spawn(
         let worktree_root = project_root.as_deref().unwrap_or(&workdir);
         crate::agent_child_env::inject_worker_test_threads(worktree_root, &mut env);
     }
-    crate::sandbox_spawn::apply_worker_jail_environment(&mut env);
+    crate::sandbox_spawn::apply_worker_jail_environment(
+        &mut env,
+        crate::sandbox_spawn::effective_sandbox_mode(
+            ctx,
+            &crate::sandbox_spawn::current_authenticated_principal(),
+        ),
+    );
     #[cfg(target_os = "linux")]
     if !pty && config.bash.linux_scope {
         env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
@@ -876,7 +883,7 @@ pub(crate) fn spawn(
                     request_id,
                     "sandbox_unavailable",
                     format!(
-                        "native sandbox failed to create the task artifact directory: {error}; set sandbox.enabled=false to disable native sandboxing"
+                        "native sandbox failed to create the task artifact directory: {error}; select sandbox.profile off to disable native sandboxing"
                     ),
                 );
             }
@@ -953,6 +960,22 @@ pub(crate) fn spawn(
             ),
             None => Response::error(request_id, code, message),
         };
+    }
+
+    // The launcher can also carry off or relaxed profiles. Only the resolved
+    // containment policy can replace a pending permission approval.
+    if scanner_requires_approval && !spawn_plan.enforces_shell_containment() {
+        spawn_plan.cleanup_unspawned();
+        #[cfg(unix)]
+        if let Some(task) = unregistered_task.as_ref() {
+            let _ = persistence::delete_resolved_task(task);
+        }
+        return Response::error_with_data(
+            request_id,
+            crate::protocol::ERROR_PERMISSION_REQUIRED,
+            "bash command requires permission",
+            json!({ "asks": scanner_report }),
+        );
     }
 
     let cleanup_plan = spawn_plan.clone();
@@ -1073,7 +1096,7 @@ pub(crate) fn spawn(
                     request_id,
                     "sandbox_unavailable",
                     format!(
-                        "native sandbox failed before command execution: {message}; set sandbox.enabled=false to disable native sandboxing"
+                        "native sandbox failed before command execution: {message}; select sandbox.profile off to disable native sandboxing"
                     ),
                 )
             } else {

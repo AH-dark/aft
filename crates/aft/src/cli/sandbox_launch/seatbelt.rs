@@ -5,16 +5,21 @@
 //! error buffers allocated by that API.
 
 use aft::sandbox_profile::SandboxProfile;
+#[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString};
+#[cfg(target_os = "macos")]
 use std::os::raw::c_char;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::ptr;
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> i32;
     fn sandbox_free_error(errorbuf: *mut c_char);
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn apply(profile: &SandboxProfile) -> Result<(), String> {
     let source = render_profile(profile)?;
     let source = CString::new(source)
@@ -44,6 +49,9 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<(), String> {
 }
 
 fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
+    if profile.mode == aft::config::SandboxMode::Relaxed {
+        return render_relaxed_profile(profile);
+    }
     let mut source = String::from(
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
     );
@@ -129,6 +137,164 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
     Ok(source)
 }
 
+fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
+    let mut source = String::from("(version 1)\n(allow default)\n");
+    for path in &profile.write_deny {
+        source.push_str(&format!(
+            "(deny file-write* {})\n",
+            relaxed_filter(path, false)?
+        ));
+    }
+    // Path-based denies must survive renaming any enclosing directory, including
+    // parents of private files outside the usual credential and store locations.
+    let ancestors = profile
+        .write_deny
+        .iter()
+        .chain(&profile.write_deny_nested)
+        .chain(&profile.deny_prefixes)
+        .chain(&profile.read_deny)
+        .chain(&profile.data_policy.deny)
+        .flat_map(|path| path.ancestors().skip(1))
+        .collect::<std::collections::BTreeSet<_>>();
+    for ancestor in ancestors {
+        source.push_str(&format!(
+            "(deny file-write-unlink (literal \"{}\"))\n",
+            escape_path(ancestor)?
+        ));
+    }
+    for path in &profile.read_deny {
+        source.push_str(&format!(
+            "(deny file-read* {})\n",
+            relaxed_filter(path, false)?
+        ));
+    }
+    for path in &profile.deny_prefixes {
+        source.push_str(&format!(
+            "(deny file-read* file-write* {})\n",
+            relaxed_filter(path, true)?
+        ));
+    }
+    let writes = profile
+        .write_allow_roots()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .chain(profile.writable_files.iter().cloned())
+        .collect::<Vec<_>>();
+    render_relaxed_scopes(
+        &mut source,
+        "file-write*",
+        &profile.write_deny_nested,
+        &writes,
+        &profile.writable_files,
+        &profile.writable_roots,
+    )?;
+    render_relaxed_scopes(
+        &mut source,
+        "file-write*",
+        &profile.data_policy.deny,
+        &profile.data_policy.write_allow,
+        &profile.writable_files,
+        &[],
+    )?;
+    render_relaxed_scopes(
+        &mut source,
+        "file-read*",
+        &profile.data_policy.deny,
+        &profile.data_policy.read_allow,
+        &profile.writable_files,
+        &[],
+    )?;
+    for allow in profile
+        .data_policy
+        .read_allow
+        .iter()
+        .chain(&profile.data_policy.read_metadata_allow)
+    {
+        for ancestor in allow.ancestors() {
+            if profile
+                .data_policy
+                .deny
+                .iter()
+                .any(|deny| ancestor.starts_with(deny))
+                && !profile
+                    .read_deny
+                    .iter()
+                    .any(|deny| ancestor.starts_with(deny))
+            {
+                source.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escape_path(ancestor)?
+                ));
+            }
+        }
+    }
+    Ok(source)
+}
+
+fn render_relaxed_scopes(
+    source: &mut String,
+    operation: &str,
+    denies: &[std::path::PathBuf],
+    allows: &[std::path::PathBuf],
+    files: &[std::path::PathBuf],
+    equal_roots: &[std::path::PathBuf],
+) -> Result<(), String> {
+    for deny in denies {
+        source.push_str(&format!(
+            "(deny {operation} (require-all {}",
+            relaxed_filter(deny, false)?
+        ));
+        for allow in allows
+            .iter()
+            // Only checkout exceptions may equal a denied directory, such as ~/Work.
+            // Unrelated nested repos then belong to that checkout; linked siblings
+            // retain their own denies. Private-store allows stay strict descendants.
+            .filter(|allow| {
+                allow.starts_with(deny) && (*allow != deny || equal_roots.contains(allow))
+            })
+        {
+            let filter = if files.contains(allow) {
+                format!("(literal \"{}\")", escape_path(allow)?)
+            } else {
+                relaxed_filter(allow, false)?
+            };
+            source.push_str(&format!(" (require-not {filter})"));
+        }
+        source.push_str("))\n");
+    }
+    Ok(())
+}
+
+/// Canonicalize before rendering, then also match ASCII case aliases for
+/// missing filenames on case-insensitive volumes (for example .SSH).
+fn relaxed_filter(path: &Path, prefix: bool) -> Result<String, String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| "Seatbelt path is not UTF-8".to_string())?;
+    let mut pattern = String::from("^");
+    for character in text.chars() {
+        if character.is_control() {
+            return Err(format!(
+                "Seatbelt path contains a control character: {text:?}"
+            ));
+        } else if character == '"' {
+            pattern.push_str("\\\"");
+        } else if character.is_ascii_alphabetic() {
+            pattern.push_str(&format!(
+                "[{}{}]",
+                character.to_ascii_lowercase(),
+                character.to_ascii_uppercase()
+            ));
+        } else {
+            pattern.push_str(&regex::escape(&character.to_string()));
+        }
+    }
+    pattern.push_str(if prefix { "[^/]*($|/)" } else { "($|/)" });
+    // SBPL #"..." retains regex backslashes. Ordinary string escaping would
+    // turn \. into \\. and match a backslash instead of a literal dot.
+    Ok(format!("(regex #\"{pattern}\")"))
+}
+
 fn render_data_denies(
     source: &mut String,
     operation: &str,
@@ -197,6 +363,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relaxed_regex_literal_escapes_dot_once() {
+        assert_eq!(
+            relaxed_filter(Path::new("/tmp/a.b"), false).unwrap(),
+            r##"(regex #"^/[tT][mM][pP]/[aA]\.[bB]($|/)")"##
+        );
+        assert_eq!(
+            relaxed_filter(Path::new("/tmp/a.b"), true).unwrap(),
+            r##"(regex #"^/[tT][mM][pP]/[aA]\.[bB][^/]*($|/)")"##
+        );
+        assert!(relaxed_filter(Path::new("/tmp/a\nb"), false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn optional_exact_file_carve_outs_are_literal_even_when_not_regular_files() {
         let dir = tempfile::tempdir().unwrap();
         let common = dir.path().join("common");
@@ -239,6 +419,8 @@ mod tests {
         std::fs::create_dir_all(&task_temp).expect("task temp directory");
         let profile = SandboxProfile {
             v: 1,
+            mode: aft::config::SandboxMode::Strict,
+            deny_prefixes: Vec::new(),
             data_policy: Default::default(),
             writable_roots: vec![project],
             writable_files: Vec::new(),
@@ -358,18 +540,165 @@ mod tests {
         for rule in [
             format!(
                 "(deny file-write* (subpath \"{}\"))",
-                profile.write_deny_nested[0].display()
+                escape_path(&profile.write_deny_nested[0]).unwrap()
             ),
             format!(
                 "(deny file-read* (subpath \"{}\"))",
-                profile.read_deny[0].display()
+                escape_path(&profile.read_deny[0]).unwrap()
             ),
             format!(
                 "(deny network-outbound (path \"{}\"))",
-                profile.socket_deny[0].display()
+                escape_path(&profile.socket_deny[0]).unwrap()
             ),
         ] {
             assert!(source.contains(&rule), "missing mandatory rule: {rule}");
         }
+    }
+
+    #[test]
+    fn relaxed_nested_checkout_ancestors_are_immutable_without_denying_own_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let work = root.join("Work");
+        let own = work.join("own");
+        let group = work.join("group");
+        let sibling = group.join("sibling");
+        let temp = root.join("temp");
+        for dir in [&own, &sibling, &temp] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut profile = SandboxProfile::build(
+            vec![own.clone()],
+            Vec::new(),
+            vec![work.clone(), sibling.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        profile.mode = aft::config::SandboxMode::Relaxed;
+        let source = render_profile(&profile).unwrap();
+        for ancestor in [&group, &work, &root] {
+            let rule = format!(
+                "(deny file-write-unlink (literal \"{}\"))",
+                escape_path(ancestor).unwrap()
+            );
+            assert!(source.contains(&rule), "missing ancestor rule: {rule}");
+        }
+        assert!(!source.contains(&format!(
+            "(deny file-write-unlink (literal \"{}\"))",
+            escape_path(&own).unwrap()
+        )));
+        assert!(source.contains(&format!(
+            "(deny file-write* (require-all {} (require-not {})))",
+            relaxed_filter(&work, false).unwrap(),
+            relaxed_filter(&own, false).unwrap()
+        )));
+    }
+
+    #[test]
+    fn relaxed_private_ancestors_and_equal_checkout_exceptions() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let work = root.join("Work");
+        let sibling = work.join("sibling");
+        let auth = root.join("relay/auth");
+        let temp = root.join("temp");
+        for dir in [&sibling, &auth, &temp] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let secret = auth.join("connection.json");
+        std::fs::write(&secret, "private").unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![work.clone()],
+            Vec::new(),
+            vec![work.clone(), sibling.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        profile.mode = aft::config::SandboxMode::Relaxed;
+        profile.data_policy.deny.push(secret.clone());
+        profile.data_policy.read_allow.push(secret.clone());
+        profile.data_policy.write_allow.push(secret.clone());
+        let source = render_profile(&profile).unwrap();
+        assert!(
+            source.contains(&format!(
+                "(deny file-write-unlink (literal \"{}\"))",
+                escape_path(&auth).unwrap()
+            )),
+            "private file ancestor must be immutable: {source}"
+        );
+        assert!(
+            source.contains(&format!(
+                "(deny file-write* (require-all {} (require-not {})))",
+                relaxed_filter(&work, false).unwrap(),
+                relaxed_filter(&work, false).unwrap()
+            )),
+            "equal checkout must be writable: {source}"
+        );
+        assert!(
+            source.contains(&format!(
+                "(deny file-write* (require-all {}))",
+                relaxed_filter(&sibling, false).unwrap()
+            )),
+            "linked sibling must remain denied: {source}"
+        );
+        for operation in ["file-read*", "file-write*"] {
+            assert!(
+                source.contains(&format!(
+                    "(deny {operation} (require-all {}))",
+                    relaxed_filter(&secret, false).unwrap()
+                )),
+                "equal private-file grants must not weaken denies: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn relaxed_renderer_is_default_allow_with_scoped_and_case_alias_denies() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let work = root.join("Work");
+        let own = work.join("own");
+        let temp = root.join("temp");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        let config = own.join(".git/config");
+        let mut profile = SandboxProfile::build(
+            vec![own.clone()],
+            vec![config.clone()],
+            vec![work.clone()],
+            Vec::new(),
+            vec![root.join(".ssh")],
+            Vec::new(),
+            Vec::new(),
+            temp,
+        )
+        .unwrap();
+        profile.mode = aft::config::SandboxMode::Relaxed;
+        profile.deny_prefixes.push(root.join(".cargo/credentials"));
+        let source = render_profile(&profile).unwrap();
+        assert!(source.starts_with("(version 1)\n(allow default)\n"));
+        assert!(!source.contains("(deny file-write*)"));
+        assert!(source.contains(&format!(
+            "(deny file-write* {})",
+            relaxed_filter(&config, false).unwrap()
+        )));
+        assert!(source.contains(&format!(
+            "(require-all {} (require-not {}))",
+            relaxed_filter(&work, false).unwrap(),
+            relaxed_filter(&own, false).unwrap()
+        )));
+        assert!(source.contains("[sS][sS][hH]"));
+        assert!(source.contains("[^/]*($|/)"));
+        assert!(source.contains("file-write-unlink"));
+        assert!(!source.contains("network-outbound"));
+        assert!(!source.contains("no-sandbox"));
     }
 }

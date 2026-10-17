@@ -3920,7 +3920,7 @@ mod route_tests {
                 ..crate::config::Config::default()
             },
         ));
-        ctx.update_config(|config| config.sandbox.enabled = false);
+        ctx.update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
         ctx.bash_background()
             .set_harness(crate::harness::Harness::Runner);
         ctx.bash_background()

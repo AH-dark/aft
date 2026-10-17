@@ -5,7 +5,7 @@
  * depends on one setting: `compressed` on `bash.compress`; `wait`,
  * `background`, the PTY parameters and the companion tools (`bash_status`,
  * `bash_watch`, `bash_write`, `bash_kill`) on `bash.background`; `sandbox` on
- * `sandbox.enabled`. A model shown an option that does nothing, or a tool whose
+ * `sandbox.profile.head`. A model shown an option that does nothing, or a tool whose
  * description points at a parameter it cannot pass, wastes calls on it. This
  * file walks every combination of the three settings through the production
  * registration path of both plugins and checks the schema keys, the registered
@@ -49,7 +49,7 @@ function configFor(combo: Combo): Record<string, unknown> {
   return {
     disabled_tools: [],
     bash: { compress: combo.compress, background: combo.background },
-    ...(combo.sandbox ? { sandbox: { enabled: true } } : {}),
+    ...(combo.sandbox ? { sandbox: { profile: { head: "strict" } } } : {}),
   };
 }
 
@@ -150,7 +150,7 @@ function openCodeSurface(combo: Combo) {
   return { config, tools, registered: new Set(Object.keys(tools)) };
 }
 
-describe("OpenCode shell surface follows bash.compress, bash.background and sandbox.enabled", () => {
+describe("OpenCode shell surface follows bash.compress, bash.background and sandbox.profile.head", () => {
   for (const combo of COMBOS) {
     test(`${label(combo)}: bash schema keys`, () => {
       const { tools } = openCodeSurface(combo);
@@ -225,7 +225,7 @@ function capturePi(
   return { tools, hints };
 }
 
-describe("Pi shell surface follows bash.compress, bash.background and sandbox.enabled", () => {
+describe("Pi shell surface follows bash.compress, bash.background and sandbox.profile.head", () => {
   for (const combo of COMBOS) {
     test(`${label(combo)}: bash schema keys`, () => {
       const { tools } = capturePi(configFor(combo));
@@ -298,7 +298,7 @@ const AFT_TOOL_NAME = /\b(aft_[a-z_]+|bash_(?:status|watch|write|kill))\b/g;
 function disabledConfig(disabled: string[], hashline: boolean): Record<string, unknown> {
   return {
     disabled_tools: disabled,
-    sandbox: { enabled: true },
+    sandbox: { profile: { head: "strict" } },
     ...(hashline ? { edit_mode: "hashline" } : {}),
   };
 }

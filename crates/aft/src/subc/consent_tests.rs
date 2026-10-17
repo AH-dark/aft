@@ -1264,7 +1264,12 @@ fn jail_context(root: &Path, sandbox: bool) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.to_path_buf());
     config.storage_dir = Some(root.join(".store"));
-    config.sandbox.enabled = sandbox;
+    config.sandbox.profile.worker = crate::config::SandboxMode::Strict;
+    config.sandbox.profile.head = if sandbox {
+        crate::config::SandboxMode::Strict
+    } else {
+        crate::config::SandboxMode::Off
+    };
     AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
@@ -1300,53 +1305,82 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
         resolve(RequestedSandboxTier::Disabled),
         SpawnPlan::Unsandboxed
     ));
-    with_worker_jail(true, || {
-        // The jail forces the native sandbox even with sandbox.enabled off;
-        // where it cannot be built the shell is refused by name.
-        let native = resolve(RequestedSandboxTier::Native);
-        assert!(
-            native.is_native_launcher() || native.refusal_code() == Some("sandbox_unavailable"),
-            "{native:?}"
-        );
-        if let SpawnPlan::Launcher { profile, .. } = &native {
-            // Writes are confined to the worktree: the directory holding it
-            // (and the sibling worktrees in it) is not writable.
-            let worktree = root.canonicalize().unwrap();
-            let parent = worktree.parent().unwrap();
-            assert!(profile.writable_roots.contains(&worktree), "{profile:?}");
+    for mode in [
+        crate::config::SandboxMode::Relaxed,
+        crate::config::SandboxMode::Strict,
+    ] {
+        ctx.update_config(|config| config.sandbox.profile.worker = mode);
+        with_worker_jail(true, || {
+            // The worker profile is independent of the head profile. Windows
+            // relaxed is explicitly unenforced; strict must still fail closed.
+            let native = resolve(RequestedSandboxTier::Native);
+            #[cfg(windows)]
+            {
+                assert!(!native.is_native_launcher(), "{native:?}");
+                match mode {
+                    crate::config::SandboxMode::Relaxed => {
+                        assert_eq!(native, SpawnPlan::RelaxedUnenforced);
+                    }
+                    crate::config::SandboxMode::Strict => {
+                        assert_eq!(native.refusal_code(), Some("sandbox_unavailable"));
+                    }
+                    crate::config::SandboxMode::Off => unreachable!(),
+                }
+            }
+            // macOS/Linux workers must use confinement or refuse the shell.
+            #[cfg(not(windows))]
             assert!(
-                !profile
-                    .writable_roots
-                    .iter()
-                    .any(|writable| parent.starts_with(writable)),
-                "{profile:?}"
+                native.is_native_launcher() || native.refusal_code() == Some("sandbox_unavailable"),
+                "{native:?}"
             );
-        }
-        for tier in [RequestedSandboxTier::Disabled, RequestedSandboxTier::Host] {
-            assert_eq!(resolve(tier).refusal_code(), Some("sandbox_unavailable"));
-        }
-        let untrusted = AuthenticatedPrincipal::RouteBind {
-            trust: PrincipalTrust::Untrusted,
-            route_channel: 41,
-            route_epoch: 1,
-            project_root: root.clone(),
-            harness: "runner".into(),
-            session_id: "worker".into(),
-            principal_id: None,
-        };
-        assert_eq!(
-            resolve_sandbox_spawn(
+            if let SpawnPlan::Launcher { profile, .. } = &native {
+                assert_eq!(profile.mode, mode);
+                if mode == crate::config::SandboxMode::Strict {
+                    // Writes are confined to the worktree: the directory holding it
+                    // (and the sibling worktrees in it) is not writable.
+                    let worktree = root.canonicalize().unwrap();
+                    let parent = worktree.parent().unwrap();
+                    assert!(profile.writable_roots.contains(&worktree), "{profile:?}");
+                    assert!(
+                        !profile
+                            .writable_roots
+                            .iter()
+                            .any(|writable| parent.starts_with(writable)),
+                        "{profile:?}"
+                    );
+                }
+            }
+            for tier in [RequestedSandboxTier::Disabled, RequestedSandboxTier::Host] {
+                assert_eq!(resolve(tier).refusal_code(), Some("sandbox_unavailable"));
+            }
+            let untrusted = AuthenticatedPrincipal::RouteBind {
+                trust: PrincipalTrust::Untrusted,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.clone(),
+                harness: "runner".into(),
+                session_id: "worker".into(),
+                principal_id: None,
+            };
+            // Untrusted routes now run under strict confinement instead of being
+            // rejected solely for being untrusted. They must never inherit relaxed
+            // or off from the role profile.
+            let untrusted_plan = resolve_sandbox_spawn(
                 &ctx,
                 &untrusted,
                 RequestedSandboxTier::Native,
                 SandboxTaskKind::BashForeground,
                 &task,
                 None,
-            )
-            .refusal_code(),
-            Some("sandbox_unavailable")
-        );
-    });
+            );
+            match untrusted_plan {
+                SpawnPlan::Launcher { profile, .. } => {
+                    assert_eq!(profile.mode, crate::config::SandboxMode::Strict);
+                }
+                plan => assert_eq!(plan.refusal_code(), Some("sandbox_unavailable")),
+            }
+        });
+    }
     assert!(!crate::sandbox_spawn::worker_jail_active());
 }
 

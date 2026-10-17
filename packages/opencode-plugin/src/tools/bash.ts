@@ -420,7 +420,7 @@ function ptyDriveParamSentence(statusRegistered: boolean, writeRegistered: boole
  * only when there is a sandbox to leave.
  */
 export function nativeSandboxEnabled(config: PluginContext["config"]): boolean {
-  return config.sandbox?.enabled === true;
+  return config.sandbox?.profile?.head !== undefined && config.sandbox.profile.head !== "off";
 }
 
 /**
@@ -458,7 +458,7 @@ export function createBashTool(
   // Each optional argument exists only while the feature it controls is on, so
   // a model is never offered a knob that does nothing: `wait`, `background` and
   // the PTY arguments need `bash.background`, `compressed` needs
-  // `bash.compress`, and `sandbox` needs `sandbox.enabled`. The set is fixed
+  // `bash.compress`, and `sandbox` needs `sandbox.profile.head`. The set is fixed
   // when the tool is built; a stale call that still sends a removed argument is
   // ignored in `execute` rather than rejected.
   const waitArg = initialBashCfg.background

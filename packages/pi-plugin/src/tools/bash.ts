@@ -258,7 +258,7 @@ const BashParams = Type.Object({
  * The argument set a model is shown: each optional argument exists only while
  * the feature it controls is on, so no knob that does nothing is offered.
  * `wait`, `background` and the PTY arguments need `bash.background`,
- * `compressed` needs `bash.compress`, `sandbox` needs `sandbox.enabled`, and
+ * `compressed` needs `bash.compress`, `sandbox` needs `sandbox.profile.head`, and
  * `runon` needs subc mode with remote runs enabled in the user config (bash
  * only, never PowerShell). A stale call that still sends a removed argument
  * is ignored in `execute`, except `runon`, which is forwarded so the engine
@@ -369,7 +369,7 @@ function ptyParamDescription(c: RegisteredCompanions, subagentBackground: boolea
  * only when there is a sandbox to leave.
  */
 export function nativeSandboxEnabled(config: PluginContext["config"]): boolean {
-  return config.sandbox?.enabled === true;
+  return config.sandbox?.profile?.head !== undefined && config.sandbox.profile.head !== "off";
 }
 
 const BashTaskParams = Type.Object({

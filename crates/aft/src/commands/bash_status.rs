@@ -171,7 +171,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 Response::error_with_data(
                     &req.id,
                     "sandbox_unavailable",
-                    "native sandbox failed before the command could run; set sandbox.enabled=false to disable native sandboxing",
+                    "native sandbox failed before the command could run; select sandbox.profile off to disable native sandboxing",
                     json!({
                         "task_id": snapshot.info.task_id,
                         "exit_code": snapshot.exit_code,

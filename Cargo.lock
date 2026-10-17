@@ -34,6 +34,7 @@ name = "agent-file-tools"
 version = "0.60.0"
 dependencies = [
  "aft-tokenizer",
+ "agent-file-tools",
  "apollo-parser",
  "ast-grep-core",
  "async-trait",

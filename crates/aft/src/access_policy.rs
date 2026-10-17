@@ -298,20 +298,10 @@ impl AccessPolicy {
                 home.join(path)
             });
         }
-        if let Some(path) = crate::environment::non_empty_os_var("SUBC_CONNECTION_FILE") {
-            deny.push(PathBuf::from(path));
-        }
-        if let Some(path) = crate::environment::non_empty_os_var("XDG_RUNTIME_DIR") {
-            deny.push(PathBuf::from(path).join("subc-connection.json"));
-        }
-        for variable in ["XDG_DATA_HOME", "XDG_STATE_HOME"] {
-            if let Some(path) = crate::environment::non_empty_os_var(variable) {
-                let path = PathBuf::from(path);
-                if path.is_absolute() {
-                    deny.push(path.join("cortexkit"));
-                }
-            }
-        }
+        let mut deny: Vec<_> = deny.into_iter().map(|path| policy_path(&path)).collect();
+        deny.extend(environment_private_store_denies(|key| {
+            std::env::var_os(key)
+        }));
         let mut private_store_carveouts =
             vec![home.join(".local/share/cortexkit/alfonso/worktrees")];
         if let Some(path) = crate::environment::non_empty_os_var("XDG_DATA_HOME") {
@@ -345,7 +335,7 @@ impl AccessPolicy {
         Self {
             mode: ApprovalMode::Ask,
             private_stores: SandboxDataPolicy {
-                deny: deny.into_iter().map(|path| policy_path(&path)).collect(),
+                deny,
                 read_allow,
                 write_allow: roots.clone(),
                 read_metadata_allow: Vec::new(),
@@ -513,6 +503,47 @@ impl AccessPolicy {
     }
 }
 
+fn environment_private_store_denies(
+    getenv: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut denies = Vec::new();
+    for (variable, suffix, absolute_only) in [
+        ("SUBC_CONNECTION_FILE", "", false),
+        ("XDG_RUNTIME_DIR", "subc-connection.json", false),
+        ("XDG_DATA_HOME", "cortexkit", true),
+        ("XDG_STATE_HOME", "cortexkit", true),
+    ] {
+        let Some(value) = getenv(variable).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let mut path = PathBuf::from(value);
+        if absolute_only && !path.is_absolute() {
+            continue;
+        }
+        if !suffix.is_empty() {
+            path.push(suffix);
+        }
+        #[cfg(unix)]
+        {
+            if !path.is_absolute() {
+                match std::env::current_dir() {
+                    Ok(cwd) => path = cwd.join(path),
+                    Err(error) => {
+                        log::warn!("skipping sandbox deny from {variable}: {error}");
+                        continue;
+                    }
+                }
+            }
+            denies.extend(crate::sandbox_profile::resolved_env_deny_paths(
+                variable, path,
+            ));
+        }
+        #[cfg(not(unix))]
+        denies.push(policy_path(&path));
+    }
+    denies
+}
+
 #[cfg(not(any(windows, target_os = "macos")))]
 fn floor_contains(path: &Path, prefix: &Path) -> bool {
     path.starts_with(prefix)
@@ -656,6 +687,67 @@ pub(crate) fn policy_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn environment_store_denies_resolve_dotdot_and_symlink_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("target/nested")).unwrap();
+        std::os::unix::fs::symlink(base.join("target/nested"), base.join("alias")).unwrap();
+        for (variable, suffix) in [
+            ("SUBC_CONNECTION_FILE", "connection.json"),
+            ("XDG_RUNTIME_DIR", "runtime/subc-connection.json"),
+            ("XDG_DATA_HOME", "data/cortexkit"),
+            ("XDG_STATE_HOME", "state/cortexkit"),
+        ] {
+            let leaf = match variable {
+                "SUBC_CONNECTION_FILE" => "connection.json",
+                "XDG_RUNTIME_DIR" => "runtime",
+                "XDG_DATA_HOME" => "data",
+                _ => "state",
+            };
+            let value = base.join("alias/..").join(leaf);
+            let expected = base.join("target").join(suffix);
+            for exists in [false, true] {
+                if exists {
+                    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+                    std::fs::write(&expected, "private").unwrap();
+                }
+                let denies = super::environment_private_store_denies(|key| {
+                    (key == variable).then(|| value.clone().into_os_string())
+                });
+                assert_eq!(
+                    denies,
+                    vec![expected.clone()],
+                    "{variable}, exists={exists}"
+                );
+            }
+        }
+        let denies = super::environment_private_store_denies(|key| {
+            (key == "XDG_DATA_HOME").then(|| base.join("alias").into_os_string())
+        });
+        assert!(denies.contains(&base.join("alias/cortexkit")), "{denies:?}");
+        assert!(
+            denies.contains(&base.join("target/nested/cortexkit")),
+            "{denies:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_store_denies_skip_only_unresolvable_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let link = base.join("loop");
+        std::os::unix::fs::symlink(&link, &link).unwrap();
+        let denies = super::environment_private_store_denies(|key| match key {
+            "XDG_DATA_HOME" => Some(link.clone().into_os_string()),
+            "XDG_STATE_HOME" => Some(base.join("state").into_os_string()),
+            _ => None,
+        });
+        assert_eq!(denies, vec![base.join("state/cortexkit")]);
+    }
+
     use super::*;
 
     #[test]

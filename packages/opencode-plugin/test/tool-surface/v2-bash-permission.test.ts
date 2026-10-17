@@ -217,7 +217,7 @@ describe("OpenCode 1 keeps its bash family byte-identical", () => {
    * now carries that final wording instead of the factory default.
    */
   test("names, descriptions and schemas match the capture", () => {
-    const config = resolved({ ...ALL_TOOLS_CONFIG, sandbox: { enabled: true } });
+    const config = resolved({ ...ALL_TOOLS_CONFIG, sandbox: { profile: { head: "strict" } } });
     const v1 = buildOpenCodeToolMap(
       {
         pool: {

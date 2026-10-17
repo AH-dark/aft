@@ -14,7 +14,10 @@
   },
   "restrict_to_project_root": false,
   "sandbox": {
-    "enabled": true,
+    "profile": {
+      "head": "strict",
+      "worker": "strict"
+    },
     "read_deny": [
       "/tmp/aft-sandbox-user-secret",
       "/tmp/aft-sandbox-project-secret"

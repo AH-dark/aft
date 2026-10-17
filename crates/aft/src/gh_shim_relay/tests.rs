@@ -254,7 +254,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         experimental_bash_background: true,
         ..crate::config::Config::default()
     };
-    config.sandbox.enabled = false;
+    config.sandbox.profile.head = crate::config::SandboxMode::Off;
     config.github.shim = true;
     let ctx =
         crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
@@ -280,6 +280,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     );
@@ -352,6 +353,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     );

@@ -3639,6 +3639,7 @@ impl BgTaskRegistry {
         }
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty, false)
             .map_err(|error| format!("failed to pre-open PTY output handles: {error}"))?;
+        write_unenforced_sandbox_warning(&spawn_plan, &io_handles, TaskArtifact::Pty)?;
 
         // Commit point; see `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
@@ -3888,6 +3889,7 @@ impl BgTaskRegistry {
         }
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes, false)
             .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
+        write_unenforced_sandbox_warning(&spawn_plan, &io_handles, TaskArtifact::Stderr)?;
 
         // Commit point; see the Unix `spawn_with_shell`.
         if let Err(error) = super::commit_spawn_receipt(&task_id) {
@@ -11041,6 +11043,22 @@ fn attach_sandbox_metadata(metadata: &mut PersistedTask, spawn_plan: &SpawnPlan)
     metadata.sandbox_temp_dir = spawn_plan.temp_dir().map(Path::to_path_buf);
 }
 
+fn write_unenforced_sandbox_warning(
+    plan: &SpawnPlan,
+    handles: &TaskIoHandles,
+    artifact: TaskArtifact,
+) -> Result<(), String> {
+    if !matches!(plan, SpawnPlan::RelaxedUnenforced) {
+        return Ok(());
+    }
+    // Write before the child starts, using the same capture handle offset so
+    // both pipes and PTYs retain the warning alongside the command's output.
+    handles
+        .clone_file(artifact)
+        .and_then(|mut file| file.write_all(b"sandbox: profile=relaxed unenforced=[all filesystem read/write denies] (Windows has no native sandbox backend; command runs with full user rights)\n"))
+        .map_err(|error| format!("failed to report unenforced sandbox denies: {error}"))
+}
+
 #[cfg(unix)]
 pub(crate) fn resolve_posix_shell() -> PathBuf {
     static POSIX_SHELL: OnceLock<PathBuf> = OnceLock::new();
@@ -11290,7 +11308,7 @@ fn spawn_detached_child(
         let _ = shell_path;
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
-            SpawnPlan::Unsandboxed | SpawnPlan::Host { .. } => {}
+            SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {}
             SpawnPlan::Refused { code, .. } => return Err((*code).to_string()),
             SpawnPlan::Launcher { .. } => return Err("sandbox_unavailable".to_string()),
         }
@@ -11349,6 +11367,7 @@ fn spawn_detached_child(
                     .stdout(Stdio::from(stdout))
                     .stderr(Stdio::from(stderr));
                 crate::agent_child_env::apply_to_command(&mut cmd, env);
+                crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut cmd, env);
                 if let Some((key, value)) = shell.wrapper_environment(command) {
                     cmd.env(key, value);
                 }
@@ -11482,6 +11501,40 @@ pub(crate) mod default_kill_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_relaxed_warning_survives_pipe_and_pty_capture() {
+        let root = tempfile::tempdir().unwrap();
+        for (mode, artifact) in [
+            (BgMode::Pipes, TaskArtifact::Stderr),
+            (BgMode::Pty, TaskArtifact::Pty),
+        ] {
+            let task = allocate_task_layout(root.path(), "warning-session").unwrap();
+            let handles = TaskIoHandles::create(&task, mode.clone(), false).unwrap();
+            write_unenforced_sandbox_warning(&SpawnPlan::Unsandboxed, &handles, artifact).unwrap();
+            let path = match mode {
+                BgMode::Pipes => &task.paths.stderr,
+                BgMode::Pty => &task.paths.pty,
+            };
+            assert_eq!(std::fs::read(path).unwrap(), b"");
+            write_unenforced_sandbox_warning(&SpawnPlan::RelaxedUnenforced, &handles, artifact)
+                .unwrap();
+            handles
+                .clone_file(artifact)
+                .unwrap()
+                .write_all(b"child-output\n")
+                .unwrap();
+            let output = std::fs::read_to_string(path).unwrap();
+            assert!(
+                output.contains("profile=relaxed unenforced=[all filesystem read/write denies]"),
+                "{output}"
+            );
+            assert!(
+                output.contains("command runs with full user rights"),
+                "{output}"
+            );
+            assert!(output.ends_with("child-output\n"), "{output}");
+        }
+    }
     use std::collections::HashMap;
     use std::fs;
     use std::io::Write;
@@ -11588,6 +11641,8 @@ mod tests {
             crate::sandbox_profile::SandboxProfile {
                 data_policy: Default::default(),
                 v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
+                mode: crate::config::SandboxMode::Strict,
+                deny_prefixes: Vec::new(),
                 writable_roots: Vec::new(),
                 writable_files: Vec::new(),
                 write_deny: Vec::new(),
@@ -16786,15 +16841,24 @@ mod tests {
     fn spawn_windows_registry_command(
         command: &str,
     ) -> (BgTaskRegistry, tempfile::TempDir, String) {
+        spawn_windows_registry_command_with_plan(SpawnPlan::Unsandboxed, command, HashMap::new())
+    }
+
+    #[cfg(windows)]
+    fn spawn_windows_registry_command_with_plan(
+        plan: SpawnPlan,
+        command: &str,
+        environment: HashMap<String, String>,
+    ) -> (BgTaskRegistry, tempfile::TempDir, String) {
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         let dir = tempfile::tempdir().unwrap();
         let task_id = registry
             .spawn(
-                SpawnPlan::Unsandboxed,
+                plan,
                 command,
                 "session".to_string(),
                 dir.path().to_path_buf(),
-                HashMap::new(),
+                environment,
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 dir.path().to_path_buf(),
                 10,
@@ -16804,6 +16868,38 @@ mod tests {
             )
             .unwrap();
         (registry, dir, task_id)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relaxed_unenforced_pipe_spawn_strips_daemon_environment() {
+        use crate::sandbox_spawn::environment_tests::{
+            assert_stripped_environment, request_environment, with_daemon_environment,
+        };
+        with_daemon_environment(
+            "bash_background::registry::tests::windows_relaxed_unenforced_pipe_spawn_strips_daemon_environment",
+            || {
+                let (registry, _dir, task_id) = spawn_windows_registry_command_with_plan(
+                    SpawnPlan::RelaxedUnenforced,
+                    "cmd /d /c set",
+                    request_environment(),
+                );
+                let task = registry.task_for_session(&task_id, "session").unwrap();
+                assert_eq!(wait_for_file(&task.paths.exit).trim(), "0");
+                let stdout = String::from_utf8(
+                    registry
+                        .read_artifact(&task_id, "session", TaskArtifact::Stdout)
+                        .unwrap(),
+                )
+                .unwrap();
+                let environment = stdout
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .map(|(key, value)| (key.to_ascii_uppercase(), value.to_string()))
+                    .collect();
+                assert_stripped_environment(environment, true);
+            },
+        );
     }
 
     #[cfg(windows)]

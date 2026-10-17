@@ -994,7 +994,7 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
         return Response::error_with_data(
             request_id,
             "sandbox_unavailable",
-            "native sandbox failed before the command could run; set sandbox.enabled=false to disable native sandboxing",
+            "native sandbox failed before the command could run; select sandbox.profile off to disable native sandboxing",
             json!({
                 "task_id": snapshot.info.task_id,
                 "exit_code": snapshot.exit_code,
@@ -1296,7 +1296,7 @@ mod tests {
             .data
             .get("message")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|message| message.contains("sandbox.enabled=false")));
+            .is_some_and(|message| message.contains("sandbox.profile off")));
     }
 
     #[test]

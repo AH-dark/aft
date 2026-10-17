@@ -131,7 +131,8 @@ fn removed_opencode_key_errors(map: &Map<String, Value>) -> Vec<String> {
 }
 
 /// Retired top-level (or nested) config paths and their replacement.
-pub const RETIRED_PATHS: [(&str, &str); 14] = [
+pub const RETIRED_PATHS: [(&str, &str); 15] = [
+    ("sandbox.enabled", "sandbox.profile"),
     ("tool_surface", "disabled_tools"),
     ("hoist_builtin_tools", "disabled_tools"),
     ("enabled", "disabled_tools"),
@@ -560,6 +561,37 @@ fn translate_block(
     translate_github_aliases(map, &prefix, out);
     translate_inspect_lsp_paths(map, &prefix, out);
     translate_experimental_paths(map, &prefix, out);
+    if let Some(Value::Object(sandbox)) = map.get_mut("sandbox") {
+        if let Some(enabled) = sandbox.remove("enabled") {
+            record_retired(out, &prefix, "sandbox.enabled");
+            match enabled.as_bool() {
+                Some(enabled) => {
+                    let profile = sandbox
+                        .entry("profile")
+                        .or_insert_with(|| Value::Object(Map::new()));
+                    if let Value::Object(profile) = profile {
+                        for (role, mode) in [
+                            ("worker", if enabled { "strict" } else { "relaxed" }),
+                            ("head", if enabled { "strict" } else { "off" }),
+                        ] {
+                            if profile.get(role).is_some_and(|value| value != mode) {
+                                superseded(out, format!("{prefix}sandbox.enabled"), format!("sandbox.profile.{role} takes precedence over sandbox.enabled"));
+                            }
+                            profile
+                                .entry(role)
+                                .or_insert_with(|| Value::String(mode.to_string()));
+                        }
+                    }
+                }
+                None => out.warnings.push(TranslationWarning {
+                    code: "invalid_legacy_config",
+                    key: format!("{prefix}sandbox.enabled"),
+                    message: "Ignoring non-boolean sandbox.enabled; use sandbox.profile"
+                        .to_string(),
+                }),
+            }
+        }
+    }
 
     // Canonicalize the retired `aft_`-prefixed host tool names (for example
     // `aft_read` -> `read`) inside the disabled list.

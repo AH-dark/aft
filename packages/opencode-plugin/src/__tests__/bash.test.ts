@@ -217,7 +217,7 @@ describe("OpenCode bash adapter", () => {
   test("schema accepts valid unified bash params and rejects invalid shapes", () => {
     // `sandbox` is only offered while the native sandbox is enabled.
     const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
-      sandbox: { enabled: true },
+      sandbox: { profile: { head: "strict" } },
     } as PluginContext["config"]);
 
     expect(bash.description).toContain("Output is compressed by default");

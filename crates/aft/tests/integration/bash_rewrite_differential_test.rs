@@ -344,7 +344,10 @@ fn sandbox_locking_control_never_dispatches_rewrite() {
             project_root: Some(root.path().to_path_buf()),
             experimental_bash_rewrite: true,
             sandbox: SandboxConfig {
-                enabled: true,
+                profile: aft::config::SandboxRoles {
+                    head: aft::config::SandboxMode::Strict,
+                    ..Default::default()
+                },
                 ..SandboxConfig::default()
             },
             ..Config::default()

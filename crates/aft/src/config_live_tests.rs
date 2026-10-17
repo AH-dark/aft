@@ -302,13 +302,13 @@ fn deleted_config_file_keeps_the_last_good_config() {
 
 #[test]
 fn deleting_project_config_applies_ordinary_settings_and_holds_security() {
-    let project = r#"{ "format_on_edit": true, "sandbox": { "enabled": true } }"#;
+    let project = r#"{ "format_on_edit": true, "sandbox": { "profile": { "head": "strict" } } }"#;
     let fixture = Fixture::new(
-        r#"{ "format_on_edit": false, "sandbox": { "enabled": false } }"#,
+        r#"{ "format_on_edit": false, "sandbox": { "profile": { "head": "off" } } }"#,
         Some(project),
     );
     assert!(fixture.ctx.config().format_on_edit);
-    assert!(fixture.ctx.config().sandbox.enabled);
+    assert!(fixture.ctx.config().sandbox.head_enabled());
 
     std::fs::remove_file(&fixture.project_path).expect("delete project config");
     let outcome = fixture.reload();
@@ -317,17 +317,17 @@ fn deleting_project_config_applies_ordinary_settings_and_holds_security() {
         applied(&outcome).contains(&"format_on_edit"),
         "deleting the project file must apply ordinary settings: {outcome:?}"
     );
-    assert_eq!(held(&outcome), vec!["sandbox.enabled"]);
+    assert_eq!(held(&outcome), vec!["sandbox.profile.head"]);
     let config = fixture.ctx.config();
     assert!(!config.format_on_edit);
-    assert!(config.sandbox.enabled);
+    assert!(config.sandbox.head_enabled());
 
     write(&fixture.project_path, project);
     let restored = fixture.reload();
     assert!(held(&restored).is_empty());
     assert!(applied(&restored).contains(&"format_on_edit"));
     assert!(fixture.ctx.config().format_on_edit);
-    assert!(fixture.ctx.config().sandbox.enabled);
+    assert!(fixture.ctx.config().sandbox.head_enabled());
 }
 
 #[test]
@@ -346,15 +346,15 @@ fn unchanged_file_text_is_a_no_op() {
 #[test]
 fn project_tier_still_cannot_loosen_on_live_reload() {
     let fixture = Fixture::new(
-        r#"{ "restrict_to_project_root": true, "sandbox": { "enabled": true } }"#,
+        r#"{ "restrict_to_project_root": true, "sandbox": { "profile": { "head": "strict" } } }"#,
         Some("{}"),
     );
     assert!(fixture.ctx.config().restrict_to_project_root);
-    assert!(fixture.ctx.config().sandbox.enabled);
+    assert!(fixture.ctx.config().sandbox.head_enabled());
 
     write(
         &fixture.project_path,
-        r#"{ "restrict_to_project_root": false, "sandbox": { "enabled": false }, "format_on_edit": true }"#,
+        r#"{ "restrict_to_project_root": false, "sandbox": { "profile": { "head": "off" } }, "format_on_edit": true }"#,
     );
     let outcome = fixture.reload();
 
@@ -370,7 +370,7 @@ fn project_tier_still_cannot_loosen_on_live_reload() {
     );
     let config = fixture.ctx.config();
     assert!(config.restrict_to_project_root);
-    assert!(config.sandbox.enabled);
+    assert!(config.sandbox.head_enabled());
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn request_pins_its_config_while_a_reload_publishes() {
     assert!(!fixture.ctx.config().restrict_to_project_root);
     write(
         &fixture.user_path,
-        r#"{ "restrict_to_project_root": true, "sandbox": { "enabled": true } }"#,
+        r#"{ "restrict_to_project_root": true, "sandbox": { "profile": { "head": "strict" } } }"#,
     );
 
     let principal = crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty;
@@ -389,7 +389,7 @@ fn request_pins_its_config_while_a_reload_publishes() {
         scope.spawn(|| {
             assert_eq!(
                 applied(&fixture.reload()),
-                vec!["restrict_to_project_root", "sandbox.enabled"]
+                vec!["restrict_to_project_root", "sandbox.profile.head"]
             );
         });
     });
@@ -706,7 +706,7 @@ fn held(outcome: &ReloadOutcome) -> Vec<&'static str> {
 #[test]
 fn project_edit_cannot_remove_project_hardening_until_the_next_connect() {
     let fixture = Fixture::new(
-        r#"{ "sandbox": { "enabled": true } }"#,
+        r#"{ "sandbox": { "profile": { "head": "strict" } } }"#,
         Some(r#"{ "sandbox": { "read_deny": ["/secrets"] } }"#),
     );
     let secrets = PathBuf::from("/secrets");
@@ -721,7 +721,7 @@ fn project_edit_cannot_remove_project_hardening_until_the_next_connect() {
     // A later user-file edit keeps holding it.
     write(
         &fixture.user_path,
-        r#"{ "sandbox": { "enabled": true }, "validate_on_edit": "syntax" }"#,
+        r#"{ "sandbox": { "profile": { "head": "strict" } }, "validate_on_edit": "syntax" }"#,
     );
     let outcome = fixture.reload();
     assert_eq!(applied(&outcome), vec!["validate_on_edit"]);
@@ -734,14 +734,17 @@ fn project_edit_cannot_remove_project_hardening_until_the_next_connect() {
 
 #[test]
 fn project_edit_cannot_turn_off_a_sandbox_the_project_turned_on() {
-    let fixture = Fixture::new("{}", Some(r#"{ "sandbox": { "enabled": true } }"#));
-    assert!(fixture.ctx.config().sandbox.enabled);
+    let fixture = Fixture::new(
+        "{}",
+        Some(r#"{ "sandbox": { "profile": { "head": "strict" } } }"#),
+    );
+    assert!(fixture.ctx.config().sandbox.head_enabled());
 
     write(&fixture.project_path, "{}");
     let outcome = fixture.reload();
 
-    assert_eq!(held(&outcome), vec!["sandbox.enabled"]);
-    assert!(fixture.ctx.config().sandbox.enabled);
+    assert_eq!(held(&outcome), vec!["sandbox.profile.head"]);
+    assert!(fixture.ctx.config().sandbox.head_enabled());
 }
 
 #[test]
@@ -768,12 +771,18 @@ fn user_can_live_reload_privacy_disclaim_off() {
 
 #[test]
 fn a_user_edit_can_still_loosen_what_the_user_set() {
-    let fixture = Fixture::new(r#"{ "sandbox": { "enabled": true } }"#, Some("{}"));
-    write(&fixture.user_path, r#"{ "sandbox": { "enabled": false } }"#);
+    let fixture = Fixture::new(
+        r#"{ "sandbox": { "profile": { "head": "strict" } } }"#,
+        Some("{}"),
+    );
+    write(
+        &fixture.user_path,
+        r#"{ "sandbox": { "profile": { "head": "off" } } }"#,
+    );
     let outcome = fixture.reload();
-    assert_eq!(applied(&outcome), vec!["sandbox.enabled"]);
+    assert_eq!(applied(&outcome), vec!["sandbox.profile.head"]);
     assert!(held(&outcome).is_empty());
-    assert!(!fixture.ctx.config().sandbox.enabled);
+    assert!(!fixture.ctx.config().sandbox.head_enabled());
 }
 
 #[test]
@@ -788,7 +797,7 @@ fn deleting_a_file_backed_relayed_tier_holds_security_until_recreated() {
             ..Config::default()
         },
     );
-    let relayed = r#"{ "sandbox": { "enabled": true } }"#;
+    let relayed = r#"{ "sandbox": { "profile": { "head": "strict" } } }"#;
     let req: RawRequest = serde_json::from_value(json!({
         "id": "configure-wire",
         "command": "configure",
@@ -805,23 +814,23 @@ fn deleting_a_file_backed_relayed_tier_holds_security_until_recreated() {
     let project_path = project_config_path(&root);
     write(&project_path, relayed);
     assert_eq!(reload_config_now(&ctx), ReloadOutcome::Unchanged);
-    assert!(ctx.config().sandbox.enabled);
+    assert!(ctx.config().sandbox.head_enabled());
 
     std::fs::remove_file(&project_path).unwrap();
     let deleted = reload_config_now(&ctx);
-    assert_eq!(held(&deleted), vec!["sandbox.enabled"]);
-    assert!(ctx.config().sandbox.enabled);
+    assert_eq!(held(&deleted), vec!["sandbox.profile.head"]);
+    assert!(ctx.config().sandbox.head_enabled());
 
     write(&project_path, relayed);
     let restored = reload_config_now(&ctx);
     assert!(held(&restored).is_empty());
-    assert!(ctx.config().sandbox.enabled);
+    assert!(ctx.config().sandbox.head_enabled());
 }
 
 #[test]
 fn successive_held_project_edits_keep_all_published_project_hardening() {
     let fixture = Fixture::new(
-        r#"{ "sandbox": { "enabled": true, "read_deny": ["/u"] } }"#,
+        r#"{ "sandbox": { "profile": { "head": "strict" }, "read_deny": ["/u"] } }"#,
         Some(r#"{ "sandbox": { "read_deny": ["/a"] } }"#),
     );
     let deny = |path: &str| {
@@ -863,20 +872,20 @@ fn successive_held_project_edits_keep_a_project_enabled_sandbox() {
     // drops the deny (held) while keeping the sandbox on, and the one after
     // turns the sandbox off.
     let fixture = Fixture::new("{}", Some(r#"{ "sandbox": { "read_deny": ["/a"] } }"#));
-    assert!(!fixture.ctx.config().sandbox.enabled);
+    assert!(!fixture.ctx.config().sandbox.head_enabled());
 
     write(
         &fixture.project_path,
-        r#"{ "sandbox": { "enabled": true } }"#,
+        r#"{ "sandbox": { "profile": { "head": "strict" } } }"#,
     );
     let outcome = fixture.reload();
     assert_eq!(held(&outcome), vec!["sandbox.read_deny"]);
-    assert!(fixture.ctx.config().sandbox.enabled);
+    assert!(fixture.ctx.config().sandbox.head_enabled());
 
     write(&fixture.project_path, "{}");
     fixture.reload();
     assert!(
-        fixture.ctx.config().sandbox.enabled,
+        fixture.ctx.config().sandbox.head_enabled(),
         "a sandbox a held project edit turned on must stay on"
     );
 }
@@ -899,10 +908,10 @@ fn a_replaced_config_directory_is_watched_again() {
     // A security tightening in the replacement must be applied.
     write(
         &fixture.project_path,
-        r#"{ "sandbox": { "enabled": true } }"#,
+        r#"{ "sandbox": { "profile": { "head": "strict" } } }"#,
     );
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !fixture.ctx.config().sandbox.enabled {
+    while !fixture.ctx.config().sandbox.head_enabled() {
         assert!(
             Instant::now() < deadline,
             "an edit in the replaced directory was never applied"
@@ -1091,7 +1100,7 @@ fn publishing_inside_update_config_panics_instead_of_deadlocking() {
 #[test]
 fn reverting_the_project_file_releases_the_hold() {
     let fixture = Fixture::new(
-        r#"{ "sandbox": { "enabled": true, "read_deny": ["/u"] } }"#,
+        r#"{ "sandbox": { "profile": { "head": "strict" }, "read_deny": ["/u"] } }"#,
         Some(r#"{ "sandbox": { "read_deny": ["/a"] } }"#),
     );
     let deny = |path: &str| {
@@ -1124,11 +1133,11 @@ fn reverting_the_project_file_releases_the_hold() {
     // With the hold released, a user-file loosening applies live again.
     write(
         &fixture.user_path,
-        r#"{ "sandbox": { "enabled": false, "read_deny": ["/u"] } }"#,
+        r#"{ "sandbox": { "profile": { "head": "off" }, "read_deny": ["/u"] } }"#,
     );
     let outcome = fixture.reload();
-    assert_eq!(applied(&outcome), vec!["sandbox.enabled"]);
-    assert!(!fixture.ctx.config().sandbox.enabled);
+    assert_eq!(applied(&outcome), vec!["sandbox.profile.head"]);
+    assert!(!fixture.ctx.config().sandbox.head_enabled());
 }
 #[test]
 fn legacy_project_sources_keep_actual_file_paths() {

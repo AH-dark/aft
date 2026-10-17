@@ -31,7 +31,7 @@ describe("Pi bash family registration", () => {
       },
       // The native sandbox is enabled so the `sandbox` parameter, offered
       // only then, stays pinned with the rest of the full surface.
-      config: { sandbox: { enabled: true } },
+      config: { sandbox: { profile: { head: "strict" } } },
       storageDir: "/tmp/test",
     } as unknown as PluginContext;
 

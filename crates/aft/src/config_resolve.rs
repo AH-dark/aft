@@ -652,9 +652,16 @@ pub struct RawRemoteExec {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawSandbox {
-    pub enabled: Option<bool>,
+    pub profile: Option<RawSandboxRoles>,
     pub write_allow: Option<Vec<PathBuf>>,
     pub read_deny: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawSandboxRoles {
+    pub worker: Option<crate::config::SandboxMode>,
+    pub head: Option<crate::config::SandboxMode>,
 }
 
 /// Raw user-tier standing index configuration. Unlike normally stripped nested
@@ -1175,8 +1182,23 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.pi.is_some() {
         base.pi = override_config.pi;
     }
-    if override_config.sandbox.is_some() {
-        base.sandbox = override_config.sandbox;
+    if let Some(next) = override_config.sandbox {
+        let sandbox = base.sandbox.get_or_insert_with(RawSandbox::default);
+        if let Some(next) = next.profile {
+            let profile = sandbox.profile.get_or_insert_with(RawSandboxRoles::default);
+            if next.worker.is_some() {
+                profile.worker = next.worker;
+            }
+            if next.head.is_some() {
+                profile.head = next.head;
+            }
+        }
+        if next.write_allow.is_some() {
+            sandbox.write_allow = next.write_allow;
+        }
+        if next.read_deny.is_some() {
+            sandbox.read_deny = next.read_deny;
+        }
     }
     if override_config.bash.is_some() {
         base.bash = override_config.bash;
@@ -1329,13 +1351,17 @@ fn merge_project_sandbox(
             }
         }
     }
-    // A project may ENABLE the sandbox for itself (hardening is one-way): a
-    // repo can opt its own bash into kernel confinement, but a project-tier
-    // `enabled: false` can never switch off what the user turned on.
-    if project.enabled == Some(true) {
-        sandbox.enabled = Some(true);
+    if let Some(next) = project.profile {
+        let floor = resolve_sandbox_config(Some(&sandbox)).profile;
+        let profile = sandbox.profile.get_or_insert_with(RawSandboxRoles::default);
+        if let Some(worker) = next.worker.filter(|value| *value >= floor.worker) {
+            profile.worker = Some(worker);
+        }
+        if let Some(head) = next.head.filter(|value| *value >= floor.head) {
+            profile.head = Some(head);
+        }
     }
-    (sandbox.enabled.is_some() || sandbox.write_allow.is_some() || sandbox.read_deny.is_some())
+    (sandbox.profile.is_some() || sandbox.write_allow.is_some() || sandbox.read_deny.is_some())
         .then_some(sandbox)
 }
 
@@ -1723,6 +1749,26 @@ fn record_resource_loosening(
     tier: &str,
     dropped: &mut Vec<DroppedKey>,
 ) {
+    let floor = resolve_sandbox_config(base.sandbox.as_ref()).profile;
+    if let Some(profile) = project
+        .sandbox
+        .as_ref()
+        .and_then(|sandbox| sandbox.profile.as_ref())
+    {
+        for (role, next, floor) in [
+            ("worker", profile.worker, floor.worker),
+            ("head", profile.head, floor.head),
+        ] {
+            if next.is_some_and(|next| next < floor) {
+                push_drop(
+                    dropped,
+                    &format!("sandbox.profile.{role}"),
+                    tier,
+                    "projects may only select a stricter sandbox profile",
+                );
+            }
+        }
+    }
     const REASON: &str = "resource: project settings may only tighten the user budget";
     if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.idle_minutes) {
         let floor = base
@@ -1829,11 +1875,6 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         push_drop(dropped, "index.roots", tier, USER_ONLY_REASON);
     }
     if let Some(sandbox) = &raw.sandbox {
-        // enabled:true is an accepted project-tier hardening opt-in (merged by
-        // merge_project_sandbox); only the weakening direction is dropped.
-        if sandbox.enabled == Some(false) {
-            push_drop(dropped, "sandbox.enabled", tier, USER_ONLY_REASON);
-        }
         if sandbox.write_allow.is_some() {
             push_drop(dropped, "sandbox.write_allow", tier, USER_ONLY_REASON);
         }
@@ -2352,7 +2393,18 @@ fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {
         return SandboxConfig::default();
     };
     SandboxConfig {
-        enabled: raw.enabled.unwrap_or(false),
+        profile: crate::config::SandboxRoles {
+            worker: raw
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.worker)
+                .unwrap_or(crate::config::SandboxMode::Relaxed),
+            head: raw
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.head)
+                .unwrap_or(crate::config::SandboxMode::Off),
+        },
         write_allow: raw.write_allow.clone().unwrap_or_default(),
         read_deny: raw.read_deny.clone().unwrap_or_default(),
     }
@@ -3504,7 +3556,7 @@ mod tests {
             result.config.semantic.api_key_env.as_deref(),
             Some("USER_KEY")
         );
-        assert!(result.config.sandbox.enabled);
+        assert!(result.config.sandbox.head_enabled());
         assert_eq!(
             result.config.sandbox.write_allow,
             vec![PathBuf::from("/user/write")]
@@ -3516,7 +3568,7 @@ mod tests {
             "semantic.base_url",
             "semantic.api_key_env",
             "subc",
-            "sandbox.enabled",
+            "sandbox.profile.head",
             "sandbox.write_allow",
         ] {
             assert!(keys.contains(&key.to_string()), "missing dropped key {key}");
@@ -3974,6 +4026,46 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_profiles_default_by_role_and_project_cannot_loosen() {
+        let defaults = resolve_config(&[tier("user", "{}")]);
+        let sandbox = serde_json::to_value(&defaults.config.sandbox).unwrap();
+        assert_eq!(sandbox["profile"]["worker"], "relaxed");
+        assert_eq!(sandbox["profile"]["head"], "off");
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"sandbox":{"profile":{"worker":"strict","head":"relaxed"}}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"sandbox":{"profile":{"worker":"off","head":"off"}}}"#,
+            ),
+        ]);
+        let sandbox = serde_json::to_value(&result.config.sandbox).unwrap();
+        assert_eq!(sandbox["profile"]["worker"], "strict");
+        assert_eq!(sandbox["profile"]["head"], "relaxed");
+        assert!(drop_keys(&result).contains(&"sandbox.profile.worker".to_string()));
+        assert!(drop_keys(&result).contains(&"sandbox.profile.head".to_string()));
+        for role in ["worker", "head"] {
+            for (floor_rank, floor) in ["off", "relaxed", "strict"].into_iter().enumerate() {
+                for (next_rank, next) in ["off", "relaxed", "strict"].into_iter().enumerate() {
+                    let user =
+                        serde_json::json!({"sandbox":{"profile":{(role):floor}}}).to_string();
+                    let project =
+                        serde_json::json!({"sandbox":{"profile":{(role):next}}}).to_string();
+                    let result = resolve_config(&[tier("user", &user), tier("project", &project)]);
+                    let sandbox = serde_json::to_value(&result.config.sandbox).unwrap();
+                    assert_eq!(
+                        sandbox["profile"][role],
+                        if next_rank >= floor_rank { next } else { floor },
+                        "{role}: {floor} -> {next}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn project_sandbox_can_add_read_denies_but_not_enable_or_add_writes() {
         let result = resolve_config(&[
             tier(
@@ -3998,7 +4090,7 @@ mod tests {
             ),
         ]);
 
-        assert!(result.config.sandbox.enabled);
+        assert!(result.config.sandbox.head_enabled());
         assert_eq!(
             result.config.sandbox.write_allow,
             vec![PathBuf::from("/user/write")]
@@ -4013,8 +4105,9 @@ mod tests {
         assert_eq!(
             drop_keys(&result),
             vec![
-                "sandbox.enabled".to_string(),
-                "sandbox.write_allow".to_string()
+                "sandbox.write_allow".to_string(),
+                "sandbox.profile.worker".to_string(),
+                "sandbox.profile.head".to_string()
             ]
         );
     }
@@ -4026,9 +4119,9 @@ mod tests {
             tier("user", r#"{}"#),
             tier("project", r#"{ "sandbox": { "enabled": true } }"#),
         ]);
-        assert!(opt_in.config.sandbox.enabled);
+        assert!(opt_in.config.sandbox.head_enabled());
         assert!(
-            !drop_keys(&opt_in).contains(&"sandbox.enabled".to_string()),
+            !drop_keys(&opt_in).contains(&"sandbox.profile.head".to_string()),
             "project enabled:true is an accepted opt-in, not a dropped key"
         );
 
@@ -4037,8 +4130,8 @@ mod tests {
             tier("user", r#"{ "sandbox": { "enabled": true } }"#),
             tier("project", r#"{ "sandbox": { "enabled": false } }"#),
         ]);
-        assert!(opt_out.config.sandbox.enabled);
-        assert!(drop_keys(&opt_out).contains(&"sandbox.enabled".to_string()));
+        assert!(opt_out.config.sandbox.head_enabled());
+        assert!(drop_keys(&opt_out).contains(&"sandbox.profile.head".to_string()));
     }
 
     #[test]
