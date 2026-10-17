@@ -4246,6 +4246,11 @@ mod grant_path_tests {
         }
     }
 
+    /// Cancellation and a module drain each end the capture wait on their own.
+    /// No timer competes with them here: the capture deadline is pushed out to
+    /// an hour and the foreground window to ten minutes, and the runner holds
+    /// Accepted until the test releases it. A reply therefore proves the signal
+    /// ended the wait, and the timeout below is only a hang watchdog.
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_cancellation_and_drain_signals_interrupt_wait() {
@@ -4254,6 +4259,7 @@ mod grant_path_tests {
             for background in [false, true] {
                 let (daemon, _dir, root, executor, ctx) =
                     capture_fixture(Script::GatedAcceptance).await;
+                ctx.update_config(|config| config.foreground_wait_window_ms = 600_000);
                 let metrics = Arc::new(DispatchPathMetrics::new());
                 let cancel = BashWaitCancel {
                     run_scope: None,
@@ -4263,22 +4269,28 @@ mod grant_path_tests {
                     route: PersistentCancelSignal::new(),
                     drain: drain::ModuleDrainWindow::default(),
                 };
-                let mut rx = with_bash_timing_for_test(
-                    Some(BashTimingForTest::new(Instant::now())),
-                    || {
-                        deadline_test_call_controlled(
-                            &executor,
-                            &root,
-                            remote_runon_stub,
-                            json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
-                            Instant::now(),
-                            false,
-                            metrics,
-                            cancel.clone(),
-                        )
-                    },
-                );
+                let mut timing = BashTimingForTest::new(Instant::now());
+                Arc::get_mut(&mut timing).unwrap().capture_wait = Some(Duration::from_secs(3600));
+                let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
+                    deadline_test_call_controlled(
+                        &executor,
+                        &root,
+                        remote_runon_stub,
+                        json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
+                        Instant::now(),
+                        false,
+                        metrics,
+                        cancel.clone(),
+                    )
+                });
                 wait_for_capture_submission(&daemon, &mut rx).await;
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    timing.capture_registered.notified(),
+                )
+                .await
+                .expect("capture wait must publish its detach target");
+                assert!(rx.try_recv().is_err(), "the capture wait holds the reply");
                 let task_id = ctx
                     .bash_background()
                     .list(0)
@@ -4292,9 +4304,9 @@ mod grant_path_tests {
                 } else {
                     cancel.connection.cancel();
                 }
-                let done = tokio::time::timeout(Duration::from_millis(750), rx.recv())
+                let done = tokio::time::timeout(Duration::from_secs(60), rx.recv())
                     .await
-                    .expect("capture wait must observe cancellation and drain signals promptly")
+                    .expect("capture wait must observe cancellation and drain signals")
                     .unwrap();
                 if drain {
                     assert_eq!(done.response_for_test().data["task_id"], task_id);
@@ -4319,6 +4331,13 @@ mod grant_path_tests {
         }
     }
 
+    /// Neither a background launch reply nor a foreground promotion may answer
+    /// before the runner's Accepted. The call is received two seconds ago with
+    /// a one-second foreground window, so promotion is already due when the
+    /// capture wait starts, and the capture deadline is an hour out: nothing but
+    /// Accepted may release the reply. The half-second check before Accepted
+    /// can only miss an early reply under load, never fail a correct one; the
+    /// wait after Accepted is a hang watchdog.
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_delays_background_reply_and_foreground_promotion() {
@@ -4327,21 +4346,39 @@ mod grant_path_tests {
             let (daemon, _dir, root, executor, ctx) =
                 capture_fixture(Script::GatedAcceptance).await;
             ctx.update_config(|config| config.foreground_wait_window_ms = 1_000);
-            let mut rx = capture_call(
-                &executor,
-                &root,
-                json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
-            );
+            let received_at = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
+            let mut timing = BashTimingForTest::new(received_at);
+            Arc::get_mut(&mut timing).unwrap().capture_wait = Some(Duration::from_secs(3600));
+            let mut rx = with_bash_timing_for_test(Some(timing.clone()), || {
+                deadline_test_call_received(
+                    &executor,
+                    &root,
+                    remote_runon_stub,
+                    json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
+                    received_at,
+                )
+            });
             wait_for_capture_submission(&daemon, &mut rx).await;
-            assert!(tokio::time::timeout(Duration::from_millis(1_100), rx.recv()).await.is_err(),
-                "neither launch nor promotion may reply before the first stream record (background={background})");
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                timing.capture_registered.notified(),
+            )
+            .await
+            .expect("capture wait must publish its detach target");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                    .await
+                    .is_err(),
+                "neither launch nor promotion may reply before Accepted (background={background})"
+            );
             daemon.acceptance_gate.notify_one();
-            let done = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            let done = tokio::time::timeout(Duration::from_secs(60), rx.recv())
                 .await
-                .unwrap()
+                .expect("Accepted must release the reply")
                 .unwrap();
             let response = done.response_for_test();
             assert!(response.success, "{response:?}");
+            assert_ne!(response.data["status"], "starting", "{response:?}");
             let task = response.data["task_id"].as_str().unwrap();
             assert!(ctx
                 .bash_background()
@@ -4349,7 +4386,10 @@ mod grant_path_tests {
                 .unwrap()
                 .job_id
                 .is_some());
-            assert!(!done.text_for_test().unwrap().contains("hasn't confirmed"));
+            assert!(
+                !done.text_for_test().unwrap().contains("hasn't confirmed"),
+                "neither launch nor promotion may reply before Accepted (background={background}): {response:?}"
+            );
         }
     }
 
