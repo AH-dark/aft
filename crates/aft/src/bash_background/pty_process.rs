@@ -57,6 +57,7 @@ pub(crate) fn spawn_pty_for_command(
     cols: u16,
     wake_tx: crossbeam_channel::Sender<()>,
     io_handles: &mut TaskIoHandles,
+    spawned_pgid: &mut Option<i32>,
 ) -> Result<PtyRuntime, String> {
     #[cfg(unix)]
     {
@@ -82,6 +83,7 @@ pub(crate) fn spawn_pty_for_command(
             cols,
             wake_tx,
             io_handles,
+            spawned_pgid,
         )
     }
     #[cfg(windows)]
@@ -133,6 +135,7 @@ pub(crate) fn spawn_pty_for_command(
                 cols,
                 wake_tx.clone(),
                 io_handles,
+                spawned_pgid,
             ) {
                 Ok(runtime) => return Ok(runtime),
                 Err(error) => {
@@ -183,6 +186,7 @@ fn try_spawn_pty(
     cols: u16,
     wake_tx: crossbeam_channel::Sender<()>,
     io_handles: &mut TaskIoHandles,
+    spawned_pgid: &mut Option<i32>,
 ) -> Result<PtyRuntime, String> {
     let (command, profile_handle) = crate::sandbox_spawn::pty_command_for_plan(
         spawn_plan,
@@ -239,6 +243,9 @@ fn try_spawn_pty(
     drop(profile_handle);
     let mut child = SpawnedPtyChild(Some(child));
     let child_pid = child.0.as_ref().unwrap().process_id();
+    // Setup can fail after exec. Preserve the group identity for the failed
+    // task's scratch cleanup even though no runtime is returned to the registry.
+    *spawned_pgid = child_pid.map(|pid| pid as i32);
     let killer = child.0.as_ref().unwrap().clone_killer();
     #[cfg(test)]
     fail_pty_setup_for_test(child_pid)?;
@@ -652,6 +659,7 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
     let pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
     SETUP_FAILURE
         .with(|failure| *failure.borrow_mut() = Some((dir.path().join("ready"), pid.clone())));
+    let mut spawned_pgid = None;
     let result = try_spawn_pty(
         &SpawnPlan::Unsandboxed,
         "bash-0000000000000901",
@@ -665,9 +673,11 @@ fn lifecycle_pty_setup_failure_terminates_and_reaps_child() {
         80,
         crossbeam_channel::unbounded().0,
         &mut handles,
+        &mut spawned_pgid,
     );
     let pid = pid.load(Ordering::SeqCst);
     assert_ne!(pid, 0);
+    assert_eq!(spawned_pgid, Some(pid as i32));
     let alive = super::process::is_process_alive(pid);
     if alive {
         super::process::terminate_pgid(pid as i32, None);

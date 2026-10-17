@@ -32,7 +32,7 @@ const LINKED_WORKTREE_REBIND_MARGIN_MS: u64 = 10 * 60 * 1000;
 const ORPHAN_VIEW_GRACE_MS: u64 = 60 * 60 * 1000;
 /// Caches of checkouts already past their grace that one pass processes
 /// before resuming the lexical walk.
-const DUE_FIRST_ENTRIES: usize = 64;
+const DUE_FIRST_ENTRIES: usize = 256;
 const INTERVAL: Duration = Duration::from_secs(10 * 60);
 // Startup can warm many checkout views at once. Keep storage-wide V1 blob
 // marking (which must exclude pin admission) off that request-critical lane.
@@ -89,6 +89,9 @@ pub(crate) struct SweepReport {
     /// Keys whose every binding is past its grace with caches still on disk
     /// when the pass began.
     pub due_keys: usize,
+    /// Vanished-checkout view folders still due after this pass. Protected
+    /// folders remain in this count so a stalled backlog is visible in health.
+    pub due_views_remaining: usize,
     /// The share of this pass spent on keys already past their grace.
     pub due_first: DomainReport,
     /// The share of this pass spent on view folders with no registry member
@@ -1336,6 +1339,9 @@ fn retire_due_cache(
         phase.elapsed().as_millis() as u64;
     report.removed_roots += 1;
     report.unmeasured_removed_roots += 1;
+    if directory == storage.join("views") {
+        report.due_views_remaining = report.due_views_remaining.saturating_sub(1);
+    }
     if !cache_key_present(storage, key, deadline)? {
         clear_unknown_observation(storage, key)?;
     }
@@ -1767,6 +1773,9 @@ fn due_first(
             }
             if fs::symlink_metadata(directory.join(&key)).is_ok_and(|metadata| metadata.is_dir()) {
                 present = true;
+                if directory == &storage.join("views") {
+                    report.due_views_remaining += 1;
+                }
                 caches.push((key.clone(), directory.clone()));
             }
         }
@@ -1777,8 +1786,15 @@ fn due_first(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(storage)
         .and_then(|state| state.due_cursor.clone());
-    let start = cursor.map_or(0, |last| caches.partition_point(|(key, _)| *key <= last));
-    caches.rotate_left(start);
+    // Large per-checkout views dominate disk usage. Process them before other
+    // planes, retaining a rotating key order within each priority class.
+    caches.sort_by_key(|(key, directory)| {
+        (
+            directory != &storage.join("views"),
+            cursor.as_ref().is_some_and(|last| key <= last),
+            key.clone(),
+        )
+    });
     let mut last = None;
     for (key, directory) in caches.into_iter().take(DUE_FIRST_ENTRIES) {
         if cancelled() {
@@ -3575,6 +3591,68 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn storage_retention_vanished_view_backlog_drains_in_two_passes() {
+        const ROOTS: usize = 600;
+        let (temp, root, scope) = fixture();
+        let template: Binding =
+            read_json(&temp.path().join(format!("retention/roots/{scope}.json"))).unwrap();
+        fs::remove_dir(root).unwrap();
+        for number in 0..ROOTS {
+            let key = format!("{number:016x}");
+            let mut binding = template.clone();
+            binding.root = temp.path().join(format!("deleted-{number}"));
+            binding.artifact_key = key.clone();
+            atomic_json(
+                &temp.path().join(format!("retention/roots/{key}.json")),
+                &binding,
+            )
+            .unwrap();
+            cache(temp.path(), "views", &key);
+            cache(temp.path(), "callgraph", &key);
+        }
+        let remaining = || {
+            (0..ROOTS)
+                .filter(|number| temp.path().join(format!("views/{number:016x}")).exists())
+                .count()
+        };
+        let mut passes = 0;
+        drain_due_views(|| {
+            let report = run_pass_entry_bound(temp.path());
+            passes += 1;
+            assert_eq!(report.due_views_remaining, remaining(), "{report:?}");
+            assert!(report.due_first.examined <= DUE_FIRST_ENTRIES, "{report:?}");
+            if passes == 1 {
+                assert_eq!(report.due_first.removed_roots, 256, "{report:?}");
+                assert_eq!(
+                    remaining(),
+                    ROOTS - 256 - PASS_ENTRIES,
+                    "views must precede other domains"
+                );
+            }
+            assert!(passes <= 2, "vanished views stalled: {report:?}");
+            report
+        });
+        assert_eq!(passes, 2);
+        assert_eq!(remaining(), 0);
+    }
+
+    #[test]
+    fn storage_retention_backlog_burst_stops_without_progress_or_on_cancellation() {
+        for cancelled in [false, true] {
+            let mut passes = 0;
+            drain_due_views(|| {
+                passes += 1;
+                SweepReport {
+                    due_views_remaining: 3,
+                    cancelled,
+                    ..Default::default()
+                }
+            });
+            assert_eq!(passes, 1);
+        }
+    }
+
+    #[test]
     fn storage_retention_large_due_backlog_drains_within_budget() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         const ROOTS: usize = 256;
@@ -3999,12 +4077,16 @@ pub(crate) fn schedule(
         .name("aft-storage-retention".into())
         .spawn(move || {
             scheduled_run(&storage, || {
-                let report = run_pass(&storage, &|| !admission.is_current(&generation, expected));
-                crate::slog_info!(
-                    "storage retention root={} report={}",
-                    storage.display(),
-                    serde_json::to_string(&report).unwrap_or_default()
-                );
+                drain_due_views(|| {
+                    let report =
+                        run_pass(&storage, &|| !admission.is_current(&generation, expected));
+                    crate::slog_info!(
+                        "storage retention root={} report={}",
+                        storage.display(),
+                        serde_json::to_string(&report).unwrap_or_default()
+                    );
+                    report
+                });
             });
         })
     {
@@ -4013,6 +4095,24 @@ pub(crate) fn schedule(
             completed: false,
         });
         crate::slog_warn!("storage retention worker could not start: {error}");
+    }
+}
+
+/// Each pass keeps its own entry and time bounds. A shrinking vanished-view
+/// backlog does not wait ten minutes between passes; protected or unreadable
+/// views stop the burst rather than spinning on an uncollectable directory.
+fn drain_due_views(mut pass: impl FnMut() -> SweepReport) {
+    loop {
+        let report = pass();
+        if report.cancelled
+            || report.due_views_remaining == 0
+            || report
+                .domains
+                .get("views")
+                .is_none_or(|views| views.unmeasured_removed_roots == 0)
+        {
+            break;
+        }
     }
 }
 

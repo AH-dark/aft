@@ -205,6 +205,10 @@ impl HintJob {
     pub(crate) fn hint(&self) -> Option<&str> {
         self.result.get().and_then(|result| result.as_deref())
     }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.result.get().is_some()
+    }
 }
 
 fn resolve_binary(binary: &Path, cwd: &Path, path: &std::ffi::OsStr) -> Option<PathBuf> {
