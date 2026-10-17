@@ -8222,12 +8222,20 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Run `git diff --name-status -z -M from..to` and return its raw output.
+///
+/// The output is read NUL-delimited on purpose. Without `-z`, git quotes any
+/// name that holds non-ASCII bytes, a tab, a quote or a backslash
+/// (`core.quotePath`), so `café.rs` arrives as `"caf\303\251.rs"`. That
+/// string is not a real path: the edited file would be counted once under the
+/// quoted name and again under its real name from the disk walk, and the
+/// committed edit itself would never be matched to the cached file.
 fn read_git_diff(
     root: &Path,
     from: &str,
     to: &str,
     max_changed_paths: Option<usize>,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     if !crate::developer_tools::git_usable() {
         return None;
     }
@@ -8235,7 +8243,7 @@ fn read_git_diff(
     let output = match crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)
-        .args(["diff", "--name-status", "-M", &diff_range])
+        .args(["diff", "--name-status", "-z", "-M", &diff_range])
         .output()
     {
         Ok(output) => output,
@@ -8246,13 +8254,63 @@ fn read_git_diff(
         return None;
     }
 
-    let Ok(diff) = String::from_utf8(output.stdout) else {
-        return None;
-    };
+    let diff = output.stdout;
     if max_changed_paths.is_some_and(|limit| !git_diff_within_path_limit(&diff, limit)) {
         return None;
     }
     Some(diff)
+}
+
+/// One record of `git diff --name-status -z` output, borrowing its raw bytes.
+struct GitNameStatusRecord<'a> {
+    /// Status letters, such as `M`, `A`, `D` or `R100` for a rename.
+    status: &'a [u8],
+    /// One path, or the old path then the new path for a rename or copy.
+    paths: Vec<&'a [u8]>,
+}
+
+/// Split `git diff --name-status -z` output into records.
+///
+/// In this format every field ends with a NUL byte: a status field, then one
+/// path field, or two (old then new) when the status is a rename (`R`) or a
+/// copy (`C`). Paths are never quoted or escaped. Returns `None` for output
+/// that does not follow this shape, so callers fall back to a full refresh
+/// instead of acting on a misread diff.
+fn parse_git_name_status_z(diff: &[u8]) -> Option<Vec<GitNameStatusRecord<'_>>> {
+    let body = match diff.split_last() {
+        None => return Some(Vec::new()),
+        Some((0, body)) => body,
+        Some(_) => return None,
+    };
+    let mut fields = body.split(|byte| *byte == 0);
+    let mut records = Vec::new();
+    while let Some(status) = fields.next() {
+        let path_count = match status.first()? {
+            b'R' | b'C' => 2,
+            _ => 1,
+        };
+        let paths = (0..path_count)
+            .map(|_| fields.next().filter(|path| !path.is_empty()))
+            .collect::<Option<Vec<_>>>()?;
+        records.push(GitNameStatusRecord { status, paths });
+    }
+    Some(records)
+}
+
+/// Turn one raw path from git's `-z` output into a relative path.
+///
+/// Git writes the bytes it stores for the name. On Unix those bytes are the
+/// file name itself; git for Windows stores and prints names as UTF-8, so a
+/// name that is not UTF-8 there is reported as `None`.
+#[cfg(unix)]
+fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 fn git_diff_paths(
@@ -8262,12 +8320,14 @@ fn git_diff_paths(
     max_changed_paths: Option<usize>,
 ) -> Option<HashSet<PathBuf>> {
     let diff = read_git_diff(root, from, to, max_changed_paths)?;
+    let records = parse_git_name_status_z(&diff)?;
     let mut canonical_parents = ParentCanonicalizationMemo::default();
     let mut paths = HashSet::new();
-    for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        for path in line.split('\t').skip(1) {
+    for record in &records {
+        for raw_path in &record.paths {
+            let relative = git_output_path(raw_path)?;
             if let Some(path) =
-                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
+                cached_path_under_root_with_memo(root, &relative, &mut canonical_parents)
             {
                 paths.insert(path);
             }
@@ -8286,54 +8346,69 @@ fn apply_git_diff_updates(
     let Some(diff) = read_git_diff(root, from, to, max_changed_paths) else {
         return false;
     };
+    let Some(records) = parse_git_name_status_z(&diff) else {
+        return false;
+    };
+    // Resolve every path before touching the index, so a name that cannot be
+    // decoded leaves the index as it was and the caller rebuilds instead.
+    let Some(records) = records
+        .iter()
+        .map(|record| {
+            let paths = record
+                .paths
+                .iter()
+                .map(|raw_path| git_output_path(raw_path))
+                .collect::<Option<Vec<_>>>()?;
+            Some((record.status, paths))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
     let mut canonical_parents = ParentCanonicalizationMemo::default();
 
-    for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let mut fields = line.split('\t');
-        let Some(status) = fields.next() else {
-            continue;
-        };
-
-        if status.starts_with('R') {
-            let Some(old_path) = fields.next().and_then(|path| {
-                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
-            }) else {
+    for (status, paths) in records {
+        let resolved: Vec<Option<PathBuf>> = paths
+            .iter()
+            .map(|path| cached_path_under_root_with_memo(root, path, &mut canonical_parents))
+            .collect();
+        let path = match (status.first(), resolved.as_slice()) {
+            (Some(b'R'), [Some(old_path), Some(new_path)]) => {
+                index.remove_file_with_canonicalization_memo(old_path, &mut canonical_parents);
+                index.update_file_with_canonicalization_memo(new_path, &mut canonical_parents);
                 continue;
-            };
-            let Some(new_path) = fields.next().and_then(|path| {
-                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
-            }) else {
-                continue;
-            };
-            index.remove_file_with_canonicalization_memo(&old_path, &mut canonical_parents);
-            index.update_file_with_canonicalization_memo(&new_path, &mut canonical_parents);
-            continue;
-        }
-
-        let Some(path) = fields.next().and_then(|path| {
-            cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
-        }) else {
-            continue;
+            }
+            // A copy leaves its source unchanged; only the new path changed.
+            (Some(b'C'), [_, Some(new_path)]) => new_path,
+            (Some(b'R' | b'C'), _) => continue,
+            (_, [Some(path)]) => path,
+            _ => continue,
         };
-        if status.starts_with('D') || !path.exists() {
-            index.remove_file_with_canonicalization_memo(&path, &mut canonical_parents);
+        if status.first() == Some(&b'D') || !path.exists() {
+            index.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
         } else {
-            index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
+            index.update_file_with_canonicalization_memo(path, &mut canonical_parents);
         }
     }
 
     true
 }
 
-fn git_diff_within_path_limit(diff: &str, limit: usize) -> bool {
-    // Decide before touching source files. Renames name both an old and a new
-    // path, so the cheap line-count check is followed by an exact path count.
-    diff.lines().count() <= limit
-        && diff
-            .lines()
-            .map(|line| line.split('\t').skip(1).count())
-            .sum::<usize>()
-            <= limit
+fn git_diff_within_path_limit(diff: &[u8], limit: usize) -> bool {
+    // Decide before touching source files. Each record is a status field plus
+    // one or two path fields, so more than twice the limit in fields already
+    // means more than `limit` paths; otherwise count the paths exactly, which
+    // includes both the old and the new path of a rename. Output that cannot
+    // be parsed is never admitted.
+    let fields = diff.iter().filter(|byte| **byte == 0).count();
+    fields <= limit.saturating_mul(2)
+        && parse_git_name_status_z(diff).is_some_and(|records| {
+            records
+                .iter()
+                .map(|record| record.paths.len())
+                .sum::<usize>()
+                <= limit
+        })
 }
 
 fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
@@ -8536,13 +8611,44 @@ mod tests {
     #[test]
     fn warm_git_diff_budget_counts_both_rename_paths() {
         let mut diff = (0..510)
-            .map(|i| format!("M\tfile_{i}.rs\n"))
+            .map(|i| format!("M\0file_{i}.rs\0"))
             .collect::<String>();
-        diff.push_str("R100\told.rs\tnew.rs\n");
-        assert!(git_diff_within_path_limit(&diff, 512));
-        diff.push_str("A\textra.rs\n");
-        assert!(!git_diff_within_path_limit(&diff, 512));
-        assert!(git_diff_within_path_limit("", 512));
+        diff.push_str("R100\0old.rs\0new.rs\0");
+        assert!(git_diff_within_path_limit(diff.as_bytes(), 512));
+        diff.push_str("A\0extra.rs\0");
+        assert!(!git_diff_within_path_limit(diff.as_bytes(), 512));
+        assert!(git_diff_within_path_limit(b"", 512));
+    }
+
+    #[test]
+    fn git_name_status_z_keeps_special_names_raw_and_pairs_rename_paths() {
+        let diff = b"M\0caf\xc3\xa9.rs\0R087\0old name.rs\0new\tname.rs\0A\0say \"hi\".rs\0";
+        let records = parse_git_name_status_z(diff).expect("well-formed output");
+        let parsed: Vec<(&[u8], Vec<&[u8]>)> = records
+            .iter()
+            .map(|record| (record.status, record.paths.clone()))
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                (&b"M"[..], vec!["café.rs".as_bytes()]),
+                (
+                    &b"R087"[..],
+                    vec![&b"old name.rs"[..], &b"new\tname.rs"[..]]
+                ),
+                (&b"A"[..], vec![&b"say \"hi\".rs"[..]]),
+            ]
+        );
+        assert_eq!(
+            git_output_path("café.rs".as_bytes()),
+            Some(PathBuf::from("café.rs"))
+        );
+        assert!(parse_git_name_status_z(b"").is_some_and(|records| records.is_empty()));
+        // A rename missing its new path, or output cut before its final NUL,
+        // is rejected rather than half-applied.
+        assert!(parse_git_name_status_z(b"R100\0old.rs\0").is_none());
+        assert!(parse_git_name_status_z(b"M\0file.rs").is_none());
+        assert!(!git_diff_within_path_limit(b"R100\0old.rs\0", 512));
     }
 
     #[test]
@@ -9875,6 +9981,164 @@ mod tests {
             .contains_key(&canonical_project.join("untracked.txt")));
         let matches = refreshed.grep("after local edit", true, &[], &[], &canonical_project, 10);
         assert_eq!(matches.matches.len(), 1);
+    }
+
+    /// File names that `git diff` quotes unless it is run with `-z`: non-ASCII
+    /// bytes everywhere, plus a tab, double quotes and a backslash where the
+    /// platform allows them in a file name. The space is never quoted and
+    /// serves as a control.
+    fn names_git_quotes() -> Vec<&'static str> {
+        let mut names = vec!["café.rs", "with space.rs"];
+        if cfg!(unix) {
+            names.extend(["tab\tname.rs", "say \"hi\".rs", "back\\slash.rs"]);
+        }
+        names
+    }
+
+    fn git_commit_all_for_test(project: &Path, message: &str) {
+        assert!(git_command_for_test(project)
+            .args(["add", "-A"])
+            .status()
+            .expect("git add")
+            .success());
+        assert!(git_command_for_test(project)
+            .args(["commit", "--quiet", "-m", message])
+            .status()
+            .expect("git commit")
+            .success());
+    }
+
+    /// A repository whose first commit holds every file already in `project`.
+    /// `core.quotePath` is set explicitly so git quotes non-ASCII names no
+    /// matter what the surrounding configuration says.
+    fn init_quoting_git_repo(project: &Path) -> String {
+        let mut init = Command::new("git");
+        assert!(crate::test_env::apply_hermetic_git_env(
+            init.arg("init").arg("--quiet").arg(project)
+        )
+        .status()
+        .expect("git init")
+        .success());
+        for args in [
+            ["config", "user.email", "aft@example.invalid"],
+            ["config", "user.name", "AFT Test"],
+            ["config", "core.quotePath", "true"],
+        ] {
+            assert!(git_command_for_test(project)
+                .args(args)
+                .status()
+                .expect("git config")
+                .success());
+        }
+        git_commit_all_for_test(project, "initial");
+        run_git(project, &["rev-parse", "HEAD"]).expect("initial head")
+    }
+
+    #[test]
+    fn warm_reload_counts_each_git_quoted_path_once_between_heads() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        let names = names_git_quotes();
+        for (ordinal, name) in names.iter().enumerate() {
+            fs::write(project.join(name), format!("// {ordinal}\n")).expect("write file");
+        }
+        let previous = init_quoting_git_repo(&project);
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = Some(previous.clone());
+
+        // Ordinary edits change size and mtime, so the disk walk reports each
+        // file too. The git diff must name the same paths, not quoted copies.
+        for (ordinal, name) in names.iter().enumerate() {
+            fs::write(
+                project.join(name),
+                format!("// {ordinal} QuotedPathNeedle after the edit\n"),
+            )
+            .expect("edit file");
+        }
+        git_commit_all_for_test(&project, "edit special names");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+
+        let expected: HashSet<PathBuf> = names
+            .iter()
+            .map(|name| cached_path_under_root(&project, Path::new(name)).expect("under root"))
+            .collect();
+        assert_eq!(
+            git_diff_paths(&project, &previous, &current, Some(names.len())),
+            Some(expected)
+        );
+        // A budget of exactly one path per edited file is enough only when no
+        // file is counted twice.
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            baseline,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current.clone()),
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(names.len()),
+        )
+        .expect("each edited file must count once against the warm budget");
+        assert_eq!(refreshed.git_head.as_deref(), Some(current.as_str()));
+        let result = refreshed.grep("QuotedPathNeedle", true, &[], &[], &canonical_project, 10);
+        assert_eq!(result.total_matches, names.len());
+    }
+
+    #[test]
+    fn warm_reload_reads_committed_edit_to_git_quoted_path_with_unchanged_stat() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        let names = names_git_quotes();
+        for (ordinal, name) in names.iter().enumerate() {
+            fs::write(project.join(name), format!("// {ordinal} QuotedOld\n")).expect("write");
+        }
+        let previous = init_quoting_git_repo(&project);
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = Some(previous.clone());
+
+        // Same size and the original mtime: the stat pass sees nothing, so
+        // only the git diff can tell the refresh to reread these files.
+        for (ordinal, name) in names.iter().enumerate() {
+            let path = project.join(name);
+            let modified = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .expect("original mtime");
+            fs::write(&path, format!("// {ordinal} QuotedNew\n")).expect("edit file");
+            File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(modified))
+                .expect("restore mtime");
+        }
+        git_commit_all_for_test(&project, "same-size edits");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+        assert_ne!(previous, current, "git must record the same-size edits");
+
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            baseline,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current),
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(WARM_GIT_DIFF_PATH_LIMIT),
+        )
+        .expect("warm refresh");
+        let new = refreshed.grep("QuotedNew", true, &[], &[], &canonical_project, 10);
+        let mut found: Vec<_> = new
+            .matches
+            .iter()
+            .map(|matched| matched.file.file_name().unwrap().to_owned())
+            .collect();
+        found.sort();
+        let mut expected: Vec<_> = names.iter().map(std::ffi::OsString::from).collect();
+        expected.sort();
+        assert_eq!(found, expected, "every committed edit must be searchable");
+        let old = refreshed.grep("QuotedOld", true, &[], &[], &canonical_project, 10);
+        assert_eq!(old.total_matches, 0, "no stale content may remain");
     }
 
     #[test]
