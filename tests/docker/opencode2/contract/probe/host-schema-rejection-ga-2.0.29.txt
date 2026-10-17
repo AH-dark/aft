@@ -1,0 +1,24 @@
+OpenCode 2 GA host schema-rejection probe
+run_id: oc2-ga-2.0.29-20261017-schema
+checkout_sha: 7f001b797715b7bbc57cd6b69d9bc358ebb396e
+platform: linux/amd64 isolated capture
+binary: @opencode/cli-linux-x64@2.0.29/bin/opencode
+session_id: ses_eb88be9deffeWrRyb7hHkEGaa2
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private under one temporary root; OPENCODE_DB=opencode2.db in the private project; OPENCODE_DISABLE_DEFAULT_PLUGINS=true; OPENCODE_DISABLE_MODELS_FETCH unset
+service isolation: a free loopback port was written to $XDG_CONFIG_HOME/opencode/service.json; the schema probe used `run --standalone`, so it created no background service.
+
+The probe replays the harness's read/T2/host_schema_rejection_probe case against the host's native `read` tool. The deterministic mock answered the selected `openai/mock-model` request with `{"name":"read","arguments":"{}"}`, then answered the follow-up request after the host rejected the invalid call.
+
+$ opencode run --standalone --print-logs --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+{"type":"step_start","timestamp":1792200153841,"sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","part":{"id":"prt_147741af1001UXGp9LzIhCh1Qe","sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","messageID":"msg_147741ac6001Q2Q23aPZ1ORWcw","type":"step-start"}}
+{"type":"tool_use","timestamp":1792200153862,"sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","part":{"partID":"prt_147741af40013GNz9yMbMFWs85","sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","messageID":"msg_147741ac6001Q2Q23aPZ1ORWcw","type":"tool","id":"host-schema-rejection","tool":"read","state":{"status":"error","input":{},"error":"Invalid arguments for tool \"read\":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.","metadata":{"providerCall":{"executed":false},"providerResult":{"executed":false},"rawInput":"{}"},"time":{"start":1792200153844,"end":1792200153862}}}}
+{"type":"step_finish","timestamp":1792200153864,"sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","part":{"id":"prt_147741b08001CJOETDLejFKoqK","sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","messageID":"msg_147741ac6001Q2Q23aPZ1ORWcw","type":"step-finish","reason":"tool-calls","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}
+{"type":"step_start","timestamp":1792200153892,"sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","part":{"id":"prt_147741b24001nm3BC3l6KHZtcC","sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","messageID":"msg_147741b15001cdDF0m9iSS1u1U","type":"step-start"}}
+{"type":"text","timestamp":1792200153898,"sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","part":{"id":"prt_147741b27001KYYwqwT9TxT90o","sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","messageID":"msg_147741b15001cdDF0m9iSS1u1U","type":"text","text":"Probe complete.","time":{"start":1792200153895,"end":1792200153898}}}
+{"type":"step_finish","timestamp":1792200153900,"sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","part":{"id":"prt_147741b2c001F1BLswSngITOhY","sessionID":"ses_eb88be9deffeWrRyb7hHkEGaa2","messageID":"msg_147741b15001cdDF0m9iSS1u1U","type":"step-finish","reason":"stop","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}
+[exit 0]
+
+Agent-visible tool message read from the mock's follow-up request:
+{"role":"tool","tool_call_id":"host-schema-rejection","content":"{\"error\":{\"type\":\"tool.execution\",\"message\":\"Invalid arguments for tool \\\"read\\\":\\n- path: Missing key\\n\\nArguments provided:\\n{}\\n\\nUpdate the arguments and call the tool again.\"},\"content\":[]}"}
+
+Diff from 2.0.11: the validation result and agent-visible tool.execution error are unchanged. The tool event still contains `partID`; its `state.metadata` now has `providerCall: { executed: false }`, `providerResult: { executed: false }`, and `rawInput: "{}"` instead of the empty object recorded at 2.0.11. The metadata addition is a host observation; the harness contract loader checks that the error text and JSON event are present but does not depend on these metadata values.

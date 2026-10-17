@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "run_id": "oc2-ga-2.0.11-20260920-shared",
-  "observed_run_id": "oc2-ga-2.0.11-20260920-shared",
-  "observed_sha": "48f95796160b920874efe30be4f288621994b06c",
-  "supersedes_host_version": "2.0.3",
-  "host_version": "2.0.11",
+  "run_id": "oc2-ga-2.0.29-20261017-shared",
+  "observed_run_id": "oc2-ga-2.0.29-20261017-shared",
+  "observed_sha": "7f001b797715b7bbc57cd6b69d9bc358ebb396e",
+  "supersedes_host_version": "2.0.11",
+  "host_version": "2.0.29",
   "host": "opencode2",
   "platform": "linux-x64",
-  "transcript": "probe/shared-server-ga-2.0.11.txt",
+  "transcript": "probe/shared-server-ga-2.0.29.txt",
   "endpoint_handoff": {
     "run": {
       "kind": "flag",
@@ -17,7 +17,7 @@
       "kind": "flag",
       "name": "--server"
     },
-    "producer_command": "opencode2 serve --hostname 127.0.0.1 --port 0 --service",
+    "producer_command": "opencode2 serve --hostname 127.0.0.1 --port ${service_port} --service --print-logs",
     "stdout_pattern": "^server listening on (?<endpoint>http://127\\.0\\.0\\.1:[0-9]+)$",
     "run_client_arguments": [
       "--server",
@@ -44,7 +44,7 @@
       "fields": ["id", "version", "url", "pid", "password"],
       "stdout_password_line": "absent under --service",
       "read_by": "discover() in @opencode/client/service, and the harness for the server password",
-      "observed_on": "GA 2.0.11 darwin-arm64; re-observed by every shared-server scenario, which fails when the registration does not appear"
+      "observed_on": "GA 2.0.29 linux-x64; registration carries id, version, url, pid, and password while --service omits the password from stdout"
     },
     "preferred_client_environment": "OPENCODE_PASSWORD=${password}",
     "observed_run_client_environment": "OPENCODE_SERVER_PASSWORD=${password}",
@@ -59,10 +59,10 @@
     "transcript_redaction": "The ephemeral password is replaced with <redacted>; its presence and use are retained."
   },
   "permission_prompt": {
-    "answered_by": "opencode run itself: --auto approves anything the rules do not deny, and a run without it rejects",
-    "stderr_line": "! permission requested: edit (patched.txt); auto-rejecting",
+    "answered_by": "The isolated 2.0.29 native-edit probe completed edit without --auto; --auto also approves permissions that are not explicitly denied",
+    "stderr_line": "not emitted; native edit completed without --auto",
     "stderr_line_under_auto": "not printed",
-    "observed_on": "GA 2.0.11 linux-x64 in this harness; `opencode run --help` documents --auto as 'Auto-approve permissions that are not explicitly denied'",
+    "observed_on": "GA 2.0.29 linux-x64; the native edit probe changed patched.txt without --auto; `opencode run --help` documents --auto as 'Auto-approve permissions that are not explicitly denied'",
     "observation_channel": "GET /api/event (SSE): permission.asked carries the request, permission.replied carries the answer. No external client can reply first, so the event stream is where a raised prompt is observed."
   },
   "request_body_handoff": {
@@ -72,7 +72,7 @@
   },
   "session_start": {
     "stream": "opencode2 run --format json NDJSON",
-    "first_record_type": "step_start",
+    "first_record_type": "text",
     "required_top_level_fields": [
       "type",
       "timestamp",
@@ -90,8 +90,8 @@
       "part.type": "string"
     },
     "fixed_values": {
-      "type": "step_start",
-      "part.type": "step-start"
+      "type": "text",
+      "part.type": "text"
     },
     "identity_invariants": [
       "sessionID == part.sessionID"
@@ -147,13 +147,16 @@
         "handoff": "--server plus OPENCODE_SERVER_PASSWORD",
         "exit_status": 0,
         "response": {
-          "version": "2.0.11",
-          "pid": 190,
+          "version": "2.0.29",
+          "pid": 80,
           "urls": [
-            "http://127.0.0.1:46757"
+            "http://127.0.0.1:41875"
           ],
           "paths": {
-            "tmp": "/probe2/tmp/opencode"
+            "tmp": "/probe/shared/tmp/opencode"
+          },
+          "capabilities": {
+            "persistentPty": true
           }
         },
         "response_volatile_fields": [
@@ -170,8 +173,8 @@
         "client": "api",
         "password_environment": "OPENCODE_SERVER_PASSWORD=WRONG",
         "exit_status": 1,
-        "stable_error": "Server at http://127.0.0.1:46397 did not provide a compatible V2 health response",
-        "cause": "UnsupportedContentType"
+        "stable_error": "Server at http://127.0.0.1:41875 rejected the password",
+        "cause": "UnauthorizedError"
       },
       {
         "order": 2,
@@ -179,8 +182,8 @@
         "client": "api",
         "password_environment": "unset",
         "exit_status": 1,
-        "stable_error": "Server at http://127.0.0.1:46397 did not provide a compatible V2 health response",
-        "cause": "UnsupportedContentType"
+        "stable_error": "Server at http://127.0.0.1:41875 requires a password; set OPENCODE_PASSWORD",
+        "cause": "UnauthorizedError"
       },
       {
         "order": 3,

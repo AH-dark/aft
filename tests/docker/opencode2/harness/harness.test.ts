@@ -506,10 +506,28 @@ describe("scenario isolation and liveness", () => {
       .filter((entry) => entry.tool === "apply_patch");
     expect(scenarios).toHaveLength(7);
     for (const entry of scenarios) expect(entry.model).toBe("openai/gpt-5-mock");
-    const contract = await loadHostProviderConfigContract(join(import.meta.dir, "../contract"), "2.0.11");
+    const contract = await loadHostProviderConfigContract(join(import.meta.dir, "../contract"), "2.0.29");
     const openai = contract.provider_config.openai as Record<string, unknown>;
     expect(Object.keys(openai.models as Record<string, unknown>).sort()).toEqual(["gpt-5-mock", "mock-model"]);
     expect((openai.settings as Record<string, unknown>).baseURL).toBe("{{AIMOCK_BASE_URL}}/v1");
+  });
+
+  test("checked-in OpenCode 2.0.29 contracts match the matrix pin", async () => {
+    const contractRoot = join(import.meta.dir, "../contract");
+    const cli = await loadHostCliContract(contractRoot, "2.0.29");
+    const provider = await loadHostProviderConfigContract(contractRoot, "2.0.29");
+    const schema = await loadHostSchemaRejectionContract(contractRoot, "2.0.29");
+
+    expect(cli.host_version).toBe("2.0.29");
+    expect(provider.host_version).toBe("2.0.29");
+    expect(provider.config_key).toBe("providers");
+    expect(provider.model).toBe("openai/mock-model");
+    expect(schema.host_version).toBe("2.0.29");
+    expect(schema.json_event.state_metadata).toEqual({
+      providerCall: { executed: false },
+      providerResult: { executed: false },
+      rawInput: "{}",
+    });
   });
 
   // The surface check runs on the V2 leg, where AFT's apply_patch is `patch`.
