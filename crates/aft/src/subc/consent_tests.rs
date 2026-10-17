@@ -1307,6 +1307,93 @@ fn consent_scope_rejects_drive_and_unc_volume_boundaries() {
 
 #[cfg(unix)]
 #[test]
+fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("nested/src");
+    std::fs::create_dir_all(&parent).unwrap();
+    let grant = AccessGrant {
+        path: parent.join("lib.rs"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+
+    let limiter = Arc::new(RootAliasScanLimiter::new());
+    let scan_count = Arc::new(AtomicUsize::new(0));
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let root_alias_check: Arc<dyn Fn(&Path, &Path) -> Option<bool> + Send + Sync> = {
+        let limiter = Arc::clone(&limiter);
+        let scan_count = Arc::clone(&scan_count);
+        Arc::new(move |_, _| {
+            let scan_count = Arc::clone(&scan_count);
+            let started = started_tx.clone();
+            let release = Arc::clone(&release_rx);
+            Arc::clone(&limiter).scan(move || {
+                if scan_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = started.send(());
+                    let _ = release.lock().unwrap().recv();
+                }
+                Some(false)
+            })
+        })
+    };
+
+    let first_check = Arc::clone(&root_alias_check);
+    let started_at = Instant::now();
+    let first =
+        read_directory_scope_with(&grant, move |directory, root| first_check(directory, root));
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("the dedicated root-alias helper started");
+    assert_eq!(first, grant);
+    assert!(started_at.elapsed() < Duration::from_secs(1));
+
+    let fanout_started = Instant::now();
+    let asks = (0..16)
+        .map(|_| {
+            let grant = grant.clone();
+            let check = Arc::clone(&root_alias_check);
+            std::thread::spawn(move || {
+                read_directory_scope_with(&grant, move |directory, root| check(directory, root))
+            })
+        })
+        .collect::<Vec<_>>();
+    for ask in asks {
+        assert_eq!(ask.join().unwrap(), grant);
+    }
+    assert!(fanout_started.elapsed() < Duration::from_secs(1));
+
+    let unrelated = crate::bounded_io::run(
+        &parent,
+        Some(Instant::now() + Duration::from_secs(1)),
+        |_| Ok(17),
+    )
+    .expect("a stalled optional scan leaves the shared helper pool available");
+    assert_eq!(unrelated, 17);
+
+    release_tx.send(()).unwrap();
+    let release_deadline = Instant::now() + Duration::from_secs(1);
+    while limiter.in_flight.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < release_deadline,
+            "stalled scan did not finish"
+        );
+        std::thread::yield_now();
+    }
+
+    let next_check = Arc::clone(&root_alias_check);
+    let next =
+        read_directory_scope_with(&grant, move |directory, root| next_check(directory, root));
+    assert_eq!(next.kind, GrantKind::Subtree);
+    assert!(scan_count.load(Ordering::SeqCst) >= 2);
+}
+
+#[cfg(unix)]
+#[test]
 fn consent_scope_rejects_canonical_root_alias() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");

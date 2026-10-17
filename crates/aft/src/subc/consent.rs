@@ -701,6 +701,13 @@ fn scope_reason(grant: &AccessGrant) -> &'static str {
 /// Offer a read-file's immediate directory only when it is not a home ancestor
 /// or a root-level system directory. Unknown home/volume identity stays file-only.
 fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
+    read_directory_scope_with(grant, directory_is_root_alias)
+}
+
+fn read_directory_scope_with<F>(grant: &AccessGrant, root_alias_check: F) -> AccessGrant
+where
+    F: Fn(&Path, &Path) -> Option<bool> + Send + Sync + 'static,
+{
     const PROBE_BUDGET: Duration = Duration::from_millis(250);
     if grant.operation != AccessOperation::Read || grant.kind != GrantKind::File {
         return grant.clone();
@@ -709,10 +716,10 @@ fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
         return grant.clone();
     };
     let probing = grant.clone();
-    // The whole identity probe shares one deadline, including reverse root
-    // aliases whose symlink targets can be unavailable network mounts.
+    // Root-alias enumeration has its own single-flight helper, so an unavailable
+    // mount cannot leave a shared filesystem worker occupied after this deadline.
     crate::bounded_io::run(parent, Some(Instant::now() + PROBE_BUDGET), move |_| {
-        Ok(probe_directory_scope(&probing))
+        Ok(probe_directory_scope_with(&probing, root_alias_check))
     })
     .unwrap_or_else(|_| grant.clone())
 }
@@ -726,7 +733,10 @@ async fn scope_before_db(grant: &AccessGrant) -> AccessGrant {
         .unwrap_or_else(|_| grant.clone())
 }
 
-fn probe_directory_scope(grant: &AccessGrant) -> AccessGrant {
+fn probe_directory_scope_with(
+    grant: &AccessGrant,
+    root_alias_check: impl Fn(&Path, &Path) -> Option<bool>,
+) -> AccessGrant {
     if grant.operation == AccessOperation::Read && grant.kind == GrantKind::File {
         if let Some(parent) = grant.path.parent() {
             let home = crate::environment::non_empty_os_var("HOME")
@@ -741,8 +751,8 @@ fn probe_directory_scope(grant: &AccessGrant) -> AccessGrant {
                 let root = parent.ancestors().last().unwrap_or(parent);
                 if directory_scope_is_narrow(parent, &home, &volume)
                     && directory_is_protected_alias(parent, &home, &volume) == Some(false)
-                    && directory_is_root_alias(parent, root) == Some(false)
-                    && (root == volume || directory_is_root_alias(parent, &volume) == Some(false))
+                    && root_alias_check(parent, root) == Some(false)
+                    && (root == volume || root_alias_check(parent, &volume) == Some(false))
                 {
                     return AccessGrant {
                         path: parent.to_path_buf(),
@@ -791,9 +801,76 @@ fn directory_is_protected_alias(_directory: &Path, _home: &Path, _volume: &Path)
 
 /// A canonical directory can still be a root-level alias, such as /etc pointing
 /// to /private/etc. Only resolvable aliases have a target identity to compare.
-/// Reverse aliases cannot be recovered from the candidate's canonical path;
-/// keep their enumeration inside the bounded identity probe.
+/// Reverse aliases cannot be recovered from the candidate's canonical path.
+/// Give their enumeration a separate helper and one process-wide slot: unknown
+/// or busy scans must never widen a file grant.
+const ROOT_ALIAS_SCAN_BUDGET: Duration = Duration::from_millis(250);
+
+struct RootAliasScanLimiter {
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RootAliasScanLimiter {
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn scan<F>(&self, scan: F) -> Option<bool>
+    where
+        F: FnOnce() -> Option<bool> + Send + 'static,
+    {
+        if self
+            .in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let permit = RootAliasScanPermit(Arc::clone(&self.in_flight));
+        let spawned = std::thread::Builder::new()
+            .name("aft-root-alias-scan".into())
+            .spawn(move || {
+                let result = scan();
+                drop(permit);
+                let _ = sender.send(result);
+            });
+        if spawned.is_err() {
+            self.in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+            return None;
+        }
+
+        receiver.recv_timeout(ROOT_ALIAS_SCAN_BUDGET).ok().flatten()
+    }
+}
+
+struct RootAliasScanPermit(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for RootAliasScanPermit {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+static ROOT_ALIAS_SCAN_LIMITER: LazyLock<RootAliasScanLimiter> =
+    LazyLock::new(RootAliasScanLimiter::new);
+
 fn directory_is_root_alias(directory: &Path, root: &Path) -> Option<bool> {
+    let directory = directory.to_path_buf();
+    let root = root.to_path_buf();
+    ROOT_ALIAS_SCAN_LIMITER.scan(move || scan_root_alias(&directory, &root))
+}
+
+fn scan_root_alias(directory: &Path, root: &Path) -> Option<bool> {
     for entry in std::fs::read_dir(root).ok()? {
         let entry = entry.ok()?;
         if entry.file_type().ok()?.is_symlink() {
