@@ -2997,6 +2997,44 @@ mod grant_path_tests {
         deadline_test_call_received(executor, root, dispatch, arguments, Instant::now())
     }
 
+    #[tokio::test]
+    async fn pending_message_detach_preserves_subc_wait_mode_eligibility() {
+        for wait in [true, false] {
+            let (_dir, root) = super::super::test_support::test_root("pending-bash-message");
+            let ctx = super::super::test_support::test_ctx();
+            let registry = ctx.bash_background().clone();
+            registry.request_wait_mode_detach("deadline-session");
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(root.clone(), ctx);
+            let mut arguments = json!({"command": "sleep 1", "timeout": 10_000});
+            if wait {
+                arguments["wait"] = json!(true);
+            }
+            let mut replies = deadline_test_call(&executor, &root, running_bash_stub, arguments);
+            let completion = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let response = completion.result.unwrap().response;
+            if let Some(task_id) = response.data["task_id"].as_str() {
+                let _ = registry.kill(task_id, "deadline-session");
+            }
+            assert!(response.success, "{response:?}");
+            assert_eq!(
+                response
+                    .data
+                    .to_string()
+                    .contains("Detached because a user message arrived"),
+                wait,
+                "{response:?}"
+            );
+            if !wait {
+                assert_eq!(response.data["status"], "completed", "{response:?}");
+                assert_eq!(response.data["exit_code"], 0, "{response:?}");
+            }
+        }
+    }
+
     fn deadline_test_call_received(
         executor: &Arc<Executor>,
         root: &ProjectRootId,

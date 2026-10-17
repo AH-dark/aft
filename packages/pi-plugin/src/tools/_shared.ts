@@ -5,6 +5,7 @@
 import { existsSync } from "node:fs";
 import type {
   AftProjectTransport,
+  AftTransportPool,
   BridgeRequestOptions,
   ToolCallOptions,
   ToolCallResult,
@@ -24,6 +25,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, type TSchema, Type } from "typebox";
+import { forwardPendingBashWaitDetach } from "../bash-wait-detach.js";
 import { ingestBgCompletions } from "../bg-notifications.js";
 import type { PiToolPresentation } from "../config.js";
 import type { PiHarness } from "../harness.js";
@@ -165,6 +167,8 @@ export function prepareToolDefinitionForRegistration<
   };
 }
 
+const bridgePools = new WeakMap<AftProjectTransport, AftTransportPool>();
+
 /** Get the session bridge for the current working directory. */
 export function bridgeFor(ctx: PluginContext, cwd: string): AftProjectTransport {
   // A restored session can point at a reclaimed mason worktree (or any
@@ -176,7 +180,9 @@ export function bridgeFor(ctx: PluginContext, cwd: string): AftProjectTransport 
   // A tool call is a session using AFT: make sure the deferred startup (which
   // hands cached LSP server paths to new bridges) has run before this spawn.
   ctx.startSessionWork?.();
-  return ctx.pool.getBridge(cwd);
+  const bridge = ctx.pool.getBridge(cwd);
+  bridgePools.set(bridge, ctx.pool);
+  return bridge;
 }
 
 /**
@@ -244,6 +250,8 @@ export async function callBridge(
   };
   let response: Record<string, unknown>;
   try {
+    const pool = bridgePools.get(bridge);
+    if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, command === "bash");
     response = await bridge.send(
       command,
       merged,
@@ -312,6 +320,8 @@ export async function callToolCallForSession(
   };
   let response: ToolCallResult;
   try {
+    const pool = bridgePools.get(bridge);
+    if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, name === "bash");
     response = await bridge.toolCall(
       sessionId,
       name,

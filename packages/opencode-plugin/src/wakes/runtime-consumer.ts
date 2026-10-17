@@ -225,9 +225,16 @@ function detachWaitsForCompletion(
     getActiveBridgeForRoot: () => bridge,
     activeBridges: () => [bridge],
   } as unknown as Parameters<typeof interruptBashWaitsForChatMessage>[0];
-  interruptBashWaitsForChatMessage(onlyThisBridge, config, "", sessionID, {
-    parts: [{ type: "text", text, synthetic: true }],
-  });
+  interruptBashWaitsForChatMessage(
+    onlyThisBridge,
+    config,
+    "",
+    sessionID,
+    {
+      parts: [{ type: "text", text, synthetic: true }],
+    },
+    false,
+  );
 }
 
 /**

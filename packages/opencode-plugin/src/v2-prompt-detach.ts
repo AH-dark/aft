@@ -10,7 +10,10 @@
 import { detachStripEdits } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
-import { interruptBashWaitsForChatMessage } from "./bash-wait-detach.js";
+import {
+  clearPendingBashWaitDetach,
+  interruptBashWaitsForChatMessage,
+} from "./bash-wait-detach.js";
 import type { AftConfig } from "./config.js";
 import { warn } from "./logger.js";
 import { isAftOriginatedPrompt } from "./wakes/session-delivery.js";
@@ -168,6 +171,13 @@ type SessionHookRegistrar = (
   callback: (event: V2PromptHookEvent) => Effect.Effect<void>,
 ) => Effect.Effect<unknown, never, unknown>;
 
+/** OpenCode 2 prepares model-step context after admitting queued prompts, so old requests can be cleared. */
+export function createV2DetachDeliveryHook(
+  runtime: V2PromptDetachRuntime,
+): (event: { sessionID: string }) => Effect.Effect<void> {
+  return (event) => Effect.promise(() => clearPendingBashWaitDetach(runtime.pool, event.sessionID));
+}
+
 /**
  * Register the prompt hook on an OpenCode 2 host context. The registration is
  * scoped by the host, so it ends with the Location. A host context without
@@ -186,7 +196,18 @@ export function registerV2PromptDetachHook(
     );
     return Effect.succeed(false);
   }
-  return (hook as SessionHookRegistrar)
-    .call(session, "prompt", createV2PromptDetachHook(runtime))
-    .pipe(Effect.as(true));
+  return Effect.gen(function* () {
+    yield* (hook as SessionHookRegistrar).call(
+      session,
+      "prompt",
+      createV2PromptDetachHook(runtime),
+    );
+    yield* (
+      hook as (
+        name: "context",
+        callback: (event: { sessionID: string }) => Effect.Effect<void>,
+      ) => Effect.Effect<unknown, never, unknown>
+    ).call(session, "context", createV2DetachDeliveryHook(runtime));
+    return true;
+  });
 }
