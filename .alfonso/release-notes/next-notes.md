@@ -19,6 +19,7 @@
 - edit: multi-item `edits[]` and line-range edits now work on existing files whose paths contain glob characters, such as Next.js `app/[id]/page.tsx`, instead of being refused as glob targets; real globs behave as before. Thanks for the report (#486).
 - aft_zoom: when the call graph store is momentarily busy, zoom now reports the call graph as building (retry shortly), as `aft_callgraph` does, instead of unavailable.
 - gh shim (manifest 19): `gh workflow disable` and `gh workflow enable` run under the operator bypass, like `run cancel`, and are refused as undeclared on older manifests.
+- Backups: the daemon writes its ENGRAM backup catalog (`engram-catalog.json` in the storage root) at startup, so a fresh machine is covered without a hand-written file. It declares only what exists right now: `aft.db` (captured page by page) and the trusted-filter project list as device-local, and undo history, checkpoints, background task output, logs, diagnostics, caches and generated shims as excluded from backup. Undo history keeps its earlier entry ids, so ENGRAM records the switch to excluded on the same entries, and an id stays with its folder across restarts. The catalog is written only when the storage folder is named `aft`, since ENGRAM looks nowhere else.
 
 ## Sandbox profiles
 

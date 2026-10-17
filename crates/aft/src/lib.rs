@@ -85,6 +85,7 @@ pub mod developer_tools;
 pub(crate) mod durability;
 pub mod edit;
 pub mod effective_path;
+pub mod engram_catalog;
 #[doc(hidden)]
 pub mod environment;
 pub mod error;
