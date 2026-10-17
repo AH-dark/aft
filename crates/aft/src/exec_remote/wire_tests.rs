@@ -103,6 +103,9 @@ pub(crate) enum Script {
     GatedStages {
         position: u32,
     },
+    /// Accepted, then refused before start (`unreachable`): the runner took
+    /// the inputs but never ran the command.
+    AcceptedThenRefused,
     /// Withhold the first stream record until `Daemon::acceptance_gate` is notified.
     GatedAcceptance,
     /// Drop the connection on the first `exec.run`, before any stream record:
@@ -284,7 +287,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Lost | Script::NetworkLost => Outcome::OutcomeUnknown,
                                     Script::NetworkUnsupported => Outcome::RefusedBeforeStart { reason: RefusalReason::NetworkUnsupported },
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
-                                    Script::KnownRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
+                                    Script::KnownRefused | Script::AcceptedThenRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
                                     Script::WorkspaceSetupRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::WorkspaceSetupFailed },
                                     Script::RefusedWithDetail => Outcome::RefusedBeforeStart { reason: RefusalReason::RunnerDraining },
                                     Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },

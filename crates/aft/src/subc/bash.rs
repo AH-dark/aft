@@ -612,9 +612,10 @@ fn copy_response(response: &Response) -> Response {
 }
 
 /// The launch reply once the remote dispatch worker has settled (the runner's
-/// `Accepted` arrived, or the worker finished without it). `None` keeps the
-/// caller's normal reply: inputs were captured and the task is live or about to
-/// report through its usual wait.
+/// `Accepted` arrived, or the worker finished without it), and the same
+/// decision when the capture wait ends before seeing it settle. `None` keeps
+/// the caller's normal reply: inputs were captured, the runner has not refused
+/// the job, and the task is live or about to report through its usual wait.
 fn settled_runon_launch_reply(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
@@ -653,11 +654,15 @@ fn settled_runon_launch_reply(
 
 /// The launch reply when the capture wait ends (deadline or module drain)
 /// without having seen the worker settle. Reads saved state off the frame
-/// runtime. The runner's `Accepted` can land between the last poll and this
-/// read: a recorded `Accepted` returns `None` and keeps the caller's ordinary
-/// launch reply, exactly as a settled wait would, instead of the capture
-/// warning. Without it, a task that ended in the meantime reports its outcome
-/// and a live one says `starting` with the warning.
+/// runtime and decides it with [`settled_runon_launch_reply`], so a wait that
+/// saw the worker settle and one that did not give the same answer for the
+/// same saved state. The runner's
+/// `Accepted` can land between the last poll and this read: a recorded
+/// `Accepted` keeps the caller's ordinary launch reply (`None`) unless the
+/// runner then refused the job, in which case the reply is that refusal error,
+/// since the command never ran. Without `Accepted`, a task that ended in the
+/// meantime reports its outcome and a live one says `starting` with the
+/// warning.
 async fn unsettled_runon_launch_reply(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
@@ -666,11 +671,7 @@ async fn unsettled_runon_launch_reply(
 ) -> Option<Response> {
     let pending = copy_response(response);
     tokio::task::spawn_blocking(move || {
-        (registry.runon_inputs_captured(&task_id, &session) != Some(true)).then(|| {
-            crate::commands::bash_orchestrate::runon_uncaptured_reply(
-                &registry, &task_id, &session, &pending,
-            )
-        })
+        settled_runon_launch_reply(&registry, &task_id, &session, &pending)
     })
     .await
     .unwrap_or_else(|_| Some(with_capture_warning(response)))
@@ -4963,6 +4964,83 @@ mod grant_path_tests {
                     .await;
                 }
             }
+        }
+    }
+
+    /// A runner can accept a job (the inputs are captured) and then refuse it
+    /// before it starts. The command never ran, so the launch reply must be
+    /// that refusal error, not the ordinary `running` launch reply, however
+    /// the capture wait ends: a module drain decides the reply without waiting
+    /// for the worker to settle, and an expired capture deadline decides it
+    /// from whatever state is saved by then. The remote handler is held until
+    /// the refusal is recorded, so the reply is decided only afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_wait_ended_after_accepted_then_refused_reports_refusal() {
+        use crate::exec_remote::wire_tests::Script;
+        for drain_ends_wait in [true, false] {
+            let case = if drain_ends_wait {
+                "module drain after Accepted then refusal"
+            } else {
+                "expired capture deadline after Accepted then refusal"
+            };
+            let (_daemon, _dir, root, executor, ctx) =
+                capture_fixture(Script::AcceptedThenRefused).await;
+            let mut timing = BashTimingForTest::new(Instant::now());
+            if !drain_ends_wait {
+                // The capture deadline passes while the dispatch is held.
+                Arc::get_mut(&mut timing).unwrap().capture_wait = Some(Duration::from_millis(1));
+            }
+            let cancel = BashWaitCancel {
+                run_scope: None,
+                scope: None,
+                late_results: false,
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            };
+            let (mut rx, task_id) = held_capture_call(
+                &executor,
+                &root,
+                json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+                timing.clone(),
+                cancel.clone(),
+            )
+            .await;
+            wait_for_task_state(&ctx, "Accepted, then refused", |registry| {
+                registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+                    && registry
+                        .observed_status(&task_id, "deadline-session", 0)
+                        .is_some_and(|snapshot| snapshot.remote_refusal.is_some())
+            })
+            .await;
+            if drain_ends_wait {
+                cancel.drain.begin(Instant::now() + Duration::from_secs(60));
+            }
+            BashTimingForTest::release(&timing.result);
+            let done = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+                .await
+                .expect("the released launch must answer")
+                .unwrap();
+            let response = done.response_for_test();
+            let text = done.text_for_test().unwrap();
+            assert!(!response.success, "{case}: {response:?}");
+            assert_eq!(
+                response.data["code"], "remote_unavailable",
+                "{case}: {response:?}"
+            );
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("command was not run")),
+                "{case}: {response:?}"
+            );
+            assert_eq!(response.data["task_id"], task_id, "{case}: {response:?}");
+            assert_ne!(response.data["status"], "running", "{case}: {response:?}");
+            assert!(
+                !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                "{case}: {text}"
+            );
         }
     }
 
