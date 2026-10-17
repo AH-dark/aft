@@ -128,6 +128,79 @@ impl DatabaseWaits {
         self.wait(decoded, route, &ctx, name, deadline_ms, confine_wait)
     }
 
+    /// Read a scoped worker route's saved confinement on a blocking thread
+    /// before one of its tool calls reaches admission, when memory cannot
+    /// answer it. The read takes the aft.db lock, which a catalog job can
+    /// hold for seconds while SQLite waits for its write lock; taking it on
+    /// the frame loop would stop health checks, cancellations and other roots
+    /// from being served meanwhile. The frame comes back from [`Self::next`]
+    /// carrying the result in `DecodedFrame::confinement`, and the call is
+    /// not admitted before then. Returns the frame unchanged when no read is
+    /// needed. Past the waiter limit the frame also comes back unchanged, and
+    /// admission refuses it for want of a policy (see
+    /// `remote_policy::admit_confined_on_frame_loop`).
+    pub(super) fn read_confinement(
+        &mut self,
+        decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Executor,
+    ) -> Result<(), DecodedFrame> {
+        if decoded.confinement.is_some() {
+            return Err(decoded);
+        }
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let Some(identity) = routes.get(&route) else {
+            return Err(decoded);
+        };
+        let Some(ctx) = executor.actor_context(&identity.root) else {
+            return Err(decoded);
+        };
+        if remote_policy::confinement_from_memory(&ctx, identity).is_some() {
+            return Err(decoded);
+        }
+        let Ok(body) = decoded.body() else {
+            return Err(decoded);
+        };
+        // Catalog fetches and the other provider operations run on the
+        // executor and read the policy there; only tool calls are checked
+        // against it on the frame loop.
+        let operation = body.get("op").and_then(Value::as_str).or_else(|| {
+            body.get("name")
+                .and_then(Value::as_str)
+                .filter(|name| tool_provider::recognized_operation(name))
+        });
+        if operation.is_some_and(|operation| {
+            tool_provider::recognized_operation(operation) && operation != "tool.call"
+        }) {
+            return Err(decoded);
+        }
+        let name = body
+            .get("name")
+            .or_else(|| body.get("op"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool.call")
+            .to_owned();
+        if self.pending.len() >= MAX_WAITERS {
+            return Err(decoded);
+        }
+        let key = (route, decoded.frame.header.corr);
+        let admission = AdmissionWait::from_decoded(&decoded, &name);
+        let identity = identity.clone();
+        let mut decoded = decoded;
+        let handle = self.tasks.spawn(async move {
+            let read =
+                tokio::task::spawn_blocking(move || remote_policy::confined(&ctx, &identity))
+                    .await
+                    .unwrap_or_else(|_| Err(remote_policy::policy_unavailable()));
+            decoded.confinement = Some(read);
+            decoded
+        });
+        if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
+            old.abort();
+        }
+        Ok(())
+    }
+
     /// Hold `decoded` until the root's database open finishes or the wait
     /// budget ends. With `any_command` false the wait ends as soon as `name`
     /// no longer needs to wait for persistence; with it true (calls whose
@@ -251,6 +324,7 @@ mod tests {
         let routes = HashMap::from([(route, test_support::route_identity(&root, "session"))]);
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -291,6 +365,7 @@ mod tests {
         let route = route_key(42, 1);
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1, Vec::new()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()),
         };
@@ -321,6 +396,7 @@ mod tests {
         let routes = HashMap::from([(route, test_support::route_identity(&root, "test"))]);
         let frame = |name: &str, corr, deadline_ms| DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -379,14 +455,10 @@ mod tests {
         assert!(waits.is_empty());
     }
 
-    #[tokio::test]
-    async fn scoped_worker_calls_wait_for_opening_database_then_run_unconfined() {
-        let (dir, root) = test_support::test_root("confine-database-waits");
-        let ctx = test_support::test_ctx();
-        ctx.mark_database_runtime_initializing_for_test();
-        let executor = Executor::new();
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let unscoped = test_support::route_identity(&root, "head");
+    /// A scoped worker route on `root` whose saved confinement lives in
+    /// aft.db, and an unscoped head route on the same root.
+    fn scoped_worker_and_head(root: &ProjectRootId) -> (RouteIdentity, RouteIdentity) {
+        let unscoped = test_support::route_identity(root, "head");
         let scope: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
             "owner": {"kind": "direct"}, "ref": "worker-scope", "scope_epoch": 1,
             "kind": "worker", "owner_authorized": true,
@@ -408,10 +480,22 @@ mod tests {
             made_tool_call: AtomicBool::new(false),
         }));
         assert!(remote_policy::key(&worker, Some("worker")).is_some());
+        (worker, unscoped)
+    }
+
+    #[tokio::test]
+    async fn scoped_worker_calls_wait_for_opening_database_then_run_unconfined() {
+        let (dir, root) = test_support::test_root("confine-database-waits");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let (worker, unscoped) = scoped_worker_and_head(&root);
         let (scoped_route, unscoped_route) = (route_key(43, 1), route_key(42, 1));
         let routes = HashMap::from([(scoped_route, worker.clone()), (unscoped_route, unscoped)]);
         let frame = |channel: u16, corr, body: Value| DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -423,7 +507,7 @@ mod tests {
             .unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()),
         };
-        let read = json!({"name": "read", "preset": "worker", "arguments": {"filePath": "a"}});
+        let read = json!({"name": "read", "preset": "worker", "arguments": {"path": "a"}});
         let mut waits = DatabaseWaits::default();
         // Read-only tools never waited for the database, and still do not on
         // a route that can hold no saved confinement.
@@ -471,6 +555,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confinement_read_runs_off_the_frame_loop_and_holds_admission_until_it_finishes() {
+        let (dir, root) = test_support::test_root("confine-read-held-lock");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let (worker, _) = scoped_worker_and_head(&root);
+        let db = ctx.db().unwrap();
+        // Saved straight into aft.db, as a catalog fetch in an earlier process
+        // would have left it, so memory does not know this worker is confined.
+        crate::db::remote_exec::freeze(
+            &db.lock().unwrap(),
+            &remote_policy::key(&worker, Some("worker")).unwrap(),
+            &crate::exec_remote::FrozenParams {
+                confine: Some(crate::exec_remote::RootConfinement::Root),
+                ..Default::default()
+            },
+            crate::bash_background::persistence::unix_millis(),
+        )
+        .unwrap();
+        assert!(remote_policy::confinement_from_memory(&ctx, &worker).is_none());
+        let routes = HashMap::from([(route_key(43, 1), worker.clone())]);
+        let frame = |corr, body: Value| DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+
+        // Hold the aft.db lock on another thread, as a catalog job's policy
+        // freeze does while SQLite waits for its write lock. The holder lets
+        // go on its own after a bound, so code that blocks on the lock fails
+        // the timing checks below instead of hanging the test.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder_db = Arc::clone(&db);
+        let holder = std::thread::spawn(move || {
+            let _conn = holder_db.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        // Frame-loop admission never reads aft.db itself: with no read result
+        // it refuses at once instead of waiting, or running the call unconfined.
+        assert_eq!(
+            remote_policy::admit_confined_on_frame_loop(&ctx, &worker, "read", None)
+                .unwrap_err()
+                .code,
+            "confine_policy_unavailable"
+        );
+        let mut waits = DatabaseWaits::default();
+        // A catalog fetch reads the policy on the executor, not here.
+        assert!(waits
+            .read_confinement(
+                frame(1, json!({"op": "tool.catalog", "preset": "worker"})),
+                &routes,
+                &executor
+            )
+            .is_err());
+        let bash = json!({"name": "bash", "preset": "worker", "arguments": {"command": "true"}});
+        assert!(waits
+            .read_confinement(frame(2, bash), &routes, &executor)
+            .is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "frame-loop admission waited {:?} for the held aft.db lock",
+            started.elapsed()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), waits.next())
+                .await
+                .is_err(),
+            "a call resumed before its confinement could be read"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let resumed = tokio::time::timeout(Duration::from_secs(5), waits.next())
+            .await
+            .unwrap();
+        assert_eq!(resumed.frame.header.corr, 2);
+        assert_eq!(resumed.confinement, Some(Ok(true)));
+        assert_eq!(
+            remote_policy::admit_confined_on_frame_loop(
+                &ctx,
+                &worker,
+                "bash",
+                resumed.confinement.as_ref()
+            )
+            .unwrap_err()
+            .code,
+            "tool_not_offered_confined"
+        );
+        // The confined answer is now remembered, so later calls need no read.
+        let read = json!({"name": "read", "preset": "worker", "arguments": {"path": "a"}});
+        assert!(waits
+            .read_confinement(frame(3, read), &routes, &executor)
+            .is_err());
+        assert!(remote_policy::admit_confined_on_frame_loop(&ctx, &worker, "read", None).unwrap());
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
     async fn database_wait_notification_releases_only_persistence_calls_and_cancel_aborts_wait() {
         let (_dir, root) = test_support::test_root("database-waits");
         let ctx = test_support::test_ctx();
@@ -484,6 +681,7 @@ mod tests {
         let routes = HashMap::from([(route, test_support::route_identity(&root, "test"))]);
         let frame = |name: &str, corr| DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

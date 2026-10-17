@@ -211,42 +211,63 @@ pub(super) fn confined_tool(name: &str) -> bool {
 /// `catalog` refuses `confine` without a database, so such a context (a
 /// library or test harness) has no store the fence could have been saved in.
 ///
-/// Every tool call runs this check on the subc frame loop. It never writes
-/// aft.db, and a key once found confined is answered from memory afterwards.
-pub(super) fn confined(
-    ctx: &AppContext,
-    identity: &RouteIdentity,
-) -> Result<bool, subc_protocol::ErrorBody> {
-    let Some(key) = key(identity, Some("worker")) else {
-        return Ok(false);
-    };
-    if ctx.policy_key_known_confined(&key) {
-        return Ok(true);
+/// This never writes aft.db, and a key once found confined is answered from
+/// memory afterwards. Any other answer takes the aft.db lock, so the subc
+/// frame loop never calls this: it answers from [`confinement_from_memory`] or
+/// has `persistence::DatabaseWaits::read_confinement` run this on a blocking
+/// thread first (see [`admit_confined_on_frame_loop`]).
+pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> ConfinementRead {
+    if let Some(known) = confinement_from_memory(ctx, identity) {
+        return known;
     }
-    let unavailable = || {
-        subc_protocol::ErrorBody::new(
-            "confine_policy_unavailable",
-            "cannot read the scoped worker's confinement policy",
-        )
+    let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
+        return Err(policy_unavailable());
     };
-    let Some(db) = ctx.db() else {
-        // A database that is still opening or failed to open may hold a saved
-        // confinement policy we cannot read, so refuse. Calls on such routes
-        // wait for an opening database first (see `persistence::DatabaseWaits`),
-        // so this refusal follows a failed open or a wait that expired.
-        return if ctx.database_runtime_unconfigured() {
-            Ok(false)
-        } else {
-            Err(unavailable())
-        };
-    };
-    let conn = db.lock().map_err(|_| unavailable())?;
-    let confined = store::confined(&conn, &key).map_err(|_| unavailable())?;
+    let conn = db.lock().map_err(|_| policy_unavailable())?;
+    let confined = store::confined(&conn, &key).map_err(|_| policy_unavailable())?;
     drop(conn);
     if confined {
         ctx.remember_confined_policy_key(key);
     }
     Ok(confined)
+}
+
+/// A route's saved confinement: whether its scoped worker saved
+/// `confine: "root"`, or why that could not be read.
+pub(super) type ConfinementRead = Result<bool, subc_protocol::ErrorBody>;
+
+pub(super) fn policy_unavailable() -> subc_protocol::ErrorBody {
+    subc_protocol::ErrorBody::new(
+        "confine_policy_unavailable",
+        "cannot read the scoped worker's confinement policy",
+    )
+}
+
+/// The answer [`confined`] gives when it needs no aft.db read: a route that
+/// cannot hold a saved fence, a key already found confined, or a context with
+/// no database handle. `None` means the saved policy must be read from aft.db.
+pub(super) fn confinement_from_memory(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+) -> Option<ConfinementRead> {
+    let Some(key) = key(identity, Some("worker")) else {
+        return Some(Ok(false));
+    };
+    if ctx.policy_key_known_confined(&key) {
+        return Some(Ok(true));
+    }
+    if ctx.db().is_some() {
+        return None;
+    }
+    // A database that is still opening or failed to open may hold a saved
+    // confinement policy we cannot read, so refuse. Calls on such routes
+    // wait for an opening database first (see `persistence::DatabaseWaits`),
+    // so this refusal follows a failed open or a wait that expired.
+    Some(if ctx.database_runtime_unconfigured() {
+        Ok(false)
+    } else {
+        Err(policy_unavailable())
+    })
 }
 
 /// Whether a call on this route must wait for an opening aft.db before its
@@ -262,7 +283,28 @@ pub(super) fn admit_confined(
     identity: &RouteIdentity,
     name: &str,
 ) -> Result<bool, subc_protocol::ErrorBody> {
-    let confined = confined(ctx, identity)?;
+    admit_confined_tool(confined(ctx, identity)?, name)
+}
+
+/// [`admit_confined`] for the subc frame loop, which must never wait for the
+/// aft.db lock: a catalog job can hold it for seconds while SQLite waits for
+/// its write lock, and the loop would stop answering health checks,
+/// cancellations and other roots meanwhile. The policy comes from memory or
+/// from `read`, the result of [`confined`] run off the loop before the call
+/// reached admission. A call with neither is refused, never run unconfined.
+pub(super) fn admit_confined_on_frame_loop(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    name: &str,
+    read: Option<&ConfinementRead>,
+) -> Result<bool, subc_protocol::ErrorBody> {
+    let confined = confinement_from_memory(ctx, identity)
+        .or_else(|| read.cloned())
+        .unwrap_or_else(|| Err(policy_unavailable()))?;
+    admit_confined_tool(confined, name)
+}
+
+fn admit_confined_tool(confined: bool, name: &str) -> Result<bool, subc_protocol::ErrorBody> {
     if confined && !confined_tool(name) {
         return Err(subc_protocol::ErrorBody::new(
             "tool_not_offered_confined",

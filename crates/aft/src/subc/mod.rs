@@ -433,6 +433,10 @@ struct DecodedFrame {
     frame: Frame,
     phase_trace: PhaseTrace,
     parsed_body: OnceLock<Result<Value, serde_json::Error>>,
+    /// The route's saved confinement, read off the frame loop by
+    /// `persistence::DatabaseWaits::read_confinement` when memory could not
+    /// answer it. `None` until then.
+    confinement: Option<remote_policy::ConfinementRead>,
 }
 
 impl DecodedFrame {
@@ -5149,7 +5153,7 @@ where
                 if !database_waited && !ledger_waited && frame.frame.header.ty == FrameType::Request && frame.frame.header.channel != 0 {
                     dispatch_path_metrics.tool_received_decoded(&frame);
                 }
-                let DecodedFrame { frame, phase_trace, parsed_body } = frame;
+                let DecodedFrame { frame, phase_trace, parsed_body, confinement } = frame;
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
@@ -5211,7 +5215,7 @@ where
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
-                        let decoded = DecodedFrame {frame, phase_trace, parsed_body};
+                        let decoded = DecodedFrame {frame, phase_trace, parsed_body, confinement};
                         let decoded = if !ledger_waited {
                             match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
                                 Ok(()) => continue,
@@ -5288,7 +5292,7 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
-                        let decoded = DecodedFrame { frame, phase_trace, parsed_body };
+                        let decoded = DecodedFrame { frame, phase_trace, parsed_body, confinement };
                         let decoded = if let Some(identity) = routes.get(&route) {
                             match run_scopes.defer(decoded, identity, &run_ready_tx) {
                                 Ok(()) => continue,
@@ -5303,6 +5307,18 @@ where
                         } else {
                             decoded
                         };
+                        // A scoped worker's saved confinement is read from aft.db on
+                        // a blocking thread, never here; the call comes back carrying
+                        // it, then passes the ledger and admission. Calls the ledger
+                        // hands back already went through this step.
+                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                            match database_waits.read_confinement(decoded, &routes, &executor) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else {
+                            decoded
+                        };
                         let decoded = if !ledger_waited && !management_routes.contains(&route) {
                             match ledger_edge.defer(decoded, &routes, &executor, &writer_tx, &dispatch_path_metrics) {
                                 Ok(()) => continue,
@@ -5310,6 +5326,7 @@ where
                             }
                         } else {decoded};
                         let parsed_body = decoded.parsed_body.into_inner();
+                        let confinement = decoded.confinement;
                         let frame = decoded.frame;
                         let phase_trace = decoded.phase_trace;
                         if ledger_waited && !ledger_edge.has_waiting(&frame) {
@@ -5377,6 +5394,7 @@ where
                                  &writer_tx,
                                  &frame,
                                  parsed_body,
+                                 confinement,
                                  phase_trace,
                                 &routes,
                                 &pending_binds,
@@ -6284,6 +6302,7 @@ where
                         frame.header.ty == FrameType::Ping && frame.header.corr == 124;
                     let decoded = DecodedFrame {
                         parsed_body: Default::default(),
+                        confinement: None,
                         frame,
                         phase_trace: PhaseTrace::new(received_at),
                     };
@@ -8281,6 +8300,7 @@ async fn handle_tool_call(
     tx: &WriterSender,
     frame: &Frame,
     parsed_body: Option<Result<Value, serde_json::Error>>,
+    confinement: Option<remote_policy::ConfinementRead>,
     mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
@@ -8428,7 +8448,9 @@ async fn handle_tool_call(
                 .await
             }
         };
-        if let Err(error) = admit_confined_call_name(executor, &identity, &mut call.name) {
+        if let Err(error) =
+            admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
+        {
             return send_provider_error(tx, metrics, frame, error).await;
         }
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
@@ -8479,7 +8501,9 @@ async fn handle_tool_call(
     };
     if identity.role == tool_provider::RouteRole::Legacy {
         if let RouteRequest::ToolCall(call) = &mut route_request {
-            if let Err(error) = admit_confined_call_name(executor, &identity, &mut call.name) {
+            if let Err(error) =
+                admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
+            {
                 return send_provider_error(tx, metrics, frame, error).await;
             }
             if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
@@ -9870,16 +9894,21 @@ async fn signal_fatal_teardown(
 /// outline under the public name `aft_outline` (see
 /// `tool_provider::render_catalog`), so a confined call by that name is
 /// renamed to the internal `outline` command here; call-mode admission, the
-/// manifest check and dispatch only know `outline`.
+/// manifest check and dispatch only know `outline`. `confinement` is the saved
+/// policy read off the frame loop for this call, if memory could not answer
+/// (see `DecodedFrame::confinement`).
 fn admit_confined_call_name(
     executor: &Executor,
     identity: &RouteIdentity,
     name: &mut String,
+    confinement: Option<&remote_policy::ConfinementRead>,
 ) -> Result<(), subc_protocol::ErrorBody> {
     let ctx = executor.actor_context(&identity.root).ok_or_else(|| {
         subc_protocol::ErrorBody::new("confine_policy_unavailable", "session context unavailable")
     })?;
-    if remote_policy::admit_confined(&ctx, identity, name)? && name == "aft_outline" {
+    if remote_policy::admit_confined_on_frame_loop(&ctx, identity, name, confinement)?
+        && name == "aft_outline"
+    {
         *name = "outline".into();
     }
     Ok(())
@@ -10753,6 +10782,7 @@ pub(crate) mod test_support {
         handle_tool_call(
             &writer,
             &frame,
+            None,
             None,
             PhaseTrace::new(Instant::now()),
             &routes,
@@ -17836,7 +17866,7 @@ mod tests {
             )
             .unwrap();
             let mut waits = persistence::DatabaseWaits::default();
-            let decoded = DecodedFrame { parsed_body: Default::default(), frame, phase_trace: PhaseTrace::new(Instant::now()) };
+            let decoded = DecodedFrame { parsed_body: Default::default(), confinement: None, frame, phase_trace: PhaseTrace::new(Instant::now()) };
             let decoded = match waits.defer(decoded, &routes, executor) {
                 Ok(()) => waits.next().await,
                 Err(decoded) => decoded,
@@ -17852,7 +17882,7 @@ mod tests {
             };
             tokio::time::timeout(
                 dispatch_guard,
-                handle_tool_call(&writer, &frame, None, decoded.phase_trace,
+                handle_tool_call(&writer, &frame, None, None, decoded.phase_trace,
                 &routes,
                 &HashMap::new(),
                 &ReclaimedRoutes::default(),
@@ -18432,7 +18462,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let mut waits = persistence::DatabaseWaits::default();
-            let frame = DecodedFrame { parsed_body: Default::default(), frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
+            let frame = DecodedFrame { parsed_body: Default::default(), confinement: None, frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 1,
                 serde_json::to_vec(&json!({"name": "db_set_host_state", "arguments": {"key": "retry", "value": "ok"}})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(Instant::now()), };
             assert!(waits.defer(frame, &routes, &executor).is_ok());
@@ -19069,6 +19099,7 @@ mod admission_mechanism_tests {
     fn decoded_request_metadata_is_reused_after_deferral() {
         let mut decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),

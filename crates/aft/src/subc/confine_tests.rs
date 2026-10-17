@@ -1,6 +1,5 @@
 use super::*;
 use crate::context::confinement;
-use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
 
 struct Fixture {
     repo: tempfile::TempDir,
@@ -84,49 +83,6 @@ impl Fixture {
     fn call(&self, name: &str, args: Value) -> Response {
         call(&self.ctx, &self.route, name, args)
     }
-}
-
-fn call(ctx: &AppContext, route: &RouteIdentity, name: &str, args: Value) -> Response {
-    let _scope = crate::access_policy::scope_guard(Some(access_grants::policy_scope_key(route)));
-    let _ask =
-        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Consent {
-            once: vec![],
-        }));
-    let format =
-        crate::subc_format::FormatContext::from_tool_call(name, &args, &route.project_root);
-    let tool_ctx = ToolCallContext {
-        project_root: route.project_root.clone(),
-        session_id: Some(route.session.clone()),
-        request_id: "confine-vector".into(),
-        diagnostics_on_edit: false,
-        preview: false,
-        edit_slot_survives: None,
-        report_registration_downgrade: false,
-        standard_edit_grammar: true,
-        disabled_tools: Some(route.disabled_tools.clone()),
-        worker_session: true,
-        host_tool_names: None,
-    };
-    with_call_policy(ctx, route, &tool_ctx.request_id, name, args, |args| {
-        let ToolCallOutcome::Unary(result) = run_tool_call(
-            name,
-            args,
-            &format,
-            &tool_ctx,
-            ctx,
-            &|request, ctx| match request.command.as_str() {
-                "read" => crate::commands::read::handle_read(&request, ctx),
-                "grep" => crate::commands::grep::handle_grep(&request, ctx),
-                "glob" => crate::commands::glob::handle_glob(&request, ctx),
-                "outline" => crate::commands::outline::handle_outline(&request, ctx),
-                _ => Response::success(&request.id, json!({"unexpected_dispatch": true})),
-            },
-            None,
-            None,
-        );
-        result.response
-    })
-    .unwrap_or_else(|response| response)
 }
 
 fn arguments(name: &str, input: &str) -> Value {

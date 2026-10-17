@@ -1726,6 +1726,7 @@ impl LedgerEdge {
                             std::time::Instant::now(),
                         ),
                         parsed_body: Default::default(),
+                        confinement: None,
                     });
                 }
                 Err(error) => log::warn!("withdrawn call could not be ended: {error}"),
@@ -3909,11 +3910,26 @@ mod route_tests {
             entries: deferred_tx,
             wake: crate::response_finalize::DeferredResponseWake::default(),
         };
+        // As on the frame loop, a scoped worker's saved confinement is read
+        // off the loop first when memory cannot answer for it.
+        let decoded = DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            frame,
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        let mut waits = super::super::persistence::DatabaseWaits::default();
+        let decoded = match waits.read_confinement(decoded, &routes, &executor) {
+            Ok(()) => waits.next().await,
+            Err(decoded) => decoded,
+        };
+        let frame = decoded.frame;
         handle_tool_call(
             &writer,
             &frame,
             None,
-            PhaseTrace::new(Instant::now()),
+            decoded.confinement,
+            decoded.phase_trace,
             &routes,
             &HashMap::new(),
             &crate::subc::ReclaimedRoutes::default(),
@@ -4404,6 +4420,7 @@ mod route_tests {
         let (edge, _ready) = LedgerEdge::new();
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -5100,6 +5117,7 @@ mod ledger_terminal_tests {
         let body = json!({"name":"bash", "arguments":arguments, "call_key":"held-copy-key"});
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -5164,6 +5182,7 @@ mod ledger_terminal_tests {
         let body = json!({"name":"read", "arguments":{"filePath":"r".repeat(32768)}, "call_key":"copy-key"});
         let decode = |body: &Value, corr| DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(
                 FrameType::Request,
                 control_flags(),
@@ -5360,6 +5379,7 @@ mod ledger_terminal_tests {
         let (edge, mut ready) = LedgerEdge::new();
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
+            confinement: None,
             frame: Frame::build(FrameType::Request, control_flags(), 42, 1, 7, serde_json::to_vec(&json!({"name":"read", "arguments":{"filePath":"README.md"}, "call_key":"drain-key"})).unwrap()).unwrap(),
             phase_trace: PhaseTrace::new(std::time::Instant::now()),
         };
@@ -5430,6 +5450,7 @@ mod ledger_terminal_tests {
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),
+                        confinement: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),
@@ -5471,6 +5492,7 @@ mod ledger_terminal_tests {
                 admission: crate::subc::AdmissionWait::from_decoded(
                     &crate::subc::DecodedFrame {
                         parsed_body: Default::default(),
+                        confinement: None,
                         frame: request(),
                         phase_trace: crate::run_tool_call::PhaseTrace::new(
                             std::time::Instant::now(),

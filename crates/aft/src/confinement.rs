@@ -348,6 +348,13 @@ impl ConfinedIgnoreRules {
         let Some(root) = self.fence.gate.as_ref().map(|gate| gate.root.as_path()) else {
             return false;
         };
+        // The gate's root has the Windows verbatim prefix (`\\?\C:\...`)
+        // stripped, but a walk started from a canonicalized path yields entries
+        // that keep it. Compare, load and match in the root's spelling, or no
+        // directory would count as inside the root and no rule would apply.
+        // Only this local copy changes; the walk's paths stay as they are.
+        let path = crate::inspect::job::normalize_path(path);
+        let path = path.as_path();
         let Some(parent) = path.parent() else {
             return false;
         };
