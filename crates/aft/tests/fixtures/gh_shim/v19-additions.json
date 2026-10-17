@@ -6,7 +6,9 @@
     ],
     "admin": [
       { "tuple": "repo rename", "platform": ["macos", "linux"] },
-      { "tuple": "repo create", "platform": ["macos", "linux"] }
+      { "tuple": "repo create", "platform": ["macos", "linux"] },
+      { "tuple": "workflow disable", "platform": ["macos", "linux"] },
+      { "tuple": "workflow enable", "platform": ["macos", "linux"] }
     ]
   },
   "api_rules": [

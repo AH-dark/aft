@@ -199,6 +199,203 @@ fn check_admin(raw: &[&str], tuple: &str) {
 }
 
 #[test]
+fn v19_workflow_toggle_rows_are_reviewed_only_at_v19() {
+    let manifest = manifest();
+    manifest.validate().unwrap();
+    let rows = [
+        (
+            "workflow disable",
+            vec!["workflow", "disable", "ci.yml", "--repo", "cortexkit/aft"],
+        ),
+        (
+            "workflow disable",
+            vec!["workflow", "disable", "12345", "-R", "cortexkit/aft"],
+        ),
+        (
+            "workflow enable",
+            vec!["workflow", "enable", "ci.yml", "--repo", "cortexkit/aft"],
+        ),
+        (
+            "workflow enable",
+            vec!["workflow", "enable", "12345", "-R", "cortexkit/aft"],
+        ),
+    ];
+    for (tuple, raw) in &rows {
+        for platform in ["macos", "linux"] {
+            assert!(matches!(
+                classify(&args(raw), &manifest, platform),
+                Classification::Admin { tuple: found } if found == *tuple
+            ));
+            // The same declaration on a v18 manifest is not reviewed yet, so it
+            // refuses as undeclared rather than running as administration.
+            let mut previous = manifest.clone();
+            previous.manifest_version = 18;
+            assert!(matches!(
+                classify(&args(raw), &previous, platform),
+                Classification::Unclassified
+            ));
+        }
+    }
+    let mut undeclared = manifest.clone();
+    undeclared
+        .tiers
+        .get_mut(&Tier::Admin)
+        .unwrap()
+        .retain(|row| !row.tuple().starts_with("workflow "));
+    for (_, raw) in &rows {
+        assert!(matches!(
+            classify(&args(raw), &undeclared, "linux"),
+            Classification::Unclassified
+        ));
+    }
+    // Adding these two rows must not move the neighbours: `workflow run`
+    // stays an admin tuple and `workflow view`/`workflow list` stay reads.
+    assert!(matches!(
+        classify(&args(&["workflow", "run", "ci.yml"]), &manifest, "linux"),
+        Classification::Admin { tuple } if tuple == "workflow run"
+    ));
+    for raw in [vec!["workflow", "view", "ci.yml"], vec!["workflow", "list"]] {
+        assert!(matches!(
+            classify(&args(&raw), &manifest, "linux"),
+            Classification::Mechanical
+        ));
+    }
+}
+
+#[test]
+fn v19_workflow_toggle_requires_the_audited_operator_bypass() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest = manifest();
+    manifest.validate().unwrap();
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    for (tuple, raw) in [
+        (
+            "workflow disable",
+            vec!["workflow", "disable", "ci.yml", "--repo", "cortexkit/aft"],
+        ),
+        (
+            "workflow enable",
+            vec!["workflow", "enable", "ci.yml", "--repo", "cortexkit/aft"],
+        ),
+    ] {
+        let argv = args(&raw);
+        let directory = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        {
+            let _bypass = BypassEnv::set(None);
+            assert_eq!(
+                dispatch_r3(
+                    &argv,
+                    classify(&argv, &manifest, "linux"),
+                    &manifest,
+                    &paths,
+                    &rung(),
+                    &binding,
+                    1_700_000_000,
+                    |_| panic!("{tuple} reached upstream without the operator bypass"),
+                ),
+                REFUSAL_EXIT_STATUS
+            );
+            assert!(!paths.bypass_audit.exists());
+        }
+        let _bypass = BypassEnv::set(Some("operator"));
+        assert_eq!(
+            dispatch_r3(
+                &argv,
+                classify(&argv, &manifest, "linux"),
+                &manifest,
+                &paths,
+                &rung(),
+                &binding,
+                1_700_000_000,
+                |forwarded| {
+                    assert_eq!(forwarded, argv);
+                    let (records, error) = read_bypass_audit(&paths);
+                    assert!(error.is_none());
+                    let records = records.unwrap();
+                    assert_eq!(records.len(), 1);
+                    assert_eq!(records[0]["tuple"], tuple);
+                    assert_eq!(records[0]["repository"], "cortexkit/aft");
+                    73
+                },
+            ),
+            73
+        );
+    }
+}
+
+#[test]
+fn v19_workflow_toggle_refuses_modelled_flags_and_leaves_others_to_upstream_gh() {
+    let _lock = crate::test_env::process_env_lock();
+    let manifest = manifest();
+    manifest.validate().unwrap();
+    // The shim models no flags for these rows, exactly as for `run cancel`:
+    // argv goes to upstream `gh` unchanged, and its own parser is what refuses a
+    // flag the verb does not have. The flags the shim refuses for every verb
+    // (deleting or creating the authenticated user's last comment) still refuse
+    // here, before the manifest or the bypass are consulted.
+    for flag in ["--delete-last", "--create-if-none", "--edit-last"] {
+        for verb in ["disable", "enable"] {
+            assert!(
+                matches!(
+                    classify(
+                        &args(&["workflow", verb, "ci.yml", flag]),
+                        &manifest,
+                        "linux"
+                    ),
+                    Classification::Unclassified
+                ),
+                "{flag} on workflow {verb}"
+            );
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StatePaths::from_root(directory.path().to_path_buf());
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".into(),
+        agent_id: "alfonso-aft".into(),
+    };
+    let _bypass = BypassEnv::set(Some("operator"));
+    let argv = args(&[
+        "workflow",
+        "disable",
+        "ci.yml",
+        "--bogus",
+        "--repo",
+        "cortexkit/aft",
+    ]);
+    assert!(matches!(
+        classify(&argv, &manifest, "linux"),
+        Classification::Admin { tuple } if tuple == "workflow disable"
+    ));
+    assert_eq!(
+        dispatch_r3(
+            &argv,
+            classify(&argv, &manifest, "linux"),
+            &manifest,
+            &paths,
+            &rung(),
+            &binding,
+            1_700_000_000,
+            |forwarded| {
+                // Byte-identical forwarding is what lets upstream `gh` refuse
+                // `--bogus` itself: a shim that dropped or rewrote the flag
+                // would change what the operator asked for.
+                assert_eq!(forwarded, argv);
+                let records = read_bypass_audit(&paths).0.unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0]["tuple"], "workflow disable");
+                UPSTREAM_FAILURE_EXIT_STATUS
+            },
+        ),
+        UPSTREAM_FAILURE_EXIT_STATUS
+    );
+}
+
+#[test]
 fn v19_repo_rename_requires_operator_bypass() {
     check_admin(
         &["repo", "rename", "new-name", "--repo", "cortexkit/aft"],
