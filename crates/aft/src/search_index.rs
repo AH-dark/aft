@@ -10011,7 +10011,22 @@ mod tests {
         names
     }
 
+    /// Commit everything in the working tree, rehashing every file.
+    ///
+    /// `git add` normally skips a file whose size and mtime match what the
+    /// index recorded, unless the file was written so close to the index that
+    /// the mtime cannot be trusted. On Linux and macOS git also compares the
+    /// change time, which every write updates; git for Windows has no such
+    /// time to compare. So on Windows an edit that keeps the size and restores
+    /// the old mtime is not staged, and the commit fails with nothing to
+    /// commit, unless the index is emptied first so every file is hashed
+    /// again.
     fn git_commit_all_for_test(project: &Path, message: &str) {
+        assert!(git_command_for_test(project)
+            .args(["read-tree", "--empty"])
+            .status()
+            .expect("git read-tree")
+            .success());
         assert!(git_command_for_test(project)
             .args(["add", "-A"])
             .status()
@@ -10022,6 +10037,20 @@ mod tests {
             .status()
             .expect("git commit")
             .success());
+    }
+
+    /// Move a file's mtime an hour into the past, so git trusts its recorded
+    /// size and mtime for the file instead of hashing it again. A same-size
+    /// edit that restores this mtime is then invisible to a plain `git add`
+    /// on Windows every time, not only when the index happens to be written
+    /// in a later clock tick than the file.
+    fn backdate_for_test(path: &Path) {
+        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(an_hour_ago))
+            .expect("backdate mtime");
     }
 
     /// A repository whose first commit holds every file already in `project`.
@@ -10111,6 +10140,7 @@ mod tests {
         let names = names_git_quotes();
         for (ordinal, name) in names.iter().enumerate() {
             fs::write(project.join(name), format!("// {ordinal} QuotedOld\n")).expect("write");
+            backdate_for_test(&project.join(name));
         }
         let previous = init_quoting_git_repo(&project);
         let mut baseline = SearchIndex::build(&project);
@@ -10169,6 +10199,7 @@ mod tests {
         fs::create_dir_all(&project).expect("create project dir");
         fs::create_dir_all(outside.parent().unwrap()).expect("create sibling dir");
         fs::write(&inside, "// SubdirOld\n").expect("write inside");
+        backdate_for_test(&inside);
         fs::write(&outside, "// OutsideOld\n").expect("write outside");
         let canonical_project = fs::canonicalize(&project).expect("canonical project");
         init_quoting_git_repo(&repo);
