@@ -451,12 +451,76 @@ impl RemoteTask {
 }
 
 #[cfg(unix)]
+#[derive(Default)]
+struct DirtyOutput {
+    stdout: bool,
+    stderr: bool,
+    unknown: bool,
+}
+
+#[cfg(unix)]
+impl DirtyOutput {
+    fn sync(
+        &mut self,
+        stdout: &fs::File,
+        stderr: &fs::File,
+        unknown: Option<&fs::File>,
+    ) -> io::Result<()> {
+        fn sync_dirty(file: &fs::File, dirty: &mut bool) -> io::Result<()> {
+            if *dirty {
+                super::super::persistence::sync_task_file(file)?;
+                *dirty = false;
+            }
+            Ok(())
+        }
+        sync_dirty(stdout, &mut self.stdout)?;
+        sync_dirty(stderr, &mut self.stderr)?;
+        if let Some(file) = unknown {
+            sync_dirty(file, &mut self.unknown)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct OutputProgress {
+    last_seq: Option<u64>,
+    stdout_len: u64,
+    stderr_len: u64,
+    unknown_len: u64,
+}
+
+#[cfg(unix)]
+impl OutputProgress {
+    fn of(remote: &RemoteTask) -> Self {
+        Self {
+            last_seq: remote.last_seq,
+            stdout_len: remote.stdout_len,
+            stderr_len: remote.stderr_len,
+            unknown_len: remote.unknown_len,
+        }
+    }
+
+    fn store(self, remote: &mut RemoteTask) {
+        remote.last_seq = self.last_seq;
+        remote.stdout_len = self.stdout_len;
+        remote.stderr_len = self.stderr_len;
+        remote.unknown_len = self.unknown_len;
+    }
+}
+
+#[cfg(unix)]
 struct TaskSink {
     registry: BgTaskRegistry,
     task: Arc<BgTask>,
     stdout: fs::File,
     stderr: fs::File,
     unknown: Option<fs::File>,
+    dirty: DirtyOutput,
+    // Keep newly received byte counts and sequence numbers out of shared task
+    // metadata until the files are synced. Cancellation also saves that metadata.
+    output_progress: OutputProgress,
     last_progress_persist: Instant,
 }
 
@@ -473,34 +537,100 @@ impl TaskSink {
             .ok_or_else(|| io::Error::other("remote record absent"))?;
         let stdout = open_task_artifact_for_remote(&task, TaskArtifact::Stdout)?;
         let stderr = open_task_artifact_for_remote(&task, TaskArtifact::Stderr)?;
-        // Bytes beyond the committed cursor can exist if AFT died between a
-        // file append and the atomic metadata replacement. Discard only those.
-        stdout.set_len(remote.stdout_len)?;
-        stderr.set_len(remote.stderr_len)?;
+        // Discard bytes beyond the saved checkpoint, but never extend a short
+        // file. The saved sequence number has no byte offsets for replaying its tail.
+        fn restore_length(file: &fs::File, checkpoint: u64) -> io::Result<(u64, bool)> {
+            let actual = file.metadata()?.len();
+            if actual > checkpoint {
+                file.set_len(checkpoint)?;
+            }
+            Ok((actual.min(checkpoint), actual > checkpoint))
+        }
+        let (stdout_len, stdout_dirty) = restore_length(&stdout, remote.stdout_len)?;
+        let (stderr_len, stderr_dirty) = restore_length(&stderr, remote.stderr_len)?;
         let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)?;
         let unknown = match layout
             .dirs
             .io
             .open_file(OsStr::new("remote-unknown-output"), true)
         {
-            Ok(file) => {
-                file.set_len(remote.unknown_len)?;
-                Some(file)
-            }
+            Ok(file) => Some(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        Ok(Self {
+        let (unknown_len, unknown_dirty) = unknown
+            .as_ref()
+            .map(|file| restore_length(file, remote.unknown_len))
+            .transpose()?
+            .unwrap_or((0, false));
+        let mut sink = Self {
             registry: registry.clone(),
             task,
             stdout,
             stderr,
             unknown,
+            dirty: DirtyOutput {
+                stdout: stdout_dirty,
+                stderr: stderr_dirty,
+                unknown: unknown_dirty,
+            },
+            output_progress: OutputProgress {
+                stdout_len,
+                stderr_len,
+                unknown_len,
+                ..OutputProgress::of(&remote)
+            },
             last_progress_persist: Instant::now(),
+        };
+        let losses: Vec<_> = [
+            ("stdout", stdout_len, remote.stdout_len),
+            ("stderr", stderr_len, remote.stderr_len),
+            ("remote-unknown-output", unknown_len, remote.unknown_len),
+        ]
+        .into_iter()
+        .filter(|(_, actual, checkpoint)| actual < checkpoint)
+        .map(|(name, actual, checkpoint)| {
+            format!("{name} has {actual} of {checkpoint} checkpointed bytes")
         })
+        .collect();
+        if !losses.is_empty() {
+            sink.dirty
+                .sync(&sink.stdout, &sink.stderr, sink.unknown.as_ref())?;
+            let mut db = DeferredDbWrites::new(registry, &sink.task);
+            let mut state = sink
+                .task
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("task lock poisoned"))?;
+            let previous = state.metadata.clone();
+            let remote = state.metadata.remote.as_mut().unwrap();
+            remote.stdout_len = stdout_len;
+            remote.stderr_len = stderr_len;
+            remote.unknown_len = unknown_len;
+            // Keep the saved sequence number and any known command outcome.
+            // Replaying earlier records would duplicate bytes in intact streams;
+            // no per-record byte offsets are saved to separate them from lost bytes.
+            let note = state
+                .metadata
+                .execution_note
+                .get_or_insert_with(String::new);
+            note.push_str(&format!(
+                "\nOutput incomplete (remote_output_checkpoint_short): {}; missing bytes cannot be mapped to replay sequences.",
+                losses.join("; ")
+            ));
+            if let Err(error) = registry.persist_task_locked(&sink.task, &state.metadata, &mut db) {
+                state.metadata = previous;
+                return Err(error);
+            }
+        }
+        Ok(sink)
     }
 
     fn commit(&mut self, update: impl FnOnce(&mut RemoteTask)) -> io::Result<()> {
+        // Acceptance, start, and terminal records save output progress too, so
+        // their metadata must not become durable before the output files.
+        self.dirty
+            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
         let mut state = self
             .task
@@ -508,19 +638,20 @@ impl TaskSink {
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
         let previous = state.metadata.remote.clone();
-        update(
-            state
-                .metadata
-                .remote
-                .as_mut()
-                .ok_or_else(|| io::Error::other("remote record absent"))?,
-        );
+        let remote = state
+            .metadata
+            .remote
+            .as_mut()
+            .ok_or_else(|| io::Error::other("remote record absent"))?;
+        self.output_progress.store(remote);
+        update(remote);
         let result = self
             .registry
             .persist_task_locked(&self.task, &state.metadata, &mut db);
         if result.is_err() {
             state.metadata.remote = previous;
         } else {
+            self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
             self.last_progress_persist = Instant::now();
         }
         result
@@ -534,21 +665,17 @@ impl TaskSink {
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
         let remote = state.metadata.remote.as_mut().unwrap();
-        let previous = (
-            remote.last_seq,
-            remote.stdout_len,
-            remote.stderr_len,
-            remote.unknown_len,
-            remote.output_received,
-        );
+        let previous = self.output_progress;
+        let previous_durable = OutputProgress::of(remote);
+        let previous_received = remote.output_received;
         let was_running = remote.started.is_some() || remote.output_received;
         match stream {
-            Some(OutputStream::Stdout) => remote.stdout_len = len,
-            Some(OutputStream::Stderr) => remote.stderr_len = len,
-            None => remote.unknown_len = len,
+            Some(OutputStream::Stdout) => self.output_progress.stdout_len = len,
+            Some(OutputStream::Stderr) => self.output_progress.stderr_len = len,
+            None => self.output_progress.unknown_len = len,
             Some(_) => unreachable!("unknown streams use unknown_output"),
         }
-        remote.last_seq = Some(seq);
+        self.output_progress.last_seq = Some(seq);
         remote.output_received |= stream.is_some();
         // Older runners omit Started. Their first output is still a durable
         // running transition; subsequent output only checkpoints the replay cursor.
@@ -557,17 +684,19 @@ impl TaskSink {
             return Ok(());
         }
         let result = self
-            .registry
-            .persist_task_locked(&self.task, &state.metadata, &mut db);
+            .dirty
+            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())
+            .and_then(|()| {
+                self.output_progress
+                    .store(state.metadata.remote.as_mut().unwrap());
+                self.registry
+                    .persist_task_locked(&self.task, &state.metadata, &mut db)
+            });
         if result.is_err() {
             let remote = state.metadata.remote.as_mut().unwrap();
-            (
-                remote.last_seq,
-                remote.stdout_len,
-                remote.stderr_len,
-                remote.unknown_len,
-                remote.output_received,
-            ) = previous;
+            previous_durable.store(remote);
+            remote.output_received = previous_received;
+            self.output_progress = previous;
         } else {
             self.last_progress_persist = Instant::now();
         }
@@ -741,28 +870,22 @@ impl OutputSink for TaskSink {
     }
     fn output(&mut self, seq: u64, stream: OutputStream, bytes: &[u8]) -> io::Result<()> {
         let stdout = stream == OutputStream::Stdout;
-        let offset = self
-            .task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?
-            .metadata
-            .remote
-            .as_ref()
-            .map(|remote| {
-                if stdout {
-                    remote.stdout_len
-                } else {
-                    remote.stderr_len
-                }
-            })
-            .unwrap();
+        let offset = if stdout {
+            self.output_progress.stdout_len
+        } else {
+            self.output_progress.stderr_len
+        };
         let file = if stdout {
             &mut self.stdout
         } else {
             &mut self.stderr
         };
         file.seek(SeekFrom::Start(offset))?;
+        if stdout {
+            self.dirty.stdout = true;
+        } else {
+            self.dirty.stderr = true;
+        }
         file.write_all(bytes)?;
         file.set_len(offset + bytes.len() as u64)?;
         self.progress(seq, Some(stream), offset + bytes.len() as u64)?;
@@ -779,16 +902,7 @@ impl OutputSink for TaskSink {
         self.commit(|r| r.gap_recovery = Some(recovery.clone()))
     }
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
-        let offset = self
-            .task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?
-            .metadata
-            .remote
-            .as_ref()
-            .unwrap()
-            .unknown_len;
+        let offset = self.output_progress.unknown_len;
         if !bytes.is_empty() {
             if self.unknown.is_none() {
                 let layout = resolve_task_layout(&self.task.paths.session_dir, &self.task.task_id)?;
@@ -804,6 +918,7 @@ impl OutputSink for TaskSink {
             }
             let file = self.unknown.as_mut().unwrap();
             file.seek(SeekFrom::Start(offset))?;
+            self.dirty.unknown = true;
             file.write_all(bytes)?;
             file.set_len(offset + bytes.len() as u64)?;
         }
@@ -836,6 +951,8 @@ impl OutputSink for TaskSink {
 #[cfg(unix)]
 impl TaskSink {
     fn truncate_output(&mut self, before_seq: u64, undelivered: bool) -> io::Result<()> {
+        self.dirty
+            .sync(&self.stdout, &self.stderr, self.unknown.as_ref())?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
         let mut state = self
             .task
@@ -848,6 +965,7 @@ impl TaskSink {
             .remote
             .as_mut()
             .ok_or_else(|| io::Error::other("remote record absent"))?;
+        self.output_progress.store(remote);
         let first = remote.last_seq.map_or(0, |seq| seq.saturating_add(1));
         remote.last_seq = before_seq.checked_sub(1);
         if first < before_seq {
@@ -865,6 +983,9 @@ impl TaskSink {
             .persist_task_locked(&self.task, &state.metadata, &mut db);
         if result.is_err() {
             state.metadata = previous;
+        } else {
+            self.output_progress = OutputProgress::of(state.metadata.remote.as_ref().unwrap());
+            self.last_progress_persist = Instant::now();
         }
         result
     }
