@@ -813,11 +813,20 @@ fn outline_structure_entries(
             }
             let mut included = base.join(&included_path);
             let mut label_path = PathBuf::from(&included_path);
-            if region.implicit_include
-                && !crate::bounded_io::metadata(&included).is_ok_and(|m| m.is_file())
-            {
-                label_path = PathBuf::from(&region.summary.name).join("mod.rs");
-                included = base.join(&label_path);
+            if region.implicit_include {
+                // Even an existence probe can follow an include symlink outside
+                // the pinned tree. Validate before choosing the module layout.
+                let probe = if crate::context::confinement::active() {
+                    ctx.validate_read_path(req_id, session_id, &included).ok()
+                } else {
+                    Some(included.clone())
+                };
+                if !probe.is_some_and(|path| {
+                    crate::bounded_io::metadata(&path).is_ok_and(|m| m.is_file())
+                }) {
+                    label_path = PathBuf::from(&region.summary.name).join("mod.rs");
+                    included = base.join(&label_path);
+                }
             }
             let included_label = test_module_include_label(parent, &base, &label_path);
             // A test include is navigation metadata, not a requested file. A
@@ -1138,6 +1147,11 @@ impl OutlineIgnoreStack {
             target_root: root.clone(),
             ..Self::default()
         };
+        // Ignore discovery can open global files, ancestors, or symlinks outside
+        // the pinned tree. Confined outlines use only the walked entries.
+        if crate::context::confinement::active() {
+            return stack;
+        }
 
         // Global excludes and .git/info/exclude are lower priority than every
         // .gitignore in the target's ancestor chain. Load them once per walk.
@@ -1165,6 +1179,9 @@ impl OutlineIgnoreStack {
 
     fn for_child_directory(&self, directory: &Path) -> Self {
         let mut child = self.clone();
+        if crate::context::confinement::active() {
+            return child;
+        }
         if let Some(matcher) = build_outline_gitignore(directory, &directory.join(".gitignore")) {
             child.matchers.push(matcher);
         }

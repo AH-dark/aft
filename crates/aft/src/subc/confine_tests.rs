@@ -368,6 +368,190 @@ fn confined_catalog_validation_and_monotonic_freeze() {
     assert!(admit_confined(&f.ctx, &unconfined, "bash").is_ok());
 }
 
+#[test]
+fn confined_epoch_refetch_cannot_remove_fence() {
+    let f = Fixture::new();
+    for (epoch, params) in [
+        (8, json!({"remote_exec":{"enabled":true}})),
+        (9, json!({"siblings":[f.live]})),
+    ] {
+        let route = identity(&f.pin, "designer", epoch, true);
+        let answer = catalog(json!({"preset":"worker","params":params}), &route, &f.ctx).unwrap();
+        assert_eq!(answer["tools"].as_array().unwrap().len(), 4, "{answer}");
+        assert!(confined(&f.ctx, &route).unwrap());
+        for name in ["bash", "write"] {
+            assert_eq!(
+                call(&f.ctx, &route, name, json!({})).data["code"],
+                "tool_not_offered_confined"
+            );
+        }
+        assert_eq!(
+            call(
+                &f.ctx,
+                &route,
+                "read",
+                arguments("read", "../live/sentinel.rs")
+            )
+            .data["code"],
+            "path_outside_confined_root"
+        );
+    }
+    let route = identity(&f.pin, "designer", 10, true);
+    let error = catalog(
+        json!({"preset":"worker","params":{"confine":"none"}}),
+        &route,
+        &f.ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "invalid_confine");
+    assert!(confined(&f.ctx, &route).unwrap());
+}
+
+fn with_outline_outside_ignores(f: impl FnOnce(&Fixture)) {
+    let _lock = crate::test_env::process_env_lock();
+    struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreEnv(
+        ["HOME", "USERPROFILE", "XDG_CONFIG_HOME"]
+            .into_iter()
+            .map(|name| {
+                let previous = std::env::var_os(name);
+                std::env::set_var(name, home.path());
+                (name, previous)
+            })
+            .collect(),
+    );
+    std::fs::write(home.path().join("excludes"), "global.rs\n").unwrap();
+    std::fs::write(
+        home.path().join(".gitconfig"),
+        format!(
+            "[core]\nexcludesFile = {}\n",
+            home.path().join("excludes").display()
+        ),
+    )
+    .unwrap();
+    let fixture = Fixture::new();
+    std::fs::write(fixture.repo.path().join(".gitignore"), "ancestor.rs\n").unwrap();
+    std::fs::write(fixture.repo.path().join(".git/info/exclude"), "info.rs\n").unwrap();
+    std::fs::write(fixture.live.join("ignores"), "symlink.rs\n").unwrap();
+    std::os::unix::fs::symlink("../live/ignores", fixture.pin.join(".gitignore")).unwrap();
+    std::fs::create_dir(fixture.pin.join("nested")).unwrap();
+    std::os::unix::fs::symlink("../../live/ignores", fixture.pin.join("nested/.gitignore"))
+        .unwrap();
+    for path in [
+        "global.rs",
+        "ancestor.rs",
+        "info.rs",
+        "symlink.rs",
+        "nested/symlink.rs",
+    ] {
+        std::fs::write(fixture.pin.join(path), "fn pinned_token() {}\n").unwrap();
+    }
+    f(&fixture);
+}
+
+#[test]
+fn confined_outline_files_ignores_no_outside_rules() {
+    with_outline_outside_ignores(|f| {
+        let response = f.call("outline", json!({"target":".", "files":true}));
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true, "{response:?}");
+        let files = response.data["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files,
+            [
+                ".git",
+                "ancestor.rs",
+                "global.rs",
+                "info.rs",
+                "nested/symlink.rs",
+                "only.rs",
+                "symlink.rs"
+            ],
+            "outside ignore rules changed the pinned tree: {response:?}"
+        );
+    });
+}
+
+#[test]
+fn confined_outline_test_includes_do_not_probe_unvalidated_paths() {
+    let f = Fixture::new();
+    std::fs::write(
+        f.pin.join("lib.rs"),
+        "pub fn product() {}\n#[cfg(test)]\nmod tests;\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../live/sentinel.rs", f.pin.join("tests.rs")).unwrap();
+    let present = f.call("outline", json!({"target":["lib.rs"]}));
+    assert!(present.success, "{present:?}");
+    std::fs::remove_file(f.live.join("sentinel.rs")).unwrap();
+    let absent = f.call("outline", json!({"target":["lib.rs"]}));
+    assert!(absent.success, "{absent:?}");
+    assert_eq!(
+        present.data, absent.data,
+        "outside file existence affected the outline"
+    );
+}
+
+#[test]
+fn confined_security_golden_vectors() {
+    let f = Fixture::new();
+    let route = identity(&f.pin, "designer", 8, true);
+    catalog(
+        json!({"preset":"worker","params":{"siblings":[f.live]}}),
+        &route,
+        &f.ctx,
+    )
+    .unwrap();
+    vector(
+        &f,
+        "epoch-refetch-bash-refusal",
+        serde_json::to_value(call(&f.ctx, &route, "bash", json!({}))).unwrap(),
+    );
+    vector(
+        &f,
+        "epoch-refetch-invalid-confine",
+        serde_json::to_value(
+            catalog(
+                json!({"preset":"worker","params":{"confine":"none"}}),
+                &route,
+                &f.ctx,
+            )
+            .unwrap_err(),
+        )
+        .unwrap(),
+    );
+    with_outline_outside_ignores(|f| {
+        for (case, target) in [
+            ("outside-ignore-files", "."),
+            ("symlink-ignore-target", "nested"),
+        ] {
+            let response = f.call("outline", json!({"target":target,"files":true}));
+            assert!(response.success, "{response:?}");
+            vector(
+                f,
+                &format!("outline-{case}"),
+                serde_json::to_value(response).unwrap(),
+            );
+        }
+    });
+}
+
 fn vector(f: &Fixture, name: &str, value: Value) {
     fn stable(value: Value, root: &str) -> Value {
         match value {

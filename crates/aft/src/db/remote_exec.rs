@@ -39,8 +39,30 @@ pub fn freeze(
     policy: &FrozenParams,
     now: u64,
 ) -> rusqlite::Result<()> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let v = key.values();
-    conn.execute(
+    let epoch = key.epoch.to_string();
+    let prior: Option<String> = tx
+        .query_row(
+            "SELECT params FROM remote_exec_policies
+             WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
+             AND owner=?5 AND scope_ref=?6 AND preset=?7
+             AND (length(epoch)<length(?8) OR (length(epoch)=length(?8) AND epoch<?8))
+             ORDER BY length(epoch) DESC,epoch DESC LIMIT 1",
+            params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut policy = policy.clone();
+    if let Some(prior) = prior {
+        let prior: FrozenParams = serde_json::from_str(&prior).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        // Merge the fence before inserting an exact-epoch row: lookup prefers
+        // that row and can no longer carry confinement from the previous epoch.
+        policy.confine = policy.confine.or(prior.confine);
+    }
+    tx.execute(
         "INSERT OR IGNORE INTO remote_exec_policies
         (project_root,harness,session,principal,owner,scope_ref,preset,epoch,params,last_used)
         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -52,15 +74,15 @@ pub fn freeze(
             v[4],
             v[5],
             v[6],
-            key.epoch.to_string(),
-            serde_json::to_string(policy).expect("routing fields serialize"),
+            epoch,
+            serde_json::to_string(&policy).expect("routing fields serialize"),
             now as i64
         ],
     )?;
     // Confinement is monotonic: a later catalog may tighten an existing plan,
     // but a parameterless fetch or a routing override cannot remove the fence.
     if policy.confine.is_some() {
-        conn.execute(
+        tx.execute(
             "UPDATE remote_exec_policies SET params=json_set(params,'$.confine','root')
              WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
              AND owner=?5 AND scope_ref=?6 AND preset=?7 AND epoch=?8",
@@ -76,7 +98,7 @@ pub fn freeze(
             ],
         )?;
     }
-    Ok(())
+    tx.commit()
 }
 
 /// The only per-call policy lookup: no files or call arguments can supply it.
@@ -369,6 +391,64 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn confined_freeze_carries_only_fence_across_epochs_and_preserves_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let mut first = key(dir.path());
+        first.epoch = 9;
+        freeze(
+            &conn,
+            &first,
+            &FrozenParams {
+                confine: Some(crate::exec_remote::RootConfinement::Root),
+                siblings: vec!["/old-sibling".into()],
+                ..policy(false)
+            },
+            100,
+        )
+        .unwrap();
+        for different in 0..7 {
+            let mut other = first.clone();
+            other.epoch = 10;
+            match different {
+                0 => other.principal = "direct".into(),
+                1 => other.owner = "other".into(),
+                2 => other.scope_ref = "other".into(),
+                3 => other.harness = "other".into(),
+                4 => other.project_root = "/other".into(),
+                5 => other.preset = "head".into(),
+                _ => other.session = "two".into(),
+            }
+            freeze(&conn, &other, &policy(true), 200).unwrap();
+            assert!(lookup(&conn, &other, 200)
+                .unwrap()
+                .unwrap()
+                .confine
+                .is_none());
+        }
+        for epoch in [10, u64::MAX - 1, u64::MAX] {
+            let mut rebound = first.clone();
+            rebound.epoch = epoch;
+            freeze(&conn, &rebound, &policy(true), 300).unwrap();
+            // Inspect the inserted row before lookup can copy an older policy.
+            let v = rebound.values();
+            let json: String = conn
+                .query_row(
+                    "SELECT params FROM remote_exec_policies
+                     WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
+                     AND owner=?5 AND scope_ref=?6 AND preset=?7 AND epoch=?8",
+                    params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let saved: FrozenParams = serde_json::from_str(&json).unwrap();
+            assert!(saved.confine.is_some(), "epoch {epoch}: {json}");
+            assert!(saved.remote_exec.unwrap().enabled);
+            assert!(saved.siblings.is_empty());
+        }
     }
 
     #[test]
