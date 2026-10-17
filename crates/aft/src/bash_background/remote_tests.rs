@@ -5067,8 +5067,21 @@ fn draining_clocks() -> &'static Mutex<HashMap<PathBuf, Arc<DrainingClock>>> {
     CLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Clocks are keyed by the canonical project root. A test names its temporary
+/// directory as created (on macOS under the `/var` symlink), while a worker
+/// started through the bash handler records the resolved checkout path (under
+/// `/private/var`). Without one key form the worker misses the paused clock,
+/// sleeps on real time, and the test waits for an event that never comes.
+fn draining_clock_key(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.into())
+}
+
 pub(super) fn draining_clock(root: &Path) -> Option<Arc<DrainingClock>> {
-    draining_clocks().lock().unwrap().get(root).cloned()
+    draining_clocks()
+        .lock()
+        .unwrap()
+        .get(&draining_clock_key(root))
+        .cloned()
 }
 
 pub(super) fn task_draining_clock(task: &BgTask) -> Option<Arc<DrainingClock>> {
@@ -5087,16 +5100,17 @@ struct PausedDrainingClock {
 
 impl PausedDrainingClock {
     fn new(root: &Path) -> Self {
+        let root = draining_clock_key(root);
         let (ticks, _) = tokio::sync::watch::channel(1_000_000);
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
         let clock = Arc::new(DrainingClock { ticks, events });
         assert!(draining_clocks()
             .lock()
             .unwrap()
-            .insert(root.into(), clock.clone())
+            .insert(root.clone(), clock.clone())
             .is_none());
         Self {
-            root: root.into(),
+            root,
             clock,
             events: receiver,
         }
