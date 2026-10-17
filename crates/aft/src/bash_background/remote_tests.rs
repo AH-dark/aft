@@ -4863,6 +4863,82 @@ async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart()
     }
 }
 
+#[tokio::test]
+async fn runon_capture_recovered_status_keeps_warning_without_accepted() {
+    use crate::commands::bash_orchestrate::REMOTE_INPUT_CAPTURE_WARNING;
+    for accepted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (original, task_id, paths) = persist_accepted_with_snapshot(
+            dir.path(),
+            dir.path().join("missing-connection.json"),
+            "cargo test",
+        );
+        drop(original);
+        let mut metadata = read_task(&paths.json).unwrap();
+        let remote = metadata.remote.as_mut().unwrap();
+        remote.explicit_runon = true;
+        remote.accepted = accepted;
+        remote.terminal = Some(TerminalRecord::new(
+            id(),
+            Outcome::RefusedBeforeStart {
+                reason: RefusalReason::Unreachable,
+            },
+            1,
+            0,
+            0,
+        ));
+        metadata.status = BgTaskStatus::Failed;
+        write_task(&paths.json, &metadata).unwrap();
+        let ctx = restarted_context(dir.path());
+        ctx.bash_background()
+            .replay_session(dir.path(), "session")
+            .unwrap();
+        let request = crate::protocol::RawRequest {
+            id: "recovered-capture-status".into(),
+            command: "bash_status".into(),
+            params: serde_json::json!({"task_id":task_id}),
+            session_id: Some("session".into()),
+            lsp_hints: None,
+        };
+        let response = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["status"], "failed", "{response:?}");
+        assert_eq!(
+            response.data["output_preview"]
+                .as_str()
+                .unwrap()
+                .contains(REMOTE_INPUT_CAPTURE_WARNING),
+            !accepted,
+            "{response:?}"
+        );
+        let (disk, _) = ctx
+            .bash_background()
+            .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+            .unwrap();
+        assert_eq!(disk.remote_inputs_captured, Some(accepted));
+        let response = crate::commands::bash_orchestrate::decide_bash_step(
+            disk,
+            Instant::now(),
+            false,
+            false,
+            Instant::now(),
+            "disk-capture-result",
+        );
+        let crate::commands::bash_orchestrate::BashStep::Done(response) = response else {
+            panic!("recovered refusal must remain terminal");
+        };
+        assert!(!response.success, "{response:?}");
+        assert_eq!(
+            response.data["output"]
+                .as_str()
+                .unwrap()
+                .contains(REMOTE_INPUT_CAPTURE_WARNING),
+            !accepted,
+            "{response:?}"
+        );
+    }
+}
+
 #[test]
 fn cancelled_call_notice_names_a_remote_task_and_its_job_once() {
     let dir = tempfile::tempdir().unwrap();

@@ -573,6 +573,9 @@ pub struct BgTaskSnapshot {
     /// An explicit remote demand was refused before the command started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_refusal: Option<RemoteRefusal>,
+    /// Whether the runner confirmed input capture, retained through disk recovery.
+    #[serde(skip)]
+    pub(crate) remote_inputs_captured: Option<bool>,
     /// The remote stream's phase: submitting, queued, waiting on a retained job,
     /// or running after execution evidence. Local and finished tasks omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10789,6 +10792,11 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
     let hard_kill =
         HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
     let remote_refusal = remote::remote_refusal(&metadata);
+    let remote_inputs_captured = metadata
+        .remote
+        .as_ref()
+        .filter(|r| r.explicit_runon)
+        .map(|r| r.accepted);
     let remote_job_id = remote_job_id(&metadata);
     BgTaskSnapshot {
         info: BgTaskInfo {
@@ -10817,6 +10825,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         sandbox_native: metadata.sandbox_native,
         sandbox_unavailable: false,
         remote_refusal,
+        remote_inputs_captured,
         phase: None,
         live_descendants: metadata.live_descendants.clone(),
         live_descendants_omitted: metadata.live_descendants_omitted,
@@ -10940,6 +10949,11 @@ impl BgTask {
                     .and_then(|mut file| file.read_all())
                     .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
             remote_refusal: remote::remote_refusal(metadata),
+            remote_inputs_captured: metadata
+                .remote
+                .as_ref()
+                .filter(|r| r.explicit_runon)
+                .map(|r| r.accepted),
             phase: metadata
                 .remote
                 .as_ref()

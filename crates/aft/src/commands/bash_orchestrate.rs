@@ -705,7 +705,7 @@ pub(crate) fn promote_bash(
     bash_watch_available: bool,
     capped_worker_wait: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) if capped_worker_wait => {
             if worker_session {
                 ctx.bash_background().renew_hard_kill(
@@ -763,7 +763,8 @@ pub(crate) fn promote_bash(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
-    }
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
 pub(crate) fn detach_wait_mode_bash(
@@ -774,7 +775,7 @@ pub(crate) fn detach_wait_mode_bash(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => wait_detach_response(
             request_id,
             task_id,
@@ -788,7 +789,8 @@ pub(crate) fn detach_wait_mode_bash(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
-    }
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
 /// How long a blocking call (`wait: true` or `block_to_completion`) on a
@@ -846,7 +848,7 @@ pub(crate) fn handback_remote_bash(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => {
             let progress = ctx.bash_background().remote_progress(task_id, session_id);
             let output = format!(
@@ -888,7 +890,8 @@ pub(crate) fn handback_remote_bash(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
-    }
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
 /// Hands a still-running foreground command to the background because the
@@ -902,7 +905,7 @@ pub(crate) fn detach_bash_for_module_drain(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => {
             let snapshot = ctx
                 .bash_background()
@@ -940,10 +943,58 @@ pub(crate) fn detach_bash_for_module_drain(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
+}
+
+pub(crate) const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirmed the inputs were copied yet. Do not change or delete input files until bash_status shows the job queued or running.";
+
+/// Keep launch, detach and recovered status replies consistent until the runner's
+/// Accepted stream record confirms input capture. Preserve terminal errors and status.
+pub(crate) fn with_capture_warning(response: &Response) -> Response {
+    let mut response = Response {
+        id: response.id.clone(),
+        success: response.success,
+        data: response.data.clone(),
+    };
+    if matches!(
+        response.data["status"].as_str(),
+        None | Some("running" | "starting")
+    ) {
+        response.data["status"] = json!("starting");
+        response.data["phase"] = json!("submitting");
+        if response.data.get("remote_phase").is_some() {
+            response.data["remote_phase"] = json!("submitting");
+        }
+    }
+    let field =
+        if response.data.get("output").is_none() && response.data.get("output_preview").is_some() {
+            "output_preview"
+        } else {
+            "output"
+        };
+    let output = response.data[field].as_str().unwrap_or("");
+    if !output.ends_with(REMOTE_INPUT_CAPTURE_WARNING) {
+        response.data[field] = json!(format!("{output}\n{REMOTE_INPUT_CAPTURE_WARNING}"));
+    }
+    response
+}
+
+pub(crate) fn with_runon_capture_state(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: Response,
+) -> Response {
+    if registry.runon_inputs_captured(task_id, session) == Some(false) {
+        with_capture_warning(&response)
+    } else {
+        response
     }
 }
 
 fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
+    let inputs_captured = snapshot.remote_inputs_captured;
     let task_line = foreground_task_line(&snapshot);
     let (output, foreground_envelope) =
         if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {
@@ -972,7 +1023,7 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             (output, None)
         };
     if let Some(refusal) = &snapshot.remote_refusal {
-        return Response::error_with_data(
+        let response = Response::error_with_data(
             request_id,
             refusal.code,
             &refusal.message,
@@ -983,6 +1034,11 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
                 "output": output,
             }),
         );
+        return if inputs_captured == Some(false) {
+            with_capture_warning(&response)
+        } else {
+            response
+        };
     }
     if snapshot.sandbox_native
         && snapshot.sandbox_unavailable
@@ -1024,7 +1080,12 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
     if let Some(job_id) = &snapshot.remote_job_id {
         data["remote_job_id"] = json!(job_id);
     }
-    Response::success(request_id, data)
+    let response = Response::success(request_id, data);
+    if inputs_captured == Some(false) {
+        with_capture_warning(&response)
+    } else {
+        response
+    }
 }
 
 /// The line naming the task (and its build-server job, for a `runon` task) at
@@ -1231,6 +1292,7 @@ mod tests {
             sandbox_native: false,
             sandbox_unavailable: false,
             remote_refusal: None,
+            remote_inputs_captured: None,
             phase: None,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
