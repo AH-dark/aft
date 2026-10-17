@@ -2033,16 +2033,42 @@ struct RefreshBatch {
 /// An opaque value a refresh batch keeps alive until it settles.
 pub(crate) type RefreshKeepalive = Arc<dyn std::any::Any + Send + Sync>;
 
+/// The inputs that decide whether a refresh batch may still replay, copied out
+/// of a batch without its keepalive guards. Code that inspects batches outside
+/// the queue lock holds this instead of a batch clone, so a guard is released
+/// as soon as the queue drops the batch rather than when the inspector finishes.
+struct RefreshReplayEligibility {
+    ticket: Option<CallgraphRefreshTicket>,
+    refresh_states: Vec<CallgraphRefreshState>,
+}
+
+impl RefreshReplayEligibility {
+    fn is_current(&self) -> bool {
+        replay_eligible(self.ticket.as_ref(), &self.refresh_states)
+    }
+}
+
+fn replay_eligible(
+    ticket: Option<&CallgraphRefreshTicket>,
+    refresh_states: &[CallgraphRefreshState],
+) -> bool {
+    ticket.is_none_or(CallgraphRefreshTicket::is_current)
+        && (refresh_states.is_empty()
+            || refresh_states
+                .iter()
+                .any(|state| state.heavy_root_work_allowed.load(AtomicOrdering::SeqCst)))
+}
+
 impl RefreshBatch {
     fn eligible_for_replay(&self) -> bool {
-        self.ticket
-            .as_ref()
-            .is_none_or(CallgraphRefreshTicket::is_current)
-            && (self.refresh_states.is_empty()
-                || self
-                    .refresh_states
-                    .iter()
-                    .any(|state| state.heavy_root_work_allowed.load(AtomicOrdering::SeqCst)))
+        replay_eligible(self.ticket.as_ref(), &self.refresh_states)
+    }
+
+    fn replay_eligibility(&self) -> RefreshReplayEligibility {
+        RefreshReplayEligibility {
+            ticket: self.ticket.clone(),
+            refresh_states: self.refresh_states.clone(),
+        }
     }
 
     fn remove_pending_paths(&self) {
@@ -2349,7 +2375,10 @@ pub(crate) fn retire_obsolete_callgraph_refresh_waiters() {
     }
     for worker in workers {
         // Enqueue holds lifecycle admission before locking the queue. Check
-        // tickets outside the queue lock to preserve that lock order.
+        // tickets outside the queue lock to preserve that lock order. Copy only
+        // the eligibility inputs: a batch clone would carry its keepalive
+        // guards, and a concurrent retire that removes the waiter could then
+        // return while this snapshot still keeps a query catch-up outstanding.
         let candidates = {
             let queue = worker.shared.queue.lock().unwrap();
             queue
@@ -2359,14 +2388,16 @@ pub(crate) fn retire_obsolete_callgraph_refresh_waiters() {
                     (
                         root.clone(),
                         Arc::clone(&waiting.identity),
-                        waiting.batch.clone(),
+                        waiting.batch.replay_eligibility(),
                     )
                 })
                 .collect::<Vec<_>>()
         };
+        #[cfg(test)]
+        hold_retire_snapshot_for_test(&candidates);
         let obsolete = candidates
             .into_iter()
-            .filter(|(_, _, batch)| !batch.eligible_for_replay())
+            .filter(|(_, _, eligibility)| !eligibility.is_current())
             .collect::<Vec<_>>();
         let mut queue = worker.shared.queue.lock().unwrap();
         for (root, identity, _) in obsolete {
@@ -3457,6 +3488,10 @@ struct RefreshWorkerTestSeam {
     panic_once: bool,
     #[cfg(test)]
     fail_stale_mark: bool,
+    /// Pauses `retire_obsolete_callgraph_refresh_waiters` on the named thread
+    /// after it has snapshotted this root's waiter, until the test releases it.
+    #[cfg(test)]
+    retire_snapshot_hold: Option<RetireSnapshotHold>,
     delay: Duration,
     fail_refresh: bool,
     fail_open: bool,
@@ -3468,6 +3503,43 @@ struct RefreshWorkerTestSeam {
 
 static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
     OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RetireSnapshotHold {
+    thread: std::thread::ThreadId,
+    held: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+/// Parks a retire call between its out-of-lock snapshot and its removal pass,
+/// where a concurrent retire on another thread can overlap it. The hold only
+/// applies to the thread the test named, so retires from parallel tests that
+/// walk the same worker are never paused.
+#[cfg(test)]
+fn hold_retire_snapshot_for_test<T>(candidates: &[(RefreshRoot, Arc<()>, T)]) {
+    let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() else {
+        return;
+    };
+    for (root, _, _) in candidates {
+        let hold = {
+            let mut seams = seams.lock().unwrap();
+            let Some(seam) = seams.get_mut(&root.project_root) else {
+                continue;
+            };
+            if !seam
+                .retire_snapshot_hold
+                .as_ref()
+                .is_some_and(|hold| hold.thread == std::thread::current().id())
+            {
+                continue;
+            }
+            seam.retire_snapshot_hold.take().unwrap()
+        };
+        hold.held.send(()).unwrap();
+        hold.release.recv().unwrap();
+    }
+}
 
 #[cfg(test)]
 fn hold_idle_writer_for_test(
@@ -23229,6 +23301,79 @@ mod refresh_worker_tests {
         generation.store(2, AtomicOrdering::SeqCst);
         retire_obsolete_callgraph_refresh_waiters();
         assert_eq!(Arc::strong_count(&keepalive), 1);
+        assert!(pending.lock().contains(&source));
+        assert!(callgraph_refresh_status(&root).is_null());
+        drop(foreign);
+    }
+
+    #[test]
+    fn concurrent_retire_snapshot_does_not_retain_obsolete_catch_up() {
+        // Every retire walks every worker, so a retire on another thread (the
+        // worker's own post-park recheck, or a parallel lifecycle change) can
+        // snapshot a waiter just before this thread removes it. The waiter's
+        // query guard must be released by the removal, not by whichever
+        // snapshot finishes last.
+        let (_temp, root, dir, source) = ready_store_fixture();
+        let worker = isolated_callgraph_refresh_worker_for_test(root.clone());
+        let foreign = ForeignRefreshWriter::start(&root, &dir);
+        let pending = pending_paths();
+        let generation = Arc::new(AtomicU64::new(1));
+        let epoch = crate::root_cache::ArtifactPublishEpoch::default();
+        let ticket = CallgraphRefreshTicket::new(
+            SubcLifecycleAdmission::default(),
+            Arc::clone(&generation),
+            1,
+            epoch.clone(),
+            epoch.current(),
+        );
+        let keepalive = Arc::new(());
+        set_callgraph_refresh_worker_test_seam(root.clone(), Duration::ZERO, false);
+        enqueue_callgraph_store_refresh_inner(
+            dir,
+            root.clone(),
+            vec![source.clone()],
+            Arc::clone(&pending),
+            Vec::new(),
+            Some(ticket),
+            Some(keepalive.clone()),
+        );
+        assert!(worker.wait(Duration::from_secs(12)));
+        assert!(Arc::strong_count(&keepalive) > 1);
+
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (thread_tx, thread_rx) = crossbeam_channel::bounded(1);
+        let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+        let concurrent = std::thread::spawn(move || {
+            thread_tx.send(std::thread::current().id()).unwrap();
+            start_rx.recv().unwrap();
+            retire_obsolete_callgraph_refresh_waiters();
+        });
+        REFRESH_WORKER_TEST_SEAMS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .retire_snapshot_hold = Some(RetireSnapshotHold {
+            thread: thread_rx.recv().unwrap(),
+            held: held_tx,
+            release: release_rx,
+        });
+        start_tx.send(()).unwrap();
+        // The concurrent retire has snapshotted the still-current waiter.
+        held_rx.recv_timeout(Duration::from_secs(12)).unwrap();
+
+        generation.store(2, AtomicOrdering::SeqCst);
+        retire_obsolete_callgraph_refresh_waiters();
+        let released = Arc::strong_count(&keepalive);
+        release_tx.send(()).unwrap();
+        concurrent.join().unwrap();
+        assert_eq!(
+            released, 1,
+            "retiring the waiter must release its guard while another retire holds a snapshot"
+        );
         assert!(pending.lock().contains(&source));
         assert!(callgraph_refresh_status(&root).is_null());
         drop(foreign);
