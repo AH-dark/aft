@@ -187,6 +187,18 @@ impl BgTaskRegistry {
         session: &str,
         path: &Path,
     ) -> Option<Vec<PathBuf>> {
+        // Exact owned outputs include legacy flat-layout tasks, which have no
+        // bundle read record. Ownership bypasses storage exclusion, not SQLite
+        // or link checks, and never authorizes the containing directory.
+        if self.is_session_owned_artifact_path(session, path) {
+            let readable = !crate::project_content::is_sqlite_or_metadata(path)
+                && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file());
+            return Some(if readable {
+                vec![path.to_path_buf()]
+            } else {
+                Vec::new()
+            });
+        }
         let record = self.task_read_record(task_directory(path)?)?;
         let paths = &record.resolved.paths;
         if ![&paths.dir, &paths.control_dir, &paths.io_dir]
