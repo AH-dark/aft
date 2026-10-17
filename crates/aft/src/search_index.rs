@@ -8222,7 +8222,8 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Run `git diff --name-status -z -M from..to` and return its raw output.
+/// Run `git diff --name-status -z -M --relative from..to` from `root` and
+/// return its raw output.
 ///
 /// The output is read NUL-delimited on purpose. Without `-z`, git quotes any
 /// name that holds non-ASCII bytes, a tab, a quote or a backslash
@@ -8230,6 +8231,14 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
 /// string is not a real path: the edited file would be counted once under the
 /// quoted name and again under its real name from the disk walk, and the
 /// committed edit itself would never be matched to the cached file.
+///
+/// `--relative` matters when the search root is a subdirectory of the
+/// repository, such as one package of a monorepo opened on its own. Git
+/// otherwise names paths from the repository's top level (`packages/app/x.rs`)
+/// and lists changes anywhere in the repository; joined onto the search root
+/// those become paths that do not exist. With `--relative`, run from the root
+/// through `-C`, git lists only changes under the root, relative to it. At the
+/// top level of the repository it changes nothing.
 fn read_git_diff(
     root: &Path,
     from: &str,
@@ -8243,7 +8252,14 @@ fn read_git_diff(
     let output = match crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)
-        .args(["diff", "--name-status", "-z", "-M", &diff_range])
+        .args([
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            "--relative",
+            &diff_range,
+        ])
         .output()
     {
         Ok(output) => output,
@@ -10139,6 +10155,103 @@ mod tests {
         assert_eq!(found, expected, "every committed edit must be searchable");
         let old = refreshed.grep("QuotedOld", true, &[], &[], &canonical_project, 10);
         assert_eq!(old.total_matches, 0, "no stale content may remain");
+    }
+
+    #[test]
+    fn warm_reload_from_repository_subdirectory_counts_and_rereads_only_paths_under_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path().join("repo");
+        // The search root is one package of a larger repository.
+        let project = repo.join("packages").join("app");
+        let outside = repo.join("other").join("outside.rs");
+        let inside = project.join("inside.rs");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(outside.parent().unwrap()).expect("create sibling dir");
+        fs::write(&inside, "// SubdirOld\n").expect("write inside");
+        fs::write(&outside, "// OutsideOld\n").expect("write outside");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        init_quoting_git_repo(&repo);
+        let previous = run_git(&project, &["rev-parse", "HEAD"]).expect("previous head");
+        // One baseline for the budgeted warm lane, one for the unbudgeted refresh.
+        let mut budgeted = SearchIndex::build(&project);
+        budgeted.git_head = Some(previous.clone());
+        let mut unbudgeted = SearchIndex::build(&project);
+        unbudgeted.git_head = Some(previous.clone());
+
+        // Same size and the original mtime inside the root, so only the git
+        // diff can tell the refresh to reread it. The edit outside the root is
+        // an ordinary one.
+        let modified = fs::metadata(&inside)
+            .and_then(|metadata| metadata.modified())
+            .expect("original mtime");
+        fs::write(&inside, "// SubdirNew\n").expect("edit inside");
+        File::options()
+            .write(true)
+            .open(&inside)
+            .and_then(|file| file.set_modified(modified))
+            .expect("restore mtime");
+        fs::write(&outside, "// OutsideNew, a longer edit\n").expect("edit outside");
+        git_commit_all_for_test(&repo, "edit inside and outside the package");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+
+        assert_eq!(
+            git_diff_paths(&project, &previous, &current, Some(1)),
+            Some(HashSet::from([cached_path_under_root(
+                &project,
+                Path::new("inside.rs")
+            )
+            .expect("under root")])),
+            "only the change under the root is reported, relative to the root"
+        );
+
+        let assert_only_inside_is_indexed_and_fresh = |index: &SearchIndex, lane: &str| {
+            let indexed: Vec<_> = index
+                .path_to_id
+                .keys()
+                .filter(|path| !path.as_os_str().is_empty())
+                .cloned()
+                .collect();
+            assert_eq!(
+                indexed,
+                vec![canonical_project.join("inside.rs")],
+                "{lane}: nothing outside the root may enter the index"
+            );
+            let new = index.grep("SubdirNew", true, &[], &[], &canonical_project, 10);
+            assert_eq!(
+                new.total_matches, 1,
+                "{lane}: the edit under the root is searchable"
+            );
+            let old = index.grep("SubdirOld", true, &[], &[], &canonical_project, 10);
+            assert_eq!(old.total_matches, 0, "{lane}: no stale content may remain");
+            let outside = index.grep("Outside", true, &[], &[], &canonical_project, 10);
+            assert_eq!(
+                outside.total_matches, 0,
+                "{lane}: outside content stays out"
+            );
+        };
+        // A budget of one path is enough only when the outside edit is not
+        // counted.
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            budgeted,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current.clone()),
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(1),
+        )
+        .expect("the edit outside the root must not count against the warm budget");
+        assert_only_inside_is_indexed_and_fresh(&refreshed, "budgeted");
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            unbudgeted,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current),
+            cache_freshness::VerifyStrategy::StatFirst,
+            None,
+        )
+        .expect("unbudgeted refresh");
+        assert_only_inside_is_indexed_and_fresh(&refreshed, "unbudgeted");
     }
 
     #[test]
