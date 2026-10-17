@@ -12,6 +12,7 @@ let nextSession = 0;
 
 function fixture(open = true) {
   const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
+  const pending = new Set<unknown>();
   let opened = open;
   let creations = 0;
   let hold: Promise<void> | undefined;
@@ -21,8 +22,11 @@ function fixture(open = true) {
   const bridge = {
     send: async (command: string, params: Record<string, unknown>) => {
       calls.push({ command, params });
+      if (params.pending) pending.add(params.session_id);
       if (params.pending || params.clear_pending) await hold;
-      return { success: true, detached: false, text: "ok" };
+      if (params.clear_pending) pending.delete(params.session_id);
+      const detached = command === "bash" && pending.delete(params.session_id);
+      return { success: true, detached, text: "ok" };
     },
     toolCall: async (sessionID: string, name: string, args: Record<string, unknown>) =>
       bridge.send("tool_call", { session_id: sessionID, name, args }),
@@ -105,10 +109,10 @@ async function host(version: "V1" | "V2", pool: ReturnType<typeof fixture>["pool
   };
 }
 
-async function promptly(operation: Promise<unknown>) {
+async function promptly<T>(operation: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([
+    return await Promise.race([
       operation,
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error("model step waited for a bridge")), 200);
@@ -213,6 +217,79 @@ for (const version of ["V1", "V2"] as const) {
     }
     await drain();
     expect(f.calls[2].params).toEqual({ session_id: h.sessionID, pending: true });
+  });
+
+  test.each([
+    "admission",
+    "clear",
+  ])(`${version} next bash waits for its slow delivery clear with %s in flight and does not detach`, async (stage) => {
+    const f = fixture();
+    const h = await host(version, f.pool);
+    if (stage === "admission") f.block();
+    await h.admit();
+    await drain();
+    if (stage === "clear") f.block();
+    let tool: ReturnType<typeof h.tool> | undefined;
+    try {
+      await promptly(h.step());
+      tool = h.tool();
+      await drain();
+      expect(f.calls.map(({ command }) => command)).toEqual(
+        stage === "admission" ? ["bash_wait_detach"] : ["bash_wait_detach", "bash_wait_detach"],
+      );
+    } finally {
+      f.release();
+    }
+    expect((await tool)?.detached).toBe(false);
+    expect(f.calls.map(({ command }) => command)).toEqual([
+      "bash_wait_detach",
+      "bash_wait_detach",
+      "bash",
+    ]);
+  });
+
+  test(`${version} next bash waits only for its bridge while another project's admission hangs`, async () => {
+    const f = fixture();
+    const h = await host(version, f.pool);
+    f.openSecond();
+    await h.admit();
+    await drain();
+    expect(f.secondCalls()).toBe(1);
+    await promptly(h.step());
+    const result = await promptly(h.tool());
+    expect(result.detached).toBe(false);
+    expect(f.calls.map(({ params }) => params)).toEqual([
+      { session_id: h.sessionID, pending: true },
+      { session_id: h.sessionID, clear_pending: true },
+      { command: "echo ready", block_to_completion: true, session_id: h.sessionID },
+    ]);
+  });
+
+  test(`${version} next bash bounds its wait for a hung delivery clear`, async () => {
+    const f = fixture();
+    const h = await host(version, f.pool);
+    await h.admit();
+    await drain();
+    f.block();
+    await promptly(h.step());
+    const setTimer = globalThis.setTimeout;
+    const delays: Array<number | undefined> = [];
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+      delays.push(delay);
+      // Exercise the real deadline without making the suite wait 30 seconds.
+      return setTimer(callback, delay === 30_000 ? 0 : delay, ...args);
+    });
+    try {
+      await promptly(
+        expect(h.tool()).rejects.toThrow("Timed out waiting for bash wait detach delivery clear"),
+      );
+      expect(delays).toContain(30_000);
+      expect(f.calls.some(({ command }) => command === "bash")).toBe(false);
+    } finally {
+      timer.mockRestore();
+      f.release();
+    }
+    await drain();
   });
 
   test(`${version} delivery clears cold pending without opening a bridge`, async () => {
