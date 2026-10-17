@@ -16886,7 +16886,12 @@ mod tests {
                 );
                 let task = registry.task_for_session(&task_id, "session").unwrap();
                 assert_eq!(wait_for_file(&task.paths.exit).trim(), "0");
-                let stdout = fs::read_to_string(&task.paths.stdout).unwrap();
+                let stdout = String::from_utf8(
+                    registry
+                        .read_artifact(&task_id, "session", TaskArtifact::Stdout)
+                        .unwrap(),
+                )
+                .unwrap();
                 let environment = stdout
                     .lines()
                     .filter_map(|line| line.split_once('='))

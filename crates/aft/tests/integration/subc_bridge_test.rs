@@ -11474,7 +11474,11 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
     )
     .await;
     let first_party = read_frame_timeout(&mut stream, "first-party principal bash").await;
-    assert!(!tool_result_is_error(&first_party));
+    assert!(
+        !tool_result_is_error(&first_party),
+        "first-party bash failed: {}",
+        tool_result_text(&first_party)
+    );
 
     bind_untrusted_elicitation_route(&mut stream, 2, 201, &root1).await;
     send_tool_call(
@@ -11494,11 +11498,30 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
     )
     .await;
     let untrusted = read_frame_timeout(&mut stream, "untrusted principal bash").await;
-    assert!(!tool_result_is_error(&untrusted));
+    if cfg!(windows) {
+        // Permission approval cannot waive strict confinement for an untrusted route.
+        assert!(tool_result_is_error(&untrusted));
+        assert_eq!(
+            tool_result_text(&untrusted),
+            "sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"
+        );
+    } else {
+        assert!(
+            !tool_result_is_error(&untrusted),
+            "untrusted bash failed: {}",
+            tool_result_text(&untrusted)
+        );
+    }
 
     let observations = sandbox_spawn_test_observations(&seam_root);
     clear_sandbox_spawn_test_seam(&seam_root);
-    assert_eq!(observations.len(), 2, "observations: {observations:?}");
+    // Windows refuses strict before entering the spawn resolver, so only the
+    // first-party call reaches it. Both principals reach it on macOS/Linux.
+    assert_eq!(
+        observations.len(),
+        if cfg!(windows) { 1 } else { 2 },
+        "observations: {observations:?}"
+    );
     assert!(observations
         .iter()
         .all(|observation| observation.task_kind == SandboxTaskKind::BashForeground));
@@ -11508,7 +11531,6 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
         observations[0].requested_tier,
         RequestedSandboxTier::Disabled
     );
-    assert_eq!(observations[1].requested_tier, RequestedSandboxTier::Native);
 
     match &observations[0].principal {
         AuthenticatedPrincipal::RouteBind {
@@ -11530,25 +11552,31 @@ async fn drive_bash_resolver_principal_daemon(input: FakeDaemonInput) {
         }
         principal => panic!("expected bound first-party principal, got {principal:?}"),
     }
-    match &observations[1].principal {
-        AuthenticatedPrincipal::RouteBind {
-            trust,
-            route_channel,
-            route_epoch,
-            project_root,
-            harness,
-            session_id,
-            principal_id,
-        } => {
-            assert_eq!(*trust, PrincipalTrust::Untrusted);
-            assert_eq!(*route_channel, 2);
-            assert_eq!(*route_epoch, 1);
-            assert_eq!(project_root, &root1);
-            assert_eq!(harness, "runner");
-            assert_eq!(session_id, "elicitation-session-2");
-            assert_eq!(principal_id.as_deref(), Some("reserved:subc-mcp"));
+    if let Some(untrusted_observation) = observations.get(1) {
+        assert_eq!(
+            untrusted_observation.requested_tier,
+            RequestedSandboxTier::Native
+        );
+        match &untrusted_observation.principal {
+            AuthenticatedPrincipal::RouteBind {
+                trust,
+                route_channel,
+                route_epoch,
+                project_root,
+                harness,
+                session_id,
+                principal_id,
+            } => {
+                assert_eq!(*trust, PrincipalTrust::Untrusted);
+                assert_eq!(*route_channel, 2);
+                assert_eq!(*route_epoch, 1);
+                assert_eq!(project_root, &root1);
+                assert_eq!(harness, "runner");
+                assert_eq!(session_id, "elicitation-session-2");
+                assert_eq!(principal_id.as_deref(), Some("reserved:subc-mcp"));
+            }
+            principal => panic!("expected bound untrusted principal, got {principal:?}"),
         }
-        principal => panic!("expected bound untrusted principal, got {principal:?}"),
     }
 
     send_connection_goodbye(&mut stream).await;

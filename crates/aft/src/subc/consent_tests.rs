@@ -1311,9 +1311,24 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
     ] {
         ctx.update_config(|config| config.sandbox.profile.worker = mode);
         with_worker_jail(true, || {
-            // The worker profile is independent of the head profile;
-            // where it cannot be built the shell is refused by name.
+            // The worker profile is independent of the head profile. Windows
+            // relaxed is explicitly unenforced; strict must still fail closed.
             let native = resolve(RequestedSandboxTier::Native);
+            #[cfg(windows)]
+            {
+                assert!(!native.is_native_launcher(), "{native:?}");
+                match mode {
+                    crate::config::SandboxMode::Relaxed => {
+                        assert_eq!(native, SpawnPlan::RelaxedUnenforced);
+                    }
+                    crate::config::SandboxMode::Strict => {
+                        assert_eq!(native.refusal_code(), Some("sandbox_unavailable"));
+                    }
+                    crate::config::SandboxMode::Off => unreachable!(),
+                }
+            }
+            // macOS/Linux workers must use confinement or refuse the shell.
+            #[cfg(not(windows))]
             assert!(
                 native.is_native_launcher() || native.refusal_code() == Some("sandbox_unavailable"),
                 "{native:?}"
