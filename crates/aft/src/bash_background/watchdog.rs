@@ -311,6 +311,9 @@ fn retire_terminal_task(
     if registry.retry_terminal_persist(task).is_err() {
         return;
     }
+    if !registry.cleanup_terminal_task_temp(task).unwrap_or(false) {
+        return;
+    }
     registry.record_completion_pass_cause(&task.task_id, pass_cause);
     awaiting_reader.remove(&task.task_id);
     registry.retire_watchdog_task(&task.task_id);

@@ -1300,6 +1300,23 @@ pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     read_task_file(&mut file, path)
 }
 
+/// Terminal status describes the leader's outcome, not the lifetime of its
+/// descendants. Require the process group to have disappeared before deleting
+/// scratch space; a cached `live_descendants` sample can already be out of date.
+pub(crate) fn task_temp_quiescent(metadata: &PersistedTask) -> bool {
+    if !metadata.is_terminal() {
+        return false;
+    }
+    #[cfg(unix)]
+    if let Some(pgid) = metadata.pgid {
+        return pgid > 0
+            && unsafe { libc::kill(-pgid, 0) } == -1
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    // A spawn that failed before releasing a child has no process group.
+    metadata.child_pid.is_none() && metadata.pgid.is_none()
+}
+
 pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
     let name = match task.paths.layout {
         TaskLayout::Directory => OsString::from(METADATA_FILE),
@@ -1663,6 +1680,12 @@ fn validate_and_cleanup_task_tombstone_metadata(task: &PinnedDir, task_id: &str)
         ));
     }
     if let Some(temp_dir) = &metadata.sandbox_temp_dir {
+        if !task_temp_quiescent(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "task scratch still in use",
+            ));
+        }
         crate::sandbox_spawn::cleanup_task_temp_dir(temp_dir)?;
     }
     Ok(())
@@ -1837,6 +1860,12 @@ fn remove_directory_task_with_io_cleanup(
         // before removing the metadata that records its ownership.
         if let Ok(metadata) = read_task_at(task) {
             if let Some(temp_dir) = &metadata.sandbox_temp_dir {
+                if !task_temp_quiescent(&metadata) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "task scratch still in use",
+                    ));
+                }
                 crate::sandbox_spawn::cleanup_task_temp_dir(temp_dir)?;
             }
         }
@@ -3779,6 +3808,16 @@ mod tests {
         let temp = crate::sandbox_spawn::create_task_temp_dir(task.dirs.io.path()).unwrap();
         fs::write(temp.join("scratch"), "payload").unwrap();
         metadata.sandbox_temp_dir = Some(temp.clone());
+        write_task_at(&task, &metadata).unwrap();
+        assert_eq!(
+            delete_resolved_task(&task).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            temp.exists(),
+            "an unfinished task must keep its scratch directory"
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
         write_task_at(&task, &metadata).unwrap();
         delete_resolved_task(&task).unwrap();
         assert!(!temp.exists());

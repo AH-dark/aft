@@ -2109,6 +2109,9 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         emit_frame: bool,
     ) -> Result<(), String> {
+        if let Err(error) = self.cleanup_terminal_task_temp(task) {
+            crate::slog_warn!("failed to clean task scratch for {}: {error}", task.task_id);
+        }
         let (metadata, buffer) = {
             let state = task
                 .lock_state()
@@ -3327,6 +3330,7 @@ impl BgTaskRegistry {
                     metadata.notify_on_completion = true;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
+                    let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
                     self.record_live_delivery_session(&metadata.session_id);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
@@ -3351,6 +3355,7 @@ impl BgTaskRegistry {
                 Some("spawn aborted".to_string()),
             );
             let _ = self.persist_task(&paths, &metadata);
+            let _ = self.insert_rehydrated_task(metadata, paths.clone(), true);
             return Err(format!(
                 "failed to persist background task metadata: {error}"
             ));
@@ -3647,6 +3652,7 @@ impl BgTaskRegistry {
         }
         self.dual_write_task(&paths, &metadata);
 
+        let mut spawned_pgid = None;
         let runtime = match spawn_pty_for_command(
             &spawn_plan,
             &task_id,
@@ -3661,14 +3667,17 @@ impl BgTaskRegistry {
             cols,
             self.inner.wake_tx.clone(),
             &mut io_handles,
+            &mut spawned_pgid,
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
                 crate::slog_warn!("failed to spawn PTY background bash task {task_id}: {error}");
                 if super::spawn_receipt_committed() {
                     metadata.notify_on_completion = true;
+                    metadata.pgid = spawned_pgid;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
+                    let _ = self.insert_rehydrated_task(metadata.clone(), paths.clone(), true);
                     self.record_live_delivery_session(&metadata.session_id);
                     self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
@@ -6676,7 +6685,10 @@ impl BgTaskRegistry {
                 (Some(_), None) => true,
                 (None, _) => false,
             };
-            if !delivered_terminal || !expired {
+            if !delivered_terminal
+                || !expired
+                || !self.cleanup_terminal_task_temp(&task).unwrap_or(false)
+            {
                 self.inner
                     .cleanup_queue
                     .lock()
@@ -7508,6 +7520,7 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn retry_terminal_persist(&self, task: &BgTask) -> std::io::Result<()> {
+        self.cleanup_terminal_task_temp(task)?;
         if !task.terminal_persist_dirty.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -7520,6 +7533,30 @@ impl BgTaskRegistry {
             task.terminal_persist_dirty.store(false, Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    /// Keep terminal tasks on the watchdog until scratch cleanup is safe and
+    /// successful. Holding the task lock makes competing exit/kill observers
+    /// share one cleanup, including the no-scratch remote-task case.
+    pub(crate) fn cleanup_terminal_task_temp(&self, task: &BgTask) -> std::io::Result<bool> {
+        let mut db = DeferredDbWrites::new(self, task);
+        let mut state = task
+            .lock_state()
+            .map_err(|_| std::io::Error::other("task lock poisoned"))?;
+        let Some(path) = state.metadata.sandbox_temp_dir.as_ref() else {
+            return Ok(true);
+        };
+        if state.kill_in_flight || !super::persistence::task_temp_quiescent(&state.metadata) {
+            return Ok(false);
+        }
+        crate::sandbox_spawn::cleanup_task_temp_dir(path)?;
+        state.metadata.sandbox_temp_dir = None;
+        // A crash before this write is harmless: deletion is idempotent, and
+        // replay can retry from the old record without touching another task.
+        task.terminal_persist_dirty.store(true, Ordering::SeqCst);
+        self.persist_task_locked(task, &state.metadata, &mut db)?;
+        task.terminal_persist_dirty.store(false, Ordering::SeqCst);
+        Ok(true)
     }
 
     pub(crate) fn running_tasks(&self) -> Vec<Arc<BgTask>> {
@@ -7718,7 +7755,7 @@ impl BgTaskRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(task_id.clone());
-        if task.is_running() {
+        if task.is_running() || !self.cleanup_terminal_task_temp(&task).unwrap_or(false) {
             self.inner
                 .watchdog_tasks
                 .lock()
@@ -12862,6 +12899,86 @@ mod tests {
         assert!(first.output_preview.starts_with("compressed "));
         assert_eq!(second.output_preview, first.output_preview);
         assert_eq!(listed[0].output_preview, first.output_preview);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_terminal_temp_cleanup_waits_for_process_group() {
+        use std::os::unix::process::CommandExt;
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.sandbox_temp_dir = Some(scratch.clone());
+            state.metadata.mark_running(child.id(), child.id() as i32);
+            state.metadata.live_descendants = Some(Vec::new());
+        }
+        registry.retry_terminal_persist(&task).unwrap();
+        assert!(scratch.exists(), "running task lost its scratch directory");
+        task.lock_state()
+            .unwrap()
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        registry.post_terminal_transition(&task, false).unwrap();
+        assert!(
+            scratch.exists(),
+            "terminal leader still has a live process group"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        registry.retry_terminal_persist(&task).unwrap();
+        assert!(
+            !scratch.exists(),
+            "finished task scratch directory was leaked"
+        );
+        assert!(!scratch.with_extension("owner").exists());
+        registry.retry_terminal_persist(&task).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_terminal_temp_cleanup_covers_replay_modes_and_outcomes() {
+        for mode in [BgMode::Pipes, BgMode::Pty] {
+            for status in [
+                BgTaskStatus::Completed,
+                BgTaskStatus::Failed,
+                BgTaskStatus::TimedOut,
+                BgTaskStatus::Killed,
+            ] {
+                let registry = BgTaskRegistry::default();
+                let dir = tempfile::tempdir().unwrap();
+                let paths = task_paths(dir.path(), "session", &random_slug()).unwrap();
+                fs::create_dir_all(&paths.io_dir).unwrap();
+                let scratch = crate::sandbox_spawn::create_task_temp_dir(&paths.io_dir).unwrap();
+                let mut metadata = PersistedTask::starting(
+                    paths.task_id.clone(),
+                    "session".into(),
+                    "true".into(),
+                    dir.path().into(),
+                    None,
+                    None,
+                    false,
+                    false,
+                );
+                metadata.mode = mode.clone();
+                metadata.mark_terminal(status, None, None);
+                metadata.sandbox_temp_dir = Some(scratch.clone());
+                write_task(&paths.json, &metadata).unwrap();
+                registry
+                    .rehydrate_resolved_task(metadata, paths.clone(), "session")
+                    .unwrap();
+                assert!(!scratch.exists(), "replay leaked {mode:?} scratch");
+                assert!(read_task(&paths.json).unwrap().sandbox_temp_dir.is_none());
+            }
+        }
     }
 
     #[test]

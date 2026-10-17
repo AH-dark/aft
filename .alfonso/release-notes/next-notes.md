@@ -1,5 +1,6 @@
 # Notes for the next release
 
+- Disk retention: finished bash tasks release scratch directories once their process groups exit, older terminal scratch folders are swept, and vanished-checkout views drain in bounded consecutive passes with a visible backlog count.
 - 0.60.1: Worker file tools can read Cargo registry sources and Rust toolchains without permission cards; writes, credential/cache paths, permanent deny floors, and shell confinement are unchanged.
 - Permissions: grep, outline, zoom, callgraph, AST search, inspect and OpenCode glob now recognize exact session-owned bash output without OpenCode's external-directory prompts or Pi's root-restriction denials; directory-wide searches, other sessions' output and mutations stay protected.
 - Daemon health: scheduler contention now preserves the last measured census and timestamp, marks it stale with an increasing age, and reports unmeasured startup metrics as null instead of empty/zero/available. The health sentinel treats stale or unknown census data as an instrument failure without losing watcher baselines or disabling live liveness checks.

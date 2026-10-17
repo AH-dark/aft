@@ -233,8 +233,27 @@ fn sweep_stale(
                 owner.read_to_end(&mut bytes)?;
                 let io_path = PathBuf::from(std::ffi::OsString::from_vec(bytes));
                 // A crash can leave the newly created owner file empty.
-                !io_path.is_absolute()
-                    || matches!(fs::symlink_metadata(io_path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                if !io_path.is_absolute()
+                    || matches!(fs::symlink_metadata(&io_path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+                {
+                    true
+                } else {
+                    // Retained task records keep their IO bundle for days after exit.
+                    // Use the validated task-record reader, and keep unknown
+                    // records or terminal leaders with surviving descendants.
+                    let record = io_path
+                        .parent()
+                        .map(|task| task.join("control/metadata.json"));
+                    record
+                        .and_then(|path| crate::bash_background::persistence::read_task(&path).ok())
+                        .is_some_and(|metadata| {
+                            metadata.sandbox_temp_dir.as_deref()
+                                == Some(parent.path.join(task).as_path())
+                                && crate::bash_background::persistence::task_temp_quiescent(
+                                    &metadata,
+                                )
+                        })
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => true,
             Err(_) => false,
@@ -285,6 +304,73 @@ mod tests {
             .remove(second.file_name().unwrap().to_str().unwrap())
             .unwrap();
         assert_eq!(fs::read_dir(&parent.path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sandbox_task_temp_sweep_reclaims_terminal_records_from_older_cards() {
+        use crate::bash_background::{persistence, BgTaskStatus};
+        let root = tempfile::tempdir().unwrap();
+        let parent = Parent::open(&root.path().join("aft-w")).unwrap();
+        let mut kept = Vec::new();
+        for (number, status) in [
+            BgTaskStatus::Completed,
+            BgTaskStatus::Failed,
+            BgTaskStatus::TimedOut,
+            BgTaskStatus::Killed,
+            BgTaskStatus::Running,
+            BgTaskStatus::Completed,
+            BgTaskStatus::Completed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let paths = persistence::create_task_layout(
+                root.path(),
+                "older-card",
+                &format!("bash-{number:016x}"),
+            )
+            .unwrap()
+            .paths;
+            fs::create_dir_all(&paths.io_dir).unwrap();
+            let path = parent.allocate(&paths.io_dir).unwrap();
+            let mut metadata = persistence::PersistedTask::starting(
+                paths.task_id.clone(),
+                "older-card".into(),
+                "true".into(),
+                root.path().into(),
+                None,
+                None,
+                false,
+                false,
+            );
+            metadata.status = status;
+            metadata.sandbox_temp_dir = Some(path.clone());
+            if number == 5 {
+                metadata.child_pid = Some(std::process::id());
+                metadata.pgid = Some(unsafe { libc::getpgrp() });
+                metadata.live_descendants = Some(Vec::new());
+            }
+            persistence::write_task(&paths.json, &metadata).unwrap();
+            if number == 6 {
+                fs::write(&paths.json, b"unreadable record").unwrap();
+            }
+            kept.push((path, number < 4));
+        }
+        let mut cursor = None;
+        sweep_stale(
+            &parent,
+            &mut cursor,
+            SystemTime::now() + STALE_AFTER + Duration::from_secs(1),
+        )
+        .unwrap();
+        for (path, terminal) in kept {
+            assert_eq!(
+                path.exists(),
+                !terminal,
+                "terminal={terminal}: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
