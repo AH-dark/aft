@@ -86,6 +86,39 @@ fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
     }
 }
 
+// Cached sidecar identities outlive unlinks while a database remains open.
+// Include birth time where available to distinguish recycled inodes from live
+// SQLite aliases. Unlike ctime, birth time survives renames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LiveFileIdentity {
+    file: FileIdentity,
+    created: Option<std::time::SystemTime>,
+}
+
+impl LiveFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            file: metadata_identity(metadata)?,
+            // Filesystems without birth times retain inode-only protection.
+            created: metadata.created().ok(),
+        })
+    }
+
+    fn of(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            #[cfg(test)]
+            stat_probe::record(path);
+            Self::from_metadata(&std::fs::metadata(path).ok()?)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+}
+
 pub(crate) fn candidate_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     #[cfg(test)]
     stat_probe::record(path);
@@ -152,7 +185,7 @@ impl Opener {
 #[derive(Debug, Default)]
 struct OpenDatabase {
     openers: Vec<Opener>,
-    identities: HashSet<FileIdentity>,
+    identities: HashSet<LiveFileIdentity>,
 }
 
 fn open_databases() -> &'static Mutex<BTreeMap<PathBuf, OpenDatabase>> {
@@ -163,7 +196,7 @@ fn open_databases() -> &'static Mutex<BTreeMap<PathBuf, OpenDatabase>> {
 #[derive(Default)]
 struct LiveFiles {
     names: HashMap<PathBuf, usize>,
-    identities: HashMap<FileIdentity, usize>,
+    identities: HashMap<LiveFileIdentity, usize>,
 }
 
 fn live_files() -> &'static RwLock<LiveFiles> {
@@ -187,7 +220,7 @@ fn database_files(key: &Path) -> [PathBuf; 4] {
 
 fn retain_identities(
     database: &mut OpenDatabase,
-    identities: impl IntoIterator<Item = FileIdentity>,
+    identities: impl IntoIterator<Item = LiveFileIdentity>,
 ) {
     let mut files = live_files().write().unwrap_or_else(|p| p.into_inner());
     for identity in identities {
@@ -386,11 +419,11 @@ impl std::ops::DerefMut for IdentityConnection {
 pub(crate) fn note_open(path: &Path, store: SqliteStore) -> PathBuf {
     let key = registry_key(path);
     let paths = database_files(&key);
-    let identities = paths.each_ref().map(|path| identity_of(path));
+    let identities = paths.each_ref().map(|path| LiveFileIdentity::of(path));
     let opener = Opener {
         store: store.label(),
         thread: thread_label(),
-        identity: identities[0],
+        identity: identities[0].map(|identity| identity.file),
     };
     let hazard = {
         let mut databases = open_databases()
@@ -536,7 +569,7 @@ pub(crate) fn is_live_sqlite_file_with_metadata(
     let Some(metadata) = metadata else {
         return false;
     };
-    let Some(identity) = metadata_identity(metadata) else {
+    let Some(identity) = LiveFileIdentity::from_metadata(metadata) else {
         return false;
     };
     if live_files()
@@ -578,7 +611,7 @@ fn refresh_sidecar_identities() {
         .map(|key| {
             let identities = database_files(&key)[1..]
                 .iter()
-                .filter_map(|path| identity_of(path))
+                .filter_map(|path| LiveFileIdentity::of(path))
                 .collect::<Vec<_>>();
             (key, identities)
         })
@@ -693,6 +726,38 @@ mod tests {
     use rusqlite::Connection;
 
     #[cfg(unix)]
+    #[test]
+    fn reused_sidecar_inode_does_not_block_source_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("registered.cache");
+        let source = dir.path().join("source.rs");
+        std::fs::write(&database, "database").unwrap();
+        std::fs::write(&source, "source").unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let Ok(created) = metadata.created() else {
+            // Without birth times the registry conservatively retains its
+            // device/inode protection, including possible reuse false positives.
+            return;
+        };
+        let key = note_open(&database, SqliteStore::AftDb);
+        // Model an unlinked sidecar's recycled inode without relying on the
+        // filesystem allocator to reuse a particular inode during the test.
+        let old = LiveFileIdentity {
+            file: metadata_identity(&metadata).unwrap(),
+            created: Some(created - std::time::Duration::from_secs(1)),
+        };
+        {
+            let mut databases = open_databases().lock().unwrap();
+            retain_identities(databases.get_mut(&key).unwrap(), [old]);
+        }
+        let result = crate::cache_freshness::collect(&source);
+        note_close(&key, SqliteStore::AftDb);
+        assert!(
+            result.is_ok(),
+            "recycled sidecar inode denied source: {result:?}"
+        );
+    }
+
     #[test]
     fn sidecars_created_after_registration_are_live_by_name() {
         let dir = tempfile::tempdir().unwrap();
