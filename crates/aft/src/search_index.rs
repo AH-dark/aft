@@ -12020,6 +12020,64 @@ mod warm_reload_verification_tests {
         assert!(index.delta.superseded_paths.contains(&stored_key));
     }
 
+    /// Windows runners can hand out 8.3 short temp paths (`C:\Users\RUNNER~1`).
+    /// Loading from such a root resolves it to the long name, so removing a
+    /// file by its short spelling must still reach the long-name cached key.
+    #[test]
+    #[cfg(windows)]
+    fn remove_file_through_short_name_root_supersedes_the_cached_record() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Longer than eight characters, so the volume assigns it a short name
+        // when 8.3 name generation is enabled.
+        let real_root = dir.path().join("checkout_with_long_name");
+        fs::create_dir_all(&real_root).unwrap();
+        fs::write(real_root.join("cached.txt"), "ShortNameRemovalNeedle\n").unwrap();
+
+        let wide: Vec<u16> = real_root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = vec![0u16; 1024];
+        // SAFETY: `wide` is NUL-terminated and `buffer` holds `buffer.len()` units.
+        let written = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                wide.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        } as usize;
+        assert!(
+            written > 0 && written < buffer.len(),
+            "GetShortPathNameW failed"
+        );
+        let short_root = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written]));
+        if short_root.file_name() == real_root.file_name() {
+            eprintln!(
+                "skipping: 8.3 short names are disabled on the volume holding {}",
+                real_root.display()
+            );
+            return;
+        }
+
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&real_root);
+        assert!(built.write_to_disk(cache.path(), None));
+
+        let mut index = SearchIndex::read_from_disk(cache.path(), &short_root).unwrap();
+        assert!(!index.project_root.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(index.project_root.file_name(), real_root.file_name());
+        let stored_key = index.project_root.join("cached.txt");
+        let cached_id = index.path_to_id[&stored_key];
+
+        index.remove_file(&short_root.join("cached.txt"));
+
+        assert!(!index.path_to_id.contains_key(&stored_key));
+        assert!(index.delta.superseded.contains(&cached_id));
+    }
+
     #[test]
     #[cfg(any(unix, windows))]
     fn warm_refresh_keeps_cached_and_new_files_visible_through_root_alias() {
