@@ -4677,23 +4677,29 @@ mod windows_pty_environment_tests {
 
     #[test]
     fn windows_pty_inherits_process_search_path_not_registry_environment() {
-        let dir = tempfile::tempdir().unwrap();
-        let (command, _) = pty_command_for_plan(
-            &SpawnPlan::Unsandboxed,
-            OsStr::new("pwsh.exe"),
-            &[],
-            &dir.path().join("metadata.json"),
-            dir.path(),
-            &HashMap::new(),
-        )
-        .unwrap();
-        for key in ["PATH", "PATHEXT", "TEMP", "USERPROFILE"] {
-            assert_eq!(
-                command.get_env(key),
-                std::env::var_os(key).as_deref(),
-                "{key}"
-            );
-        }
+        environment_tests::with_daemon_environment(
+            "sandbox_spawn::windows_pty_environment_tests::windows_pty_inherits_process_search_path_not_registry_environment",
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let (command, _) = pty_command_for_plan(
+                    &SpawnPlan::Unsandboxed,
+                    OsStr::new("pwsh.exe"),
+                    &[],
+                    &dir.path().join("metadata.json"),
+                    dir.path(),
+                    &HashMap::new(),
+                )
+                .unwrap();
+                for key in ["PATH", "PATHEXT", "TEMP", "USERPROFILE"] {
+                    assert_eq!(
+                        command.get_env(key),
+                        std::env::var_os(key).as_deref(),
+                        "{key}"
+                    );
+                }
+                assert_eq!(command.get_env("SUBC_TEST_CREDENTIAL"), None);
+            },
+        );
     }
 
     #[test]
@@ -4734,13 +4740,24 @@ pub(crate) mod environment_tests {
             check();
             return;
         }
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", test, "--nocapture"])
             .env(REENTRY, test)
             .env("AWS_SECRET_ACCESS_KEY", "daemon-secret")
-            .env("TERM", "aft-inherited-term")
-            .output()
-            .unwrap();
+            .env("SUBC_TEST_CREDENTIAL", "daemon-subc-secret")
+            .env("TERM", "aft-inherited-term");
+        #[cfg(windows)]
+        let process_bin = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        {
+            // A process-only directory makes registry-based PATH inheritance
+            // observably different without changing the test runner's environment.
+            let mut paths = vec![process_bin.path().to_path_buf()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            command.env("PATH", std::env::join_paths(paths).unwrap());
+        }
+        let output = command.output().unwrap();
         assert!(
             output.status.success(),
             "environment regression subprocess failed:\n{}\n{}",
@@ -4766,6 +4783,10 @@ pub(crate) mod environment_tests {
             !environment.contains_key("AWS_SECRET_ACCESS_KEY"),
             "daemon secret leaked into relaxed-unenforced child"
         );
+        assert!(
+            !environment.contains_key("SUBC_TEST_CREDENTIAL"),
+            "daemon subc credential leaked into child"
+        );
         let path = environment.get("PATH").expect("child PATH");
         let expected_path = crate::effective_path::effective_path().to_str().unwrap();
         // PowerShell prepends its installation directory to PATH and may append
@@ -4782,7 +4803,18 @@ pub(crate) mod environment_tests {
         for (key, value) in request_environment() {
             assert_eq!(environment.get(&key), Some(&value), "lost child key {key}");
         }
-        for key in ["HOME", "USERPROFILE", "SYSTEMROOT", "COMSPEC", "PATHEXT"] {
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
             if let Some((_, value)) = std::env::vars().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
                 if through_shell && key == "PATHEXT" {
                     let actual = environment.get(key).expect("child PATHEXT");

@@ -13,3 +13,10 @@
 - Callgraph stores sweep orphaned build temporaries (age-based, both layouts).
 - OpenCode 2 now requires 2.0.29 or newer. Permission prompts run in-process through OpenCode's own permission check, including on standalone hosts and hosts without a readable server password, and edit prompts keep the built-in diff view. The `opencode.server_url` and `opencode.server_password_env` settings are removed; `npx @cortexkit/aft doctor --fix` deletes them.
 - File watching no longer hangs on a project whose build folder is a link to an unresponsive or disconnected drive. Linked folders and folders on other drives are left out of watching without being opened.
+
+## Sandbox profiles
+
+- Replace the single stamped-worker shell jail with `sandbox.profile` role choices: `off`, `relaxed`, and `strict`. Stamped workers default to `relaxed`; heads, standalone and unstamped sessions default to `off`. Projects may only harden a profile; untrusted/MCP/unverified routes are always strict.
+- macOS relaxed shells allow ordinary caches, sockets, browsers, toolchains and shared compile servers while protecting credentials, CortexKit private data, known sibling checkouts, shell/Git configuration and hook governance. Strict keeps the existing jail and sccache block. Short worker temp paths, GitHub CLI access checks, commit co-author attribution and child-environment stripping remain in place.
+- Linux relaxed reports every deny as unenforced because Landlock cannot subtract paths from default-allow grants. Windows relaxed runs with an unenforced warning and a stripped child environment that preserves the process PATH and standard user variables; Windows strict refuses those launches. Seatbelt still cannot execute setuid `ps`/`top`; use `pgrep`/`pkill`, or select `off` when `ps` is required.
+- Retire `sandbox.enabled` through the existing in-memory and `doctor --fix` JSONC migration: `true` maps to strict for both roles, `false` maps to relaxed worker/off head, and explicit canonical role values win. An absent setting uses the same new defaults; heads that explicitly enabled the old jail remain confined.
