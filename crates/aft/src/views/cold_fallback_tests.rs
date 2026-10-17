@@ -159,16 +159,21 @@ fn views_newly_excluded_storage_members_are_not_reused() {
     assert_eq!(probe.paths(), vec![root.join("file_0.ts")]);
 }
 
+// Windows cannot compare file identities here and refuses known SQLite names, not this `.rs` hard-link alias.
+#[cfg(unix)]
 #[test]
 fn views_live_sqlite_hard_link_is_skipped_before_read() {
     assert_live_sqlite_hard_link_is_skipped(&[]);
 }
 
+// Windows cannot compare file identities here and refuses known SQLite names, not this `.rs` hard-link alias.
+#[cfg(unix)]
 #[test]
 fn views_live_sqlite_hard_link_is_skipped_before_reuse() {
     assert_live_sqlite_hard_link_is_skipped(&["file_0.ts".to_string()]);
 }
 
+#[cfg(unix)]
 fn assert_live_sqlite_hard_link_is_skipped(changed: &[String]) {
     let project = repository(1);
     let root = project.path().canonicalize().unwrap();

@@ -5779,11 +5779,12 @@ pub(crate) fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
     crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(|entry| {
-        if crate::project_content::is_excluded(entry.path()) {
+        let file_type = entry.file_type();
+        if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref()) {
             return false;
         }
         let name = entry.file_name().to_string_lossy();
-        if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+        if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
             return !matches!(
                 name.as_ref(),
                 "node_modules"

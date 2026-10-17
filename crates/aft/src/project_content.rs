@@ -37,7 +37,14 @@ pub(crate) fn register_storage_root(path: &Path) {
 /// Walkers use the guarded readers' admission check to skip known live-file
 /// aliases before scheduling source reads or reusing cached entries.
 pub(crate) fn is_excluded(path: &Path) -> bool {
-    admit(path).is_err()
+    admit(path, None).is_err()
+}
+
+pub(crate) fn is_excluded_with_file_type(
+    path: &Path,
+    file_type: Option<&std::fs::FileType>,
+) -> bool {
+    admit(path, file_type).is_err()
 }
 
 /// Watcher events can name vanished directories. A SQLite suffix only excludes
@@ -83,9 +90,15 @@ fn has_sqlite_suffix(path: &Path) -> bool {
     })
 }
 
-fn is_excluded_file_with_metadata(path: &Path, metadata: Option<&std::fs::Metadata>) -> bool {
+fn is_excluded_file_with_metadata(
+    path: &Path,
+    file_type: Option<&std::fs::FileType>,
+    metadata: Option<&std::fs::Metadata>,
+) -> bool {
     crate::os_metadata::is_os_metadata_path(path)
-        || has_sqlite_suffix(path) && !metadata.is_some_and(std::fs::Metadata::is_dir)
+        || has_sqlite_suffix(path)
+            && !file_type.is_some_and(std::fs::FileType::is_dir)
+            && !metadata.is_some_and(std::fs::Metadata::is_dir)
         || crate::db::file_identity::is_registered_file_path(path)
 }
 
@@ -111,7 +124,7 @@ pub(crate) fn read_bounded(
             ));
         }
     } else {
-        admit(path)?;
+        admit(path, None)?;
     }
     #[cfg(test)]
     record_open(path);
@@ -122,7 +135,7 @@ pub(crate) fn read_bounded(
 /// view work can hold paths admitted before storage was configured.
 pub(crate) fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     let path = path.as_ref();
-    admit(path)?;
+    admit(path, None)?;
     #[cfg(test)]
     record_open(path);
     std::fs::read(path)
@@ -135,16 +148,23 @@ pub(crate) fn read_to_string(path: impl AsRef<Path>) -> std::io::Result<String> 
 
 pub(crate) fn open(path: impl AsRef<Path>) -> std::io::Result<std::fs::File> {
     let path = path.as_ref();
-    admit(path)?;
+    admit(path, None)?;
     #[cfg(test)]
     record_open(path);
     std::fs::File::open(path)
 }
 
-fn admit(path: &Path) -> std::io::Result<()> {
-    let metadata = crate::db::file_identity::candidate_metadata(path).ok();
-    if is_excluded_file_with_metadata(path, metadata.as_ref()) || is_storage_path(path) {
+fn admit(path: &Path, file_type: Option<&std::fs::FileType>) -> std::io::Result<()> {
+    let known_directory = file_type.is_some_and(std::fs::FileType::is_dir);
+    let metadata = (!known_directory)
+        .then(|| crate::db::file_identity::candidate_metadata(path).ok())
+        .flatten();
+    if is_excluded_file_with_metadata(path, file_type, metadata.as_ref()) || is_storage_path(path) {
         return Err(excluded_error());
+    }
+    // A directory cannot be a live SQLite file, and walker entries already know its type.
+    if known_directory || metadata.as_ref().is_some_and(std::fs::Metadata::is_dir) {
+        return Ok(());
     }
     let excluded_alias = metadata
         .as_ref()
@@ -362,6 +382,52 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn project_walks_do_not_probe_identity_for_nested_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let nested = root.join("one/two/three");
+        std::fs::create_dir_all(&nested).unwrap();
+        let directories = [root.join("one"), root.join("one/two"), nested.clone()];
+        let source = nested.join("source.rs");
+        std::fs::write(&source, "fn source() {}\n").unwrap();
+        let database = crate::db::file_identity::IdentityConnection::open(
+            root.join("open_database.cache"),
+            "project_walk_directory_identity_probe",
+        )
+        .unwrap();
+
+        let counts = crate::db::file_identity::stat_probe::count(|| {
+            crate::search_index::project_walk_builder(&root)
+                .build()
+                .map(Result::unwrap)
+                .for_each(drop);
+        });
+
+        for directory in directories {
+            assert_eq!(
+                counts.get(&directory),
+                None,
+                "walk probed directory identity for {directory:?}: {counts:?}"
+            );
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let sidecar = std::path::PathBuf::from(format!(
+                "{}{}",
+                root.join("open_database.cache").display(),
+                suffix
+            ));
+            assert_eq!(
+                counts.get(&sidecar),
+                None,
+                "directory visit refreshed database sidecar {sidecar:?}: {counts:?}"
+            );
+        }
+        assert_eq!(counts.get(&source), Some(&1));
+        drop(database);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn late_created_shm_hard_link_is_refused_before_open() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -395,6 +461,8 @@ mod tests {
         );
     }
 
+    // Windows cannot compare file identities here and refuses known SQLite names, not this `.rs` hard-link alias.
+    #[cfg(unix)]
     #[test]
     fn live_sqlite_alias_walk_completes_without_gaps() {
         let dir = tempfile::tempdir().unwrap();

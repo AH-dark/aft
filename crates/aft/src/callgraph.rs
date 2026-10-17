@@ -3930,12 +3930,15 @@ fn walk_project_files_filtered_while_with_builder(
                 PROJECT_WALK_ACCEPTED_FILTER_ENTRIES
                     .with(|entries| entries.borrow_mut().push(entry.path().to_path_buf()));
             }
-            if crate::project_content::is_excluded(entry.path()) || !include(entry.path()) {
+            let file_type = entry.file_type();
+            if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
+                || !include(entry.path())
+            {
                 return false;
             }
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
                 return !WALK_EXCLUDED_DIR_NAMES.contains(&name.as_ref());
             }
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())

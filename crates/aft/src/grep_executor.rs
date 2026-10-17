@@ -811,13 +811,15 @@ fn fallback_target_walk_builder(
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(true)
         .filter_entry(move |entry| {
-            if crate::project_content::is_excluded(entry.path()) {
+            let file_type = entry.file_type();
+            if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
+            {
                 return false;
             }
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
                 return false;
             }
-            if entry.depth() > 0 && entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.depth() > 0 && file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
                 match boundary
                     .as_ref()
                     .map(|boundary| boundary.should_descend(entry.path()))
@@ -831,7 +833,7 @@ fn fallback_target_walk_builder(
                 }
             }
             let name = entry.file_name().to_string_lossy();
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
                 let descend = !matches!(
                     name.as_ref(),
                     "node_modules"
