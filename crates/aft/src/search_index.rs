@@ -1954,13 +1954,28 @@ impl SearchIndex {
     }
 
     pub(crate) fn apply_search_update(&mut self, update: PreparedSearchUpdate) {
-        self.remove_resolved_file(&update.path, &update.path);
-        match update.file {
+        let PreparedSearchUpdate { path, file } = update;
+        // Prepared updates use filesystem-canonical paths, but borrowed indexes
+        // can have a plain Windows root. Match the stored root's spelling before
+        // replacing its exact path key; normalize only the comparison operands.
+        #[cfg(windows)]
+        let path = if self.project_root.as_os_str().is_empty() {
+            path
+        } else {
+            let root = crate::windows_path::normalize_windows_path(&self.project_root);
+            let normalized = crate::windows_path::normalize_windows_path(&path);
+            normalized
+                .strip_prefix(&root)
+                .map(|relative| self.project_root.join(relative))
+                .unwrap_or(path)
+        };
+        self.remove_resolved_file(&path, &path);
+        match file {
             PreparedSearchPath::Indexed(file) => {
-                self.index_prepared_new_file(&update.path, file);
+                self.index_prepared_new_file(&path, file);
             }
             PreparedSearchPath::Unindexed(metadata) => {
-                self.track_unindexed_file_with_metadata(&update.path, metadata);
+                self.track_unindexed_file_with_metadata(&path, metadata);
             }
             PreparedSearchPath::Skipped => {}
         }
@@ -2256,11 +2271,17 @@ impl SearchIndex {
         let mut root_bytes = vec![0u8; root_len];
         reader.read_exact(&mut root_bytes).ok()?;
         let stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
-        // Resolve root aliases before deriving any file keys. Queries canonicalize
-        // their scope, and new files use canonical keys; retaining a symlink or
-        // differently cased root only for cached files would hide them from search.
+        // Resolve aliases before deriving cached keys so scoped queries can see
+        // both cached and new files. Keep the caller's Windows prefix convention:
+        // configure supplies verbatim roots, while read-only callers may supply
+        // plain canonical roots for disk-walk lookups shared with the semantic index.
         let project_root = fs::canonicalize(current_canonical_root)
             .unwrap_or_else(|_| current_canonical_root.to_path_buf());
+        #[cfg(windows)]
+        let project_root = match current_canonical_root.components().next() {
+            Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim() => project_root,
+            _ => crate::windows_path::normalize_windows_path(&project_root),
+        };
         // Snapshot paths are stored relative to the root that wrote them and
         // are re-rooted onto the loading root. That is only sound when both
         // roots sit at the same place in their checkouts: a snapshot written
@@ -9624,19 +9645,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
-        let file = project.join("src.txt");
-        fs::write(&file, "abcdef").expect("write source");
-        let mut index = SearchIndex::new();
-        index.project_root = project.clone();
-        {
-            let mut state = index.compaction_state.lock().expect("compaction state");
-            state.running = true;
+        let project = fs::canonicalize(&project).expect("canonical project root");
+        fs::write(project.join("src.txt"), "abcdef").expect("write source");
+        for root in [
+            project.clone(),
+            crate::inspect::job::normalize_path(&project),
+        ] {
+            let file = root.join("src.txt");
+            let mut index = SearchIndex::new();
+            index.project_root = root;
+            {
+                let mut state = index.compaction_state.lock().expect("compaction state");
+                state.running = true;
+            }
+            index.update_file(&file);
+            assert!(index.path_to_id.contains_key(&file));
+            let state = index.compaction_state.lock().expect("compaction state");
+            assert!(state.requested_again || !index.delta.postings.is_empty());
+            assert!(state.buffered_paths.contains(&file));
         }
-        index.update_file(&file);
-        let state = index.compaction_state.lock().expect("compaction state");
-        assert!(state.requested_again || !index.delta.postings.is_empty());
-        let canonical_file = fs::canonicalize(&file).expect("canonical source path");
-        assert!(state.buffered_paths.contains(&canonical_file));
     }
 
     fn cache_has_file_trigram_count_extension(cache_path: &Path) -> bool {
@@ -11960,6 +11987,9 @@ mod warm_reload_verification_tests {
         #[cfg(windows)]
         let alias_root = dir.path().join("CHECKOUT");
         let canonical_root = fs::canonicalize(&real_root).unwrap();
+        let plain_subfolder = crate::inspect::job::normalize_path(&canonical_root).join("src");
+        #[cfg(windows)]
+        assert!(!plain_subfolder.to_string_lossy().starts_with(r"\\?\"));
         assert_ne!(alias_root, canonical_root);
         assert_eq!(fs::canonicalize(&alias_root).unwrap(), canonical_root);
         let changed = real_root.join("src/changed.rs");
@@ -11984,6 +12014,12 @@ mod warm_reload_verification_tests {
         ] {
             assert!(built.write_to_disk(cache.path(), None));
             let baseline = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
+            let loaded_root = crate::inspect::job::canonicalize_normalized(&alias_root);
+            assert_eq!(baseline.project_root, loaded_root);
+            #[cfg(windows)]
+            assert!(!baseline.project_root.to_string_lossy().starts_with(r"\\?\"));
+            let cached_path = loaded_root.join("src/changed.rs");
+            let cached_id = baseline.path_to_id[&cached_path];
             let mut refreshed = SearchIndex::refresh_cached_with_diff_limit(
                 baseline,
                 &alias_root,
@@ -11993,11 +12029,29 @@ mod warm_reload_verification_tests {
                 Some(2),
             )
             .expect("one cached edit and one new file fit the two-path budget");
+            assert!(refreshed.delta.superseded.contains(&cached_id));
+            assert!(refreshed.delta.superseded_paths.contains(&cached_path));
+            assert_eq!(refreshed.live_file_identities().len(), 3);
             for persisted in [false, true] {
                 if persisted {
                     assert!(refreshed.write_to_disk(cache.path(), None));
+                    let baseline = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
+                    assert_eq!(baseline.project_root, loaded_root);
+                    refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                        baseline,
+                        &alias_root,
+                        DEFAULT_MAX_FILE_SIZE,
+                        None,
+                        strategy,
+                        Some(0),
+                    )
+                    .expect("persisted canonical keys must fit a zero-path refresh budget");
                 }
-                for scope in [alias_root.clone(), canonical_root.join("src")] {
+                for scope in [
+                    alias_root.clone(),
+                    canonical_root.join("src"),
+                    plain_subfolder.clone(),
+                ] {
                     for needle in [
                         "ChangedAliasNeedle",
                         "UnchangedAliasNeedle",
@@ -12046,7 +12100,7 @@ mod warm_reload_verification_tests {
                     .expect("unchanged cached paths must fit a zero-path budget");
                     assert!(refreshed.is_ready());
                     assert_eq!(refreshed.project_root, loaded_root);
-                    assert_eq!(refreshed.project_root, verbatim_root);
+                    assert_eq!(refreshed.project_root, *loading_root);
                     assert_eq!(refreshed.path_to_id, original_keys);
                     assert_eq!(
                         refreshed
