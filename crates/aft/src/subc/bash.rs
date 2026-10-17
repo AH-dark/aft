@@ -61,7 +61,6 @@ impl BashDeferredCompletion {
 
     /// The text the caller sees, or `None` for a completion that carries no
     /// result (the call was already answered elsewhere, or cancelled).
-    #[cfg(unix)]
     pub(super) fn text_for_test(&self) -> Option<&str> {
         self.result.as_ref().map(|result| result.text.as_str())
     }

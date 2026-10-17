@@ -123,14 +123,18 @@ pub(crate) struct Daemon {
     pub(crate) log: Arc<Mutex<Vec<(subc_protocol::EnvelopeHeader, Value)>>>,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) acceptance_gate: Arc<tokio::sync::Notify>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) output_gate: Arc<tokio::sync::Notify>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) completion_gate: Arc<tokio::sync::Notify>,
+    #[cfg_attr(not(unix), allow(dead_code))]
     requests: Arc<tokio::sync::Notify>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
 
 impl Daemon {
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) async fn wait_for_requests(&self, method: &str, count: usize) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
