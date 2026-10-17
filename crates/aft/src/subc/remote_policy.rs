@@ -203,7 +203,14 @@ pub(super) fn confined_tool(name: &str) -> bool {
 }
 
 /// Read the worker key regardless of the preset claimed by the current call.
-/// Missing persistence or malformed saved params must never downgrade a fence.
+/// Missing persistence or malformed saved params must never downgrade a fence,
+/// with one exception: a context whose persistence was never configured.
+/// Every route bind configures persistence, and `catalog` refuses `confine`
+/// without a database, so such a context (a library or test harness) has no
+/// store a fence could have been saved in.
+///
+/// Tool calls ask this on the frame loop. It never writes aft.db, and a key
+/// once found confined is answered from memory afterwards.
 pub(super) fn confined(
     ctx: &AppContext,
     identity: &RouteIdentity,
@@ -211,21 +218,40 @@ pub(super) fn confined(
     let Some(key) = key(identity, Some("worker")) else {
         return Ok(false);
     };
+    if ctx.policy_key_known_confined(&key) {
+        return Ok(true);
+    }
     let unavailable = || {
         subc_protocol::ErrorBody::new(
             "confine_policy_unavailable",
             "cannot read the scoped worker's confinement policy",
         )
     };
-    let db = ctx.db().ok_or_else(unavailable)?;
+    let Some(db) = ctx.db() else {
+        // An opening or failed database may hold a saved fence: refuse.
+        // Calls on such routes wait for an opening database first (see
+        // `persistence::DatabaseWaits`), so this refusal follows a failed
+        // open or one that outlasted the wait.
+        return if ctx.database_runtime_unconfigured() {
+            Ok(false)
+        } else {
+            Err(unavailable())
+        };
+    };
     let conn = db.lock().map_err(|_| unavailable())?;
-    let params = store::lookup(
-        &conn,
-        &key,
-        crate::bash_background::persistence::unix_millis(),
-    )
-    .map_err(|_| unavailable())?;
-    Ok(params.is_some_and(|params| params.confine.is_some()))
+    let confined = store::confined(&conn, &key).map_err(|_| unavailable())?;
+    drop(conn);
+    if confined {
+        ctx.remember_confined_policy_key(key);
+    }
+    Ok(confined)
+}
+
+/// Whether a call on this route must wait for an opening aft.db before its
+/// confinement can be decided. False once the fence is known from memory.
+pub(super) fn awaits_policy_store(ctx: &AppContext, identity: &RouteIdentity) -> bool {
+    ctx.database_runtime_initializing()
+        && key(identity, Some("worker")).is_some_and(|key| !ctx.policy_key_known_confined(&key))
 }
 
 pub(super) fn admit_confined(

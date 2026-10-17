@@ -255,8 +255,21 @@ fn confined_restart_and_fail_closed() {
         .unwrap()
         .execute("UPDATE remote_exec_policies SET params='broken'", [])
         .unwrap();
+    // `restarted` already read the fence and keeps it without reading again.
+    // A process that first meets the unreadable row must refuse the call.
     assert_eq!(
-        call(&restarted, &f.route, "read", arguments("read", "only.rs")).data["code"],
+        call(
+            &restarted,
+            &f.route,
+            "read",
+            arguments("read", "../live/sentinel.rs")
+        )
+        .data["code"],
+        "path_outside_confined_root"
+    );
+    let unreadable = context(&f.pin, f.storage.path(), None);
+    assert_eq!(
+        call(&unreadable, &f.route, "read", arguments("read", "only.rs")).data["code"],
         "confine_policy_unavailable"
     );
 }

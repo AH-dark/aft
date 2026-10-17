@@ -3532,6 +3532,14 @@ pub struct AppContext {
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
     database_runtime_failure: parking_lot::Mutex<DatabaseRuntimeFailure>,
+    /// Scoped worker policy keys this context has already read as confined.
+    /// Confinement is monotonic (a later catalog fetch cannot remove it), so
+    /// a key found confined once stays confined and later calls skip aft.db.
+    /// Only positive answers are kept: an unconfined worker can still become
+    /// confined by a later catalog fetch, possibly on another route. A new
+    /// process starts empty and reads the saved row again.
+    confined_policy_keys:
+        parking_lot::Mutex<std::collections::HashSet<crate::db::remote_exec::PolicyKey>>,
     #[cfg(test)]
     database_open_attempts: AtomicU64,
     /// The pending aft.db open request, the configure epoch it belongs to, and
@@ -4243,6 +4251,7 @@ impl AppContext {
             database_runtime_state: AtomicU8::new(0),
             database_runtime_changed: tokio::sync::Notify::new(),
             database_runtime_failure: parking_lot::Mutex::new(DatabaseRuntimeFailure::default()),
+            confined_policy_keys: parking_lot::Mutex::new(std::collections::HashSet::new()),
             #[cfg(test)]
             database_open_attempts: AtomicU64::new(0),
             database_open: parking_lot::Mutex::new(Default::default()),
@@ -6458,6 +6467,47 @@ impl AppContext {
                 return;
             }
         }
+    }
+
+    /// True until this context's first configure stages a database open. Such
+    /// a context (a library or test context) has never had aft.db open.
+    pub(crate) fn database_runtime_unconfigured(&self) -> bool {
+        self.database_runtime_state.load(Ordering::Acquire) == 0
+    }
+
+    /// True while a committed configure's database open has not finished.
+    pub(crate) fn database_runtime_initializing(&self) -> bool {
+        self.database_runtime_state.load(Ordering::Acquire) == 1
+    }
+
+    /// Wait outside executor admission until the database open in progress
+    /// finishes or `deadline` passes, whatever command is waiting.
+    pub(crate) async fn wait_for_database_open(&self, deadline: Instant) {
+        loop {
+            let changed = self.database_runtime_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.database_runtime_initializing() {
+                return;
+            }
+            if tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), changed)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn policy_key_known_confined(
+        &self,
+        key: &crate::db::remote_exec::PolicyKey,
+    ) -> bool {
+        self.confined_policy_keys.lock().contains(key)
+    }
+
+    pub(crate) fn remember_confined_policy_key(&self, key: crate::db::remote_exec::PolicyKey) {
+        self.confined_policy_keys.lock().insert(key);
     }
 
     pub(crate) fn database_runtime_failed(&self) -> bool {
@@ -12506,11 +12556,12 @@ impl AppContext {
             identify(resolved.to_path_buf())
         };
         if crate::context::confinement::for_request(req_id) && self.request_force_restrict(req_id) {
-            let root = self
-                .config()
-                .project_root
-                .as_ref()
-                .map(|root| self.resolved_path_restriction_root(root));
+            // `identity` went through `policy_path`, which drops the Windows
+            // verbatim prefix (`\\?\C:\`) that `canonicalize` puts on the
+            // root. Compare both in that same form, or nothing is in the root.
+            let root = self.config().project_root.as_ref().map(|root| {
+                crate::inspect::job::normalize_path(&self.resolved_path_restriction_root(root))
+            });
             if !root.is_some_and(|root| identity.starts_with(root))
                 || !crate::bounded_io::metadata(&identity).is_ok()
             {

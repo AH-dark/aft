@@ -17,8 +17,10 @@ impl DatabaseWaits {
     }
 
     /// Return the frame unchanged unless this is a persistence-dependent call
-    /// on a bound root whose database is opening. Failure and overflow are
-    /// answered by the ordinary tool refusal path without waiting.
+    /// on a bound root whose database is opening, or any catalog fetch or
+    /// tool call on a scoped worker route whose saved confinement is not yet
+    /// known. Failure and overflow are answered by the ordinary tool refusal
+    /// path without waiting.
     pub(super) fn defer(
         &mut self,
         decoded: DecodedFrame,
@@ -35,15 +37,24 @@ impl DatabaseWaits {
         let Ok(body) = decoded.body() else {
             return Err(decoded);
         };
-        if body
-            .get("op")
-            .and_then(Value::as_str)
-            .is_some_and(tool_provider::recognized_operation)
-            || body
-                .get("name")
+        // A scoped worker's saved confinement lives in aft.db, and the bind
+        // reply goes out while that database may still be opening. Its
+        // catalog fetch and tool calls wait for the open rather than be
+        // refused for an unreadable fence (read-only tools included).
+        let confine_wait = remote_policy::awaits_policy_store(&ctx, identity);
+        let operation = body.get("op").and_then(Value::as_str).or_else(|| {
+            body.get("name")
                 .and_then(Value::as_str)
-                .is_some_and(tool_provider::recognized_operation)
+                .filter(|name| tool_provider::recognized_operation(name))
+        });
+        if let Some(operation) =
+            operation.filter(|operation| tool_provider::recognized_operation(operation))
         {
+            if confine_wait && matches!(operation, "tool.catalog" | "tool.call") {
+                let name = operation.to_string();
+                let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
+                return self.wait(decoded, route, &ctx, name, deadline_ms, true);
+            }
             return Err(decoded);
         }
         if identity.role == tool_provider::RouteRole::ToolProviderV1 {
@@ -109,27 +120,43 @@ impl DatabaseWaits {
                 }
             });
         }
-        if !ctx.database_runtime_pending(name) {
+        if !ctx.database_runtime_pending(name) && !confine_wait {
             return Err(decoded);
         }
+        let name = name.to_string();
+        let deadline_ms = body.get("deadline_ms").and_then(Value::as_u64);
+        self.wait(decoded, route, &ctx, name, deadline_ms, confine_wait)
+    }
+
+    /// Hold `decoded` until the root's database open finishes or the wait
+    /// budget ends. `any_command` waits on the open itself rather than on
+    /// whether `name` needs persistence.
+    fn wait(
+        &mut self,
+        decoded: DecodedFrame,
+        route: RouteChannel,
+        ctx: &Arc<AppContext>,
+        name: String,
+        deadline_ms: Option<u64>,
+        any_command: bool,
+    ) -> Result<(), DecodedFrame> {
         // A root reported as initializing always has its open staged or
         // running. Hand a staged open to the database-open thread now rather
         // than trusting that the bind's dispatch or the configure tail will
         // get to it soon: the tail can be queued behind other roots for
         // minutes, and a missed dispatch must not leave this root refusing
         // mutations indefinitely. A no-op when the open is already running.
-        crate::database_open::dispatch(&ctx);
+        crate::database_open::dispatch(ctx);
         if self.pending.len() >= MAX_WAITERS {
             return Err(decoded);
         }
-        let name = name.to_string();
         let key = (route, decoded.frame.header.corr);
         let admission = AdmissionWait::from_decoded(&decoded, &name);
         // A caller may shorten the wait with an absolute Unix-millisecond
         // deadline. The bash timeout limits command execution, not the wait
         // for permission to admit the command.
         let mut deadline = decoded.phase_trace.received_at() + WAIT_BUDGET;
-        if let Some(epoch_ms) = body.get("deadline_ms").and_then(Value::as_u64) {
+        if let Some(epoch_ms) = deadline_ms {
             let remaining = Duration::from_millis(
                 epoch_ms.saturating_sub(
                     std::time::SystemTime::now()
@@ -141,8 +168,13 @@ impl DatabaseWaits {
             );
             deadline = deadline.min(Instant::now() + remaining.min(WAIT_BUDGET));
         }
+        let ctx = Arc::clone(ctx);
         let handle = self.tasks.spawn(async move {
-            ctx.wait_for_database_runtime(&name, deadline).await;
+            if any_command {
+                ctx.wait_for_database_open(deadline).await;
+            } else {
+                ctx.wait_for_database_runtime(&name, deadline).await;
+            }
             decoded
         });
         if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
@@ -342,6 +374,97 @@ mod tests {
         assert!(waits
             .defer(frame("bash_status", 4, None), &routes, &executor)
             .is_err());
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_worker_calls_wait_for_opening_database_then_run_unconfined() {
+        let (dir, root) = test_support::test_root("confine-database-waits");
+        let ctx = test_support::test_ctx();
+        ctx.mark_database_runtime_initializing_for_test();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let unscoped = test_support::route_identity(&root, "head");
+        let scope: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
+            "owner": {"kind": "direct"}, "ref": "worker-scope", "scope_epoch": 1,
+            "kind": "worker", "owner_authorized": true,
+        }))
+        .unwrap();
+        let worker = RouteIdentity(Arc::new(RouteIdentityData {
+            root: root.clone(),
+            project_root: unscoped.project_root.clone(),
+            harness: unscoped.harness.clone(),
+            session: "worker".into(),
+            role: tool_provider::RouteRole::Legacy,
+            trust: BindTrust::FirstParty,
+            spawn_principal: unscoped.spawn_principal.clone(),
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::default(),
+            scope: Some(scope),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
+            run_scope: OnceLock::new(),
+            made_tool_call: AtomicBool::new(false),
+        }));
+        assert!(remote_policy::key(&worker, Some("worker")).is_some());
+        let (scoped_route, unscoped_route) = (route_key(43, 1), route_key(42, 1));
+        let routes = HashMap::from([(scoped_route, worker.clone()), (unscoped_route, unscoped)]);
+        let frame = |channel: u16, corr, body: Value| DecodedFrame {
+            parsed_body: Default::default(),
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                channel,
+                1,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        let read = json!({"name": "read", "preset": "worker", "arguments": {"filePath": "a"}});
+        let mut waits = DatabaseWaits::default();
+        // Read-only tools never waited for the database, and still do not on
+        // a route that can hold no saved confinement.
+        assert!(waits
+            .defer(frame(42, 1, read.clone()), &routes, &executor)
+            .is_err());
+        assert!(waits
+            .defer(
+                frame(43, 2, json!({"op": "tool.withdraw"})),
+                &routes,
+                &executor
+            )
+            .is_err());
+        assert!(waits.defer(frame(43, 3, read), &routes, &executor).is_ok());
+        assert!(waits
+            .defer(
+                frame(43, 4, json!({"op": "tool.catalog", "preset": "worker"})),
+                &routes,
+                &executor
+            )
+            .is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), waits.next())
+                .await
+                .is_err(),
+            "a scoped call resumed before the database opened"
+        );
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        ctx.finish_database_runtime(Ok(()));
+        let mut resumed = Vec::new();
+        for _ in 0..2 {
+            let decoded = tokio::time::timeout(Duration::from_millis(500), waits.next())
+                .await
+                .unwrap();
+            resumed.push(decoded.frame.header.corr);
+        }
+        resumed.sort_unstable();
+        assert_eq!(resumed, [3, 4]);
+        // Once open, the saved policy answers: this worker never asked for
+        // confinement, so its read is admitted as before.
+        assert!(!remote_policy::admit_confined(&ctx, &worker, "read").unwrap());
         assert!(waits.is_empty());
     }
 

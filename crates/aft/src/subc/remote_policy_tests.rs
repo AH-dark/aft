@@ -93,6 +93,119 @@ fn context_with_switch(
     ctx
 }
 
+/// A context whose aft.db is not open: never configured, or with its runtime
+/// state set by the caller.
+fn context_without_database(root: &Path, storage: &Path) -> AppContext {
+    let mut config = crate::config::Config::default();
+    config.project_root = Some(root.into());
+    config.storage_dir = Some(storage.into());
+    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+}
+
+#[test]
+fn confine_lookup_without_configured_persistence_is_unconfined() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_without_database(root.path(), storage.path());
+    let route = identity(root.path(), "ordinary-worker", 7, true);
+    assert!(key(&route, Some("worker")).is_some());
+    assert!(!confined(&ctx, &route).unwrap());
+    assert!(!admit_confined(&ctx, &route, "bash").unwrap());
+    assert!(!admit_confined(&ctx, &route, "read").unwrap());
+}
+
+#[test]
+fn confine_lookup_refuses_while_database_opens_or_after_it_failed() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_without_database(root.path(), storage.path());
+    let route = identity(root.path(), "designer", 7, true);
+    ctx.mark_database_runtime_initializing_for_test();
+    assert!(awaits_policy_store(&ctx, &route));
+    assert!(!awaits_policy_store(
+        &ctx,
+        &identity(root.path(), "unscoped", 7, false)
+    ));
+    assert_eq!(
+        confined(&ctx, &route).unwrap_err().code,
+        "confine_policy_unavailable"
+    );
+    ctx.finish_database_runtime_error("database cannot open".into(), false);
+    assert!(!awaits_policy_store(&ctx, &route));
+    for name in ["read", "bash"] {
+        assert_eq!(
+            admit_confined(&ctx, &route, name).unwrap_err().code,
+            "confine_policy_unavailable",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn confine_lookup_takes_no_write_lock_and_copies_no_row() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    catalog(
+        json!({"preset":"worker","params":{"confine":"root"}}),
+        &identity(root.path(), "designer", 7, true),
+        &ctx,
+    )
+    .unwrap();
+    // A second process: nothing cached, its own connection, and no waiting
+    // for a lock, so a write transaction here fails at once.
+    let restarted = context(root.path(), storage.path(), None);
+    restarted
+        .db()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .busy_timeout(Duration::ZERO)
+        .unwrap();
+    let writer = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let rebound = identity(root.path(), "designer", 8, true);
+    assert!(confined(&restarted, &rebound).unwrap());
+    assert_eq!(
+        admit_confined(&restarted, &rebound, "bash")
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    let copied: i64 = writer
+        .query_row(
+            "SELECT COUNT(*) FROM remote_exec_policies WHERE epoch='8'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(copied, 0, "a per-call lookup carried a row forward");
+}
+
+#[test]
+fn confine_answer_is_kept_once_confined() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let route = identity(root.path(), "designer", 7, true);
+    let ordinary = identity(root.path(), "ordinary-worker", 7, true);
+    catalog(
+        json!({"preset":"worker","params":{"confine":"root"}}),
+        &route,
+        &ctx,
+    )
+    .unwrap();
+    assert!(confined(&ctx, &route).unwrap());
+    assert!(!confined(&ctx, &ordinary).unwrap());
+    // With the store gone, only the remembered answer can keep the fence.
+    ctx.clear_db();
+    assert!(confined(&ctx, &route).unwrap());
+    ctx.mark_database_runtime_initializing_for_test();
+    assert!(!awaits_policy_store(&ctx, &route));
+    assert!(awaits_policy_store(&ctx, &ordinary));
+}
+
 fn plan(name: &str) -> Value {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/exec_remote/fixtures/plans");
     let jcs = std::fs::read(root.join(format!("{name}.jcs"))).unwrap();

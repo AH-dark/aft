@@ -7,7 +7,7 @@
 use crate::exec_remote::FrozenParams;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PolicyKey {
     pub project_root: String,
     pub harness: String,
@@ -126,6 +126,44 @@ pub fn lookup(
         .transpose()?;
     tx.commit()?;
     Ok(policy)
+}
+
+/// Whether the saved params for `key` carry the root confinement fence.
+///
+/// Tool calls ask this on the subc frame loop, so it only reads: no write
+/// transaction, no carried-forward row, no `last_used` update. It returns the
+/// same answer [`lookup`] would: the exact-epoch row when present, otherwise
+/// the newest older epoch's row, which is the row `lookup` would copy forward.
+/// Saved params that do not parse are an error, so callers can refuse the call
+/// instead of treating an unreadable fence as absent.
+pub fn confined(conn: &Connection, key: &PolicyKey) -> rusqlite::Result<bool> {
+    let v = key.values();
+    let epoch = key.epoch.to_string();
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT params FROM remote_exec_policies
+             WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
+             AND owner=?5 AND scope_ref=?6 AND preset=?7
+             AND (epoch=?8 OR length(epoch)<length(?8)
+                  OR (length(epoch)=length(?8) AND epoch<?8))
+             ORDER BY epoch=?8 DESC, length(epoch) DESC, epoch DESC LIMIT 1",
+            params![v[0], v[1], v[2], v[3], v[4], v[5], v[6], epoch],
+            |row| row.get(0),
+        )
+        .optional()?;
+    row.map(|json| {
+        serde_json::from_str::<FrozenParams>(&json)
+            .map(|params| params.confine.is_some())
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+    })
+    .transpose()
+    .map(|confined| confined.unwrap_or(false))
 }
 
 pub(super) enum CatalogParams {
