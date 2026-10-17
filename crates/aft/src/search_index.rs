@@ -2773,7 +2773,13 @@ impl SearchIndex {
         if baseline.max_file_size != max_file_size {
             return None;
         }
-        baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        // Cached file keys use the loading root's lexical spelling. Replacing
+        // only the root with a Windows verbatim path makes the walk report every
+        // cached file as removed and re-added, incorrectly exhausting the budget.
+        // Keep that spelling; a different checkout must be re-rooted at load time.
+        if canonicalize_or_normalize(&baseline.project_root) != canonicalize_or_normalize(root) {
+            return None;
+        }
         let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
         if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
             return None;
@@ -11933,6 +11939,50 @@ mod tests {
 #[cfg(test)]
 mod warm_reload_verification_tests {
     use super::*;
+
+    #[test]
+    fn warm_refresh_preserves_loaded_path_keys_across_root_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim_root = fs::canonicalize(dir.path()).unwrap();
+        let plain_root = crate::inspect::job::normalize_path(&verbatim_root);
+        #[cfg(windows)]
+        assert_ne!(verbatim_root, plain_root);
+        fs::write(plain_root.join("unchanged.rs"), "fn unchanged() {}\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&plain_root);
+        assert!(built.write_to_disk(cache.path(), None));
+
+        for loading_root in [&plain_root, &verbatim_root] {
+            for refresh_root in [&plain_root, &verbatim_root] {
+                for strategy in [
+                    cache_freshness::VerifyStrategy::StatFirst,
+                    cache_freshness::VerifyStrategy::Strict,
+                ] {
+                    let baseline = SearchIndex::read_from_disk(cache.path(), loading_root).unwrap();
+                    let original_keys = baseline.path_to_id.clone();
+                    let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                        baseline,
+                        refresh_root,
+                        DEFAULT_MAX_FILE_SIZE,
+                        None,
+                        strategy,
+                        Some(0),
+                    )
+                    .expect("unchanged cached paths must fit a zero-path budget");
+                    assert!(refreshed.is_ready());
+                    assert_eq!(refreshed.project_root, *loading_root);
+                    assert_eq!(refreshed.path_to_id, original_keys);
+                    assert_eq!(
+                        refreshed
+                            .grep("unchanged", true, &[], &[], refresh_root, 10)
+                            .matches
+                            .len(),
+                        1
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn warm_refresh_rejects_local_changes_before_source_reads() {
