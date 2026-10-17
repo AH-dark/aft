@@ -34,8 +34,20 @@ pub(crate) fn register_storage_root(path: &Path) {
 /// before binary detection, which would already open and close them. Internal
 /// storage is also excluded wholesale so its generated source and cache files
 /// never feed back into project indexing.
+/// Walkers use the guarded readers' admission check to skip known live-file
+/// aliases before scheduling source reads or reusing cached entries.
 pub(crate) fn is_excluded(path: &Path) -> bool {
-    is_excluded_file(path) || is_storage_path(path)
+    admit(path).is_err()
+}
+
+/// Watcher events can name vanished directories. A SQLite suffix only excludes
+/// a known non-directory; an unknown type must still trigger reconciliation.
+/// Unlike source walks, this check does not scan live SQLite identities.
+pub(crate) fn is_excluded_event(path: &Path) -> bool {
+    is_storage_path(path)
+        || crate::os_metadata::is_os_metadata_path(path)
+        || crate::db::file_identity::is_registered_file_path(path)
+        || has_sqlite_suffix(path) && path.metadata().is_ok_and(|metadata| !metadata.is_dir())
 }
 
 fn is_storage_path(path: &Path) -> bool {
@@ -381,6 +393,54 @@ mod tests {
                 .unwrap(),
             "alive"
         );
+    }
+
+    #[test]
+    fn live_sqlite_alias_walk_completes_without_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let database = root.join("live.db");
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&database, "walk_alias").unwrap();
+        connection
+            .execute_batch("CREATE TABLE probe(value TEXT)")
+            .unwrap();
+        let alias = root.join("alias.rs");
+        std::fs::hard_link(&database, &alias).unwrap();
+        let source = root.join("source.rs");
+        std::fs::write(&source, "fn user_source() {}\n").unwrap();
+        let probe = Probe::new(&root);
+        let policy = crate::blob_store::v2::TrigramPolicy {
+            max_file_size: 1024,
+        };
+        let walk = crate::views::live_delta::strict_walk(&root, &policy, 1);
+        assert!(walk.gaps.is_empty(), "{:?}", walk.gaps);
+        assert_eq!(
+            walk.entries
+                .keys()
+                .map(|path| path.as_bytes())
+                .collect::<Vec<_>>(),
+            vec![b"source.rs".as_slice()]
+        );
+        assert_eq!(
+            crate::callgraph::walk_project_files(&root).collect::<Vec<_>>(),
+            vec![source.clone()]
+        );
+        let grep_files = crate::grep_executor::fallback_project_walk_builder(
+            &root,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        )
+        .build()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+        assert_eq!(grep_files, vec![source.clone()]);
+        assert!(matches!(
+            crate::inspect::scanners::source_text::read_source_text(&alias).unwrap(),
+            crate::inspect::scanners::source_text::SourceText::Vanished
+        ));
+        assert_eq!(probe.paths(), vec![source]);
     }
 
     #[cfg(unix)]

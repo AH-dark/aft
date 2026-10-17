@@ -160,6 +160,60 @@ fn views_newly_excluded_storage_members_are_not_reused() {
 }
 
 #[test]
+fn views_live_sqlite_hard_link_is_skipped_before_read() {
+    assert_live_sqlite_hard_link_is_skipped(&[]);
+}
+
+#[test]
+fn views_live_sqlite_hard_link_is_skipped_before_reuse() {
+    assert_live_sqlite_hard_link_is_skipped(&["file_0.ts".to_string()]);
+}
+
+fn assert_live_sqlite_hard_link_is_skipped(changed: &[String]) {
+    let project = repository(1);
+    let root = project.path().canonicalize().unwrap();
+    let alias = root.join("alias.rs");
+    fs::write(&alias, "fn ordinary_source() {}\n").unwrap();
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "source alias",
+        ],
+    );
+    let storage = tempfile::tempdir().unwrap();
+    let initial = publish_checkout(&request(&root, storage.path(), "source", &[])).unwrap();
+    assert_eq!(initial.manifest.unwrap().entries().count(), 2);
+
+    let database = root.join("live.db");
+    let connection =
+        crate::db::file_identity::IdentityConnection::open(&database, "view_alias").unwrap();
+    connection
+        .execute_batch("CREATE TABLE probe(value TEXT)")
+        .unwrap();
+    fs::remove_file(&alias).unwrap();
+    fs::hard_link(&database, &alias).unwrap();
+    let probe = crate::project_content::Probe::new(&root);
+    let report = publish_checkout(&request(&root, storage.path(), "live", changed)).unwrap();
+    assert!(report.published);
+    let paths = report
+        .manifest
+        .unwrap()
+        .entries()
+        .map(|(path, _)| path.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec![b"file_0.ts".to_vec()]);
+    assert!(!probe.paths().contains(&alias));
+}
+
+#[test]
 fn empty_desired_head_does_not_take_the_no_op_path() {
     let project = repository(2);
     let storage = tempfile::tempdir().unwrap();
