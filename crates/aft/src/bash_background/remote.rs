@@ -1992,6 +1992,21 @@ impl BgTaskRegistry {
                 .as_ref()
                 .map(remote_execution_note)
                 .unwrap_or_else(|| format!("ran remotely on {RUNNER_ID}"));
+            // Short output files are recorded in the note before a terminal proof
+            // is published. Keep that warning visible when the final note changes.
+            let checkpoint_warnings: Vec<_> = state
+                .metadata
+                .execution_note
+                .as_deref()
+                .map(|note| {
+                    note.lines()
+                        .filter(|line| {
+                            line.contains("Output incomplete (remote_output_checkpoint_short)")
+                        })
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
             if unknown {
                 if let Some(remote) = state.metadata.remote.as_ref() {
                     let job_id = remote
@@ -2056,6 +2071,24 @@ impl BgTaskRegistry {
                     .execution_note
                     .get_or_insert_with(|| remote_note.clone());
                 note.push_str(&format!("\n{reason}"));
+            }
+            if !checkpoint_warnings.is_empty() {
+                let note = state
+                    .metadata
+                    .execution_note
+                    .get_or_insert_with(String::new);
+                let missing_warnings: Vec<_> = checkpoint_warnings
+                    .into_iter()
+                    .filter(|warning| !note.lines().any(|line| line == warning))
+                    .collect();
+                if !missing_warnings.is_empty() {
+                    let final_note = std::mem::take(note);
+                    let mut combined = missing_warnings;
+                    if !final_note.is_empty() {
+                        combined.push(final_note);
+                    }
+                    *note = combined.join("\n");
+                }
             }
             task.mark_terminal_now();
             let _ = self.persist_task_locked(task, &state.metadata, &mut db);

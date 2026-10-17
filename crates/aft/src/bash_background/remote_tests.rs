@@ -2342,6 +2342,106 @@ fn exec_remote_bash_restart_short_checkpoint_never_zero_fills() {
     }
 }
 
+fn recover_short_checkpoint(
+    terminal_proof: bool,
+) -> (
+    tempfile::TempDir,
+    BgTaskRegistry,
+    String,
+    TaskPaths,
+    Arc<BgTask>,
+    Option<TerminalRecord>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("unused-connection"),
+        "printf remote",
+    );
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.output(1, OutputStream::Stdout, b"stdout").unwrap();
+    sink.output(2, OutputStream::Stderr, b"stderr").unwrap();
+    sink.unknown_output(3, b"unknown").unwrap();
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0);
+    if terminal_proof {
+        sink.terminal(&record, &exec::grade(&record)).unwrap();
+    } else {
+        sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+        sink.unknown_output(4, b"").unwrap();
+    }
+    drop(sink);
+    drop(original);
+
+    fs::write(&paths.stdout, b"out").unwrap();
+    fs::write(&paths.stderr, b"err").unwrap();
+    fs::write(paths.io_dir.join("remote-unknown-output"), b"unk").unwrap();
+    let disk = read_task(&paths.json).unwrap();
+    let restarted = registry();
+    restarted
+        .insert_rehydrated_task(disk, paths.clone(), false)
+        .unwrap();
+    let task = restarted.task(&task_id).unwrap();
+    drop(TaskSink::new(&restarted, task.clone()).unwrap());
+
+    (
+        dir,
+        restarted,
+        task_id,
+        paths,
+        task,
+        terminal_proof.then_some(record),
+    )
+}
+
+fn assert_checkpoint_warning_is_visible(registry: &BgTaskRegistry, task_id: &str) {
+    let warning = "Output incomplete (remote_output_checkpoint_short)";
+    let note = registry.execution_note(task_id, "session").unwrap();
+    assert!(note.starts_with(warning), "{note}");
+    let snapshot = registry.observed_status(task_id, "session", 8192).unwrap();
+    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+    assert!(snapshot.output_preview.contains(warning), "{snapshot:?}");
+}
+
+#[test]
+fn exec_remote_bash_short_checkpoint_warning_survives_normal_completion() {
+    let (_dir, registry, task_id, _paths, task, _) = recover_short_checkpoint(false);
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0);
+    sink.terminal(&record, &exec::grade(&record)).unwrap();
+    drop(sink);
+
+    registry.remote_terminal(&task, exec::grade(&record), None);
+
+    assert_checkpoint_warning_is_visible(&registry, &task_id);
+}
+
+#[test]
+fn exec_remote_bash_short_checkpoint_warning_survives_saved_terminal_proof() {
+    let (_dir, registry, task_id, _paths, task, record) = recover_short_checkpoint(true);
+    registry.remote_terminal(&task, exec::grade(&record.unwrap()), None);
+
+    assert_checkpoint_warning_is_visible(&registry, &task_id);
+}
+
+#[test]
+fn exec_remote_bash_short_checkpoint_warning_survives_second_restart() {
+    let (dir, task_registry, task_id, _paths, task, _) = recover_short_checkpoint(false);
+    let mut sink = TaskSink::new(&task_registry, task.clone()).unwrap();
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0);
+    sink.terminal(&record, &exec::grade(&record)).unwrap();
+    drop(sink);
+    task_registry.remote_terminal(&task, exec::grade(&record), None);
+    drop(task);
+    drop(task_registry);
+
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+
+    assert_checkpoint_warning_is_visible(&restarted, &task_id);
+}
+
 #[test]
 fn exec_remote_bash_restart_replays_uncheckpointed_output() {
     let dir = tempfile::tempdir().unwrap();
