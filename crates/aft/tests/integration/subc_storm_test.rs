@@ -1926,7 +1926,7 @@ async fn drive_epoch_rebind_rejection_daemon(input: FakeDaemonInput) {
         "storm-epoch-current",
         storm_project_config(false, false, false, 0),
     );
-    expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+    expect_setup_bind_ack(&mut rx, corr).await;
     for epoch in [INSTALLED_EPOCH, INSTALLED_EPOCH - 1] {
         corr += 1;
         send_bind_epoch(
@@ -3183,6 +3183,32 @@ async fn expect_ack_within(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64, b
             let elapsed = started.elapsed();
             assert!(elapsed <= bound, "RouteBindAck {corr} took {elapsed:?}");
             return;
+        }
+    }
+}
+
+/// Waits for the reply to a bind that only sets up a scenario and whose
+/// latency is not what the test checks. A cold first bind does real work
+/// (topology probe, retention record, owner claim, index setup) that a loaded
+/// runner can stretch past any fixed window, so this waits for the reply
+/// itself: the module always answers a bind, with an ack or, at its own
+/// pending-bind deadline, a named refusal. A refusal fails here with its body
+/// instead of being skipped and reported as a timeout. The scenario's
+/// watchdog bounds a reply that never comes.
+async fn expect_setup_bind_ack(rx: &mut mpsc::UnboundedReceiver<Frame>, corr: u64) {
+    loop {
+        let frame = rx
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("EOF waiting for setup RouteBindAck {corr}"));
+        if is_ack(&frame, corr) {
+            return;
+        }
+        if frame.header.ty == FrameType::Error && frame.header.corr == corr {
+            panic!(
+                "setup bind {corr} was refused: {}",
+                String::from_utf8_lossy(&frame.body)
+            );
         }
     }
 }

@@ -8824,13 +8824,22 @@ mod tests {
         use crate::synapse_embed::pause_test_support::*;
         crate::semantic_index::with_lane_pause_clock(START, |_clock| {
             let project = tempfile::tempdir().unwrap();
-            std::fs::write(
-                project.path().join("remix-panel.ts"),
-                "// where remix panel mounted option switching handled\nexport const panel = true;\n",
-            )
-            .unwrap();
+            let source_file = project.path().join("remix-panel.ts");
+            let source =
+                "// where remix panel mounted option switching handled\nexport const panel = true;\n";
+            std::fs::write(&source_file, source).unwrap();
             let ctx = test_context(project.path());
             ctx.set_canonical_cache_root(project.path().to_path_buf());
+            // The keyword lane must already be ready. Without a resident
+            // trigram index the search starts a background build and serves
+            // only if that build finishes inside its short wait budget; on a
+            // loaded machine it does not, and with the paused semantic lane
+            // also unavailable the search refuses with
+            // `search_lanes_unavailable` before any pause notice is written.
+            let mut index = SearchIndex::new();
+            index.index_file(&source_file, source.as_bytes());
+            index.ready = true;
+            *ctx.search_index().write().unwrap() = Some(index);
             // The cold build is waiting out the pause: no index is loaded, so
             // the search never embeds its query and takes the lane state from
             // the backend health snapshot.

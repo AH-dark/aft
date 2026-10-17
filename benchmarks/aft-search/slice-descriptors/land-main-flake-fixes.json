@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "note": "Test-only changes inside the fenced files: the lane-paused search test installs a ready trigram index instead of waiting on a background build, and the long-line grep test runs its scan on a frozen test clock. No production search code changes; benchmark rows must remain byte-identical."
+}
