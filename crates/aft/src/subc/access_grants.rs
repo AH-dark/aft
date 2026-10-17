@@ -324,12 +324,8 @@ pub(super) fn policy_for_scope(
         .unwrap_or_default();
     let mut policy = AccessPolicy::from_config(&config, &ctx.storage_dir(), roots, &home);
     policy.mode = store::mode(conn, key)?;
-    policy.grants = store::list(conn, key)?;
-    if store::is_worker(conn, key)? {
-        policy
-            .grants
-            .extend(crate::access_policy::worker_rust_read_grants());
-    }
+    let stored = store::list(conn, key)?;
+    policy.install_scope_grants(stored, store::is_worker(conn, key)?);
     Ok(Some(policy))
 }
 

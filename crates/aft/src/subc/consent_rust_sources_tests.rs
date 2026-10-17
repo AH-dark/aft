@@ -382,3 +382,33 @@ async fn worker_codemode_inherits_rust_read_grants() {
         .await;
     assert_no_ask(&f, &response);
 }
+
+// Policies built by the subc layer itself (consent head checks, launch-param
+// validation) must hold the same built-in grants the tool checks above see.
+#[tokio::test]
+async fn worker_scope_policy_holds_rust_read_grants() {
+    if !in_rust_home("worker_scope_policy_holds_rust_read_grants", false) {
+        return;
+    }
+    use crate::access_policy::{AccessDecision, AccessOperation};
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = rust_fixture();
+    let path = crate::access_policy::policy_path(&cargo_root().join("registry/src/example/lib.rs"));
+    let db = f.ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    for (identity, expected) in [
+        (&f.worker, AccessDecision::Allow),
+        (&f.head, AccessDecision::Ask),
+    ] {
+        let policy =
+            access_grants::policy_for_scope(&conn, &access_grants::scope_key(identity), &f.ctx)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            policy.decide(AccessOperation::Read, &path, false),
+            expected,
+            "{}",
+            identity.session
+        );
+    }
+}

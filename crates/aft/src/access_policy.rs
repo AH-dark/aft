@@ -42,46 +42,78 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
 }
 
-/// Worker library reads use daemon-owned roots, never a caller's environment.
-/// A root is pinned to its real directory the first time it resolves, so later
-/// symlink changes cannot widen a grant. A root that does not exist yet (no
-/// crate downloaded on a fresh machine) is retried on the next policy build
-/// instead of being skipped until AFT restarts.
-pub(crate) fn worker_rust_read_grants() -> Vec<AccessGrant> {
-    // Published crate sources (registry and git dependencies) and toolchains:
-    // immutable package sources workers read when changing code against them.
-    const ROOTS: [(&str, &str, &str); 3] = [
-        ("CARGO_HOME", ".cargo", "registry/src"),
-        ("CARGO_HOME", ".cargo", "git/checkouts"),
-        ("RUSTUP_HOME", ".rustup", "toolchains"),
-    ];
-    static RESOLVED: std::sync::Mutex<[Option<AccessGrant>; 3]> =
-        std::sync::Mutex::new([None, None, None]);
-    let mut resolved = RESOLVED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (slot, (variable, default, subtree)) in resolved.iter_mut().zip(ROOTS) {
-        if slot.is_none() {
-            *slot = resolve_worker_rust_root(variable, default, subtree);
-        }
-    }
-    resolved.iter().flatten().cloned().collect()
+/// Published crate sources (registry and git dependencies) and toolchains:
+/// immutable package sources a worker reads when changing code against them.
+/// Each entry is the home's environment variable, its default directory under
+/// the user's home, and the subtree inside that home that may be read. The rest
+/// of each home (credentials, config, `git/db`, registry cache and index) is not
+/// granted.
+const WORKER_RUST_ROOTS: [(&str, &str, &str); 3] = [
+    ("CARGO_HOME", ".cargo", "registry/src"),
+    ("CARGO_HOME", ".cargo", "git/checkouts"),
+    ("RUSTUP_HOME", ".rustup", "toolchains"),
+];
+
+/// The built-in read grants for Rust library sources that every live worker
+/// scope gets without asking. Workers read these roots from the daemon's own
+/// environment, never a caller's. A root is pinned to its real directory the
+/// first time it resolves, so later symlink changes cannot widen a grant. A
+/// root that does not exist yet (no crate downloaded on a fresh machine) is
+/// retried on the next policy build instead of being skipped until AFT
+/// restarts.
+pub(crate) struct WorkerRustSources {
+    /// Finds a home directory from its environment variable name and its
+    /// default directory under the user's home.
+    locate_home: Box<dyn Fn(&str, &str) -> Option<PathBuf> + Send + Sync>,
+    resolved: std::sync::Mutex<[Option<AccessGrant>; 3]>,
 }
 
-fn resolve_worker_rust_root(variable: &str, default: &str, subtree: &str) -> Option<AccessGrant> {
-    let root = crate::environment::non_empty_os_var(variable)
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|home| PathBuf::from(home).join(default))
-        })?;
+impl WorkerRustSources {
+    fn new(locate_home: impl Fn(&str, &str) -> Option<PathBuf> + Send + Sync + 'static) -> Self {
+        Self {
+            locate_home: Box::new(locate_home),
+            resolved: std::sync::Mutex::new([None, None, None]),
+        }
+    }
+
+    /// The roots found from this daemon's environment.
+    fn daemon() -> &'static Self {
+        static DAEMON: std::sync::LazyLock<WorkerRustSources> = std::sync::LazyLock::new(|| {
+            WorkerRustSources::new(|variable, default| {
+                crate::environment::non_empty_os_var(variable)
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .or_else(|| std::env::var_os("USERPROFILE"))
+                            .map(|home| PathBuf::from(home).join(default))
+                    })
+            })
+        });
+        &DAEMON
+    }
+
+    fn grants(&self) -> Vec<AccessGrant> {
+        let mut resolved = self
+            .resolved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (slot, (variable, default, subtree)) in resolved.iter_mut().zip(WORKER_RUST_ROOTS) {
+            if slot.is_none() {
+                *slot = (self.locate_home)(variable, default)
+                    .and_then(|root| resolve_worker_rust_root(&root, subtree));
+            }
+        }
+        resolved.iter().flatten().cloned().collect()
+    }
+}
+
+fn resolve_worker_rust_root(root: &Path, subtree: &str) -> Option<AccessGrant> {
     // The root is retried while it is missing, and a worker shell can write in
     // the Cargo cache, so it could create the subtree as a symlink to another
     // project before the next policy build. Grant only a real directory reached
     // without following any link below the configured home.
     let joined = root.join(subtree);
-    if !no_symlink_below(&root, &joined) {
+    if !no_symlink_below(root, &joined) {
         return None;
     }
     let path = joined.canonicalize().ok()?;
@@ -359,6 +391,27 @@ impl AccessPolicy {
                 .into_iter()
                 .map(|path| policy_path(&path))
                 .collect(),
+        }
+    }
+
+    /// Installs the grants a scope's policy holds: the ones stored for the scope,
+    /// plus the built-in Rust library read grants when the scope is a live
+    /// worker. Every policy built for a scope comes through here, so the
+    /// in-process tool checks and the subc consent and launch checks cannot
+    /// disagree about what a worker may read.
+    pub(crate) fn install_scope_grants(&mut self, stored: Vec<AccessGrant>, worker: bool) {
+        self.install_scope_grants_from(stored, worker, WorkerRustSources::daemon());
+    }
+
+    fn install_scope_grants_from(
+        &mut self,
+        stored: Vec<AccessGrant>,
+        worker: bool,
+        rust_sources: &WorkerRustSources,
+    ) {
+        self.grants = stored;
+        if worker {
+            self.grants.extend(rust_sources.grants());
         }
     }
 
@@ -1117,3 +1170,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "access_policy_worker_rust_tests.rs"]
+mod worker_rust_tests;

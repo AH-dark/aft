@@ -12380,12 +12380,7 @@ impl AppContext {
         };
         let build = move || {
             let mut policy = AccessPolicy::from_config(&config, &storage, roots, &home);
-            policy.grants = grants;
-            if worker {
-                policy
-                    .grants
-                    .extend(crate::access_policy::worker_rust_read_grants());
-            }
+            policy.install_scope_grants(grants, worker);
             policy.mode = mode;
             if force_restrict {
                 policy.outside = AccessDecision::Deny(AccessDenial::OutsideRoots);
