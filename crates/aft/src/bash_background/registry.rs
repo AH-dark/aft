@@ -1911,7 +1911,7 @@ impl BgTaskRegistry {
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(task, &mut snapshot);
         if let Ok(state) = task.lock_state() {
-            if let Some(note) = &state.metadata.execution_note {
+            if let Some(note) = rendered_execution_note(&state.metadata) {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
             append_remote_report(&mut snapshot.output_preview, &state.metadata);
@@ -1920,12 +1920,9 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn execution_note(&self, task_id: &str, session: &str) -> Option<String> {
-        self.task_for_session(task_id, session)?
-            .lock_state()
-            .ok()?
-            .metadata
-            .execution_note
-            .clone()
+        let task = self.task_for_session(task_id, session)?;
+        let state = task.lock_state().ok()?;
+        rendered_execution_note(&state.metadata)
     }
 
     pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
@@ -7159,6 +7156,11 @@ impl BgTaskRegistry {
                 })
                 .unwrap_or_else(|| (String::new(), false, None))
         };
+        if let Ok(state) = task.lock_state() {
+            if let Some(note) = rendered_execution_note(&state.metadata) {
+                output_preview = format!("{note}\n{output_preview}");
+            }
+        }
         self.append_db_hint(&task.task_id, &mut output_preview);
         let bash_output_list_envelope = cache
             .as_ref()
@@ -8614,7 +8616,7 @@ impl BgTaskRegistry {
         let (mut output_preview, output_truncated) = render
             .map(|cache| completion_preview_for_cache(cache, metadata.exit_code))
             .unwrap_or_else(|| (String::new(), false));
-        if let Some(note) = &metadata.execution_note {
+        if let Some(note) = rendered_execution_note(metadata) {
             output_preview = format!("{note}\n{output_preview}");
         }
         append_remote_report(&mut output_preview, metadata);
@@ -11396,6 +11398,20 @@ fn random_slug() -> String {
 #[cfg(test)]
 #[path = "pty_completion_test.rs"]
 mod pty_completion_tests;
+
+fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
+    let warning = metadata
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.output_incomplete.as_ref())
+        .map(remote::RemoteOutputIncomplete::warning_line);
+    match (warning, metadata.execution_note.as_deref()) {
+        (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
+        (Some(warning), _) => Some(warning),
+        (None, Some(note)) => Some(note.to_owned()),
+        (None, None) => None,
+    }
+}
 
 /// Print what a remote run's report says about the workspace after the
 /// command's output, where a reader looks once the output ends.

@@ -78,7 +78,7 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
     if remote.terminal.is_none() && remote.job_id.is_none() {
         return Some(super::RemoteRefusal {
             code: "remote_unavailable",
-            message: metadata.execution_note.clone()?,
+            message: super::rendered_execution_note(metadata)?,
         });
     }
     let crate::exec_remote::Verdict::RunLocally {
@@ -283,6 +283,67 @@ pub(crate) struct DrainingRetry {
     waited_ms: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteOutputStream {
+    Stdout,
+    Stderr,
+    Unknown,
+}
+
+impl RemoteOutputStream {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Unknown => "remote-unknown-output",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemoteOutputShortStream {
+    pub stream: RemoteOutputStream,
+    pub actual_bytes: u64,
+    pub checkpoint_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteOutputIncompleteReason {
+    CheckpointShort,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemoteOutputIncomplete {
+    pub reason: RemoteOutputIncompleteReason,
+    pub streams: Vec<RemoteOutputShortStream>,
+}
+
+impl RemoteOutputIncomplete {
+    pub(super) fn warning_line(&self) -> String {
+        let reason = match self.reason {
+            RemoteOutputIncompleteReason::CheckpointShort => "remote_output_checkpoint_short",
+        };
+        let streams = self
+            .streams
+            .iter()
+            .map(|loss| {
+                format!(
+                    "{} has {} of {} checkpointed bytes",
+                    loss.stream.label(),
+                    loss.actual_bytes,
+                    loss.checkpoint_bytes
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "Output incomplete ({reason}): {streams}; missing bytes cannot be mapped to replay sequences."
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,6 +391,8 @@ pub(crate) struct RemoteTask {
     /// `Started` record.
     #[serde(default)]
     pub output_received: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_incomplete: Option<RemoteOutputIncomplete>,
 }
 
 /// Where a remote job is, as far as its own stream has shown. Used to tell a
@@ -583,15 +646,19 @@ impl TaskSink {
             last_progress_persist: Instant::now(),
         };
         let losses: Vec<_> = [
-            ("stdout", stdout_len, remote.stdout_len),
-            ("stderr", stderr_len, remote.stderr_len),
-            ("remote-unknown-output", unknown_len, remote.unknown_len),
+            (RemoteOutputStream::Stdout, stdout_len, remote.stdout_len),
+            (RemoteOutputStream::Stderr, stderr_len, remote.stderr_len),
+            (RemoteOutputStream::Unknown, unknown_len, remote.unknown_len),
         ]
         .into_iter()
         .filter(|(_, actual, checkpoint)| actual < checkpoint)
-        .map(|(name, actual, checkpoint)| {
-            format!("{name} has {actual} of {checkpoint} checkpointed bytes")
-        })
+        .map(
+            |(stream, actual_bytes, checkpoint_bytes)| RemoteOutputShortStream {
+                stream,
+                actual_bytes,
+                checkpoint_bytes,
+            },
+        )
         .collect();
         if !losses.is_empty() {
             sink.dirty
@@ -607,17 +674,25 @@ impl TaskSink {
             remote.stdout_len = stdout_len;
             remote.stderr_len = stderr_len;
             remote.unknown_len = unknown_len;
+            let incomplete =
+                remote
+                    .output_incomplete
+                    .get_or_insert_with(|| RemoteOutputIncomplete {
+                        reason: RemoteOutputIncompleteReason::CheckpointShort,
+                        streams: Vec::new(),
+                    });
+            for loss in losses {
+                if !incomplete
+                    .streams
+                    .iter()
+                    .any(|saved| saved.stream == loss.stream)
+                {
+                    incomplete.streams.push(loss);
+                }
+            }
             // Keep the saved sequence number and any known command outcome.
             // Replaying earlier records would duplicate bytes in intact streams;
             // no per-record byte offsets are saved to separate them from lost bytes.
-            let note = state
-                .metadata
-                .execution_note
-                .get_or_insert_with(String::new);
-            note.push_str(&format!(
-                "\nOutput incomplete (remote_output_checkpoint_short): {}; missing bytes cannot be mapped to replay sequences.",
-                losses.join("; ")
-            ));
             if let Err(error) = registry.persist_task_locked(&sink.task, &state.metadata, &mut db) {
                 state.metadata = previous;
                 return Err(error);
@@ -1122,6 +1197,7 @@ impl BgTaskRegistry {
             queue_position: None,
             output_received: false,
             retry: None,
+            output_incomplete: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -1992,21 +2068,6 @@ impl BgTaskRegistry {
                 .as_ref()
                 .map(remote_execution_note)
                 .unwrap_or_else(|| format!("ran remotely on {RUNNER_ID}"));
-            // Short output files are recorded in the note before a terminal proof
-            // is published. Keep that warning visible when the final note changes.
-            let checkpoint_warnings: Vec<_> = state
-                .metadata
-                .execution_note
-                .as_deref()
-                .map(|note| {
-                    note.lines()
-                        .filter(|line| {
-                            line.contains("Output incomplete (remote_output_checkpoint_short)")
-                        })
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
             if unknown {
                 if let Some(remote) = state.metadata.remote.as_ref() {
                     let job_id = remote
@@ -2071,24 +2132,6 @@ impl BgTaskRegistry {
                     .execution_note
                     .get_or_insert_with(|| remote_note.clone());
                 note.push_str(&format!("\n{reason}"));
-            }
-            if !checkpoint_warnings.is_empty() {
-                let note = state
-                    .metadata
-                    .execution_note
-                    .get_or_insert_with(String::new);
-                let missing_warnings: Vec<_> = checkpoint_warnings
-                    .into_iter()
-                    .filter(|warning| !note.lines().any(|line| line == warning))
-                    .collect();
-                if !missing_warnings.is_empty() {
-                    let final_note = std::mem::take(note);
-                    let mut combined = missing_warnings;
-                    if !final_note.is_empty() {
-                        combined.push(final_note);
-                    }
-                    *note = combined.join("\n");
-                }
             }
             task.mark_terminal_now();
             let _ = self.persist_task_locked(task, &state.metadata, &mut db);

@@ -1505,6 +1505,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -2291,14 +2292,32 @@ fn exec_remote_bash_restart_short_checkpoint_never_zero_fills() {
             "short stderr must not be padded"
         );
         let disk = read_task(&paths.json).unwrap();
-        let note = disk.execution_note.as_deref().unwrap_or_default();
+        let incomplete = disk
+            .remote
+            .as_ref()
+            .unwrap()
+            .output_incomplete
+            .as_ref()
+            .expect("short checkpoint loss is stored structurally");
         assert!(
-            note.contains("Output incomplete (remote_output_checkpoint_short)"),
-            "{note}"
+            incomplete.reason == RemoteOutputIncompleteReason::CheckpointShort,
+            "{incomplete:?}"
         );
-        for name in ["stdout", "stderr", "remote-unknown-output"] {
-            assert!(note.contains(name), "missing {name}: {note}");
+        for stream in [
+            RemoteOutputStream::Stdout,
+            RemoteOutputStream::Stderr,
+            RemoteOutputStream::Unknown,
+        ] {
+            assert!(
+                incomplete.streams.iter().any(|loss| loss.stream == stream),
+                "missing {stream:?}: {incomplete:?}"
+            );
         }
+        assert!(!disk
+            .execution_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Output incomplete"));
         let remote = disk.remote.unwrap();
         assert_eq!(
             (remote.stdout_len, remote.stderr_len, remote.unknown_len),
@@ -2333,10 +2352,12 @@ fn exec_remote_bash_restart_short_checkpoint_never_zero_fills() {
         let task = again.task(&task_id).unwrap();
         let _sink = TaskSink::new(&again, task).unwrap();
         let disk = read_task(&paths.json).unwrap();
-        assert!(disk
+        assert!(disk.remote.as_ref().unwrap().output_incomplete.is_some());
+        assert!(!disk
             .execution_note
-            .unwrap()
-            .contains("remote_output_checkpoint_short"));
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Output incomplete"));
         assert!(!fs::read(&paths.stdout).unwrap().contains(&0));
         assert!(!fs::read(&paths.stderr).unwrap().contains(&0));
     }
@@ -2396,12 +2417,40 @@ fn recover_short_checkpoint(
 }
 
 fn assert_checkpoint_warning_is_visible(registry: &BgTaskRegistry, task_id: &str) {
-    let warning = "Output incomplete (remote_output_checkpoint_short)";
+    let task = registry.task(task_id).unwrap();
+    let metadata = task.state.lock().unwrap().metadata.clone();
+    let incomplete = metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .output_incomplete
+        .as_ref()
+        .expect("short checkpoint loss remains in remote metadata");
+    let warning = incomplete.warning_line();
     let note = registry.execution_note(task_id, "session").unwrap();
-    assert!(note.starts_with(warning), "{note}");
+    assert!(note.starts_with(&warning), "{note}");
+    assert!(!metadata
+        .execution_note
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Output incomplete"));
     let snapshot = registry.observed_status(task_id, "session", 8192).unwrap();
     assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
-    assert!(snapshot.output_preview.contains(warning), "{snapshot:?}");
+    assert!(snapshot.output_preview.contains(&warning), "{snapshot:?}");
+}
+
+fn assert_checkpoint_warning_is_in_completion(registry: &BgTaskRegistry, task_id: &str) {
+    let completion = registry
+        .drain_completions()
+        .into_iter()
+        .find(|completion| completion.task_id == task_id)
+        .expect("completed remote task queues a completion notice");
+    assert!(
+        completion
+            .output_preview
+            .contains("Output incomplete (remote_output_checkpoint_short)"),
+        "{completion:?}"
+    );
 }
 
 #[test]
@@ -2415,6 +2464,7 @@ fn exec_remote_bash_short_checkpoint_warning_survives_normal_completion() {
     registry.remote_terminal(&task, exec::grade(&record), None);
 
     assert_checkpoint_warning_is_visible(&registry, &task_id);
+    assert_checkpoint_warning_is_in_completion(&registry, &task_id);
 }
 
 #[test]
@@ -2423,6 +2473,7 @@ fn exec_remote_bash_short_checkpoint_warning_survives_saved_terminal_proof() {
     registry.remote_terminal(&task, exec::grade(&record.unwrap()), None);
 
     assert_checkpoint_warning_is_visible(&registry, &task_id);
+    assert_checkpoint_warning_is_in_completion(&registry, &task_id);
 }
 
 #[test]
@@ -2440,6 +2491,20 @@ fn exec_remote_bash_short_checkpoint_warning_survives_second_restart() {
     restarted.replay_session(dir.path(), "session").unwrap();
 
     assert_checkpoint_warning_is_visible(&restarted, &task_id);
+}
+
+#[test]
+fn exec_remote_bash_old_record_without_output_incomplete_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_registry, _task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let bytes = fs::read(&paths.json).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value["remote"].get("output_incomplete").is_none());
+
+    let loaded = read_task(&paths.json).unwrap();
+
+    assert!(loaded.remote.unwrap().output_incomplete.is_none());
 }
 
 #[test]
@@ -2588,6 +2653,7 @@ fn persist_accepted_with_snapshot(
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -4443,6 +4509,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::WaitingOnRunner);
     remote.job_id = Some(id());
@@ -4549,6 +4616,7 @@ fn remote_phase_note_says_queued_until_started_then_names_the_runner_stop() {
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     });
     let now = 1_042_900;
     // Before acceptance there is no position to report.
