@@ -849,9 +849,9 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
         "{output}"
     );
     assert!(!output.contains("moved to the background"), "{output}");
-    // Inputs were never confirmed copied, and an unknown outcome may still be
-    // using them, so the warning stays.
-    assert!(output.ends_with(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
+    // The task has finished, so it will never be queued or running: the
+    // in-flight capture warning would be a false instruction here.
+    assert!(!output.contains(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
 }
 
 #[test]
@@ -4924,8 +4924,12 @@ async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart()
     }
 }
 
+/// A recovered refusal is a finished task whether or not the runner sent
+/// Accepted. Neither bash_status nor the finished-command reply may carry the
+/// in-flight capture warning, which tells the caller to wait for queued or
+/// running states the task will never reach.
 #[tokio::test]
-async fn runon_capture_recovered_status_keeps_warning_without_accepted() {
+async fn runon_capture_recovered_terminal_status_omits_in_flight_warning() {
     use crate::commands::bash_orchestrate::REMOTE_INPUT_CAPTURE_WARNING;
     for accepted in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -4964,13 +4968,12 @@ async fn runon_capture_recovered_status_keeps_warning_without_accepted() {
         let response = crate::commands::bash_status::handle(&request, &ctx);
         assert!(!response.success, "{response:?}");
         assert_eq!(response.data["status"], "failed", "{response:?}");
-        assert_eq!(
-            response.data["output_preview"]
+        assert!(
+            !response.data["output_preview"]
                 .as_str()
                 .unwrap()
                 .contains(REMOTE_INPUT_CAPTURE_WARNING),
-            !accepted,
-            "{response:?}"
+            "accepted={accepted}: {response:?}"
         );
         let (disk, _) = ctx
             .bash_background()
@@ -4989,13 +4992,12 @@ async fn runon_capture_recovered_status_keeps_warning_without_accepted() {
             panic!("recovered refusal must remain terminal");
         };
         assert!(!response.success, "{response:?}");
-        assert_eq!(
-            response.data["output"]
+        assert!(
+            !response.data["output"]
                 .as_str()
                 .unwrap()
                 .contains(REMOTE_INPUT_CAPTURE_WARNING),
-            !accepted,
-            "{response:?}"
+            "accepted={accepted}: {response:?}"
         );
     }
 }

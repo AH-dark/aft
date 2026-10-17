@@ -950,19 +950,22 @@ pub(crate) fn detach_bash_for_module_drain(
 pub(crate) const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirmed the inputs were copied yet. Do not change or delete input files until bash_status shows the job queued or running.";
 
 /// Keep launch, detach and recovered status replies consistent until the runner's
-/// Accepted stream record confirms input capture. Preserve terminal errors and status.
+/// Accepted stream record confirms input capture. The warning tells the caller to
+/// wait for the job to be queued or running, which is true only for a task still
+/// in flight; a reply that already carries a finished status is returned as is.
 pub(crate) fn with_capture_warning(response: &Response) -> Response {
     let mut response = Response {
         id: response.id.clone(),
         success: response.success,
         data: response.data.clone(),
     };
-    if reply_announces_live_task(&response) {
-        response.data["status"] = json!("starting");
-        response.data["phase"] = json!("submitting");
-        if response.data.get("remote_phase").is_some() {
-            response.data["remote_phase"] = json!("submitting");
-        }
+    if !reply_announces_live_task(&response) {
+        return response;
+    }
+    response.data["status"] = json!("starting");
+    response.data["phase"] = json!("submitting");
+    if response.data.get("remote_phase").is_some() {
+        response.data["remote_phase"] = json!("submitting");
     }
     let field =
         if response.data.get("output").is_none() && response.data.get("output_preview").is_some() {
@@ -982,9 +985,9 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
 /// is checked against the task's saved state first: a task that already ended
 /// (refused, failed, outcome unknown, killed or completed) before `Accepted`
 /// shows that saved outcome, rendered as a finished command's reply with its
-/// advice, so the caller is never told to wait for queued or running states the
-/// task will not reach. A task still in flight gets the `starting` reply with
-/// the capture warning.
+/// advice and without the capture warning, so the caller is never told to wait
+/// for queued or running states the task will not reach. A task still in
+/// flight gets the `starting` reply with the capture warning.
 pub(crate) fn runon_uncaptured_reply(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
@@ -1000,15 +1003,14 @@ pub(crate) fn runon_uncaptured_reply(
             )
             .filter(|snapshot| snapshot.info.status.is_terminal())
         {
-            // The finished-command reply adds the capture warning itself
-            // while the runner's Accepted record is missing.
             return foreground_result_response(&response.id, snapshot);
         }
     }
     with_capture_warning(response)
 }
 
-/// Whether `with_capture_warning` would present this reply as `starting`.
+/// Whether this reply describes a task still in flight (`running`, `starting`,
+/// or no status at all), which `with_capture_warning` presents as `starting`.
 pub(crate) fn reply_announces_live_task(response: &Response) -> bool {
     matches!(
         response.data["status"].as_str(),
@@ -1029,8 +1031,10 @@ pub(crate) fn with_runon_capture_state(
     }
 }
 
+/// A finished task's reply. It never carries the input-capture warning: that
+/// warning asks the caller to wait for queued or running states a finished task
+/// will not reach, even when the runner never confirmed capture.
 fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
-    let inputs_captured = snapshot.remote_inputs_captured;
     let task_line = foreground_task_line(&snapshot);
     let (output, foreground_envelope) =
         if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {
@@ -1059,7 +1063,7 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
             (output, None)
         };
     if let Some(refusal) = &snapshot.remote_refusal {
-        let response = Response::error_with_data(
+        return Response::error_with_data(
             request_id,
             refusal.code,
             &refusal.message,
@@ -1070,11 +1074,6 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
                 "output": output,
             }),
         );
-        return if inputs_captured == Some(false) {
-            with_capture_warning(&response)
-        } else {
-            response
-        };
     }
     if snapshot.sandbox_native
         && snapshot.sandbox_unavailable
@@ -1116,12 +1115,7 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
     if let Some(job_id) = &snapshot.remote_job_id {
         data["remote_job_id"] = json!(job_id);
     }
-    let response = Response::success(request_id, data);
-    if inputs_captured == Some(false) {
-        with_capture_warning(&response)
-    } else {
-        response
-    }
+    Response::success(request_id, data)
 }
 
 /// The line naming the task (and its build-server job, for a `runon` task) at

@@ -2435,6 +2435,119 @@ async fn submit_bash_promote(
     ToolCallResult { text, response }
 }
 
+/// Rechecks a finalized reply against the task's saved input-capture state
+/// just before it is sent. A live-task reply for a task whose runner never sent
+/// Accepted gets the capture warning; if that task has since finished, the
+/// reply is replaced by its saved outcome (see [`carry_finalization`]).
+async fn recheck_runon_capture(
+    result: ToolCallResult,
+    ctx: &AppContext,
+    task_id: &str,
+    session_id: &str,
+    format_context: &crate::subc_format::FormatContext,
+) -> ToolCallResult {
+    let announced_live =
+        crate::commands::bash_orchestrate::reply_announces_live_task(&result.response);
+    let replacement = warn_if_runon_capture_missing(
+        ctx.bash_background().clone(),
+        task_id.to_owned(),
+        session_id.to_owned(),
+        copy_response(&result.response),
+    )
+    .await;
+    if announced_live && !crate::commands::bash_orchestrate::reply_announces_live_task(&replacement)
+    {
+        return carry_finalization(result, replacement, ctx, session_id, format_context).await;
+    }
+    let mut result = ToolCallResult {
+        text: result.text,
+        response: replacement,
+    };
+    if result.response.data["output"]
+        .as_str()
+        .is_some_and(|text| text.ends_with(REMOTE_INPUT_CAPTURE_WARNING))
+        && !result.text.contains(REMOTE_INPUT_CAPTURE_WARNING)
+    {
+        result
+            .text
+            .push_str(&format!("\n{REMOTE_INPUT_CAPTURE_WARNING}"));
+    }
+    result
+}
+
+/// Builds the reply for a task that finished before its runner confirmed input
+/// capture, replacing a live-task reply that was already finalized.
+///
+/// Finalization is not run again: it consumed one-shot items into the earlier
+/// reply (background completions drained for the session, cancelled-call
+/// notices) and appended the status bar, so a second pass would lose them.
+/// Instead, everything the finalizer added after the formatted body, and the
+/// completions and gaps it attached to the response, move onto the replacement.
+/// The formatted body stays a prefix of the text, which the repeat breaker in
+/// `observe_completed_bash_result` relies on. A finished result is acknowledged
+/// for the session, as finalization does for a finished reply, so the same
+/// outcome is not delivered again as a background completion.
+async fn carry_finalization(
+    previous: ToolCallResult,
+    replacement: Response,
+    ctx: &AppContext,
+    session_id: &str,
+    format_context: &crate::subc_format::FormatContext,
+) -> ToolCallResult {
+    let previous_body = crate::subc_format::format_response_with_context(
+        "bash",
+        &previous.response,
+        format_context,
+    );
+    let additions = previous
+        .text
+        .strip_prefix(&previous_body)
+        .unwrap_or_default()
+        .trim_start_matches('\n');
+    let mut response = replacement;
+    if let Some(completions) = previous.response.data.get("bg_completions") {
+        response.data["bg_completions"] = completions.clone();
+    }
+    if previous.response.data.get("complete") == Some(&json!(false)) {
+        response.data["complete"] = json!(false);
+    }
+    if let Some(previous_gaps) = previous.response.data["gaps"].as_array() {
+        if !response.data["gaps"].is_array() {
+            response.data["gaps"] = json!([]);
+        }
+        if let Some(gaps) = response.data["gaps"].as_array_mut() {
+            for gap in previous_gaps {
+                if !gaps.contains(gap) {
+                    gaps.push(gap.clone());
+                }
+            }
+        }
+    }
+    let mut text =
+        crate::subc_format::format_response_with_context("bash", &response, format_context);
+    if !additions.is_empty() {
+        if !text.is_empty() {
+            text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+        }
+        text.push_str(additions);
+    }
+    let finished = response.success
+        && matches!(
+            response.data["status"].as_str(),
+            Some("completed" | "failed" | "killed" | "timed_out" | "fate_unknown")
+        );
+    if let Some(task_id) = response.data["task_id"].as_str().filter(|_| finished) {
+        let registry = ctx.bash_background().clone();
+        let task_id = task_id.to_owned();
+        let session_id = session_id.to_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            registry.ack_terminal_result_for_session(&task_id, &session_id)
+        })
+        .await;
+    }
+    ToolCallResult { text, response }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_ready_bash_result(
     completion_tx: &mpsc::Sender<BashDeferredCompletion>,
@@ -2445,7 +2558,7 @@ async fn send_ready_bash_result(
     ver: u8,
     root: ProjectRootId,
     request_id: String,
-    mut result: ToolCallResult,
+    result: ToolCallResult,
     ctx: &AppContext,
     format_context: &crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
@@ -2455,31 +2568,7 @@ async fn send_ready_bash_result(
 ) {
     // Capture is not a second blocking-call deadline. Inspect it only when the
     // normal wait is ready to answer, and preserve that answer with a warning.
-    let announced_live =
-        crate::commands::bash_orchestrate::reply_announces_live_task(&result.response);
-    result.response = warn_if_runon_capture_missing(
-        ctx.bash_background().clone(),
-        task_id.to_owned(),
-        session_id.to_owned(),
-        result.response,
-    )
-    .await;
-    if announced_live
-        && !crate::commands::bash_orchestrate::reply_announces_live_task(&result.response)
-    {
-        // The task ended before the runner confirmed input capture, so the
-        // reply now carries its saved outcome; the earlier text described a
-        // live task and must not be sent.
-        result = bash_result_from_response(result.response, format_context);
-    } else if result.response.data["output"]
-        .as_str()
-        .is_some_and(|text| text.ends_with(REMOTE_INPUT_CAPTURE_WARNING))
-        && !result.text.contains(REMOTE_INPUT_CAPTURE_WARNING)
-    {
-        result
-            .text
-            .push_str(&format!("\n{REMOTE_INPUT_CAPTURE_WARNING}"));
-    }
+    let result = recheck_runon_capture(result, ctx, task_id, session_id, format_context).await;
     let fatal = response_is_fatal_panic(&result.response);
     if claim.try_claim_for_wait_task() {
         let result = observe_completed_bash_result(result, ctx, format_context, repeat);
@@ -3783,7 +3872,7 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runon_capture_draining_then_ended_warns() {
+    async fn runon_capture_draining_then_killed_reports_outcome_without_warning() {
         use crate::exec_remote::wire_tests::Script;
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::Draining {
             refusals: u32::MAX,
@@ -3852,14 +3941,18 @@ mod grant_path_tests {
             .await
             .unwrap()
             .unwrap();
+        // Killed during the draining retry, before Accepted: the reply is the
+        // finished task's outcome, without the in-flight capture warning.
+        let response = done.response_for_test();
+        assert_eq!(response.data["status"], "killed", "{response:?}");
         assert!(
-            done.text_for_test()
+            !done
+                .text_for_test()
                 .unwrap()
                 .contains(REMOTE_INPUT_CAPTURE_WARNING),
-            "ending without Accepted must warn: {:?}",
-            done.response_for_test()
+            "a finished task is never queued or running: {response:?}"
         );
-        assert_eq!(done.response_for_test().data["task_id"], task_id);
+        assert_eq!(response.data["task_id"], task_id);
     }
 
     #[cfg(unix)]
@@ -4312,6 +4405,10 @@ mod grant_path_tests {
             );
             assert_ne!(response.data["phase"], "submitting", "{response:?}");
             assert!(
+                !text.contains(REMOTE_INPUT_CAPTURE_WARNING),
+                "background={background}: {text}"
+            );
+            assert!(
                 text.contains("remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe"),
                 "background={background}: {text}"
             );
@@ -4325,6 +4422,128 @@ mod grant_path_tests {
                 crate::bash_background::BgTaskStatus::FateUnknown
             );
         }
+    }
+
+    /// A ready reply finalized while its task looked live can turn out to
+    /// describe a task that finished before the runner sent Accepted. Its
+    /// replacement shows the saved outcome but keeps what finalization added:
+    /// the trailing status text, the background completions it drained, and
+    /// the formatted body as the text's prefix, so the repeat breaker still
+    /// places its reminder before that trailing text. The finished result is
+    /// acknowledged, as finalization does for a finished reply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_ready_reply_swap_keeps_finalization() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, dir, root, executor, ctx) = capture_fixture(Script::DropBeforeAccepted).await;
+        let mut rx = capture_call(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+        );
+        wait_for_capture_submission(&daemon, &mut rx).await;
+        let launched = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let task_id = launched.response_for_test().data["task_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            ctx.bash_background()
+                .observed_status(&task_id, "deadline-session", 0)
+                .unwrap()
+                .info
+                .status,
+            crate::bash_background::BgTaskStatus::FateUnknown
+        );
+        assert!(ctx
+            .bash_background()
+            .has_completions_for_session(Some("deadline-session")));
+
+        let args = json!({"command":"uname -s"});
+        let format_context =
+            crate::subc_format::FormatContext::from_tool_call("bash", &args, dir.path());
+        let completions = json!([{"task_id":"earlier-task", "status":"completed"}]);
+        let live = Response::success(
+            "ready-reply",
+            json!({
+                "output": "Command moved to the background",
+                "task_id": task_id,
+                "status": "running",
+                "bg_completions": completions,
+            }),
+        );
+        let additions = "[AFT E1 W2 | D0 U0 C0 | T0]";
+        let live_text = format!(
+            "{}\n\n{additions}",
+            crate::subc_format::format_response_with_context("bash", &live, &format_context)
+        );
+        let swapped = recheck_runon_capture(
+            ToolCallResult {
+                text: live_text,
+                response: live,
+            },
+            &ctx,
+            &task_id,
+            "deadline-session",
+            &format_context,
+        )
+        .await;
+        assert_eq!(
+            swapped.response.data["status"], "fate_unknown",
+            "{:?}",
+            swapped.response
+        );
+        assert_eq!(swapped.response.data["bg_completions"], completions);
+        let body = crate::subc_format::format_response_with_context(
+            "bash",
+            &swapped.response,
+            &format_context,
+        );
+        assert!(swapped.text.starts_with(&body), "{}", swapped.text);
+        assert!(swapped.text.ends_with(additions), "{}", swapped.text);
+        assert!(
+            swapped.text.contains("rerunning is safe"),
+            "{}",
+            swapped.text
+        );
+        assert!(!swapped.text.contains("moved to the background"));
+        assert!(!swapped.text.contains(REMOTE_INPUT_CAPTURE_WARNING));
+        assert!(
+            !ctx.bash_background()
+                .drain_completions_for_session(Some("deadline-session"))
+                .iter()
+                .any(|completion| completion.task_id == task_id),
+            "the finished result was delivered in the reply"
+        );
+
+        // Two earlier identical calls, a minute ago, so this third one is steered
+        // without the test waiting out the breaker's minimum span. They use
+        // their own session: the launch above was already observed in
+        // "deadline-session", and the breaker measures from that first call.
+        let call = crate::response_finalize::repeat_breaker::RepeatCall::new("bash", &args);
+        let earlier = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        for _ in 0..2 {
+            ctx.repeat_breaker()
+                .observe_at("repeat-session", &call, 0, earlier);
+        }
+        let repeat = crate::run_tool_call::RepeatObservation::for_agent_call(
+            "repeat-session",
+            "bash",
+            &args,
+            false,
+            false,
+            false,
+        );
+        let text = observe_completed_bash_result(swapped, &ctx, &format_context, repeat).text;
+        let reminder = text
+            .find("<system-reminder>")
+            .unwrap_or_else(|| panic!("the third identical call must be steered: {text}"));
+        assert!(text.starts_with(&body), "{text}");
+        assert!(text.ends_with(additions), "{text}");
+        assert!(reminder < text.len() - additions.len(), "{text}");
     }
 
     /// A runner that accepts and then finishes keeps the ordinary launch reply:

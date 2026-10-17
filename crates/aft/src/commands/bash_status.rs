@@ -148,6 +148,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     match snapshot {
         Some(mut snapshot) => {
             let inputs_captured = snapshot.remote_inputs_captured;
+            // The capture warning asks the caller to wait for queued or running;
+            // a finished task shows its outcome and its own advice instead.
+            let in_flight = !snapshot.info.status.is_terminal();
             let pty_raw = maybe_render_pty_screen(
                 ctx,
                 task_session,
@@ -249,7 +252,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 }
                 Response::success(&req.id, data)
             };
-            if inputs_captured == Some(false) {
+            if inputs_captured == Some(false) && in_flight {
                 super::bash_orchestrate::with_capture_warning(&response)
             } else {
                 response
