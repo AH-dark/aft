@@ -514,7 +514,14 @@ fn artifact_read_grep_and_glob_exact_file_under_root_restriction() {
             &ctx,
         );
         assert!(glob.success, "{restrict}: {:?}", glob.data);
-        assert_eq!(glob.data["files"], json!([artifact]));
+        let files = glob.data["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{restrict}: {:?}", glob.data);
+        // Glob resolves paths before returning them, so compare file identities rather than
+        // temp-directory aliases (macOS) or verbatim path prefixes (Windows).
+        assert_eq!(
+            std::fs::canonicalize(files[0].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&artifact).unwrap()
+        );
     }
 }
 artifact_read_tool_test!(

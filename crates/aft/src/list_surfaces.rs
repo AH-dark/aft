@@ -577,6 +577,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "test walk-list truncate",
         reason: "ignored manual reproduction test that replays the former 1,000-file fallback walk cap to compare it with the current walk; no tool response is produced",
     },
+    ExclusionEntry {
+        file: "commands/glob.rs",
+        enclosing_item: "exact_file_glob_with_ready_index_matches_basename_without_widening_scope, exact_file_glob_fallback_matches_basename_without_widening_scope",
+        location_or_primitive: "test walk_truncated assertions",
+        reason: "test-only assertions on walk_truncated for indexed and fallback exact-file discovery; they do not cut a list or produce a tool response",
+    },
     // Checkpoint and restore results name their first files and then say how
     // many more there are; the checkpoint itself always covers every file.
     ExclusionEntry {
