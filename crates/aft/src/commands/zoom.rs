@@ -1574,6 +1574,16 @@ fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
     let observation = if served_by_view {
         let access = ctx.callgraph_store_for_query_without_wait();
         match &access {
+            // A view reader opens the published database without a busy wait,
+            // so a publication checkpointing it (or a writer holding it) makes
+            // the open fail with SQLite busy/locked for a moment. That is not
+            // a verdict about the graph: report it as building, the same
+            // retryable answer `callers` and the other graph commands give.
+            crate::context::CallgraphStoreAccess::Error(error)
+                if error.is_transient_lock_contention() =>
+            {
+                IndexObservation::building()
+            }
             crate::context::CallgraphStoreAccess::Error(error) => {
                 IndexObservation::unavailable(error.to_string())
             }

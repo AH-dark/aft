@@ -15284,6 +15284,57 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
+    /// Zoom's call graph field reads the same store as `callers` and must give
+    /// the same verdict for a busy database: building, retry shortly. A busy
+    /// open says nothing about whether the graph exists, so reporting it as
+    /// `callgraph_unavailable` would present a moment of contention as a fact
+    /// about the index.
+    #[test]
+    fn views_keyed_generation_zoom_reports_building_while_derived_store_is_busy() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.publish();
+        let zoom = || {
+            crate::commands::zoom::handle_zoom(
+                &RawRequest {
+                    id: "views-zoom".to_owned(),
+                    command: "zoom".to_owned(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({
+                        "file": fixture.source,
+                        "symbol": "target",
+                        "callgraph": true,
+                    }),
+                },
+                &fixture.ctx,
+            )
+        };
+        let busy = fixture.hold_pinned_derived_busy();
+
+        let response = zoom();
+
+        assert!(response.success, "{:#}", response.data);
+        assert_eq!(
+            response.data["callgraph"]["code"], "callgraph_building",
+            "{:#}",
+            response.data
+        );
+        assert_eq!(
+            response.data["callgraph"]["index"]["status"], "building",
+            "{:#}",
+            response.data
+        );
+        // Once the database is free again the same zoom reads the graph.
+        drop(busy);
+        let response = zoom();
+        assert!(response.success, "{:#}", response.data);
+        assert!(
+            response.data.get("callgraph").is_none(),
+            "{:#}",
+            response.data
+        );
+    }
+
     #[test]
     fn views_published_navigation_uses_cached_head_without_git_spawns() {
         let fixture = ViewsCallgraphFixture::new();
