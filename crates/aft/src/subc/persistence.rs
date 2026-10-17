@@ -575,6 +575,7 @@ mod tests {
                 ..Default::default()
             },
             crate::bash_background::persistence::unix_millis(),
+            || {},
         )
         .unwrap();
         assert!(remote_policy::confinement_from_memory(&ctx, &worker).is_none());
@@ -664,6 +665,76 @@ mod tests {
             .read_confinement(frame(3, read), &routes, &executor)
             .is_err());
         assert!(remote_policy::admit_confined_on_frame_loop(&ctx, &worker, "read", None).unwrap());
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unconfined_worker_is_read_from_aft_db_once_then_answered_from_memory() {
+        let (dir, root) = test_support::test_root("unconfined-memo");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let (worker, _) = scoped_worker_and_head(&root);
+        let routes = HashMap::from([(route_key(43, 1), worker.clone())]);
+        let frame = |corr| DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                corr,
+                serde_json::to_vec(&json!({
+                    "name": "read", "preset": "worker", "arguments": {"path": "a"},
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        };
+        let mut waits = DatabaseWaits::default();
+        // The first call reads this worker's policy from aft.db: none saved.
+        assert!(waits.read_confinement(frame(1), &routes, &executor).is_ok());
+        let resumed = tokio::time::timeout(Duration::from_secs(5), waits.next())
+            .await
+            .unwrap();
+        assert_eq!(resumed.confinement, Some(Ok(false)));
+        assert_eq!(ctx.policy_confinement_reads_for_test(), 1);
+
+        // Hold the aft.db lock, as a catalog job's policy freeze does while
+        // SQLite waits for its write lock. Released on its own after a bound,
+        // so code that blocks on it fails the timing check instead of hanging.
+        let db = ctx.db().unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _conn = db.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        // The second call is answered from memory, on the frame loop and on
+        // the executor alike, without reading aft.db or waiting for its lock.
+        let second = match waits.read_confinement(frame(2), &routes, &executor) {
+            Ok(()) => panic!("a remembered unconfined worker was read from aft.db again"),
+            Err(decoded) => decoded,
+        };
+        assert!(second.confinement.is_none());
+        assert!(!remote_policy::admit_confined_on_frame_loop(&ctx, &worker, "bash", None).unwrap());
+        assert!(!remote_policy::admit_confined(&ctx, &worker, "bash").unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a remembered unconfined worker waited {:?} for the aft.db lock",
+            started.elapsed()
+        );
+        assert_eq!(ctx.policy_confinement_reads_for_test(), 1);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
         assert!(waits.is_empty());
     }
 

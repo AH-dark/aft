@@ -154,11 +154,15 @@ pub(super) fn catalog(
                     "routing policy database lock poisoned",
                 )
             })?;
+            // A worker unconfined until now may be remembered as such: mark it
+            // confined before the fence commits, so no call can still be
+            // admitted on the older answer once the fence is saved.
             store::freeze(
                 &conn,
                 &key,
                 &policy,
                 crate::bash_background::persistence::unix_millis(),
+                || ctx.remember_confined_policy_key(key.clone()),
             )
             .map_err(|e| {
                 cortexkit_role_tool_provider::errors::invalid_request(
@@ -211,9 +215,10 @@ pub(super) fn confined_tool(name: &str) -> bool {
 /// `catalog` refuses `confine` without a database, so such a context (a
 /// library or test harness) has no store the fence could have been saved in.
 ///
-/// This never writes aft.db, and a key once found confined is answered from
-/// memory afterwards. Any other answer takes the aft.db lock, so the subc
-/// frame loop never calls this: it answers from [`confinement_from_memory`] or
+/// This never writes aft.db, and a key once read is answered from memory
+/// afterwards (see `PolicyConfinementMemo` in `context`). A read takes the
+/// aft.db lock, so the subc frame loop never calls this: it answers from
+/// [`confinement_from_memory`] or
 /// has `persistence::DatabaseWaits::read_confinement` run this on a blocking
 /// thread first (see [`admit_confined_on_frame_loop`]).
 pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> ConfinementRead {
@@ -223,11 +228,17 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
     let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
         return Err(policy_unavailable());
     };
+    // Taken before the read, so an answer that may predate a confining save
+    // is not remembered (see `AppContext::remember_unconfined_policy_key`).
+    let generation = ctx.policy_confinement_generation();
+    ctx.note_policy_confinement_read();
     let conn = db.lock().map_err(|_| policy_unavailable())?;
     let confined = store::confined(&conn, &key).map_err(|_| policy_unavailable())?;
     drop(conn);
     if confined {
         ctx.remember_confined_policy_key(key);
+    } else {
+        ctx.remember_unconfined_policy_key(key, generation, &db);
     }
     Ok(confined)
 }
@@ -244,8 +255,9 @@ pub(super) fn policy_unavailable() -> subc_protocol::ErrorBody {
 }
 
 /// The answer [`confined`] gives when it needs no aft.db read: a route that
-/// cannot hold a saved fence, a key already found confined, or a context with
-/// no database handle. `None` means the saved policy must be read from aft.db.
+/// cannot hold a saved fence, a key whose confinement this context already
+/// read or saved, or a context with no database handle. `None` means the
+/// saved policy must be read from aft.db.
 pub(super) fn confinement_from_memory(
     ctx: &AppContext,
     identity: &RouteIdentity,
@@ -253,8 +265,8 @@ pub(super) fn confinement_from_memory(
     let Some(key) = key(identity, Some("worker")) else {
         return Some(Ok(false));
     };
-    if ctx.policy_key_known_confined(&key) {
-        return Some(Ok(true));
+    if let Some(confined) = ctx.policy_key_confinement(&key) {
+        return Some(Ok(confined));
     }
     if ctx.db().is_some() {
         return None;
@@ -272,10 +284,11 @@ pub(super) fn confinement_from_memory(
 
 /// Whether a call on this route must wait for an opening aft.db before its
 /// saved confinement policy can be read. False for routes that cannot have
-/// one, and once the policy is known confined from memory.
+/// one, and once the policy is known from memory.
 pub(super) fn awaits_policy_store(ctx: &AppContext, identity: &RouteIdentity) -> bool {
     ctx.database_runtime_initializing()
-        && key(identity, Some("worker")).is_some_and(|key| !ctx.policy_key_known_confined(&key))
+        && key(identity, Some("worker"))
+            .is_some_and(|key| ctx.policy_key_confinement(&key).is_none())
 }
 
 pub(super) fn admit_confined(

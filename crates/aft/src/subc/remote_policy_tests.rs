@@ -118,6 +118,58 @@ fn confined_glob_without_path_honors_the_trees_gitignore() {
     );
 }
 
+/// An unconfined answer is remembered, but a confining save for the worker,
+/// whether asked for in a catalog fetch or carried forward from an older
+/// epoch's fence, takes effect on the worker's very next call.
+#[test]
+fn remembered_unconfined_answer_cannot_outlive_a_confining_save() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    let unconfined_plan = || json!({"preset":"worker", "params":{"remote_exec":{"enabled":true}}});
+    // The newer epoch saves an unconfined plan; both epochs read as unconfined
+    // and are remembered so.
+    catalog(unconfined_plan(), &newer, &ctx).unwrap();
+    for route in [&older, &newer] {
+        assert_eq!(confined(&ctx, route), Ok(false));
+        assert_eq!(confinement_from_memory(&ctx, route), Some(Ok(false)));
+    }
+
+    // A confining fetch on the older epoch: its next call is confined,
+    // answered from memory without reading aft.db.
+    catalog(
+        json!({"preset":"worker", "params":{"confine":"root"}}),
+        &older,
+        &ctx,
+    )
+    .unwrap();
+    let reads = ctx.policy_confinement_reads_for_test();
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &older, "bash", None)
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), reads);
+
+    // The newer epoch's own row is still unconfined, so it reads (and is
+    // remembered) as unconfined until its next fetch carries the older
+    // epoch's fence forward onto that row.
+    assert_eq!(confined(&ctx, &newer), Ok(false));
+    assert_eq!(confinement_from_memory(&ctx, &newer), Some(Ok(false)));
+    catalog(unconfined_plan(), &newer, &ctx).unwrap();
+    let reads = ctx.policy_confinement_reads_for_test();
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", None)
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), reads);
+}
+
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {
     let scope=serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"worker","scope_epoch":epoch,"kind":"worker","owner_authorized":true})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {

@@ -2698,6 +2698,31 @@ fn lock_database_slot<T>(
     Ok(slot.lock())
 }
 
+/// Remembered root-confinement answers for scoped worker policy keys.
+///
+/// Confinement is monotonic (a later catalog fetch cannot remove it), so a
+/// key found confined stays confined. An unconfined answer is also kept, so
+/// an ordinary worker's calls skip aft.db and its lock; it can go stale only
+/// through a confining save, and every such save goes through
+/// `AppContext::remember_confined_policy_key`, which marks the key confined
+/// and forgets every unconfined answer before the save commits. Unconfined
+/// answers also belong to the aft.db handle they were read from: once the
+/// context uses another database (a rebind to another storage directory, or
+/// a reopen), they no longer count and the next call reads again. A new
+/// process starts empty and reads the saved rows again.
+#[derive(Default)]
+struct PolicyConfinementMemo {
+    confined: std::collections::HashSet<crate::db::remote_exec::PolicyKey>,
+    unconfined: std::collections::HashSet<crate::db::remote_exec::PolicyKey>,
+    /// The database the `unconfined` answers were read from.
+    unconfined_db: Option<std::sync::Weak<Mutex<TrackedConnection>>>,
+    /// Bumped by every confining save, so an unconfined answer read before
+    /// one is not remembered after it.
+    generation: u64,
+    #[cfg(test)]
+    store_reads: usize,
+}
+
 #[derive(Default)]
 struct DatabaseRuntimeFailure {
     error: Option<String>,
@@ -3532,14 +3557,10 @@ pub struct AppContext {
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
     database_runtime_failure: parking_lot::Mutex<DatabaseRuntimeFailure>,
-    /// Scoped worker policy keys this context has already read as confined.
-    /// Confinement is monotonic (a later catalog fetch cannot remove it), so
-    /// a key found confined once stays confined and later calls skip aft.db.
-    /// Only positive answers are kept: an unconfined worker can still become
-    /// confined by a later catalog fetch, possibly on another route. A new
-    /// process starts empty and reads the saved row again.
-    confined_policy_keys:
-        parking_lot::Mutex<std::collections::HashSet<crate::db::remote_exec::PolicyKey>>,
+    /// What this context already knows about scoped worker policy keys'
+    /// saved root confinement, so tool calls skip the aft.db read (and the
+    /// aft.db lock). See [`PolicyConfinementMemo`].
+    policy_confinement: parking_lot::Mutex<PolicyConfinementMemo>,
     #[cfg(test)]
     database_open_attempts: AtomicU64,
     /// The pending aft.db open request, the configure epoch it belongs to, and
@@ -4251,7 +4272,7 @@ impl AppContext {
             database_runtime_state: AtomicU8::new(0),
             database_runtime_changed: tokio::sync::Notify::new(),
             database_runtime_failure: parking_lot::Mutex::new(DatabaseRuntimeFailure::default()),
-            confined_policy_keys: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            policy_confinement: parking_lot::Mutex::new(PolicyConfinementMemo::default()),
             #[cfg(test)]
             database_open_attempts: AtomicU64::new(0),
             database_open: parking_lot::Mutex::new(Default::default()),
@@ -6499,15 +6520,83 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn policy_key_known_confined(
+    /// The remembered confinement of `key`: `Some(true)` once known confined
+    /// (which always wins), `Some(false)` once read as unconfined and not
+    /// confined since, `None` when only aft.db can answer.
+    pub(crate) fn policy_key_confinement(
         &self,
         key: &crate::db::remote_exec::PolicyKey,
-    ) -> bool {
-        self.confined_policy_keys.lock().contains(key)
+    ) -> Option<bool> {
+        // Never waits for the database handle slot, which an open holds while
+        // SQLite opens: the subc frame loop asks this. A busy slot only means
+        // a remembered unconfined answer cannot be checked against it now.
+        let db = self.app.try_db().flatten();
+        let memo = self.policy_confinement.lock();
+        if memo.confined.contains(key) {
+            return Some(true);
+        }
+        let same_db = match (&db, memo.unconfined_db.as_ref().and_then(|db| db.upgrade())) {
+            (Some(current), Some(read_from)) => Arc::ptr_eq(current, &read_from),
+            _ => false,
+        };
+        (same_db && memo.unconfined.contains(key)).then_some(false)
     }
 
+    /// Mark `key` confined. Call it before the transaction that saves a
+    /// confining policy commits, so no call can use an older "unconfined"
+    /// answer once the fence is saved. Every remembered "unconfined" answer
+    /// is dropped too, not only this key's: a key with no row for its own
+    /// epoch reads an older epoch's row (see `db::remote_exec::confined`), so
+    /// fencing one epoch can confine another key of the same worker.
     pub(crate) fn remember_confined_policy_key(&self, key: crate::db::remote_exec::PolicyKey) {
-        self.confined_policy_keys.lock().insert(key);
+        let mut memo = self.policy_confinement.lock();
+        memo.confined.insert(key);
+        memo.unconfined.clear();
+        memo.generation = memo.generation.wrapping_add(1);
+    }
+
+    /// The generation to pass to [`Self::remember_unconfined_policy_key`]:
+    /// take it before reading a key's policy from aft.db.
+    pub(crate) fn policy_confinement_generation(&self) -> u64 {
+        self.policy_confinement.lock().generation
+    }
+
+    /// Remember that the aft.db handle `db` said `key` is unconfined, unless a
+    /// key was marked confined since `generation` was taken: that read may
+    /// predate the fence, so it is not kept and the next call reads again.
+    pub(crate) fn remember_unconfined_policy_key(
+        &self,
+        key: crate::db::remote_exec::PolicyKey,
+        generation: u64,
+        db: &Arc<Mutex<TrackedConnection>>,
+    ) {
+        let mut memo = self.policy_confinement.lock();
+        if memo.generation != generation || memo.confined.contains(&key) {
+            return;
+        }
+        let same_db = memo
+            .unconfined_db
+            .as_ref()
+            .and_then(|db| db.upgrade())
+            .is_some_and(|read_from| Arc::ptr_eq(db, &read_from));
+        if !same_db {
+            memo.unconfined.clear();
+            memo.unconfined_db = Some(Arc::downgrade(db));
+        }
+        memo.unconfined.insert(key);
+    }
+
+    /// Count one read of a policy key's confinement from aft.db.
+    pub(crate) fn note_policy_confinement_read(&self) {
+        #[cfg(test)]
+        {
+            self.policy_confinement.lock().store_reads += 1;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy_confinement_reads_for_test(&self) -> usize {
+        self.policy_confinement.lock().store_reads
     }
 
     pub(crate) fn database_runtime_failed(&self) -> bool {

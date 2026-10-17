@@ -33,11 +33,18 @@ impl PolicyKey {
     }
 }
 
+/// Save `policy` as `key`'s catalog params. When the saved row will carry the
+/// root confinement fence (asked for now, or carried from an older epoch of
+/// the same worker), `before_confining_commit` runs inside the transaction
+/// just before it commits, so a caller can mark the key confined in memory
+/// before any reader can see the fence in aft.db. If the commit then fails,
+/// the key stays marked confined, which only restricts the worker.
 pub fn freeze(
     conn: &Connection,
     key: &PolicyKey,
     policy: &FrozenParams,
     now: u64,
+    before_confining_commit: impl FnOnce(),
 ) -> rusqlite::Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let v = key.values();
@@ -97,6 +104,7 @@ pub fn freeze(
                 key.epoch.to_string()
             ],
         )?;
+        before_confining_commit();
     }
     tx.commit()
 }
@@ -275,7 +283,7 @@ mod tests {
         let key = key(dir.path());
         {
             let conn = crate::db::open(&path).unwrap();
-            freeze(&conn, &key, &policy(true), 100).unwrap();
+            freeze(&conn, &key, &policy(true), 100, || {}).unwrap();
             assert!(
                 lookup(&conn, &key, 100).unwrap().is_some(),
                 "the first process routed before restart"
@@ -298,10 +306,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
         let first = key(dir.path());
-        freeze(&conn, &first, &policy(true), 100).unwrap();
+        freeze(&conn, &first, &policy(true), 100, || {}).unwrap();
         let mut second = first.clone();
         second.session = "two".into();
-        freeze(&conn, &second, &policy(false), 100).unwrap();
+        freeze(&conn, &second, &policy(false), 100, || {}).unwrap();
         assert!(
             lookup(&conn, &first, 200)
                 .unwrap()
@@ -347,7 +355,7 @@ mod tests {
             host: Some("runner".into()),
             ..policy(true)
         };
-        freeze(&conn, &first, &frozen, 100).unwrap();
+        freeze(&conn, &first, &frozen, 100, || {}).unwrap();
         let mut revived = first.clone();
         revived.epoch = 2;
         let carried = lookup(&conn, &revived, 200).unwrap().unwrap();
@@ -386,10 +394,10 @@ mod tests {
         let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
         let mut first = key(dir.path());
         first.epoch = 1;
-        freeze(&conn, &first, &policy(true), 100).unwrap();
+        freeze(&conn, &first, &policy(true), 100, || {}).unwrap();
         let mut second = first.clone();
         second.epoch = 2;
-        freeze(&conn, &second, &policy(false), 100).unwrap();
+        freeze(&conn, &second, &policy(false), 100, || {}).unwrap();
         let mut third = first.clone();
         third.epoch = 3;
         assert!(
@@ -419,7 +427,7 @@ mod tests {
         }
         let mut newer = first.clone();
         newer.epoch = u64::MAX - 1;
-        freeze(&conn, &newer, &policy(true), 100).unwrap();
+        freeze(&conn, &newer, &policy(true), 100, || {}).unwrap();
         newer.epoch = u64::MAX;
         assert!(
             lookup(&conn, &newer, 200)
@@ -446,6 +454,7 @@ mod tests {
                 ..policy(false)
             },
             100,
+            || {},
         )
         .unwrap();
         for different in 0..7 {
@@ -460,7 +469,7 @@ mod tests {
                 5 => other.preset = "head".into(),
                 _ => other.session = "two".into(),
             }
-            freeze(&conn, &other, &policy(true), 200).unwrap();
+            freeze(&conn, &other, &policy(true), 200, || {}).unwrap();
             assert!(lookup(&conn, &other, 200)
                 .unwrap()
                 .unwrap()
@@ -470,7 +479,7 @@ mod tests {
         for epoch in [10, u64::MAX - 1, u64::MAX] {
             let mut rebound = first.clone();
             rebound.epoch = epoch;
-            freeze(&conn, &rebound, &policy(true), 300).unwrap();
+            freeze(&conn, &rebound, &policy(true), 300, || {}).unwrap();
             // Inspect the inserted row before lookup can copy an older policy.
             let v = rebound.values();
             let json: String = conn
@@ -508,7 +517,7 @@ mod tests {
             );
             let dir = tempfile::tempdir().unwrap();
             let key = key(dir.path());
-            freeze(&conn, &key, &policy(true), 100).unwrap();
+            freeze(&conn, &key, &policy(true), 100, || {}).unwrap();
             assert!(lookup(&conn, &key, 200).unwrap().is_some());
         }
     }
