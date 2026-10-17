@@ -705,9 +705,10 @@ mod tests {
         assert_eq!(resumed.confinement, Some(Ok(false)));
         assert_eq!(ctx.policy_confinement_reads_for_test(), 1);
 
-        // Hold the aft.db lock, as a catalog job's policy freeze does while
-        // SQLite waits for its write lock. Released on its own after a bound,
-        // so code that blocks on it fails the timing check instead of hanging.
+        // Hold the aft.db lock, as a catalog fetch saving a worker's policy
+        // does while SQLite waits for its write lock. The holder lets go after
+        // at most five seconds, so code that blocks on the lock fails the
+        // timing check instead of hanging.
         let db = ctx.db().unwrap();
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();

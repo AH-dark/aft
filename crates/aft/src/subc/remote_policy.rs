@@ -228,8 +228,9 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
     let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
         return Err(policy_unavailable());
     };
-    // Taken before the read, so an answer that may predate a confining save
-    // is not remembered (see `AppContext::remember_unconfined_policy_key`).
+    // Capture the memo generation before reading aft.db: if a policy saving
+    // `confine: "root"` commits after this read, the read's "unconfined"
+    // answer is not remembered (see `AppContext::remember_unconfined_policy_key`).
     let generation = ctx.policy_confinement_generation();
     ctx.note_policy_confinement_read();
     let conn = db.lock().map_err(|_| policy_unavailable())?;

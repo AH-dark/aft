@@ -3557,9 +3557,10 @@ pub struct AppContext {
     database_runtime_state: AtomicU8,
     database_runtime_changed: tokio::sync::Notify,
     database_runtime_failure: parking_lot::Mutex<DatabaseRuntimeFailure>,
-    /// What this context already knows about scoped worker policy keys'
-    /// saved root confinement, so tool calls skip the aft.db read (and the
-    /// aft.db lock). See [`PolicyConfinementMemo`].
+    /// Whether each scoped worker (identified by its remote-exec policy key)
+    /// saved `confine: "root"`, as far as this context has read or saved it,
+    /// so tool calls can skip the aft.db read and its lock. See
+    /// [`PolicyConfinementMemo`].
     policy_confinement: parking_lot::Mutex<PolicyConfinementMemo>,
     #[cfg(test)]
     database_open_attempts: AtomicU64,

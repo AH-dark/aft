@@ -118,9 +118,9 @@ fn confined_glob_without_path_honors_the_trees_gitignore() {
     );
 }
 
-/// An unconfined answer is remembered, but a confining save for the worker,
-/// whether asked for in a catalog fetch or carried forward from an older
-/// epoch's fence, takes effect on the worker's very next call.
+/// An unconfined answer is remembered, but saving `confine: "root"` for the
+/// worker, whether a catalog fetch asks for it or it is carried forward from
+/// an older epoch's saved policy, takes effect on the worker's very next call.
 #[test]
 fn remembered_unconfined_answer_cannot_outlive_a_confining_save() {
     let root = tempfile::tempdir().unwrap();
