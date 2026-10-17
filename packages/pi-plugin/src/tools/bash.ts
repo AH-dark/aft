@@ -10,6 +10,7 @@ import {
   formatWatchWaited,
   interruptedWatchTail,
   isBridgeTransportTimeout,
+  isLiveBackgroundTaskReply,
   isTerminalStatus,
   LONGEST_TIMER_DELAY_MS,
   maxWatchTimeoutMs,
@@ -39,6 +40,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+
 import {
   consumeBgCompletion,
   markBgCompletionDelivered,
@@ -121,25 +123,6 @@ const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 const BASH_TRANSPORT_MARGIN_MS = 10_000;
 // Mirrors Rust's REMOTE_INPUT_CAPTURE_WAIT: runon launch replies may wait for capture.
 const REMOTE_INPUT_CAPTURE_WAIT_MS = 60_000;
-
-const TERMINAL_BG_TASK_STATUSES = new Set([
-  "completed",
-  "failed",
-  "killed",
-  "timed_out",
-  "fate_unknown",
-]);
-
-function isLiveBackgroundTaskReply(
-  reply: Record<string, unknown>,
-): reply is Record<string, unknown> & { task_id: string; status: string } {
-  return (
-    typeof reply.task_id === "string" &&
-    reply.task_id.length > 0 &&
-    typeof reply.status === "string" &&
-    !TERMINAL_BG_TASK_STATUSES.has(reply.status)
-  );
-}
 
 function orchestratedTransportTimeoutMs(
   blockToCompletion: boolean,
