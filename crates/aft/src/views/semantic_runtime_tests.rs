@@ -281,6 +281,171 @@ fn lane_paused_view_cursor_retains_completed_and_unattempted_chunks() {
     });
 }
 
+/// A refusal for an announced Synapse lane pause, as the client renders it.
+fn lane_pause_error() -> String {
+    use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
+    SynapseEmbeddingError::LanePaused(LanePause {
+        lane_id: MODEL.into(),
+        fingerprint: Some("pinned".into()),
+        retry_after_ms: Some(PAUSE_MS),
+        paused_until_ms: START + PAUSE_MS,
+        reason: "maintenance".into(),
+    })
+    .to_string()
+}
+
+/// The route drops while the lane is paused, then comes back: the fill parks
+/// instead of stopping, and the rebind's wake finishes indexing.
+#[test]
+fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
+    use crate::semantic_index::{with_lane_pause_wait_hook, PauseRetryScope};
+    use std::sync::atomic::AtomicBool;
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let bound = Arc::new(AtomicBool::new(true));
+    let model = Arc::new(Model::default());
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let bound = Arc::clone(&bound);
+        let model = Arc::clone(&model);
+        let root = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            let strict = Arc::clone(&bound);
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true)
+                    .with_pause_current(move || strict.load(Ordering::SeqCst));
+            let mut paused = false;
+            // A pause wait that is not cut short returns at once instead of
+            // sleeping out the announced pause.
+            with_lane_pause_wait_hook(
+                |_| {},
+                || {
+                    serve_fills(&weak, epoch, &wake, &fast_schedule(&root), &mut |texts| {
+                        if !paused {
+                            paused = true;
+                            bound.store(false, Ordering::SeqCst);
+                            return Err(lane_pause_error());
+                        }
+                        model.embed(texts)
+                    });
+                },
+            );
+        })
+    };
+    let hang_guard = Duration::from_secs(20);
+    let parked = observer.rx.recv_timeout(hang_guard).ok();
+    if parked != Some("parked") {
+        slot.clear();
+        worker.join().unwrap();
+        panic!("a disconnect during the pause stopped the fill: {parked:?}");
+    }
+    assert_eq!(model.calls(), 0);
+    assert!(slot.is_current(epoch), "the parked lane gave up its slot");
+    bound.store(true, Ordering::SeqCst);
+    slot.wake();
+    let deadline = Instant::now() + hang_guard;
+    let finished = loop {
+        match observer.rx.recv_deadline(deadline) {
+            Ok("wake") => continue,
+            event => break event.ok(),
+        }
+    };
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(finished, Some("settled"));
+    assert!(model.calls() > 0);
+    assert!(!runtime
+        .search(&vector("alpha_total"), 100, &|_| true)
+        .unwrap()
+        .results
+        .is_empty());
+}
+
+/// The same for a pause met while the lane is still starting: the fingerprint
+/// probe parks on the disconnect and runs again after the rebind.
+#[test]
+fn lane_paused_activation_parks_on_disconnect_and_resumes_on_rebind() {
+    use crate::semantic_index::{with_lane_pause_wait_hook, PauseRetryScope};
+    use std::sync::atomic::AtomicBool;
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let observer = FillObserver::new(root.path().to_path_buf());
+    let bound = Arc::new(AtomicBool::new(true));
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let bound = Arc::clone(&bound);
+        let root = root.path().to_path_buf();
+        let storage = storage.path().to_path_buf();
+        std::thread::spawn(move || {
+            let config = WorkerConfig {
+                root: root.clone(),
+                storage,
+                family: "family".into(),
+                scope: "paused-activation".into(),
+                semantic: crate::config::SemanticBackendConfig::default(),
+                status: Arc::new(RwLock::new(crate::context::SemanticIndexStatus::Disabled)),
+                drivers: InstalledDriver::default(),
+                schedule: fast_schedule(&root),
+            };
+            let strict = Arc::clone(&bound);
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true)
+                    .with_pause_current(move || strict.load(Ordering::SeqCst));
+            let mut attempts = 0;
+            let result = with_lane_pause_wait_hook(
+                |_| {},
+                || {
+                    retry_activation(&weak, epoch, &wake, &config, "embedding model", || {
+                        attempts += 1;
+                        if attempts == 1 {
+                            bound.store(false, Ordering::SeqCst);
+                            return Err(lane_pause_error());
+                        }
+                        Ok(attempts)
+                    })
+                },
+            );
+            (result, attempts)
+        })
+    };
+    let parked = observer.rx.recv_timeout(Duration::from_secs(20)).ok();
+    if parked != Some("parked") {
+        slot.clear();
+        let (result, _) = worker.join().unwrap();
+        panic!("a disconnect during the pause stopped activation: {parked:?} {result:?}");
+    }
+    bound.store(true, Ordering::SeqCst);
+    slot.wake();
+    let (result, attempts) = worker.join().unwrap();
+    assert_eq!(result, Ok(2));
+    assert_eq!(attempts, 2);
+}
+
+#[test]
+fn released_lane_frees_only_its_own_epoch() {
+    let slot = CheckoutSemanticSlot::default();
+    let (replaced, _replaced_wake) = slot.begin();
+    let (current, wake) = slot.begin();
+    assert!(
+        !slot.release(replaced),
+        "a replaced worker released its successor"
+    );
+    assert!(slot.active() && slot.is_current(current));
+    assert!(slot.release(current));
+    // Reads as never started, so the next artifact check starts a worker.
+    assert!(!slot.active());
+    assert!(!slot.is_current(current));
+    assert!(
+        wake.recv().is_err(),
+        "the released worker's channel stayed open"
+    );
+}
+
 const FILES: &[(&str, &str)] = &[
     (
         "src/alpha.rs",

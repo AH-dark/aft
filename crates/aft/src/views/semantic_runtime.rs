@@ -600,6 +600,35 @@ impl CheckoutSemanticSlot {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
+    /// Forgets the lane only if `epoch` still owns it, for a worker that is
+    /// stopping without a replacement. The slot then reads as never started,
+    /// so the root's next artifact check starts a new worker instead of
+    /// leaving search waiting on a lane nobody serves. True when it released.
+    pub(crate) fn release(&self, epoch: u64) -> bool {
+        // Held throughout, so a `begin` racing this cannot have its new state
+        // or wake sender reset: it advances the epoch under the same lock.
+        let _publishing = lock(&self.publish);
+        if self
+            .epoch
+            .compare_exchange(
+                epoch,
+                epoch.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        *lock(&self.wake) = None;
+        *lock(&self.retry) = None;
+        *self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        true
+    }
+
     pub fn state(&self) -> Option<CheckoutSemanticState> {
         self.state
             .read()
@@ -888,9 +917,32 @@ fn retry_activation<T>(
                 }
                 backoff = (backoff * 2).min(config.schedule.retry_max);
             }
+            // The pause wait gave up although this lane is still current: the
+            // root lost its route during an announced pause (or stayed
+            // unbound past the grace window). That is not a replacement; park
+            // until the rebind wakes the lane, then retry the stage.
+            Err(RefreshError::Superseded) if is_current(slot, epoch) => {
+                #[cfg(test)]
+                observe_fill(&config.root, "parked");
+                if !wait_parked(slot, epoch, wake) {
+                    return Err(RefreshError::Superseded);
+                }
+            }
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Blocks a parked lane until something wakes it: a rebind (which always
+/// wakes the lane), or an edit. False when the lane was replaced or cleared,
+/// which closes the channel or moves the epoch. Wakes are never drained
+/// before parking, so a rebind that raced the park is not lost.
+fn wait_parked(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    wake: &crossbeam_channel::Receiver<()>,
+) -> bool {
+    wake.recv().is_ok() && is_current(slot, epoch)
 }
 
 /// Counts a running worker on its slot for as long as it lives.
@@ -970,7 +1022,10 @@ pub(crate) fn run_worker(
                 .fingerprint_for_view(&config.semantic)
         }) {
             Ok(fingerprint) => fingerprint,
-            Err(RefreshError::Superseded) => return,
+            Err(RefreshError::Superseded) => {
+                release_lane(&slot, epoch);
+                return;
+            }
             Err(error) => return fail(format!("embedding model: {error}")),
         };
     let mut model = model.unwrap();
@@ -1007,7 +1062,9 @@ pub(crate) fn run_worker(
         retry_activation(&slot, epoch, &wake, &config, "view load", || runtime.load())
     {
         config.drivers.clear_if(runtime.driver());
-        if error != RefreshError::Superseded {
+        if error == RefreshError::Superseded {
+            release_lane(&slot, epoch);
+        } else {
             fail(format!("view load: {error}"));
         }
         return;
@@ -1035,6 +1092,7 @@ pub(crate) fn run_worker(
         &config.status,
         crate::context::SemanticIndexStatus::ready(),
     );
+    let driver = Arc::clone(runtime.driver());
     drop(runtime);
     serve_fills_with_status(
         &slot,
@@ -1044,6 +1102,23 @@ pub(crate) fn run_worker(
         Some(&config.status),
         &mut |texts| model.embed(texts),
     );
+    // Fills end when the lane is replaced, cleared or dropped, and then this
+    // does nothing. Should they end while the lane is still this worker's,
+    // the slot is given up so a new worker can be started for the root.
+    if release_lane(&slot, epoch) {
+        config.drivers.clear_if(&driver);
+    }
+}
+
+/// Gives up the slot when a worker stops while its epoch still owns it. A
+/// lane left current with no worker would read as started forever: artifact
+/// checks never start another one, and wakes reach a channel nobody reads.
+fn release_lane(slot: &Weak<CheckoutSemanticSlot>, epoch: u64) -> bool {
+    let released = slot.upgrade().is_some_and(|slot| slot.release(epoch));
+    if released {
+        crate::slog_warn!("semantic view worker stopped; released its lane epoch {epoch}");
+    }
+    released
 }
 
 /// What one catch-up left behind.
@@ -1058,6 +1133,9 @@ enum FillOutcome {
     },
     /// The lane is no longer this worker's.
     Stop,
+    /// The lane is still this worker's, but its root lost its route while the
+    /// embedding lane was paused: wait for the rebind's wake, not a timer.
+    Parked,
 }
 
 /// Simulate a slow storage read, not CPU contention. Child-process tests get
@@ -1201,6 +1279,11 @@ fn serve_fills_with_status<F>(
         };
         match outcome {
             FillOutcome::Stop => return,
+            FillOutcome::Parked => {
+                #[cfg(test)]
+                observe_fill(&schedule.root, "parked");
+                retry_after = None;
+            }
             FillOutcome::Settled => {
                 clear_retry(slot, epoch);
                 if let Some(status) = status {
@@ -1477,9 +1560,12 @@ where
                 mark_unavailable(runtime, schedule, error);
                 return FillOutcome::Settled;
             }
-            // A restart replaced this lane while it folded; its work is
-            // dropped and the replacement owns the view.
-            Err(RefreshError::Superseded) => return FillOutcome::Stop,
+            // A replaced lane already stopped at the currency check above, so
+            // a refusal that gets here came from the pause wait while the lane
+            // is still current: the root lost its route during an announced
+            // pause, or stayed unbound past the grace window. Park until the
+            // rebind wakes the lane.
+            Err(RefreshError::Superseded) => return FillOutcome::Parked,
         }
     }
 }

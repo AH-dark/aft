@@ -7336,6 +7336,20 @@ fn semantic_lane_state(
             disclosure: None,
         };
     }
+    // An announced Synapse lane pause is a scheduled wait, not an outage: a
+    // build or fingerprint probe waiting it out reads exactly like a query
+    // embedding refused by the same pause, and no backend probe is started.
+    let backend = ctx.semantic_backend_health_snapshot();
+    if !backend.available && backend.paused_until_ms.is_some() {
+        return SemanticLaneState {
+            semantic_status: "unavailable",
+            backend_unavailable: None,
+            disclosure: Some(SemanticLaneDisclosure {
+                text: PAUSED_EMBEDDING_DETAIL.to_string(),
+                note: PAUSED_EMBEDDING_DETAIL.to_string(),
+            }),
+        };
+    }
     let check = crate::semantic_index::check_remote_backend_while_building(ctx);
     let checking = match check {
         crate::semantic_index::RemoteBackendCheck::Checking { base_url } => Some(base_url),
@@ -8800,6 +8814,49 @@ mod tests {
                     START + PAUSE_MS
                 );
             });
+        });
+    }
+
+    #[test]
+    fn lane_paused_initial_build_search_shows_approved_sentence() {
+        use crate::synapse_embed::pause_test_support::*;
+        crate::semantic_index::with_lane_pause_clock(START, |_clock| {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::write(
+                project.path().join("remix-panel.ts"),
+                "// where remix panel mounted option switching handled\nexport const panel = true;\n",
+            )
+            .unwrap();
+            let ctx = test_context(project.path());
+            ctx.set_canonical_cache_root(project.path().to_path_buf());
+            // The cold build is waiting out the pause: no index is loaded, so
+            // the search never embeds its query and words the lane from health.
+            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
+                stage: "embedding".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+            record_pause_for_root(project.path());
+            let response = response_value(handle_semantic_search(
+                &semantic_request("where remix panel mounted option switching handled", 5),
+                &ctx,
+            ));
+            assert_eq!(response["success"], true, "{response}");
+            assert_eq!(response["lexical_only_fallback"], true, "{response}");
+            let text = response["text"].as_str().unwrap();
+            let opening = text.split("\n\n").next().unwrap();
+            assert_eq!(
+                opening,
+                "Semantic search unavailable: the embedding model is paused; using keyword search only.",
+                "{text}"
+            );
+            assert!(!text.contains("Semantic backend unavailable"), "{text}");
+            assert!(!text.contains("scheduled maintenance"), "{text}");
+            assert_eq!(
+                response["note"],
+                "Semantic search unavailable: the embedding model is paused; using keyword search only."
+            );
         });
     }
 

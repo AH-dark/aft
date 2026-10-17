@@ -365,6 +365,77 @@ struct ReusePauseCheckpoint {
     completed: usize,
     dimension: Option<usize>,
     skipped: usize,
+    /// The files the interrupted refresh covered, with the content identity
+    /// each had when it was read. A retry resumes only the files that still
+    /// match it.
+    selection: HashMap<PathBuf, IndexedFileMetadata>,
+}
+
+impl ReusePauseCheckpoint {
+    /// Whether the retry covers exactly the chunks this checkpoint was taken
+    /// over, from the same files with the same content, so its cursor still
+    /// points at the same misses.
+    fn covers(
+        &self,
+        chunks: &[SemanticChunk],
+        selection: &HashMap<PathBuf, IndexedFileMetadata>,
+    ) -> bool {
+        if self.selection != *selection || self.entries.len() != chunks.len() {
+            return false;
+        }
+        let mut source: Vec<Option<&SemanticChunk>> = self
+            .entries
+            .iter()
+            .map(|entry| entry.as_ref().map(|entry| &entry.chunk))
+            .collect();
+        // A miss's entry carries the text the model actually embedded, which
+        // can be shorter than the chunk's; compare the chunk as it was read.
+        for (index, chunk) in &self.misses {
+            if let Some(slot) = source.get_mut(*index) {
+                *slot = Some(chunk);
+            }
+        }
+        source
+            .iter()
+            .zip(chunks)
+            .all(|(saved, current)| *saved == Some(current))
+    }
+
+    /// The finished vectors that are still valid for a retry over a
+    /// different chunk set, keyed by file and the chunk text as read. Entries
+    /// of files the retry no longer covers (deleted, ignored, deferred) or
+    /// whose content identity changed since the pause are dropped.
+    fn into_reusable(
+        self,
+        selection: &HashMap<PathBuf, IndexedFileMetadata>,
+    ) -> HashMap<PathBuf, HashMap<String, EmbeddingEntry>> {
+        let mut source_text: HashMap<usize, String> = self
+            .misses
+            .into_iter()
+            .map(|(index, chunk)| (index, chunk.embed_text))
+            .collect();
+        let mut reusable: HashMap<PathBuf, HashMap<String, EmbeddingEntry>> = HashMap::new();
+        for (index, entry) in self.entries.into_iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            let unchanged = self
+                .selection
+                .get(&entry.chunk.file)
+                .is_some_and(|saved| selection.get(&entry.chunk.file) == Some(saved));
+            if !unchanged {
+                continue;
+            }
+            let text = source_text
+                .remove(&index)
+                .unwrap_or_else(|| entry.chunk.embed_text.clone());
+            reusable
+                .entry(entry.chunk.file.clone())
+                .or_default()
+                .insert(text, entry);
+        }
+        reusable
+    }
 }
 
 struct ViewPauseCheckpoint {
@@ -4862,7 +4933,7 @@ pub struct SemanticIndex {
     removal_retain_passes: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct IndexedFileMetadata {
     mtime: SystemTime,
     size: u64,
@@ -5933,6 +6004,7 @@ impl SemanticIndex {
 
     fn entries_for_chunks_with_reuse<F, P>(
         chunks: Vec<SemanticChunk>,
+        selection: &HashMap<PathBuf, IndexedFileMetadata>,
         reuse_map: &ChunkReuseMap,
         embed_fn: &mut F,
         max_batch_size: usize,
@@ -5947,7 +6019,22 @@ impl SemanticIndex {
         let total_chunks = chunks.len();
         progress(0, total_chunks);
 
-        let resume = prepared_pause_job().and_then(|job| job.borrow_mut().reuse.take());
+        // A retry after a pause continues from its cursor only over the exact
+        // chunks it was interrupted on. When the selection moved in between (a
+        // file deleted or edited), the cursor no longer lines up: start over
+        // on the current chunks, reusing only the finished vectors of files
+        // that are still selected with the same content.
+        let mut paused_vectors = HashMap::new();
+        let mut paused_dimension = None;
+        let resume = match prepared_pause_job().and_then(|job| job.borrow_mut().reuse.take()) {
+            Some(state) if state.covers(&chunks, selection) => Some(state),
+            Some(state) => {
+                paused_dimension = state.dimension;
+                paused_vectors = state.into_reusable(selection);
+                None
+            }
+            None => None,
+        };
         let (
             mut entries_by_chunk,
             misses,
@@ -5970,12 +6057,20 @@ impl SemanticIndex {
             for (chunk_index, chunk) in chunks.into_iter().enumerate() {
                 if let Some(vector) = Self::reusable_vector_for_chunk(reuse_map, &chunk) {
                     entries[chunk_index] = Some(EmbeddingEntry::new(chunk, vector));
+                } else if let Some(saved) = paused_vectors
+                    .get(&chunk.file)
+                    .and_then(|file| file.get(&chunk.embed_text))
+                {
+                    let mut chunk = chunk;
+                    chunk.embed_text = saved.chunk.embed_text.clone();
+                    entries[chunk_index] = Some(EmbeddingEntry::new(chunk, saved.vector.clone()));
                 } else {
                     misses.push((chunk_index, chunk));
                 }
             }
             let completed = total_chunks.saturating_sub(misses.len());
-            (entries, misses, completed, initial_observed_dimension, 0, 0)
+            let dimension = initial_observed_dimension.or(paused_dimension);
+            (entries, misses, completed, dimension, 0, 0)
         };
         if completed > 0 {
             progress(completed, total_chunks);
@@ -6001,6 +6096,7 @@ impl SemanticIndex {
                             completed,
                             dimension: observed_dimension,
                             skipped: skipped_rows,
+                            selection: selection.clone(),
                         });
                     }
                     return Err(error);
@@ -6796,6 +6892,7 @@ impl SemanticIndex {
         };
         let built = Self::entries_for_chunks_with_reuse(
             chunks,
+            &fresh_metadata,
             &reuse_map,
             embed_fn,
             max_batch_size,
@@ -7134,6 +7231,7 @@ impl SemanticIndex {
         };
         let built = Self::entries_for_chunks_with_reuse(
             chunks,
+            &fresh_metadata,
             &reuse_map,
             embed_fn,
             max_batch_size,
@@ -9773,8 +9871,20 @@ fn collect_semantic_file(
             file: file.to_path_buf(),
             caps: embed_text_caps,
         };
-        if let Some(prepared) = job.borrow_mut().file_chunks.remove(&key) {
-            return Ok(prepared);
+        if let Some((metadata, chunks)) = job.borrow_mut().file_chunks.remove(&key) {
+            // Chunks prepared before a pause are reused only while the file is
+            // as it was read; an edit or deletion since then reads it again.
+            let unchanged = indexed_file_content_unchanged(
+                file,
+                &FileFreshness {
+                    mtime: metadata.mtime,
+                    size: metadata.size,
+                    content_hash: metadata.content_hash,
+                },
+            );
+            if unchanged {
+                return Ok((metadata, chunks));
+            }
         }
     }
     collect_semantic_file_uncached(project_root, file, embed_text_caps, phases)
@@ -10923,6 +11033,115 @@ mod tests {
                 assert_eq!(requests.lock().unwrap().len(), 3);
             });
         });
+    }
+
+    #[test]
+    fn lane_paused_refresh_drops_files_deleted_before_retry() {
+        use crate::synapse_embed::pause_test_support::*;
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("a_kept.rs");
+        let deleted = root.path().join("b_deleted.rs");
+        let source = |tag: &str| {
+            format!("/// First {tag}.\npub fn first_{tag}(x: u64) -> u64 {{ x + 1 }}\n/// Second {tag}.\npub fn second_{tag}(x: u64) -> u64 {{ x + 2 }}\n")
+        };
+        fs::write(&kept, source("kept")).unwrap();
+        fs::write(&deleted, source("gone")).unwrap();
+        let files = vec![kept.clone(), deleted.clone()];
+        let mut worker = SemanticIndex::build(
+            root.path(),
+            &files,
+            &mut |texts: Vec<String>| Ok(vec![vec![0.0, 1.0]; texts.len()]),
+            1,
+        )
+        .unwrap();
+        // The index searches serve from; the refresh result is applied to it
+        // the way the completion drain applies it.
+        let mut serving = worker.clone();
+        // Both files change, so the refresh embeds every chunk again.
+        fs::write(&kept, source("kept_edit")).unwrap();
+        fs::write(&deleted, source("gone_edit")).unwrap();
+        let _policy =
+            PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+        let removed = deleted.clone();
+        let mut inputs: Vec<String> = Vec::new();
+        let mut paused_at = None;
+        let update = with_lane_pause_wait_hook(
+            // The file disappears while the lane is paused.
+            move |_| fs::remove_file(&removed).unwrap(),
+            || {
+                retry_lane_pause(|| {
+                    worker.refresh_invalidated_files(
+                        root.path(),
+                        &files,
+                        &mut |texts: Vec<String>| {
+                            // Pause once, on a batch of the deleted file after
+                            // one of its batches already finished, so the saved
+                            // checkpoint holds finished rows of that file.
+                            let finished_deleted =
+                                inputs.iter().any(|text| text.contains("gone_edit"));
+                            let batch_deleted = texts.iter().any(|text| text.contains("gone_edit"));
+                            if paused_at.is_none() && finished_deleted && batch_deleted {
+                                paused_at = Some(inputs.len());
+                                return Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+                                    crate::synapse_embed::LanePause {
+                                        lane_id: MODEL.into(),
+                                        fingerprint: Some("pinned".into()),
+                                        retry_after_ms: Some(PAUSE_MS),
+                                        paused_until_ms: START + PAUSE_MS,
+                                        reason: "maintenance".into(),
+                                    },
+                                )
+                                .to_string());
+                            }
+                            inputs.extend(texts.clone());
+                            Ok(vec![vec![1.0, 0.0]; texts.len()])
+                        },
+                        1,
+                        100,
+                        &mut |_, _| {},
+                    )
+                })
+            },
+        )
+        .unwrap();
+        assert!(!deleted.exists());
+        assert!(paused_at.is_some(), "the refresh never paused: {inputs:?}");
+        assert_eq!(
+            Some(inputs.len()),
+            paused_at,
+            "the retry embedded again: {inputs:?}"
+        );
+        assert!(
+            update
+                .added_entries
+                .iter()
+                .all(|entry| entry.file() == kept),
+            "the retry kept rows of a file deleted during the pause"
+        );
+        assert_eq!(
+            update.added_entries.len(),
+            3,
+            "{:?}",
+            update
+                .added_entries
+                .iter()
+                .map(|entry| (entry.file().to_path_buf(), entry.chunk.name.clone()))
+                .collect::<Vec<_>>()
+        );
+        serving.apply_refresh_update(
+            update.added_entries,
+            update.updated_metadata,
+            &update.completed_paths,
+        );
+        for index in [&serving, &worker] {
+            let results = index.search(&[1.0, 0.0], 100);
+            assert!(
+                results.iter().all(|result| result.file != deleted),
+                "deleted file came back: {results:?}"
+            );
+            assert!(results.iter().any(|result| result.file == kept));
+        }
+        assert!(serving.recorded_file_freshness(&deleted).is_none());
     }
 
     #[test]
