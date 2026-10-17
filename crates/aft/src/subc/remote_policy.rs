@@ -41,10 +41,23 @@ pub(super) fn catalog(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    // Validate and strip the known plan params on every route. A session
-    // starter preflights its plan on an unscoped route before any scoped
-    // session exists, so the same params must be accepted there; only a
-    // scoped worker fetch freezes routing settings (see `key`).
+    if let Some(value) = original.get("confine") {
+        if value != "root" {
+            return Err(subc_protocol::ErrorBody::new(
+                "invalid_confine",
+                "params.confine accepts only \"root\"",
+            ));
+        }
+        if key(identity, Some(&preset)).is_none() {
+            return Err(subc_protocol::ErrorBody::new(
+                "confine_requires_scoped_worker",
+                "params.confine requires a scoped worker with an authenticated principal",
+            ));
+        }
+    }
+    // Routing params also support unscoped plan preflights. Confinement is
+    // different: it requires a persistable scoped worker, checked above.
+    // Remove recognized params before the generic catalog validator runs.
     if let Some(args) = body.get_mut("params").and_then(Value::as_object_mut) {
         for (name, value) in &original {
             let valid = match name.as_str() {
@@ -62,6 +75,7 @@ pub(super) fn catalog(
                 }
                 "remote_exec" | "siblings" if preset == "worker" => true,
                 "allow_paths" if preset == "worker" => true,
+                "confine" => true,
                 _ => continue,
             };
             if !valid {
@@ -106,7 +120,10 @@ pub(super) fn catalog(
         })?;
     }
     if let Some(key) = key(identity, Some(&preset)) {
-        if original.contains_key("remote_exec") || original.contains_key("siblings") {
+        if original.contains_key("remote_exec")
+            || original.contains_key("siblings")
+            || original.contains_key("confine")
+        {
             let policy = match crate::exec_remote::FrozenParams::decode(&original) {
                 Ok(policy) => policy,
                 Err(error) => {
@@ -114,6 +131,9 @@ pub(super) fn catalog(
                         "remote execution routing disabled: malformed catalog params: {error}"
                     );
                     crate::exec_remote::FrozenParams {
+                        confine: original
+                            .get("confine")
+                            .map(|_| crate::exec_remote::RootConfinement::Root),
                         host: original
                             .get("host")
                             .and_then(Value::as_str)
@@ -163,7 +183,12 @@ pub(super) fn catalog(
                 .as_ref()
                 .is_some_and(|policy| policy.enabled)
         });
-    tool_provider::catalog_for_request(
+    let render = if confined(ctx, identity)? {
+        tool_provider::catalog_for_confined_request
+    } else {
+        tool_provider::catalog_for_request
+    };
+    render(
         request,
         catalog_preset,
         &identity.disabled_tools,
@@ -171,6 +196,71 @@ pub(super) fn catalog(
         offered,
         worker_wait_max_ms,
     )
+}
+
+pub(super) fn confined_tool(name: &str) -> bool {
+    matches!(name, "read" | "grep" | "glob" | "outline" | "aft_outline")
+}
+
+/// Read the worker key regardless of the preset claimed by the current call.
+/// Missing persistence or malformed saved params must never downgrade a fence.
+pub(super) fn confined(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+) -> Result<bool, subc_protocol::ErrorBody> {
+    let Some(key) = key(identity, Some("worker")) else {
+        return Ok(false);
+    };
+    let unavailable = || {
+        subc_protocol::ErrorBody::new(
+            "confine_policy_unavailable",
+            "cannot read the scoped worker's confinement policy",
+        )
+    };
+    let db = ctx.db().ok_or_else(unavailable)?;
+    let conn = db.lock().map_err(|_| unavailable())?;
+    let params = store::lookup(
+        &conn,
+        &key,
+        crate::bash_background::persistence::unix_millis(),
+    )
+    .map_err(|_| unavailable())?;
+    Ok(params.is_some_and(|params| params.confine.is_some()))
+}
+
+pub(super) fn admit_confined(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    name: &str,
+) -> Result<bool, subc_protocol::ErrorBody> {
+    let confined = confined(ctx, identity)?;
+    if confined && !confined_tool(name) {
+        return Err(subc_protocol::ErrorBody::new(
+            "tool_not_offered_confined",
+            format!("tool {name:?} is not offered in a confined session"),
+        ));
+    }
+    Ok(confined)
+}
+
+pub(super) fn with_call_policy<R>(
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    id: &str,
+    name: &str,
+    args: Value,
+    run: impl FnOnce(Value) -> R,
+) -> Result<R, Response> {
+    let confined = admit_confined(ctx, identity, name)
+        .map_err(|error| Response::error(id, &error.code, error.message))?;
+    if confined {
+        crate::context::confinement::with_root(ctx, id, || {
+            crate::context::confinement::preflight(ctx, id, &identity.session, &args)?;
+            Ok(run(args))
+        })
+    } else {
+        Ok(run(args))
+    }
 }
 
 /// Where a bash call's remote-run policy comes from.

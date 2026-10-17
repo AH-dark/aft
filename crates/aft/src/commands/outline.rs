@@ -2386,10 +2386,11 @@ fn outline_target_walk_builder(directory: &Path) -> ignore::WalkBuilder {
     // each ancestor ignore file for every directory.
     builder
         .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
+        .ignore(!crate::context::confinement::active())
+        .git_ignore(!crate::context::confinement::active())
+        .git_global(!crate::context::confinement::active())
+        .git_exclude(!crate::context::confinement::active())
+        .parents(!crate::context::confinement::active())
         .require_git(false)
         .follow_links(false)
         .sort_by_file_name(|left, right| left.cmp(right));

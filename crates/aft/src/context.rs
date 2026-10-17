@@ -44,6 +44,9 @@ pub(crate) use gitignore_state::IgnoreRuleChange;
 // The shared ignore-rule definition every project walker applies; see
 // `apply_project_ignore_rules`.
 pub(crate) use gitignore_state::apply_project_ignore_rules;
+
+#[path = "confinement.rs"]
+pub(crate) mod confinement;
 #[cfg(test)]
 pub(crate) use gitignore_state::ignore_rules_fixture;
 
@@ -12256,7 +12259,14 @@ impl AppContext {
         session_id: &str,
         path: &Path,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
-        self.validate_path_with_artifact_session(req_id, path, Some(session_id))
+        let result = self.validate_path_with_artifact_session(req_id, path, Some(session_id));
+        if crate::context::confinement::for_request(req_id) {
+            // Canonical targets and symlink destinations are private outside the
+            // fence. Always report the caller's spelling, including on failure.
+            result.map_err(|_| crate::context::confinement::refusal(req_id, path))
+        } else {
+            result
+        }
     }
 
     fn validate_path_with_artifact_session(
@@ -12416,6 +12426,8 @@ impl AppContext {
         identity: &Path,
         operation: crate::access_policy::AccessOperation,
     ) -> Result<(), crate::protocol::Response> {
+        #[cfg(test)]
+        confinement::note_ask();
         use crate::access_policy::{AskRoute, GrantKind};
         let AskRoute::Consent { once } = crate::access_policy::current_ask_route() else {
             return Ok(());
@@ -12493,6 +12505,20 @@ impl AppContext {
         } else {
             identify(resolved.to_path_buf())
         };
+        if crate::context::confinement::for_request(req_id) && self.request_force_restrict(req_id) {
+            let root = self
+                .config()
+                .project_root
+                .as_ref()
+                .map(|root| self.resolved_path_restriction_root(root));
+            if !root.is_some_and(|root| identity.starts_with(root))
+                || !crate::bounded_io::metadata(&identity).is_ok()
+            {
+                return Err(crate::context::confinement::refusal(req_id, original));
+            }
+            // Containment is unconditional, but an in-root file still obeys
+            // the existing credential and user-configured denial floors.
+        }
         let owned_artifact = artifact_session.is_some_and(|session| {
             self.bash_background
                 .is_session_owned_artifact_path(session, &identity)

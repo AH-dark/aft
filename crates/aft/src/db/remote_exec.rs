@@ -57,6 +57,25 @@ pub fn freeze(
             now as i64
         ],
     )?;
+    // Confinement is monotonic: a later catalog may tighten an existing plan,
+    // but a parameterless fetch or a routing override cannot remove the fence.
+    if policy.confine.is_some() {
+        conn.execute(
+            "UPDATE remote_exec_policies SET params=json_set(params,'$.confine','root')
+             WHERE project_root=?1 AND harness=?2 AND session=?3 AND principal=?4
+             AND owner=?5 AND scope_ref=?6 AND preset=?7 AND epoch=?8",
+            params![
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                v[4],
+                v[5],
+                v[6],
+                key.epoch.to_string()
+            ],
+        )?;
+    }
     Ok(())
 }
 

@@ -1,16 +1,34 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+#[cfg(unix)]
+#[path = "confine_tests.rs"]
+mod confine_tests;
+
 #[test]
 fn confined_catalog_offers_only_root_readers() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let ctx = context(root.path(), storage.path(), None);
     let route = identity(root.path(), "designer", 7, true);
-    let answer = catalog(json!({"preset":"worker","params":{"confine":"root"}}), &route, &ctx).unwrap();
-    let names: std::collections::BTreeSet<_> = answer["tools"].as_array().unwrap().iter()
-        .map(|tool| tool["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["read", "grep", "glob", "aft_outline"].into_iter().collect());
+    let answer = catalog(
+        json!({"preset":"worker","params":{"confine":"root"}}),
+        &route,
+        &ctx,
+    )
+    .unwrap();
+    let names: std::collections::BTreeSet<_> = answer["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["read", "grep", "glob", "aft_outline"]
+            .into_iter()
+            .collect()
+    );
 }
 
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {

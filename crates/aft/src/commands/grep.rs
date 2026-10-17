@@ -133,7 +133,9 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // A parent folder session answers from its child repositories' indexes.
     // Child indexes intentionally omit ignored targets, just like the local
     // index. An explicitly named ignored root must use the direct walk instead.
-    let parent_answer = if scope.roots.iter().any(|root| root.ignored_target) {
+    let parent_answer = if crate::context::confinement::active()
+        || scope.roots.iter().any(|root| root.ignored_target)
+    {
         None
     } else {
         crate::views::parent::grep_fan_out(ctx, &compiled, &scope, &params, &filters)
@@ -277,7 +279,11 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // Disclose the trigram index state and whether this answer came from a
     // filesystem walk instead of the index. A missing or building index never
     // turns into "no matches": the walk above still searched every file.
-    body["index"] = trigram_index_disclosure(ctx);
+    body["index"] = if crate::context::confinement::active() {
+        serde_json::json!({"trigram": {"status":"fallback", "reason":"confined root walk"}})
+    } else {
+        trigram_index_disclosure(ctx)
+    };
     body["fallback"] = if result.index_status == IndexStatus::Ready {
         serde_json::Value::Null
     } else {

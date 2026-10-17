@@ -75,7 +75,7 @@ pub(super) fn describe() -> Value {
             stability: "alpha".into(),
         }],
         implementation_version: env!("CARGO_PKG_VERSION").into(),
-        capabilities: vec![],
+        capabilities: vec!["tool-catalog-confine/v1".into()],
     })
     .expect("the commons role declaration is JSON")
 }
@@ -504,6 +504,45 @@ pub(super) fn catalog_for_request(
     runon: bool,
     worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
+    render_catalog(
+        request,
+        preset,
+        disabled,
+        powershell_available,
+        runon,
+        worker_wait_max_ms,
+        false,
+    )
+}
+
+pub(super) fn catalog_for_confined_request(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+    worker_wait_max_ms: u64,
+) -> Result<Value, ErrorBody> {
+    render_catalog(
+        request,
+        preset,
+        disabled,
+        powershell_available,
+        runon,
+        worker_wait_max_ms,
+        true,
+    )
+}
+
+fn render_catalog(
+    request: CatalogRequest,
+    preset: CatalogPreset,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+    worker_wait_max_ms: u64,
+    confined: bool,
+) -> Result<Value, ErrorBody> {
     #[cfg(test)]
     CATALOG_RENDERS.set(CATALOG_RENDERS.get() + 1);
     let mut answer = CatalogAnswer::new("", "").with_tools(tools_for_session(
@@ -512,6 +551,16 @@ pub(super) fn catalog_for_request(
         powershell_available,
         runon,
     ));
+    if confined {
+        answer
+            .tools
+            .retain(|tool| matches!(tool.name.as_str(), "read" | "grep" | "glob" | "outline"));
+        for tool in &mut answer.tools {
+            if tool.name == "outline" {
+                tool.name = "aft_outline".into();
+            }
+        }
+    }
     // Every preset can settle a keyed call after its reply (a held shell
     // call, or a scoped call whose end was never observed), so every catalog
     // declares the session capability that lets a custodian pull those
@@ -2524,8 +2573,8 @@ mod tests {
 
     /// `role.describe` serves exactly the declaration pinned in the
     /// conformance fixture: `role.describe`, `tool.catalog` and `tool.call`
-    /// plus `tool.withdraw`, `late_results` and `late_results.ack`, with no
-    /// module-level capabilities.
+    /// plus `tool.withdraw`, `late_results` and `late_results.ack`, and the
+    /// root-confinement capability used for worker admission.
     #[test]
     fn slice_b_declaration_matches_independent_fixture_without_normalizing_other_fields() {
         let fixtures: Value = serde_json::from_str(include_str!(
@@ -4472,6 +4521,82 @@ mod route_tests {
 
     fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
         serde_json::from_value(json!({"owner": {"kind": "direct"}, "ref": "scope", "scope_epoch": 1, "kind": kind, "owner_authorized": true})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn confined_route_dispatch_uses_saved_policy_and_public_outline_name() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        std::fs::write(root.join("pin.rs"), "pub fn pinned_symbol() {}\n").unwrap();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().into()),
+                restrict_to_project_root: false,
+                ..Default::default()
+            },
+        ));
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        )));
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: ProjectRootId::from_path(&root).unwrap(),
+            project_root: root.clone(),
+            harness: "runner".into(),
+            session: "designer".into(),
+            role: RouteRole::ToolProviderV1,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.clone(),
+                harness: "runner".into(),
+                session_id: "designer".into(),
+                principal_id: Some("reserved:broca".into()),
+            },
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::new(vec![]),
+            scope: Some(stamp("worker")),
+            run_scope: OnceLock::new(),
+            call_mode: subc_protocol::call_mode::CallMode::Classic,
+            made_tool_call: AtomicBool::new(false),
+        }));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let reply = exchange_with_actor(
+            json!({"op":"tool.catalog","preset":"worker","params":{"confine":"root"}}),
+            identity.clone(),
+            ctx.clone(),
+            &metrics,
+            |_, _| panic!("catalog reached file dispatch"),
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let catalog: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(catalog["tools"].as_array().unwrap().len(), 4);
+        let reply = exchange_with_actor(json!({"op":"tool.call", "preset":"worker", "name":"aft_outline", "arguments":{"target":"pin.rs"}}), identity.clone(), ctx.clone(), &metrics, |request, ctx| {
+            assert_eq!(request.command, "outline");
+            assert!(ctx.request_force_restrict(&request.id));
+            crate::commands::outline::handle_outline(&request, ctx)
+        }).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let result: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(result["structuredContent"]["success"], true, "{result}");
+        assert!(String::from_utf8_lossy(&reply.body).contains("pinned_symbol"));
+        for name in ["bash", "inspect", "write"] {
+            let reply = exchange_with_actor(
+                json!({"op":"tool.call", "preset":"head", "name":name,"arguments":{}}),
+                identity.clone(),
+                ctx.clone(),
+                &metrics,
+                |_, _| panic!("unoffered tool reached dispatch"),
+            )
+            .await;
+            assert_eq!(error_body(&reply).code, "tool_not_offered_confined");
+        }
     }
 
     fn error_body(reply: &WriterFrame) -> subc_protocol::ErrorBody {

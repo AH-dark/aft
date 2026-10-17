@@ -465,6 +465,7 @@ fn run_with_limiter<T: Send + 'static>(
     };
     let owned = path.to_path_buf();
     let budget = current();
+    let confinement = crate::context::confinement::capture();
     #[cfg(test)]
     let measurements = budget.as_ref().map(|b| Arc::clone(&b.measurements));
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -481,7 +482,7 @@ fn run_with_limiter<T: Send + 'static>(
             #[cfg(test)]
             regression_tests::before_helper(&owned);
             HELPER_DEADLINE.with(|deadline| deadline.set(Some(at)));
-            let result = with_budget(budget, || {
+            let result = crate::context::confinement::inherit(confinement, || with_budget(budget, || {
                 // Owning a slot does not mean the OS has scheduled this helper.
                 // Never start expired work or blame its scheduling delay on I/O.
                 let mut running = helper_running.lock().unwrap_or_else(|e| e.into_inner());
@@ -491,7 +492,7 @@ fn run_with_limiter<T: Send + 'static>(
                 *running = true;
                 drop(running);
                 work(owned)
-            });
+            }));
             let _ = tx.send(result);
         })?;
     #[cfg(test)]

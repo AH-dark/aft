@@ -8108,21 +8108,44 @@ impl PlainToolRun {
                             ctx,
                             &identity_for_run.session,
                             &bare_name,
-                            bind_trust.allows_bash_observation(),
+                            bind_trust.allows_bash_observation()
+                                && !crate::context::confinement::active(),
                         );
                     };
-                    match run_tool_call(
+                    let outcome = remote_policy::with_call_policy(
+                        ctx,
+                        &identity_for_run,
+                        &request_id_for_force,
                         &bare_name,
                         arguments,
-                        &format_context,
-                        &tool_call_context,
-                        ctx,
-                        &dispatch,
-                        Some(&finalizer),
-                        Some(&mut phase_trace),
-                    ) {
+                        |arguments| {
+                            run_tool_call(
+                                &bare_name,
+                                arguments,
+                                &format_context,
+                                &tool_call_context,
+                                ctx,
+                                &dispatch,
+                                Some(&finalizer),
+                                Some(&mut phase_trace),
+                            )
+                        },
+                    )
+                    .unwrap_or_else(|response| {
+                        ToolCallOutcome::Unary(ToolCallResult {
+                            text: crate::subc_format::format_response_with_context(
+                                &bare_name,
+                                &response,
+                                &format_context,
+                            ),
+                            response,
+                        })
+                    });
+                    match outcome {
                         ToolCallOutcome::Unary(result) => {
-                            if let Some(db) = ctx.db() {
+                            if let Some(db) = ctx.db().filter(|_| {
+                                result.response.data["code"] != "path_outside_confined_root"
+                            }) {
                                 let mut observations = io_budget.permissions();
                                 if result.response.data["code"] != "macos_permission_denied" {
                                     observations.retain(|observation| observation.readable);
@@ -8387,9 +8410,10 @@ async fn handle_tool_call(
     }
     let route_request = if identity.role == tool_provider::RouteRole::ToolProviderV1 {
         note_route_tool_call(&identity, metrics);
-        let call = match serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(
-            envelope,
-        ) {
+        let mut call = match serde_json::from_value::<
+            cortexkit_role_tool_provider::call::ToolCallRequest,
+        >(envelope)
+        {
             Ok(call) => call,
             Err(error) => {
                 return send_provider_error(
@@ -8404,6 +8428,20 @@ async fn handle_tool_call(
                 .await
             }
         };
+        let confinement = executor
+            .actor_context(&identity.root)
+            .ok_or_else(|| {
+                subc_protocol::ErrorBody::new(
+                    "confine_policy_unavailable",
+                    "session context unavailable",
+                )
+            })
+            .and_then(|ctx| remote_policy::admit_confined(&ctx, &identity, &call.name));
+        match confinement {
+            Ok(true) if call.name == "aft_outline" => call.name = "outline".into(),
+            Ok(_) => {}
+            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        }
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
@@ -8563,6 +8601,20 @@ async fn handle_tool_call(
         }
     };
     let worker_preset = role.is_worker() && call.preset.as_deref() == Some("worker");
+    // A call cannot escape a saved worker fence by claiming another preset or
+    // by sending a tool that was absent from its catalog.
+    let confinement = executor
+        .actor_context(&identity.root)
+        .ok_or_else(|| {
+            subc_protocol::ErrorBody::new(
+                "confine_policy_unavailable",
+                "session context unavailable",
+            )
+        })
+        .and_then(|ctx| remote_policy::admit_confined(&ctx, &identity, &call.name));
+    if let Err(error) = confinement {
+        return send_provider_error(tx, metrics, frame, error).await;
+    }
     if agent_tool && call.preset.is_none() && !scoped_route {
         metrics.record_presetless_tool_call(&identity.harness);
     }

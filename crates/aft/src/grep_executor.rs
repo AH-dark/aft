@@ -23,6 +23,34 @@ use crate::search_index::{
 
 /// Maximum files enumerated during grep/glob index-unavailable fallback walks.
 pub(crate) const MAX_FALLBACK_WALK_FILES: usize = 50_000;
+
+#[cfg(test)]
+thread_local! {
+    static WALK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_FALLBACK_WALK_FILES) };
+}
+
+fn fallback_walk_limit() -> usize {
+    #[cfg(test)]
+    {
+        WALK_LIMIT.with(|limit| limit.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_FALLBACK_WALK_FILES
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WALK_LIMIT.with(|limit| limit.set(self.0));
+        }
+    }
+    let _restore = Restore(WALK_LIMIT.with(|current| current.replace(limit)));
+    run()
+}
 /// Wall-clock budget for grep/glob index-unavailable fallback walks on the dispatch thread.
 pub(crate) const FALLBACK_WALK_BUDGET: Duration = Duration::from_secs(10);
 
@@ -213,7 +241,8 @@ pub fn resolve_grep_scope(
         .map(|(search_root, task_filter_root)| {
             let scope = resolve_search_scope(&project_root, Some(&search_root.to_string_lossy()));
             let is_external = !scope.use_index;
-            let ignored_target = paths.is_some_and(|paths| !paths.is_null())
+            let ignored_target = !crate::context::confinement::active()
+                && paths.is_some_and(|paths| !paths.is_null())
                 && !is_same_directory(&scope.root, &project_root)
                 && target_is_ignored(&scope.root);
             let authorized_task_artifact = task_filter_root.is_some();
@@ -501,10 +530,10 @@ fn execute_root_profiled(
     // where naming a file explicitly searches it even when it is gitignored,
     // .aftignored, or not yet indexed. Binary + UTF-8 guards still apply.
     if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-        if root.use_index {
+        if root.use_index && !crate::context::confinement::active() {
             crate::commands::configure::trigger_search_index_reload_if_evicted(ctx);
         }
-        let index_status = if root.use_index {
+        let index_status = if root.use_index && !crate::context::confinement::active() {
             current_index_status(ctx)
         } else {
             IndexStatus::Fallback
@@ -526,6 +555,29 @@ fn execute_root_profiled(
             )
         };
         return (result, GrepExecutionPhaseTimings::default());
+    }
+
+    if crate::context::confinement::active() {
+        let mut counts = ScopeFileCounts::default();
+        let result = fallback_grep_counted(
+            project_root,
+            &root.search_root,
+            &root.filter_root,
+            pattern,
+            filters,
+            max_results,
+            IndexStatus::Fallback,
+            params.path_exclusion,
+            &mut counts,
+            root.ignored_target,
+        );
+        return (
+            result,
+            GrepExecutionPhaseTimings {
+                walk_counts: Some(counts),
+                ..Default::default()
+            },
+        );
     }
 
     let snapshot_started = Instant::now();
@@ -809,7 +861,7 @@ fn fallback_target_walk_builder(
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
-        .parents(true)
+        .parents(!crate::context::confinement::active())
         .filter_entry(move |entry| {
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
@@ -1033,7 +1085,7 @@ pub(crate) fn bounded_fallback_walk_files(
         filter_root,
         search_root,
         filters,
-        MAX_FALLBACK_WALK_FILES,
+        fallback_walk_limit(),
         FALLBACK_WALK_BUDGET,
     )
 }
@@ -1048,7 +1100,7 @@ pub(crate) fn bounded_fallback_walk_files_for_target(
         filter_root,
         search_root,
         filters,
-        MAX_FALLBACK_WALK_FILES,
+        fallback_walk_limit(),
         FALLBACK_WALK_BUDGET,
         ignored_target,
     )
@@ -1408,7 +1460,7 @@ fn fallback_grep_counted(
         max_results,
         index_status,
         path_exclusion,
-        MAX_FALLBACK_WALK_FILES,
+        fallback_walk_limit(),
         FALLBACK_WALK_BUDGET,
         counts,
         ignored_target,

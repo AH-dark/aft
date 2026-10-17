@@ -100,15 +100,19 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let ignored_targets = search_roots
         .iter()
         .map(|root| {
-            req.params
-                .get("path")
-                .and_then(|value| value.as_str())
-                .is_some()
+            !crate::context::confinement::active()
+                && req
+                    .params
+                    .get("path")
+                    .and_then(|value| value.as_str())
+                    .is_some()
                 && !crate::grep_executor::is_same_directory(root, &project_root)
                 && crate::grep_executor::target_is_ignored(root)
         })
         .collect::<Vec<_>>();
-    let parent_answer = if ignored_targets.iter().any(|ignored| *ignored) {
+    let parent_answer = if crate::context::confinement::active()
+        || ignored_targets.iter().any(|ignored| *ignored)
+    {
         None
     } else {
         crate::views::parent::glob_fan_out(ctx, &search_roots, pattern)
@@ -286,7 +290,11 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     // Disclose the trigram index state and whether any root was answered by a
     // filesystem walk rather than the index.
-    body["index"] = crate::commands::grep::trigram_index_disclosure(ctx);
+    body["index"] = if crate::context::confinement::active() {
+        serde_json::json!({"trigram": {"status":"fallback", "reason":"confined root walk"}})
+    } else {
+        crate::commands::grep::trigram_index_disclosure(ctx)
+    };
     body["fallback"] = if source == "index" {
         serde_json::Value::Null
     } else {
@@ -348,6 +356,9 @@ fn glob_root(
     ignored_target: bool,
     explicit_session: Option<&str>,
 ) -> GlobDiscovery {
+    if crate::context::confinement::active() {
+        return fallback_glob(project_root, search_root, pattern, ignored_target);
+    }
     if let Some(outputs) = explicit_session.and_then(|session| {
         ctx.bash_background()
             .explicit_task_artifacts(session, search_root)
