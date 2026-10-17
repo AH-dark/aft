@@ -251,12 +251,579 @@ fn embedding_backend_build_health_registry(
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn unix_millis_now() -> u64 {
+pub(crate) fn unix_millis_now() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = LANE_PAUSE_TEST_CLOCK.with(|clock| clock.borrow().clone()) {
+        return now.load(std::sync::atomic::Ordering::SeqCst);
+    }
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+thread_local! {
+    static LANE_PAUSE_RETRY_POLICY: std::cell::RefCell<Option<PauseRetryPolicy>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static LANE_PAUSE_TEST_CLOCK: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static LANE_PAUSE_CHUNK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREPARED_PAUSE_JOB: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>>> = const { std::cell::RefCell::new(None) };
+    static PAUSE_JOB_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    static LANE_PAUSE_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(Duration)>>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static CHECKPOINT_WORK: std::cell::Cell<CheckpointWork> = const { std::cell::Cell::new(CheckpointWork { allocations: 0, inserts: 0, clones: 0 }) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CheckpointWork {
+    allocations: usize,
+    inserts: usize,
+    clones: usize,
+}
+
+fn checkpoint_work(allocations: usize, inserts: usize, clones: usize) {
+    #[cfg(test)]
+    CHECKPOINT_WORK.with(|work| {
+        let mut value = work.get();
+        value.allocations += allocations;
+        value.inserts += inserts;
+        value.clones += clones;
+        work.set(value);
+    });
+    #[cfg(not(test))]
+    let _ = (allocations, inserts, clones);
+}
+
+#[cfg(test)]
+pub(crate) fn with_checkpoint_work<T>(run: impl FnOnce() -> T) -> (T, CheckpointWork) {
+    struct Restore(CheckpointWork);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHECKPOINT_WORK.with(|work| work.set(self.0));
+        }
+    }
+    let _restore = Restore(CHECKPOINT_WORK.with(|work| work.replace(CheckpointWork::default())));
+    let value = run();
+    (value, CHECKPOINT_WORK.with(std::cell::Cell::get))
+}
+
+/// Created only when Synapse refuses an embedding request with `lane_paused`.
+/// The interrupted collector or embed loop transfers its source chunks and
+/// finished vectors here before returning, without retaining admission permits,
+/// file locks, store handles or file claims. Healthy builds never allocate it.
+#[derive(Default)]
+struct PreparedPauseJob {
+    files: HashMap<PathBuf, Vec<PathBuf>>,
+    cold: Option<ColdPauseCheckpoint>,
+    reuse: Option<ReusePauseCheckpoint>,
+    file_chunks: HashMap<FileCheckpointKey, (IndexedFileMetadata, Vec<SemanticChunk>)>,
+    view_chunks: HashMap<ViewCheckpointKey, Option<Vec<SemanticChunk>>>,
+    view: Option<ViewPauseCheckpoint>,
+    producer: Option<SemanticIndexFingerprint>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ColdCheckpointIdentity {
+    root: PathBuf,
+    files: Vec<PathBuf>,
+    caps: EmbedTextCaps,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct FileCheckpointKey {
+    root: PathBuf,
+    file: PathBuf,
+    caps: EmbedTextCaps,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct ViewCheckpointKey {
+    root: PathBuf,
+    file: PathBuf,
+    content: crate::blob_store::v2::ContentHash,
+    caps: EmbedTextCaps,
+}
+
+struct ColdPauseCheckpoint {
+    identity: Option<ColdCheckpointIdentity>,
+    chunks: Vec<SemanticChunk>,
+    metadata: HashMap<PathBuf, IndexedFileMetadata>,
+    entries: Vec<EmbeddingEntry>,
+    next_chunk: usize,
+    dimension: Option<usize>,
+    skipped: usize,
+}
+
+struct ReusePauseCheckpoint {
+    entries: Vec<Option<EmbeddingEntry>>,
+    misses: Vec<(usize, SemanticChunk)>,
+    next_miss: usize,
+    completed: usize,
+    dimension: Option<usize>,
+    skipped: usize,
+    /// The files the interrupted refresh covered, with the content identity
+    /// each had when it was read. A retry resumes only the files that still
+    /// match it.
+    selection: HashMap<PathBuf, IndexedFileMetadata>,
+}
+
+impl ReusePauseCheckpoint {
+    /// Whether the retry covers exactly the chunks this checkpoint was taken
+    /// over, from the same files with the same content, so its cursor still
+    /// points at the same misses.
+    fn covers(
+        &self,
+        chunks: &[SemanticChunk],
+        selection: &HashMap<PathBuf, IndexedFileMetadata>,
+    ) -> bool {
+        if self.selection != *selection || self.entries.len() != chunks.len() {
+            return false;
+        }
+        let mut source: Vec<Option<&SemanticChunk>> = self
+            .entries
+            .iter()
+            .map(|entry| entry.as_ref().map(|entry| &entry.chunk))
+            .collect();
+        // A miss's entry carries the text the model actually embedded, which
+        // can be shorter than the chunk's; compare the chunk as it was read.
+        for (index, chunk) in &self.misses {
+            if let Some(slot) = source.get_mut(*index) {
+                *slot = Some(chunk);
+            }
+        }
+        source
+            .iter()
+            .zip(chunks)
+            .all(|(saved, current)| *saved == Some(current))
+    }
+
+    /// The finished vectors that are still valid for a retry over a
+    /// different chunk set, keyed by file and the chunk text as read. Entries
+    /// of files the retry no longer covers (deleted, ignored, deferred) or
+    /// whose content identity changed since the pause are dropped.
+    fn into_reusable(
+        self,
+        selection: &HashMap<PathBuf, IndexedFileMetadata>,
+    ) -> HashMap<PathBuf, HashMap<String, EmbeddingEntry>> {
+        let mut source_text: HashMap<usize, String> = self
+            .misses
+            .into_iter()
+            .map(|(index, chunk)| (index, chunk.embed_text))
+            .collect();
+        let mut reusable: HashMap<PathBuf, HashMap<String, EmbeddingEntry>> = HashMap::new();
+        for (index, entry) in self.entries.into_iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            let unchanged = self
+                .selection
+                .get(&entry.chunk.file)
+                .is_some_and(|saved| selection.get(&entry.chunk.file) == Some(saved));
+            if !unchanged {
+                continue;
+            }
+            let text = source_text
+                .remove(&index)
+                .unwrap_or_else(|| entry.chunk.embed_text.clone());
+            reusable
+                .entry(entry.chunk.file.clone())
+                .or_default()
+                .insert(text, entry);
+        }
+        reusable
+    }
+}
+
+struct ViewPauseCheckpoint {
+    runs: Vec<Vec<EmbeddingEntry>>,
+    pending: Vec<(usize, SemanticChunk)>,
+    next_chunk: usize,
+    dimension: Option<usize>,
+}
+
+struct PreparedPauseJobScope(bool);
+
+impl PreparedPauseJobScope {
+    fn new() -> Self {
+        Self(PAUSE_JOB_DEPTH.with(|depth| {
+            let nested = depth.get() != 0;
+            depth.set(depth.get() + 1);
+            nested
+        }))
+    }
+}
+
+impl Drop for PreparedPauseJobScope {
+    fn drop(&mut self) {
+        PAUSE_JOB_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        if !self.0 {
+            PREPARED_PAUSE_JOB.with(|slot| slot.take());
+        }
+    }
+}
+
+fn prepared_pause_job() -> Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>> {
+    PREPARED_PAUSE_JOB.with(|slot| slot.borrow().clone())
+}
+
+fn observe_lane_pause(error: &str) -> Option<std::rc::Rc<std::cell::RefCell<PreparedPauseJob>>> {
+    if !PAUSE_JOB_DEPTH.with(|depth| depth.get() != 0)
+        || crate::synapse_embed::LanePause::from_error(error).is_none()
+    {
+        return None;
+    }
+    Some(PREPARED_PAUSE_JOB.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.get_or_insert_with(|| {
+            checkpoint_work(1, 0, 0);
+            Default::default()
+        })
+        .clone()
+    }))
+}
+
+pub(crate) fn pause_job_producer(producer: &SemanticIndexFingerprint) {
+    if let Some(job) = prepared_pause_job() {
+        let mut job = job.borrow_mut();
+        if job.producer.as_ref().is_some_and(|old| old != producer) {
+            *job = PreparedPauseJob::default();
+        }
+        if job.producer.as_ref() != Some(producer) {
+            checkpoint_work(0, 1, 1);
+            job.producer = Some(producer.clone());
+        }
+    }
+}
+
+pub(crate) fn pause_job_files(
+    root: &Path,
+    walk: impl FnOnce() -> Result<Vec<PathBuf>, usize>,
+) -> Result<Vec<PathBuf>, usize> {
+    let job = prepared_pause_job();
+    if let Some(files) = job
+        .as_ref()
+        .and_then(|job| job.borrow().files.get(root).cloned())
+    {
+        checkpoint_work(0, 0, 1);
+        return Ok(files);
+    }
+    walk()
+}
+
+fn retain_cold_identity(root: &Path, files: &[PathBuf], caps: EmbedTextCaps, error: &str) {
+    if let Some(job) = observe_lane_pause(error) {
+        let mut job = job.borrow_mut();
+        if let Some(cold) = &mut job.cold {
+            checkpoint_work(0, 1, 1);
+            cold.identity = Some(ColdCheckpointIdentity {
+                root: root.to_path_buf(),
+                files: files.to_vec(),
+                caps,
+            });
+        }
+        if !job.files.contains_key(root) {
+            checkpoint_work(0, 1, 1);
+            job.files.insert(root.to_path_buf(), files.to_vec());
+        }
+    }
+}
+
+fn retain_reuse_files(
+    root: &Path,
+    caps: EmbedTextCaps,
+    metadata: HashMap<PathBuf, IndexedFileMetadata>,
+    error: &str,
+) {
+    let Some(job) = observe_lane_pause(error) else {
+        return;
+    };
+    let mut job = job.borrow_mut();
+    let Some(state) = &job.reuse else {
+        return;
+    };
+    let mut chunks = vec![None; state.entries.len()];
+    for (index, chunk) in &state.misses {
+        checkpoint_work(0, 0, 1);
+        chunks[*index] = Some(chunk.clone());
+    }
+    for (index, entry) in state.entries.iter().enumerate() {
+        if chunks[index].is_none() {
+            if let Some(entry) = entry {
+                checkpoint_work(0, 0, 1);
+                chunks[index] = Some(entry.chunk.clone());
+            }
+        }
+    }
+    let mut by_file: HashMap<PathBuf, Vec<SemanticChunk>> = HashMap::new();
+    for chunk in chunks.into_iter().flatten() {
+        by_file.entry(chunk.file.clone()).or_default().push(chunk);
+    }
+    for (file, metadata) in metadata {
+        let chunks = by_file.remove(&file).unwrap_or_default();
+        checkpoint_work(0, 1, 0);
+        job.file_chunks.insert(
+            FileCheckpointKey {
+                root: root.to_path_buf(),
+                file,
+                caps,
+            },
+            (metadata, chunks),
+        );
+    }
+}
+
+pub(crate) fn retain_view_pause_chunks(
+    root: &Path,
+    caps: EmbedTextCaps,
+    files: impl Iterator<Item = (PathBuf, crate::blob_store::v2::ContentHash)>,
+    error: &str,
+) {
+    let Some(job) = observe_lane_pause(error) else {
+        return;
+    };
+    let mut job = job.borrow_mut();
+    let Some(state) = &job.view else {
+        return;
+    };
+    let mut chunks = vec![Vec::new(); state.runs.len()];
+    for (file, chunk) in &state.pending {
+        checkpoint_work(0, 0, 1);
+        chunks[*file].push(chunk.clone());
+    }
+    for ((file, content), chunks) in files.zip(chunks) {
+        checkpoint_work(0, 1, 0);
+        job.view_chunks.insert(
+            ViewCheckpointKey {
+                root: root.to_path_buf(),
+                file,
+                content,
+                caps,
+            },
+            Some(chunks),
+        );
+    }
+}
+
+pub(crate) fn retain_unattempted_view_chunks(
+    root: &Path,
+    caps: EmbedTextCaps,
+    files: impl Iterator<
+        Item = (
+            PathBuf,
+            crate::blob_store::v2::ContentHash,
+            Vec<SemanticChunk>,
+        ),
+    >,
+    error: &str,
+) {
+    let Some(job) = observe_lane_pause(error) else {
+        return;
+    };
+    let mut job = job.borrow_mut();
+    for (file, content, chunks) in files {
+        checkpoint_work(0, 1, 0);
+        job.view_chunks.insert(
+            ViewCheckpointKey {
+                root: root.to_path_buf(),
+                file,
+                content,
+                caps,
+            },
+            Some(chunks),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn lane_pause_chunk_calls() -> usize {
+    LANE_PAUSE_CHUNK_CALLS.with(std::cell::Cell::get)
+}
+
+struct PauseRetryPolicy {
+    initial: Duration,
+    max: Duration,
+    current: Box<dyn Fn() -> bool>,
+    // Keep in-flight indexing alive through short route reconnects. Consult this
+    // stricter predicate only after the backend returned `lane_paused`: no embed
+    // request is running during that wait, so route loss can cancel it immediately.
+    pause_current: Option<std::rc::Rc<dyn Fn() -> bool>>,
+}
+
+pub(crate) struct PauseRetryScope(Option<PauseRetryPolicy>);
+
+impl PauseRetryScope {
+    pub(crate) fn new(
+        initial: Duration,
+        max: Duration,
+        current: impl Fn() -> bool + 'static,
+    ) -> Self {
+        Self(LANE_PAUSE_RETRY_POLICY.with(|policy| {
+            let pause_current = policy
+                .borrow()
+                .as_ref()
+                .and_then(|policy| policy.pause_current.clone());
+            policy.replace(Some(PauseRetryPolicy {
+                initial,
+                max,
+                current: Box::new(current),
+                pause_current,
+            }))
+        }))
+    }
+
+    pub(crate) fn with_pause_current(self, current: impl Fn() -> bool + 'static) -> Self {
+        LANE_PAUSE_RETRY_POLICY.with(|policy| {
+            if let Some(policy) = policy.borrow_mut().as_mut() {
+                policy.pause_current = Some(std::rc::Rc::new(current));
+            }
+        });
+        self
+    }
+}
+
+impl Drop for PauseRetryScope {
+    fn drop(&mut self) {
+        LANE_PAUSE_RETRY_POLICY.with(|policy| policy.replace(self.0.take()));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_lane_pause_clock<T>(
+    start_ms: u64,
+    run: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicU64>) -> T,
+) -> T {
+    struct Restore(Option<std::sync::Arc<std::sync::atomic::AtomicU64>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LANE_PAUSE_TEST_CLOCK.with(|clock| clock.replace(self.0.take()));
+        }
+    }
+    let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start_ms));
+    let _restore =
+        Restore(LANE_PAUSE_TEST_CLOCK.with(|current| current.replace(Some(clock.clone()))));
+    run(clock)
+}
+
+#[cfg(test)]
+pub(crate) fn with_lane_pause_wait_hook<T>(
+    hook: impl FnMut(Duration) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Box<dyn FnMut(Duration)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(LANE_PAUSE_WAIT_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    run()
+}
+
+fn pause_job_is_current(local: &mut impl FnMut() -> bool, paused: bool) -> bool {
+    !crate::executor::current_job_cancelled()
+        && local()
+        && LANE_PAUSE_RETRY_POLICY.with(|policy| {
+            policy.borrow().as_ref().is_some_and(|policy| {
+                (policy.current)()
+                    && (!paused
+                        || policy
+                            .pause_current
+                            .as_ref()
+                            .is_none_or(|current| current()))
+            })
+        })
+}
+
+fn wait_lane_pause(delay: Duration, local: &mut impl FnMut() -> bool) -> Result<(), String> {
+    let deadline = Instant::now() + delay;
+    loop {
+        if !pause_job_is_current(local, true) {
+            return Err("semantic lane superseded".into());
+        }
+        #[cfg(test)]
+        if LANE_PAUSE_WAIT_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(delay);
+                true
+            } else {
+                false
+            }
+        }) {
+            return if pause_job_is_current(local, true) {
+                Ok(())
+            } else {
+                Err("semantic lane superseded".into())
+            };
+        }
+        #[cfg(test)]
+        if LANE_PAUSE_TEST_CLOCK.with(|clock| {
+            if let Some(clock) = clock.borrow().as_ref() {
+                clock.fetch_add(
+                    delay.as_millis() as u64,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                true
+            } else {
+                false
+            }
+        }) {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
+}
+
+/// Retry a whole attempt on a dedicated semantic thread, after its resources
+/// have gone out of scope. Only owned data checkpoints survive between attempts.
+/// Executor jobs and callers without an explicit cancellation policy never sleep.
+pub(crate) fn retry_lane_pause<T>(attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    retry_lane_pause_while(attempt, &mut || true)
+}
+
+pub(crate) fn retry_lane_pause_while<T>(
+    mut attempt: impl FnMut() -> Result<T, String>,
+    current: &mut impl FnMut() -> bool,
+) -> Result<T, String> {
+    let _prepared = PreparedPauseJobScope::new();
+    let may_wait = LANE_PAUSE_RETRY_POLICY.with(|policy| policy.borrow().is_some())
+        && crate::executor::current_job_cancellation().is_none()
+        && !crate::executor::current_thread_is_executor_worker();
+    let (mut backoff, max) = LANE_PAUSE_RETRY_POLICY.with(|policy| {
+        policy
+            .borrow()
+            .as_ref()
+            .map(|policy| (policy.initial, policy.max))
+            .unwrap_or((Duration::from_secs(15), Duration::from_secs(60)))
+    });
+    let mut paused = false;
+    loop {
+        if may_wait && !pause_job_is_current(current, paused) {
+            return Err("semantic lane superseded".into());
+        }
+        match attempt() {
+            Err(error) => {
+                let Some(pause) = crate::synapse_embed::LanePause::from_error(&error) else {
+                    return Err(error);
+                };
+                observe_lane_pause(&error);
+                paused = true;
+                if !may_wait {
+                    return Err(error);
+                }
+                wait_lane_pause(pause.retry_delay(backoff), current)?;
+                backoff = (backoff * 2).min(max);
+            }
+            success => return success,
+        }
+    }
 }
 
 /// Delay before the cold semantic build retries an unreachable embedding backend.
@@ -276,6 +843,9 @@ pub(crate) fn build_backend_retry_delay_ms(attempt: usize) -> u64 {
 }
 
 fn record_embedding_backend_build_failure(project_root: &Path, error: &str) {
+    if crate::synapse_embed::LanePause::from_error(error).is_some() {
+        return;
+    }
     let now_ms = unix_millis_now();
     let clean = strip_transient_embedding_marker(error);
     let mut registry = embedding_backend_build_health_registry()
@@ -1036,7 +1606,7 @@ impl SemanticIndexLock {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticIndexFingerprint {
     pub backend: String,
     pub model: String,
@@ -3837,7 +4407,7 @@ pub fn format_embedding_init_error(error: impl Display) -> String {
 }
 
 /// A chunk of code ready for embedding — derived from a Symbol with context enrichment
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticChunk {
     /// Absolute file path
     pub file: PathBuf,
@@ -3884,6 +4454,7 @@ impl EmbeddingEntry {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum BuildEmbeddingRow {
     Embedded {
         embedded_text: String,
@@ -3904,7 +4475,13 @@ where
 {
     clear_http_build_metadata();
     let requested_texts = texts.clone();
-    let vectors = embed_fn(texts)?;
+    let vectors = match embed_fn(texts) {
+        Ok(vectors) => vectors,
+        Err(error) => {
+            observe_lane_pause(&error);
+            return Err(error);
+        }
+    };
     let metadata = take_http_build_metadata();
     // Adaptive HTTP requests report their successful sub-batches immediately,
     // including when later requests fail. Generic/local providers report here.
@@ -4356,7 +4933,7 @@ pub struct SemanticIndex {
     removal_retain_passes: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct IndexedFileMetadata {
     mtime: SystemTime,
     size: u64,
@@ -5180,6 +5757,21 @@ impl SemanticIndex {
         files: &[PathBuf],
         embed_text_caps: EmbedTextCaps,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
+        let job = prepared_pause_job();
+        if let Some(job) = &job {
+            let mut job = job.borrow_mut();
+            if let Some(cold) = job.cold.as_mut().filter(|cold| {
+                cold.identity.as_ref().is_some_and(|id| {
+                    id.root == project_root && id.files == files && id.caps == embed_text_caps
+                })
+            }) {
+                return (
+                    std::mem::take(&mut cold.chunks),
+                    std::mem::take(&mut cold.metadata),
+                );
+            }
+            job.cold = None;
+        }
         let collect_started = Instant::now();
         let progress = crate::cold_build_limiter::progress::counter();
         let collect_one = |file: &Path, sched: Duration| {
@@ -5193,7 +5785,7 @@ impl SemanticIndex {
             }
             (file.to_path_buf(), result, phases)
         };
-        let per_file: Vec<CollectedSemanticFile> = if files.len() <= 2 {
+        let per_file: Vec<CollectedSemanticFile> = if files.len() <= 2 || job.is_some() {
             files
                 .iter()
                 .map(|file| collect_one(file, Duration::ZERO))
@@ -5412,6 +6004,7 @@ impl SemanticIndex {
 
     fn entries_for_chunks_with_reuse<F, P>(
         chunks: Vec<SemanticChunk>,
+        selection: &HashMap<PathBuf, IndexedFileMetadata>,
         reuse_map: &ChunkReuseMap,
         embed_fn: &mut F,
         max_batch_size: usize,
@@ -5426,34 +6019,89 @@ impl SemanticIndex {
         let total_chunks = chunks.len();
         progress(0, total_chunks);
 
-        let mut entries_by_chunk: Vec<Option<EmbeddingEntry>> = vec![None; total_chunks];
-        let mut misses: Vec<(usize, SemanticChunk)> = Vec::new();
-
-        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
-            if let Some(vector) = Self::reusable_vector_for_chunk(reuse_map, &chunk) {
-                entries_by_chunk[chunk_index] = Some(EmbeddingEntry::new(chunk, vector));
-            } else {
-                misses.push((chunk_index, chunk));
+        // A retry after a pause continues from its cursor only over the exact
+        // chunks it was interrupted on. When the selection moved in between (a
+        // file deleted or edited), the cursor no longer lines up: start over
+        // on the current chunks, reusing only the finished vectors of files
+        // that are still selected with the same content.
+        let mut paused_vectors = HashMap::new();
+        let mut paused_dimension = None;
+        let resume = match prepared_pause_job().and_then(|job| job.borrow_mut().reuse.take()) {
+            Some(state) if state.covers(&chunks, selection) => Some(state),
+            Some(state) => {
+                paused_dimension = state.dimension;
+                paused_vectors = state.into_reusable(selection);
+                None
             }
-        }
-
-        let mut completed = total_chunks.saturating_sub(misses.len());
+            None => None,
+        };
+        let (
+            mut entries_by_chunk,
+            misses,
+            mut completed,
+            mut observed_dimension,
+            mut skipped_rows,
+            next_miss,
+        ) = if let Some(state) = resume {
+            (
+                state.entries,
+                state.misses,
+                state.completed,
+                state.dimension,
+                state.skipped,
+                state.next_miss,
+            )
+        } else {
+            let mut entries = vec![None; total_chunks];
+            let mut misses = Vec::new();
+            for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+                if let Some(vector) = Self::reusable_vector_for_chunk(reuse_map, &chunk) {
+                    entries[chunk_index] = Some(EmbeddingEntry::new(chunk, vector));
+                } else if let Some(saved) = paused_vectors
+                    .get(&chunk.file)
+                    .and_then(|file| file.get(&chunk.embed_text))
+                {
+                    let mut chunk = chunk;
+                    chunk.embed_text = saved.chunk.embed_text.clone();
+                    entries[chunk_index] = Some(EmbeddingEntry::new(chunk, saved.vector.clone()));
+                } else {
+                    misses.push((chunk_index, chunk));
+                }
+            }
+            let completed = total_chunks.saturating_sub(misses.len());
+            let dimension = initial_observed_dimension.or(paused_dimension);
+            (entries, misses, completed, dimension, 0, 0)
+        };
         if completed > 0 {
             progress(completed, total_chunks);
         }
 
         let batch_size = max_batch_size.max(1);
-        let mut observed_dimension = initial_observed_dimension;
-        let mut skipped_rows = 0usize;
-
-        for batch_start in (0..misses.len()).step_by(batch_size) {
+        for batch_start in (next_miss..misses.len()).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(misses.len());
             let batch_texts: Vec<String> = misses[batch_start..batch_end]
                 .iter()
                 .map(|(_, chunk)| chunk.embed_text.clone())
                 .collect();
 
-            let rows = execute_build_embedding_batch(batch_texts, embed_fn)?;
+            let rows = match execute_build_embedding_batch(batch_texts, embed_fn) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    if let Some(job) = observe_lane_pause(&error) {
+                        checkpoint_work(0, 1, 0);
+                        job.borrow_mut().reuse = Some(ReusePauseCheckpoint {
+                            entries: entries_by_chunk,
+                            misses,
+                            next_miss: batch_start,
+                            completed,
+                            dimension: observed_dimension,
+                            skipped: skipped_rows,
+                            selection: selection.clone(),
+                        });
+                    }
+                    return Err(error);
+                }
+            };
             for (i, row) in rows.into_iter().enumerate() {
                 let (chunk_index, mut chunk) = misses[batch_start + i].clone();
                 match row {
@@ -5555,15 +6203,23 @@ impl SemanticIndex {
             });
         }
 
-        let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
-        let mut expected_dimension: Option<usize> = None;
-        let mut skipped_rows = 0usize;
-        let mut completed_rows = 0usize;
+        let resume = prepared_pause_job().and_then(|job| job.borrow_mut().cold.take());
+        let (mut entries, mut expected_dimension, mut skipped_rows, mut completed_rows) =
+            match resume {
+                Some(state) => (
+                    state.entries,
+                    state.dimension,
+                    state.skipped,
+                    state.next_chunk,
+                ),
+                None => (Vec::with_capacity(chunks.len()), None, 0, 0),
+            };
         let batch_size = max_batch_size.max(1);
         let embed_started = std::time::Instant::now();
         let batch_count = total_chunks.div_ceil(batch_size);
-        for (batch_index, batch_start) in (0..chunks.len()).step_by(batch_size).enumerate() {
-            if !should_continue() {
+        for batch_start in (completed_rows..chunks.len()).step_by(batch_size) {
+            let batch_index = batch_start / batch_size;
+            if !should_continue() || crate::executor::current_job_cancelled() {
                 slog_info!(
                     "semantic embed superseded, stopping after {}/{} batches",
                     batch_index,
@@ -5579,7 +6235,24 @@ impl SemanticIndex {
                 .map(|chunk| chunk.embed_text.clone())
                 .collect();
 
-            let rows = execute_build_embedding_batch(batch_texts, embed_fn)?;
+            let rows = match execute_build_embedding_batch(batch_texts, embed_fn) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    if let Some(job) = observe_lane_pause(&error) {
+                        checkpoint_work(0, 1, 0);
+                        job.borrow_mut().cold = Some(ColdPauseCheckpoint {
+                            identity: None,
+                            chunks,
+                            metadata: file_metadata,
+                            entries,
+                            next_chunk: batch_start,
+                            dimension: expected_dimension,
+                            skipped: skipped_rows,
+                        });
+                    }
+                    return Err(error);
+                }
+            };
             for (i, row) in rows.into_iter().enumerate() {
                 let mut chunk = chunks[batch_start + i].clone();
                 match row {
@@ -5751,6 +6424,9 @@ impl SemanticIndex {
             elapsed_started,
             &embedding_timing,
         );
+        if let Err(error) = &result {
+            retain_cold_identity(project_root, files, embed_text_caps, error);
+        }
         finish_semantic_index_build(
             &scope,
             &mut failure_guard,
@@ -5782,8 +6458,8 @@ impl SemanticIndex {
             crate::cold_build_limiter::progress::StartLog::Info,
         );
         crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
-        let (chunks, file_mtimes) =
-            Self::collect_chunks(project_root, files, EmbedTextCaps::default());
+        let embed_text_caps = EmbedTextCaps::default();
+        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let mut should_continue = || true;
@@ -5798,6 +6474,9 @@ impl SemanticIndex {
             elapsed_started,
             &embedding_timing,
         );
+        if let Err(error) = &result {
+            retain_cold_identity(project_root, files, embed_text_caps, error);
+        }
         finish_semantic_index_build(
             &scope,
             &mut failure_guard,
@@ -5872,6 +6551,9 @@ impl SemanticIndex {
             elapsed_started,
             &embedding_timing,
         );
+        if let Err(error) = &result {
+            retain_cold_identity(project_root, files, embed_text_caps, error);
+        }
         finish_semantic_index_build(
             &scope,
             &mut failure_guard,
@@ -6208,15 +6890,23 @@ impl SemanticIndex {
         } else {
             Some(self.dimension)
         };
-        let (new_entries, observed_dimension, skipped_rows) = Self::entries_for_chunks_with_reuse(
+        let built = Self::entries_for_chunks_with_reuse(
             chunks,
+            &fresh_metadata,
             &reuse_map,
             embed_fn,
             max_batch_size,
             existing_dimension,
             "incremental refresh",
             progress,
-        )?;
+        );
+        let (new_entries, observed_dimension, skipped_rows) = match built {
+            Ok(built) => built,
+            Err(error) => {
+                retain_reuse_files(project_root, embed_text_caps, fresh_metadata, &error);
+                return Err(error);
+            }
+        };
         self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
@@ -6539,15 +7229,23 @@ impl SemanticIndex {
         } else {
             Some(self.dimension)
         };
-        let (new_entries, observed_dimension, skipped_rows) = Self::entries_for_chunks_with_reuse(
+        let built = Self::entries_for_chunks_with_reuse(
             chunks,
+            &fresh_metadata,
             &reuse_map,
             embed_fn,
             max_batch_size,
             initial_observed_dimension,
             "invalidated-file refresh",
             progress,
-        )?;
+        );
+        let (new_entries, observed_dimension, skipped_rows) = match built {
+            Ok(built) => built,
+            Err(error) => {
+                retain_reuse_files(project_root, embed_text_caps, fresh_metadata, &error);
+                return Err(error);
+            }
+        };
         self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
 
         let added_entries = new_entries.clone();
@@ -8888,7 +9586,7 @@ pub const MAX_EMBED_TEXT_HEADER_CHARS: usize = 457;
 const CHARS_PER_TOKEN_NUMERATOR: usize = 7;
 const CHARS_PER_TOKEN_DENOMINATOR: usize = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EmbedTextCaps {
     pub signature_chars: usize,
     pub body_lines: usize,
@@ -9167,6 +9865,37 @@ fn collect_semantic_file(
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
+    if let Some(job) = prepared_pause_job() {
+        let key = FileCheckpointKey {
+            root: project_root.to_path_buf(),
+            file: file.to_path_buf(),
+            caps: embed_text_caps,
+        };
+        if let Some((metadata, chunks)) = job.borrow_mut().file_chunks.remove(&key) {
+            // Chunks prepared before a pause are reused only while the file is
+            // as it was read; an edit or deletion since then reads it again.
+            let unchanged = indexed_file_content_unchanged(
+                file,
+                &FileFreshness {
+                    mtime: metadata.mtime,
+                    size: metadata.size,
+                    content_hash: metadata.content_hash,
+                },
+            );
+            if unchanged {
+                return Ok((metadata, chunks));
+            }
+        }
+    }
+    collect_semantic_file_uncached(project_root, file, embed_text_caps, phases)
+}
+
+fn collect_semantic_file_uncached(
+    project_root: &Path,
+    file: &Path,
+    embed_text_caps: EmbedTextCaps,
+    phases: &mut SemanticCollectPhaseTimings,
+) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
     let read_hash_started = Instant::now();
     let read_result = (|| {
         let metadata = fs::metadata(file).map_err(|error| error.to_string())?;
@@ -9286,6 +10015,8 @@ fn collect_file_chunks_from_source_timed(
     embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<Vec<SemanticChunk>, String> {
+    #[cfg(test)]
+    LANE_PAUSE_CHUNK_CALLS.with(|count| count.set(count.get() + 1));
     let parse_started = Instant::now();
     let tree_result =
         parse_source_with_cached_parser(file, source, lang).map_err(|error| error.to_string());
@@ -9636,6 +10367,26 @@ pub(crate) fn chunk_view_file(
     bytes: &[u8],
     embed_text_caps: EmbedTextCaps,
 ) -> Result<Option<Vec<SemanticChunk>>, String> {
+    if let Some(job) = prepared_pause_job() {
+        let key = ViewCheckpointKey {
+            root: project_root.to_path_buf(),
+            file: rel_path.to_path_buf(),
+            content: crate::blob_store::v2::ContentHash::of(bytes),
+            caps: embed_text_caps,
+        };
+        if let Some(chunks) = job.borrow_mut().view_chunks.remove(&key) {
+            return Ok(chunks);
+        }
+    }
+    chunk_view_file_uncached(project_root, rel_path, bytes, embed_text_caps)
+}
+
+fn chunk_view_file_uncached(
+    project_root: &Path,
+    rel_path: &Path,
+    bytes: &[u8],
+    embed_text_caps: EmbedTextCaps,
+) -> Result<Option<Vec<SemanticChunk>>, String> {
     let file = project_root.join(rel_path);
     if !is_semantic_indexed_extension(&file) {
         return Ok(None);
@@ -9689,22 +10440,55 @@ pub(crate) fn embed_view_files_with_rows<F>(
 where
     F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
 {
-    let mut runs = files
-        .iter()
-        .map(|chunks| Vec::with_capacity(chunks.len()))
-        .collect::<Vec<Vec<EmbeddingEntry>>>();
-    let pending = files
-        .into_iter()
-        .enumerate()
-        .flat_map(|(file, chunks)| chunks.into_iter().map(move |chunk| (file, chunk)))
-        .collect::<Vec<_>>();
-    let mut dimension = None;
-    for batch in pending.chunks(max_batch_size.max(1)) {
+    let resume = prepared_pause_job()
+        .and_then(|job| job.borrow_mut().view.take())
+        .filter(|state| {
+            state.runs.len() == files.len()
+                && state
+                    .pending
+                    .iter()
+                    .map(|(file, chunk)| (*file, chunk))
+                    .eq(files
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(file, chunks)| chunks.iter().map(move |chunk| (file, chunk))))
+        });
+    let (mut runs, pending, mut dimension, next_chunk) = if let Some(state) = resume {
+        (state.runs, state.pending, state.dimension, state.next_chunk)
+    } else {
+        let runs = files
+            .iter()
+            .map(|chunks| Vec::with_capacity(chunks.len()))
+            .collect::<Vec<Vec<EmbeddingEntry>>>();
+        let pending = files
+            .into_iter()
+            .enumerate()
+            .flat_map(|(file, chunks)| chunks.into_iter().map(move |chunk| (file, chunk)))
+            .collect::<Vec<_>>();
+        (runs, pending, None, 0)
+    };
+    let batch_size = max_batch_size.max(1);
+    for batch_start in (next_chunk..pending.len()).step_by(batch_size) {
+        let batch = &pending[batch_start..(batch_start + batch_size).min(pending.len())];
         let texts = batch
             .iter()
             .map(|(_, chunk)| chunk.embed_text.clone())
             .collect();
-        let rows = rows_fn(texts)?;
+        let rows = match rows_fn(texts) {
+            Ok(rows) => rows,
+            Err(error) => {
+                if let Some(job) = observe_lane_pause(&error) {
+                    checkpoint_work(0, 1, 0);
+                    job.borrow_mut().view = Some(ViewPauseCheckpoint {
+                        runs,
+                        pending,
+                        next_chunk: batch_start,
+                        dimension,
+                    });
+                }
+                return Err(error);
+            }
+        };
         for ((file, chunk), row) in batch.iter().zip(rows) {
             let mut chunk = chunk.clone();
             match row {
@@ -9896,6 +10680,608 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
 
 #[cfg(test)]
 mod tests {
+    fn no_pause_checkpoint_fixture(
+        files: usize,
+        symbols: usize,
+        dimension: usize,
+    ) -> (usize, CheckpointWork, u128) {
+        let root = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for file in 0..files {
+            let path = root.path().join(format!("fixture_{file}.rs"));
+            let source = (0..symbols).map(|symbol| format!(
+                "/// Deterministic cold-build RSS fixture, file {file}, symbol {symbol}.\npub fn item_{file}_{symbol}(value: u64) -> u64 {{ value.wrapping_add({symbol}) }}\n"
+            )).collect::<String>();
+            fs::write(&path, source).unwrap();
+            paths.push(path);
+        }
+        let start = Instant::now();
+        let (index, work) = with_checkpoint_work(|| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            retry_lane_pause(|| {
+                SemanticIndex::build(
+                    root.path(),
+                    &paths,
+                    &mut |texts: Vec<String>| Ok(vec![vec![0.25; dimension]; texts.len()]),
+                    128,
+                )
+            })
+            .unwrap()
+        });
+        let elapsed = start.elapsed().as_millis();
+        (index.len(), work, elapsed)
+    }
+
+    #[test]
+    fn normal_cold_build_has_zero_checkpoint_work() {
+        let (chunks, work, _) = no_pause_checkpoint_fixture(3, 10, 16);
+        assert_eq!(chunks, 30);
+        assert_eq!(
+            work,
+            CheckpointWork::default(),
+            "a normal build allocated or copied pause checkpoints"
+        );
+    }
+
+    #[test]
+    fn normal_semantic_retry_preserves_reconnect_grace_before_any_pause() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("grace.rs");
+        fs::write(&file, "/// First value.\npub fn first(x: u64) -> u64 { x + 1 }\n/// Second value.\npub fn second(x: u64) -> u64 { x + 2 }\n").unwrap();
+        let ctx = Arc::new(crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        ));
+        ctx.set_unbound_build_abandon_grace_for_test(Duration::from_secs(300));
+        ctx.mark_subc_unbound();
+        let grace = ctx.subc_lifecycle_admission();
+        let strict = grace.clone();
+        let strict_checks = Arc::new(AtomicUsize::new(0));
+        let checks = strict_checks.clone();
+        let (index, work) = with_checkpoint_work(|| {
+            let _policy = PauseRetryScope::new(
+                Duration::from_secs(15),
+                Duration::from_secs(60),
+                move || !grace.unbound_past_grace(),
+            )
+            .with_pause_current(move || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                strict.is_bound()
+            });
+            retry_lane_pause(|| {
+                SemanticIndex::build(
+                    root.path(),
+                    std::slice::from_ref(&file),
+                    &mut |texts: Vec<String>| Ok(vec![vec![1.0, 0.0]; texts.len()]),
+                    1,
+                )
+            })
+            .unwrap()
+        });
+        assert!(index.len() > 0);
+        assert_eq!(
+            strict_checks.load(Ordering::SeqCst),
+            0,
+            "normal indexing used the pause-only immediate-unbind rule"
+        );
+        assert_eq!(work, CheckpointWork::default());
+        ctx.mark_subc_bound();
+    }
+
+    #[test]
+    fn lane_paused_owned_cursors_resume_after_completed_batches() {
+        use crate::synapse_embed::pause_test_support::*;
+        for refresh in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("cursor.rs");
+            fs::write(
+                &file,
+                "/// First.\npub fn first(x: u64) -> u64 { x + 1 }\n/// Second.\npub fn second(x: u64) -> u64 { x + 2 }\n/// Third.\npub fn third(x: u64) -> u64 { x + 3 }\n",
+            )
+            .unwrap();
+            let mut initial = if refresh {
+                let index = SemanticIndex::build(
+                    root.path(),
+                    std::slice::from_ref(&file),
+                    &mut |texts: Vec<String>| Ok(vec![vec![0.0, 1.0]; texts.len()]),
+                    1,
+                )
+                .unwrap();
+                fs::write(&file, "/// First.\npub fn first(x: u64) -> u64 { x + 4 }\n/// Second.\npub fn second(x: u64) -> u64 { x + 5 }\n/// Third.\npub fn third(x: u64) -> u64 { x + 6 }\n").unwrap();
+                Some(index)
+            } else {
+                None
+            };
+            with_lane_pause_clock(START, |clock| {
+                let _policy =
+                    PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+                let mut inputs = Vec::new();
+                let mut embed = |texts: Vec<String>| {
+                    inputs.extend(texts.clone());
+                    if inputs.len() == 2 && clock.load(Ordering::SeqCst) == START {
+                        Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+                            crate::synapse_embed::LanePause {
+                                lane_id: MODEL.into(),
+                                fingerprint: Some("pinned".into()),
+                                retry_after_ms: Some(PAUSE_MS),
+                                paused_until_ms: START + PAUSE_MS,
+                                reason: "maintenance".into(),
+                            },
+                        )
+                        .to_string())
+                    } else {
+                        Ok(vec![vec![1.0, 0.0]; texts.len()])
+                    }
+                };
+                let before = lane_pause_chunk_calls();
+                if refresh {
+                    let mut index = initial.take().unwrap();
+                    let result = retry_lane_pause(|| {
+                        index.refresh_invalidated_files(
+                            root.path(),
+                            std::slice::from_ref(&file),
+                            &mut embed,
+                            1,
+                            100,
+                            &mut |_, _| {},
+                        )
+                    })
+                    .unwrap();
+                    assert_eq!(result.added_entries.len(), 3);
+                } else {
+                    let index = retry_lane_pause(|| {
+                        SemanticIndex::build(
+                            root.path(),
+                            std::slice::from_ref(&file),
+                            &mut embed,
+                            1,
+                        )
+                    })
+                    .unwrap();
+                    assert_eq!(index.len(), 3);
+                }
+                assert_eq!(inputs.len(), 4, "resume re-embedded a completed batch");
+                assert_eq!(inputs[1], inputs[2]);
+                assert_ne!(inputs[0], inputs[2]);
+                assert_eq!(lane_pause_chunk_calls() - before, 1);
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual no-pause cold-build peak RSS measurement"]
+    fn profile_no_pause_cold_build_peak_rss() {
+        let (chunks, work, elapsed_ms) = no_pause_checkpoint_fixture(100, 40, 1024);
+        assert_eq!(chunks, 4_000);
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let peak_kib = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        println!("NO_PAUSE_COLD_RSS chunks={chunks} dimension=1024 peak_kib={peak_kib} elapsed_ms={elapsed_ms} checkpoint_allocations={} checkpoint_inserts={} checkpoint_clones={}",
+            work.allocations, work.inserts, work.clones);
+    }
+
+    #[test]
+    fn lane_paused_cold_build_waits_without_rechunking_and_resumes() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_fake_synapse(clock.clone(), None, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("pause.ts");
+                fs::write(&file, "export function keyword() { return 1; }\n").unwrap();
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let before = lane_pause_chunk_calls();
+                let mut attempts = Vec::new();
+                let mut embed = |texts: Vec<String>| {
+                    attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
+                    model.embed(texts)
+                };
+                let walks = std::cell::Cell::new(0);
+                let index = retry_lane_pause(|| {
+                    let files = pause_job_files(directory.path(), || {
+                        walks.set(walks.get() + 1);
+                        Ok(fs::read_dir(directory.path())
+                            .unwrap()
+                            .map(|entry| entry.unwrap().path())
+                            .filter(|path| path.is_file())
+                            .collect())
+                    })
+                    .map_err(|_| "corpus walk failed".to_string())?;
+                    SemanticIndex::build_with_progress_and_cancellation_caps(
+                        directory.path(),
+                        &files,
+                        &mut embed,
+                        100,
+                        EmbedTextCaps::default(),
+                        &mut |_, _| {},
+                        &mut || true,
+                    )
+                })
+                .unwrap();
+                assert!(index.len() > 0);
+                assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
+                assert_eq!(lane_pause_chunk_calls() - before, 1);
+                assert_eq!(walks.get(), 1);
+                assert_eq!(
+                    requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == "embed.batch")
+                        .count(),
+                    2
+                );
+                assert!(embedding_backend_build_health(directory.path()).is_none());
+            });
+        });
+    }
+
+    #[test]
+    fn lane_paused_invalid_hint_uses_backoff_without_hot_loop() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_fake_synapse(
+                clock.clone(),
+                Some(serde_json::json!(
+                    crate::synapse_embed::MAX_LANE_PAUSE_MS + 1
+                )),
+                |config, requests| {
+                    let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                    let rows = retry_lane_pause(|| {
+                        execute_build_embedding_batch(vec!["keyword".into()], &mut |texts| {
+                            model.embed(texts)
+                        })
+                    })
+                    .unwrap();
+                    assert_eq!(rows.len(), 1);
+                    let times = requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(_, request)| request["method"] == "embed.batch")
+                        .map(|(now, _)| *now - START)
+                        .collect::<Vec<_>>();
+                    assert_eq!(&times[..4], &[0, 15_000, 45_000, 105_000]);
+                    assert_eq!(
+                        times.len(),
+                        48,
+                        "45 minutes must not spin or hit a retry limit"
+                    );
+                    assert_eq!(times.last(), Some(&2_745_000));
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn lane_paused_wait_uses_maximum_of_hint_and_worker_backoff() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _scope =
+                PauseRetryScope::new(Duration::from_secs(5), Duration::from_secs(300), || true);
+            let mut attempts = Vec::new();
+            let result = retry_lane_pause(|| {
+                attempts.push(unix_millis_now());
+                if attempts.len() == 4 {
+                    return Ok(4);
+                }
+                let reply = pause_reply(serde_json::json!(1_000));
+                let pause = crate::synapse_embed::LanePause {
+                    lane_id: MODEL.into(),
+                    fingerprint: Some("pinned".into()),
+                    retry_after_ms: Some(1_000),
+                    paused_until_ms: reply["error"]["details"]["paused_until_ms"]
+                        .as_u64()
+                        .unwrap(),
+                    reason: "maintenance".into(),
+                };
+                Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(pause).to_string())
+            });
+            assert_eq!(result, Ok(4));
+            assert_eq!(
+                attempts,
+                vec![START, START + 5_000, START + 15_000, START + 35_000]
+            );
+            assert_eq!(
+                clock.load(std::sync::atomic::Ordering::SeqCst),
+                START + 35_000
+            );
+        });
+    }
+
+    #[test]
+    fn lane_paused_live_refresh_retains_prepared_chunks_until_resume() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            let _policy =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_fake_synapse(clock, None, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("live.ts");
+                fs::write(&file, "export function keyword() { return 2; }\n").unwrap();
+                let mut index = SemanticIndex::new(directory.path().to_path_buf(), 2);
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let before = lane_pause_chunk_calls();
+                let mut attempts = Vec::new();
+                let refresh = retry_lane_pause(|| {
+                    index.refresh_invalidated_files(
+                        directory.path(),
+                        std::slice::from_ref(&file),
+                        &mut |texts| {
+                            attempts.push((unix_millis_now(), lane_pause_chunk_calls() - before));
+                            model.embed(texts)
+                        },
+                        100,
+                        100,
+                        &mut |_, _| {},
+                    )
+                })
+                .unwrap();
+                assert!(!refresh.added_entries.is_empty());
+                assert_eq!(attempts, vec![(START, 1), (START + PAUSE_MS, 1)]);
+                assert_eq!(requests.lock().unwrap().len(), 3);
+            });
+        });
+    }
+
+    #[test]
+    fn lane_paused_refresh_drops_files_deleted_before_retry() {
+        use crate::synapse_embed::pause_test_support::*;
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("a_kept.rs");
+        let deleted = root.path().join("b_deleted.rs");
+        let source = |tag: &str| {
+            format!("/// First {tag}.\npub fn first_{tag}(x: u64) -> u64 {{ x + 1 }}\n/// Second {tag}.\npub fn second_{tag}(x: u64) -> u64 {{ x + 2 }}\n")
+        };
+        fs::write(&kept, source("kept")).unwrap();
+        fs::write(&deleted, source("gone")).unwrap();
+        let files = vec![kept.clone(), deleted.clone()];
+        let mut worker = SemanticIndex::build(
+            root.path(),
+            &files,
+            &mut |texts: Vec<String>| Ok(vec![vec![0.0, 1.0]; texts.len()]),
+            1,
+        )
+        .unwrap();
+        // `worker` is the refresh worker's copy; `serving` stands for the index
+        // searches read, which receives the refresh result through
+        // `apply_refresh_update` exactly as the completion drain hands it over.
+        let mut serving = worker.clone();
+        // Both files change, so the refresh embeds every chunk again.
+        fs::write(&kept, source("kept_edit")).unwrap();
+        fs::write(&deleted, source("gone_edit")).unwrap();
+        let _policy =
+            PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+        let removed = deleted.clone();
+        let mut inputs: Vec<String> = Vec::new();
+        let mut paused_at = None;
+        let update = with_lane_pause_wait_hook(
+            // The file disappears while the lane is paused.
+            move |_| fs::remove_file(&removed).unwrap(),
+            || {
+                retry_lane_pause(|| {
+                    worker.refresh_invalidated_files(
+                        root.path(),
+                        &files,
+                        &mut |texts: Vec<String>| {
+                            // Pause once, on a batch of the deleted file after
+                            // one of its batches already finished, so the saved
+                            // checkpoint holds finished rows of that file.
+                            let finished_deleted =
+                                inputs.iter().any(|text| text.contains("gone_edit"));
+                            let batch_deleted = texts.iter().any(|text| text.contains("gone_edit"));
+                            if paused_at.is_none() && finished_deleted && batch_deleted {
+                                paused_at = Some(inputs.len());
+                                return Err(
+                                    crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+                                        crate::synapse_embed::LanePause {
+                                            lane_id: MODEL.into(),
+                                            fingerprint: Some("pinned".into()),
+                                            retry_after_ms: Some(PAUSE_MS),
+                                            paused_until_ms: START + PAUSE_MS,
+                                            reason: "maintenance".into(),
+                                        },
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                            inputs.extend(texts.clone());
+                            Ok(vec![vec![1.0, 0.0]; texts.len()])
+                        },
+                        1,
+                        100,
+                        &mut |_, _| {},
+                    )
+                })
+            },
+        )
+        .unwrap();
+        assert!(!deleted.exists());
+        assert!(paused_at.is_some(), "the refresh never paused: {inputs:?}");
+        assert_eq!(
+            Some(inputs.len()),
+            paused_at,
+            "the retry embedded again: {inputs:?}"
+        );
+        assert!(
+            update
+                .added_entries
+                .iter()
+                .all(|entry| entry.file() == kept),
+            "the retry kept rows of a file deleted during the pause"
+        );
+        assert_eq!(
+            update.added_entries.len(),
+            3,
+            "{:?}",
+            update
+                .added_entries
+                .iter()
+                .map(|entry| (entry.file().to_path_buf(), entry.chunk.name.clone()))
+                .collect::<Vec<_>>()
+        );
+        serving.apply_refresh_update(
+            update.added_entries,
+            update.updated_metadata,
+            &update.completed_paths,
+        );
+        for index in [&serving, &worker] {
+            let results = index.search(&[1.0, 0.0], 100);
+            assert!(
+                results.iter().all(|result| result.file != deleted),
+                "deleted file came back: {results:?}"
+            );
+            assert!(results.iter().any(|result| result.file == kept));
+        }
+        assert!(serving.recorded_file_freshness(&deleted).is_none());
+    }
+
+    #[test]
+    fn lane_paused_wait_is_cancelled_when_worker_is_superseded() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |_clock| {
+            let _scope =
+                PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || false);
+            let mut attempts = 0;
+            let result: Result<(), String> = retry_lane_pause(|| {
+                attempts += 1;
+                Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+                    crate::synapse_embed::LanePause {
+                        lane_id: MODEL.into(),
+                        fingerprint: Some("pinned".into()),
+                        retry_after_ms: Some(PAUSE_MS),
+                        paused_until_ms: START + PAUSE_MS,
+                        reason: "maintenance".into(),
+                    },
+                )
+                .to_string())
+            });
+            assert_eq!(attempts, 0);
+            assert_eq!(result.unwrap_err(), "semantic lane superseded");
+        });
+    }
+
+    #[test]
+    fn lane_paused_cold_job_stops_on_quiesce_or_own_cancellation() {
+        use crate::synapse_embed::pause_test_support::*;
+        for quiesce in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let file = root.path().join("cancel.rs");
+            fs::write(&file, "pub fn cancelled() {}\n").unwrap();
+            let ctx = Arc::new(crate::context::AppContext::new(
+                crate::context::default_language_provider_factory(),
+                crate::config::Config::default(),
+            ));
+            let lifecycle = ctx.subc_lifecycle_admission();
+            let grace = lifecycle.clone();
+            let own = Arc::new(AtomicBool::new(true));
+            let checks = Arc::new(AtomicUsize::new(0));
+            let at_cancel = Arc::new(AtomicUsize::new(0));
+            let _policy = PauseRetryScope::new(
+                Duration::from_secs(15),
+                Duration::from_secs(60),
+                move || !grace.unbound_past_grace(),
+            )
+            .with_pause_current(move || lifecycle.is_bound());
+            with_lane_pause_clock(START, |clock| {
+                let own_cancel = own.clone();
+                let checks_hook = checks.clone();
+                let at_cancel_hook = at_cancel.clone();
+                let ctx_hook = ctx.clone();
+                with_lane_pause_wait_hook(
+                    move |_| {
+                        at_cancel_hook.store(checks_hook.load(Ordering::SeqCst), Ordering::SeqCst);
+                        if quiesce {
+                            ctx_hook.mark_subc_unbound();
+                        } else {
+                            own_cancel.store(false, Ordering::SeqCst);
+                        }
+                    },
+                    || {
+                        let calls = std::cell::Cell::new(0);
+                        let result = retry_lane_pause_while(
+                            || {
+                                SemanticIndex::build_with_progress_and_cancellation_caps(
+                                    root.path(),
+                                    std::slice::from_ref(&file),
+                                    &mut |_| {
+                                        calls.set(calls.get() + 1);
+                                        assert_eq!(
+                                            calls.get(),
+                                            1,
+                                            "a quiesced paused build attempted more embedding work"
+                                        );
+                                        Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(crate::synapse_embed::LanePause {
+                                lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
+                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(),
+                            }).to_string())
+                                    },
+                                    100,
+                                    EmbedTextCaps::default(),
+                                    &mut |_, _| {},
+                                    &mut || own.load(Ordering::SeqCst),
+                                )
+                            },
+                            &mut || {
+                                checks.fetch_add(1, Ordering::SeqCst);
+                                own.load(Ordering::SeqCst)
+                            },
+                        );
+                        assert_eq!(result.err().as_deref(), Some("semantic lane superseded"));
+                        assert_eq!(
+                            checks.load(Ordering::SeqCst),
+                            at_cancel.load(Ordering::SeqCst) + 1
+                        );
+                        assert_eq!(calls.get(), 1, "a cancelled paused build did more indexing");
+                        assert_eq!(clock.load(Ordering::SeqCst), START);
+                    },
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn lane_paused_direct_cold_builder_has_no_implicit_wait() {
+        use crate::synapse_embed::pause_test_support::*;
+        with_lane_pause_clock(START, |clock| {
+            with_fake_synapse(clock.clone(), None, |config, requests| {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("direct.rs");
+                fs::write(&file, "pub fn direct() {}\n").unwrap();
+                let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+                let result = SemanticIndex::build_with_progress_and_cancellation_caps(
+                    directory.path(),
+                    &[file],
+                    &mut |texts| model.embed(texts),
+                    100,
+                    EmbedTextCaps::default(),
+                    &mut |_, _| {},
+                    &mut || true,
+                );
+                assert!(crate::synapse_embed::LanePause::from_error(
+                    &result
+                        .err()
+                        .expect("a direct builder must return its pause to its caller")
+                )
+                .is_some());
+                assert_eq!(clock.load(Ordering::SeqCst), START);
+                assert_eq!(requests.lock().unwrap().len(), 2);
+            });
+        });
+    }
+
     #[test]
     fn durability_semantic_snapshot_count() {
         let project = tempfile::tempdir().unwrap();

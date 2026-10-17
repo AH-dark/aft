@@ -156,11 +156,12 @@ impl AppContext {
         let embedding_backend = self.semantic_backend_health_snapshot();
         let semantic_index_info = if !embedding_backend.available {
             serde_json::json!({
-                "status": "backend_unavailable",
-                "state": "backend_unavailable",
+                "status": if embedding_backend.paused_until_ms.is_some() { "paused" } else { "backend_unavailable" },
+                "state": if embedding_backend.paused_until_ms.is_some() { "paused" } else { "backend_unavailable" },
                 "reason": embedding_backend.last_error,
                 "since_ms": embedding_backend.since_ms,
                 "next_retry_ms": embedding_backend.next_retry_ms,
+                "paused_until_ms": embedding_backend.paused_until_ms,
                 "backend": config.semantic_backend_label(),
                 "backend_url": config.semantic.base_url.as_deref(),
                 "model": config.semantic.model.as_str(),

@@ -101,6 +101,11 @@ impl SemanticArena {
         lock(&self.chunk_batch)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_resources_are_free(&self) -> bool {
+        self.chunk_batch.try_lock().is_ok() && lock(&self.inflight).is_empty()
+    }
+
     pub fn storage(&self) -> &Path {
         &self.storage
     }

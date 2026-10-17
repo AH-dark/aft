@@ -2299,6 +2299,8 @@ fn build_health_diagnostic_rollup_from_actors(
     let mut candidates = Vec::with_capacity(actor_count.saturating_add(standing_entries.len()));
     let mut repair_roots_annotated = 0usize;
     let mut embedding_backend_available = true;
+    let mut embedding_backend_paused_until_ms: Option<u64> = None;
+    let mut embedding_backend_down = false;
     let mut embedding_backend_last_error = None;
     let mut embedding_backend_since_ms = None;
     let mut task_storage_roots = std::collections::HashSet::new();
@@ -2380,6 +2382,12 @@ fn build_health_diagnostic_rollup_from_actors(
         let backend = ctx.semantic_backend_health_snapshot();
         if !backend.available {
             embedding_backend_available = false;
+            if let Some(until) = backend.paused_until_ms {
+                embedding_backend_paused_until_ms =
+                    Some(embedding_backend_paused_until_ms.map_or(until, |old| old.max(until)));
+            } else {
+                embedding_backend_down = true;
+            }
             let replace_error = embedding_backend_since_ms
                 .is_none_or(|since| backend.since_ms.is_some_and(|candidate| candidate <= since));
             if replace_error {
@@ -2392,8 +2400,10 @@ fn build_health_diagnostic_rollup_from_actors(
         }
         if let Some(backend) =
             crate::semantic_index::embedding_backend_build_health(root_id.as_path())
+                .filter(|_| crate::synapse_embed::lane_pause_for_root(root_id.as_path()).is_none())
         {
             embedding_backend_available = false;
+            embedding_backend_down = true;
             if embedding_backend_since_ms.is_none_or(|since| backend.since_ms <= since) {
                 embedding_backend_last_error = Some(backend.last_error);
             }
@@ -2474,6 +2484,9 @@ fn build_health_diagnostic_rollup_from_actors(
             let mut value = standing_root_health_value(snapshot, candidate.standing.as_ref());
             if let Some(backend) =
                 crate::semantic_index::embedding_backend_build_health(Path::new(&root_label))
+                    .filter(|_| {
+                        crate::synapse_embed::lane_pause_for_root(Path::new(&root_label)).is_none()
+                    })
             {
                 if let Some(semantic) = value
                     .get_mut("semantic_index")
@@ -2605,6 +2618,8 @@ fn build_health_diagnostic_rollup_from_actors(
         },
         "embedding_backend": {
             "available": embedding_backend_available,
+            "state": if embedding_backend_available { "available" } else if !embedding_backend_down && embedding_backend_paused_until_ms.is_some() { "paused" } else { "backend_unavailable" },
+            "paused_until_ms": embedding_backend_paused_until_ms,
             "last_error": embedding_backend_last_error,
             "since_ms": embedding_backend_since_ms,
         },

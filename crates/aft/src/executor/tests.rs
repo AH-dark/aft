@@ -117,6 +117,170 @@ fn test_executor(
 }
 
 #[test]
+fn lane_paused_six_cold_roots_leave_slots_and_maintenance_available() {
+    use crate::semantic_index::{
+        retry_lane_pause, with_lane_pause_clock, with_lane_pause_wait_hook, PauseRetryScope,
+        SemanticIndex, SemanticIndexLock,
+    };
+    use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
+    const ROOTS: usize = 6;
+    let limiter = crate::cold_build_limiter::isolated_limiter(2);
+    let storage = tempfile::tempdir().unwrap();
+    let (entered_tx, entered_rx) = crossbeam_channel::unbounded();
+    let resume = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let advanced = Arc::new(AtomicUsize::new(0));
+    let writer_reached = Arc::new(AtomicUsize::new(0));
+    let mut directories = Vec::new();
+    let mut workers = Vec::new();
+    for number in 0..ROOTS {
+        let (directory, root) = test_root(&format!("paused-{number}"));
+        let file = directory.path().join("lib.rs");
+        std::fs::write(&file, "pub fn prepared() {}\n").unwrap();
+        let key = format!("paused-{number}");
+        crate::root_cache::configure_artifact_access(root.as_path(), &key, false);
+        let storage = storage.path().to_path_buf();
+        let limiter = limiter.clone();
+        let entered = entered_tx.clone();
+        let resume = resume.clone();
+        let advanced = advanced.clone();
+        let writer_reached = writer_reached.clone();
+        directories.push((directory, key.clone()));
+        workers.push(thread::spawn(move || {
+            let _policy = PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_lane_pause_clock(START, |clock| {
+                let clock_wait = clock.clone();
+                with_lane_pause_wait_hook(move |delay| {
+                    entered.send(number).unwrap();
+                    let (lock, wake) = &*resume;
+                    let mut released = lock.lock().unwrap();
+                    while !*released { released = wake.wait(released).unwrap(); }
+                    clock_wait.fetch_add(delay.as_millis() as u64, Ordering::SeqCst);
+                    advanced.fetch_add(1, Ordering::SeqCst);
+                }, || retry_lane_pause(|| {
+                    let _permit = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                        &limiter, "semantic build", root.as_path(), || true).unwrap();
+                    let _writer =
+                        SemanticIndexLock::acquire(&storage, &key, root.as_path()).unwrap();
+                    if storage.join("semantic").join(&key).join("cache.lock").exists() {
+                        writer_reached.fetch_add(1, Ordering::SeqCst);
+                    }
+                    SemanticIndex::build(root.as_path(), std::slice::from_ref(&file), &mut |texts: Vec<String>| {
+                        if clock.load(Ordering::SeqCst) < START + PAUSE_MS {
+                            Err(SynapseEmbeddingError::LanePaused(LanePause {
+                                lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
+                                paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(),
+                            }).to_string())
+                        } else { Ok(vec![vec![1.0, 0.0]; texts.len()]) }
+                    }, 100)
+                })).map(|index| index.len())
+            })
+        }));
+    }
+    let paused = (0..ROOTS)
+        .take_while(|_| entered_rx.recv_timeout(Duration::from_secs(3)).is_ok())
+        .count();
+    let writer_locks_free = directories
+        .iter()
+        .filter(|(_, key)| {
+            let path = storage.path().join("semantic").join(key).join("cache.lock");
+            crate::fs_lock::try_acquire(&path, Duration::ZERO).is_ok()
+        })
+        .count();
+    let executor = test_executor(2, 1, 2, 1);
+    let (_other_dir, other) = test_root("unrelated-during-pause");
+    executor.register_actor(other.clone(), test_ctx());
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let counted = admitted.clone();
+    let other_limiter = limiter.clone();
+    let unrelated = executor.submit_maintenance_async(
+        other,
+        Lane::HeavyInit,
+        "unrelated-cold".into(),
+        Box::new(move |_| {
+            if let Some(_permit) = other_limiter.try_acquire() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                ok("unrelated-cold")
+            } else {
+                Response::error(
+                    "unrelated-cold",
+                    "admission_blocked",
+                    "all cold slots retained by paused roots",
+                )
+            }
+        }),
+    );
+    let unrelated = recv_async(unrelated, "unrelated maintenance during pause");
+    let before_advance = advanced.load(Ordering::SeqCst);
+    let writer_attempts_before_advance = writer_reached.load(Ordering::SeqCst);
+    {
+        let (lock, wake) = &*resume;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    for worker in workers {
+        assert!(worker.join().unwrap().unwrap() > 0);
+    }
+    assert_eq!(
+        paused, ROOTS,
+        "paused roots monopolized the shared cold limiter"
+    );
+    assert_eq!(writer_locks_free, ROOTS, "a pause retained a writer lock");
+    assert_eq!(
+        writer_attempts_before_advance, ROOTS,
+        "the writer-lock control did not reach each real lock"
+    );
+    assert!(unrelated.success);
+    assert_eq!(admitted.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        before_advance, 0,
+        "unrelated work only ran after virtual pause expiry"
+    );
+}
+
+#[test]
+fn lane_paused_executor_jobs_return_without_pinning_a_worker() {
+    use crate::semantic_index::{retry_lane_pause, with_lane_pause_wait_hook, PauseRetryScope};
+    use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
+    let executor = test_executor(2, 1, 2, 1);
+    let mut directories = Vec::new();
+    let mut replies = Vec::new();
+    for number in 0..6 {
+        let (directory, root) = test_root(&format!("paused-executor-{number}"));
+        executor.register_actor(root.clone(), test_ctx());
+        directories.push(directory);
+        replies.push(executor.submit_maintenance_async(root, Lane::HeavyInit, format!("paused-{number}"), Box::new(move |_| {
+            let _policy = PauseRetryScope::new(Duration::from_secs(15), Duration::from_secs(60), || true);
+            with_lane_pause_wait_hook(|_| panic!("executor worker attempted an announced-pause wait"), || {
+                let result: Result<(), String> = retry_lane_pause(|| Err(SynapseEmbeddingError::LanePaused(LanePause {
+                    lane_id: MODEL.into(), fingerprint: Some("pinned".into()), retry_after_ms: Some(PAUSE_MS),
+                    paused_until_ms: START + PAUSE_MS, reason: "maintenance".into(),
+                }).to_string()));
+                Response::success(format!("paused-{number}"), serde_json::json!({"pause": LanePause::from_error(&result.unwrap_err()).is_some()}))
+            })
+        })));
+    }
+    for reply in replies {
+        let response = recv_async(reply, "paused executor job");
+        assert!(response.success, "{}", response.data);
+        assert_eq!(response.data["pause"], true);
+    }
+    let (_other, root) = test_root("after-paused-executor");
+    executor.register_actor(root.clone(), test_ctx());
+    assert!(
+        recv_async(
+            executor.submit_maintenance_async(
+                root,
+                Lane::HeavyInit,
+                "after-pause".into(),
+                Box::new(|_| ok("after-pause"))
+            ),
+            "maintenance after pauses"
+        )
+        .success
+    );
+}
+
+#[test]
 fn last_executor_owner_can_drop_on_worker() {
     let owner = Arc::new(parking_lot::Mutex::new(Some(test_executor(2, 1, 1, 1))));
     let (_dir, root) = test_root("last-owner");

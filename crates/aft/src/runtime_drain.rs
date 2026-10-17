@@ -1574,6 +1574,9 @@ pub fn semantic_refresh_circuit_is_open(ctx: &AppContext) -> bool {
 }
 
 pub fn record_semantic_refresh_transient_failure(ctx: &AppContext, error: &str) -> bool {
+    if aft::synapse_embed::LanePause::from_error(error).is_some() {
+        return false;
+    }
     let reason = aft::semantic_index::strip_transient_embedding_marker(error);
     ctx.record_semantic_refresh_transient_failure(BREAKER_TRIP_THRESHOLD, &reason)
 }
@@ -1825,6 +1828,12 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                 added_entries.retain(|entry| !stale.contains(entry.file()));
                 updated_metadata.retain(|(path, _)| !stale.contains(path));
                 completed_paths.retain(|path| !stale.contains(path));
+                // Rows are only installed together with the freshness record of
+                // their file. A row without one (a file deleted while its batch
+                // was in flight) would be unreachable by every later freshness
+                // check and stay in the index for good.
+                let with_metadata = updated_metadata.iter().map(|(path, _)| path.as_path()).collect::<HashSet<_>>();
+                added_entries.retain(|entry| with_metadata.contains(entry.file()));
                 replay_refresh_paths.extend(stale.into_iter().filter(|path| !watcher_path_is_ignored_by_current_matcher(ctx, path)));
                 if let Some(index) = ctx
                     .semantic_index()
@@ -6454,6 +6463,31 @@ mod tests {
         ctx
     }
 
+    #[test]
+    fn lane_paused_refresh_does_not_advance_failure_breaker() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = semantic_owner_context(directory.path());
+        assert!(!record_semantic_refresh_transient_failure(
+            &ctx,
+            "[transient] connection refused"
+        ));
+        let error = crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+            crate::synapse_embed::LanePause {
+                lane_id: "qwen3-embedding-0.6b-ane".into(),
+                fingerprint: Some("pinned".into()),
+                retry_after_ms: Some(2_700_000),
+                paused_until_ms: 2_800_000,
+                reason: "maintenance".into(),
+            },
+        )
+        .to_string();
+        for _ in 0..100 {
+            assert!(!record_semantic_refresh_transient_failure(&ctx, &error));
+        }
+        assert_eq!(semantic_refresh_transient_failure_count_for_test(&ctx), 1);
+        assert!(!semantic_refresh_circuit_is_open(&ctx));
+    }
+
     /// The daemon reproduction in `tests/daemon_malloc_small_growth_repro.rs`
     /// found hundreds of MB of semantic indexes live but missing from the
     /// memory census. The cause: when the drain installs a load on its owner
@@ -7015,6 +7049,78 @@ mod tests {
     #[test]
     fn revision_same_worker_stale_corpus_cannot_resurrect_second_edit() {
         assert_same_worker_completion_is_fresh(true);
+    }
+
+    #[test]
+    fn completion_rejects_rows_without_a_freshness_record() {
+        let _guard = ARTIFACT_DRAIN_TEST_MUTEX.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("kept.rs");
+        let orphan = root.path().join("orphan.rs");
+        std::fs::write(&kept, "pub fn kept_original() {}\n").unwrap();
+        std::fs::write(&orphan, "pub fn orphan_original() {}\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        let files = vec![kept.clone(), orphan.clone()];
+        let mut serving = crate::semantic_index::SemanticIndex::build(
+            root.path(),
+            &files,
+            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()),
+            8,
+        )
+        .unwrap();
+        let mut worker = serving.fork_for_refresh();
+        std::fs::write(&kept, "pub fn kept_edit() {}\n").unwrap();
+        std::fs::write(&orphan, "pub fn orphan_edit() {}\n").unwrap();
+        let mut update = worker
+            .refresh_invalidated_files(
+                root.path(),
+                &files,
+                &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect()),
+                8,
+                100,
+                &mut |_, _| {},
+            )
+            .unwrap();
+        // Simulate a completion carrying rows for a file without a freshness
+        // record, as a refresh that resumed paused work after the file was
+        // deleted used to produce.
+        update.updated_metadata.retain(|(path, _)| path != &orphan);
+        assert!(update
+            .added_entries
+            .iter()
+            .any(|entry| entry.file() == orphan));
+        *ctx.semantic_index().write().unwrap() = Some(serving);
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+        let (request_tx, _request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        event_tx
+            .send(SemanticRefreshEvent::Completed {
+                added_entries: update.added_entries,
+                updated_metadata: update.updated_metadata,
+                completed_paths: update.completed_paths,
+            })
+            .unwrap();
+        drain_semantic_refresh_events(&ctx);
+        let index = ctx.semantic_index().read().unwrap();
+        let rows = index.as_ref().unwrap().search(&[1.0, 0.0, 0.0], 100);
+        assert!(
+            rows.iter().all(|row| row.file != orphan),
+            "a row without a freshness record was installed: {rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.snippet.contains("kept_edit")));
     }
 
     fn assert_same_worker_completion_is_fresh(corpus: bool) {
