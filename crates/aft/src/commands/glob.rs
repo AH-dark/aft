@@ -472,6 +472,30 @@ fn glob_root(
     }
 }
 
+/// Runs one `glob_root` discovery and returns the files it found and the
+/// source that answered, so tests outside this module can check which branch
+/// a call took.
+#[cfg(all(test, unix))]
+pub(crate) fn glob_root_files_for_test(
+    ctx: &AppContext,
+    project_root: &Path,
+    search_root: &Path,
+    pattern: &str,
+    max_results: usize,
+    explicit_session: Option<&str>,
+) -> (Vec<PathBuf>, &'static str) {
+    let discovery = glob_root(
+        ctx,
+        project_root,
+        search_root,
+        pattern,
+        max_results,
+        false,
+        explicit_session,
+    );
+    (discovery.files, discovery.source)
+}
+
 fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();

@@ -757,24 +757,11 @@ fn confined_handler_golden_vectors() {
     }
 }
 
-#[test]
-fn confined_grants_and_owned_outputs_cannot_escape() {
-    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+/// Records a finished bash task owned by the fixture's "designer" session,
+/// with its output stored outside the pinned root, and returns its paths.
+fn owned_task_output(f: &Fixture) -> crate::bash_background::persistence::TaskPaths {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
     use crate::bash_background::BgTaskStatus;
-    let f = Fixture::new();
-    let scope = access_grants::policy_scope_key(&f.route);
-    let db = f.ctx.db().unwrap();
-    crate::db::access_grants::insert(
-        &db.lock().unwrap(),
-        &scope,
-        &AccessGrant {
-            path: f.live.clone(),
-            kind: GrantKind::Subtree,
-            operation: AccessOperation::Read,
-        },
-    )
-    .unwrap();
     let paths = task_paths(f.storage.path(), "designer", "bash-0123456789abcdef").unwrap();
     let mut metadata = PersistedTask::starting(
         "bash-0123456789abcdef".into(),
@@ -799,6 +786,26 @@ fn confined_grants_and_owned_outputs_cannot_escape() {
         .ctx
         .bash_background()
         .is_session_owned_artifact_path("designer", &paths.stdout));
+    paths
+}
+
+#[test]
+fn confined_grants_and_owned_outputs_cannot_escape() {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    let f = Fixture::new();
+    let scope = access_grants::policy_scope_key(&f.route);
+    let db = f.ctx.db().unwrap();
+    crate::db::access_grants::insert(
+        &db.lock().unwrap(),
+        &scope,
+        &AccessGrant {
+            path: f.live.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    let paths = owned_task_output(&f);
     for name in ["read", "grep", "glob", "outline"] {
         for input in [f.live.join("sentinel.rs"), paths.stdout.clone()] {
             let response = f.call(name, arguments(name, input.to_str().unwrap()));
@@ -812,6 +819,65 @@ fn confined_grants_and_owned_outputs_cannot_escape() {
             assert_eq!(
                 response.data["code"], "path_outside_confined_root",
                 "{name}: {response:?}"
+            );
+        }
+    }
+}
+
+/// An unconfined glob that names a session's own bash output answers from the
+/// task record (source "task-output"), and those files live outside the
+/// pinned root. A confined glob must take its confined walk before that
+/// shortcut, so even when it carries the owning session it never lists them.
+#[test]
+fn confined_glob_with_explicit_session_never_returns_task_output() {
+    let f = Fixture::new();
+    let paths = owned_task_output(&f);
+    // Unconfined, a glob naming the owning session's output file is answered
+    // from the task record instead of a directory walk.
+    let (files, source) = crate::commands::glob::glob_root_files_for_test(
+        &f.ctx,
+        &f.pin,
+        &paths.stdout,
+        "**/*",
+        16,
+        Some("designer"),
+    );
+    assert_eq!(source, "task-output");
+    assert_eq!(files, vec![paths.stdout.clone()]);
+
+    // Confined, the same discovery takes the confined walk instead. (The path
+    // check that runs before discovery is what refuses an outside root; see
+    // the routed call below.)
+    let (_, source) = confinement::with_root(&f.ctx, "confine-glob-task-output", || {
+        Ok(crate::commands::glob::glob_root_files_for_test(
+            &f.ctx,
+            &f.pin,
+            &paths.stdout,
+            "**/*",
+            16,
+            Some("designer"),
+        ))
+    })
+    .unwrap();
+    assert_eq!(source, "fallback");
+
+    // Routed as the owning session, naming the output file or its folder.
+    let outputs = [&paths.stdout, &paths.stderr, &paths.exit, &paths.json];
+    for input in [&paths.stdout, &paths.dir] {
+        let response = f.call(
+            "glob",
+            json!({"pattern":"**/*", "path": input.to_str().unwrap()}),
+        );
+        assert_eq!(
+            response.data["code"], "path_outside_confined_root",
+            "{response:?}"
+        );
+        let text = response.data.to_string();
+        for output in outputs {
+            let name = output.file_name().unwrap().to_str().unwrap();
+            assert!(
+                input == output || !text.contains(name),
+                "{output:?} in {text}"
             );
         }
     }
