@@ -1,8 +1,12 @@
 {
-  "fixtures": [
-    "harness-goldens"
-  ],
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
   "kind": "harness",
-  "slice_class": "non_ranking",
-  "targeted_mechanism": "none"
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs"
+  ],
+  "note": "The only fenced change is a module declaration in lib.rs for the startup backup catalog writer (engram_catalog.rs), which runs once at daemon startup and touches no search code. Ranking and routing are unchanged; benchmark rows must remain byte-identical."
 }
