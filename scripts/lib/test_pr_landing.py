@@ -135,10 +135,18 @@ if 'graphql' in a:
                 nodes, 'pageInfo': {'hasNextPage': has_next_page,
                                     'endCursor': 'cursor-1' if has_next_page else None}}}}}})
     if 'dequeuePullRequest' in q:
+        # GitHub's DequeuePullRequestInput takes `id`; reject anything else
+        # the way the real API does instead of accepting any field name.
+        if 'input:{id:' not in q.replace(' ', ''):
+            print("gh: Argument 'id' on InputObject 'DequeuePullRequestInput' is required.", file=sys.stderr)
+            sys.exit(1)
         s['dequeued'] = s.get('dequeued', 0) + 1
         s['queued'] = False; persist()
         answer({'data': {'dequeuePullRequest': {'clientMutationId': None}}})
     if 'disablePullRequestAutoMerge' in q:
+        if 'input:{pullRequestId:' not in q.replace(' ', ''):
+            print("gh: Argument 'pullRequestId' on InputObject 'DisablePullRequestAutoMergeInput' is required.", file=sys.stderr)
+            sys.exit(1)
         s['auto_merge_armed'] = False; s['disabled_auto_merge'] = s.get('disabled_auto_merge', 0) + 1
         persist()
         answer({'data': {'disablePullRequestAutoMerge': {'clientMutationId': None}}})

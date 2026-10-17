@@ -53,7 +53,7 @@ def disarm_auto_merge(repo: str, number: int, reason: str) -> None:
     if not pull_id:
         raise ValueError(f"could not identify PR #{number} before disarming auto-merge")
     if pull.get("isInMergeQueue"):
-        mutation = ("mutation($id:ID!){dequeuePullRequest(input:{pullRequestId:$id}){clientMutationId}}")
+        mutation = ("mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}")
         operator_gh("api", "graphql", "-f", f"query={mutation}", "-F", f"id={pull_id}")
         log(f"dequeued PR #{number} before {reason}")
     if pull.get("autoMergeRequest") is not None:

@@ -68,7 +68,7 @@ disarm_auto_merge() {
   IFS=$'\t' read -r pull_request_id queued auto_merge <<< "$state"
   [[ -n "$pull_request_id" ]] || hard_refuse "could not identify PR #$PR to disarm auto-merge"
   if [[ "$queued" == true ]]; then
-    "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){dequeuePullRequest(input:{pullRequestId:$id}){clientMutationId}}' \
+    "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}' \
       -F id="$pull_request_id" >/dev/null || hard_refuse "could not dequeue PR #$PR before merge admission"
     echo "merge-pr: dequeued #$PR before merge admission" >&2
   fi
