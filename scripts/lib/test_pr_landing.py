@@ -150,6 +150,12 @@ if 'graphql' in a:
     if 'reviewThreads' in q:
         unresolved = s.get('unresolved', 0)
         if s.get('unresolved_after_admission') and s.get('admitted'): unresolved = 1
+        # A reviewer opens a thread once the script has read mergeability (or
+        # submitted) this many times, without moving the head.
+        after_reads = s.get('unresolved_after_mergeable_reads')
+        if after_reads is not None and s.get('mergeable_reads', 0) >= after_reads: unresolved = 1
+        after_merges = s.get('unresolved_after_merge_calls')
+        if after_merges is not None and s.get('merge_calls', 0) >= after_merges: unresolved = 1
         after = next((a[i+1].split('=', 1)[1] for i, arg in enumerate(a[:-1])
                       if arg == '-F' and a[i+1].startswith('after=')), None)
         page = 1 if after == 'cursor-1' else 0
@@ -639,8 +645,57 @@ class MergeAdmissionTests(PRFixture):
         self.write_state(checks_pending=True, auto_merge=True, ghost_enqueue=True)
         result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "0"})
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("confirmed #7 with GitHub", result.stderr)
         self.assertEqual(len(self.merges()), 1)
-        self.assertTrue(json.loads(self.state_path.read_text())["auto_merge_armed"])
+        state = json.loads(self.state_path.read_text())
+        self.assertTrue(state["auto_merge_armed"])
+        # One read at admission and a fresh one at confirmation time.
+        self.assertEqual(state["check_polls"], 2)
+
+    def test_checks_finished_before_confirmation_require_a_real_queue_entry(self) -> None:
+        # Checks are pending at admission but pass before confirmation; the armed
+        # request then has nothing left to wait on, so only a queue entry counts.
+        self.write_state(checks_pending=True, auto_merge=True, ghost_enqueue=True, finish_after_polls=1)
+        # Whole-second deadline arithmetic: 2s guarantees at least two reads.
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "2",
+                                 "AFT_MERGE_PR_QUEUE_CONFIRM_POLL_SECONDS": "0.5"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required checks still running for #7", result.stderr)
+        self.assertIn("PR #7 was submitted but GitHub never listed it in the merge queue", result.stderr)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertGreater(len([i for i in self.queue_state_reads() if i > self.merge_indexes()[0]]), 1)
+        state = json.loads(self.state_path.read_text())
+        self.assertFalse(state["auto_merge_armed"])
+        self.assertEqual(state.get("disabled_auto_merge"), 1)
+
+    def thread_reads(self) -> list[int]:
+        return [i for i, call in enumerate(self.calls()) if "reviewThreads" in " ".join(call["args"])]
+
+    def test_thread_opened_during_mergeability_wait_refuses_before_submission(self) -> None:
+        # The first mergeability read is UNKNOWN; while the script waits for it,
+        # a reviewer opens a thread on the same head.
+        self.write_state(mergeable_unknown_reads=1, unresolved_after_mergeable_reads=1)
+        result = self.merge()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("waiting for it to be computed", result.stderr)
+        self.assertIn("1 unresolved review thread(s)", result.stderr)
+        self.assertEqual(self.merges(), [])
+        first_mergeable_read = self.queue_state_reads()[0]
+        self.assertTrue(any(i > first_mergeable_read for i in self.thread_reads()))
+
+    def test_thread_opened_before_resubmission_refuses_without_resubmitting(self) -> None:
+        # The first submission never enters the queue with mergeability UNKNOWN,
+        # which normally earns one resubmission; a thread opened after the first
+        # submission must stop it.
+        self.write_state(ghost_enqueue=True, ghost_mergeable="UNKNOWN", unresolved_after_merge_calls=1)
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resubmitting once", result.stderr)
+        self.assertIn("1 unresolved review thread(s)", result.stderr)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertTrue(any(i > self.merge_indexes()[0] for i in self.thread_reads()))
+        state = json.loads(self.state_path.read_text())
+        self.assertFalse(state["auto_merge_armed"])
 
 
 class DeliveryTests(PRFixture):
