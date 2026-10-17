@@ -3844,6 +3844,28 @@ mod grant_path_tests {
         timing: Arc<BashTimingForTest>,
         cancel: BashWaitCancel,
     ) -> (mpsc::Receiver<BashDeferredCompletion>, String) {
+        held_capture_call_with_metrics(
+            executor,
+            root,
+            arguments,
+            timing,
+            cancel,
+            Arc::new(DispatchPathMetrics::new()),
+        )
+        .await
+    }
+
+    /// [`held_capture_call`] with the caller's dispatch metrics, which hold the
+    /// call's entry in the held-bash-call table the module loop answers from.
+    #[cfg(unix)]
+    async fn held_capture_call_with_metrics(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        arguments: Value,
+        timing: Arc<BashTimingForTest>,
+        cancel: BashWaitCancel,
+        metrics: Arc<DispatchPathMetrics>,
+    ) -> (mpsc::Receiver<BashDeferredCompletion>, String) {
         let rx = with_bash_timing_for_test(Some(timing.clone()), || {
             deadline_test_call_controlled(
                 executor,
@@ -3852,7 +3874,7 @@ mod grant_path_tests {
                 arguments,
                 Instant::now(),
                 false,
-                Arc::new(DispatchPathMetrics::new()),
+                metrics,
                 cancel,
             )
         });
@@ -4347,6 +4369,92 @@ mod grant_path_tests {
                 .unwrap()
                 .contains(REMOTE_INPUT_CAPTURE_WARNING));
         }
+    }
+
+    /// The module loop answers a held foreground call itself when a drain is
+    /// due (see `answer_held_bash_calls_from_module_loop`). Once the runner's
+    /// Accepted is recorded, that answer is the drain-detach reply for a live
+    /// task: status `running`, without the input-capture warning. The answer
+    /// before Accepted is covered by
+    /// `runon_capture_restart_module_loop_reports_pending_until_accepted`.
+    /// The remote handler is held until Accepted is recorded, so the call
+    /// reaches the module loop's held-call table only afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_module_loop_drain_after_accepted_keeps_running_reply() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, ctx) =
+            capture_fixture(Script::GatedStages { position: 1 }).await;
+        // Keep the foreground wait from promoting the call on its own before
+        // the module loop answers it.
+        ctx.update_config(|config| config.foreground_wait_window_ms = 600_000);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let timing = BashTimingForTest::new(Instant::now());
+        let (mut rx, task_id) = held_capture_call_with_metrics(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "timeout":10000}),
+            timing.clone(),
+            BashWaitCancel {
+                run_scope: None,
+                scope: None,
+                late_results: false,
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            metrics.clone(),
+        )
+        .await;
+        wait_for_task_state(&ctx, "Accepted", |registry| {
+            registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
+        })
+        .await;
+        BashTimingForTest::release(&timing.result);
+        let routes = HashMap::from([(
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            super::super::test_support::route_identity(&root, "deadline-session"),
+        )]);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(8);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true)
+                .await
+                .unwrap()
+                == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the foreground call must reach the module loop's held-call table");
+        let frame = writer_rx.recv().await.unwrap().frame;
+        let body: Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["structuredContent"]["task_id"], task_id, "{body}");
+        assert_eq!(body["structuredContent"]["status"], "running", "{body}");
+        assert!(
+            !body.to_string().contains(REMOTE_INPUT_CAPTURE_WARNING),
+            "{body}"
+        );
+        assert!(!body.to_string().contains("hasn't confirmed"), "{body}");
+        let done = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(done.result.is_none(), "the module loop owns the only reply");
+        assert!(writer_rx.try_recv().is_err(), "one terminal reply per call");
+        assert!(
+            !ctx.bash_background().is_task_terminal(&task_id),
+            "the reply described a live task"
+        );
+        daemon.output_gate.notify_one();
+        wait_for_task_state(&ctx, "completed", |registry| {
+            daemon.completion_gate.notify_one();
+            registry.is_task_terminal(&task_id)
+        })
+        .await;
     }
 
     /// Cancellation and a module drain each end the capture wait on their own.
