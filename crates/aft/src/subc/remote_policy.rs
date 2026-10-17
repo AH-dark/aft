@@ -202,15 +202,17 @@ pub(super) fn confined_tool(name: &str) -> bool {
     matches!(name, "read" | "grep" | "glob" | "outline" | "aft_outline")
 }
 
-/// Read the worker key regardless of the preset claimed by the current call.
-/// Missing persistence or malformed saved params must never downgrade a fence,
-/// with one exception: a context whose persistence was never configured.
-/// Every route bind configures persistence, and `catalog` refuses `confine`
-/// without a database, so such a context (a library or test harness) has no
-/// store a fence could have been saved in.
+/// Whether this route's scoped worker saved `confine: "root"` (the root
+/// confinement fence) at a catalog fetch. The worker policy key is read even
+/// when the current call claims another preset, so claiming one cannot escape.
+/// An unreadable database or malformed saved params refuse the call rather
+/// than answer "unconfined", with one exception: a context whose persistence
+/// was never configured. Every route bind configures persistence, and
+/// `catalog` refuses `confine` without a database, so such a context (a
+/// library or test harness) has no store the fence could have been saved in.
 ///
-/// Tool calls ask this on the frame loop. It never writes aft.db, and a key
-/// once found confined is answered from memory afterwards.
+/// Every tool call runs this check on the subc frame loop. It never writes
+/// aft.db, and a key once found confined is answered from memory afterwards.
 pub(super) fn confined(
     ctx: &AppContext,
     identity: &RouteIdentity,
@@ -228,10 +230,10 @@ pub(super) fn confined(
         )
     };
     let Some(db) = ctx.db() else {
-        // An opening or failed database may hold a saved fence: refuse.
-        // Calls on such routes wait for an opening database first (see
-        // `persistence::DatabaseWaits`), so this refusal follows a failed
-        // open or one that outlasted the wait.
+        // A database that is still opening or failed to open may hold a saved
+        // confinement policy we cannot read, so refuse. Calls on such routes
+        // wait for an opening database first (see `persistence::DatabaseWaits`),
+        // so this refusal follows a failed open or a wait that expired.
         return if ctx.database_runtime_unconfigured() {
             Ok(false)
         } else {
@@ -248,7 +250,8 @@ pub(super) fn confined(
 }
 
 /// Whether a call on this route must wait for an opening aft.db before its
-/// confinement can be decided. False once the fence is known from memory.
+/// saved confinement policy can be read. False for routes that cannot have
+/// one, and once the policy is known confined from memory.
 pub(super) fn awaits_policy_store(ctx: &AppContext, identity: &RouteIdentity) -> bool {
     ctx.database_runtime_initializing()
         && key(identity, Some("worker")).is_some_and(|key| !ctx.policy_key_known_confined(&key))

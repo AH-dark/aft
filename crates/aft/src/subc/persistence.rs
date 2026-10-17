@@ -129,8 +129,10 @@ impl DatabaseWaits {
     }
 
     /// Hold `decoded` until the root's database open finishes or the wait
-    /// budget ends. `any_command` waits on the open itself rather than on
-    /// whether `name` needs persistence.
+    /// budget ends. With `any_command` false the wait ends as soon as `name`
+    /// no longer needs to wait for persistence; with it true (calls whose
+    /// saved confinement must be read first) the wait lasts until the open
+    /// itself finishes, whatever tool `name` is.
     fn wait(
         &mut self,
         decoded: DecodedFrame,

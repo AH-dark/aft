@@ -93,8 +93,8 @@ fn context_with_switch(
     ctx
 }
 
-/// A context whose aft.db is not open: never configured, or with its runtime
-/// state set by the caller.
+/// A context with no aft.db handle and persistence never configured. Tests
+/// move its database runtime state to opening or failed when they need to.
 fn context_without_database(root: &Path, storage: &Path) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
