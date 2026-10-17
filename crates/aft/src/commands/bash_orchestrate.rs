@@ -981,8 +981,8 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
 }
 
 /// The reply for an explicit `runon` task whose runner has not confirmed input
-/// capture. A reply that would announce a live task (`running` or `starting`)
-/// is checked against the task's saved state first: a task that already ended
+/// capture. A reply that would announce a live task (status `running` or
+/// `starting`, or no status at all) is checked against the task's saved state first: a task that already ended
 /// (refused, failed, outcome unknown, killed or completed) before `Accepted`
 /// shows that saved outcome, rendered as a finished command's reply with its
 /// advice and without the capture warning, so the caller is never told to wait

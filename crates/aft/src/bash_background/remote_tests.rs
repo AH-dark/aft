@@ -849,8 +849,9 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
         "{output}"
     );
     assert!(!output.contains("moved to the background"), "{output}");
-    // The task has finished, so it will never be queued or running: the
-    // in-flight capture warning would be a false instruction here.
+    // The local task is terminal (the remote outcome is unknown), so this
+    // reply will never move to queued or running: the in-flight capture
+    // warning would be a false instruction here.
     assert!(!output.contains(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
 }
 
