@@ -556,6 +556,14 @@ impl SpawnPlan {
         matches!(self.policy(), Self::Launcher { .. })
     }
 
+    /// Strict native backends fail closed if containment cannot be installed.
+    /// Merely using the launcher is insufficient: off installs no policy and
+    /// relaxed is not a boundary for arbitrary outside-project operations.
+    pub(crate) fn enforces_shell_containment(&self) -> bool {
+        cfg!(any(target_os = "linux", target_os = "macos"))
+            && matches!(self.policy(), Self::Launcher { profile, .. } if profile.mode == SandboxMode::Strict)
+    }
+
     #[cfg(unix)]
     pub(crate) fn host_shell_path(&self) -> Option<&Path> {
         match self.policy() {
@@ -4883,6 +4891,42 @@ pub(crate) mod environment_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_containment_requires_strict_native_plan() {
+        let project = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut profile = SandboxProfile::build(
+            vec![project.path().to_path_buf()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        for mode in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+            profile.mode = mode;
+            let plan = SpawnPlan::launcher_for_test(profile.clone(), PathBuf::from("aft"));
+            assert_eq!(
+                plan.enforces_shell_containment(),
+                mode == SandboxMode::Strict
+            );
+        }
+        for plan in [
+            SpawnPlan::Unsandboxed,
+            SpawnPlan::RelaxedUnenforced,
+            SpawnPlan::Host {
+                shell_path: PathBuf::from("/bin/sh"),
+                environment: ChildEnvironment::new(),
+            },
+            SpawnPlan::refused_for_test("sandbox_unavailable"),
+        ] {
+            assert!(!plan.enforces_shell_containment(), "{plan:?}");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

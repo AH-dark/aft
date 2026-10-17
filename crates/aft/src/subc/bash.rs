@@ -2734,6 +2734,7 @@ mod grant_path_tests {
             24,
             80,
             Vec::new(),
+            false,
             None,
             None,
         )

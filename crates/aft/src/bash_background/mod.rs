@@ -788,6 +788,7 @@ pub(crate) fn spawn(
     pty_rows: u16,
     pty_cols: u16,
     scanner_report: Vec<PermissionAsk>,
+    scanner_requires_approval: bool,
     host_escalation: Option<HostEscalationAttempt>,
     remote: Option<RemoteLaunch>,
 ) -> Response {
@@ -959,6 +960,22 @@ pub(crate) fn spawn(
             ),
             None => Response::error(request_id, code, message),
         };
+    }
+
+    // The launcher can also carry off or relaxed profiles. Only the resolved
+    // containment policy can replace a pending permission approval.
+    if scanner_requires_approval && !spawn_plan.enforces_shell_containment() {
+        spawn_plan.cleanup_unspawned();
+        #[cfg(unix)]
+        if let Some(task) = unregistered_task.as_ref() {
+            let _ = persistence::delete_resolved_task(task);
+        }
+        return Response::error_with_data(
+            request_id,
+            crate::protocol::ERROR_PERMISSION_REQUIRED,
+            "bash command requires permission",
+            json!({ "asks": scanner_report }),
+        );
     }
 
     let cleanup_plan = spawn_plan.clone();

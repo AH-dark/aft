@@ -45,6 +45,7 @@ fn launch(ctx: &AppContext, session: &str, command: &str, background: bool) -> R
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     )
@@ -163,6 +164,7 @@ fn refusal_lists_only_the_callers_own_holders_and_counts_other_sessions() {
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     );

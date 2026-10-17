@@ -280,6 +280,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     );
@@ -352,6 +353,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         24,
         80,
         Vec::new(),
+        false,
         None,
         None,
     );

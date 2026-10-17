@@ -337,12 +337,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     }
-    // Untrusted routes keep the shell permission asks even though strict now
-    // confines them. An off-profile worker uses the launcher only for its
-    // environment and temp directory, not as a replacement for those asks.
-    let native_report_only = crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal)
+    // Only first-party strict requests may defer approval until the resolved
+    // spawn plan proves containment. Relaxed denies protect only selected paths
+    // (and are unenforced on Linux), so relaxed must ask just like off.
+    let defer_permission_asks = crate::sandbox_spawn::native_sandbox_enforced(ctx, &principal)
         && crate::sandbox_spawn::effective_sandbox_mode(ctx, &principal)
-            != crate::config::SandboxMode::Off
+            == crate::config::SandboxMode::Strict
         && !crate::sandbox_spawn::principal_requires_strict(&principal)
         && host_escalation.is_none();
     // The bash scanner parses POSIX grammar and must not treat PowerShell
@@ -350,7 +350,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // approval path instead of a potentially unsafe rewrite or auto-allow.
     let permission_asks = if params.shell.is_powershell() {
         conservative_powershell_permission_asks(&params.command)
-    } else if native_report_only || params.permissions_requested || ctx.config().bash_permissions {
+    } else if defer_permission_asks || params.permissions_requested || ctx.config().bash_permissions
+    {
         crate::bash_permissions::scan::scan_with_cwd_for_session(
             &params.command,
             ctx,
@@ -360,10 +361,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         Vec::new()
     };
-    if !native_report_only
-        && !permission_asks.is_empty()
-        && !permissions_granted_cover(&permission_asks, &params.permissions_granted)
-    {
+    let scanner_requires_approval = !permission_asks.is_empty()
+        && !permissions_granted_cover(&permission_asks, &params.permissions_granted);
+    if !defer_permission_asks && scanner_requires_approval {
         return Response::error_with_data(
             &req.id,
             ERROR_PERMISSION_REQUIRED,
@@ -437,7 +437,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .pty_cols
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_PTY_COLS);
-    let scanner_report = native_report_only
+    let scanner_report = defer_permission_asks
         .then_some(permission_asks)
         .unwrap_or_default();
     crate::bash_background::spawn(
@@ -457,6 +457,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         pty_rows,
         pty_cols,
         scanner_report,
+        scanner_requires_approval,
         host_escalation,
         remote,
     )
@@ -1680,6 +1681,191 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[cfg(unix)]
+    fn assert_worker_outside_rm_asks(
+        mode: crate::config::SandboxMode,
+        principal: crate::sandbox_spawn::AuthenticatedPrincipal,
+    ) {
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail, SpawnPlan};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        // Keep the target outside both the project and the temporary-directory
+        // exemption used by the permission scanner.
+        let outside = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let target = outside.path().join("unapproved-delete");
+        std::fs::write(&target, "keep me").unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        ctx.update_config(|config| config.sandbox.profile.worker = mode);
+        for requested_by_plugin in [false, true] {
+            ctx.update_config(|config| config.bash_permissions = !requested_by_plugin);
+            let mut request = spawn_test_request(
+                "outside-rm",
+                &format!("rm -- '{}'", target.display()),
+                false,
+            );
+            request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+            request.params["params"]["permissions_requested"] = json!(requested_by_plugin);
+            // Refuse at the spawn seam if approval is bypassed, so a failing
+            // regression cannot actually delete the fixture.
+            let run = |request: &RawRequest| {
+                crate::sandbox_spawn::with_authenticated_principal(principal.clone(), || {
+                    with_worker_jail(true, || {
+                        with_spawn_plan_for_test(
+                            SpawnPlan::refused_for_test("unapproved_spawn"),
+                            || handle(request, &ctx),
+                        )
+                    })
+                })
+            };
+            let response = run(&request);
+            assert_eq!(
+                response.data["code"], ERROR_PERMISSION_REQUIRED,
+                "{response:?}"
+            );
+            assert!(!response.success);
+            assert!(
+                response.data["asks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|ask| { ask["kind"] == "external_directory" }),
+                "outside-project rm must ask: {response:?}"
+            );
+            assert_eq!(
+                ctx.bash_background().try_health_counts().unwrap().running,
+                0
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+
+            let grants: Vec<_> = response.data["asks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|ask| ask["patterns"].as_array().unwrap())
+                .cloned()
+                .collect();
+            request.params["params"]["permissions_granted"] = json!(grants);
+            assert_eq!(
+                run(&request).data["code"],
+                "unapproved_spawn",
+                "approval must allow the request to reach spawn policy"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relaxed_worker_outside_rm_requires_approval() {
+        assert_worker_outside_rm_asks(
+            crate::config::SandboxMode::Relaxed,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn off_worker_outside_rm_requires_approval() {
+        assert_worker_outside_rm_asks(
+            crate::config::SandboxMode::Off,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_worker_outside_rm_requires_approval() {
+        assert_worker_outside_rm_asks(
+            crate::config::SandboxMode::Relaxed,
+            crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::Untrusted,
+                route_channel: 9,
+                route_epoch: 4,
+                project_root: std::env::current_dir().unwrap(),
+                harness: "mcp:test".to_string(),
+                session_id: "sandbox-spawn-test".to_string(),
+                principal_id: Some("unverified".to_string()),
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    fn worker_permission_test_plan(
+        mode: crate::config::SandboxMode,
+        project: &Path,
+        storage: &Path,
+    ) -> crate::sandbox_spawn::SpawnPlan {
+        let mut profile = crate::sandbox_profile::SandboxProfile::build(
+            vec![project.to_path_buf()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            storage.to_path_buf(),
+        )
+        .unwrap();
+        profile.mode = mode;
+        // Never execute the requested rm even if the approval guard regresses.
+        crate::sandbox_spawn::SpawnPlan::launcher_for_test(profile, PathBuf::from("/bin/false"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_worker_uncontained_plan_requires_approval() {
+        use crate::config::SandboxMode;
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        ctx.update_config(|config| {
+            config.sandbox.profile.worker = SandboxMode::Strict;
+            config.bash_permissions = true;
+        });
+        let request = spawn_test_request("strict-uncontained", "rm /outside-project/file", false);
+        for mode in [SandboxMode::Off, SandboxMode::Relaxed] {
+            let plan = worker_permission_test_plan(mode, project.path(), storage.path());
+            let response = with_worker_jail(true, || {
+                with_spawn_plan_for_test(plan, || handle(&request, &ctx))
+            });
+            assert_eq!(
+                response.data["code"], ERROR_PERMISSION_REQUIRED,
+                "{response:?}"
+            );
+            assert!(!response.data["asks"].as_array().unwrap().is_empty());
+            assert_eq!(
+                ctx.bash_background().try_health_counts().unwrap().running,
+                0
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_worker_contained_plan_keeps_scanner_report_only() {
+        use crate::config::SandboxMode;
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        ctx.update_config(|config| {
+            config.sandbox.profile.worker = SandboxMode::Strict;
+            config.bash_permissions = true;
+        });
+        let request = spawn_test_request("strict-contained", "rm /outside-project/file", false);
+        let plan = worker_permission_test_plan(SandboxMode::Strict, project.path(), storage.path());
+        let response = with_worker_jail(true, || {
+            with_spawn_plan_for_test(plan, || handle(&request, &ctx))
+        });
+        assert!(response.success, "{response:?}");
+        let task = response.data["task_id"].as_str().unwrap();
+        assert!(!read_record(&ctx, task).scanner_report.is_empty());
+        stop_spawned_test_task(&ctx, &response);
     }
 
     #[cfg(unix)]
