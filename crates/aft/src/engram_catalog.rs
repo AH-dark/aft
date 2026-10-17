@@ -60,9 +60,10 @@ const FIXED_HARNESS_DIRS: &[&str] = &["opencode", "pi", "runner"];
 const MCP_HARNESS_PREFIX: &str = "mcp--";
 const FED_HARNESS_PREFIX: &str = "fed--";
 
-/// The folder checkpoints use before the daemon knows its harness. It only
-/// ever holds checkpoints (and, in principle, task output), never undo
-/// backups, so it gets the excluded harness entries but no backups entries.
+/// Storage-root folder where checkpoints are kept before the daemon knows
+/// its harness. It holds checkpoints (and, in principle, task output) but
+/// never undo backups, so it gets the `checkpoints`/`bash-tasks` entries of a
+/// harness folder but no backups entries.
 const UNBOUND_HARNESS_DIR: &str = "unbound";
 
 const BACKUPS_DIR: &str = "backups";
@@ -70,7 +71,8 @@ const PARKED_BACKUPS_PREFIX: &str = "backups.parked-";
 const CHECKPOINTS_DIR: &str = "checkpoints";
 const BASH_TASKS_DIR: &str = "bash-tasks";
 
-/// AFT's shared SQLite store, captured page by page.
+/// AFT's shared SQLite database file (declared with ENGRAM's page-db
+/// mechanism, which copies changed database pages).
 const DB_FILE: &str = "aft.db";
 /// The user's list of projects trusted for output filters.
 const TRUSTED_FILTER_PROJECTS_FILE: &str = "trusted-filter-projects.json";
@@ -166,7 +168,8 @@ struct Candidate {
 }
 
 impl Candidate {
-    /// An entry whose id cannot collide with another one.
+    /// An entry with one fixed id, for paths that occur once per storage root
+    /// and so can never compete for an id.
     fn fixed(id: &str, path: &str, class: &'static str, mechanism: &'static str) -> Self {
         Self {
             path: path.to_string(),
@@ -367,7 +370,8 @@ fn collect_harness_candidates(
     Ok(())
 }
 
-/// The shape of a catalog already on disk, as far as id keeping needs it.
+/// The fields of the catalog already on disk that are needed to keep each
+/// path's entry id across writes.
 #[derive(Deserialize)]
 struct PreviousCatalog {
     entries: Vec<PreviousEntry>,
@@ -722,8 +726,8 @@ mod tests {
             "runner/backups",
             &format!("{LIVE_MCP_DIR}/backups"),
             "opencode/backups.parked-20260710",
-            // Siblings that now get entries of their own; they must not shift
-            // or rename the backup ids.
+            // Folders next to the backups that get entries of their own; their
+            // presence must not change any `aft/backups-*` id.
             "opencode/checkpoints",
             "opencode/bash-tasks",
             "semantic",
@@ -773,7 +777,8 @@ mod tests {
         assert_eq!(found, expected);
 
         for entry in backups {
-            // Undo history is no longer backed up: the same ids, now excluded.
+            // Undo history is no longer backed up: these entries keep their
+            // ids but are declared excluded, with a reason.
             assert_eq!(entry["class"], UNDO_BACKUPS_CLASS);
             assert_eq!(entry["class"], "excluded");
             assert_eq!(entry["mechanism"], "filetree");
@@ -1031,7 +1036,8 @@ mod tests {
         expected.sort();
         assert_eq!(found, expected);
 
-        // ENGRAM's agreed wording for the database entry, field for field.
+        // The database entry exactly as agreed with the ENGRAM maintainers,
+        // field for field.
         assert_eq!(
             *entry_by_id(&value, "aft/db"),
             serde_json::json!({
