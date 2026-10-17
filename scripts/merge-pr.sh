@@ -13,6 +13,9 @@
 #      author has not pushed over yet),
 #   3. the head was pushed very recently (author likely mid-iteration),
 #   4. CI on the head is red/pending (merge rides gh's own check gate).
+# and, after a merge-queue submission, refuses (with auto-merge disarmed) when
+# GitHub does not list the PR in the queue within a bounded wait: gh can report
+# a submission as accepted while no queue entry is ever created.
 #
 # Usage: scripts/merge-pr.sh <pr-number> [--settle-minutes N] [--force-reason "..."]
 #        [--expected-head SHA] [--legacy-merge]
@@ -55,8 +58,10 @@ hard_refuse() {
   exit 1
 }
 
+# $1 says when the disarm happens, for the log lines; it defaults to the
+# pre-submission case.
 disarm_auto_merge() {
-  local state pull_request_id queued auto_merge
+  local when="${1:-before merge admission}" state pull_request_id queued auto_merge
   state=$("$OPERATOR_GH" api graphql -f query='
     query($owner:String!,$repo:String!,$pr:Int!){
       repository(owner:$owner,name:$repo){
@@ -64,18 +69,18 @@ disarm_auto_merge() {
       }
     }' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" \
     --jq '[.data.repository.pullRequest.id, .data.repository.pullRequest.isInMergeQueue, (.data.repository.pullRequest.autoMergeRequest != null)] | @tsv') ||
-    hard_refuse "could not inspect auto-merge/queue state before merge admission"
+    hard_refuse "could not inspect auto-merge/queue state $when"
   IFS=$'\t' read -r pull_request_id queued auto_merge <<< "$state"
   [[ -n "$pull_request_id" ]] || hard_refuse "could not identify PR #$PR to disarm auto-merge"
   if [[ "$queued" == true ]]; then
     "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}' \
-      -F id="$pull_request_id" >/dev/null || hard_refuse "could not dequeue PR #$PR before merge admission"
-    echo "merge-pr: dequeued #$PR before merge admission" >&2
+      -F id="$pull_request_id" >/dev/null || hard_refuse "could not dequeue PR #$PR $when"
+    echo "merge-pr: dequeued #$PR $when" >&2
   fi
   if [[ "$auto_merge" == true ]]; then
     "$OPERATOR_GH" api graphql -f query='mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id}){clientMutationId}}' \
-      -F id="$pull_request_id" >/dev/null || hard_refuse "could not disable auto-merge for PR #$PR before merge admission"
-    echo "merge-pr: disabled auto-merge for #$PR before merge admission" >&2
+      -F id="$pull_request_id" >/dev/null || hard_refuse "could not disable auto-merge for PR #$PR $when"
+    echo "merge-pr: disabled auto-merge for #$PR $when" >&2
   fi
 }
 
@@ -104,6 +109,88 @@ wait_for_greptile_review() {
     if (( now - started >= timeout )); then
       hard_refuse "Greptile Review did not complete for head $head_sha within ${timeout}s; refusing blind submission"
     fi
+    sleep "$poll"
+  done
+}
+
+# One GraphQL read of the PR's lifecycle state, GitHub's merge-conflict
+# computation, queue membership and auto-merge arming, as four tab-separated
+# fields: state, mergeable (MERGEABLE/CONFLICTING/UNKNOWN), isInMergeQueue,
+# and whether an auto-merge request is armed.
+read_queue_state() {
+  "$OPERATOR_GH" api graphql -f query='
+    query($owner:String!,$repo:String!,$pr:Int!){
+      repository(owner:$owner,name:$repo){
+        pullRequest(number:$pr){state mergeable isInMergeQueue autoMergeRequest{enabledAt}}
+      }
+    }' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR" \
+    --jq '[.data.repository.pullRequest.state, .data.repository.pullRequest.mergeable, .data.repository.pullRequest.isInMergeQueue, (.data.repository.pullRequest.autoMergeRequest != null)] | @tsv'
+}
+
+load_queue_state() {
+  local state
+  state=$(read_queue_state) || return 1
+  PR_STATE=""
+  PR_MERGEABLE=""
+  PR_QUEUED=""
+  PR_ARMED=""
+  IFS=$'\t' read -r PR_STATE PR_MERGEABLE PR_QUEUED PR_ARMED <<< "$state"
+  [[ -n "$PR_STATE" && -n "$PR_MERGEABLE" ]]
+}
+
+# GitHub computes mergeability lazily and reports UNKNOWN until it has. A queue
+# submission made while it is UNKNOWN can be accepted without the PR ever
+# entering the queue, so wait (bounded) for a computed value first.
+wait_for_mergeable() {
+  local timeout poll started now
+  timeout="${AFT_MERGE_PR_MERGEABLE_TIMEOUT_SECONDS:-60}"
+  poll="${AFT_MERGE_PR_MERGEABLE_POLL_SECONDS:-5}"
+  started=$(date -u +%s)
+  while :; do
+    load_queue_state || hard_refuse "could not read mergeability of PR #$PR"
+    [[ "$PR_MERGEABLE" != UNKNOWN ]] && return 0
+    now=$(date -u +%s)
+    if (( now - started >= timeout )); then
+      hard_refuse "GitHub has not computed mergeability for PR #$PR within ${timeout}s (mergeable UNKNOWN); refusing blind queue submission, rerun later"
+    fi
+    echo "merge-pr: GitHub reports mergeable UNKNOWN for #$PR; waiting for it to be computed" >&2
+    sleep "$poll"
+  done
+}
+
+# Submit with the operator's real GitHub CLI, not the agent's bot-routed shim.
+# The response is kept so a later refusal can quote what GitHub said.
+submit_merge() {
+  local status=0
+  MERGE_RESPONSE=$(GH_SHIM_BYPASS=operator "$OPERATOR_GH" pr merge "$PR" "${MERGE_ARGS[@]}" 2>&1) || status=$?
+  if [ -n "$MERGE_RESPONSE" ]; then
+    printf '%s\n' "$MERGE_RESPONSE" >&2
+  fi
+  if [ "$status" -ne 0 ]; then
+    echo "merge-pr: gh pr merge failed for #$PR (exit $status)" >&2
+    exit "$status"
+  fi
+}
+
+# gh can report a queue submission as accepted while GitHub never creates the
+# queue entry. Poll (bounded) until GitHub lists the PR in the queue or merged.
+# While required checks are still running, GitHub only arms auto-merge and adds
+# the PR once they pass, so an armed request also counts when $1 is true.
+# Returns 1 when the wait ends without that; PR_* hold the last observation.
+confirm_queue_entry() {
+  local accept_armed="$1" timeout poll started now
+  timeout="${AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS:-60}"
+  poll="${AFT_MERGE_PR_QUEUE_CONFIRM_POLL_SECONDS:-5}"
+  started=$(date -u +%s)
+  while :; do
+    if ! load_queue_state; then
+      disarm_auto_merge "after an unconfirmed queue submission"
+      hard_refuse "submitted PR #$PR but could not read whether it entered the merge queue; auto-merge disarmed"
+    fi
+    [[ "$PR_STATE" == MERGED || "$PR_QUEUED" == true ]] && return 0
+    [[ "$accept_armed" == true && "$PR_ARMED" == true ]] && return 0
+    now=$(date -u +%s)
+    (( now - started >= timeout )) && return 1
     sleep "$poll"
   done
 }
@@ -221,8 +308,11 @@ fi
 # required checks pass, so one read is enough: refuse a red check by name, and
 # otherwise submit. Without auto-merge, a merge request on a PR whose checks are
 # still running is refused by GitHub, so refuse here too and let the caller
-# rerun once they pass. Never wait inside this script: the review gates above
-# were read before any wait and would go stale.
+# rerun once they pass. Never wait for checks inside this script: the review
+# gates above were read before any wait and would go stale. The only waits after
+# them are short and bounded: for GitHub to compute mergeability before
+# submitting, and for the queue entry to appear after submitting (the head stays
+# pinned by --match-head-commit throughout).
 if [[ "$QUEUE_ENABLED" == true ]]; then
   CHECK_EXIT=0
   if REQUIRED_CHECKS=$("$OPERATOR_GH" pr checks "$PR" --required --json name,bucket \
@@ -263,6 +353,40 @@ if [[ "$QUEUE_ENABLED" == true ]]; then
   fi
 fi
 
+if [[ "$QUEUE_ENABLED" != true ]]; then
+  echo "merge-pr: admission gates satisfied (head ${AGE_MIN}m settled) - submitting #$PR at $HEAD_SHA"
+  submit_merge
+  exit 0
+fi
+
+ACCEPT_ARMED=false
+if [ "${#PENDING_NAMES[@]}" -gt 0 ]; then
+  ACCEPT_ARMED=true
+fi
+wait_for_mergeable
 echo "merge-pr: admission gates satisfied (head ${AGE_MIN}m settled) - submitting #$PR at $HEAD_SHA"
-# Submit with the operator's real GitHub CLI, not the agent's bot-routed shim.
-GH_SHIM_BYPASS=operator "$OPERATOR_GH" pr merge "$PR" "${MERGE_ARGS[@]}"
+submit_merge
+CONFIRM_TIMEOUT="${AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS:-60}"
+if confirm_queue_entry "$ACCEPT_ARMED"; then
+  echo "merge-pr: confirmed #$PR with GitHub (state $PR_STATE, in merge queue $PR_QUEUED, auto-merge armed $PR_ARMED)" >&2
+  exit 0
+fi
+
+REPORTED="state $PR_STATE, mergeable $PR_MERGEABLE, isInMergeQueue $PR_QUEUED, auto-merge armed $PR_ARMED"
+RESPONSES="enqueue response: '${MERGE_RESPONSE:-<empty>}'"
+# Only an uncomputed mergeability explains a silently dropped submission well
+# enough to resubmit; any other state is refused as-is for the operator.
+if [[ "$PR_MERGEABLE" == UNKNOWN ]]; then
+  echo "merge-pr: #$PR is not in the merge queue ${CONFIRM_TIMEOUT}s after submission ($REPORTED); resubmitting once" >&2
+  disarm_auto_merge "before resubmitting to the merge queue"
+  wait_for_mergeable
+  submit_merge
+  if confirm_queue_entry "$ACCEPT_ARMED"; then
+    echo "merge-pr: confirmed #$PR with GitHub after resubmission (state $PR_STATE, in merge queue $PR_QUEUED, auto-merge armed $PR_ARMED)" >&2
+    exit 0
+  fi
+  REPORTED="first submission: $REPORTED; resubmission: state $PR_STATE, mergeable $PR_MERGEABLE, isInMergeQueue $PR_QUEUED, auto-merge armed $PR_ARMED"
+  RESPONSES="$RESPONSES; resubmission response: '${MERGE_RESPONSE:-<empty>}'"
+fi
+disarm_auto_merge "after an unconfirmed queue submission"
+hard_refuse "PR #$PR was submitted but GitHub never listed it in the merge queue within ${CONFIRM_TIMEOUT}s ($REPORTED; $RESPONSES); auto-merge disarmed - inspect the PR on GitHub and rerun"

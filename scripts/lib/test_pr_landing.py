@@ -18,7 +18,7 @@ OWNER = "94532+ualtinok@users.noreply.github.com"
 COAUTHOR = "Co-authored-by: alfonso-aft <289616620+alfonso-aft@users.noreply.github.com>"
 
 FAKE_GH = r'''
-import datetime, io, json, os, pathlib, subprocess, sys, zipfile
+import datetime, io, json, os, pathlib, re, subprocess, sys, zipfile
 a = sys.argv[1:]
 p = pathlib.Path(os.environ['PR_TEST_STATE'])
 s = json.loads(p.read_text())
@@ -83,6 +83,15 @@ if a[:2] == ['pr', 'merge']:
     assert '--admin' not in a
     if s.get('checks_pending') and not s.get('auto_merge'):
         raise SystemExit('GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)')
+    s['merge_calls'] = s.get('merge_calls', 0) + 1
+    if s.get('ghost_enqueue') or s['merge_calls'] <= s.get('ghost_merges', 0):
+        # GitHub accepts the request and arms auto-merge, but never creates the
+        # queue entry (no merge_group run follows).
+        s['auto_merge_armed'] = True; s['ghost_armed'] = True; persist()
+        print('! Pull request example/repo#7 will be added to the merge queue for main when ready', file=sys.stderr)
+        sys.exit(0)
+    if s.get('queue_on_merge'):
+        s['queued'] = True; persist(); sys.exit(0)
     h = head(); base = g('--git-dir', s['origin'], 'rev-parse', 'main')
     tree = g('--git-dir', s['origin'], 'rev-parse', h+'^{tree}')
     oid = subprocess.check_output(['git', '--git-dir', s['origin'], 'commit-tree', tree,
@@ -113,8 +122,31 @@ if endpoint.endswith('/check-runs?per_page=100'):
     answer({'check_runs': [{'name': 'Greptile Review', 'app': {'slug': 'greptile-apps'},
                             'head_sha': head(), 'status': 'in_progress' if pending else 'completed',
                             'conclusion': None if pending else s.get('greptile_conclusion', 'success')}]})
+# Fields this fake can answer, all real fields of GitHub's PullRequest type.
+PULL_REQUEST_FIELDS = {'id', 'number', 'state', 'headRefOid', 'baseRefName', 'isMergeQueueEnabled',
+                       'isInMergeQueue', 'mergeable', 'mergeCommit', 'autoMergeRequest',
+                       'mergeQueueEntry', 'timelineItems', 'reviewThreads'}
+def pull_request_fields(q):
+    # Top-level field names of the pullRequest(...){...} selection set.
+    depth, parens, fields = 0, 0, []
+    for token in re.findall(r'[A-Za-z_]\w*|\S', q[q.index('{', q.index('pullRequest(')):]):
+        if token == '{': depth += 1
+        elif token == '}':
+            depth -= 1
+            if depth == 0: break
+        elif token == '(': parens += 1
+        elif token == ')': parens -= 1
+        elif depth == 1 and parens == 0 and re.fullmatch(r'[A-Za-z_]\w*', token): fields.append(token)
+    return fields
 if 'graphql' in a:
     q = a[a.index('-f')+1]
+    if 'pullRequest(' in q:
+        # GitHub rejects the whole query when a selected field does not exist
+        # (for example the REST-only `mergeable_state`); answer the same way.
+        for field in pull_request_fields(q):
+            if field not in PULL_REQUEST_FIELDS:
+                print(f"gh: Field '{field}' doesn't exist on type 'PullRequest'", file=sys.stderr)
+                sys.exit(1)
     if 'reviewThreads' in q:
         unresolved = s.get('unresolved', 0)
         if s.get('unresolved_after_admission') and s.get('admitted'): unresolved = 1
@@ -147,9 +179,20 @@ if 'graphql' in a:
         if 'input:{pullRequestId:' not in q.replace(' ', ''):
             print("gh: Argument 'pullRequestId' on InputObject 'DisablePullRequestAutoMergeInput' is required.", file=sys.stderr)
             sys.exit(1)
-        s['auto_merge_armed'] = False; s['disabled_auto_merge'] = s.get('disabled_auto_merge', 0) + 1
+        s['auto_merge_armed'] = False; s['ghost_armed'] = False
+        s['disabled_auto_merge'] = s.get('disabled_auto_merge', 0) + 1
         persist()
         answer({'data': {'disablePullRequestAutoMerge': {'clientMutationId': None}}})
+    if 'mergeable' in q:
+        s['mergeable_reads'] = s.get('mergeable_reads', 0) + 1
+        if s.get('ghost_armed') and s.get('ghost_mergeable'): mergeable = s['ghost_mergeable']
+        elif s['mergeable_reads'] <= s.get('mergeable_unknown_reads', 0): mergeable = 'UNKNOWN'
+        else: mergeable = s.get('mergeable', 'MERGEABLE')
+        persist()
+        answer({'data': {'repository': {'pullRequest': {
+                'state': 'MERGED' if s.get('merged') else 'OPEN', 'mergeable': mergeable,
+                'isInMergeQueue': bool(s.get('queued')) and not s.get('merged'),
+                'autoMergeRequest': {'enabledAt': now()} if s.get('auto_merge_armed') else None}}}})
     if 'isInMergeQueue' in q and 'autoMergeRequest' in q and 'mergeQueueEntry' not in q:
         answer({'data': {'repository': {'pullRequest': {
                 'id': s.get('pull_id', 'PR_fixture'),
@@ -244,6 +287,8 @@ class PRFixture(unittest.TestCase):
                         LAND_PR_POLL_SECONDS="0", LAND_PR_TIMEOUT_SECONDS="5",
                         AFT_MERGE_PR_GREPTILE_POLL_SECONDS="0.01",
                         AFT_MERGE_PR_GREPTILE_TIMEOUT_SECONDS="60",
+                        AFT_MERGE_PR_MERGEABLE_POLL_SECONDS="0.01",
+                        AFT_MERGE_PR_QUEUE_CONFIRM_POLL_SECONDS="0.01",
                         OPERATOR_GH_FALLBACK_PATHS="")
         Path(self.env["HOME"]).mkdir()
         for file in ("merge-pr.sh", "land-pr.sh", "landing-policy.py", "merge-queue-search.py",
@@ -508,6 +553,95 @@ class MergeAdmissionTests(PRFixture):
         self.assertNotEqual(self.merge().returncode, 0)
         self.assertEqual(self.merges(), [])
 
+    def queue_state_reads(self) -> list[int]:
+        """Indexes of calls reading mergeability/queue membership."""
+        return [i for i, call in enumerate(self.calls()) if "mergeable" in " ".join(call["args"])]
+
+    def merge_indexes(self) -> list[int]:
+        return [i for i, call in enumerate(self.calls()) if call["args"][:2] == ["pr", "merge"]]
+
+    def test_fake_gh_rejects_unknown_pull_request_field_like_github(self) -> None:
+        query = ("query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){"
+                 "pullRequest(number:$pr){state mergeable_state}}}")
+        result = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}", "-F", "pr=7"],
+                                cwd=self.repo, env=self.env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Field 'mergeable_state' doesn't exist on type 'PullRequest'", result.stderr)
+
+    def test_enqueue_accepted_but_never_in_queue_refuses_and_disarms(self) -> None:
+        self.write_state(ghost_enqueue=True)
+        # Whole-second deadline arithmetic: 2s guarantees at least two reads.
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "2",
+                                 "AFT_MERGE_PR_QUEUE_CONFIRM_POLL_SECONDS": "0.5"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PR #7 was submitted but GitHub never listed it in the merge queue", result.stderr)
+        self.assertIn("mergeable MERGEABLE", result.stderr)
+        self.assertIn("will be added to the merge queue for main when ready", result.stderr)
+        self.assertNotIn("resubmitting", result.stderr)
+        # A computed mergeability does not explain the missing entry: no retry.
+        self.assertEqual(len(self.merges()), 1)
+        self.assertGreater(len([i for i in self.queue_state_reads() if i > self.merge_indexes()[0]]), 1)
+        state = json.loads(self.state_path.read_text())
+        self.assertFalse(state["auto_merge_armed"])
+        self.assertEqual(state.get("disabled_auto_merge"), 1)
+
+    def test_unknown_mergeability_after_missing_entry_resubmits_once_then_refuses(self) -> None:
+        self.write_state(ghost_enqueue=True, ghost_mergeable="UNKNOWN")
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resubmitting once", result.stderr)
+        self.assertIn("PR #7 was submitted but GitHub never listed it in the merge queue", result.stderr)
+        self.assertIn("mergeable UNKNOWN", result.stderr)
+        self.assertIn("resubmission response:", result.stderr)
+        self.assertEqual(len(self.merges()), 2)
+        state = json.loads(self.state_path.read_text())
+        self.assertFalse(state["auto_merge_armed"])
+
+    def test_resubmission_after_unknown_mergeability_can_enter_queue(self) -> None:
+        self.write_state(ghost_merges=1, ghost_mergeable="UNKNOWN", queue_on_merge=True)
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("after resubmission", result.stderr)
+        self.assertEqual(len(self.merges()), 2)
+
+    def test_unknown_then_mergeable_waits_before_enqueueing(self) -> None:
+        self.write_state(mergeable_unknown_reads=2, queue_on_merge=True)
+        result = self.merge()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("waiting for it to be computed", result.stderr)
+        merge_index = self.merge_indexes()
+        self.assertEqual(len(merge_index), 1)
+        self.assertEqual(len([i for i in self.queue_state_reads() if i < merge_index[0]]), 3)
+
+    def test_mergeability_that_stays_unknown_refuses_without_submitting(self) -> None:
+        self.write_state(mergeable="UNKNOWN")
+        result = self.merge(env={"AFT_MERGE_PR_MERGEABLE_TIMEOUT_SECONDS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has not computed mergeability for PR #7", result.stderr)
+        self.assertEqual(self.merges(), [])
+
+    def test_queue_entry_on_first_check_needs_no_extra_polling(self) -> None:
+        self.write_state(queue_on_merge=True)
+        # An extra poll would sleep 30s; the read count below catches it either way.
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_POLL_SECONDS": "30",
+                                 "AFT_MERGE_PR_MERGEABLE_POLL_SECONDS": "30"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("confirmed #7 with GitHub", result.stderr)
+        merge_index = self.merge_indexes()
+        self.assertEqual(len(merge_index), 1)
+        reads = self.queue_state_reads()
+        self.assertEqual(len([i for i in reads if i < merge_index[0]]), 1)
+        self.assertEqual(len([i for i in reads if i > merge_index[0]]), 1)
+
+    def test_pending_checks_accept_armed_auto_merge_before_queue_entry(self) -> None:
+        # With checks still running GitHub only arms auto-merge; the queue entry
+        # follows once they pass, so the armed request is the confirmation.
+        self.write_state(checks_pending=True, auto_merge=True, ghost_enqueue=True)
+        result = self.merge(env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "0"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.merges()), 1)
+        self.assertTrue(json.loads(self.state_path.read_text())["auto_merge_armed"])
+
 
 class DeliveryTests(PRFixture):
     def test_fake_gh_refuses_pr_text_edits_with_manifest_error(self) -> None:
@@ -643,6 +777,15 @@ sys.exit(2)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("removed from queue", result.stdout)
         self.assertIn("exact failing group/run could not be established", result.stderr)
+
+    def test_landing_refuses_when_submission_never_enters_queue(self) -> None:
+        self.write_state(ghost_enqueue=True)
+        result = self.run_script("land-pr.sh", "delivery",
+                                 env={"AFT_MERGE_PR_QUEUE_CONFIRM_TIMEOUT_SECONDS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GitHub never listed it in the merge queue", result.stderr)
+        self.assertIn("land-pr: REFUSED", result.stderr)
+        self.assertNotIn("timed out waiting", result.stderr)
 
     def test_existing_open_pr_is_reused_and_text_stays_unchanged(self) -> None:
         self.write_state(exists=True)
