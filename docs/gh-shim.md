@@ -152,6 +152,7 @@ terminal's `PATH`, so a `gh` the operator types reaches upstream `gh` directly.
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
 | `run cancel` (including `--force`) | ADMINISTRATION-AS-OPERATOR | v15 |
 | `repo rename`, `repo create` | ADMINISTRATION-AS-OPERATOR | v19 |
+| `workflow disable`, `workflow enable` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `api` PUT and DELETE `/repos/*/*/private-vulnerability-reporting` | ADMINISTRATION-AS-OPERATOR | v19 |
 | `release edit`, `release upload` | ADMINISTRATION | v13 |
 | `api` PUT and DELETE `/repos/*/*/branches/*/protection` | ADMINISTRATION | v13 |
@@ -296,6 +297,22 @@ synced before upstream execution. A new repository cannot already be bot-bound:
 `repo create` therefore takes the existing account-write refusal and audited
 operator bypass, including from a bound checkout. There is no unapproved create
 exception. These commands do not enter the bot-speech relay.
+
+`workflow disable` and `workflow enable` take the same operator gate, for the
+same reason `run cancel` does: a workflow that keeps refusing every attempt
+otherwise piles up failed runs with no way to stop it short of a token only the
+operator holds. Switching one off is repository administration, not speech, so
+neither verb enters the bot-speech relay and both record the usual
+operator-attributed audit line before upstream `gh` runs. The real flags are the
+workflow name or id positional and `--repo`/`-R`; the shim models no flags for
+these rows, exactly as for `run cancel`, so a flag these verbs do not have is
+forwarded unchanged and refused by upstream `gh`'s own argument parser before it
+makes any request. `workflow run` keeps its v10 administration row and
+`workflow view`/`workflow list` stay mechanical reads.
+
+Older manifests refuse both verbs as `gh_shim_unclassified`, whatever the
+bypass says: the declaration and the code-side review are each version-gated at
+v19.
 
 The API setting matches exactly `/repos/<owner>/<repo>/private-vulnerability-reporting`
 (with or without the leading slash in argv). Neither nested or neighbouring

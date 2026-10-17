@@ -89,7 +89,18 @@ const V16_GOVERNED_TUPLES: &[&str] = &["pr create"];
 // Marking a pull request ready (or draft again) changes its public state as
 // the bot; creating or renaming a repository remains operator administration.
 const V19_GOVERNED_TUPLES: &[&str] = &["pr ready"];
-const V19_ADMIN_TUPLES: &[&str] = &["repo rename", "repo create"];
+// Switching a workflow off (or back on) is repository administration, not bot
+// speech: a workflow that keeps refusing every attempt otherwise stacks up
+// failed runs and notifications with no way to stop it short of a token held by
+// the operator. Both verbs therefore take the same audited operator bypass as
+// `run cancel`. Dispatching a workflow keeps its own v10 admin row, and the
+// read-only `workflow view`/`workflow list` rows are unchanged.
+const V19_ADMIN_TUPLES: &[&str] = &[
+    "repo rename",
+    "repo create",
+    "workflow disable",
+    "workflow enable",
+];
 const PRIVATE_REPORTING_PATH_GLOB: &str = "/repos/*/*/private-vulnerability-reporting";
 /// The body fields the `pr create` reader produces, in the order the manifest
 /// declares them. The reader is purpose-built for this list, so a signed
