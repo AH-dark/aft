@@ -21,7 +21,12 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
-import { __resetBgNotificationStateForTests, sessionBgStates } from "../bg-notifications.js";
+import {
+  __resetBgNotificationStateForTests,
+  appendToolResultBgCompletions,
+  handlePushedBgCompletion,
+  sessionBgStates,
+} from "../bg-notifications.js";
 import {
   __parseWaitPatternForTests,
   __trimWaitScanBufferForTests,
@@ -538,6 +543,84 @@ describe("bash tool adapter", () => {
     // A worker whose timeout is longer than the worker wait limit (30 minutes
     // by default) is handed back at the limit.
     expect(await transportFor(false, 3_600_000)).toBe(1_800_000 + 10_000);
+  });
+
+  test("starting runon hand-back tracks its later completion for reminder delivery", async () => {
+    const sessionID = "ses_starting_runon";
+    const taskId = "bash-starting-runon";
+    __resetBgNotificationStateForTests();
+    const tools = new Map<string, MockToolDef>();
+    const { bridge } = makeTrackableMockBridge({
+      output: "submitting",
+      status: "starting",
+      task_id: taskId,
+    });
+    const config = {
+      subc: { connection_file: "/run/subc-connection.json" },
+      remote_exec: { enabled: true },
+      bash: { runon_enabled: true },
+    } as PluginContext["config"];
+    const ctx = makeMockContext(bridge, config);
+    registerBashTool(makeMockApi(tools), ctx);
+    const extCtx = {
+      cwd: projectRoot,
+      hasUI: false,
+      sessionManager: { getSessionId: () => sessionID },
+    };
+
+    await tools
+      .get("bash")!
+      .execute(
+        "test-call",
+        { command: "cargo test", runon: "linux", wait: true },
+        undefined,
+        undefined,
+        extCtx,
+      );
+    const state = sessionBgStates.get(sessionID);
+    expect(state?.outstandingTaskIds.has(taskId)).toBe(true);
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: projectRoot,
+        sessionID,
+        runtime: { sendUserMessage: () => {} },
+      },
+      { task_id: taskId, status: "completed", exit_code: 0, command: "cargo test" },
+    );
+    expect(state?.unknownCompletions).toEqual([]);
+    const content = await appendToolResultBgCompletions(
+      { ctx, directory: projectRoot, sessionID },
+      [{ type: "text", text: "next tool result" }],
+    );
+    expect(JSON.stringify(content)).toContain("<system-reminder>");
+    expect(JSON.stringify(content)).toContain(`- task ${taskId} (exit 0)`);
+  });
+
+  test("terminal bash replies do not track their task id", async () => {
+    const sessionID = "ses_terminal_runon";
+    const taskId = "bash-terminal-runon";
+    __resetBgNotificationStateForTests();
+    const tools = new Map<string, MockToolDef>();
+    const { bridge } = makeTrackableMockBridge({
+      output: "finished",
+      status: "completed",
+      task_id: taskId,
+      exit_code: 0,
+    });
+    registerBashTool(makeMockApi(tools), makeMockContext(bridge));
+    const extCtx = {
+      cwd: projectRoot,
+      hasUI: false,
+      sessionManager: { getSessionId: () => sessionID },
+    };
+
+    await tools
+      .get("bash")!
+      .execute("test-call", { command: "true", wait: true }, undefined, undefined, extCtx);
+
+    expect(Boolean(sessionBgStates.get(sessionID)?.outstandingTaskIds.has(taskId))).toBe(false);
   });
 
   test("head and worker runon transport budgets cover a short configured blocking cap", async () => {

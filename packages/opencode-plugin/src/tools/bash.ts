@@ -41,6 +41,24 @@ const REMOTE_INPUT_CAPTURE_WAIT_MS = 60_000;
 const ABORT_REGISTRATION_WAIT_MS = 5_000;
 const ABORT_REGISTRATION_POLL_MS = 25;
 const ABORT_ATTEMPT_TIMEOUT_MS = 1_000;
+const TERMINAL_BG_TASK_STATUSES = new Set([
+  "completed",
+  "failed",
+  "killed",
+  "timed_out",
+  "fate_unknown",
+]);
+
+function isLiveBackgroundTaskReply(
+  reply: Record<string, unknown>,
+): reply is Record<string, unknown> & { task_id: string; status: string } {
+  return (
+    typeof reply.task_id === "string" &&
+    reply.task_id.length > 0 &&
+    typeof reply.status === "string" &&
+    !TERMINAL_BG_TASK_STATUSES.has(reply.status)
+  );
+}
 
 // Test-only override for the foreground wait window. Production resolves the
 // window from config (floored at 5000ms), but bun caps each test at 5000ms, so
@@ -783,7 +801,7 @@ export function createBashTool(
       if (!usedHostFallback && hostFallbackActive) hostFallbackActive = false;
 
       const uiTitle = description ?? shortenCommand(command);
-      if (data.status === "running" && typeof data.task_id === "string") {
+      if (isLiveBackgroundTaskReply(data)) {
         const taskId = data.task_id;
         trackBgTask(context.sessionID, taskId);
         await trackV2BackgroundTask(ctx, context, taskId, startedEpoch);

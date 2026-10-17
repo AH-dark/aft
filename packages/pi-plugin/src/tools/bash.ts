@@ -122,6 +122,25 @@ const BASH_TRANSPORT_MARGIN_MS = 10_000;
 // Mirrors Rust's REMOTE_INPUT_CAPTURE_WAIT: runon launch replies may wait for capture.
 const REMOTE_INPUT_CAPTURE_WAIT_MS = 60_000;
 
+const TERMINAL_BG_TASK_STATUSES = new Set([
+  "completed",
+  "failed",
+  "killed",
+  "timed_out",
+  "fate_unknown",
+]);
+
+function isLiveBackgroundTaskReply(
+  reply: Record<string, unknown>,
+): reply is Record<string, unknown> & { task_id: string; status: string } {
+  return (
+    typeof reply.task_id === "string" &&
+    reply.task_id.length > 0 &&
+    typeof reply.status === "string" &&
+    !TERMINAL_BG_TASK_STATUSES.has(reply.status)
+  );
+}
+
 function orchestratedTransportTimeoutMs(
   blockToCompletion: boolean,
   wait: boolean,
@@ -956,16 +975,16 @@ export function registerBashTool(
       if (!usedHostFallback && hostFallbackActive) hostFallbackActive = false;
 
       const taskId = response.task_id as string | undefined;
-      if (response.status === "running" && taskId) {
-        trackBgTask(resolveSessionId(extCtx), taskId);
+      if (isLiveBackgroundTaskReply(response)) {
+        trackBgTask(resolveSessionId(extCtx), response.task_id);
         // The Rust engine words this hand-off text for the caller's role
         // (worker_session, which callBridge adds to every request). It cannot
         // assume the host has bash_watch, so a worker is told here how to
         // wait on the task it now holds.
         const handOff = (response.output as string | undefined) ?? "";
         return bashResult(
-          isWorker ? handOff + workerBackgroundTaskNote(taskId, "task_id") : handOff,
-          { task_id: taskId },
+          isWorker ? handOff + workerBackgroundTaskNote(response.task_id, "task_id") : handOff,
+          { task_id: response.task_id },
         );
       }
 
