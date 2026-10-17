@@ -717,22 +717,6 @@
       "additionalProperties": false,
       "description": "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module."
     },
-    "opencode": {
-      "type": "object",
-      "properties": {
-        "server_url": {
-          "type": "string",
-          "format": "uri",
-          "description": "Base URL of the OpenCode 2 server AFT raises permission prompts on, e.g. http://127.0.0.1:4096. When set, AFT uses it instead of discovering the server it runs inside. Point it at the host/port given to OpenChamber (OPENCODE_HOST / OPENCODE_PORT). Read at startup."
-        },
-        "server_password_env": {
-          "type": "string",
-          "description": "Name of the environment variable holding that server's password (Basic auth, username opencode). A variable name, never the password itself. Default: OpenCode's own OPENCODE_PASSWORD, then OPENCODE_SERVER_PASSWORD."
-        }
-      },
-      "additionalProperties": false,
-      "description": "OpenCode 2 server used for permission prompts. User-scoped only — a project config cannot set this block, because it decides where permission prompts are sent."
-    },
     "github": {
       "type": "object",
       "properties": {
@@ -1532,22 +1516,6 @@
             },
             "additionalProperties": false,
             "description": "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module."
-          },
-          "opencode": {
-            "type": "object",
-            "properties": {
-              "server_url": {
-                "type": "string",
-                "format": "uri",
-                "description": "Base URL of the OpenCode 2 server AFT raises permission prompts on, e.g. http://127.0.0.1:4096. When set, AFT uses it instead of discovering the server it runs inside. Point it at the host/port given to OpenChamber (OPENCODE_HOST / OPENCODE_PORT). Read at startup."
-              },
-              "server_password_env": {
-                "type": "string",
-                "description": "Name of the environment variable holding that server's password (Basic auth, username opencode). A variable name, never the password itself. Default: OpenCode's own OPENCODE_PASSWORD, then OPENCODE_SERVER_PASSWORD."
-              }
-            },
-            "additionalProperties": false,
-            "description": "OpenCode 2 server used for permission prompts. User-scoped only — a project config cannot set this block, because it decides where permission prompts are sent."
           },
           "github": {
             "type": "object",

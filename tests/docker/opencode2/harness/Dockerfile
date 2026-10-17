@@ -51,7 +51,12 @@ RUN bun install --frozen-lockfile && \
     mkdir -p /packs /plugin/node_modules/@cortexkit/aft-opencode /plugin/node_modules && \
     npm pack ./packages/opencode-plugin --pack-destination /packs >/dev/null && \
     tar -xzf /packs/*.tgz -C /plugin/node_modules/@cortexkit/aft-opencode --strip-components=1 && \
-    cp -a node_modules/.bun/effect@4.0.0-rc.112/node_modules/effect /plugin/node_modules/effect
+    if ! effect_package_json="$(node -p "require.resolve('effect/package.json', {paths:['/src/packages/opencode-plugin']})" 2>/dev/null)" || [ ! -f "$effect_package_json" ]; then \
+      printf 'could not resolve effect/package.json from /src/packages/opencode-plugin\n' >&2; \
+      exit 1; \
+    fi && \
+    effect_dir="$(dirname "$effect_package_json")" && \
+    cp -a "$effect_dir" /plugin/node_modules/effect
 
 FROM --platform=linux/amd64 node:24-bookworm-slim AS runtime
 ARG OPENCODE2_VERSION

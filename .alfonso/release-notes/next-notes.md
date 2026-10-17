@@ -10,3 +10,4 @@
 - Workflow hints ship inside the host's system entry — fixes "System message must be at the beginning" on Qwen-family endpoints (issue #150).
 - Checkpoints under restrict_to_project_root now snapshot a symlink itself rather than its target.
 - Callgraph stores sweep orphaned build temporaries (age-based, both layouts).
+- OpenCode 2 now requires 2.0.29 or newer. Permission prompts run in-process through OpenCode's own permission check, including on standalone hosts and hosts without a readable server password, and edit prompts keep the built-in diff view. The `opencode.server_url` and `opencode.server_password_env` settings are removed; `npx @cortexkit/aft doctor --fix` deletes them.

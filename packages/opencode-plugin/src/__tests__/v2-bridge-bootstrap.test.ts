@@ -46,6 +46,7 @@ function settle(): Promise<void> {
 
 function v2Host(directory: string) {
   return {
+    permission: { assert: () => Effect.void },
     location: { directory, project: { directory, canonical: directory } },
     tool: { transform: () => Effect.void },
   };

@@ -1,0 +1,85 @@
+OpenCode 2 GA shared-server host contract probe
+run_id: oc2-ga-2.0.29-20261017-shared
+checkout_sha: 7f001b797715b7bbc57cd6b69d9bc358ebb396e
+platform: linux/amd64 isolated capture
+binary: @opencode/cli-linux-x64@2.0.29/bin/opencode
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private under one temporary root; OPENCODE_DB=opencode2.db in the private project; OPENCODE_DISABLE_DEFAULT_PLUGINS=true; OPENCODE_DISABLE_MODELS_FETCH unset
+service isolation: a free loopback port was written to $XDG_CONFIG_HOME/opencode/service.json and passed to the foreground `serve --service` process; clients attached with --server. No background service was launched.
+secret handling: the service password is redacted.
+
+$ opencode --version
+opencode v2.0.29
+
+$ opencode serve --hostname 127.0.0.1 --port 41875 --service --print-logs
+server listening on http://127.0.0.1:41875
+[foreground process remains running; stdout contains no password line]
+
+Registration written under $XDG_STATE_HOME/opencode/service.json:
+{"id":"<redacted>","version":"2.0.29","url":"http://127.0.0.1:41875","pid":80,"password":"<redacted>"}
+The registration has the same fields as 2.0.11: id, version, url, pid, password.
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:41875 GET /api/info
+{"version":"2.0.29","pid":80,"urls":["http://127.0.0.1:41875"],"paths":{"tmp":"<tempdir>/shared/tmp/opencode"},"capabilities":{"persistentPty":true}}
+[exit 0]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:41875 GET /api/health
+HTTP 404 Not Found
+[exit 1]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:41875 GET /api/server
+HTTP 404 Not Found
+[exit 1]
+
+Wrong-password and missing-password controls:
+
+$ OPENCODE_SERVER_PASSWORD=WRONG opencode api --server http://127.0.0.1:41875 GET /api/info
+Error: Server at http://127.0.0.1:41875 rejected the password
+[cause: UnauthorizedError: Authentication required]
+[exit 1]
+
+$ env -u OPENCODE_SERVER_PASSWORD opencode api --server http://127.0.0.1:41875 GET /api/info
+Error: Server at http://127.0.0.1:41875 requires a password; set OPENCODE_PASSWORD
+[cause: UnauthorizedError: Authentication required]
+[exit 1]
+
+$ OPENCODE_PASSWORD=<captured> OPENCODE_SERVER_PASSWORD=WRONG opencode api --server http://127.0.0.1:41875 GET /api/info
+{"version":"2.0.29","pid":80,"urls":["http://127.0.0.1:41875"],"paths":{"tmp":"<tempdir>/shared/tmp/opencode"},"capabilities":{"persistentPty":true}}
+[exit 0; OPENCODE_PASSWORD takes precedence]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:1 GET /api/info
+Error: Could not reach server at http://127.0.0.1:1
+[cause: Transport]
+[exit 1]
+
+CLI help and body flag:
+
+$ opencode api --help
+--server string        Connect to a server URL instead of the background service
+--data, -d string      Request body
+--header, -H string    Request header in name:value form
+--param key=value      OpenAPI path or query parameter
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:41875 --body '{}' GET /api/info
+Unrecognized flag: --body in command opencode api
+[exit 1]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode run --server http://127.0.0.1:41875 --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+{"type":"text","timestamp":1792200150522,"sessionID":"ses_eb88bf5b5ffeJsXZ1tzvJ505Dy","part":{"id":"prt_147740d96001oucI0rwpMELqTR_text-0","sessionID":"ses_eb88bf5b5ffeJsXZ1tzvJ505Dy","messageID":"msg_147740d96001oucI0rwpMELqTR","type":"text","text":"Probe complete.","time":{"start":1792200150439,"end":1792200150522}}}
+[exit 0; this text-only shared-server run emitted one `text` record, with no `step_start` or `step_finish` record]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:41875 GET /api/session/ses_eb88bf5b5ffeJsXZ1tzvJ505Dy
+{"data":{"id":"ses_eb88bf5b5ffeJsXZ1tzvJ505Dy","model":{"id":"mock-model","providerID":"openai","variant":"default"},"outcome":"succeeded","time":{"idle":1792200150530},"title":"Probe title"}}
+[exit 0; the session remained available after the run client exited]
+
+Native edit permission observation (separate isolated standalone run, same host version): a deterministic `edit` call for `patched.txt` completed without `--auto`, printed `Edited patched.txt (1 replacement)`, and changed `before` to `after`; the non-auto-reject stderr line from 2.0.11 was not emitted. This native host tool observation is not the AFT plugin's own edit path.
+
+Diff from 2.0.11: `/api/info` adds `capabilities.persistentPty`; wrong and missing passwords now produce explicit `UnauthorizedError` messages; the text-only shared-server run's first JSON record is `text` rather than `step_start`; native `edit` is allowed in this default isolated run without `--auto`. The CLI flags used by this contract are unchanged: `run`/`api` use `--server`, and `api` uses `--data` (not `--body`). The service registration fields, `/api/health` and `/api/server` 404s, password environment precedence, and successful session persistence are preserved.
+
+Foreground password-output control in a separate isolated root (same XDG and OPENCODE_DB isolation):
+
+$ opencode serve --hostname 127.0.0.1 --port 34761 --print-logs
+server listening on http://127.0.0.1:34761
+server password <redacted>
+[process stayed in the foreground until stopped]
+
+This confirms the captured stdout password pattern is still present without `--service`; `--service` suppresses it and publishes the password in the state registration instead.

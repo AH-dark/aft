@@ -1,0 +1,52 @@
+{
+  "cases": [
+    {
+      "name": "base config",
+      "doc": {
+        "opencode": {
+          "server_url": "http://127.0.0.1:4096",
+          "server_password_env": "PW"
+        }
+      },
+      "errors": [
+        "removed_config_key:opencode.server_url; run aft doctor --fix",
+        "removed_config_key:opencode.server_password_env; run aft doctor --fix"
+      ]
+    },
+    {
+      "name": "first-level harness",
+      "doc": {
+        "harnesses": {
+          "opencode": {
+            "opencode": {
+              "server_url": "http://127.0.0.1:4096",
+              "server_password_env": "PW"
+            }
+          }
+        }
+      },
+      "errors": [
+        "removed_config_key:harnesses.opencode.opencode.server_url; run aft doctor --fix",
+        "removed_config_key:harnesses.opencode.opencode.server_password_env; run aft doctor --fix"
+      ]
+    },
+    {
+      "name": "deeper ignored harness",
+      "doc": {
+        "harnesses": {
+          "opencode": {
+            "harnesses": {
+              "pi": {
+                "opencode": {
+                  "server_url": "http://127.0.0.1:4096",
+                  "server_password_env": "PW"
+                }
+              }
+            }
+          }
+        }
+      },
+      "errors": []
+    }
+  ]
+}

@@ -54,11 +54,10 @@ const acceptanceMatrix: AcceptanceRow[] = [
   },
   {
     sliceId: "S5",
-    claim:
-      "V2 hoisted filesystem mutations route through host permission.create with path headers and PatchDiff",
+    claim: "V2 filesystem mutations use in-process permission.assert with edit diffs",
     governingSource:
       "delta §1, rulings R1, R3, R4, R15; OC record pm_4a4e8133, pm_7ceb3a96, pm_7725ea5f",
-    testFile: "permissions/v2-permission.test.ts",
+    testFile: "../src/__tests__/v2-permission-assert.test.ts",
     testPattern: "requestPermission",
   },
   {

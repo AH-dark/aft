@@ -1,0 +1,38 @@
+OpenCode 2 GA native provider configuration probe
+run_id: oc2-ga-2.0.29-20261017-shared
+checkout_sha: 7f001b797715b7bbc57cd6b69d9bc358ebb396e
+platform: linux/amd64 isolated capture
+binary: @opencode/cli-linux-x64@2.0.29/bin/opencode
+provider: @copilotkit/aimock@1.24.0, the deterministic mock used by the Docker harness
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private under one temporary root; OPENCODE_DB=opencode2.db in the private project; OPENCODE_DISABLE_DEFAULT_PLUGINS=true; OPENCODE_DISABLE_MODELS_FETCH unset
+service isolation: a free loopback port was written to $XDG_CONFIG_HOME/opencode/service.json; `serve --service` ran in the foreground and `run` attached to its explicit endpoint. The mock listened on 127.0.0.1:4010.
+
+The exact provider object written under `providers.openai` in the isolated `opencode.json` was:
+{
+  "name": "Deterministic aimock",
+  "package": "@opencode/ai/providers/openai-compatible",
+  "settings": {
+    "baseURL": "http://127.0.0.1:4010/v1",
+    "apiKey": "{env:OPENAI_API_KEY}"
+  },
+  "models": {
+    "mock-model": { "name": "Mock Model" },
+    "gpt-5-mock": { "name": "Mock GPT Model" }
+  }
+}
+
+OpenCode 2.0.29's `debug config` listed this file at the isolated XDG config path, and `opencode models` listed `openai/mock-model`.
+
+$ OPENAI_API_KEY=sk-mock OPENCODE_SERVER_PASSWORD=<captured> opencode run --server http://127.0.0.1:41875 --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+{"type":"text","timestamp":1792200150522,"sessionID":"ses_eb88bf5b5ffeJsXZ1tzvJ505Dy","part":{"id":"prt_147740d96001oucI0rwpMELqTR_text-0","sessionID":"ses_eb88bf5b5ffeJsXZ1tzvJ505Dy","messageID":"msg_147740d96001oucI0rwpMELqTR","type":"text","text":"Probe complete.","time":{"start":1792200150439,"end":1792200150522}}}
+[exit 0]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:41875 GET /api/session/ses_eb88bf5b5ffeJsXZ1tzvJ505Dy
+{"data":{"id":"ses_eb88bf5b5ffeJsXZ1tzvJ505Dy","model":{"id":"mock-model","providerID":"openai","variant":"default"},"outcome":"succeeded","time":{"idle":1792200150530},"title":"Probe title"}}
+[exit 0]
+
+The mock received two OpenAI-compatible requests at `/v1/chat/completions`: the selected `mock-model` request and a separate `gpt-6-luna` title-generation request. The run's retained session reports model `{id: mock-model, providerID: openai, variant: default}` and outcome `succeeded`.
+
+Capture correction: the earlier attempt ran OpenCode with `spawnSync` while the same Node process hosted LLMock's request handlers. That blocked the mock's event loop, leaving the handler unable to answer the model request and causing the client timeout. Running the host client asynchronously kept the mock responsive. No provider schema or package identifier change was needed: the same `providers` key and `@opencode/ai/providers/openai-compatible` identifier used by 2.0.11 worked on 2.0.29.
+
+Diff from 2.0.11: the provider key, package identifier, settings, API key indirection, model selector, and model contract are unchanged; only the OpenCode host version and the separate shared-server CLI response shape differ. The `gpt-5-mock` model remains the Docker harness extension and was not selected by this capture.

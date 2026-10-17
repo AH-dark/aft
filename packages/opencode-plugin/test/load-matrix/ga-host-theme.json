@@ -1,9 +1,9 @@
 {
   "recorded": {
     "host": "@opencode/cli",
-    "version": "2.0.11",
+    "version": "2.0.29",
     "channel": "latest",
-    "date": "2026-09-21",
+    "date": "2026-10-16",
     "theme": "the host default, resolved with no terminal palette available",
     "how": "read off context.theme inside a plugin running in the host; the light record was taken after dispatching the host command theme.switch_mode",
     "leaves": "a colour is {\"rgba\": \"#rrggbbaa\"} — an @opentui/core RGBA read back through toInts(); \"<function>\" is a token group the host exposes as a callable"
@@ -111,35 +111,6 @@
           },
           "900": {
             "rgba": "#1f0b01ff"
-          }
-        },
-        "yellow": {
-          "100": {
-            "rgba": "#ffffffff"
-          },
-          "200": {
-            "rgba": "#eeeeeeff"
-          },
-          "300": {
-            "rgba": "#b5b5b5ff"
-          },
-          "400": {
-            "rgba": "#808080ff"
-          },
-          "500": {
-            "rgba": "#4c4c4cff"
-          },
-          "600": {
-            "rgba": "#1e1e1eff"
-          },
-          "700": {
-            "rgba": "#141414ff"
-          },
-          "800": {
-            "rgba": "#0a0a0aff"
-          },
-          "900": {
-            "rgba": "#030303ff"
           }
         },
         "green": {
@@ -968,35 +939,6 @@
           },
           "900": {
             "rgba": "#fef3e7ff"
-          }
-        },
-        "yellow": {
-          "100": {
-            "rgba": "#000000ff"
-          },
-          "200": {
-            "rgba": "#1a1a1aff"
-          },
-          "300": {
-            "rgba": "#4e4e4eff"
-          },
-          "400": {
-            "rgba": "#8a8a8aff"
-          },
-          "500": {
-            "rgba": "#bebebeff"
-          },
-          "600": {
-            "rgba": "#f5f5f5ff"
-          },
-          "700": {
-            "rgba": "#fafafaff"
-          },
-          "800": {
-            "rgba": "#ffffffff"
-          },
-          "900": {
-            "rgba": "#ffffffff"
           }
         },
         "green": {

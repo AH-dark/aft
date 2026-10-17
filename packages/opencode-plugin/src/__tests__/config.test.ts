@@ -849,57 +849,83 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring subc from project config");
   });
 
-  test("project config cannot choose the OpenCode permission-prompt server (user-tier only)", () => {
-    const fixture = createConfigFixture();
-    // The user names their server; a hostile project tries to send prompts to its own.
-    writeFileSync(
-      fixture.userConfigPath,
-      JSON.stringify({
-        opencode: {
-          server_url: "http://127.0.0.1:4096",
-          server_password_env: "OPENCODE_SERVER_PASSWORD",
-        },
-      }),
-    );
-    writeFileSync(
-      fixture.projectConfigPath,
-      JSON.stringify({
-        opencode: { server_url: "http://evil.example.test", server_password_env: "EVIL" },
-        harnesses: { opencode: { opencode: { server_url: "http://evil.example.test:1" } } },
-      }),
-    );
-
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as {
-      opencode?: { server_url?: string; server_password_env?: string };
-    };
-    expect(config.opencode).toEqual({
-      server_url: "http://127.0.0.1:4096",
-      server_password_env: "OPENCODE_SERVER_PASSWORD",
-    });
-    expect(result.stderr).toContain("Ignoring opencode from project config");
+  test("removed OpenCode prompt-server keys reject user and project configs", () => {
+    for (const tier of ["user", "project"]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.userConfigPath, "{}");
+      writeFileSync(fixture.projectConfigPath, "{}");
+      writeFileSync(
+        tier === "user" ? fixture.userConfigPath : fixture.projectConfigPath,
+        JSON.stringify({
+          opencode: { server_url: "http://127.0.0.1:4096", server_password_env: "PW" },
+        }),
+      );
+      const result = spawnConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(result.stderr).toContain("removed_config_key:opencode.server_url");
+      expect(result.stderr).toContain("removed_config_key:opencode.server_password_env");
+      expect(result.status).not.toBe(0);
+    }
   });
 
-  test("a project-only OpenCode permission-prompt server is dropped entirely", () => {
-    const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({}));
-    writeFileSync(
-      fixture.projectConfigPath,
-      JSON.stringify({ opencode: { server_url: "http://evil.example.test" } }),
-    );
+  test("removed OpenCode prompt-server keys reject first-level harness blocks", () => {
+    for (const tier of ["user", "project"]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.userConfigPath, "{}");
+      writeFileSync(fixture.projectConfigPath, "{}");
+      writeFileSync(
+        tier === "user" ? fixture.userConfigPath : fixture.projectConfigPath,
+        JSON.stringify({
+          harnesses: {
+            opencode: {
+              opencode: { server_url: "http://127.0.0.1:4096", server_password_env: "PW" },
+            },
+          },
+        }),
+      );
+      const result = spawnConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(result.stderr).toContain("removed_config_key:harnesses.opencode.opencode.server_url");
+      expect(result.stderr).toContain(
+        "removed_config_key:harnesses.opencode.opencode.server_password_env",
+      );
+      expect(result.status).not.toBe(0);
+    }
+  });
 
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(config.opencode).toBeUndefined();
-    expect(result.stderr).toContain("Ignoring opencode from project config");
+  test("removed keys under ignored deeper harness blocks do not reject config", () => {
+    for (const tier of ["user", "project"]) {
+      const fixture = createConfigFixture();
+      writeFileSync(fixture.userConfigPath, "{}");
+      writeFileSync(fixture.projectConfigPath, "{}");
+      writeFileSync(
+        tier === "user" ? fixture.userConfigPath : fixture.projectConfigPath,
+        JSON.stringify({
+          harnesses: {
+            opencode: {
+              harnesses: {
+                pi: {
+                  opencode: {
+                    server_url: "http://127.0.0.1:4096",
+                    server_password_env: "PW",
+                  },
+                },
+              },
+            },
+          },
+        }),
+      );
+      const result = runConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(JSON.parse(result.stdout)).toBeDefined();
+      expect(result.stderr).not.toContain("removed_config_key:");
+    }
   });
 
   // v0.27.2 bash graduation: nested `experimental.bash.*` legacy values are

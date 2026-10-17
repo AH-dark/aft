@@ -452,9 +452,7 @@ const CASES: ParityCase[] = [
     },
   },
   {
-    // The OpenCode plugin's permission-prompt server is user-only: the
-    // project's server, password variable, and harness override are dropped,
-    // and the user's values come through unchanged.
+    // Removed HTTP permission settings reject all tiers and harness blocks.
     name: "drop_opencode_prompt_server",
     user: {
       opencode: {
@@ -471,13 +469,25 @@ const CASES: ParityCase[] = [
     },
   },
   {
-    // A project alone cannot introduce a prompt server either.
+    // Removed keys are rejected even without a user tier.
     name: "drop_opencode_prompt_server_project_only",
     project: { opencode: { server_url: "http://evil.test" } },
   },
   {
-    // Pi reads the same aft.jsonc files, so it must accept the user's block
-    // and drop a project's the same way.
+    // Nested harness blocks are ignored, including their removed transport keys.
+    name: "ignore_deep_harness_removed_opencode_prompt_server",
+    project: {
+      harnesses: {
+        opencode: {
+          harnesses: {
+            pi: { opencode: { server_url: "http://evil.test" } },
+          },
+        },
+      },
+    },
+  },
+  {
+    // Pi reads the same aft.jsonc files and rejects the same removed keys.
     name: "drop_opencode_prompt_server_pi",
     harness: "pi",
     user: { opencode: { server_url: "http://127.0.0.1:4096" } },

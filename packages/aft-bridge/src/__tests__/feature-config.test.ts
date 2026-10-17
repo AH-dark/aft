@@ -8,6 +8,7 @@ import {
   legacyConfigNoticeMessage,
   noticeDigest,
   noticeProjection,
+  removedConfigKeyErrors,
   SEMANTIC_COST_NOTICE,
   semanticCostNotice,
   suppliesSemanticIndexInput,
@@ -26,6 +27,18 @@ const fixtures = JSON.parse(
   ),
 ) as { cases: Array<{ name: string; doc?: Record<string, unknown>; digest: string }> };
 
+const removedKeyFixtures = JSON.parse(
+  readFileSync(
+    new URL(
+      "../../../../crates/aft/tests/fixtures/feature_config/removed_config_key_errors.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+) as {
+  cases: Array<{ name: string; doc: Record<string, unknown>; errors: string[] }>;
+};
+
 const policy = JSON.parse(
   readFileSync(
     new URL("../../../../spec/feature-config/migration-policy.json", import.meta.url),
@@ -43,6 +56,12 @@ afterEach(() => {
 });
 
 describe("feature-config policy", () => {
+  test("removed config key checking matches shared Rust/TypeScript fixtures", () => {
+    for (const fixture of removedKeyFixtures.cases) {
+      expect(removedConfigKeyErrors(fixture.doc), fixture.name).toEqual(fixture.errors);
+    }
+  });
+
   test("experimental aliases preserve opt-in defaults and canonical precedence in both tiers", () => {
     for (const tier of ["user", "project"] as const) {
       for (const [key, expected] of [

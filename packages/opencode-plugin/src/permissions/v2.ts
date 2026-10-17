@@ -1,7 +1,23 @@
-import { Effect } from "effect";
+import type { PermissionDomain } from "@opencode/plugin/effect/permission";
+import { Cause, Effect } from "effect";
 
 import type { V2ExecutionContext, V2PermissionRequest } from "../tools/definitions/v2.js";
-import type { V2PromptChannel } from "./v2-service.js";
+
+type AssertInput = Parameters<PermissionDomain["assert"]>[0];
+export class PermissionDeniedError extends Error {
+  override readonly name = "PermissionDeniedError";
+}
+
+export class PermissionRulesUnavailableError extends Error {
+  override readonly name = "PermissionRulesUnavailableError";
+}
+
+/** Rejecting a prompt without feedback ends the model's current step, not just the tool call. */
+export class PermissionStepAbort extends Error {
+  constructor(readonly original: unknown) {
+    super("OpenCode ended the current step");
+  }
+}
 
 export type V2PermissionEffect = "allow" | "deny" | "ask";
 
@@ -29,6 +45,7 @@ export interface V2SessionRecord {
  * resolve "allow", "deny", or "ask" without a round trip to the user.
  */
 export interface V2PermissionHostContext {
+  readonly permission: Pick<PermissionDomain, "assert">;
   readonly agent: {
     get(input: { agentID: string }): Effect.Effect<{ data: V2AgentRecord }, unknown>;
   };
@@ -36,108 +53,6 @@ export interface V2PermissionHostContext {
     get(input: { sessionID: string }): Effect.Effect<V2SessionRecord | undefined, unknown>;
   };
 }
-
-export type V2PermissionReply = "once" | "always" | "reject";
-
-export interface V2PermissionCreateInput {
-  sessionID: string;
-  action: string;
-  resources: string[];
-  save: string[];
-  metadata: Record<string, unknown>;
-  source: {
-    type: "tool";
-    messageID: string;
-    id: string;
-  };
-}
-
-interface V2PermissionCreateResult {
-  id: string;
-  effect: V2PermissionEffect;
-}
-
-interface V2PermissionRepliedEvent {
-  sessionID: string;
-  requestID: string;
-  reply: V2PermissionReply;
-}
-
-interface V2EventSubscription {
-  stream: AsyncIterable<unknown>;
-}
-
-/** The two service calls a permission prompt needs, in the shape AFT sends them. */
-export interface V2PermissionClient {
-  permission: {
-    create(
-      input: V2PermissionCreateInput,
-    ): Promise<V2PermissionCreateResult | { data?: V2PermissionCreateResult; error?: unknown }>;
-  };
-  event: {
-    subscribe(): Promise<V2EventSubscription>;
-  };
-}
-
-export class PermissionDeniedError extends Error {
-  override readonly name = "PermissionDeniedError";
-}
-
-export class PermissionRejectedError extends Error {
-  override readonly name = "PermissionRejectedError";
-}
-
-/**
- * Raised when the rules resolve to "ask" and the service that shows the prompt
- * could not be reached.
- *
- * Deliberately not named like a rule denial: the caller-side classifier rewrites
- * recognised denial classes into a generic "denied by rule" sentence, and this
- * refusal has to keep its own text because that text names the way out.
- */
-export class PermissionPromptUnavailableError extends Error {
-  override readonly name = "PermissionPromptUnavailableError";
-}
-
-/**
- * Raised when the prompt was shown and no answer ever came back.
- *
- * Like the unavailable-prompt refusal this keeps its own text, because that
- * text is the only place the user learns that a prompt was raised on their
- * behalf and went unanswered. Never an allow: an answer nobody gave is not
- * permission.
- */
-export class PermissionPromptUnansweredError extends Error {
-  override readonly name = "PermissionPromptUnansweredError";
-}
-
-/** Raised when the host's rules for this call could not be read at all. */
-export class PermissionRulesUnavailableError extends Error {
-  override readonly name = "PermissionRulesUnavailableError";
-}
-
-/**
- * How long a raised prompt may stay unanswered before the call is refused.
- *
- * A prompt is a question for a person, and a person may be away from the
- * machine: ten minutes is well beyond the minutes a real answer takes, so an
- * answer that is coming still arrives in time. The bound exists for the answer
- * that is not coming, which used to hold the tool call open for the life of the
- * session.
- */
-export const V2_PROMPT_REPLY_TIMEOUT_MS = 10 * 60_000;
-
-/**
- * How long AFT waits for its event subscription to start delivering before it
- * raises the request anyway.
- *
- * OpenCode greets a new subscriber immediately, so this is normally over in a
- * millisecond or two on a loopback connection. It is a bound rather than an
- * unconditional wait so a host that greets nobody cannot stop prompts from
- * being raised at all; a request raised without a confirmed subscription is
- * still bounded by the reply timeout, and refuses rather than allows.
- */
-export const V2_PROMPT_LISTEN_TIMEOUT_MS = 5_000;
 
 /**
  * OpenCode's permission pattern matcher, kept byte-compatible with the host.
@@ -193,9 +108,8 @@ export interface V2PermissionDecision {
  *
  * One deliberate difference: OpenCode also folds in the user's saved "always"
  * grants before the allow/ask split, and those are not readable from a plugin.
- * A saved grant therefore reads as "ask" here, which costs one round trip to
- * the service: the host applies the grant when the request reaches it and
- * answers "allow" without showing anything.
+ * A saved grant therefore reads as "ask" here; the host applies it during
+ * assert and allows without showing anything.
  */
 export function decidePermission(
   request: V2PermissionRequest,
@@ -288,52 +202,6 @@ function deniedMessage(request: V2PermissionRequest, decision: V2PermissionDecis
   );
 }
 
-function promptUnavailableMessage(
-  request: V2PermissionRequest,
-  decision: V2PermissionDecision,
-  observed: string,
-): string {
-  const resource = decision.resource ?? "*";
-  return (
-    `The ${JSON.stringify(request.permission)} operation needs interactive approval: this ` +
-    `session's permission rules resolve it to "ask" for ${JSON.stringify(resource)}, and AFT ` +
-    `could not reach the OpenCode service to raise a prompt (${observed}). Once the server is ` +
-    "reachable, retry; or run it without a prompt by adding " +
-    `{"action": ${JSON.stringify(request.permission)}, "resource": ${JSON.stringify(resource)}, ` +
-    '"effect": "allow"} to the "permissions" list of the agent or session in your OpenCode config.'
-  );
-}
-
-/**
- * The refusal for a prompt that was raised and never answered.
- *
- * It states what was observed rather than a verdict, because the difference
- * matters to whoever reads it: the operation was not denied by anyone, the
- * answer simply never reached AFT, and nothing was permitted in the meantime.
- */
-function promptUnansweredMessage(
-  request: V2PermissionRequest,
-  decision: V2PermissionDecision,
-  observed: string,
-): string {
-  const resource = decision.resource ?? "*";
-  return (
-    `The ${JSON.stringify(request.permission)} operation was refused: this session's permission ` +
-    `rules resolve it to "ask" for ${JSON.stringify(resource)}, AFT raised a prompt and received ` +
-    `no reply (${observed}), so nothing was permitted. Answer the prompt and run the operation ` +
-    "again, or run it without a prompt by adding " +
-    `{"action": ${JSON.stringify(request.permission)}, "resource": ${JSON.stringify(resource)}, ` +
-    '"effect": "allow"} to the "permissions" list of the agent or session in your OpenCode config.'
-  );
-}
-
-/** Render a wait bound the way a refusal quotes it back. */
-function waitDuration(ms: number): string {
-  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000}m`;
-  if (ms >= 1_000 && ms % 1_000 === 0) return `${ms / 1_000}s`;
-  return `${ms}ms`;
-}
-
 function requiredContextID(
   context: V2ExecutionContext,
   key: "sessionID" | "messageID" | "id",
@@ -345,301 +213,6 @@ function requiredContextID(
   return value;
 }
 
-function createResult(
-  response: V2PermissionCreateResult | { data?: V2PermissionCreateResult; error?: unknown },
-): V2PermissionCreateResult {
-  if ("id" in response && "effect" in response) return response;
-  if (response.error !== undefined) {
-    throw response.error instanceof Error
-      ? response.error
-      : new Error(`Permission request failed: ${String(response.error)}`);
-  }
-  if (!response.data) throw new Error("Permission request returned no result");
-  return response.data;
-}
-
-/**
- * Recognise a "the user answered" event on the service's event stream.
- *
- * The payload is read from `data`, which is where OpenCode 2 puts an event's
- * body, and the whole envelope is unwrapped from `payload` first for transports
- * that nest it.
- */
-function repliedEvent(event: unknown): V2PermissionRepliedEvent | undefined {
-  if (!event || typeof event !== "object") return undefined;
-  const envelope = event as { payload?: unknown };
-  const candidate = (envelope.payload ?? event) as {
-    type?: unknown;
-    data?: unknown;
-  };
-  if (candidate.type !== "permission.replied") return undefined;
-  if (!candidate.data || typeof candidate.data !== "object") return undefined;
-  return candidate.data as V2PermissionRepliedEvent;
-}
-
-async function closeStream(iterator: AsyncIterator<unknown>): Promise<void> {
-  if (typeof iterator.return === "function") await iterator.return();
-}
-
-/**
- * One pull from the event stream, with its failure folded into the value.
- *
- * A pull is started before anyone is ready to await it, so it must never be a
- * promise that can reject while unobserved.
- */
-type StreamPull =
-  | { readonly kind: "event"; readonly result: IteratorResult<unknown> }
-  | { readonly kind: "failed"; readonly error: unknown };
-
-function pull(iterator: AsyncIterator<unknown>): Promise<StreamPull> {
-  return iterator.next().then(
-    (result) => ({ kind: "event", result }) as const,
-    (error) => ({ kind: "failed", error }) as const,
-  );
-}
-
-interface Countdown {
-  readonly expired: Promise<void>;
-  cancel(): void;
-}
-
-function countdown(ms: number): Countdown {
-  let handle: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<void>((resolve) => {
-    handle = setTimeout(resolve, ms);
-  });
-  return {
-    expired,
-    cancel: () => {
-      if (handle !== undefined) clearTimeout(handle);
-    },
-  };
-}
-
-interface Cancellation {
-  readonly cancelled: Promise<void>;
-  dispose(): void;
-}
-
-function cancellation(signal: AbortSignal | undefined): Cancellation {
-  if (!signal) return { cancelled: new Promise<void>(() => {}), dispose: () => {} };
-  if (signal.aborted) return { cancelled: Promise.resolve(), dispose: () => {} };
-  let listener: (() => void) | undefined;
-  const cancelled = new Promise<void>((resolve) => {
-    listener = () => resolve();
-    signal.addEventListener("abort", listener, { once: true });
-  });
-  return {
-    cancelled,
-    dispose: () => {
-      if (listener) signal.removeEventListener("abort", listener);
-    },
-  };
-}
-
-/**
- * Open the event stream and wait until it is actually delivering.
- *
- * The generated client's `event.subscribe()` hands back a lazy async generator:
- * holding it, or even taking its iterator, performs no I/O at all, and the HTTP
- * request that attaches the subscription is only made by the first `next()`.
- * The host forwards events to whoever is attached when they are emitted and
- * keeps no backlog, so a subscription that attaches after a request has been
- * announced can never be told how that request was answered.
- *
- * Pulling one event is therefore what subscribing means here. OpenCode greets
- * every new subscriber, so the pull settles as soon as the stream is live. The
- * pulled event is not thrown away: it is handed to the wait as its first item,
- * so a greeting and a real event are treated the same way and nothing can be
- * swallowed by the handshake.
- */
-async function startListening(
-  client: V2PermissionClient,
-  listenTimeoutMs: number,
-): Promise<
-  | { readonly iterator: AsyncIterator<unknown>; readonly first: Promise<StreamPull> }
-  | { readonly unavailable: string }
-> {
-  let iterator: AsyncIterator<unknown>;
-  try {
-    const subscription = await client.event.subscribe();
-    iterator = subscription.stream[Symbol.asyncIterator]();
-  } catch (error) {
-    return { unavailable: `subscribing to the event stream failed: ${detail(error)}` };
-  }
-
-  const first = pull(iterator);
-  const ready = countdown(listenTimeoutMs);
-  try {
-    const settled = await Promise.race([first, ready.expired.then(() => undefined)]);
-    if (settled?.kind === "failed") {
-      await closeStream(iterator);
-      return { unavailable: `reading the event stream failed: ${detail(settled.error)}` };
-    }
-  } finally {
-    ready.cancel();
-  }
-  return { iterator, first };
-}
-
-interface ReplyWaitLimits {
-  readonly replyTimeoutMs: number;
-  readonly signal?: AbortSignal;
-}
-
-/**
- * Wait for this request's answer, for as long as the bound allows.
- *
- * `first` is the pull that made the subscription live; it is examined like any
- * other event so the handshake cannot hide one.
- */
-async function waitForReply(
-  iterator: AsyncIterator<unknown>,
-  first: Promise<StreamPull>,
-  sessionID: string,
-  requestID: string,
-  limits: ReplyWaitLimits,
-): Promise<void> {
-  const deadline = countdown(limits.replyTimeoutMs);
-  const abort = cancellation(limits.signal);
-  let pending: Promise<StreamPull> | undefined = first;
-  try {
-    while (true) {
-      const next = pending ?? pull(iterator);
-      pending = undefined;
-      const settled = await Promise.race([
-        next,
-        deadline.expired.then(() => ({ kind: "unanswered" }) as const),
-        abort.cancelled.then(() => ({ kind: "cancelled" }) as const),
-      ]);
-      if (settled.kind === "unanswered") {
-        throw new PermissionPromptUnansweredError(
-          `waited ${waitDuration(limits.replyTimeoutMs)} after raising it`,
-        );
-      }
-      if (settled.kind === "cancelled") {
-        throw new PermissionPromptUnansweredError(
-          "the operation was cancelled while the prompt was still open",
-        );
-      }
-      if (settled.kind === "failed") {
-        throw new PermissionPromptUnansweredError(
-          `reading the event stream failed: ${detail(settled.error)}`,
-        );
-      }
-      if (settled.result.done) {
-        throw new PermissionPromptUnansweredError("the event stream ended before a reply arrived");
-      }
-      const event = repliedEvent(settled.result.value);
-      if (!event || event.sessionID !== sessionID || event.requestID !== requestID) continue;
-      if (event.reply === "reject") throw new PermissionRejectedError("Permission denied.");
-      return;
-    }
-  } finally {
-    deadline.cancel();
-    abort.dispose();
-    await closeStream(iterator);
-  }
-}
-
-/**
- * Put the question to the user through OpenCode's own permission service.
- *
- * Listening starts before `permission.create`, and listening means a stream
- * that has already delivered something — a headless client answers within a
- * millisecond or two of the request being announced, and an answer delivered
- * before the subscription attaches is gone for good. The create response still
- * handles saved-rule allows and configured denies immediately; only an `ask`
- * waits for its matching reply, and that wait is bounded.
- *
- * `request.metadata` is forwarded unchanged, which is what gives an edit-class
- * request its `diff` and makes the host render its built-in patch view.
- */
-async function raisePrompt(
-  client: V2PermissionClient,
-  request: V2PermissionRequest,
-  decision: V2PermissionDecision,
-  context: V2ExecutionContext,
-  limits: ResolvedPromptLimits,
-): Promise<void> {
-  const sessionID = requiredContextID(context, "sessionID");
-  const messageID = requiredContextID(context, "messageID");
-  const id = requiredContextID(context, "id");
-  const listening = await startListening(client, limits.listenTimeoutMs);
-  let streamClaimed = false;
-
-  try {
-    const result = createResult(
-      await client.permission.create({
-        sessionID,
-        action: request.permission,
-        resources: [...request.patterns],
-        save: [...request.always],
-        metadata: { ...request.metadata },
-        source: { type: "tool", messageID, id },
-      }),
-    );
-
-    if (result.effect === "allow") return;
-    if (result.effect === "deny") throw new PermissionDeniedError("Permission denied.");
-
-    // Only an answer we could hear is worth raising a prompt for. A settled
-    // effect above needed no stream, so this refusal is deliberately reached
-    // after the create call rather than before it.
-    if ("unavailable" in listening) {
-      throw new PermissionPromptUnavailableError(
-        promptUnavailableMessage(request, decision, listening.unavailable),
-      );
-    }
-
-    streamClaimed = true;
-    try {
-      await waitForReply(listening.iterator, listening.first, sessionID, result.id, limits);
-    } catch (error) {
-      if (!(error instanceof PermissionPromptUnansweredError)) throw error;
-      throw new PermissionPromptUnansweredError(
-        promptUnansweredMessage(request, decision, error.message),
-      );
-    }
-  } finally {
-    if (!streamClaimed && "iterator" in listening) await closeStream(listening.iterator);
-  }
-}
-
-/** The wait bounds and cancellation one prompt runs under. */
-export interface V2PromptLimits {
-  readonly replyTimeoutMs?: number;
-  readonly listenTimeoutMs?: number;
-  /** Ends the wait when the tool call it belongs to is cancelled. */
-  readonly signal?: AbortSignal;
-}
-
-interface ResolvedPromptLimits extends ReplyWaitLimits {
-  readonly listenTimeoutMs: number;
-}
-
-/**
- * The tool call's own cancellation signal, when its context carries one.
- *
- * The runtime object a V2 tool executes against exposes the host's abort signal
- * as `abort`; the plain execution contexts AFT's own fixtures build do not have
- * one. Reading it defensively is what keeps a cancelled call from leaving a
- * prompt wait running behind it, without requiring every caller to thread the
- * signal through by hand.
- */
-function contextAbortSignal(context: V2ExecutionContext): AbortSignal | undefined {
-  const candidate = (context as { abort?: unknown }).abort;
-  return candidate instanceof AbortSignal ? candidate : undefined;
-}
-
-function resolveLimits(context: V2ExecutionContext, limits: V2PromptLimits): ResolvedPromptLimits {
-  return {
-    replyTimeoutMs: limits.replyTimeoutMs ?? V2_PROMPT_REPLY_TIMEOUT_MS,
-    listenTimeoutMs: limits.listenTimeoutMs ?? V2_PROMPT_LISTEN_TIMEOUT_MS,
-    signal: limits.signal ?? contextAbortSignal(context),
-  };
-}
-
 /**
  * Answer a V2 tool's permission request.
  *
@@ -647,14 +220,13 @@ function resolveLimits(context: V2ExecutionContext, limits: V2PromptLimits): Res
  * already permitted — reading a file inside the project under OpenCode's
  * default allow-everything ruleset, for instance — runs with no round trip,
  * and a denial fails naming the rule that produced it. Only a rule that asks
- * costs a call to the service, which raises the real prompt.
+ * costs a call to the host, which raises the real prompt.
  */
 export async function requestPermission(
   host: V2PermissionHostContext,
   request: V2PermissionRequest,
   context: V2ExecutionContext,
-  prompt: V2PromptChannel,
-  limits: V2PromptLimits = {},
+  signal?: AbortSignal,
 ): Promise<void> {
   let rules: readonly V2PermissionRule[];
   try {
@@ -672,11 +244,32 @@ export async function requestPermission(
   if (decision.effect === "allow") return;
   if (decision.effect === "deny") throw new PermissionDeniedError(deniedMessage(request, decision));
 
-  const channel = await prompt.client();
-  if (!channel.client) {
-    throw new PermissionPromptUnavailableError(
-      promptUnavailableMessage(request, decision, channel.unavailable),
-    );
+  const result = await Effect.runPromiseExit(
+    host.permission.assert({
+      sessionID: requiredContextID(context, "sessionID") as AssertInput["sessionID"],
+      ...(context.agent ? { agent: context.agent as AssertInput["agent"] } : {}),
+      action: request.permission,
+      resources: [...request.patterns],
+      save: [...request.always],
+      metadata: { ...request.metadata },
+      source: {
+        type: "tool",
+        messageID: requiredContextID(context, "messageID"),
+        id: requiredContextID(context, "id"),
+      },
+    }),
+    { signal },
+  );
+  if (result._tag === "Failure") {
+    const error = Cause.squash(result.cause);
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "_tag" in error &&
+      error._tag === "Tool.Error"
+    ) {
+      throw error;
+    }
+    throw new PermissionStepAbort(error);
   }
-  await raisePrompt(channel.client, request, decision, context, resolveLimits(context, limits));
 }

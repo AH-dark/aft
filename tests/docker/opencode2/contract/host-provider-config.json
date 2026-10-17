@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "run_id": "oc2-ga-2.0.11-20260920-shared",
-  "observed_run_id": "oc2-ga-2.0.11-20260920-shared",
-  "observed_sha": "48f95796160b920874efe30be4f288621994b06c",
-  "supersedes_host_version": "2.0.3",
-  "host_version": "2.0.11",
+  "run_id": "oc2-ga-2.0.29-20261017-shared",
+  "observed_run_id": "oc2-ga-2.0.29-20261017-shared",
+  "observed_sha": "7f001b797715b7bbc57cd6b69d9bc358ebb396e",
+  "supersedes_host_version": "2.0.11",
+  "host_version": "2.0.29",
   "host": "opencode2",
   "platform": "linux-x64",
-  "transcript": "probe/host-provider-config-ga-2.0.11.txt",
+  "transcript": "probe/host-provider-config-ga-2.0.29.txt",
   "guard_transcript": "probe/host-provider-contract-guard.txt",
   "provider_config": {
     "openai": {
@@ -56,13 +56,14 @@
     "json",
     "--model",
     "openai/mock-model",
+    "--auto",
     "${message}"
   ],
   "environment": {
     "OPENAI_API_KEY": "sk-mock"
   },
   "observed_session": {
-    "session_id": "ses_f3efb4c86ffeXu4KRN2JlnQFTW",
+    "session_id": "ses_eb88bf5b5ffeJsXZ1tzvJ505Dy",
     "model": {
       "id": "mock-model",
       "providerID": "openai",
