@@ -11762,10 +11762,13 @@ mod tests {
     /// before `System32` (as it does under Git Bash) that is GNU coreutils
     /// `timeout`, which rejects `/t` and exits 125 at once. Tests that kill
     /// this command then passed only when the kill beat shell startup. The
-    /// absolute `System32` path cannot be shadowed by PATH order.
+    /// absolute `System32` path cannot be shadowed by PATH order. It is quoted
+    /// because the task shell may be Git Bash, which drops the backslashes of an
+    /// unquoted word before `cmd` sees it; inside double quotes Bash keeps them,
+    /// and PowerShell and `cmd` accept the quoted path as written.
     #[cfg(windows)]
     const LONG_RUNNING_COMMAND: &str =
-        "cmd /c %SystemRoot%\\System32\\PING.EXE -n 6 127.0.0.1 > nul";
+        "cmd /c \"%SystemRoot%\\System32\\PING.EXE\" -n 6 127.0.0.1 > nul";
 
     #[test]
     fn bash_memory_estimate_is_zero_when_empty_and_nonzero_for_completion_cache() {
