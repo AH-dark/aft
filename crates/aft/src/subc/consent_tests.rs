@@ -1035,7 +1035,7 @@ fn scope_probe_call(f: &Fixture, target: &Path) -> HeldCall {
         reply_deadline: Instant::now() + Duration::from_secs(5),
         identity: f.worker.clone(),
         tool: "read".into(),
-        arguments: json!({"filePath":target}),
+        arguments: json!({"path":target}),
         request_id: "scope-probe".into(),
         executor: Arc::clone(&f.executor),
         route: RouteChannel {
