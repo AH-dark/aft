@@ -55,8 +55,8 @@ const WORKER_RUST_ROOTS: [(&str, &str, &str); 3] = [
 ];
 
 /// The built-in read grants for Rust library sources that every live worker
-/// scope gets without asking. Workers read these roots from the daemon's own
-/// environment, never a caller's. A root is pinned to its real directory the
+/// scope gets without asking. The daemon instance finds these roots in the
+/// daemon's own environment, never a caller's. A root is pinned to its real directory the
 /// first time it resolves, so later symlink changes cannot widen a grant. A
 /// root that does not exist yet (no crate downloaded on a fresh machine) is
 /// retried on the next policy build instead of being skipped until AFT
