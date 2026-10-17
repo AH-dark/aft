@@ -1689,18 +1689,33 @@ fn callgraph_ops_report_a_keyless_view_generation_as_disabled() {
         );
         thread::sleep(Duration::from_millis(250));
     }
-    let zoom = aft.send(
-        &json!({
-            "id": "zoom-ready",
-            "command": "zoom",
-            "file": root.join("src/lib.rs"),
-            "symbol": "target",
-            "callgraph": true,
-        })
-        .to_string(),
-    );
-    assert_eq!(zoom["success"], true, "{zoom:#}");
-    assert_ne!(zoom["callgraph"]["status"], "unavailable", "{zoom:#}");
+    // Zoom reads the store the same way `callers` does and can meet the same
+    // post-publication checkpoint, which it reports as a retryable
+    // `callgraph_building`. Retry only on that answer; any other verdict, and
+    // above all `callgraph_unavailable`, for the published graph fails.
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let zoom = aft.send(
+            &json!({
+                "id": "zoom-ready",
+                "command": "zoom",
+                "file": root.join("src/lib.rs"),
+                "symbol": "target",
+                "callgraph": true,
+            })
+            .to_string(),
+        );
+        assert_eq!(zoom["success"], true, "{zoom:#}");
+        if zoom["callgraph"].is_null() {
+            break;
+        }
+        assert_eq!(zoom["callgraph"]["code"], "callgraph_building", "{zoom:#}");
+        assert!(
+            Instant::now() < deadline,
+            "zoom never read the published call graph: {zoom:#}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(aft.shutdown().success());
 }
 
