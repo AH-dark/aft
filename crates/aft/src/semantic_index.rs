@@ -11054,8 +11054,9 @@ mod tests {
             1,
         )
         .unwrap();
-        // The index searches serve from; the refresh result is applied to it
-        // the way the completion drain applies it.
+        // `worker` is the refresh worker's copy; `serving` stands for the index
+        // searches read, which receives the refresh result through
+        // `apply_refresh_update` exactly as the completion drain hands it over.
         let mut serving = worker.clone();
         // Both files change, so the refresh embeds every chunk again.
         fs::write(&kept, source("kept_edit")).unwrap();
@@ -11082,16 +11083,18 @@ mod tests {
                             let batch_deleted = texts.iter().any(|text| text.contains("gone_edit"));
                             if paused_at.is_none() && finished_deleted && batch_deleted {
                                 paused_at = Some(inputs.len());
-                                return Err(crate::synapse_embed::SynapseEmbeddingError::LanePaused(
-                                    crate::synapse_embed::LanePause {
-                                        lane_id: MODEL.into(),
-                                        fingerprint: Some("pinned".into()),
-                                        retry_after_ms: Some(PAUSE_MS),
-                                        paused_until_ms: START + PAUSE_MS,
-                                        reason: "maintenance".into(),
-                                    },
-                                )
-                                .to_string());
+                                return Err(
+                                    crate::synapse_embed::SynapseEmbeddingError::LanePaused(
+                                        crate::synapse_embed::LanePause {
+                                            lane_id: MODEL.into(),
+                                            fingerprint: Some("pinned".into()),
+                                            retry_after_ms: Some(PAUSE_MS),
+                                            paused_until_ms: START + PAUSE_MS,
+                                            reason: "maintenance".into(),
+                                        },
+                                    )
+                                    .to_string(),
+                                );
                             }
                             inputs.extend(texts.clone());
                             Ok(vec![vec![1.0, 0.0]; texts.len()])

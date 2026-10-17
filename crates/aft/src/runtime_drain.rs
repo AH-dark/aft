@@ -7088,8 +7088,9 @@ mod tests {
                 &mut |_, _| {},
             )
             .unwrap();
-        // A completion carrying rows for a file it has no freshness record for,
-        // as a refresh that resumed stale work after the file was deleted did.
+        // Simulate a completion carrying rows for a file without a freshness
+        // record, as a refresh that resumed paused work after the file was
+        // deleted used to produce.
         update.updated_metadata.retain(|(path, _)| path != &orphan);
         assert!(update
             .added_entries

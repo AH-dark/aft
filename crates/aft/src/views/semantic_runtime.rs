@@ -605,8 +605,9 @@ impl CheckoutSemanticSlot {
     /// so the root's next artifact check starts a new worker instead of
     /// leaving search waiting on a lane nobody serves. True when it released.
     pub(crate) fn release(&self, epoch: u64) -> bool {
-        // Held throughout, so a `begin` racing this cannot have its new state
-        // or wake sender reset: it advances the epoch under the same lock.
+        // The `publish` lock is held throughout, so a racing `begin` cannot
+        // have its new state or wake sender reset: `begin` advances the epoch
+        // under the same lock.
         let _publishing = lock(&self.publish);
         if self
             .epoch

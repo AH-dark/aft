@@ -281,7 +281,8 @@ fn lane_paused_view_cursor_retains_completed_and_unattempted_chunks() {
     });
 }
 
-/// A refusal for an announced Synapse lane pause, as the client renders it.
+/// The error a Synapse client returns when the embedding lane refuses a
+/// request with `lane_paused`, as the client renders it.
 fn lane_pause_error() -> String {
     use crate::synapse_embed::{pause_test_support::*, LanePause, SynapseEmbeddingError};
     SynapseEmbeddingError::LanePaused(LanePause {
@@ -294,8 +295,9 @@ fn lane_pause_error() -> String {
     .to_string()
 }
 
-/// The route drops while the lane is paused, then comes back: the fill parks
-/// instead of stopping, and the rebind's wake finishes indexing.
+/// The root loses its subc route (unbind) while the Synapse embedding lane is
+/// paused, then the route comes back. The fill parks instead of stopping, and
+/// the wake a rebind sends lets it finish indexing.
 #[test]
 fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
     use crate::semantic_index::{with_lane_pause_wait_hook, PauseRetryScope};
@@ -364,8 +366,9 @@ fn lane_paused_fill_parks_on_disconnect_and_resumes_on_rebind() {
         .is_empty());
 }
 
-/// The same for a pause met while the lane is still starting: the fingerprint
-/// probe parks on the disconnect and runs again after the rebind.
+/// The root loses its subc route while the lane is still starting and its
+/// embedding-model fingerprint probe was refused with `lane_paused`: the probe
+/// parks, and runs again once a rebind wakes the lane.
 #[test]
 fn lane_paused_activation_parks_on_disconnect_and_resumes_on_rebind() {
     use crate::semantic_index::{with_lane_pause_wait_hook, PauseRetryScope};
@@ -437,7 +440,8 @@ fn released_lane_frees_only_its_own_epoch() {
     );
     assert!(slot.active() && slot.is_current(current));
     assert!(slot.release(current));
-    // Reads as never started, so the next artifact check starts a worker.
+    // `active()` now reports no lane, which is what lets the root's next
+    // artifact check start a new worker.
     assert!(!slot.active());
     assert!(!slot.is_current(current));
     assert!(

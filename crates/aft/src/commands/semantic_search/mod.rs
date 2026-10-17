@@ -8830,7 +8830,8 @@ mod tests {
             let ctx = test_context(project.path());
             ctx.set_canonical_cache_root(project.path().to_path_buf());
             // The cold build is waiting out the pause: no index is loaded, so
-            // the search never embeds its query and words the lane from health.
+            // the search never embeds its query and takes the lane state from
+            // the backend health snapshot.
             *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
                 stage: "embedding".to_string(),
                 files: None,
