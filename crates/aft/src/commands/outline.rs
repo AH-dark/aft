@@ -80,6 +80,11 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             Ok(path) => path,
             Err(resp) => return resp,
         };
+        // In a confined call, refuse a directory outside the confined root or
+        // denied by the read policy before any walk starts there.
+        if let Err(refusal) = crate::context::confinement::check_walk_root(&req.id, &dir_path) {
+            return refusal;
+        }
         if !crate::bounded_io::metadata(&dir_path).is_ok_and(|m| m.is_dir()) {
             return Response::error(
                 &req.id,
@@ -1311,6 +1316,11 @@ fn handle_outline_files_mode(
             Ok(path) => path,
             Err(response) => return response,
         };
+        // In a confined call, refuse a directory outside the confined root or
+        // denied by the read policy before any walk starts there.
+        if let Err(refusal) = crate::context::confinement::check_walk_root(&req.id, &dir_path) {
+            return refusal;
+        }
 
         if crate::bounded_io::metadata(&dir_path).is_err() {
             return Response::error(
@@ -2348,6 +2358,20 @@ fn discover_outline_files_with_options(
     directory: &Path,
     breadth_first: bool,
 ) -> OutlineFileDiscovery {
+    // The walkers below never filter their own starting directory, so a
+    // confined walk checks it here, before anything under it is opened. A
+    // refused directory is an empty, complete discovery.
+    if !crate::context::confinement::admits_walk_root(directory) {
+        return OutlineFileDiscovery {
+            entries_examined: 0,
+            files: Vec::new(),
+            directories: Vec::new(),
+            walk_truncated: false,
+            collection_truncated: false,
+            skipped_foreign_mounts: 0,
+            ignored_entries: 0,
+        };
+    }
     crate::bounded_io::run(directory, None, move |directory| {
         Ok(discover_outline_files_unbounded(&directory, breadth_first))
     })
@@ -2360,6 +2384,17 @@ fn discover_outline_files_with_options(
         skipped_foreign_mounts: 0,
         ignored_entries: 0,
     })
+}
+
+/// The files and directories one outline walk discovers below `directory`
+/// (`files_mode` picks the files-mode walk), so tests outside this module can
+/// see what a walk yields without the request's earlier path checks.
+#[cfg(all(test, unix))]
+pub(crate) fn discover_outline_paths_for_test(directory: &Path, files_mode: bool) -> Vec<String> {
+    let discovery = discover_outline_files_with_options(directory, files_mode);
+    let mut paths = discovery.files;
+    paths.extend(discovery.directories);
+    paths
 }
 
 fn discover_outline_files_unbounded(directory: &Path, breadth_first: bool) -> OutlineFileDiscovery {

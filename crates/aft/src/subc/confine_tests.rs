@@ -834,7 +834,7 @@ fn confined_glob_with_explicit_session_never_returns_task_output() {
     let paths = owned_task_output(&f);
     // Unconfined, a glob naming the owning session's output file is answered
     // from the task record instead of a directory walk.
-    let (files, source) = crate::commands::glob::glob_root_files_for_test(
+    let (files, source, _) = crate::commands::glob::glob_root_files_for_test(
         &f.ctx,
         &f.pin,
         &paths.stdout,
@@ -845,21 +845,25 @@ fn confined_glob_with_explicit_session_never_returns_task_output() {
     assert_eq!(source, "task-output");
     assert_eq!(files, vec![paths.stdout.clone()]);
 
-    // Confined, the same discovery takes the confined walk instead. (The path
-    // check that runs before discovery is what refuses an outside root; see
-    // the routed call below.)
-    let (_, source) = confinement::with_root(&f.ctx, "confine-glob-task-output", || {
-        Ok(crate::commands::glob::glob_root_files_for_test(
-            &f.ctx,
-            &f.pin,
-            &paths.stdout,
-            "**/*",
-            16,
-            Some("designer"),
-        ))
-    })
-    .unwrap();
+    // Confined, the same discovery neither answers from the task record nor
+    // starts a walk at the outside file: it finds nothing and visits nothing.
+    let opens = crate::bounded_io::tests::watch_opens(&paths.stdout);
+    let (files, source, visited) =
+        confinement::with_root(&f.ctx, "confine-glob-task-output", || {
+            Ok(crate::commands::glob::glob_root_files_for_test(
+                &f.ctx,
+                &f.pin,
+                &paths.stdout,
+                "**/*",
+                16,
+                Some("designer"),
+            ))
+        })
+        .unwrap();
     assert_eq!(source, "fallback");
+    assert!(files.is_empty(), "{files:?}");
+    assert_eq!(visited, 0);
+    assert_eq!(opens.opens.load(std::sync::atomic::Ordering::Relaxed), 0);
 
     // Routed as the owning session, naming the output file or its folder.
     let outputs = [&paths.stdout, &paths.stderr, &paths.exit, &paths.json];
@@ -880,6 +884,87 @@ fn confined_glob_with_explicit_session_never_returns_task_output() {
                 "{output:?} in {text}"
             );
         }
+    }
+}
+
+/// Every confined walk checks its own starting path, not only the entries
+/// under it, against the same gate: inside the confined root and admitted by
+/// the read policy. The request's earlier path check normally refuses such a
+/// path first; these calls skip it, so only the walks' own check stands.
+#[test]
+fn confined_walks_refuse_a_starting_path_outside_the_fence() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let f = denied_tree();
+    let sentinel = f.live.join("sentinel.rs");
+    let pattern = "outside_secret|pinned_token";
+    let glob = |start: &Path| {
+        crate::commands::glob::glob_root_files_for_test(&f.ctx, &f.pin, start, "**/*", 16, None)
+    };
+    let grep = |start: &Path| crate::grep_executor::grep_root_for_test(&f.ctx, start, pattern);
+    let outline = |start: &Path, files_mode: bool| {
+        crate::commands::outline::discover_outline_paths_for_test(start, files_mode)
+    };
+
+    // Unconfined, each walk does reach the outside tree.
+    let sentinel_text = sentinel.display().to_string();
+    assert_eq!(glob(&f.live).0, vec![sentinel.clone()]);
+    assert_eq!(glob(&sentinel).0, vec![sentinel.clone()]);
+    assert_eq!(grep(&f.live).total_matches, 1);
+    assert_eq!(grep(&sentinel).total_matches, 1);
+    for files_mode in [false, true] {
+        assert!(outline(&f.live, files_mode).contains(&sentinel_text));
+    }
+
+    let watches = [
+        crate::bounded_io::tests::watch_opens(&sentinel),
+        crate::bounded_io::tests::watch_opens(&f.pin.join("secret.rs")),
+        crate::bounded_io::tests::watch_opens(&f.pin.join("vault/inner.rs")),
+    ];
+    confinement::with_root(&f.ctx, "confine-walk-start", || {
+        // Outside the root; a link inside the root to outside; and in-root
+        // paths the read policy denies (a file and a directory).
+        let directories = [f.live.clone(), f.pin.join("escape"), f.pin.join("vault")];
+        let files = [
+            sentinel.clone(),
+            f.pin.join("escape-file"),
+            f.pin.join("secret.rs"),
+        ];
+        for start in directories.iter().chain(&files) {
+            let refusal = confinement::check_walk_root("confine-walk-start", start).unwrap_err();
+            assert_eq!(refusal.data["code"], "path_outside_confined_root");
+            let (found, _, visited) = glob(start);
+            assert!(
+                found.is_empty() && visited == 0,
+                "glob {start:?}: {found:?}"
+            );
+            let result = grep(start);
+            assert_eq!(
+                (result.total_matches, result.files_searched),
+                (0, 0),
+                "grep {start:?}"
+            );
+        }
+        for start in &directories {
+            for files_mode in [false, true] {
+                let found = outline(start, files_mode);
+                assert!(found.is_empty(), "outline {start:?}: {found:?}");
+            }
+        }
+        // No walk listed anything under a refused start: a walk that did
+        // would have met entries the read policy denies and counted them.
+        assert_eq!(confinement::denied_count(), 0);
+        // The pinned root itself still starts every walk.
+        assert!(confinement::check_walk_root("confine-walk-start", &f.pin).is_ok());
+        assert!(!glob(&f.pin).0.is_empty());
+        assert!(grep(&f.pin).total_matches > 0);
+        for files_mode in [false, true] {
+            assert!(!outline(&f.pin, files_mode).is_empty());
+        }
+        Ok(())
+    })
+    .unwrap();
+    for watch in &watches {
+        assert_eq!(watch.opens.load(Relaxed), 0);
     }
 }
 

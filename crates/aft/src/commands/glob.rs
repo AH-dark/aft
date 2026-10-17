@@ -79,6 +79,13 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         },
         None => vec![resolve_search_scope(&project_root, None).root],
     };
+    // In a confined call, refuse a search root outside the confined root or
+    // denied by the read policy before any walk starts there.
+    for root in &search_roots {
+        if let Err(refusal) = crate::context::confinement::check_walk_root(&req.id, root) {
+            return refusal;
+        }
+    }
 
     // Return clear error if the search path doesn't exist
     if let Some(missing_root) = search_roots
@@ -472,9 +479,9 @@ fn glob_root(
     }
 }
 
-/// Runs one `glob_root` discovery and returns the files it found and the
-/// source that answered, so tests outside this module can check which branch
-/// a call took.
+/// Runs one `glob_root` discovery and returns the files it found, the source
+/// that answered, and how many walk entries it visited, so tests outside this
+/// module can check which branch a call took and whether it walked at all.
 #[cfg(all(test, unix))]
 pub(crate) fn glob_root_files_for_test(
     ctx: &AppContext,
@@ -483,7 +490,7 @@ pub(crate) fn glob_root_files_for_test(
     pattern: &str,
     max_results: usize,
     explicit_session: Option<&str>,
-) -> (Vec<PathBuf>, &'static str) {
+) -> (Vec<PathBuf>, &'static str, usize) {
     let discovery = glob_root(
         ctx,
         project_root,
@@ -493,7 +500,7 @@ pub(crate) fn glob_root_files_for_test(
         false,
         explicit_session,
     );
-    (discovery.files, discovery.source)
+    (discovery.files, discovery.source, discovery.entries_visited)
 }
 
 fn merge_glob_files(files: Vec<PathBuf>) -> Vec<PathBuf> {

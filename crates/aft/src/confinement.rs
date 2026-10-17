@@ -191,6 +191,31 @@ pub(crate) fn disclose_denied(body: &mut Value) {
     body["text"] = Value::String(text);
 }
 
+/// Whether a walk on this thread may start at `root`. A confined walk checks
+/// its starting path against the same gate as every entry under it: inside
+/// the confined root and admitted by the read policy. The request's earlier
+/// path check normally refuses such a root first; this keeps the walk itself
+/// from starting outside the fence when a caller skipped that check.
+/// Unconfined walks always may start. A refused root is not counted among the
+/// call's skipped entries, because the call is refused rather than trimmed.
+pub(crate) fn admits_walk_root(root: &Path) -> bool {
+    FENCE.with(|fence| {
+        let fence = fence.borrow();
+        // A confined thread without its read policy fails closed.
+        !fence.active() || fence.gate.as_ref().is_some_and(|gate| gate.admits(root))
+    })
+}
+
+/// [`admits_walk_root`] as a request result: a refused root gets the same
+/// refusal the confined path check gives.
+pub(crate) fn check_walk_root(id: &str, root: &Path) -> Result<(), Response> {
+    if admits_walk_root(root) {
+        Ok(())
+    } else {
+        Err(refusal(id, root))
+    }
+}
+
 pub(crate) fn refusal(id: &str, input: &Path) -> Response {
     Response::error(
         id,
