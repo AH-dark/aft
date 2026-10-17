@@ -13,13 +13,96 @@ pub(super) fn take_reattach_budget(root: &Path) -> Option<Duration> {
 
 fn shorten_reattach_budget(root: &Path) {
     // Scope the hook to one worker, so parallel remote tests keep the real budget.
-    // Empty attaches are 100 ms apart, so 1.5 s leaves room for several even on
-    // a loaded runner. Tests bound the whole recovery at 30 s, which only
-    // catches a budget that never expires.
+    // Tests advance this logical budget after observing the relevant recovery
+    // attempts; scheduler latency must not decide how many attempts fit.
     reattach_budgets()
         .lock()
         .unwrap()
         .insert(root.into(), Duration::from_millis(1_500));
+}
+
+pub(super) struct ReattachClock {
+    pub(super) ticks: tokio::sync::watch::Sender<Duration>,
+    pub(super) resets: tokio::sync::watch::Sender<u64>,
+    pub(super) waits: tokio::sync::watch::Sender<u64>,
+}
+
+impl ReattachClock {
+    pub(super) fn now(&self) -> Duration {
+        *self.ticks.borrow()
+    }
+}
+
+fn reattach_clocks() -> &'static Mutex<HashMap<PathBuf, Arc<ReattachClock>>> {
+    static CLOCKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<ReattachClock>>>> =
+        std::sync::OnceLock::new();
+    CLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn reattach_clock(root: &Path) -> Option<Arc<ReattachClock>> {
+    reattach_clocks().lock().unwrap().get(root).cloned()
+}
+
+// Remote workers run on separate runtimes. Advance their recovery budget only
+// after a consumed record has reset it, without charging scheduler latency.
+struct PausedReattachClock {
+    root: PathBuf,
+    clock: Arc<ReattachClock>,
+}
+
+impl PausedReattachClock {
+    fn new(root: &Path) -> Self {
+        let (ticks, _) = tokio::sync::watch::channel(Duration::ZERO);
+        let (resets, _) = tokio::sync::watch::channel(0);
+        let (waits, _) = tokio::sync::watch::channel(0);
+        let clock = Arc::new(ReattachClock {
+            ticks,
+            resets,
+            waits,
+        });
+        assert!(reattach_clocks()
+            .lock()
+            .unwrap()
+            .insert(root.into(), clock.clone())
+            .is_none());
+        Self {
+            root: root.into(),
+            clock,
+        }
+    }
+
+    async fn after_resets(&self, count: u64) {
+        let mut resets = self.clock.resets.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            resets.wait_for(|resets| *resets >= count),
+        )
+        .await
+        .expect("consumed records must reset the recovery budget")
+        .unwrap();
+    }
+
+    async fn after_waits(&self, count: u64) {
+        let mut waits = self.clock.waits.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            waits.wait_for(|waits| *waits >= count),
+        )
+        .await
+        .expect("recovery must enter its budgeted wait")
+        .unwrap();
+    }
+
+    fn advance(&self, duration: Duration) {
+        self.clock.ticks.send_modify(|now| *now += duration);
+    }
+}
+
+impl Drop for PausedReattachClock {
+    fn drop(&mut self) {
+        reattach_clocks().lock().unwrap().remove(&self.root);
+        self.clock.ticks.send_replace(Duration::MAX);
+    }
 }
 
 fn crash_tasks() -> &'static Mutex<HashSet<String>> {
@@ -103,28 +186,39 @@ fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
 }
 
 async fn terminal(registry: &BgTaskRegistry, task: &str) -> BgTaskSnapshot {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    wait_for("fake executor must terminate", || {
+        let snapshot = registry.observed_status(task, "session", 8192).unwrap();
+        snapshot.info.status.is_terminal().then_some(snapshot)
+    })
+    .await
+}
+
+// Poll observable task state rather than inferring progress from elapsed time.
+// The timeout is a hang guard; only a successful probe releases the caller.
+async fn wait_for<T>(reason: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let snapshot = registry.observed_status(task, "session", 8192).unwrap();
-            if snapshot.info.status.is_terminal() {
-                return snapshot;
+            if let Some(value) = probe() {
+                return value;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("fake executor must terminate")
+    .unwrap_or_else(|_| panic!("{reason}"))
+}
+
+struct ReleaseOnDrop(PathBuf);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"release");
+    }
 }
 
 #[tokio::test]
 async fn every_local_spawn_entrypoint_executes_command_once() {
     use crate::bash_background::{BashShell, HardKill, TaskSlot};
-    struct ReleaseOnDrop(PathBuf);
-    impl Drop for ReleaseOnDrop {
-        fn drop(&mut self) {
-            let _ = fs::write(&self.0, b"release");
-        }
-    }
     for entry in [
         "foreground",
         "background",
@@ -138,12 +232,9 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
         let counter = dir.path().join("executions");
         let release = dir.path().join("release");
         let _release_on_failure = ReleaseOnDrop(release.clone());
+        let command = format!("printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf entrypoint-proof", counter.display(), release.display());
         if entry == "deferred-wait" {
-            crate::subc::test_support::assert_deferred_wait_entrypoint(&format!(
-                "printf x >> '{}'; /bin/sleep 2",
-                counter.display()
-            ))
-            .await;
+            crate::subc::test_support::assert_deferred_wait_entrypoint(&command, &release).await;
             assert_eq!(
                 fs::read(&counter).unwrap(),
                 b"x",
@@ -154,7 +245,6 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
             );
             continue;
         }
-        let command = format!("printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf entrypoint-proof", counter.display(), release.display());
         let mut registry = registry();
         let mut fake = None;
         let task_id = match entry {
@@ -241,13 +331,10 @@ async fn every_local_spawn_entrypoint_executes_command_once() {
             }
             _ => unreachable!(),
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while fs::read(&counter).map_or(true, |bytes| bytes != b"x") {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        wait_for("command must cross its startup boundary", || {
+            fs::read(&counter).ok().filter(|bytes| bytes == b"x")
         })
-        .await
-        .unwrap_or_else(|_| panic!("{entry}: command never crossed its startup boundary"));
+        .await;
         if entry == "replay-running" {
             registry.inner.shutdown.store(true, Ordering::SeqCst);
             let replacement = super::tests::registry();
@@ -342,14 +429,15 @@ async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
     let local_kill = tokio::task::spawn_blocking(move || killing.kill(&local, "session").unwrap());
     tokio::task::spawn_blocking(move || {
         kill_reached
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(Duration::from_secs(30))
             .expect("local kill reached signal checkpoint");
     })
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if registry
+    wait_for(
+        "fake executor must accept the foreground command while local kill is held",
+        || {
+            registry
                 .task(&foreground)
                 .unwrap()
                 .state
@@ -360,15 +448,10 @@ async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
                 .as_ref()
                 .unwrap()
                 .job_id
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("fake executor must accept the foreground command while local kill is held");
+                .map(|_| ())
+        },
+    )
+    .await;
     release_kill.send(()).unwrap();
     local_kill.await.unwrap();
     registry
@@ -813,8 +896,11 @@ async fn exec_remote_bash_empty_attach_budget_reports_job_without_rerun() {
     let daemon = daemon(Script::MissingTerminal, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     shorten_reattach_budget(dir.path());
+    let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.wait_for_requests("exec.attach", 2).await;
+    clock.advance(Duration::from_millis(1_500));
     let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("empty attaches must exhaust the recovery budget");
@@ -849,43 +935,38 @@ async fn exec_remote_bash_empty_attach_budget_reports_job_without_rerun() {
 
 #[tokio::test]
 async fn exec_remote_bash_gapped_attach_records_reset_budget_and_complete() {
-    let daemon = daemon(
-        Script::GappedAttach(Duration::from_millis(500)),
-        "exec-remote/v1",
-    )
-    .await;
+    let daemon = daemon(Script::GappedAttach, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     shorten_reattach_budget(dir.path());
+    let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
     let task = registry.task(&task_id).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while task
-            .state
-            .lock()
-            .unwrap()
-            .metadata
-            .remote
-            .as_ref()
-            .unwrap()
-            .last_seq
-            .is_none()
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    tokio::time::sleep(Duration::from_millis(350)).await;
-    assert_eq!(
-        registry
-            .observed_status(&task_id, "session", 8192)
-            .unwrap()
-            .info
-            .status,
-        BgTaskStatus::Running,
-        "an open attach is not subject to an output-idle deadline"
-    );
+    for seq in 0..3 {
+        daemon
+            .wait_for_requests("exec.attach", seq as usize + 1)
+            .await;
+        wait_for(
+            "attach output must be consumed before releasing its end",
+            // Output is visible before the coalesced replay cursor becomes durable.
+            || (fs::metadata(&task.paths.stdout).unwrap().len() == seq + 1).then_some(()),
+        )
+        .await;
+        // Accepted and the initial stream end each reset once, then each
+        // attach contributes an output record and (except the last) an end.
+        clock.after_resets(3 + seq * 2).await;
+        clock.advance(Duration::from_millis(1_501));
+        assert_eq!(
+            registry
+                .observed_status(&task_id, "session", 8192)
+                .unwrap()
+                .info
+                .status,
+            BgTaskStatus::Running,
+            "an open attach is not subject to an output-idle deadline"
+        );
+        daemon.completion_gate.notify_one();
+    }
     let done = terminal(&registry, &task_id).await;
     assert_eq!(done.info.status, BgTaskStatus::Completed);
     assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"ABC");
@@ -970,34 +1051,32 @@ async fn exec_remote_bash_transient_terminal_gap_recovers_without_loss() {
 
 #[tokio::test]
 async fn exec_remote_bash_reattach_budget_cancel_observes_real_terminal() {
-    let daemon = daemon(
-        Script::GappedCancel(Duration::from_millis(500)),
-        "exec-remote/v1",
-    )
-    .await;
+    let daemon = daemon(Script::GappedCancel, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     shorten_reattach_budget(dir.path());
+    let _clock = PausedReattachClock::new(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
     let task = registry.task(&task_id).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while task
-            .state
-            .lock()
-            .unwrap()
-            .metadata
-            .remote
-            .as_ref()
-            .unwrap()
-            .job_id
-            .is_none()
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for(
+        "acceptance must be consumed before recording cancellation",
+        || {
+            task.state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .job_id
+                .map(|_| ())
+        },
+    )
+    .await;
     assert!(registry.record_remote_cancel(&task).unwrap());
+    daemon.wait_for_requests("exec.cancel", 1).await;
+    daemon.wait_for_requests("exec.attach", 1).await;
+    daemon.completion_gate.notify_one();
     let done = terminal(&registry, &task_id).await;
     assert_eq!(done.info.status, BgTaskStatus::Killed);
     let state = task.state.lock().unwrap();
@@ -1038,8 +1117,11 @@ async fn exec_remote_bash_attach_call_and_reconnect_failures_exhaust_budget() {
     let daemon = daemon(Script::AttachDisconnected, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     shorten_reattach_budget(dir.path());
+    let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    daemon.wait_for_requests("exec.attach", 1).await;
+    clock.advance(Duration::from_millis(1_500));
     let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("failed attach calls and reconnects must exhaust the recovery budget");
@@ -1073,7 +1155,10 @@ async fn exec_remote_bash_restart_connect_failures_exhaust_reattach_budget() {
         "printf local-proof",
     );
     shorten_reattach_budget(dir.path());
+    let clock = PausedReattachClock::new(dir.path());
     registry.resume_remote_task(&task_id).unwrap();
+    clock.after_waits(1).await;
+    clock.advance(Duration::from_millis(1_500));
     let done = tokio::time::timeout(Duration::from_secs(30), terminal(&registry, &task_id))
         .await
         .expect("restarting an accepted job cannot retry connect forever");
@@ -1311,9 +1396,10 @@ async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
     let task = start(&registry, dir.path(), daemon.connection.clone());
-    let accepted = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if registry
+    wait_for(
+        "acceptance must be consumed before killing the task",
+        || {
+            registry
                 .task(&task)
                 .unwrap()
                 .state
@@ -1324,15 +1410,10 @@ async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
                 .as_ref()
                 .unwrap()
                 .job_id
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+                .map(|_| ())
+        },
+    )
     .await;
-    accepted.unwrap();
     let killing = registry.clone();
     let kill_task = task.clone();
     let done = tokio::task::spawn_blocking(move || killing.kill(&kill_task, "session").unwrap())
@@ -1355,34 +1436,14 @@ async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
     let task = registry.task(&task_id).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            // Cancel during active output, without waiting for a durable checkpoint.
-            if fs::metadata(&task.paths.stdout).unwrap().len() >= 11 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    // Cancel during active output without waiting for a coalesced durable checkpoint.
+    wait_for(
+        "continuous output must be consumed before cancelling",
+        || (fs::metadata(&task.paths.stdout).unwrap().len() >= 11).then_some(()),
+    )
+    .await;
     assert!(registry.record_remote_cancel(&task).unwrap());
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if daemon
-                .log
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, body)| body["method"] == "exec.cancel")
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("steady output must not defer exec.cancel until a quiet period");
+    daemon.wait_for_requests("exec.cancel", 1).await;
     assert_eq!(
         terminal(&registry, &task_id).await.info.status,
         BgTaskStatus::Killed
@@ -1429,7 +1490,8 @@ async fn exec_remote_launch_is_fenced_by_a_refused_startup_receipt() {
         ids.is_empty(),
         "refused remote launch left records: {ids:?}"
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The refused receipt returned before registering a worker, so there is
+    // no asynchronous launch left to wait for.
     assert!(!dir.path().join("remote-fence-probe").exists());
     assert!(
         daemon.log.lock().unwrap().is_empty(),
@@ -1818,6 +1880,7 @@ async fn exec_remote_bash_terminal_gap_keeps_outcome_when_attach_is_unavailable(
     let daemon = daemon(Script::AttachDisconnected, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     shorten_reattach_budget(dir.path());
+    let clock = PausedReattachClock::new(dir.path());
     let (original, task_id, paths) = persist_accepted_with_snapshot(
         dir.path(),
         daemon.connection.clone(),
@@ -1866,6 +1929,8 @@ async fn exec_remote_bash_terminal_gap_keeps_outcome_when_attach_is_unavailable(
     drop(original);
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
+    daemon.wait_for_requests("exec.attach", 1).await;
+    clock.advance(Duration::from_millis(1_500));
     let done = terminal(&restarted, &task_id).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed);
     assert_eq!(done.exit_code, Some(7));
@@ -2871,13 +2936,10 @@ async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
         assert!(!done.output_preview.contains("did not run"), "{done:?}");
         // `>>` creates the file before printf writes to it, so existence alone
         // can be observed while the file is still empty; wait for the byte.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while fs::read(&counter).map_or(true, |bytes| bytes.is_empty()) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        wait_for("fallback must write its execution marker", || {
+            fs::read(&counter).ok().filter(|bytes| !bytes.is_empty())
         })
-        .await
-        .unwrap();
+        .await;
         assert_eq!(fs::read(&counter).unwrap(), b"x");
         let replay = super::tests::registry();
         replay.replay_session(dir.path(), "session").unwrap();
@@ -2926,7 +2988,13 @@ async fn exec_remote_bash_double_restart_starts_local_fallback_once() {
     let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let counter = dir.path().join("local-runs");
-    let command = format!("printf x >> '{}'; /bin/sleep 2", counter.display());
+    let release = dir.path().join("release");
+    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let command = format!(
+        "printf x >> '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done",
+        counter.display(),
+        release.display()
+    );
     let (original, task_id, paths) =
         persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
     let stale = crate::bash_background::persistence::read_task(&paths.json).unwrap();
@@ -2943,19 +3011,17 @@ async fn exec_remote_bash_double_restart_starts_local_fallback_once() {
     let first = registry();
     first.replay_session(dir.path(), "session").unwrap();
     // Wait for the byte, not the file: `>>` creates it before printf writes.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while fs::read(&counter).map_or(true, |bytes| bytes.is_empty()) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    wait_for("fallback must write its execution marker", || {
+        fs::read(&counter).ok().filter(|bytes| !bytes.is_empty())
     })
-    .await
-    .unwrap();
+    .await;
     first.inner.shutdown.store(true, Ordering::SeqCst);
     drop(first);
     let second = registry();
     second.set_harness(crate::harness::Harness::Runner);
     second.set_db_pool(db.clone());
     second.replay_session(dir.path(), "session").unwrap();
+    fs::write(&release, b"release").unwrap();
     let _ = terminal(&second, &task_id).await;
     assert_eq!(
         fs::read(&counter).unwrap(),
@@ -3050,11 +3116,14 @@ fn exec_remote_bash_only_not_sent_errors_prove_local_fallback_safe() {
 async fn exec_remote_bash_refusal_queue_wait_is_not_local_run_time() {
     let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
-    let (original, task_id, paths) = persist_accepted_with_snapshot(
-        dir.path(),
-        daemon.connection.clone(),
-        "/bin/sleep 0.8; printf budget-proof",
+    let release = dir.path().join("release");
+    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let command = format!(
+        "while [ ! -f '{}' ]; do /bin/sleep 0.01; done; printf budget-proof",
+        release.display()
     );
+    let (original, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
     let layout = resolve_task_layout(&paths.session_dir, &task_id).unwrap();
     let mut metadata = read_task_at(&layout).unwrap();
     metadata.started_at = unix_millis().saturating_sub(60000);
@@ -3062,24 +3131,22 @@ async fn exec_remote_bash_refusal_queue_wait_is_not_local_run_time() {
     write_task_at(&layout, &metadata).unwrap();
     drop(original);
     let restarted = registry();
+    let replay_started_at = unix_millis();
     restarted.replay_session(dir.path(), "session").unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let task = restarted.task(&task_id).unwrap();
-            let state = task.state.lock().unwrap();
-            if state.metadata.local_fallback_started {
-                assert!(
-                    task.elapsed_for_metadata(&state.metadata) < Duration::from_secs(15),
-                    "the minute in the remote queue cannot consume the local run budget"
-                );
-                break;
-            }
-            drop(state);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    let local_started_at = wait_for("fallback must publish its local start", || {
+        let task = restarted.task(&task_id).unwrap();
+        let state = task.state.lock().unwrap();
+        state
+            .metadata
+            .local_fallback_started
+            .then_some(state.metadata.started_at)
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        local_started_at >= replay_started_at,
+        "the minute in the remote queue cannot consume the local run budget"
+    );
+    fs::write(&release, b"release").unwrap();
     assert_eq!(
         terminal(&restarted, &task_id).await.info.status,
         BgTaskStatus::Completed
@@ -3579,17 +3646,11 @@ async fn exec_remote_started_sets_running_phase_without_aft_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
     let task_id = start(&registry, dir.path(), daemon.connection.clone());
-    let running = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
-            if snapshot.phase == Some("running") {
-                break snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    let running = wait_for("Started must publish the running phase", || {
+        let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+        (snapshot.phase == Some("running")).then_some(snapshot)
     })
-    .await
-    .expect("Started must publish the running phase");
+    .await;
     assert_eq!(running.info.status, BgTaskStatus::Running);
     assert_eq!(serde_json::to_value(&running).unwrap()["phase"], "running");
     assert!(running.hard_kill.is_none());
@@ -3917,8 +3978,10 @@ async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
         let message = response.data["message"].as_str().unwrap_or_default();
         assert!(message.contains(expected), "{expected}: {response:?}");
     }
-    // Nothing ran anywhere: not on the server, and not quietly on this host.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Each synchronous refusal must return without registering a worker that
+    // could dispatch later, either remotely or on this host.
+    assert!(ctx.bash_background().list(0).is_empty());
+    assert!(project_off_ctx.bash_background().list(0).is_empty());
     assert!(exec_runs(&daemon).is_empty());
     assert!(!marker.exists());
 }
@@ -4219,7 +4282,14 @@ async fn orchestrated_reply(
     daemon: &crate::exec_remote::wire_tests::Daemon,
     params: serde_json::Value,
 ) -> (crate::protocol::Response, Duration) {
-    orchestrated_reply_with_probe(ctx, daemon, params, |_| true).await
+    // These callers check terminal payloads, not the foreground wait cap.
+    // Observe completion before starting that independent call budget.
+    orchestrated_reply_with_probe(ctx, daemon, params, |task_id| {
+        ctx.bash_background()
+            .observed_status(task_id, "session", 8192)
+            .is_some_and(|snapshot| snapshot.info.status.is_terminal())
+    })
+    .await
 }
 
 /// Wait for a remote-state probe before starting the foreground wait budget.
@@ -4245,13 +4315,11 @@ async fn orchestrated_reply_with_probe(
         });
     assert!(spawned.success, "{spawned:?}");
     let task_id = spawned.data["task_id"].as_str().unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !ready(task_id) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the remote task must satisfy the probe before starting its foreground wait");
+    wait_for(
+        "remote task must satisfy the probe before its foreground wait",
+        || ready(task_id).then_some(()),
+    )
+    .await;
     let received = std::time::Instant::now();
     match crate::commands::bash_orchestrate::build_bash_outcome(&request, ctx, spawned) {
         crate::response_finalize::DispatchOutcome::Immediate(response) => {
@@ -4297,19 +4365,11 @@ fn plugin_transport_deadline(timeout_ms: u64) -> Duration {
 async fn blocking_runon_queued_past_its_timeout_answers_with_task_job_and_queue_position() {
     // The runner accepts the job at queue position 11 and holds it queued well
     // past the call's `timeout` before running it.
-    let daemon = daemon(
-        Script::Staged {
-            position: 11,
-            queue: Duration::from_secs(4),
-            run: Duration::ZERO,
-        },
-        "exec-remote/v1",
-    )
-    .await;
+    let daemon = daemon(Script::GatedStages { position: 11 }, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
     let timeout_ms = 1_500;
-    let (reply, waited) = orchestrated_reply(
+    let (reply, waited) = orchestrated_reply_with_probe(
         &ctx,
         &daemon,
         serde_json::json!({
@@ -4320,6 +4380,11 @@ async fn blocking_runon_queued_past_its_timeout_answers_with_task_job_and_queue_
             "foreground_orchestrate": true,
             "compressed": false,
         }),
+        |task_id| {
+            ctx.bash_background()
+                .remote_progress(task_id, "session")
+                .is_some_and(|progress| progress.phase == RemotePhase::Queued { position: 11 })
+        },
     )
     .await;
     assert!(reply.success, "{reply:?}");
@@ -4352,6 +4417,14 @@ async fn blocking_runon_queued_past_its_timeout_answers_with_task_job_and_queue_
     );
     // The job runs once it leaves the queue: AFT did not count its timeout
     // from submission, and nothing cancelled it.
+    daemon.output_gate.notify_one();
+    wait_for("queued job must consume output before completing", || {
+        ctx.bash_background()
+            .remote_progress(&task_id, "session")
+            .filter(|progress| progress.phase == RemotePhase::Running)
+    })
+    .await;
+    daemon.completion_gate.notify_one();
     let done = terminal(ctx.bash_background(), &task_id).await;
     assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
     assert!(
@@ -4440,19 +4513,11 @@ async fn blocking_runon_killed_at_its_runner_deadline_reports_exit_124() {
 
 #[tokio::test]
 async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
-    let daemon = daemon(
-        Script::Staged {
-            position: 3,
-            queue: Duration::from_secs(6),
-            run: Duration::ZERO,
-        },
-        "exec-remote/v1",
-    )
-    .await;
+    let daemon = daemon(Script::GatedStages { position: 3 }, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
     ctx.update_config(|config| config.foreground_wait_window_ms = 2_500);
-    let (reply, waited) = orchestrated_reply(
+    let (reply, waited) = orchestrated_reply_with_probe(
         &ctx,
         &daemon,
         serde_json::json!({
@@ -4462,6 +4527,11 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
             "foreground_orchestrate": true,
             "compressed": false,
         }),
+        |task_id| {
+            ctx.bash_background()
+                .remote_progress(task_id, "session")
+                .is_some_and(|progress| progress.phase == RemotePhase::Queued { position: 3 })
+        },
     )
     .await;
     assert!(reply.success, "{reply:?}");
@@ -4478,6 +4548,13 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
         "{reply:?}"
     );
     assert_eq!(runner_cancels(&daemon), 0);
+    daemon.output_gate.notify_one();
+    daemon.completion_gate.notify_one();
+    let task_id = reply.data["task_id"].as_str().unwrap();
+    assert_eq!(
+        terminal(ctx.bash_background(), task_id).await.info.status,
+        BgTaskStatus::Completed
+    );
 }
 
 #[test]
@@ -4679,13 +4756,7 @@ async fn bash_status_watch_and_task_line_distinguish_input_capture_from_queueing
             Some(dir.path().into()),
         )
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while exec_runs(&daemon).is_empty() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    daemon.wait_for_requests("exec.run", 1).await;
     let status = rendered_status(&ctx, &task_id);
     let watch = rendered_watch(ctx.clone(), &task_id).await;
     assert!(
@@ -4712,17 +4783,13 @@ async fn bash_status_watch_and_task_line_distinguish_input_capture_from_queueing
         format!("[task {task_id}]")
     );
     daemon.acceptance_gate.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while ctx
-            .bash_background()
+    wait_for("acceptance must end the input-capture phase", || {
+        (ctx.bash_background()
             .runon_launch_pending(&task_id, "session")
-            != Some(false)
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            == Some(false))
+        .then_some(())
     })
-    .await
-    .unwrap();
+    .await;
     let status = rendered_status(&ctx, &task_id);
     let watch = rendered_watch(ctx.clone(), &task_id).await;
     assert!(status.contains("queued on the runner"), "{status}");
@@ -4832,6 +4899,7 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
     ensure_git_fixture(dir.path());
     let registry = registry();
     let mut policy = launch(daemon.connection.clone());
@@ -4853,7 +4921,9 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
             Some(dir.path().into()),
         )
         .unwrap();
-    let waiting = draining_phase(&registry, &task_id).await;
+    let first = clock.now();
+    clock.expect_sleep(first, first + 150).await;
+    let waiting = registry.observed_status(&task_id, "session", 8192).unwrap();
     assert_eq!(waiting.info.status, BgTaskStatus::Starting, "{waiting:?}");
     assert_eq!(
         registry.runon_launch_pending(&task_id, "session"),
@@ -4865,6 +4935,10 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
             .contains("draining for maintenance; retrying (attempt 2"),
         "{waiting:?}"
     );
+    clock.advance(150);
+    clock.expect_sleep(first + 150, first + 300).await;
+    assert_eq!(exec_runs(&daemon).len(), 2);
+    clock.advance(150);
     let done = terminal(&registry, &task_id).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     assert!(!done.output_preview.contains("local-proof"));
@@ -4963,7 +5037,7 @@ impl PausedDrainingClock {
     async fn expect_event(&mut self, expected: DrainingClockEvent) {
         // This is only a deadlock watchdog; the event's deadline, not elapsed
         // wall time, proves which budget or retry delay the worker selected.
-        let event = tokio::time::timeout(Duration::from_secs(10), self.events.recv())
+        let event = tokio::time::timeout(Duration::from_secs(30), self.events.recv())
             .await
             .expect("draining worker must acknowledge its wait or stop")
             .expect("draining clock event channel closed");
@@ -5023,24 +5097,6 @@ fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf)
             Some(dir.into()),
         )
         .unwrap()
-}
-
-async fn draining_phase(registry: &BgTaskRegistry, task: &str) -> BgTaskSnapshot {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let snapshot = registry.observed_status(task, "session", 8192).unwrap();
-            if snapshot
-                .output_preview
-                .contains("draining for maintenance; retrying")
-            {
-                return snapshot;
-            }
-            assert!(!snapshot.info.status.is_terminal(), "{snapshot:?}");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("retry phase must be observable")
 }
 
 #[tokio::test]
@@ -5180,7 +5236,6 @@ async fn runon_draining_restart_preserves_remaining_budget_and_request() {
         .insert(dir.path().into());
     let original = registry();
     let task_id = start_runon_retry(&original, dir.path(), daemon.connection.clone());
-    draining_phase(&original, &task_id).await;
     clock.expect_event(DrainingClockEvent::Stopped).await;
     let task = original.task(&task_id).unwrap();
     let saved = read_task(&task.paths.json).unwrap();
@@ -5238,15 +5293,19 @@ async fn runon_draining_restart_resubmits_and_accepts() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
     stopped_draining_roots()
         .lock()
         .unwrap()
         .insert(dir.path().into());
     let original = registry();
     let task = start_runon_retry(&original, dir.path(), daemon.connection.clone());
-    draining_phase(&original, &task).await;
+    clock.expect_event(DrainingClockEvent::Stopped).await;
     let restarted = registry();
     restarted.replay_session(dir.path(), "session").unwrap();
+    let first = clock.now();
+    clock.expect_sleep(first, first + 200).await;
+    clock.advance(200);
     let done = terminal(&restarted, &task).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     let requests = exec_runs(&daemon);
@@ -5281,13 +5340,14 @@ async fn runon_draining_restart_obeys_persisted_cancel() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
     stopped_draining_roots()
         .lock()
         .unwrap()
         .insert(dir.path().into());
     let original = registry();
     let task_id = start_runon_retry(&original, dir.path(), daemon.connection.clone());
-    draining_phase(&original, &task_id).await;
+    clock.expect_event(DrainingClockEvent::Stopped).await;
     let task = original.task(&task_id).unwrap();
     original.record_remote_cancel(&task).unwrap();
     let restarted = registry();
@@ -5309,13 +5369,14 @@ async fn runon_draining_restart_does_not_resubmit_ambiguous_dispatch() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
     stopped_draining_roots()
         .lock()
         .unwrap()
         .insert(dir.path().into());
     let original = registry();
     let task_id = start_runon_retry(&original, dir.path(), daemon.connection.clone());
-    draining_phase(&original, &task_id).await;
+    clock.expect_event(DrainingClockEvent::Stopped).await;
     let task = original.task(&task_id).unwrap();
     let mut saved = read_task(&task.paths.json).unwrap();
     let remote = saved.remote.as_mut().unwrap();
@@ -5345,20 +5406,27 @@ async fn runon_draining_network_retry_preserves_outbound_and_vcpu_request() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
+    let mut clock = PausedDrainingClock::new(dir.path());
     let ctx = restarted_context(dir.path());
-    let (reply, _) = orchestrated_reply(
-        &ctx,
-        &daemon,
-        serde_json::json!({
-            "command": "printf remote-proof",
-            "runon": "linux,4c,net",
-            "wait": true,
-            "timeout": 5_000,
-            "foreground_orchestrate": true,
-            "compressed": false,
-        }),
-    )
-    .await;
+    let ((reply, _), ()) = tokio::join!(
+        orchestrated_reply(
+            &ctx,
+            &daemon,
+            serde_json::json!({
+                "command": "printf remote-proof",
+                "runon": "linux,4c,net",
+                "wait": true,
+                "timeout": 5_000,
+                "foreground_orchestrate": true,
+                "compressed": false,
+            }),
+        ),
+        async {
+            let first = clock.now();
+            clock.expect_sleep(first, first + 50).await;
+            clock.advance(50);
+        },
+    );
     assert!(reply.success, "{reply:?}");
     assert_eq!(reply.data["status"], "completed", "{reply:?}");
     assert_eq!(reply.data["exit_code"], 0, "{reply:?}");
@@ -5378,15 +5446,7 @@ async fn runon_draining_network_retry_preserves_outbound_and_vcpu_request() {
 
 #[tokio::test]
 async fn head_blocking_runon_uses_configured_cap_while_queued() {
-    let daemon = daemon(
-        Script::Staged {
-            position: 9,
-            queue: Duration::from_secs(30),
-            run: Duration::ZERO,
-        },
-        "exec-remote/v1",
-    )
-    .await;
+    let daemon = daemon(Script::GatedStages { position: 9 }, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
     ctx.update_config(|config| config.bash.worker_wait_max_ms = 250);
@@ -5476,17 +5536,15 @@ async fn assert_blocking_runon_limit_before_acceptance(timeout_ms: u64, cap_ms: 
     // Let AFT learn the job ID so cleanup can cancel the held-open stream.
     daemon.acceptance_gate.notify_one();
     let task_id = reply.data["task_id"].as_str().unwrap().to_string();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !ctx
-            .bash_background()
-            .remote_progress(&task_id, "session")
-            .is_some_and(|progress| progress.phase == RemotePhase::Queued { position: 1 })
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("released acceptance must be processed before cancellation");
+    wait_for(
+        "released acceptance must be processed before cancellation",
+        || {
+            ctx.bash_background()
+                .remote_progress(&task_id, "session")
+                .filter(|progress| progress.phase == RemotePhase::Queued { position: 1 })
+        },
+    )
+    .await;
     let registry = ctx.bash_background().clone();
     tokio::task::spawn_blocking(move || registry.kill(&task_id, "session"))
         .await
@@ -5549,9 +5607,10 @@ async fn exec_remote_run_scope_revocation_reports_reason() {
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
     let task = start(&registry, dir.path(), daemon.connection.clone());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if registry
+    wait_for(
+        "acceptance must be consumed before revoking the scope",
+        || {
+            registry
                 .task(&task)
                 .unwrap()
                 .state
@@ -5562,15 +5621,10 @@ async fn exec_remote_run_scope_revocation_reports_reason() {
                 .as_ref()
                 .unwrap()
                 .job_id
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+                .map(|_| ())
+        },
+    )
+    .await;
     let killing = registry.clone();
     let done = tokio::task::spawn_blocking(move || {
         killing.kill_for_scope_revocation(&task, "session").unwrap()

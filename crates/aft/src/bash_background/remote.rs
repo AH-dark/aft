@@ -226,6 +226,10 @@ fn local_os_name() -> &'static str {
 struct ReattachBudget {
     limit: Duration,
     deadline: Option<tokio::time::Instant>,
+    #[cfg(test)]
+    clock: Option<Arc<tests::ReattachClock>>,
+    #[cfg(test)]
+    clock_deadline: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -238,11 +242,20 @@ impl ReattachBudget {
         Self {
             limit,
             deadline: None,
+            #[cfg(test)]
+            clock: tests::reattach_clock(_root),
+            #[cfg(test)]
+            clock_deadline: None,
         }
     }
 
     fn reset(&mut self) {
         self.deadline = None;
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            self.clock_deadline = None;
+            clock.resets.send_modify(|resets| *resets += 1);
+        }
     }
 
     fn expired(job_id: Uuid) -> String {
@@ -250,6 +263,17 @@ impl ReattachBudget {
     }
 
     fn check(&self, job_id: Uuid) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return if self
+                .clock_deadline
+                .is_some_and(|deadline| clock.now() >= deadline)
+            {
+                Err(Self::expired(job_id))
+            } else {
+                Ok(())
+            };
+        }
         if self
             .deadline
             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -265,6 +289,18 @@ impl ReattachBudget {
         attempt: impl std::future::Future<Output = T>,
     ) -> Result<T, String> {
         self.check(job_id)?;
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            let deadline = *self
+                .clock_deadline
+                .get_or_insert_with(|| clock.now() + self.limit);
+            clock.waits.send_modify(|waits| *waits += 1);
+            let mut ticks = clock.ticks.subscribe();
+            return tokio::select! {
+                value = attempt => Ok(value),
+                _ = ticks.wait_for(|now| *now >= deadline) => Err(Self::expired(job_id)),
+            };
+        }
         let deadline = *self
             .deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + self.limit);

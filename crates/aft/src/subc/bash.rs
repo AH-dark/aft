@@ -2709,8 +2709,11 @@ fn with_bash_timing_for_test<T>(
 }
 
 #[cfg(all(test, unix))]
-pub(super) async fn assert_deferred_wait_entrypoint_for_test(command: &str) {
-    grant_path_tests::assert_deferred_wait_entrypoint(command).await;
+pub(super) async fn assert_deferred_wait_entrypoint_for_test(
+    command: &str,
+    release: &std::path::Path,
+) {
+    grant_path_tests::assert_deferred_wait_entrypoint(command, Some(release)).await;
 }
 
 #[cfg(test)]
@@ -5506,10 +5509,13 @@ mod grant_path_tests {
     /// those routes, because they only run when the runtime thread is free.
     #[tokio::test]
     async fn deferred_bash_wait_does_not_block_the_frame_loop_on_task_state_lock() {
-        assert_deferred_wait_entrypoint("sleep 2").await;
+        assert_deferred_wait_entrypoint("sleep 2", None).await;
     }
 
-    pub(super) async fn assert_deferred_wait_entrypoint(command: &str) {
+    pub(super) async fn assert_deferred_wait_entrypoint(
+        command: &str,
+        release: Option<&std::path::Path>,
+    ) {
         let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
             pool_size: 2,
             read_cap: 1,
@@ -5638,6 +5644,11 @@ mod grant_path_tests {
             "the frame loop stalled for {longest_tick:?} behind a held task state lock"
         );
         holder.join().expect("holder thread");
+        if let Some(release) = release {
+            // Keep a gated command alive until lock contention has actually
+            // been exercised, then let it finish without a fixed run duration.
+            std::fs::write(release, b"release").unwrap();
+        }
 
         // Wait for the completion event, not a second deadline that also charges
         // Windows shell startup and persistence against the frame-loop test.
