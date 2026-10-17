@@ -261,9 +261,13 @@ pub fn watcher_event_invalidates(kind: &notify::EventKind) -> bool {
 pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
     // Operating-system metadata files (a Finder `.DS_Store` rewrite, say) are
     // never indexed by the project walks, so their events carry no change.
-    if crate::os_metadata::is_os_metadata_path(path) {
+    if crate::project_content::is_excluded_event(path) {
         return true;
     }
+    watcher_path_has_infra_component(path)
+}
+
+fn watcher_path_has_infra_component(path: &Path) -> bool {
     path.components().any(|c| {
         matches!(c, Component::Normal(name) if matches!(
             name.to_str().unwrap_or(""),
@@ -273,8 +277,13 @@ pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
 }
 
 pub(crate) fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root)
-        .is_ok_and(watcher_path_is_infra_skip)
+    let absolute = root.join(path);
+    // Only component matching is root-relative. Filesystem type checks must
+    // use the project path, never a relative path interpreted against daemon cwd.
+    crate::project_content::is_excluded_event(&absolute)
+        || absolute
+            .strip_prefix(root)
+            .is_ok_and(watcher_path_has_infra_component)
 }
 
 /// High-churn ignored directories that can be dropped from the raw event stream
@@ -5116,6 +5125,69 @@ mod tests {
         );
 
         assert_eq!(filtered.changed, BTreeSet::from([head, resolved_ref]));
+    }
+
+    #[test]
+    fn sqlite_named_source_directory_events_reach_checkout_from_unrelated_cwd() {
+        const CHILD: &str = "AFT_TEST_SQLITE_DIRECTORY_CWD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A subprocess changes the daemon cwd without racing other unit tests.
+            let cwd = TempDir::new().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "watcher_filter::tests::sqlite_named_source_directory_events_reach_checkout_from_unrelated_cwd", "--nocapture"])
+                .env(CHILD, "1")
+                .current_dir(cwd.path())
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+            return;
+        }
+        let project = TempDir::new().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        assert_ne!(std::env::current_dir().unwrap(), root);
+        let old = root.join("models.db");
+        let new = root.join("renamed.sqlite");
+        let (tx, rx) = watcher_dispatch_channel();
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.clone(), None),
+            shared_matcher(&root),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut dispatch = |kind, paths: Vec<PathBuf>| {
+            assert!(watcher_event_invalidates(&kind));
+            assert!(filter.push_raw_paths(paths.clone()));
+            assert!(filter.flush_pending());
+            assert_eq!(
+                rx.try_recv().unwrap_or_else(|error| panic!(
+                    "{kind:?} directory event must reach checkout: {error}"
+                )),
+                WatcherDispatchEvent::Paths(paths)
+            );
+            assert!(rx.try_recv().is_err());
+        };
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("source.rs"), "fn source() {}\n").unwrap();
+        dispatch(EventKind::Create(CreateKind::Folder), vec![old.clone()]);
+        std::fs::rename(&old, &new).unwrap();
+        dispatch(
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+            vec![old, new.clone()],
+        );
+        std::fs::remove_dir_all(&new).unwrap();
+        dispatch(
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+            vec![new],
+        );
+        let file = root.join("fixture.db");
+        std::fs::write(&file, "not source").unwrap();
+        assert!(watcher_path_is_infra_skip_under(&root, &file));
     }
 
     #[test]

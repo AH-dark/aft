@@ -153,6 +153,9 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
     if task_directory(path).is_none() {
         return true;
     }
+    if crate::project_content::is_sqlite_or_metadata(path) {
+        return false;
+    }
     if is_task_environment(path) {
         return false;
     }
@@ -163,6 +166,8 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
         return false;
     }
     if metadata.is_file() {
+        #[cfg(test)]
+        crate::project_content::record_open(path);
         return path
             .parent()
             .and_then(|parent| PinnedDir::open(parent).ok())
@@ -174,7 +179,68 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
     true
 }
 
+/// A second hard link exposes the same task output through another path.
+pub(super) fn has_multiple_hard_links(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() > 1
+    }
+    #[cfg(windows)]
+    {
+        // Windows link-count metadata is unstable; handle-based artifact reads
+        // retain validate_regular_handle's existing Windows check.
+        let _ = metadata;
+        false
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 impl BgTaskRegistry {
+    /// Expand only an explicitly named bundle directory or registered file,
+    /// never a storage ancestor. Recheck session/head access for each exact name.
+    pub(crate) fn explicit_task_artifacts(
+        &self,
+        session: &str,
+        path: &Path,
+    ) -> Option<Vec<PathBuf>> {
+        // Exact owned outputs include legacy flat-layout tasks, which have no
+        // bundle read record. Ownership bypasses storage exclusion, not SQLite
+        // or link checks, and never authorizes the containing directory.
+        if self.is_session_owned_artifact_path(session, path) {
+            let readable = !crate::project_content::is_sqlite_or_metadata(path)
+                && fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file() && !has_multiple_hard_links(&metadata)
+                });
+            return Some(if readable {
+                vec![path.to_path_buf()]
+            } else {
+                Vec::new()
+            });
+        }
+        let record = self.task_read_record(task_directory(path)?)?;
+        let paths = &record.resolved.paths;
+        if ![&paths.dir, &paths.control_dir, &paths.io_dir]
+            .into_iter()
+            .any(|directory| path == directory)
+            && !paths.readable_files().any(|file| path == file)
+        {
+            return None;
+        }
+        Some(
+            paths
+                .readable_files()
+                .filter(|file| file.starts_with(path))
+                .filter(|file| self.is_readable_task_path(session, file))
+                .map(Path::to_path_buf)
+                .collect(),
+        )
+    }
+
     pub(super) fn task_namespaces(&self, storage: &Path) -> std::io::Result<fs::ReadDir> {
         #[cfg(test)]
         self.inner

@@ -1364,9 +1364,10 @@ pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
         message: format!("unsupported file for call graph: {}", path.display()),
     })?;
 
-    let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
-        path: format!("{}: {}", path.display(), e),
-    })?;
+    let source =
+        crate::project_content::read_to_string(path).map_err(|e| AftError::FileNotFound {
+            path: format!("{}: {}", path.display(), e),
+        })?;
 
     build_file_data_from_source_with_lang(path, &source, lang)
 }
@@ -2548,7 +2549,7 @@ fn read_rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
 }
 
 fn rust_manifest_value(path: &Path) -> Option<toml::Value> {
-    let source = std::fs::read_to_string(path).ok()?;
+    let source = crate::project_content::read_to_string(path).ok()?;
     toml::from_str(&source).ok()
 }
 
@@ -3589,7 +3590,7 @@ where
         return None;
     }
 
-    let source = std::fs::read_to_string(&canon).ok()?;
+    let source = crate::project_content::read_to_string(&canon).ok()?;
     let lang = detect_language(&canon)?;
     if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
         if symbol_name == "default" {
@@ -3929,12 +3930,15 @@ fn walk_project_files_filtered_while_with_builder(
                 PROJECT_WALK_ACCEPTED_FILTER_ENTRIES
                     .with(|entries| entries.borrow_mut().push(entry.path().to_path_buf()));
             }
-            if !include(entry.path()) {
+            let file_type = entry.file_type();
+            if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
+                || !include(entry.path())
+            {
                 return false;
             }
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if file_type.as_ref().is_some_and(std::fs::FileType::is_dir) {
                 return !WALK_EXCLUDED_DIR_NAMES.contains(&name.as_ref());
             }
             !crate::os_metadata::is_os_metadata_file_name(entry.file_name())

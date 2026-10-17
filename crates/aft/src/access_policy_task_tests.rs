@@ -70,8 +70,11 @@ fn record(
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("project");
-    let storage = dir.path().join("store");
+    // Grep opens resolved task paths. Keep the fixture and its open probes in
+    // that same path form, including Windows prefixes and macOS temp aliases.
+    let resolved = dir.path().canonicalize().unwrap();
+    let root = resolved.join("project");
+    let storage = resolved.join("store");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&storage).unwrap();
     let ctx = AppContext::new(
@@ -340,6 +343,138 @@ fn access_policy_own_task_io_folder_grep_and_glob() {
         read_as(&f.ctx, "worker-session", &f.worker.command),
         &f.worker.command,
     );
+}
+
+#[test]
+fn explicit_task_io_grep_opens_only_registered_nonsecret_artifacts() {
+    let f = fixture();
+    for name in ["fixture.db", "fixture.db-shm", "unregistered.txt"] {
+        std::fs::write(f.worker.io_dir.join(name), "worker-output\n").unwrap();
+    }
+    let probe = crate::project_content::Probe::new(&f.worker.io_dir);
+    for (session, scope) in [
+        ("worker-session", None),
+        ("head-session", Some(f.head.clone())),
+    ] {
+        crate::access_policy::with_scope(scope, || {
+            let mut req = request(
+                "grep",
+                json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+            );
+            req.session_id = Some(session.into());
+            let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["total_matches"], 1, "{:?}", response.data);
+        });
+    }
+    let mut expected = vec![
+        f.worker.stdout.clone(),
+        f.worker.stderr.clone(),
+        f.worker.exit.clone(),
+    ];
+    expected.sort();
+    let mut opened = probe.paths();
+    opened.sort();
+    opened.dedup();
+    assert_eq!(opened, expected);
+    let mut req = request("glob", json!({"path": f.worker.io_dir, "pattern": "*"}));
+    req.session_id = Some("worker-session".into());
+    let response = crate::commands::glob::handle_glob(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total"], 3, "{:?}", response.data);
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+    );
+    req.session_id = Some("unrelated-session".into());
+    assert_floor(
+        crate::commands::grep::handle_grep(&req, &f.ctx),
+        &f.worker.io_dir,
+    );
+    let mut opened = probe.paths();
+    opened.sort();
+    opened.dedup();
+    assert_eq!(opened, expected);
+}
+
+#[test]
+fn explicit_task_io_grep_rejects_registered_sqlite_names() {
+    let f = fixture();
+    std::fs::remove_file(&f.worker.stdout).unwrap();
+    // A registered artifact name is not permission to read a live database,
+    // even on platforms without device/inode identities or a SQLite suffix.
+    let _connection = crate::db::file_identity::IdentityConnection::new(
+        rusqlite::Connection::open(&f.worker.stdout).unwrap(),
+        "task artifact test",
+    );
+    let probe = crate::project_content::Probe::new(&f.worker.io_dir);
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+    );
+    req.session_id = Some("worker-session".into());
+    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total_matches"], 0, "{:?}", response.data);
+    let mut opened = probe.paths();
+    opened.sort();
+    opened.dedup();
+    let mut expected = vec![f.worker.stderr, f.worker.exit];
+    expected.sort();
+    assert_eq!(opened, expected);
+}
+
+// Hard-link alias checks need Unix device/inode identities. The all-platform
+// registered-name test above covers Windows' name-based refusal instead.
+#[cfg(unix)]
+#[test]
+fn explicit_task_io_grep_rejects_stdout_alias_to_live_sqlite() {
+    let f = fixture();
+    std::fs::remove_file(&f.worker.stdout).unwrap();
+    std::fs::hard_link(
+        f.ctx.config().storage_dir.as_ref().unwrap().join("aft.db"),
+        &f.worker.stdout,
+    )
+    .unwrap();
+    let probe = crate::project_content::Probe::new(&f.worker.io_dir);
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "worker-output"}),
+    );
+    req.session_id = Some("worker-session".into());
+    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total_matches"], 0, "{:?}", response.data);
+    let mut opened = probe.paths();
+    opened.sort();
+    opened.dedup();
+    let mut expected = vec![f.worker.stderr, f.worker.exit];
+    expected.sort();
+    assert_eq!(opened, expected);
+}
+
+#[test]
+fn explicit_task_artifacts_keep_filters_and_do_not_widen_project_walks() {
+    let f = fixture();
+    std::fs::write(&f.worker.stderr, "stderr-output\n").unwrap();
+    let mut req = request(
+        "grep",
+        json!({"path": f.worker.io_dir, "pattern": "output", "include": ["stderr"]}),
+    );
+    req.session_id = Some("worker-session".into());
+    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total_matches"], 1, "{:?}", response.data);
+    assert!(response.data["matches"][0]["file"]
+        .as_str()
+        .unwrap()
+        .ends_with("stderr"));
+    f.ctx
+        .update_config(|config| config.project_root = Some(f._dir.path().to_path_buf()));
+    req.params = json!({"pattern": "worker-output|stderr-output"});
+    let response = crate::commands::grep::handle_grep(&req, &f.ctx);
+    assert!(response.success, "{:?}", response.data);
+    assert_eq!(response.data["total_matches"], 0, "{:?}", response.data);
 }
 
 #[test]

@@ -383,8 +383,9 @@ fn artifact_read_context() -> (tempfile::TempDir, AppContext, PathBuf) {
     use crate::bash_background::BgTaskStatus;
 
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("project");
-    let storage = directory.path().join("storage");
+    let resolved = directory.path().canonicalize().unwrap();
+    let root = resolved.join("project");
+    let storage = resolved.join("storage");
     std::fs::create_dir(&root).unwrap();
     std::fs::create_dir(&storage).unwrap();
     let config = Config {
@@ -524,6 +525,105 @@ fn artifact_read_grep_and_glob_exact_file_under_root_restriction() {
         );
     }
 }
+
+#[test]
+fn artifact_read_storage_directory_grep_does_not_open_owned_outputs() {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    let storage = ctx.config().storage_dir.clone().unwrap();
+    let probe = crate::project_content::Probe::new(&storage);
+    // Use storage as the default search root so this tests walker exclusion,
+    // not the access policy's earlier refusal of an explicit storage path.
+    ctx.update_config(|config| config.project_root = Some(storage.clone()));
+    let grep =
+        crate::commands::grep::handle_grep(&request("grep", json!({"pattern": "artifact"})), &ctx);
+    assert!(grep.success, "{:?}", grep.data);
+    assert_eq!(grep.data["total_matches"], 0, "{:?}", grep.data);
+    assert!(probe.paths().is_empty(), "{:?}", probe.paths());
+    assert!(ctx
+        .bash_background()
+        .explicit_task_artifacts("policy-session", &storage)
+        .is_none());
+    assert!(ctx
+        .bash_background()
+        .is_session_owned_artifact_path("policy-session", &artifact));
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_read_owned_hard_link_is_refused_by_grep_and_read() {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    let ordinary = artifact.parent().unwrap().join("ordinary.txt");
+    std::fs::write(&ordinary, "ordinary secret marker\n").unwrap();
+
+    let normal_read =
+        crate::commands::read::handle_read(&request("read", json!({"file": artifact})), &ctx);
+    assert!(normal_read.success, "{:?}", normal_read.data);
+    assert!(normal_read.data["content"]
+        .as_str()
+        .unwrap()
+        .contains("fn artifact() {}"));
+
+    std::fs::remove_file(&artifact).unwrap();
+    std::fs::hard_link(&ordinary, &artifact).unwrap();
+    assert!(ctx
+        .bash_background()
+        .is_session_owned_artifact_path("policy-session", &artifact));
+    let grep = crate::commands::grep::handle_grep(
+        &request(
+            "grep",
+            json!({"path": artifact, "pattern": "ordinary secret marker"}),
+        ),
+        &ctx,
+    );
+    assert!(grep.success, "{:?}", grep.data);
+    assert_eq!(grep.data["total_matches"], 0, "{:?}", grep.data);
+
+    let read =
+        crate::commands::read::handle_read(&request("read", json!({"file": artifact})), &ctx);
+    assert!(
+        !read.success,
+        "hard-linked artifact was readable: {:?}",
+        read.data
+    );
+    assert_eq!(read.data["code"], "artifact_refused", "{:?}", read.data);
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_read_owned_live_sqlite_alias_is_refused() {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    let storage = ctx.config().storage_dir.clone().unwrap();
+    let database = storage.join("live.db");
+    let _connection = crate::db::file_identity::IdentityConnection::new(
+        rusqlite::Connection::open(&database).unwrap(),
+        "owned artifact alias test",
+    );
+    std::fs::remove_file(&artifact).unwrap();
+    std::fs::hard_link(&database, &artifact).unwrap();
+    assert!(ctx
+        .bash_background()
+        .is_session_owned_artifact_path("policy-session", &artifact));
+    let probe = crate::project_content::Probe::new(&storage);
+    assert!(ctx
+        .bash_background()
+        .explicit_task_artifacts("policy-session", &artifact)
+        .unwrap()
+        .is_empty());
+    let grep = crate::commands::grep::handle_grep(
+        &request("grep", json!({"path": artifact, "pattern": "."})),
+        &ctx,
+    );
+    assert!(grep.success, "{:?}", grep.data);
+    assert_eq!(grep.data["total_matches"], 0, "{:?}", grep.data);
+    let glob = crate::commands::glob::handle_glob(
+        &request("glob", json!({"path": artifact, "pattern": "*"})),
+        &ctx,
+    );
+    assert!(glob.success, "{:?}", glob.data);
+    assert_eq!(glob.data["total"], 0, "{:?}", glob.data);
+    assert!(probe.paths().is_empty(), "{:?}", probe.paths());
+}
+
 artifact_read_tool_test!(
     artifact_read_outline_many,
     crate::commands::outline::handle_outline,

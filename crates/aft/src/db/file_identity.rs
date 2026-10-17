@@ -24,10 +24,10 @@
 //! and registering a handle is serialized with checking for live users and
 //! removing or renaming its files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use super::SqliteStore;
 
@@ -38,7 +38,7 @@ const RETAINED_HAZARDS: usize = 64;
 
 /// Identity of the file a connection is attached to, as SQLite keys it: the
 /// device and inode, not the path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
     device: u64,
     inode: u64,
@@ -59,18 +59,70 @@ impl std::fmt::Display for FileIdentity {
 /// WAL-index implementation with locks that do conflict within a process.
 #[cfg(unix)]
 pub fn identity_of(path: &Path) -> Option<FileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
+    #[cfg(test)]
+    stat_probe::record(path);
     let metadata = std::fs::metadata(path).ok()?;
-    Some(FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
+    metadata_identity(&metadata)
 }
 
 #[cfg(not(unix))]
 pub fn identity_of(_path: &Path) -> Option<FileIdentity> {
     None
+}
+
+fn metadata_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+// Cached sidecar identities outlive unlinks while a database remains open.
+// Include birth time where available to distinguish recycled inodes from live
+// SQLite aliases. Unlike ctime, birth time survives renames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LiveFileIdentity {
+    file: FileIdentity,
+    created: Option<std::time::SystemTime>,
+}
+
+impl LiveFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        Some(Self {
+            file: metadata_identity(metadata)?,
+            // Filesystems without birth times retain inode-only protection.
+            created: metadata.created().ok(),
+        })
+    }
+
+    fn of(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            #[cfg(test)]
+            stat_probe::record(path);
+            Self::from_metadata(&std::fs::metadata(path).ok()?)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+}
+
+pub(crate) fn candidate_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    stat_probe::record(path);
+    std::fs::symlink_metadata(path)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,11 +185,49 @@ impl Opener {
 #[derive(Debug, Default)]
 struct OpenDatabase {
     openers: Vec<Opener>,
+    identities: HashSet<LiveFileIdentity>,
 }
 
 fn open_databases() -> &'static Mutex<BTreeMap<PathBuf, OpenDatabase>> {
     static DATABASES: OnceLock<Mutex<BTreeMap<PathBuf, OpenDatabase>>> = OnceLock::new();
     DATABASES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[derive(Default)]
+struct LiveFiles {
+    names: HashMap<PathBuf, usize>,
+    identities: HashMap<LiveFileIdentity, usize>,
+}
+
+fn live_files() -> &'static RwLock<LiveFiles> {
+    static FILES: OnceLock<RwLock<LiveFiles>> = OnceLock::new();
+    FILES.get_or_init(RwLock::default)
+}
+
+fn database_files(key: &Path) -> [PathBuf; 4] {
+    let sidecar = |suffix| {
+        let mut path = key.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    [
+        key.to_path_buf(),
+        sidecar("-wal"),
+        sidecar("-shm"),
+        sidecar("-journal"),
+    ]
+}
+
+fn retain_identities(
+    database: &mut OpenDatabase,
+    identities: impl IntoIterator<Item = LiveFileIdentity>,
+) {
+    let mut files = live_files().write().unwrap_or_else(|p| p.into_inner());
+    for identity in identities {
+        if database.identities.insert(identity) {
+            *files.identities.entry(identity).or_default() += 1;
+        }
+    }
 }
 
 fn reported() -> &'static Mutex<Vec<DatabaseHazard>> {
@@ -328,17 +418,26 @@ impl std::ops::DerefMut for IdentityConnection {
 /// otherwise file the close under a different key than the open.
 pub(crate) fn note_open(path: &Path, store: SqliteStore) -> PathBuf {
     let key = registry_key(path);
+    let paths = database_files(&key);
+    let identities = paths.each_ref().map(|path| LiveFileIdentity::of(path));
     let opener = Opener {
         store: store.label(),
         thread: thread_label(),
-        identity: identity_of(&key),
+        identity: identities[0].map(|identity| identity.file),
     };
     let hazard = {
         let mut databases = open_databases()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = databases.entry(key.clone()).or_default();
+        if entry.openers.is_empty() {
+            let mut files = live_files().write().unwrap_or_else(|p| p.into_inner());
+            for path in paths {
+                *files.names.entry(path).or_default() += 1;
+            }
+        }
         let hazard = replacement_hazard(&key, entry, &opener);
+        retain_identities(entry, identities.into_iter().flatten());
         entry.openers.push(opener);
         hazard
     };
@@ -364,6 +463,23 @@ pub(crate) fn note_close(key: &Path, store: SqliteStore) {
         entry.openers.remove(index);
     }
     if entry.openers.is_empty() {
+        let mut files = live_files().write().unwrap_or_else(|p| p.into_inner());
+        for path in database_files(key) {
+            if let Some(count) = files.names.get_mut(&path) {
+                *count -= 1;
+                if *count == 0 {
+                    files.names.remove(&path);
+                }
+            }
+        }
+        for identity in &entry.identities {
+            if let Some(count) = files.identities.get_mut(identity) {
+                *count -= 1;
+                if *count == 0 {
+                    files.identities.remove(identity);
+                }
+            }
+        }
         databases.remove(key);
     }
 }
@@ -414,6 +530,98 @@ pub fn open_connections(path: &Path) -> usize {
                 .count()
         })
         .sum()
+}
+
+/// Cheap name check for project walkers whose roots are already canonical.
+pub(crate) fn is_registered_file_path(path: &Path) -> bool {
+    live_files()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .names
+        .contains_key(path)
+}
+
+/// Source readers must also reject aliases to live databases and their
+/// sidecars. `stat` inspects the inode without opening a descriptor, so it does
+/// not release SQLite's process-wide file locks.
+pub(crate) fn is_live_sqlite_file(path: &Path) -> bool {
+    if is_registered_file_path(path) {
+        return true;
+    }
+    let metadata = candidate_metadata(path).ok();
+    is_live_sqlite_file_with_metadata(path, metadata.as_ref())
+}
+
+pub(crate) fn is_live_sqlite_file_with_metadata(
+    path: &Path,
+    metadata: Option<&std::fs::Metadata>,
+) -> bool {
+    // A symlink's own inode and link count say nothing about SQLite's target.
+    // Resolve only this uncommon case; ordinary source reads need one stat.
+    if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
+        let key = registry_key(path);
+        if is_registered_file_path(&key) {
+            return true;
+        }
+        let target = std::fs::metadata(path).ok();
+        return is_live_sqlite_file_with_metadata(&key, target.as_ref());
+    }
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Some(identity) = LiveFileIdentity::from_metadata(metadata) else {
+        return false;
+    };
+    if live_files()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .identities
+        .contains_key(&identity)
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // A new sidecar with an innocent alias must have at least two links.
+        // Names protect the original, and cached identities also protect renames.
+        if metadata.nlink() < 2 {
+            return false;
+        }
+        refresh_sidecar_identities();
+    }
+    live_files()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .identities
+        .contains_key(&identity)
+}
+
+#[cfg(unix)]
+fn refresh_sidecar_identities() {
+    let paths = open_databases()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    // Never stat while holding the connection registry or the reader cache lock.
+    let refreshed = paths
+        .into_iter()
+        .map(|key| {
+            let identities = database_files(&key)[1..]
+                .iter()
+                .filter_map(|path| LiveFileIdentity::of(path))
+                .collect::<Vec<_>>();
+            (key, identities)
+        })
+        .collect::<Vec<_>>();
+    let mut databases = open_databases().lock().unwrap_or_else(|p| p.into_inner());
+    for (key, identities) in refreshed {
+        if let Some(database) = databases.get_mut(&key) {
+            retain_identities(database, identities);
+        }
+    }
 }
 
 /// Called under the filesystem gate before unlinking a whole cache directory.
@@ -481,10 +689,149 @@ pub fn reported_hazards() -> Vec<DatabaseHazard> {
 }
 
 #[cfg(test)]
+pub(crate) mod stat_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static COUNTS: RefCell<Option<BTreeMap<PathBuf, usize>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn record(path: &Path) {
+        COUNTS.with(|counts| {
+            if let Some(counts) = counts.borrow_mut().as_mut() {
+                *counts.entry(path.to_path_buf()).or_default() += 1;
+            }
+        });
+    }
+
+    pub(crate) fn count(f: impl FnOnce()) -> BTreeMap<PathBuf, usize> {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COUNTS.with(|counts| *counts.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        COUNTS.with(|counts| *counts.borrow_mut() = Some(BTreeMap::new()));
+        f();
+        COUNTS.with(|counts| counts.borrow_mut().take().unwrap())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::TrackedConnection;
     use rusqlite::Connection;
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_sidecar_inode_does_not_block_source_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("registered.cache");
+        let source = dir.path().join("source.rs");
+        std::fs::write(&database, "database").unwrap();
+        std::fs::write(&source, "source").unwrap();
+        let metadata = std::fs::metadata(&source).unwrap();
+        let Ok(created) = metadata.created() else {
+            // Without birth times the registry conservatively retains its
+            // device/inode protection, including possible reuse false positives.
+            return;
+        };
+        let key = note_open(&database, SqliteStore::AftDb);
+        // Model an unlinked sidecar's recycled inode without relying on the
+        // filesystem allocator to reuse a particular inode during the test.
+        let old = LiveFileIdentity {
+            file: metadata_identity(&metadata).unwrap(),
+            created: Some(created - std::time::Duration::from_secs(1)),
+        };
+        {
+            let mut databases = open_databases().lock().unwrap();
+            retain_identities(databases.get_mut(&key).unwrap(), [old]);
+        }
+        let result = crate::cache_freshness::collect(&source);
+        note_close(&key, SqliteStore::AftDb);
+        assert!(
+            result.is_ok(),
+            "recycled sidecar inode denied source: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sidecars_created_after_registration_are_live_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let database = root.join("unconventional.cache");
+        std::fs::write(&database, "database").unwrap();
+        let key = note_open(&database, SqliteStore::AftDb);
+        let sidecars = &database_files(&key)[1..];
+        for path in sidecars {
+            assert!(!path.exists());
+            std::fs::write(path, "created after registration").unwrap();
+        }
+        let probe = crate::project_content::Probe::new(&root);
+        let counts = stat_probe::count(|| {
+            for path in sidecars {
+                assert!(
+                    is_live_sqlite_file(path),
+                    "late sidecar was not live: {path:?}"
+                );
+            }
+        });
+        assert!(
+            counts.is_empty(),
+            "named sidecars needed identity stats: {counts:?}"
+        );
+        for path in sidecars {
+            assert_eq!(
+                crate::project_content::read(path).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(probe.paths().is_empty());
+        note_close(&key, SqliteStore::AftDb);
+        for path in database_files(&key) {
+            assert!(!is_registered_file_path(&path));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_sidecar_identity_survives_rename_until_last_database_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("registered.cache");
+        let sidecar = dir.path().join("registered.cache-shm");
+        std::fs::write(&database, "database").unwrap();
+        std::fs::write(&sidecar, "sidecar").unwrap();
+        let key = note_open(&database, SqliteStore::AftDb);
+        note_open(&database, SqliteStore::BlobStore);
+        let alias = dir.path().join("innocent.rs");
+        std::fs::rename(&sidecar, &alias).unwrap();
+        assert!(is_live_sqlite_file(&alias));
+        note_close(&key, SqliteStore::AftDb);
+        assert!(is_live_sqlite_file(&alias));
+        note_close(&key, SqliteStore::BlobStore);
+        assert!(!is_live_sqlite_file(&alias));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_database_identities_remain_live_until_all_registered_paths_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.cache");
+        let second = dir.path().join("second.cache");
+        let alias = dir.path().join("alias.rs");
+        std::fs::write(&first, "database").unwrap();
+        std::fs::hard_link(&first, &second).unwrap();
+        std::fs::hard_link(&first, &alias).unwrap();
+        let first_key = note_open(&first, SqliteStore::AftDb);
+        let second_key = note_open(&second, SqliteStore::BlobStore);
+        note_close(&first_key, SqliteStore::AftDb);
+        assert!(is_live_sqlite_file(&alias));
+        note_close(&second_key, SqliteStore::BlobStore);
+        assert!(!is_live_sqlite_file(&alias));
+    }
 
     #[test]
     fn identity_only_connection_tracks_lifetime_without_changing_wal_policy() {

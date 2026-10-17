@@ -6492,10 +6492,9 @@ fn collect_degraded_grep_files(
         .filter_entry({
             let skipped_foreign_mounts = Arc::clone(&skipped_foreign_mounts);
             move |entry| {
+                let file_type = entry.file_type();
                 if entry.depth() > 0
-                    && entry
-                        .file_type()
-                        .is_some_and(|file_type| file_type.is_dir())
+                    && file_type.is_some_and(|file_type| file_type.is_dir())
                     && matches!(
                         boundary
                             .as_ref()
@@ -6506,11 +6505,14 @@ fn collect_degraded_grep_files(
                     skipped_foreign_mounts.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
+                if crate::project_content::is_excluded_with_file_type(
+                    entry.path(),
+                    file_type.as_ref(),
+                ) {
+                    return false;
+                }
                 let name = entry.file_name().to_string_lossy();
-                if entry
-                    .file_type()
-                    .is_some_and(|file_type| file_type.is_dir())
-                {
+                if file_type.is_some_and(|file_type| file_type.is_dir()) {
                     return !matches!(
                         name.as_ref(),
                         "node_modules"

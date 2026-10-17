@@ -1395,6 +1395,21 @@ fn handle_read_local(
         }
     };
 
+    let requested = Path::new(file);
+    if ctx
+        .bash_background()
+        .is_session_owned_artifact_path(req.session(), requested)
+        && !ctx
+            .bash_background()
+            .is_readable_session_owned_artifact_path(req.session(), requested)
+    {
+        return Response::error(
+            &req.id,
+            "artifact_refused",
+            "read: task artifact has multiple hard links",
+        );
+    }
+
     let path = match ctx.validate_read_path(&req.id, req.session(), Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return resp,
