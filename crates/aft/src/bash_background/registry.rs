@@ -1333,6 +1333,20 @@ impl BgTaskRegistry {
             .is_some()
     }
 
+    pub(crate) fn is_readable_session_owned_artifact_path(
+        &self,
+        session_id: &str,
+        path: &Path,
+    ) -> bool {
+        let Ok(requested) = fs::canonicalize(path) else {
+            return false;
+        };
+        self.is_session_owned_artifact_path(session_id, &requested)
+            && fs::symlink_metadata(&requested).is_ok_and(|metadata| {
+                metadata.is_file() && !task_access::has_multiple_hard_links(&metadata)
+            })
+    }
+
     fn persisted_artifact_owner(
         &self,
         session_id: &str,

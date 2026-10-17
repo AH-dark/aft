@@ -550,6 +550,46 @@ fn artifact_read_storage_directory_grep_does_not_open_owned_outputs() {
 
 #[cfg(unix)]
 #[test]
+fn artifact_read_owned_hard_link_is_refused_by_grep_and_read() {
+    let (_directory, ctx, artifact) = artifact_read_context();
+    let ordinary = artifact.parent().unwrap().join("ordinary.txt");
+    std::fs::write(&ordinary, "ordinary secret marker\n").unwrap();
+
+    let normal_read =
+        crate::commands::read::handle_read(&request("read", json!({"file": artifact})), &ctx);
+    assert!(normal_read.success, "{:?}", normal_read.data);
+    assert!(normal_read.data["content"]
+        .as_str()
+        .unwrap()
+        .contains("fn artifact() {}"));
+
+    std::fs::remove_file(&artifact).unwrap();
+    std::fs::hard_link(&ordinary, &artifact).unwrap();
+    assert!(ctx
+        .bash_background()
+        .is_session_owned_artifact_path("policy-session", &artifact));
+    let grep = crate::commands::grep::handle_grep(
+        &request(
+            "grep",
+            json!({"path": artifact, "pattern": "ordinary secret marker"}),
+        ),
+        &ctx,
+    );
+    assert!(grep.success, "{:?}", grep.data);
+    assert_eq!(grep.data["total_matches"], 0, "{:?}", grep.data);
+
+    let read =
+        crate::commands::read::handle_read(&request("read", json!({"file": artifact})), &ctx);
+    assert!(
+        !read.success,
+        "hard-linked artifact was readable: {:?}",
+        read.data
+    );
+    assert_eq!(read.data["code"], "artifact_refused", "{:?}", read.data);
+}
+
+#[cfg(unix)]
+#[test]
 fn artifact_read_owned_live_sqlite_alias_is_refused() {
     let (_directory, ctx, artifact) = artifact_read_context();
     let storage = ctx.config().storage_dir.clone().unwrap();

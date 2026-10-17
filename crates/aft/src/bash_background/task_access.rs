@@ -179,6 +179,27 @@ pub(crate) fn safe_task_entry(path: &Path) -> bool {
     true
 }
 
+/// A second hard link exposes the same task output through another path.
+pub(super) fn has_multiple_hard_links(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() > 1
+    }
+    #[cfg(windows)]
+    {
+        // Windows link-count metadata is unstable; handle-based artifact reads
+        // retain validate_regular_handle's existing Windows check.
+        let _ = metadata;
+        false
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
 impl BgTaskRegistry {
     /// Expand only an explicitly named bundle directory or registered file,
     /// never a storage ancestor. Recheck session/head access for each exact name.
@@ -192,7 +213,9 @@ impl BgTaskRegistry {
         // or link checks, and never authorizes the containing directory.
         if self.is_session_owned_artifact_path(session, path) {
             let readable = !crate::project_content::is_sqlite_or_metadata(path)
-                && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file());
+                && fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_file() && !has_multiple_hard_links(&metadata)
+                });
             return Some(if readable {
                 vec![path.to_path_buf()]
             } else {
