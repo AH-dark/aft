@@ -91,7 +91,10 @@ function validateControlToolCallGate(
 ): void {
   const gate = control.wait_for_tool_call;
   if (gate === undefined) return;
+  // JSON registrations can carry `null`; report it like any other malformed gate.
   if (
+    gate === null ||
+    typeof gate !== "object" ||
     typeof gate.call_id !== "string" ||
     gate.call_id.length === 0 ||
     !Number.isInteger(gate.timeout_ms) ||

@@ -2969,6 +2969,12 @@ describe("abort controls wait for the call they interrupt", () => {
     ).toThrow("has invalid wait_for_tool_call");
     expect(() =>
       validateScenarioDefinition(
+        abortRow(JSON.parse('{"wait_for_tool_call": null}')),
+        "inspect",
+      ),
+    ).toThrow("has invalid wait_for_tool_call");
+    expect(() =>
+      validateScenarioDefinition(
         abortRow({ wait_for_tool_call: { call_id: "inspect-abort", timeout_ms: 1_000 } }),
         "inspect",
       ),
