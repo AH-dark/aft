@@ -1270,6 +1270,12 @@ fn format_edit_response(data: &Value) -> String {
     }
     append_lsp_error_lines(&mut result, data, false);
     append_lsp_server_notes(&mut result, data);
+    if let Some(warnings) = data.get("warnings").and_then(Value::as_array) {
+        for warning in warnings.iter().filter_map(Value::as_str) {
+            result.push_str("\n\nWarning: ");
+            result.push_str(warning);
+        }
+    }
     result
 }
 
