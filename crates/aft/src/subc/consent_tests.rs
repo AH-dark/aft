@@ -919,7 +919,9 @@ async fn consent_scope_head_file_grant_allows_once_without_delegating_directory(
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     set_hold_budget_for_test(Some(Duration::from_millis(100)));
-    let target = f.dir.path().join("elsewhere.txt");
+    // Cards and stored grants carry canonical policy paths. Temp directories can
+    // sit behind a symlink (macOS /var -> /private/var), so compare canonically.
+    let target = crate::access_policy::policy_path(&f.dir.path().join("elsewhere.txt"));
     {
         let db = f.ctx.db().unwrap();
         crate::db::access_grants::insert(
@@ -958,7 +960,9 @@ async fn consent_scope_head_file_only_scope_answer_stores_only_the_file() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     set_hold_budget_for_test(Some(Duration::from_millis(100)));
-    let target = f.dir.path().join("elsewhere.txt");
+    // Cards and stored grants carry canonical policy paths. Temp directories can
+    // sit behind a symlink (macOS /var -> /private/var), so compare canonically.
+    let target = crate::access_policy::policy_path(&f.dir.path().join("elsewhere.txt"));
     let grant = AccessGrant {
         path: target.clone(),
         kind: GrantKind::File,
@@ -1255,6 +1259,11 @@ async fn consent_scope_stalled_finish_probe_is_bounded_and_releases_database() {
     wait_for_scope_probe_idle().await;
 }
 
+// Cingulate accepts only `/`-rooted paths, and native Windows drive or UNC
+// paths are refused before any card is prepared (see
+// consent_native_windows_drive_path_is_denied_without_sending_a_request), so a
+// card built from a Windows fixture path is unreachable and never decodes.
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_scope_write_cards_keep_the_original_capability() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -1422,23 +1431,34 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
 
     let limiter = Arc::new(ScopeProbeLimiter::new());
     let scan_count = Arc::new(AtomicUsize::new(0));
+    let check_count = Arc::new(AtomicUsize::new(0));
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
     let root_alias_check: Arc<dyn Fn(&Path, &Path) -> Option<bool> + Send + Sync> = {
         let limiter = Arc::clone(&limiter);
         let scan_count = Arc::clone(&scan_count);
+        let check_count = Arc::clone(&check_count);
         Arc::new(move |_, _| {
+            let first_check = check_count.fetch_add(1, Ordering::SeqCst) == 0;
             let scan_count = Arc::clone(&scan_count);
             let started = started_tx.clone();
             let release = Arc::clone(&release_rx);
-            Arc::clone(&limiter).scan(move || {
+            let result = Arc::clone(&limiter).scan(move || {
                 if scan_count.fetch_add(1, Ordering::SeqCst) == 0 {
                     let _ = started.send(());
                     let _ = release.lock().unwrap().recv();
                 }
                 Some(false)
-            })
+            });
+            // The first probe outlives its caller's deadline and keeps the
+            // whole-probe slot until its helper returns. Keep that helper busy
+            // a little past the alias scan, as a slow machine would, so the
+            // recovery check below must wait for the slot instead of racing it.
+            if first_check {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            result
         })
     };
 
@@ -1481,6 +1501,19 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
         assert!(
             Instant::now() < release_deadline,
             "stalled scan did not finish"
+        );
+        std::thread::yield_now();
+    }
+    // The alias scan finishing does not end the first probe: its helper still
+    // holds the process-wide probe slot until it returns. A busy slot yields a
+    // file-only scope by design, so recovery is only observable once it is free.
+    while DIRECTORY_SCOPE_PROBE_LIMITER
+        .in_flight
+        .load(Ordering::Acquire)
+    {
+        assert!(
+            Instant::now() < release_deadline,
+            "the timed-out probe did not return its slot"
         );
         std::thread::yield_now();
     }
