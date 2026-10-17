@@ -825,7 +825,7 @@ pub(crate) fn format_remote_handback_message(
     let job = progress
         .and_then(|progress| progress.job_id)
         .map_or_else(|| "not assigned yet".to_string(), |id| id.to_string());
-    let phase = progress.map_or(RemotePhase::WaitingOnRunner, |progress| progress.phase);
+    let phase = progress.map_or(RemotePhase::Submitting, |progress| progress.phase);
     format!(
         "The remote command did not finish within {}, the longest this call waits, so it now runs in the background as {}\nIt was not killed. Remote job: {job}. Phase: {}. Its `timeout` counts from when it starts running on ck-motor; a job that waits too long in ck-motor's queue is refused without running.",
         format_wait_limit(waited_ms),
@@ -862,7 +862,7 @@ pub(crate) fn handback_remote_bash(
             );
             let phase = progress
                 .as_ref()
-                .map_or(RemotePhase::WaitingOnRunner, |progress| progress.phase);
+                .map_or(RemotePhase::Submitting, |progress| progress.phase);
             let queue_position = match phase {
                 RemotePhase::Queued { position } => Some(position),
                 _ => None,
@@ -872,7 +872,7 @@ pub(crate) fn handback_remote_bash(
                 json!({
                     "output": output,
                     "task_id": task_id,
-                    "status": "running",
+                    "status": if phase == RemotePhase::Submitting { "starting" } else { "running" },
                     "remote_job_id": progress
                         .as_ref()
                         .and_then(|progress| progress.job_id)

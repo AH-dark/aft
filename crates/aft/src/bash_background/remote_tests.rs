@@ -4510,8 +4510,14 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         retry: None,
         output_incomplete: None,
     };
-    assert_eq!(RemotePhase::of(&remote), RemotePhase::WaitingOnRunner);
+    assert_eq!(RemotePhase::of(&remote), RemotePhase::Submitting);
     remote.job_id = Some(id());
+    assert_eq!(
+        RemotePhase::of(&remote),
+        RemotePhase::Submitting,
+        "a refusal can carry a job id without acceptance"
+    );
+    remote.accepted = true;
     assert_eq!(
         RemotePhase::of(&remote),
         RemotePhase::WaitingOnRunner,
@@ -4575,7 +4581,7 @@ async fn rendered_watch(ctx: Arc<crate::context::AppContext>, task_id: &str) -> 
 }
 
 #[test]
-fn remote_phase_note_says_queued_until_started_then_names_the_runner_stop() {
+fn remote_phase_note_says_submitting_then_queued_until_started() {
     let dir = tempfile::tempdir().unwrap();
     let mut metadata = PersistedTask::starting(
         "bash-0000000000000001".into(),
@@ -4618,12 +4624,13 @@ fn remote_phase_note_says_queued_until_started_then_names_the_runner_stop() {
         output_incomplete: None,
     });
     let now = 1_042_900;
-    // Before acceptance there is no position to report.
+    // Before acceptance the runner has not confirmed it copied the inputs.
     assert_eq!(
         remote_phase_note(&metadata, now).as_deref(),
-        Some("queued on the runner (42 s)")
+        Some("submitting to the runner (capturing inputs; not accepted yet)")
     );
     let remote = metadata.remote.as_mut().unwrap();
+    remote.accepted = true;
     remote.job_id = Some(id());
     remote.queue_position = Some(7);
     assert_eq!(
@@ -4644,6 +4651,95 @@ fn remote_phase_note_says_queued_until_started_then_names_the_runner_stop() {
     assert_eq!(remote_phase_note(&fallback, now), None);
     metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
     assert_eq!(remote_phase_note(&metadata, now), None);
+}
+
+#[tokio::test]
+async fn bash_status_watch_and_task_line_distinguish_input_capture_from_queueing() {
+    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
+    let ctx = Arc::new(restarted_context(dir.path()));
+    let mut policy = launch(daemon.connection.clone());
+    policy.explicit_runon = true;
+    let task_id = ctx
+        .bash_background()
+        .spawn_remote(
+            policy,
+            SpawnPlan::Unsandboxed,
+            "uname -s",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.path().into(),
+            crate::bash_background::TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while exec_runs(&daemon).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = rendered_status(&ctx, &task_id);
+    let watch = rendered_watch(ctx.clone(), &task_id).await;
+    assert!(
+        status.starts_with(&format!("Task {task_id}: starting · submitting")),
+        "{status}"
+    );
+    assert!(
+        watch.starts_with(&format!("Task {task_id}: starting")),
+        "{watch}"
+    );
+    for text in [&status, &watch] {
+        assert!(text.contains("capturing inputs"), "{text}");
+        assert!(
+            !text.contains("queued on the runner") && !text.contains("still running"),
+            "{text}"
+        );
+    }
+    let snapshot = ctx
+        .bash_background()
+        .observed_status(&task_id, "session", 0)
+        .unwrap();
+    assert_eq!(
+        crate::commands::bash_orchestrate::foreground_task_line(&snapshot),
+        format!("[task {task_id}]")
+    );
+    daemon.acceptance_gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ctx
+            .bash_background()
+            .runon_launch_pending(&task_id, "session")
+            != Some(false)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = rendered_status(&ctx, &task_id);
+    let watch = rendered_watch(ctx.clone(), &task_id).await;
+    assert!(status.contains("queued on the runner"), "{status}");
+    assert!(watch.contains("Queued on the runner"), "{watch}");
+    let snapshot = ctx
+        .bash_background()
+        .observed_status(&task_id, "session", 0)
+        .unwrap();
+    assert_eq!(
+        crate::commands::bash_orchestrate::foreground_task_line(&snapshot),
+        format!("[task {task_id} (job {})]", id())
+    );
+    let registry = ctx.bash_background().clone();
+    tokio::task::spawn_blocking(move || registry.kill(&task_id, "session"))
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -4758,7 +4854,11 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
         )
         .unwrap();
     let waiting = draining_phase(&registry, &task_id).await;
-    assert_eq!(waiting.info.status, BgTaskStatus::Running, "{waiting:?}");
+    assert_eq!(waiting.info.status, BgTaskStatus::Starting, "{waiting:?}");
+    assert_eq!(
+        registry.runon_launch_pending(&task_id, "session"),
+        Some(true)
+    );
     assert!(
         waiting
             .output_preview
@@ -5348,15 +5448,15 @@ async fn head_blocking_runon_uses_configured_cap_before_any_stream_record() {
     assert!(reply.success, "{reply:?}");
     assert!(waited >= Duration::from_millis(250), "{waited:?}");
     assert!(waited < plugin_transport_deadline(250), "{waited:?}");
-    assert_eq!(reply.data["status"], "running", "{reply:?}");
-    assert_eq!(reply.data["remote_phase"], "waiting_on_runner", "{reply:?}");
+    assert_eq!(reply.data["status"], "starting", "{reply:?}");
+    assert_eq!(reply.data["remote_phase"], "submitting", "{reply:?}");
     assert_eq!(reply.data["queue_position"], serde_json::Value::Null);
     assert_eq!(reply.data["remote_job_id"], serde_json::Value::Null);
     assert!(
         reply.data["output"]
             .as_str()
             .unwrap()
-            .contains("waiting on the runner"),
+            .contains("capturing inputs; not accepted yet"),
         "{reply:?}"
     );
     assert_eq!(runner_cancels(&daemon), 0);

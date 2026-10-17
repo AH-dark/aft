@@ -101,6 +101,8 @@ pub(crate) enum Script {
     },
     /// Withhold the first stream record until `Daemon::acceptance_gate` is notified.
     GatedAcceptance,
+    /// Refuse once while draining, then gate the retry's first record.
+    DrainingGatedAcceptance,
     NetworkGranted,
     NetworkUnknown,
     NetworkLost,
@@ -201,12 +203,13 @@ pub(crate) async fn daemon_with_capabilities(
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
-                            let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } if runs <= refusals);
+                            let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } if runs <= refusals)
+                                || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
                             if attaching && matches!(script, Script::AttachDisconnected) {
                                 // Drop the route and listener; later attach calls and connects fail.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::DrainingGatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
@@ -241,7 +244,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. } | Script::Started | Script::GatedAcceptance) && !attaching { /* held-open run stream */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. } | Script::Started | Script::GatedAcceptance | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach(_) | Script::GappedCancel(_)) { /* delayed producer below */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -277,7 +280,10 @@ pub(crate) async fn daemon_with_capabilities(
                                     if matches!(script, Script::NetworkUnsupported) {
                                         terminal.refusal_detail = Some("outbound access disabled by runner policy".into());
                                     }
-                                    if draining {
+                                     if draining {
+                                         if matches!(script, Script::DrainingGatedAcceptance) {
+                                             terminal.retry_after_ms = Some(50);
+                                         }
                                         if let Script::Draining { retry_after_ms, .. } | Script::DiskFull { retry_after_ms, .. } = script {
                                             terminal.retry_after_ms = retry_after_ms;
                                             terminal.refusal_detail = Some("maintenance".into());
@@ -308,7 +314,10 @@ pub(crate) async fn daemon_with_capabilities(
                         .await
                         .unwrap();
                 }
-                if matches!(script, Script::GatedAcceptance) && body["method"] == "exec.run" {
+                if (matches!(script, Script::GatedAcceptance)
+                    || matches!(script, Script::DrainingGatedAcceptance) && runs > 1)
+                    && body["method"] == "exec.run"
+                {
                     let writer = writer.clone();
                     let gate = server_acceptance_gate.clone();
                     producers.push(tokio::spawn(async move {

@@ -399,8 +399,9 @@ pub(crate) struct RemoteTask {
 /// caller whose blocking wait ended what the job is doing now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemotePhase {
-    /// The runner has not accepted the job yet (it is still being submitted
-    /// or uploaded), or AFT restarted without learning its queue position.
+    /// Inputs are still being submitted; the runner has not accepted the job.
+    Submitting,
+    /// Accepted, but no queue position was retained across a restart.
     WaitingOnRunner,
     /// Accepted at this queue position, and nothing has shown it started.
     Queued { position: u32 },
@@ -414,7 +415,9 @@ impl RemotePhase {
     /// New runners explicitly report `Started`; output remains evidence of
     /// execution for older runners that do not send that record.
     pub(crate) fn of(remote: &RemoteTask) -> Self {
-        if remote.started.is_some() || remote.output_received {
+        if !remote.accepted {
+            Self::Submitting
+        } else if remote.started.is_some() || remote.output_received {
             Self::Running
         } else if let (Some(_), Some(position)) = (remote.job_id, remote.queue_position) {
             Self::Queued { position }
@@ -426,6 +429,7 @@ impl RemotePhase {
     /// A stable machine-readable name for replies.
     pub(crate) fn tag(self) -> &'static str {
         match self {
+            Self::Submitting => "submitting",
             Self::WaitingOnRunner => "waiting_on_runner",
             Self::Queued { .. } => "queued",
             Self::Running => "running",
@@ -435,6 +439,7 @@ impl RemotePhase {
     /// The phase in words, naming the runner.
     pub(crate) fn describe(self) -> String {
         match self {
+            Self::Submitting => "submitting to ck-motor (capturing inputs; not accepted yet)".to_string(),
             Self::WaitingOnRunner => {
                 "waiting on the runner (ck-motor has not reported a queue position or any output yet)"
                     .to_string()
@@ -464,13 +469,14 @@ impl RemoteProgress {
 }
 
 /// Where a still-running remote task is, for bash_status and bash_watch:
+/// `submitting to the runner (capturing inputs)` before acceptance, then
 /// `queued on the runner (N s, position P)` until the runner reports that the
 /// command started, then `the runner stops it N s after it started`, because
 /// the runner enforces the timeout from start, not from queue entry.
 ///
 /// It is read from the task's persisted record, so it reads the same after an
-/// AFT restart. `None` for a local task, a finished task, or a `runon` task the
-/// runner refused (whether or not it then ran locally).
+/// AFT restart. `None` for a local task, a finished task, or a final refusal;
+/// a draining refusal awaiting retry is still submitting inputs.
 pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) -> Option<String> {
     if metadata.is_terminal() || metadata.child_pid.is_some() {
         return None;
@@ -478,8 +484,11 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
     let remote = metadata
         .remote
         .as_ref()
-        .filter(|remote| remote.terminal.is_none())?;
+        .filter(|remote| remote.terminal.is_none() || !remote.accepted && remote.retry.is_some())?;
     let phase = RemotePhase::of(remote);
+    if phase == RemotePhase::Submitting {
+        return Some("submitting to the runner (capturing inputs; not accepted yet)".to_string());
+    }
     if phase == RemotePhase::Running {
         // The request asks the runner for this many whole seconds (see
         // `spawn_remote`), so round up the same way.
@@ -491,8 +500,7 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
             None => "running on the runner".to_string(),
         });
     }
-    // Counted from when AFT created the task: the job enters the queue as soon
-    // as it is submitted.
+    // The persisted task creation time includes submission as well as queueing.
     let queued_s = now_ms.saturating_sub(metadata.started_at) / 1000;
     Some(match phase {
         RemotePhase::Queued { position } => {
@@ -1598,7 +1606,6 @@ impl BgTaskRegistry {
                         refusal_detail: refusal_detail.clone(),
                     };
                     if retries_draining(&remote, &verdict) {
-                        task.remote_launch_ready.store(true, Ordering::Release);
                         if self.wait_draining_retry(&task, &root).await?.is_some() {
                             let Some(next) =
                                 self.submit_draining_retry(&client, &task, &root).await?
