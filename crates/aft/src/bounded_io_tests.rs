@@ -10,6 +10,7 @@ struct HelperGate {
 static HELPER_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(unix)]
 pub(crate) struct HelperStall {
     path: PathBuf,
     pub(crate) reached: Receiver<()>,
@@ -17,6 +18,7 @@ pub(crate) struct HelperStall {
     finished: Receiver<()>,
 }
 
+#[cfg(unix)]
 impl Drop for HelperStall {
     fn drop(&mut self) {
         HELPER_GATES.lock().unwrap().remove(&self.path);
@@ -26,6 +28,7 @@ impl Drop for HelperStall {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn stall_helper(path: &Path) -> HelperStall {
     let (reached, reached_rx) = channel();
     let (release, release_rx) = channel();
