@@ -11757,8 +11757,15 @@ mod tests {
         ));
     }
 
+    /// About five seconds of real work. Not `timeout /t 5`: `cmd` resolves a
+    /// bare `timeout` through PATH, and when Git for Windows' `usr\bin` comes
+    /// before `System32` (as it does under Git Bash) that is GNU coreutils
+    /// `timeout`, which rejects `/t` and exits 125 at once. Tests that kill
+    /// this command then passed only when the kill beat shell startup. The
+    /// absolute `System32` path cannot be shadowed by PATH order.
     #[cfg(windows)]
-    const LONG_RUNNING_COMMAND: &str = "cmd /c timeout /t 5 /nobreak > nul";
+    const LONG_RUNNING_COMMAND: &str =
+        "cmd /c %SystemRoot%\\System32\\PING.EXE -n 6 127.0.0.1 > nul";
 
     #[test]
     fn bash_memory_estimate_is_zero_when_empty_and_nonzero_for_completion_cache() {
@@ -14718,7 +14725,15 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        // A Failed/Completed status here means the command ended on its own
+        // before the kill reached it; the exit code says how.
+        assert_eq!(
+            snapshot.info.status,
+            BgTaskStatus::Killed,
+            "exit_code={:?} status_reason={:?}",
+            snapshot.exit_code,
+            snapshot.info.status_reason
+        );
         assert_eq!(
             snapshot.info.status_reason.as_deref(),
             Some(ROOT_RECLAIMED_REASON)
@@ -14741,6 +14756,51 @@ mod tests {
             completion.status_reason.as_deref(),
             Some(ROOT_RECLAIMED_REASON)
         );
+        registry.detach();
+    }
+
+    /// Kill tests treat `LONG_RUNNING_COMMAND` as still running when they
+    /// reach it. Check that directly: the command takes about five seconds, so
+    /// it must not be terminal three seconds after spawn. A fixture that
+    /// exits early (as `timeout /t` did whenever PATH resolved GNU coreutils
+    /// `timeout`) fails here with its exit code, instead of intermittently
+    /// turning a kill test's expected `Killed` into `Failed`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_long_running_command_fixture_keeps_running() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        let window_end = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < window_end {
+            let snapshot = registry
+                .status(&task_id, "session", Some(dir.path()), Some(dir.path()), 0)
+                .unwrap();
+            assert!(
+                !snapshot.info.status.is_terminal(),
+                "LONG_RUNNING_COMMAND ended early: status={:?} exit_code={:?}",
+                snapshot.info.status,
+                snapshot.exit_code
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        registry
+            .kill_with_status(&task_id, "session", BgTaskStatus::Killed)
+            .unwrap();
         registry.detach();
     }
 
