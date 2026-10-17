@@ -170,6 +170,50 @@ fn remembered_unconfined_answer_cannot_outlive_a_confining_save() {
     assert_eq!(ctx.policy_confinement_reads_for_test(), reads);
 }
 
+/// A worker's later epoch with no saved row of its own reads the older
+/// epoch's row. If a save of `confine: "root"` for the older epoch lands
+/// between reading the later epoch as unconfined and remembering that answer,
+/// the answer must not be remembered: the later epoch is confined from then
+/// on, and its next call must read aft.db again and be confined.
+#[test]
+fn unconfined_read_racing_a_confining_save_is_not_remembered() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    let saving = older.clone();
+    ctx.after_next_policy_read_for_test(move |ctx| {
+        catalog(
+            json!({"preset":"worker", "params":{"confine":"root"}}),
+            &saving,
+            ctx,
+        )
+        .unwrap();
+    });
+    // No row is saved yet, so the newer epoch reads as unconfined; the older
+    // epoch's confining save then commits before that answer is remembered.
+    assert_eq!(confined(&ctx, &newer), Ok(false));
+    assert_eq!(confinement_from_memory(&ctx, &older), Some(Ok(true)));
+    assert_eq!(
+        confinement_from_memory(&ctx, &newer),
+        None,
+        "an unconfined answer read before a confining save was remembered"
+    );
+    let reads = ctx.policy_confinement_reads_for_test();
+    assert_eq!(
+        admit_confined(&ctx, &newer, "bash").unwrap_err().code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), reads + 1);
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", None)
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
+    );
+}
+
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {
     let scope=serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"worker","scope_epoch":epoch,"kind":"worker","owner_authorized":true})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {

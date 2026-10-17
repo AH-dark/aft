@@ -2721,6 +2721,10 @@ struct PolicyConfinementMemo {
     generation: u64,
     #[cfg(test)]
     store_reads: usize,
+    /// Runs once, between a policy read from aft.db and remembering its
+    /// answer, so a test can save a policy in that window.
+    #[cfg(test)]
+    after_read_for_test: Option<Box<dyn FnOnce(&AppContext) + Send>>,
 }
 
 #[derive(Default)]
@@ -6598,6 +6602,25 @@ impl AppContext {
     #[cfg(test)]
     pub(crate) fn policy_confinement_reads_for_test(&self) -> usize {
         self.policy_confinement.lock().store_reads
+    }
+
+    /// Run `hook` once, after the next policy read from aft.db and before its
+    /// answer is remembered.
+    #[cfg(test)]
+    pub(crate) fn after_next_policy_read_for_test(
+        &self,
+        hook: impl FnOnce(&AppContext) + Send + 'static,
+    ) {
+        self.policy_confinement.lock().after_read_for_test = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_after_policy_read_hook_for_test(&self) {
+        // Taken out first: the hook may save a policy, which locks the memo.
+        let hook = self.policy_confinement.lock().after_read_for_test.take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
     }
 
     pub(crate) fn database_runtime_failed(&self) -> bool {

@@ -236,6 +236,8 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
     let conn = db.lock().map_err(|_| policy_unavailable())?;
     let confined = store::confined(&conn, &key).map_err(|_| policy_unavailable())?;
     drop(conn);
+    #[cfg(test)]
+    ctx.run_after_policy_read_hook_for_test();
     if confined {
         ctx.remember_confined_policy_key(key);
     } else {
