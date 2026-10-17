@@ -24,6 +24,7 @@
 - gh shim (manifest 19): `gh workflow disable` and `gh workflow enable` run under the operator bypass, like `run cancel`, and are refused as undeclared on older manifests.
 - Backups: the daemon writes its ENGRAM backup catalog (`engram-catalog.json` in the storage root) at startup, so a fresh machine is covered without a hand-written file. It declares only what exists right now: `aft.db` (captured page by page) and the trusted-filter project list as device-local, and undo history, checkpoints, background task output, logs, diagnostics, caches and generated shims as excluded from backup. Undo history keeps its earlier entry ids, so ENGRAM records the switch to excluded on the same entries, and an id stays with its folder across restarts. The catalog is written only when the storage folder is named `aft`, since ENGRAM looks nowhere else.
 - Background commands: a command that finishes while AFT restarts is now reported with its real exit code, not as an unknown outcome; replay reads the exit marker again after it finds the command's process gone.
+- Daemon CPU on macOS: formatters, checkers and git probes no longer fork the daemon (they start through posix_spawn), and the per-edit git root-commit probe is reused until the repository's git files change; forking a large multi-threaded daemon took every malloc lock and stalled allocation process-wide.
 
 ## Sandbox profiles
 
