@@ -2937,8 +2937,19 @@ impl App {
             }
         }
 
+        let created = !path.exists();
         let conn = Arc::new(Mutex::new(crate::db::open_with_mode(path, mode)?));
         *slot = Some((key, Arc::clone(&conn)));
+        drop(slot);
+        if created {
+            // The startup catalog cannot declare a database that does not
+            // exist yet, so on a fresh machine it would stay undeclared until
+            // the next restart. Describe the storage root again now that it
+            // has one.
+            if let Some(storage_root) = path.parent() {
+                crate::engram_catalog::refresh_catalog(storage_root);
+            }
+        }
         Ok(conn)
     }
 
@@ -17714,6 +17725,33 @@ mod shared_db_tests {
             &ctx_one.db().expect("first context database"),
             &ctx_two.db().expect("second context database")
         ));
+    }
+
+    /// On a fresh machine the startup catalog runs before `aft.db` exists, so
+    /// creating the database must declare it without waiting for a restart.
+    #[test]
+    fn creating_the_database_declares_it_in_the_engram_catalog() {
+        let parent = tempdir().expect("storage parent");
+        let storage = parent.path().join("aft");
+        std::fs::create_dir(&storage).unwrap();
+        crate::engram_catalog::refresh_catalog(&storage);
+        let catalog = storage.join("engram-catalog.json");
+        let declares_db = || {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
+            value["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["entry_id"] == "aft/db")
+        };
+        assert!(!declares_db(), "no database yet, so no aft/db entry");
+
+        let app = App::default_shared();
+        app.open_db(&storage.join("aft.db"))
+            .expect("create database");
+
+        assert!(declares_db(), "the new database is declared at once");
     }
 }
 

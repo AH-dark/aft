@@ -201,10 +201,11 @@ impl Candidate {
     }
 }
 
-/// Write the catalog once at daemon startup. Never fails: a catalog that
-/// cannot be written must not stop AFT from serving, so errors become a
-/// warning in the log.
-pub fn write_catalog_at_startup(storage_root: &Path) {
+/// Write the catalog at daemon startup, and again whenever the storage root
+/// gains something it should declare (see `App::open_db`, which calls this
+/// after creating `aft.db`). Never fails: a catalog that cannot be written
+/// must not stop AFT from serving, so errors become a warning in the log.
+pub fn refresh_catalog(storage_root: &Path) {
     match write_catalog(storage_root) {
         Ok(WriteOutcome::Written) => crate::slog_info!(
             "engram catalog written: {}",
@@ -1312,7 +1313,7 @@ mod tests {
         assert!(target.join("keep").exists(), "the target was not replaced");
 
         // Startup only logs the failure.
-        write_catalog_at_startup(&root);
+        refresh_catalog(&root);
         assert!(temp_files(&root).is_empty());
     }
 
@@ -1321,7 +1322,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join(MODULE_ID);
         assert!(write_catalog(&root).is_err());
-        write_catalog_at_startup(&root);
+        refresh_catalog(&root);
         assert!(
             !root.exists(),
             "the catalog writer never creates the storage root"
@@ -1338,7 +1339,7 @@ mod tests {
             write_catalog(&elsewhere).unwrap(),
             WriteOutcome::SkippedRootName
         );
-        write_catalog_at_startup(&elsewhere);
+        refresh_catalog(&elsewhere);
         assert!(!elsewhere.join(CATALOG_FILENAME).exists());
 
         let (_fixture, root) = storage_root();

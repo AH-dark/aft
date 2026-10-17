@@ -288,7 +288,7 @@ fn main() {
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         // Tell the fleet backup service what this storage root holds; a
         // failure is logged and never stops the module from attaching.
-        aft::engram_catalog::write_catalog_at_startup(&ctx.storage_dir());
+        aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
         let executor = Arc::new(aft::executor::Executor::new());
         install_subc_signal_handler(
             Arc::clone(&executor),
@@ -385,7 +385,7 @@ fn main() {
     let app = App::default_shared();
     let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
     // Same catalog as in subc mode, written before the first request.
-    aft::engram_catalog::write_catalog_at_startup(&ctx.storage_dir());
+    aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
     ctx.set_daemonless_query_mode(true);
     let registry = RuntimeRegistry::standalone(app, ctx);
     // P3-02 slice 2: signal handling aggregates all per-actor
