@@ -183,21 +183,37 @@ impl ProjectWatcher {
                         pending_rebuild = None;
                     }
                     if let Some(outcome) = pending_rebuild.as_ref().and_then(|work| work.poll()) {
-                        pending_rebuild = None;
+                        let work = pending_rebuild
+                            .take()
+                            .expect("completed rebuild is pending");
                         match outcome {
                             Ok(desired) => {
-                                let desired = desired_watch_directories(
+                                // Create events can install replacement watches after the
+                                // helper recorded the old inode. Keep those installations
+                                // separate so the stale snapshot cannot evict them.
+                                let concurrent_watches = work
+                                    .installed
+                                    .intersection(&watched_directories)
+                                    .cloned()
+                                    .collect::<BTreeSet<_>>();
+                                let mut desired = desired_watch_directories(
                                     desired,
                                     &watched_directories,
                                     &matcher,
                                     &exclusion_paths,
                                     &root,
                                 );
+                                desired.extend(concurrent_watches.iter().cloned());
                                 watched_directories = match reconcile_watch_directories(
                                     &watched_directories,
                                     &desired,
                                     |directory, install| {
                                         if install {
+                                            // These watches are already live. Reopening their
+                                            // paths could follow a subsequent symlink replacement.
+                                            if concurrent_watches.contains(directory) {
+                                                return Ok(true);
+                                            }
                                             watch_directory(
                                                 &mut watcher,
                                                 directory,
@@ -291,7 +307,11 @@ impl ProjectWatcher {
                             })
                         }) {
                             Ok(result) => {
-                                pending_rebuild = Some(PendingWatchRebuild { generation, result })
+                                pending_rebuild = Some(PendingWatchRebuild {
+                                    generation,
+                                    result,
+                                    installed: BTreeSet::new(),
+                                })
                             }
                             Err(reason) => {
                                 planning.walk_unavailable(&root, generation, &counters, reason)
@@ -359,12 +379,18 @@ impl ProjectWatcher {
                                         NEW_DIRECTORY_FILE_CAP,
                                         deadline,
                                         |directory| {
-                                            watch_directory(
+                                            let installed = watch_directory(
                                                 &mut watcher,
                                                 directory,
                                                 &mut watch,
                                                 &counters,
-                                            )
+                                            )?;
+                                            if installed {
+                                                if let Some(work) = pending_rebuild.as_mut() {
+                                                    work.installed.insert(directory.to_path_buf());
+                                                }
+                                            }
+                                            Ok(installed)
                                         },
                                     ) {
                                         Ok(NewDirectoryScan::Complete) => {}
@@ -423,6 +449,7 @@ impl ProjectWatcher {
 struct PendingWatchRebuild {
     generation: u64,
     result: mpsc::Receiver<Result<BTreeMap<PathBuf, DirectoryIdentity>, ExclusionPlanUnavailable>>,
+    installed: BTreeSet<PathBuf>,
 }
 
 impl PendingWatchRebuild {
@@ -741,8 +768,8 @@ fn desired_watch_directories(
             stale.push(directory);
         }
     }
-    // Events can install new directories while the helper walks. Keep those
-    // watches, but never restore a stale helper entry through the live set.
+    // A previously watched path is not proof of a replacement's identity.
+    // Watches installed during the walk are preserved separately on apply.
     desired.extend(
         watched
             .iter()
@@ -836,6 +863,7 @@ pub(super) mod tests {
         watcher: ProjectWatcher,
         root: tempfile::TempDir,
         rx: mpsc::Receiver<notify::Result<Event>>,
+        watch_rx: mpsc::Receiver<PathBuf>,
         counters: Arc<crate::context::WatcherCounters>,
     }
 
@@ -852,6 +880,7 @@ pub(super) mod tests {
             let generation = Arc::new(AtomicU64::new(1));
             let counters = crate::context::watcher_counters_for_root(&canonical_root);
             let (tx, rx) = mpsc::channel();
+            let (watch_tx, watch_rx) = mpsc::channel();
             let mut initial = true;
             let watcher = ProjectWatcher::create_with_plan(
                 canonical_root.clone(),
@@ -859,7 +888,11 @@ pub(super) mod tests {
                 tx,
                 matcher.clone(),
                 generation.clone(),
-                |watcher, path| watcher.watch(path, RecursiveMode::NonRecursive),
+                move |watcher, path| {
+                    watcher.watch(path, RecursiveMode::NonRecursive)?;
+                    let _ = watch_tx.send(path.to_path_buf());
+                    Ok(())
+                },
                 move |root, matcher| {
                     if std::mem::take(&mut initial) {
                         derive_watcher_exclusion_plan(root, matcher, Some(WATCHER_EXCLUSION_LIMIT))
@@ -870,6 +903,7 @@ pub(super) mod tests {
             )
             .unwrap();
             assert_eq!(watcher.watched_directory_count(), 2);
+            while watch_rx.try_recv().is_ok() {}
             let path = canonical_root.join("generated");
             let gate = Arc::new(WalkGate::default());
             walk_gates()
@@ -885,6 +919,7 @@ pub(super) mod tests {
                 watcher,
                 root,
                 rx,
+                watch_rx,
                 counters,
             }
         }
@@ -927,6 +962,56 @@ pub(super) mod tests {
         let path = fixture.root.path().join("generated/nested/restored.rs");
         std::fs::write(&path, "source").unwrap();
         wait_for_paths(&fixture.rx, &[path]);
+    }
+
+    #[test]
+    fn reinclude_completed_walk_keeps_recreated_directory_watches() {
+        let fixture = ReincludeFixture::new();
+        let directory = fixture.root.path().join("generated");
+        let nested = directory.join("nested");
+        // Keep the old inode allocated so delete/recreate cannot reuse it.
+        let _old_directory = std::fs::File::open(&directory).unwrap();
+        let old_identity = DirectoryIdentity::read(&directory).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_ne!(DirectoryIdentity::read(&directory), Some(old_identity));
+        let files = [directory.join("direct.rs"), nested.join("descendant.rs")];
+        for path in &files {
+            std::fs::write(path, "before rebuild").unwrap();
+        }
+        wait_for_paths(&fixture.rx, &[directory, nested]);
+        fixture.wait_until_watched();
+
+        fixture.block.release();
+        // Reconciliation reinstalls healthy last, after deciding which of the
+        // replacement watches to retain. A watch count alone is already four
+        // before the helper finishes and cannot acknowledge its application.
+        let healthy = fixture.root.path().join("healthy");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let installed = fixture
+                .watch_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("completed helper walk was never reconciled");
+            if installed == healthy {
+                break;
+            }
+        }
+        // Drain earlier kernel events before editing the same files again.
+        let barrier = healthy.join("after-rebuild.rs");
+        std::fs::write(&barrier, "barrier").unwrap();
+        wait_for_paths(&fixture.rx, &[barrier]);
+        for path in &files {
+            std::fs::write(path, "after rebuild").unwrap();
+            wait_for_event(
+                &fixture.rx,
+                &format!("post-rebuild edit of {path:?}"),
+                |event| {
+                    matches!(event.kind, EventKind::Modify(ModifyKind::Data(_)))
+                        && event.paths.contains(path)
+                },
+            );
+        }
     }
 
     #[test]
