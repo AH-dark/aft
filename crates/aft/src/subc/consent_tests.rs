@@ -1197,6 +1197,9 @@ async fn consent_scope_write_cards_keep_the_original_capability() {
 #[cfg(unix)]
 #[test]
 fn consent_scope_home_file_stays_file_only() {
+    // The root-alias scan limiter is process-wide; serialize with every
+    // other consent test that can reach it.
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let home = crate::environment::non_empty_os_var("HOME")
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from)
@@ -1207,12 +1210,18 @@ fn consent_scope_home_file_stays_file_only() {
 #[cfg(unix)]
 #[test]
 fn consent_scope_etc_hosts_stays_file_only() {
+    // The root-alias scan limiter is process-wide; serialize with every
+    // other consent test that can reach it.
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
     assert_file_only_read_scope(crate::access_policy::policy_path(Path::new("/etc/hosts")));
 }
 
 #[cfg(unix)]
 #[test]
 fn consent_scope_root_file_stays_file_only() {
+    // The root-alias scan limiter is process-wide; serialize with every
+    // other consent test that can reach it.
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
     assert_file_only_read_scope(PathBuf::from("/x"));
 }
 
@@ -1231,6 +1240,9 @@ fn assert_file_only_read_scope(path: PathBuf) {
 
 #[test]
 fn consent_scope_nested_file_still_offers_directory() {
+    // The root-alias scan limiter is process-wide; serialize with every
+    // other consent test that can reach it.
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let dir = tempfile::tempdir().unwrap();
     let parent = dir.path().join("nested/src");
     std::fs::create_dir_all(&parent).unwrap();
@@ -1395,6 +1407,9 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
 #[cfg(unix)]
 #[test]
 fn consent_scope_rejects_canonical_root_alias() {
+    // The root-alias scan limiter is process-wide; serialize with every
+    // other consent test that can reach it.
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
     let target = root.join("private/etc");

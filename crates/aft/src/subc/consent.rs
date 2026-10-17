@@ -843,9 +843,9 @@ impl RootAliasScanLimiter {
                 drop(permit);
                 let _ = sender.send(result);
             });
+        // A failed spawn drops the closure and its permit, which releases the
+        // slot; clearing it here too could release a newer caller's slot.
         if spawned.is_err() {
-            self.in_flight
-                .store(false, std::sync::atomic::Ordering::Release);
             return None;
         }
 
