@@ -660,17 +660,19 @@ mod tests {
         assert!(index.snapshot().has_file_in_scope(&file));
         *ctx.search_index().write().unwrap() = Some(index);
 
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false);
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None);
         assert_eq!(discovery.source, "index");
         assert!(!discovery.walk_truncated);
         assert_eq!(discovery.files, vec![file.clone()]);
         assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false).files,
+            glob_root(&ctx, &project, &file, "*.ts", 100, false, None).files,
             vec![file.clone()]
         );
-        assert!(glob_root(&ctx, &project, &file, "other.ts", 100, false)
-            .files
-            .is_empty());
+        assert!(
+            glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
+                .files
+                .is_empty()
+        );
     }
 
     #[test]
@@ -678,17 +680,19 @@ mod tests {
         let (_dir, ctx, project, file) = exact_file_glob_fixture();
         assert!(ctx.search_index().read().unwrap().is_none());
 
-        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false);
+        let discovery = glob_root(&ctx, &project, &file, "main.ts", 100, false, None);
         assert_eq!(discovery.source, "fallback");
         assert!(!discovery.walk_truncated);
         assert_eq!(discovery.files, vec![file.clone()]);
         assert_eq!(
-            glob_root(&ctx, &project, &file, "*.ts", 100, false).files,
+            glob_root(&ctx, &project, &file, "*.ts", 100, false, None).files,
             vec![file.clone()]
         );
-        assert!(glob_root(&ctx, &project, &file, "other.ts", 100, false)
-            .files
-            .is_empty());
+        assert!(
+            glob_root(&ctx, &project, &file, "other.ts", 100, false, None)
+                .files
+                .is_empty()
+        );
     }
 
     #[test]
