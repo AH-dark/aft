@@ -4,7 +4,7 @@ import { bridgeFor, callBridge, callToolCall } from "../tools/_shared.js";
 
 const projectRoot = process.cwd();
 
-function fixture(open = true) {
+function fixture(open = true, aliases = false) {
   const calls: Array<{ command: string; params: Record<string, unknown> }> = [];
   const pending = new Set<unknown>();
   let opened = open;
@@ -13,17 +13,21 @@ function fixture(open = true) {
   let release = () => {};
   let secondCalls = 0;
   const bridge = {
+    getCwd: () => projectRoot,
     send: async (command: string, params: Record<string, unknown>) => {
       calls.push({ command, params });
       if (params.pending) pending.add(params.session_id);
       if (params.pending || params.clear_pending) await hold;
       if (params.clear_pending) pending.delete(params.session_id);
-      const detached = command === "bash" && pending.delete(params.session_id);
+      const detached =
+        (command === "bash" || (command === "tool_call" && params.name === "bash")) &&
+        pending.delete(params.session_id);
       return { success: true, detached, text: "ok" };
     },
     toolCall: async (sessionID: string, name: string, args: Record<string, unknown>) =>
       bridge.send("tool_call", { session_id: sessionID, name, args }),
   };
+  let current = aliases ? { ...bridge } : bridge;
   const second = {
     send: () => {
       secondCalls += 1;
@@ -32,40 +36,53 @@ function fixture(open = true) {
   };
   const pool = {
     getActiveBridgeForRoot: (root: string) =>
-      root === projectRoot ? (opened ? bridge : null) : second,
+      root === projectRoot ? (opened ? current : null) : second,
     getBridge: () => {
       if (!opened) creations += 1;
       opened = true;
-      return bridge;
+      return current;
     },
     activeBridges: () => [bridge, second],
   } as unknown as Parameters<typeof interruptBashWaitsForInput>[0];
   const ctx = { pool } as unknown as Parameters<typeof bridgeFor>[0];
-  const extCtx = { sessionManager: { getSessionId: () => "pi" } } as unknown as NonNullable<
-    Parameters<typeof callBridge>[3]
-  >;
+  const extCtx = (sessionID: string) =>
+    ({ sessionManager: { getSessionId: () => sessionID } }) as unknown as NonNullable<
+      Parameters<typeof callBridge>[3]
+    >;
   return {
     pool,
     calls,
     creations: () => creations,
     secondCalls: () => secondCalls,
+    useUnderlying: () => {
+      current = bridge;
+    },
     block: () => {
       hold = new Promise<void>((resolve) => {
         release = resolve;
       });
     },
     release: () => release(),
-    admit: () => interruptBashWaitsForInput(pool, {}, projectRoot, "pi", { text: "hello" }),
-    step: (root = projectRoot) => clearPendingBashWaitDetach(pool, root, "pi"),
-    tool: () =>
+    admit: (sessionID = "pi") =>
+      interruptBashWaitsForInput(pool, {}, projectRoot, sessionID, { text: "hello" }),
+    step: (root = projectRoot, sessionID = "pi") =>
+      clearPendingBashWaitDetach(pool, root, sessionID),
+    tool: (sessionID = "pi") =>
       callBridge(
         bridgeFor(ctx, projectRoot),
         "bash",
         { command: "echo ready", block_to_completion: true },
-        extCtx,
+        extCtx(sessionID),
       ),
-    hoistedTool: () =>
-      callToolCall(bridgeFor(ctx, projectRoot), "read", { path: "README.md" }, extCtx),
+    otherTool: (name: string, sessionID = "pi") =>
+      callBridge(bridgeFor(ctx, projectRoot), name, { path: "README.md" }, extCtx(sessionID)),
+    hoistedTool: (name = "read", sessionID = "pi") =>
+      callToolCall(
+        bridgeFor(ctx, projectRoot),
+        name,
+        { path: "README.md", wait: true },
+        extCtx(sessionID),
+      ),
   };
 }
 
@@ -86,6 +103,130 @@ async function promptly<T>(operation: Promise<T>): Promise<T> {
 async function drain() {
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
 }
+
+test("Pi wrapper and underlying share one queue so a late clear cannot erase newer admission", async () => {
+  const f = fixture(true, true);
+  f.block();
+  f.admit();
+  await drain();
+  try {
+    await promptly(f.step());
+    f.useUnderlying();
+    f.admit();
+  } finally {
+    f.release();
+  }
+  await drain();
+  expect((await f.tool()).detached).toBe(true);
+  expect(f.calls.map(({ params }) => params)).toEqual([
+    { session_id: "pi", pending: true },
+    { session_id: "pi", clear_pending: true },
+    { session_id: "pi", pending: true },
+    { command: "echo ready", block_to_completion: true, session_id: "pi" },
+  ]);
+  await f.step();
+});
+
+test("Pi forwarding recognizes pending admission through wrapper and underlying", async () => {
+  const f = fixture(true, true);
+  f.admit();
+  await drain();
+  f.useUnderlying();
+  expect((await f.tool()).detached).toBe(true);
+  expect(f.calls.map(({ command }) => command)).toEqual(["bash_wait_detach", "bash"]);
+  await f.step();
+});
+
+test.each([
+  "command",
+  "hoisted",
+])("Pi next bash through underlying waits for wrapper clear and does not detach via %s", async (dispatch) => {
+  const f = fixture(true, true);
+  f.admit();
+  await drain();
+  f.block();
+  let tool: ReturnType<typeof f.tool> | undefined;
+  try {
+    await f.step();
+    f.useUnderlying();
+    tool = dispatch === "hoisted" ? f.hoistedTool("bash") : f.tool();
+    await drain();
+    expect(f.calls.some(({ command }) => command === "bash" || command === "tool_call")).toBe(
+      false,
+    );
+  } finally {
+    f.release();
+  }
+  expect((await tool)?.detached).toBe(false);
+});
+
+for (const dispatch of ["command", "hoisted"] as const) {
+  test.each([
+    "read",
+    "search",
+    "bash",
+  ])(`Pi session B %s ${dispatch} does not wait for session A clear on the same bridge`, async (name) => {
+    const f = fixture();
+    f.admit();
+    await drain();
+    f.block();
+    try {
+      await f.step();
+      const result = await promptly(
+        dispatch === "hoisted"
+          ? f.hoistedTool(name, "other-pi")
+          : name === "bash"
+            ? f.tool("other-pi")
+            : f.otherTool(name, "other-pi"),
+      );
+      expect(result.success).toBe(true);
+    } finally {
+      f.release();
+    }
+    await drain();
+  });
+
+  test.each([
+    "read",
+    "search",
+  ])(`Pi session A %s ${dispatch} does not wait for its own clear without pending input`, async (name) => {
+    const f = fixture();
+    f.admit();
+    await drain();
+    f.block();
+    try {
+      await f.step();
+      const result = await promptly(
+        dispatch === "hoisted" ? f.hoistedTool(name) : f.otherTool(name),
+      );
+      expect(result.success).toBe(true);
+    } finally {
+      f.release();
+    }
+    await drain();
+  });
+}
+
+test("Pi session B admission bypasses session A clear but A next bash still waits", async () => {
+  const f = fixture();
+  f.admit();
+  await drain();
+  f.block();
+  let tool: ReturnType<typeof f.tool> | undefined;
+  try {
+    await f.step();
+    f.admit("other-pi");
+    await drain();
+    expect(f.calls.some(({ params }) => params.session_id === "other-pi")).toBe(true);
+    tool = f.tool();
+    await drain();
+    expect(f.calls.some(({ command }) => command === "bash")).toBe(false);
+  } finally {
+    f.release();
+  }
+  expect((await tool)?.detached).toBe(false);
+  await f.step(projectRoot, "other-pi");
+});
 
 test("Pi cold admission creates no bridge and forwards pending before the first bash", async () => {
   const f = fixture(false);

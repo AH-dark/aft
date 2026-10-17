@@ -15,21 +15,22 @@ const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
 
 type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activeBridges">;
 
-const pendingOperations = new WeakMap<AftProjectTransport, Promise<void>>();
-const pendingClears = new WeakMap<AftProjectTransport, Promise<void>>();
+const bridgeIdentities = new WeakMap<ActiveBridgePool, Map<string, object>>();
+const pendingOperations = new WeakMap<object, Map<string, Promise<void>>>();
+const pendingClears = new WeakMap<object, Map<string, Promise<void>>>();
 const pendingRequests = new WeakMap<ActiveBridgePool, Map<string, PendingRequest>>();
 const PENDING_DETACH_TTL_MS = 120_000;
 
 interface PendingRequest {
   expiresAt: number;
-  bridges: Set<AftProjectTransport>;
+  bridges: Map<object, AftProjectTransport>;
   timer?: ReturnType<typeof setTimeout>;
 }
 
 function rememberPendingRequest(pool: ActiveBridgePool, sessionID: string): PendingRequest {
   let sessions = pendingRequests.get(pool);
   if (!sessions) pendingRequests.set(pool, (sessions = new Map()));
-  const request: PendingRequest = sessions.get(sessionID) ?? { expiresAt: 0, bridges: new Set() };
+  const request: PendingRequest = sessions.get(sessionID) ?? { expiresAt: 0, bridges: new Map() };
   clearTimeout(request.timer);
   request.expiresAt = Date.now() + PENDING_DETACH_TTL_MS;
   request.timer = setTimeout(() => {
@@ -52,26 +53,40 @@ export async function clearPendingBashWaitDetachForMessages(
   );
 }
 
+function bridgeIdentity(pool: ActiveBridgePool, bridge: AftProjectTransport): object {
+  // Root lookups can return a facade while activeBridges returns its underlying
+  // transport. Both must use the same queue and delivery barrier within this pool.
+  const root = bridge.getCwd?.();
+  if (root === undefined) return bridge;
+  let roots = bridgeIdentities.get(pool);
+  if (!roots) bridgeIdentities.set(pool, (roots = new Map()));
+  let identity = roots.get(root);
+  if (!identity) roots.set(root, (identity = {}));
+  return identity;
+}
+
 function queuePendingOperation(
-  bridge: AftProjectTransport,
+  identity: object,
   sessionID: string,
   run: () => Promise<void>,
 ): Promise<void> {
-  const previous = pendingOperations.get(bridge);
-  // Preserve admission/clear order on each bridge without letting another
-  // project's slow admission hold up this bridge's delivery clear.
+  let sessions = pendingOperations.get(identity);
+  if (!sessions) pendingOperations.set(identity, (sessions = new Map()));
+  const previous = sessions.get(sessionID);
+  // Preserve admission/clear order for one session without delaying other
+  // sessions that share the project's bridge.
   const operation = (previous ? previous.then(run, run) : run()).catch((error) => {
     warn(`[bash_wait_detach] request failed for session ${sessionID}: ${String(error)}`);
   });
-  pendingOperations.set(bridge, operation);
+  sessions.set(sessionID, operation);
   void operation.finally(() => {
-    if (pendingOperations.get(bridge) === operation) pendingOperations.delete(bridge);
+    if (sessions.get(sessionID) === operation) sessions.delete(sessionID);
   });
   return operation;
 }
 
-async function waitForPendingClear(bridge: AftProjectTransport): Promise<void> {
-  const clear = pendingClears.get(bridge);
+async function waitForPendingClear(identity: object, sessionID: string): Promise<void> {
+  const clear = pendingClears.get(identity)?.get(sessionID);
   if (!clear) return;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -102,8 +117,8 @@ export async function clearPendingBashWaitDetach(
   clearTimeout(request.timer);
   // Stop in-flight fanout from arming bridges after the model has seen the input.
   request.expiresAt = 0;
-  for (const bridge of request.bridges) {
-    const clear = queuePendingOperation(bridge, sessionID, async () => {
+  for (const [identity, bridge] of request.bridges) {
+    const clear = queuePendingOperation(identity, sessionID, async () => {
       try {
         await bridge.send(
           "bash_wait_detach",
@@ -114,11 +129,13 @@ export async function clearPendingBashWaitDetach(
         warn(`[bash_wait_detach] delivery clear failed for session ${sessionID}: ${String(error)}`);
       }
     });
-    // Retain the barrier after removing the cached request. Tools wait only for
-    // their own bridge, while the model step never waits for any bridge RPC.
-    pendingClears.set(bridge, clear);
+    // Retain the barrier after removing the cached request. Only this session's
+    // bash calls need it; the model step never waits for any bridge RPC.
+    let clears = pendingClears.get(identity);
+    if (!clears) pendingClears.set(identity, (clears = new Map()));
+    clears.set(sessionID, clear);
     void clear.finally(() => {
-      if (pendingClears.get(bridge) === clear) pendingClears.delete(bridge);
+      if (clears.get(sessionID) === clear) clears.delete(sessionID);
     });
   }
 }
@@ -128,9 +145,13 @@ export async function forwardPendingBashWaitDetach(
   pool: AftTransportPool,
   projectRoot: CanonicalRootPath,
   sessionID: string | undefined,
+  bash: boolean,
 ): Promise<void> {
   if (!sessionID) return;
   const cached = pendingRequests.get(pool)?.get(sessionID);
+  // Unrelated tools only participate when they must forward cached input to a
+  // newly opened bridge. They cannot consume a stale foreground-bash detach.
+  if (!bash && (!cached || cached.expiresAt <= Date.now())) return;
   const bridge =
     cached && cached.expiresAt > Date.now()
       ? pool.getBridgeForCanonicalRoot
@@ -138,15 +159,16 @@ export async function forwardPendingBashWaitDetach(
         : pool.getBridge(projectRoot)
       : pool.getActiveBridgeForRoot?.(projectRoot);
   if (!bridge) return;
-  await waitForPendingClear(bridge);
+  const identity = bridgeIdentity(pool, bridge);
+  if (bash) await waitForPendingClear(identity, sessionID);
   const request = pendingRequests.get(pool)?.get(sessionID);
   if (!request || request.expiresAt <= Date.now()) return;
-  if (request.bridges.has(bridge)) {
-    await pendingOperations.get(bridge);
+  if (request.bridges.has(identity)) {
+    await pendingOperations.get(identity)?.get(sessionID);
     return;
   }
-  request.bridges.add(bridge);
-  await queuePendingOperation(bridge, sessionID, async () => {
+  request.bridges.set(identity, bridge);
+  await queuePendingOperation(identity, sessionID, async () => {
     if (request.expiresAt <= Date.now()) return;
     await sendBashWaitDetach(bridge, sessionID, true);
   });
@@ -281,8 +303,12 @@ async function signalActiveBridges(
   // bridge means the wait lives elsewhere (root-key mismatch), not "done".
   const exact = pool.getActiveBridgeForRoot(projectRoot);
   const all = pool.activeBridges();
-  const targets = exact ? [exact, ...all.filter((bridge) => bridge !== exact)] : all;
-  if (targets.length === 0) {
+  const targets = new Map<object, AftProjectTransport>();
+  for (const bridge of exact ? [exact, ...all] : all) {
+    const identity = bridgeIdentity(pool, bridge);
+    if (!targets.has(identity)) targets.set(identity, bridge);
+  }
+  if (targets.size === 0) {
     // Input must not defeat lazy startup. The cached request will be forwarded
     // if a real tool opens a bridge before model delivery or expiry.
     debug(
@@ -292,20 +318,20 @@ async function signalActiveBridges(
   }
   let signaled = 0;
   let lastError: unknown = null;
-  for (const bridge of targets) {
+  for (const [identity, bridge] of targets) {
     if (request && request.expiresAt <= Date.now()) break;
     try {
       signaled += 1;
-      request?.bridges.add(bridge);
+      request?.bridges.set(identity, bridge);
       let detached = false;
       const send = async () => {
         detached = await sendBashWaitDetach(bridge, sessionID, request !== undefined);
       };
-      if (request) await queuePendingOperation(bridge, sessionID, send);
+      if (request) await queuePendingOperation(identity, sessionID, send);
       else await send();
       if (detached) {
         log(
-          `[bash_wait_detach] detached wait for session ${sessionID} (bridge ${signaled}/${targets.length})`,
+          `[bash_wait_detach] detached wait for session ${sessionID} (bridge ${signaled}/${targets.size})`,
         );
         if (!request) return;
       }

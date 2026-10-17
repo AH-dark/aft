@@ -251,7 +251,7 @@ export async function callBridge(
   let response: Record<string, unknown>;
   try {
     const pool = bridgePools.get(bridge);
-    if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId);
+    if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, command === "bash");
     response = await bridge.send(
       command,
       merged,
@@ -321,7 +321,7 @@ export async function callToolCallForSession(
   let response: ToolCallResult;
   try {
     const pool = bridgePools.get(bridge);
-    if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId);
+    if (pool) await forwardPendingBashWaitDetach(pool, bridge, sessionId, name === "bash");
     response = await bridge.toolCall(
       sessionId,
       name,

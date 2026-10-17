@@ -316,7 +316,7 @@ export async function callBridge(
   let response: Awaited<ReturnType<AftProjectTransport["send"]>>;
   try {
     const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
-    await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID);
+    await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID, command === "bash");
     const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
     response = ctx.pool.sendForCanonicalRoot
       ? await ctx.pool.sendForCanonicalRoot(root, command, merged, opts)
@@ -373,7 +373,7 @@ export async function callToolCall(
   let response: Awaited<ReturnType<AftProjectTransport["toolCall"]>>;
   try {
     const root = asCanonicalRootPath(checkedProjectRoot(ctx, runtime));
-    await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID);
+    await forwardPendingBashWaitDetach(ctx.pool, root, runtime.sessionID, name === "bash");
     const opts = Object.keys(sendOptions).length > 0 ? sendOptions : undefined;
     response = ctx.pool.toolCallForCanonicalRoot
       ? await ctx.pool.toolCallForCanonicalRoot(root, runtime.sessionID, name, rawArgs, opts)
