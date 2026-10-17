@@ -4690,6 +4690,10 @@ mod tests {
     /// queue nothing for re-embedding, and leave the status `ready`.
     #[test]
     fn watcher_burst_for_unchanged_files_keeps_vectors_and_queues_no_refresh() {
+        // The drain may defer file checks when its wall-clock budget expires.
+        // Freeze that clock so the no-refresh assertion observes all checks,
+        // rather than passing because processing has not reached them yet.
+        let _clock = WatcherDrainTestClock::freeze();
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let file_count = crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES + 8;
@@ -4746,6 +4750,7 @@ mod tests {
         let outcome = drain_watcher_events_bounded(&ctx, files.len());
 
         assert_eq!(outcome.processed, files.len());
+        assert!(!outcome.has_more);
         let index = ctx
             .semantic_index()
             .read()
@@ -4770,6 +4775,10 @@ mod tests {
     /// saying `ready` for as long as they are pending.
     #[test]
     fn watcher_burst_of_real_changes_reports_refreshing() {
+        // The drain can defer unfinished work when its wall-clock budget expires,
+        // and it sends refresh requests only after processing the whole batch.
+        // Freeze that clock so one call completes before we inspect the queue.
+        let _clock = WatcherDrainTestClock::freeze();
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let file_count = crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES + 8;
@@ -4816,12 +4825,14 @@ mod tests {
             .send(WatcherDispatchEvent::Paths(files.clone()))
             .unwrap();
 
-        drain_watcher_events_bounded(&ctx, files.len());
+        let outcome = drain_watcher_events_bounded(&ctx, files.len());
 
         match request_rx.try_recv().expect("changed files are queued") {
             SemanticRefreshRequest::Files { paths } => assert_eq!(paths.len(), files.len()),
             SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
         }
+        assert_eq!(outcome.processed, files.len());
+        assert!(!outcome.has_more);
         let mut status = ctx
             .semantic_index_status()
             .write()
