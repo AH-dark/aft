@@ -105,6 +105,9 @@ pub(crate) enum Script {
     },
     /// Withhold the first stream record until `Daemon::acceptance_gate` is notified.
     GatedAcceptance,
+    /// Drop the connection on the first `exec.run`, before any stream record:
+    /// the runner never sends `Accepted`, so the caller cannot know the outcome.
+    DropBeforeAccepted,
     /// Refuse once while draining, then gate the retry's first record.
     DrainingGatedAcceptance,
     NetworkGranted,
@@ -249,6 +252,10 @@ pub(crate) async fn daemon_with_capabilities(
                                 || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
                             if attaching && matches!(script, Script::AttachDisconnected) {
                                 // Drop the route and listener; later attach calls and connects fail.
+                                return;
+                            }
+                            if !attaching && matches!(script, Script::DropBeforeAccepted) {
+                                // Drop the connection and listener with the run in flight.
                                 return;
                             }
                             if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::DrainingGatedAcceptance) {

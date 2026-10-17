@@ -593,16 +593,81 @@ async fn warn_if_runon_capture_missing(
     session: String,
     response: Response,
 ) -> Response {
-    if tokio::task::spawn_blocking(move || registry.runon_inputs_captured(&task_id, &session))
-        .await
-        .ok()
-        .flatten()
-        == Some(false)
-    {
-        with_capture_warning(&response)
-    } else {
-        response
+    let fallback = copy_response(&response);
+    tokio::task::spawn_blocking(move || {
+        crate::commands::bash_orchestrate::with_runon_capture_state(
+            &registry, &task_id, &session, response,
+        )
+    })
+    .await
+    .unwrap_or(fallback)
+}
+
+fn copy_response(response: &Response) -> Response {
+    Response {
+        id: response.id.clone(),
+        success: response.success,
+        data: response.data.clone(),
     }
+}
+
+/// The launch reply once the remote dispatch worker has settled (the runner's
+/// `Accepted` arrived, or the worker finished without it). `None` keeps the
+/// caller's normal reply: inputs were captured and the task is live or about to
+/// report through its usual wait.
+fn settled_runon_launch_reply(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: &Response,
+) -> Option<Response> {
+    if registry.runon_inputs_captured(task_id, session) == Some(true) {
+        // A refusal after Accepted still answers the launch with its error.
+        let snapshot = registry
+            .observed_status(
+                task_id,
+                session,
+                crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .filter(|snapshot| snapshot.remote_refusal.is_some())?;
+        let now = Instant::now();
+        return match crate::commands::bash_orchestrate::decide_bash_step(
+            snapshot,
+            now,
+            false,
+            false,
+            now,
+            &response.id,
+        ) {
+            crate::commands::bash_orchestrate::BashStep::Done(reply) => Some(reply),
+            _ => None,
+        };
+    }
+    // Without Accepted, a task that already ended (refused, failed, outcome
+    // unknown, killed) reports that saved outcome; only a live task says
+    // `starting`.
+    Some(crate::commands::bash_orchestrate::runon_uncaptured_reply(
+        registry, task_id, session, response,
+    ))
+}
+
+/// The capture-pending reply when the wait ends before the worker settled.
+/// Reads saved state off the frame runtime, so a task that ended in the
+/// meantime still reports its outcome instead of `starting`.
+async fn unsettled_runon_launch_reply(
+    registry: crate::bash_background::BgTaskRegistry,
+    task_id: String,
+    session: String,
+    response: &Response,
+) -> Response {
+    let pending = copy_response(response);
+    tokio::task::spawn_blocking(move || {
+        crate::commands::bash_orchestrate::runon_uncaptured_reply(
+            &registry, &task_id, &session, &pending,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| with_capture_warning(response))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -619,52 +684,29 @@ async fn await_runon_launch_reply(
     let task_id = response.data.get("task_id")?.as_str()?.to_owned();
     let capture = async {
         loop {
-            let registry = registry.clone();
-            let task_id = task_id.clone();
-            let session = session.to_owned();
-            let request_id = response.id.clone();
+            let observed_registry = registry.clone();
+            let observed_task = task_id.clone();
+            let observed_session = session.to_owned();
+            let launch = copy_response(response);
             // Task-state and artifact access can block on disk or mutexes. Keep it
             // off the frame runtime and release every lock before polling again.
+            // Wait for the worker to settle before reading a terminal state, so a
+            // refusal is rendered from what the worker finished recording.
             let observation = tokio::task::spawn_blocking(move || {
-                let pending = registry.runon_launch_pending(&task_id, &session);
-                let refusal = if pending == Some(false) {
-                    registry
-                        .observed_status(&task_id, &session, 8192)
-                        .filter(|snapshot| snapshot.remote_refusal.is_some())
-                        .and_then(|snapshot| {
-                            let now = Instant::now();
-                            match crate::commands::bash_orchestrate::decide_bash_step(
-                                snapshot,
-                                now,
-                                false,
-                                false,
-                                now,
-                                &request_id,
-                            ) {
-                                crate::commands::bash_orchestrate::BashStep::Done(response) => {
-                                    Some(response)
-                                }
-                                _ => None,
-                            }
-                        })
-                } else {
-                    None
-                };
-                let captured = registry.runon_inputs_captured(&task_id, &session);
-                (pending == Some(true), captured, refusal)
+                (observed_registry.runon_launch_pending(&observed_task, &observed_session)
+                    != Some(true))
+                .then(|| {
+                    settled_runon_launch_reply(
+                        &observed_registry,
+                        &observed_task,
+                        &observed_session,
+                        &launch,
+                    )
+                })
             });
             match tokio::time::timeout_at(deadline.into(), observation).await {
-                Ok(Ok((false, captured, refusal))) => {
-                    return match refusal {
-                        Some(refusal) if captured == Some(false) => {
-                            Some(with_capture_warning(&refusal))
-                        }
-                        Some(refusal) => Some(refusal),
-                        None if captured != Some(true) => Some(with_capture_warning(response)),
-                        None => None,
-                    }
-                }
-                Ok(Ok((true, _, _))) if Instant::now() < deadline => {
+                Ok(Ok(Some(reply))) => return reply,
+                Ok(Ok(None)) if Instant::now() < deadline => {
                     tokio::time::sleep_until(
                         (Instant::now() + Duration::from_millis(20))
                             .min(deadline)
@@ -672,8 +714,19 @@ async fn await_runon_launch_reply(
                     )
                     .await;
                 }
+                // The state read itself overran the deadline; reading it again
+                // could block the reply just as long.
+                Err(_) => return Some(with_capture_warning(response)),
                 _ => {
-                    return Some(with_capture_warning(response));
+                    return Some(
+                        unsettled_runon_launch_reply(
+                            registry.clone(),
+                            task_id.clone(),
+                            session.to_owned(),
+                            response,
+                        )
+                        .await,
+                    );
                 }
             }
         }
@@ -686,7 +739,15 @@ async fn await_runon_launch_reply(
             while !cancel.drain.is_active() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }, if !server_completion => Some(with_capture_warning(response)),
+        }, if !server_completion => Some(
+            unsettled_runon_launch_reply(
+                registry.clone(),
+                task_id.clone(),
+                session.to_owned(),
+                response,
+            )
+            .await,
+        ),
         reply = capture => reply,
     }
 }
@@ -2394,6 +2455,8 @@ async fn send_ready_bash_result(
 ) {
     // Capture is not a second blocking-call deadline. Inspect it only when the
     // normal wait is ready to answer, and preserve that answer with a warning.
+    let announced_live =
+        crate::commands::bash_orchestrate::reply_announces_live_task(&result.response);
     result.response = warn_if_runon_capture_missing(
         ctx.bash_background().clone(),
         task_id.to_owned(),
@@ -2401,7 +2464,14 @@ async fn send_ready_bash_result(
         result.response,
     )
     .await;
-    if result.response.data["output"]
+    if announced_live
+        && !crate::commands::bash_orchestrate::reply_announces_live_task(&result.response)
+    {
+        // The task ended before the runner confirmed input capture, so the
+        // reply now carries its saved outcome; the earlier text described a
+        // live task and must not be sent.
+        result = bash_result_from_response(result.response, format_context);
+    } else if result.response.data["output"]
         .as_str()
         .is_some_and(|text| text.ends_with(REMOTE_INPUT_CAPTURE_WARNING))
         && !result.text.contains(REMOTE_INPUT_CAPTURE_WARNING)
@@ -4210,6 +4280,93 @@ mod grant_path_tests {
         assert_eq!(response.data["code"], "remote_unavailable");
         assert_eq!(response.data["message"], "runon refused: remote refused: unreachable; command was not run; retry, or omit runon to run locally");
         assert!(response.data["task_id"].as_str().is_some());
+    }
+
+    /// The runner connection drops before `Accepted`, so the worker settles
+    /// the task as outcome unknown. The launch reply, foreground or background,
+    /// must report that saved outcome and its rerun advice rather than the
+    /// pre-capture `starting` reply, which promises queued and running states
+    /// the task will never reach.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_connection_drop_before_accepted_reports_outcome_unknown() {
+        use crate::exec_remote::wire_tests::Script;
+        for background in [true, false] {
+            let (daemon, _dir, root, executor, ctx) =
+                capture_fixture(Script::DropBeforeAccepted).await;
+            let mut rx = capture_call(
+                &executor,
+                &root,
+                json!({"command":"uname -s", "runon":"linux", "background":background, "timeout":10000}),
+            );
+            wait_for_capture_submission(&daemon, &mut rx).await;
+            let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("the settled launch must answer without waiting for the capture deadline")
+                .unwrap();
+            let response = done.response_for_test();
+            let text = done.text_for_test().unwrap();
+            assert_eq!(
+                response.data["status"], "fate_unknown",
+                "background={background}: {response:?}"
+            );
+            assert_ne!(response.data["phase"], "submitting", "{response:?}");
+            assert!(
+                text.contains("remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe"),
+                "background={background}: {text}"
+            );
+            let task_id = response.data["task_id"].as_str().unwrap();
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(task_id, "deadline-session", 0)
+                .unwrap();
+            assert_eq!(
+                snapshot.info.status,
+                crate::bash_background::BgTaskStatus::FateUnknown
+            );
+        }
+    }
+
+    /// A runner that accepts and then finishes keeps the ordinary launch reply:
+    /// a background launch still answers with its task handle, not the result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runon_capture_accepted_then_completed_keeps_launch_reply() {
+        use crate::exec_remote::wire_tests::Script;
+        let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::Plain).await;
+        let mut rx = capture_call(
+            &executor,
+            &root,
+            json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000}),
+        );
+        wait_for_capture_submission(&daemon, &mut rx).await;
+        let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "running", "{response:?}");
+        assert!(!done
+            .text_for_test()
+            .unwrap()
+            .contains(REMOTE_INPUT_CAPTURE_WARNING));
+        let task_id = response.data["task_id"].as_str().unwrap().to_owned();
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = ctx
+                    .bash_background()
+                    .observed_status(&task_id, "deadline-session", 0)
+                    .unwrap();
+                if snapshot.info.status.is_terminal() {
+                    return snapshot.info.status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the accepted job must finish");
+        assert_eq!(finished, crate::bash_background::BgTaskStatus::Completed);
     }
 
     #[cfg(unix)]

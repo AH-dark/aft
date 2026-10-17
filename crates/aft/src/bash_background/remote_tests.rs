@@ -8,7 +8,10 @@ fn reattach_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
 }
 
 pub(super) fn take_reattach_budget(root: &Path) -> Option<Duration> {
-    reattach_budgets().lock().unwrap().remove(root)
+    reattach_budgets()
+        .lock()
+        .unwrap()
+        .remove(&test_clock_key(root))
 }
 
 fn shorten_reattach_budget(root: &Path) {
@@ -18,7 +21,7 @@ fn shorten_reattach_budget(root: &Path) {
     reattach_budgets()
         .lock()
         .unwrap()
-        .insert(root.into(), Duration::from_millis(1_500));
+        .insert(test_clock_key(root), Duration::from_millis(1_500));
 }
 
 pub(super) struct ReattachClock {
@@ -40,7 +43,11 @@ fn reattach_clocks() -> &'static Mutex<HashMap<PathBuf, Arc<ReattachClock>>> {
 }
 
 pub(super) fn reattach_clock(root: &Path) -> Option<Arc<ReattachClock>> {
-    reattach_clocks().lock().unwrap().get(root).cloned()
+    reattach_clocks()
+        .lock()
+        .unwrap()
+        .get(&test_clock_key(root))
+        .cloned()
 }
 
 // Remote workers run on separate runtimes. Advance their recovery budget only
@@ -52,6 +59,7 @@ struct PausedReattachClock {
 
 impl PausedReattachClock {
     fn new(root: &Path) -> Self {
+        let root = test_clock_key(root);
         let (ticks, _) = tokio::sync::watch::channel(Duration::ZERO);
         let (resets, _) = tokio::sync::watch::channel(0);
         let (waits, _) = tokio::sync::watch::channel(0);
@@ -63,12 +71,9 @@ impl PausedReattachClock {
         assert!(reattach_clocks()
             .lock()
             .unwrap()
-            .insert(root.into(), clock.clone())
+            .insert(root.clone(), clock.clone())
             .is_none());
-        Self {
-            root: root.into(),
-            clock,
-        }
+        Self { root, clock }
     }
 
     async fn after_resets(&self, count: u64) {
@@ -791,6 +796,62 @@ fn exec_remote_bash_unknown_reply_without_job_omits_status_hint() {
     assert!(done
         .output_preview
         .contains("remote route interrupted before acceptance"));
+}
+
+/// Promotion, wait-mode detach, remote hand-back, module-drain detach and the
+/// module loop's held-call answer all pass their live-task reply through
+/// `with_runon_capture_state`. Before the runner's `Accepted`, a live task
+/// reads `starting`; once the task has ended (here: outcome unknown after the
+/// connection dropped), the reply must carry that saved outcome and its rerun
+/// advice instead.
+#[test]
+fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
+    use crate::commands::bash_orchestrate::{
+        with_runon_capture_state, REMOTE_INPUT_CAPTURE_WARNING,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.explicit_runon = true;
+        remote.accepted = false;
+        remote.job_id = None;
+    }
+    let live_reply = || {
+        crate::protocol::Response::success(
+            "promote",
+            serde_json::json!({
+                "output": "moved to the background",
+                "task_id": task_id,
+                "status": "running",
+            }),
+        )
+    };
+    let pending = with_runon_capture_state(&registry, &task_id, "session", live_reply());
+    assert_eq!(pending.data["status"], "starting", "{pending:?}");
+    assert_eq!(pending.data["phase"], "submitting", "{pending:?}");
+
+    registry.remote_terminal(
+        &task,
+        Verdict::OutcomeUnknown,
+        Some("remote route interrupted before acceptance".into()),
+    );
+    let ended = with_runon_capture_state(&registry, &task_id, "session", live_reply());
+    assert_eq!(ended.data["status"], "fate_unknown", "{ended:?}");
+    assert!(ended.data.get("phase").is_none(), "{ended:?}");
+    assert_eq!(ended.data["task_id"], task_id.as_str());
+    let output = ended.data["output"].as_str().unwrap();
+    assert!(
+        output.contains("remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe"),
+        "{output}"
+    );
+    assert!(!output.contains("moved to the background"), "{output}");
+    // Inputs were never confirmed copied, and an unknown outcome may still be
+    // using them, so the warning stays.
+    assert!(output.ends_with(REMOTE_INPUT_CAPTURE_WARNING), "{output}");
 }
 
 #[test]
@@ -5067,12 +5128,12 @@ fn draining_clocks() -> &'static Mutex<HashMap<PathBuf, Arc<DrainingClock>>> {
     CLOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Clocks are keyed by the canonical project root. A test names its temporary
-/// directory as created (on macOS under the `/var` symlink), while a worker
-/// started through the bash handler records the resolved checkout path (under
-/// `/private/var`). Without one key form the worker misses the paused clock,
-/// sleeps on real time, and the test waits for an event that never comes.
-fn draining_clock_key(root: &Path) -> PathBuf {
+/// Test clocks and budgets are keyed by the canonical project root. A test names
+/// its temporary directory as created (on macOS under the `/var` symlink), while
+/// a worker started through the bash handler records the resolved checkout path
+/// (under `/private/var`). Without one key form the worker misses the paused
+/// clock, sleeps on real time, and the test waits for an event that never comes.
+fn test_clock_key(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.into())
 }
 
@@ -5080,7 +5141,7 @@ pub(super) fn draining_clock(root: &Path) -> Option<Arc<DrainingClock>> {
     draining_clocks()
         .lock()
         .unwrap()
-        .get(&draining_clock_key(root))
+        .get(&test_clock_key(root))
         .cloned()
 }
 
@@ -5100,7 +5161,7 @@ struct PausedDrainingClock {
 
 impl PausedDrainingClock {
     fn new(root: &Path) -> Self {
-        let root = draining_clock_key(root);
+        let root = test_clock_key(root);
         let (ticks, _) = tokio::sync::watch::channel(1_000_000);
         let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
         let clock = Arc::new(DrainingClock { ticks, events });

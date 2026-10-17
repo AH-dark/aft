@@ -957,10 +957,7 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
         success: response.success,
         data: response.data.clone(),
     };
-    if matches!(
-        response.data["status"].as_str(),
-        None | Some("running" | "starting")
-    ) {
+    if reply_announces_live_task(&response) {
         response.data["status"] = json!("starting");
         response.data["phase"] = json!("submitting");
         if response.data.get("remote_phase").is_some() {
@@ -980,6 +977,45 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
     response
 }
 
+/// The reply for an explicit `runon` task whose runner has not confirmed input
+/// capture. A reply that would announce a live task (`running` or `starting`)
+/// is checked against the task's saved state first: a task that already ended
+/// (refused, failed, outcome unknown, killed or completed) before `Accepted`
+/// shows that saved outcome, rendered as a finished command's reply with its
+/// advice, so the caller is never told to wait for queued or running states the
+/// task will not reach. A task still in flight gets the `starting` reply with
+/// the capture warning.
+pub(crate) fn runon_uncaptured_reply(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: &Response,
+) -> Response {
+    if reply_announces_live_task(response) {
+        if let Some(snapshot) = registry
+            .observed_status(
+                task_id,
+                session,
+                crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .filter(|snapshot| snapshot.info.status.is_terminal())
+        {
+            // The finished-command reply adds the capture warning itself
+            // while the runner's Accepted record is missing.
+            return foreground_result_response(&response.id, snapshot);
+        }
+    }
+    with_capture_warning(response)
+}
+
+/// Whether `with_capture_warning` would present this reply as `starting`.
+pub(crate) fn reply_announces_live_task(response: &Response) -> bool {
+    matches!(
+        response.data["status"].as_str(),
+        None | Some("running" | "starting")
+    )
+}
+
 pub(crate) fn with_runon_capture_state(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
@@ -987,7 +1023,7 @@ pub(crate) fn with_runon_capture_state(
     response: Response,
 ) -> Response {
     if registry.runon_inputs_captured(task_id, session) == Some(false) {
-        with_capture_warning(&response)
+        runon_uncaptured_reply(registry, task_id, session, &response)
     } else {
         response
     }
