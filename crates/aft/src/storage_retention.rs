@@ -518,7 +518,7 @@ fn boot_id() -> Option<String> {
     None
 }
 
-fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
+pub(crate) fn volume_anchor(root: &Path) -> Option<(PathBuf, u64)> {
     #[cfg(target_os = "macos")]
     {
         let anchor = mount_point(root)?;

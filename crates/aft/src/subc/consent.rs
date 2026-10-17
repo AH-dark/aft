@@ -590,6 +590,7 @@ fn new_call_key() -> String {
     format!("aft-ask-{hex}")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     conn: &rusqlite::Connection,
     ctx: &AppContext,
@@ -597,6 +598,7 @@ fn prepare(
     tool: &str,
     arguments: &Value,
     grant: &AccessGrant,
+    directory_scope: &AccessGrant,
     own_holder: Option<&str>,
 ) -> rusqlite::Result<Prep> {
     let stamp = identity
@@ -634,12 +636,22 @@ fn prepare(
         }
     }
     let call_key = new_call_key();
+    let mut scope_grant = directory_scope.clone();
     // `head_policy` says whether the worker's head itself holds the requested
     // access, which decides whether the head may allow it. Cingulate requires
     // it on asks from a `worker` scope and refuses it on every other kind.
     let head = match identity.scope.as_ref().map(|stamp| stamp.kind) {
         Some(subc_protocol::scope::ScopeKind::Worker) => {
-            Some(head_policy(conn, ctx, identity, grant)?)
+            let file_head = head_policy(conn, ctx, identity, grant)?;
+            // A head can approve a file without holding its containing tree.
+            // Advertise that tree only when the head can delegate both choices.
+            if file_head != HeadPolicy::Allow
+                || (scope_grant != *grant
+                    && head_policy(conn, ctx, identity, &scope_grant)? != HeadPolicy::Allow)
+            {
+                scope_grant = grant.clone();
+            }
+            Some(file_head)
         }
         _ => None,
     };
@@ -649,12 +661,9 @@ fn prepare(
         tool,
         operation_name(grant.operation),
         &path,
-        &format!(
-            "{tool} needs to {} a path outside this route's roots",
-            operation_name(grant.operation)
-        ),
+        scope_reason(&scope_grant),
         &key.args_hash,
-        &pattern(grant),
+        &pattern(&scope_grant),
         head.map(head_policy_name),
     );
     asks::open(
@@ -673,6 +682,227 @@ fn prepare(
         selector,
         grant: grant.clone(),
     }))
+}
+
+const READ_TREE_SCOPE_REASON: &str = "Allow scope: read-only access for all AFT read tools within the displayed directory tree. Protected paths remain denied.";
+const READ_FILE_SCOPE_REASON: &str = "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.";
+const WRITE_TREE_SCOPE_REASON: &str = "Allow scope: read/write access for all AFT file tools within the displayed directory tree. Protected paths remain denied.";
+const WRITE_FILE_SCOPE_REASON: &str = "Allow scope: read/write access for all AFT file tools to the displayed file only. Protected paths remain denied.";
+
+fn scope_reason(grant: &AccessGrant) -> &'static str {
+    match (grant.operation, grant.kind) {
+        (AccessOperation::Read, GrantKind::Subtree) => READ_TREE_SCOPE_REASON,
+        (AccessOperation::Read, GrantKind::File) => READ_FILE_SCOPE_REASON,
+        (AccessOperation::Write, GrantKind::Subtree) => WRITE_TREE_SCOPE_REASON,
+        (AccessOperation::Write, GrantKind::File) => WRITE_FILE_SCOPE_REASON,
+    }
+}
+
+/// Offer a read-file's immediate directory only when it is not a home ancestor
+/// or a root-level system directory. Unknown home/volume identity stays file-only.
+fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
+    read_directory_scope_with(grant, directory_is_root_alias)
+}
+
+fn read_directory_scope_with<F>(grant: &AccessGrant, root_alias_check: F) -> AccessGrant
+where
+    F: Fn(&Path, &Path) -> Option<bool> + Send + Sync + 'static,
+{
+    const PROBE_BUDGET: Duration = Duration::from_millis(250);
+    if grant.operation != AccessOperation::Read || grant.kind != GrantKind::File {
+        return grant.clone();
+    }
+    let Some(parent) = grant.path.parent() else {
+        return grant.clone();
+    };
+    let Some(permit) = DIRECTORY_SCOPE_PROBE_LIMITER.try_acquire() else {
+        return grant.clone();
+    };
+    let probing = grant.clone();
+    // Home canonicalization and volume checks can stall before alias scanning.
+    // Keep the slot with the filesystem work even after its caller times out,
+    // so repeated permission requests cannot exhaust the shared helper pool.
+    crate::bounded_io::run(parent, Some(Instant::now() + PROBE_BUDGET), move |_| {
+        let _permit = permit;
+        Ok(probe_directory_scope_with(&probing, root_alias_check))
+    })
+    .unwrap_or_else(|_| grant.clone())
+}
+
+async fn scope_before_db(grant: &AccessGrant) -> AccessGrant {
+    let probing = grant.clone();
+    // A bounded helper still waits for its deadline. Keep that wait off the
+    // async executor and outside the database mutex used for head-policy checks.
+    tokio::task::spawn_blocking(move || read_directory_scope(&probing))
+        .await
+        .unwrap_or_else(|_| grant.clone())
+}
+
+fn probe_directory_scope_with(
+    grant: &AccessGrant,
+    root_alias_check: impl Fn(&Path, &Path) -> Option<bool>,
+) -> AccessGrant {
+    if grant.operation == AccessOperation::Read && grant.kind == GrantKind::File {
+        if let Some(parent) = grant.path.parent() {
+            let home = crate::environment::non_empty_os_var("HOME")
+                .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .map(|path| {
+                    #[cfg(all(test, unix))]
+                    crate::bounded_io::stall_helper_if_requested(&path);
+                    crate::access_policy::policy_path(&path)
+                });
+            if let (Some(home), Some((volume, _))) =
+                (home, crate::storage_retention::volume_anchor(parent))
+            {
+                let volume = crate::access_policy::policy_path(&volume);
+                let root = parent.ancestors().last().unwrap_or(parent);
+                if directory_scope_is_narrow(parent, &home, &volume)
+                    && directory_is_protected_alias(parent, &home, &volume) == Some(false)
+                    && root_alias_check(parent, root) == Some(false)
+                    && (root == volume || root_alias_check(parent, &volume) == Some(false))
+                {
+                    return AccessGrant {
+                        path: parent.to_path_buf(),
+                        kind: GrantKind::Subtree,
+                        operation: AccessOperation::Read,
+                    };
+                }
+            }
+        }
+    }
+    grant.clone()
+}
+
+/// Inputs are canonical policy identities, including home aliases and native
+/// volume roots. Exclude root-level system directories and all home ancestors.
+fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
+    directory.is_absolute()
+        && directory.parent().and_then(Path::parent).is_some()
+        && !home.starts_with(directory)
+        && directory != volume
+        && directory.parent() != Some(volume)
+}
+
+/// Bind mounts can preserve a protected directory's identity without preserving
+/// its path spelling. Device/inode checks also catch same-device volume aliases.
+#[cfg(unix)]
+fn directory_is_protected_alias(directory: &Path, home: &Path, volume: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |path: &Path| {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    let candidate = identity(directory)?;
+    for ancestor in home.ancestors().chain(std::iter::once(volume)) {
+        if identity(ancestor)? == candidate {
+            return Some(true);
+        }
+    }
+    Some(identity(directory.parent()?)? == identity(volume)?)
+}
+
+#[cfg(not(unix))]
+fn directory_is_protected_alias(_directory: &Path, _home: &Path, _volume: &Path) -> Option<bool> {
+    Some(false)
+}
+
+/// A canonical directory can still be a root-level alias, such as /etc pointing
+/// to /private/etc. Only resolvable aliases have a target identity to compare.
+/// Reverse aliases cannot be recovered from the candidate's canonical path.
+/// Give their enumeration a separate helper and one process-wide slot: unknown
+/// or busy scans must never widen a file grant.
+const ROOT_ALIAS_SCAN_BUDGET: Duration = Duration::from_millis(250);
+
+struct ScopeProbeLimiter {
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScopeProbeLimiter {
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<ScopeProbePermit> {
+        self.in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| ScopeProbePermit(Arc::clone(&self.in_flight)))
+    }
+
+    fn scan<F>(&self, scan: F) -> Option<bool>
+    where
+        F: FnOnce() -> Option<bool> + Send + 'static,
+    {
+        let permit = self.try_acquire()?;
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("aft-root-alias-scan".into())
+            .spawn(move || {
+                let result = scan();
+                drop(permit);
+                let _ = sender.send(result);
+            });
+        // A failed spawn drops the closure and its permit, which releases the
+        // slot; clearing it here too could release a newer caller's slot.
+        if spawned.is_err() {
+            return None;
+        }
+
+        receiver.recv_timeout(ROOT_ALIAS_SCAN_BUDGET).ok().flatten()
+    }
+}
+
+struct ScopeProbePermit(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ScopeProbePermit {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+static DIRECTORY_SCOPE_PROBE_LIMITER: LazyLock<ScopeProbeLimiter> =
+    LazyLock::new(ScopeProbeLimiter::new);
+static ROOT_ALIAS_SCAN_LIMITER: LazyLock<ScopeProbeLimiter> = LazyLock::new(ScopeProbeLimiter::new);
+
+fn directory_is_root_alias(directory: &Path, root: &Path) -> Option<bool> {
+    let directory = directory.to_path_buf();
+    let root = root.to_path_buf();
+    ROOT_ALIAS_SCAN_LIMITER.scan(move || scan_root_alias(&directory, &root))
+}
+
+fn scan_root_alias(directory: &Path, root: &Path) -> Option<bool> {
+    for entry in std::fs::read_dir(root).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_type().ok()?.is_symlink() {
+            let Ok(target) = entry.path().canonicalize() else {
+                continue;
+            };
+            if crate::access_policy::policy_path(&target) == directory {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// A pending card can outlive a daemon upgrade. Widen only when its persisted
+/// display pattern offered the directory; older file-only cards stay file-only.
+fn advertised_scope(prep: &Prepared, directory: AccessGrant) -> AccessGrant {
+    if prep.request.get("pattern").and_then(Value::as_str) == Some(pattern(&directory).as_str()) {
+        directory
+    } else {
+        prep.grant.clone()
+    }
 }
 
 /// The display pattern Cingulate shows for the capability an answer grants:
@@ -960,6 +1190,7 @@ async fn hold(
     let tool = call.tool.clone();
     let arguments = call.arguments.clone();
     let asked = grant.clone();
+    let directory_scope = scope_before_db(&grant).await;
     let prepared = with_db(call, move |conn, ctx| {
         prepare(
             conn,
@@ -968,6 +1199,7 @@ async fn hold(
             &tool,
             &arguments,
             &asked,
+            &directory_scope,
             own_holder.as_deref(),
         )
     })
@@ -1102,7 +1334,18 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
             let identity = call.identity.clone();
             let key = prep.key.clone();
             let call_key = prep.call_key.clone();
-            let grant = prep.grant.clone();
+            let grant = if scope {
+                let directory = if prep.request.get("pattern").and_then(Value::as_str)
+                    == Some(pattern(&prep.grant).as_str())
+                {
+                    prep.grant.clone()
+                } else {
+                    scope_before_db(&prep.grant).await
+                };
+                advertised_scope(prep, directory)
+            } else {
+                prep.grant.clone()
+            };
             let claimant = holder.clone();
             let applied = with_db(call, move |conn, ctx| {
                 // A head may pass on only what it holds now: its authority is

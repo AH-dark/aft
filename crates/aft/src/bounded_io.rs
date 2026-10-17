@@ -860,6 +860,12 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
 #[cfg(test)]
 #[path = "bounded_io_tests.rs"]
 mod regression_tests;
+#[cfg(all(test, unix))]
+pub(crate) use regression_tests::stall_helper;
+#[cfg(all(test, unix))]
+pub(crate) fn stall_helper_if_requested(path: &Path) {
+    regression_tests::before_helper(path);
+}
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {

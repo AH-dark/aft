@@ -9,6 +9,46 @@ struct HelperGate {
 
 static HELPER_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(unix)]
+pub(crate) struct HelperStall {
+    path: PathBuf,
+    pub(crate) reached: Receiver<()>,
+    release: Sender<()>,
+    finished: Receiver<()>,
+}
+
+#[cfg(unix)]
+impl Drop for HelperStall {
+    fn drop(&mut self) {
+        HELPER_GATES.lock().unwrap().remove(&self.path);
+        if self.release.send(()).is_ok() {
+            let _ = self.finished.recv_timeout(IO_BUDGET);
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn stall_helper(path: &Path) -> HelperStall {
+    let (reached, reached_rx) = channel();
+    let (release, release_rx) = channel();
+    let (finished, finished_rx) = channel();
+    HELPER_GATES.lock().unwrap().insert(
+        path.to_path_buf(),
+        HelperGate {
+            reached,
+            release: release_rx,
+            finished,
+        },
+    );
+    HelperStall {
+        path: path.to_path_buf(),
+        reached: reached_rx,
+        release,
+        finished: finished_rx,
+    }
+}
+
 static BLOCKED_DIRECTORIES: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

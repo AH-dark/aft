@@ -828,6 +828,45 @@ mod tests {
         AccessPolicy::from_config(&config, store, vec![policy_path(root)], &root.join("home"))
     }
 
+    fn assert_read_scope_floor(relative: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = policy_path(&dir.path().join("home"));
+        let storage = home.join(".local/share/cortexkit/aft");
+        let target = home.join(relative);
+        let mut policy = AccessPolicy::from_config(
+            &Config::default(),
+            &storage,
+            vec![dir.path().join("worktree")],
+            &home,
+        );
+        let grant = AccessGrant {
+            path: home,
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        assert!(grant.covers(AccessOperation::Read, &target));
+        policy.grants.push(grant);
+        assert_eq!(
+            policy.decide(AccessOperation::Read, &target, false),
+            AccessDecision::Deny(AccessDenial::Floor)
+        );
+    }
+
+    #[test]
+    fn scope_read_grant_cannot_admit_credentials() {
+        assert_read_scope_floor(".ssh/id_ed25519");
+    }
+
+    #[test]
+    fn scope_read_grant_cannot_admit_cortexkit_data() {
+        assert_read_scope_floor(".local/share/cortexkit/alfonso/prompts/private.md");
+    }
+
+    #[test]
+    fn scope_read_grant_cannot_admit_environment_bin() {
+        assert_read_scope_floor(".local/share/cortexkit/aft/bash/task/control/environment.bin");
+    }
+
     #[test]
     fn worker_worktrees_leave_the_private_store_floor() {
         let root = tempfile::tempdir().unwrap();
