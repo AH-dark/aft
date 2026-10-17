@@ -1065,6 +1065,20 @@ async fn assert_probe_leaves_database_available(call: &HeldCall) {
 }
 
 #[cfg(unix)]
+async fn wait_for_scope_probe_idle() {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while DIRECTORY_SCOPE_PROBE_LIMITER
+            .in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the released filesystem helper returns its scope-probe slot");
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -1109,6 +1123,77 @@ async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() 
     assert_eq!(request["pattern"], json!(target));
     assert_eq!(request["reason"], READ_FILE_SCOPE_REASON);
     assert_eq!(request["head_policy"], "allow");
+    drop(_gate);
+    wait_for_scope_probe_idle().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .expect("an absolute home path for the scope probe");
+    let mut stalls = Vec::new();
+    let mut stalled_helpers = 0;
+    let started = Instant::now();
+    // More requests than the shared filesystem pool can hold must still leave
+    // room for unrelated reads while home canonicalization remains blocked.
+    for n in 0..72 {
+        let target = f.head_root.join(format!("home-probe-{n}.txt"));
+        let grant = AccessGrant {
+            path: target.clone(),
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        };
+        let call = scope_probe_call(&f, &target);
+        let route = RouteHold::new(call.route);
+        let gate = crate::bounded_io::stall_helper(&home);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            hold(&call, grant, Instant::now(), &route, None),
+        )
+        .await
+        .expect("a stalled or busy optional probe falls back without waiting");
+        assert!(matches!(result, Hold::Answer(_)));
+        stalled_helpers += usize::from(gate.reached.try_recv().is_ok());
+        stalls.push(gate);
+        let requests = f.fake.calls("consent.request");
+        let request = requests.last().expect("each request places a card");
+        assert_eq!(requests.len(), n + 1);
+        assert_eq!(request["pattern"], json!(target));
+        assert_eq!(request["reason"], READ_FILE_SCOPE_REASON);
+        assert_eq!(request["head_policy"], "allow");
+        assert_eq!(request["operation"], "read");
+    }
+    assert_eq!(
+        stalled_helpers, 1,
+        "timed-out home probes must retain the single-flight slot"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "busy probes must not wait for another probe deadline"
+    );
+    let unrelated = f.head_root.join("unrelated.txt");
+    std::fs::write(&unrelated, "unrelated read").unwrap();
+    let content = crate::bounded_io::run(
+        &unrelated,
+        Some(Instant::now() + Duration::from_secs(1)),
+        std::fs::read_to_string,
+    )
+    .expect("stalled home probes leave shared filesystem helpers available");
+    assert_eq!(content, "unrelated read");
+    drop(stalls);
+    wait_for_scope_probe_idle().await;
+    let next = AccessGrant {
+        path: f.head_root.join("after-home-recovery.txt"),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    assert_eq!(scope_before_db(&next).await.kind, GrantKind::Subtree);
 }
 
 #[cfg(unix)]
@@ -1166,6 +1251,8 @@ async fn consent_scope_stalled_finish_probe_is_bounded_and_releases_database() {
             operation: AccessOperation::Read,
         }]
     );
+    drop(_gate);
+    wait_for_scope_probe_idle().await;
 }
 
 #[tokio::test]
@@ -1323,6 +1410,7 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
+    let _lock = CONSENT_TEST_LOCK.blocking_lock();
     let dir = tempfile::tempdir().unwrap();
     let parent = dir.path().join("nested/src");
     std::fs::create_dir_all(&parent).unwrap();
@@ -1332,7 +1420,7 @@ fn consent_stalled_root_alias_scan_is_single_flight_and_fails_closed() {
         operation: AccessOperation::Read,
     };
 
-    let limiter = Arc::new(RootAliasScanLimiter::new());
+    let limiter = Arc::new(ScopeProbeLimiter::new());
     let scan_count = Arc::new(AtomicUsize::new(0));
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);

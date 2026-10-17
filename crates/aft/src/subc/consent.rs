@@ -715,10 +715,15 @@ where
     let Some(parent) = grant.path.parent() else {
         return grant.clone();
     };
+    let Some(permit) = DIRECTORY_SCOPE_PROBE_LIMITER.try_acquire() else {
+        return grant.clone();
+    };
     let probing = grant.clone();
-    // Root-alias enumeration has its own single-flight helper, so an unavailable
-    // mount cannot leave a shared filesystem worker occupied after this deadline.
+    // Home canonicalization and volume checks can stall before alias scanning.
+    // Keep the slot with the filesystem work even after its caller times out,
+    // so repeated permission requests cannot exhaust the shared helper pool.
     crate::bounded_io::run(parent, Some(Instant::now() + PROBE_BUDGET), move |_| {
+        let _permit = permit;
         Ok(probe_directory_scope_with(&probing, root_alias_check))
     })
     .unwrap_or_else(|_| grant.clone())
@@ -743,7 +748,11 @@ fn probe_directory_scope_with(
                 .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
-                .map(|path| crate::access_policy::policy_path(&path));
+                .map(|path| {
+                    #[cfg(all(test, unix))]
+                    crate::bounded_io::stall_helper_if_requested(&path);
+                    crate::access_policy::policy_path(&path)
+                });
             if let (Some(home), Some((volume, _))) =
                 (home, crate::storage_retention::volume_anchor(parent))
             {
@@ -806,36 +815,36 @@ fn directory_is_protected_alias(_directory: &Path, _home: &Path, _volume: &Path)
 /// or busy scans must never widen a file grant.
 const ROOT_ALIAS_SCAN_BUDGET: Duration = Duration::from_millis(250);
 
-struct RootAliasScanLimiter {
+struct ScopeProbeLimiter {
     in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl RootAliasScanLimiter {
+impl ScopeProbeLimiter {
     fn new() -> Self {
         Self {
             in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    fn scan<F>(&self, scan: F) -> Option<bool>
-    where
-        F: FnOnce() -> Option<bool> + Send + 'static,
-    {
-        if self
-            .in_flight
+    fn try_acquire(&self) -> Option<ScopeProbePermit> {
+        self.in_flight
             .compare_exchange(
                 false,
                 true,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
-            .is_err()
-        {
-            return None;
-        }
+            .ok()
+            .map(|_| ScopeProbePermit(Arc::clone(&self.in_flight)))
+    }
+
+    fn scan<F>(&self, scan: F) -> Option<bool>
+    where
+        F: FnOnce() -> Option<bool> + Send + 'static,
+    {
+        let permit = self.try_acquire()?;
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let permit = RootAliasScanPermit(Arc::clone(&self.in_flight));
         let spawned = std::thread::Builder::new()
             .name("aft-root-alias-scan".into())
             .spawn(move || {
@@ -853,16 +862,17 @@ impl RootAliasScanLimiter {
     }
 }
 
-struct RootAliasScanPermit(Arc<std::sync::atomic::AtomicBool>);
+struct ScopeProbePermit(Arc<std::sync::atomic::AtomicBool>);
 
-impl Drop for RootAliasScanPermit {
+impl Drop for ScopeProbePermit {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
-static ROOT_ALIAS_SCAN_LIMITER: LazyLock<RootAliasScanLimiter> =
-    LazyLock::new(RootAliasScanLimiter::new);
+static DIRECTORY_SCOPE_PROBE_LIMITER: LazyLock<ScopeProbeLimiter> =
+    LazyLock::new(ScopeProbeLimiter::new);
+static ROOT_ALIAS_SCAN_LIMITER: LazyLock<ScopeProbeLimiter> = LazyLock::new(ScopeProbeLimiter::new);
 
 fn directory_is_root_alias(directory: &Path, root: &Path) -> Option<bool> {
     let directory = directory.to_path_buf();
