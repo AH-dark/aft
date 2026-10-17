@@ -42,6 +42,74 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
     REQUEST_SCOPE.with(|slot| slot.borrow().clone())
 }
 
+/// Worker library reads use daemon-owned roots, never a caller's environment.
+/// A root is pinned to its real directory the first time it resolves, so later
+/// symlink changes cannot widen a grant. A root that does not exist yet (no
+/// crate downloaded on a fresh machine) is retried on the next policy build
+/// instead of being skipped until AFT restarts.
+pub(crate) fn worker_rust_read_grants() -> Vec<AccessGrant> {
+    // Published crate sources (registry and git dependencies) and toolchains:
+    // immutable package sources workers read when changing code against them.
+    const ROOTS: [(&str, &str, &str); 3] = [
+        ("CARGO_HOME", ".cargo", "registry/src"),
+        ("CARGO_HOME", ".cargo", "git/checkouts"),
+        ("RUSTUP_HOME", ".rustup", "toolchains"),
+    ];
+    static RESOLVED: std::sync::Mutex<[Option<AccessGrant>; 3]> =
+        std::sync::Mutex::new([None, None, None]);
+    let mut resolved = RESOLVED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (slot, (variable, default, subtree)) in resolved.iter_mut().zip(ROOTS) {
+        if slot.is_none() {
+            *slot = resolve_worker_rust_root(variable, default, subtree);
+        }
+    }
+    resolved.iter().flatten().cloned().collect()
+}
+
+fn resolve_worker_rust_root(variable: &str, default: &str, subtree: &str) -> Option<AccessGrant> {
+    let root = crate::environment::non_empty_os_var(variable)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|home| PathBuf::from(home).join(default))
+        })?;
+    // The root is retried while it is missing, and a worker shell can write in
+    // the Cargo cache, so it could create the subtree as a symlink to another
+    // project before the next policy build. Grant only a real directory reached
+    // without following any link below the configured home.
+    let joined = root.join(subtree);
+    if !no_symlink_below(&root, &joined) {
+        return None;
+    }
+    let path = joined.canonicalize().ok()?;
+    path.is_dir().then(|| AccessGrant {
+        path: crate::inspect::job::normalize_path(&path),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    })
+}
+
+/// True when every component of `path` below `root` exists and is a real
+/// directory, not a symlink or junction. `root` itself may be a link (a moved
+/// CARGO_HOME is normal); only what sits inside it must be genuine.
+fn no_symlink_below(root: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in rest.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Who answers an `ask` decision for the call running on this thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AskRoute {

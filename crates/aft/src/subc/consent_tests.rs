@@ -422,6 +422,18 @@ impl Fixture {
         corr: u64,
         dispatch: DispatchFn,
     ) -> mpsc::Receiver<WriterFrame> {
+        self.send_tool(identity, "read", json!({"filePath": path}), corr, dispatch)
+            .await
+    }
+
+    async fn send_tool(
+        &self,
+        identity: &RouteIdentity,
+        name: &str,
+        arguments: Value,
+        corr: u64,
+        dispatch: DispatchFn,
+    ) -> mpsc::Receiver<WriterFrame> {
         if self.executor.actor_context(&identity.root).is_none() {
             self.executor
                 .register_actor(identity.root.clone(), Arc::clone(&self.ctx));
@@ -434,9 +446,9 @@ impl Fixture {
             1,
             corr,
             serde_json::to_vec(&json!({
-                "name": "read",
+                "name": name,
                 "preset": if identity.scope.as_ref().is_some_and(|s| s.kind == subc_protocol::scope::ScopeKind::Head) { "head" } else { "worker" },
-                "arguments": {"filePath": path},
+                "arguments": arguments,
             }))
             .unwrap(),
         )
@@ -496,6 +508,10 @@ impl Fixture {
         crate::db::access_grants::list(&conn, &access_grants::scope_key(&self.worker)).unwrap()
     }
 }
+
+#[cfg(unix)]
+#[path = "consent_rust_sources_tests.rs"]
+mod rust_sources;
 
 fn code(reply: &Value) -> &str {
     reply["structuredContent"]["code"].as_str().unwrap_or("")
