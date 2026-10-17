@@ -590,6 +590,7 @@ fn new_call_key() -> String {
     format!("aft-ask-{hex}")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     conn: &rusqlite::Connection,
     ctx: &AppContext,
@@ -597,6 +598,7 @@ fn prepare(
     tool: &str,
     arguments: &Value,
     grant: &AccessGrant,
+    directory_scope: &AccessGrant,
     own_holder: Option<&str>,
 ) -> rusqlite::Result<Prep> {
     let stamp = identity
@@ -634,13 +636,22 @@ fn prepare(
         }
     }
     let call_key = new_call_key();
-    let scope_grant = read_directory_scope(grant);
+    let mut scope_grant = directory_scope.clone();
     // `head_policy` says whether the worker's head itself holds the requested
     // access, which decides whether the head may allow it. Cingulate requires
     // it on asks from a `worker` scope and refuses it on every other kind.
     let head = match identity.scope.as_ref().map(|stamp| stamp.kind) {
         Some(subc_protocol::scope::ScopeKind::Worker) => {
-            Some(head_policy(conn, ctx, identity, &scope_grant)?)
+            let file_head = head_policy(conn, ctx, identity, grant)?;
+            // A head can approve a file without holding its containing tree.
+            // Advertise that tree only when the head can delegate both choices.
+            if file_head != HeadPolicy::Allow
+                || (scope_grant != *grant
+                    && head_policy(conn, ctx, identity, &scope_grant)? != HeadPolicy::Allow)
+            {
+                scope_grant = grant.clone();
+            }
+            Some(file_head)
         }
         _ => None,
     };
@@ -690,6 +701,32 @@ fn scope_reason(grant: &AccessGrant) -> &'static str {
 /// Offer a read-file's immediate directory only when it is not a home ancestor
 /// or a root-level system directory. Unknown home/volume identity stays file-only.
 fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
+    const PROBE_BUDGET: Duration = Duration::from_millis(250);
+    if grant.operation != AccessOperation::Read || grant.kind != GrantKind::File {
+        return grant.clone();
+    }
+    let Some(parent) = grant.path.parent() else {
+        return grant.clone();
+    };
+    let probing = grant.clone();
+    // The whole identity probe shares one deadline, including reverse root
+    // aliases whose symlink targets can be unavailable network mounts.
+    crate::bounded_io::run(parent, Some(Instant::now() + PROBE_BUDGET), move |_| {
+        Ok(probe_directory_scope(&probing))
+    })
+    .unwrap_or_else(|_| grant.clone())
+}
+
+async fn scope_before_db(grant: &AccessGrant) -> AccessGrant {
+    let probing = grant.clone();
+    // A bounded helper still waits for its deadline. Keep that wait off the
+    // async executor and outside the database mutex used for head-policy checks.
+    tokio::task::spawn_blocking(move || read_directory_scope(&probing))
+        .await
+        .unwrap_or_else(|_| grant.clone())
+}
+
+fn probe_directory_scope(grant: &AccessGrant) -> AccessGrant {
     if grant.operation == AccessOperation::Read && grant.kind == GrantKind::File {
         if let Some(parent) = grant.path.parent() {
             let home = crate::environment::non_empty_os_var("HOME")
@@ -754,6 +791,8 @@ fn directory_is_protected_alias(_directory: &Path, _home: &Path, _volume: &Path)
 
 /// A canonical directory can still be a root-level alias, such as /etc pointing
 /// to /private/etc. Only resolvable aliases have a target identity to compare.
+/// Reverse aliases cannot be recovered from the candidate's canonical path;
+/// keep their enumeration inside the bounded identity probe.
 fn directory_is_root_alias(directory: &Path, root: &Path) -> Option<bool> {
     for entry in std::fs::read_dir(root).ok()? {
         let entry = entry.ok()?;
@@ -771,8 +810,7 @@ fn directory_is_root_alias(directory: &Path, root: &Path) -> Option<bool> {
 
 /// A pending card can outlive a daemon upgrade. Widen only when its persisted
 /// display pattern offered the directory; older file-only cards stay file-only.
-fn advertised_scope(prep: &Prepared) -> AccessGrant {
-    let directory = read_directory_scope(&prep.grant);
+fn advertised_scope(prep: &Prepared, directory: AccessGrant) -> AccessGrant {
     if prep.request.get("pattern").and_then(Value::as_str) == Some(pattern(&directory).as_str()) {
         directory
     } else {
@@ -1065,6 +1103,7 @@ async fn hold(
     let tool = call.tool.clone();
     let arguments = call.arguments.clone();
     let asked = grant.clone();
+    let directory_scope = scope_before_db(&grant).await;
     let prepared = with_db(call, move |conn, ctx| {
         prepare(
             conn,
@@ -1073,6 +1112,7 @@ async fn hold(
             &tool,
             &arguments,
             &asked,
+            &directory_scope,
             own_holder.as_deref(),
         )
     })
@@ -1208,7 +1248,14 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
             let key = prep.key.clone();
             let call_key = prep.call_key.clone();
             let grant = if scope {
-                advertised_scope(prep)
+                let directory = if prep.request.get("pattern").and_then(Value::as_str)
+                    == Some(pattern(&prep.grant).as_str())
+                {
+                    prep.grant.clone()
+                } else {
+                    scope_before_db(&prep.grant).await
+                };
+                advertised_scope(prep, directory)
             } else {
                 prep.grant.clone()
             };

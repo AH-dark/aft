@@ -915,7 +915,7 @@ async fn consent_scope_old_pending_file_is_not_widened() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn consent_scope_head_file_grant_cannot_delegate_directory() {
+async fn consent_scope_head_file_grant_allows_once_without_delegating_directory() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     set_hold_budget_for_test(Some(Duration::from_millis(100)));
@@ -938,18 +938,234 @@ async fn consent_scope_head_file_grant_cannot_delegate_directory() {
         "access_pending"
     );
     let request = &f.fake.calls("consent.request")[0];
-    assert_eq!(request["head_policy"], "not_held");
+    assert_eq!(request["head_policy"], "allow");
+    assert_eq!(request["pattern"], json!(target));
+    assert_eq!(request["reason"], READ_FILE_SCOPE_REASON);
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({
+            "state":"settled", "outcome":"allow_once", "answered_by":"head",
+        }),
+    );
+    let allowed = f.read(&f.worker, &target, 202).await;
+    assert!(text(&allowed).contains("unheld contents"), "{allowed}");
+    assert!(f.worker_grants().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_head_file_only_scope_answer_stores_only_the_file() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let target = f.dir.path().join("elsewhere.txt");
+    let grant = AccessGrant {
+        path: target.clone(),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    {
+        let db = f.ctx.db().unwrap();
+        crate::db::access_grants::insert(
+            &db.lock().unwrap(),
+            &access_grants::scope_key(&f.head),
+            &grant,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        code(&f.read(&f.worker, &target, 201).await),
+        "access_pending"
+    );
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["pattern"], json!(target));
+    assert_eq!(request["head_policy"], "allow");
     f.fake.answer(
         request["call_key"].as_str().unwrap(),
         json!({
             "state":"settled", "outcome":"allow_scope", "answered_by":"head",
         }),
     );
+    let allowed = f.read(&f.worker, &target, 202).await;
+    assert!(text(&allowed).contains("unheld contents"), "{allowed}");
+    assert_eq!(f.worker_grants(), vec![grant]);
+    let sibling = f.dir.path().join("sibling.txt");
+    std::fs::write(&sibling, "sibling contents").unwrap();
     assert_eq!(
-        code(&f.read(&f.worker, &target, 202).await),
-        "access_declined"
+        code(&f.read(&f.worker, &sibling, 203).await),
+        "access_pending"
     );
-    assert!(f.worker_grants().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_head_directory_still_delegates_directory() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let target = f.head_root.join("shared.txt");
+    assert_eq!(
+        code(&f.read(&f.worker, &target, 201).await),
+        "access_pending"
+    );
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["pattern"], format!("{}/**", f.head_root.display()));
+    assert_eq!(request["head_policy"], "allow");
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({
+            "state":"settled", "outcome":"allow_scope", "answered_by":"head",
+        }),
+    );
+    let allowed = f.read(&f.worker, &target, 202).await;
+    assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: f.head_root.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }]
+    );
+}
+
+#[cfg(unix)]
+fn scope_probe_call(f: &Fixture, target: &Path) -> HeldCall {
+    HeldCall {
+        reply_deadline: Instant::now() + Duration::from_secs(5),
+        identity: f.worker.clone(),
+        tool: "read".into(),
+        arguments: json!({"filePath":target}),
+        request_id: "scope-probe".into(),
+        executor: Arc::clone(&f.executor),
+        route: RouteChannel {
+            channel: 41,
+            epoch: 1,
+        },
+        corr: 201,
+        active: Arc::clone(&f.active),
+        connection_cancel: f.connection_cancel.clone(),
+        drain: drain::ModuleDrainWindow::default(),
+    }
+}
+
+#[cfg(unix)]
+async fn assert_probe_leaves_database_available(call: &HeldCall) {
+    let count = tokio::time::timeout(
+        Duration::from_millis(100),
+        with_db(call, |conn, _| {
+            conn.query_row("SELECT COUNT(*) FROM access_grants", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        }),
+    )
+    .await
+    .expect("another database user proceeds while the scope probe is stalled");
+    assert!(count.unwrap() >= 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_stalled_prepare_probe_is_bounded_and_releases_database() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let target = f.head_root.join("shared.txt");
+    let grant = AccessGrant {
+        path: target.clone(),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let call = Arc::new(scope_probe_call(&f, &target));
+    let gate = crate::bounded_io::stall_helper(&f.head_root);
+    let running_call = Arc::clone(&call);
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        let route = RouteHold::new(running_call.route);
+        hold(
+            &running_call,
+            grant,
+            Instant::now() + Duration::from_millis(100),
+            &route,
+            None,
+        )
+        .await
+    });
+    let _gate = tokio::task::spawn_blocking(move || {
+        gate.reached
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scope probe entered the bounded helper");
+        gate
+    })
+    .await
+    .unwrap();
+    assert_probe_leaves_database_available(&call).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("scope probe has a deadline")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(matches!(result, Hold::Answer(_)));
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["pattern"], json!(target));
+    assert_eq!(request["reason"], READ_FILE_SCOPE_REASON);
+    assert_eq!(request["head_policy"], "allow");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_stalled_finish_probe_is_bounded_and_releases_database() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    set_hold_budget_for_test(Some(Duration::from_millis(100)));
+    let target = f.head_root.join("shared.txt");
+    assert_eq!(
+        code(&f.read(&f.worker, &target, 201).await),
+        "access_pending"
+    );
+    let record = f.asks().pop().unwrap();
+    let prep = Prepared {
+        key: record.key,
+        call_key: record.call_key.unwrap(),
+        request: record.request.unwrap(),
+        selector: selector(f.worker.scope.as_ref().unwrap()),
+        grant: record.pending.unwrap(),
+    };
+    let call = Arc::new(scope_probe_call(&f, &target));
+    let gate = crate::bounded_io::stall_helper(&f.head_root);
+    let running_call = Arc::clone(&call);
+    let task = tokio::spawn(async move {
+        finish(
+            &running_call,
+            &prep,
+            Settlement::Allow {
+                scope: true,
+                by_user: true,
+            },
+        )
+        .await
+    });
+    let _gate = tokio::task::spawn_blocking(move || {
+        gate.reached
+            .recv_timeout(Duration::from_secs(1))
+            .expect("settlement probe entered the bounded helper");
+        gate
+    })
+    .await
+    .unwrap();
+    assert_probe_leaves_database_available(&call).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("settlement probe has a deadline")
+        .unwrap();
+    assert!(matches!(result, Hold::Run { .. }));
+    assert_eq!(
+        f.worker_grants(),
+        vec![AccessGrant {
+            path: target,
+            kind: GrantKind::File,
+            operation: AccessOperation::Read,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -967,13 +1183,13 @@ async fn consent_scope_write_cards_keep_the_original_capability() {
          format!("{}/**", f.head_root.display())),
     ] {
         let grant = AccessGrant { path: path.clone(), kind, operation: AccessOperation::Write };
-        let Prep::Ask(prep) = prepare(&conn, &f.ctx, &f.worker, "write", &json!({"path":path}), &grant, None).unwrap() else {
+        let Prep::Ask(prep) = prepare(&conn, &f.ctx, &f.worker, "write", &json!({"path":path}), &grant, &grant, None).unwrap() else {
             panic!("expected a fresh write card");
         };
         assert_eq!(prep.request["pattern"], expected_pattern);
         assert_eq!(prep.request["reason"], expected_reason);
         assert_eq!(prep.request["operation"], "write");
-        assert_eq!(advertised_scope(&prep), grant);
+        assert_eq!(advertised_scope(&prep, grant.clone()), grant);
         FakeAccessRequest::decode(&prep.request).unwrap();
     }
 }
@@ -1158,6 +1374,7 @@ async fn consent_scope_old_broad_card_is_restricted_to_file() {
         "read",
         &json!({"path":"/x"}),
         &grant,
+        &grant,
         None,
     )
     .unwrap() else {
@@ -1166,7 +1383,7 @@ async fn consent_scope_old_broad_card_is_restricted_to_file() {
     assert_eq!(prep.request["pattern"], "/x");
     assert_eq!(prep.request["reason"], "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.");
     prep.request["pattern"] = json!("/**");
-    assert_eq!(advertised_scope(&prep), grant);
+    assert_eq!(advertised_scope(&prep, grant.clone()), grant);
 }
 
 #[tokio::test]
