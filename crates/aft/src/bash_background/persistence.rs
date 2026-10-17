@@ -399,6 +399,8 @@ impl PinnedDir {
     }
 
     fn rename(&self, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        #[cfg(test)]
+        work_counts::record_rename();
         self.rename_to(from, self, to)
     }
 
@@ -2101,6 +2103,12 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
     atomic_replace(dir, name, content, false)
 }
 
+pub(crate) fn sync_task_file(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    work_counts::record_sync();
+    file.sync_all()
+}
+
 fn atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8], durable: bool) -> io::Result<()> {
     for _ in 0..32 {
         let temporary = random_temp_name()?;
@@ -2112,14 +2120,14 @@ fn atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8], durable: bool) 
         let result = (|| {
             file.write_all(content)?;
             if durable {
-                file.sync_all()?;
+                sync_task_file(&file)?;
             }
             // Atomic replacement protects readers after a daemon kill. Task
             // history is mirrored in a weaker database and is not a durable log.
             validate_regular_handle(&file)?;
             dir.rename(&temporary, name)?;
             if durable {
-                dir.file.sync_all()?;
+                sync_task_file(&dir.file)?;
             }
             Ok(())
         })();
@@ -2169,6 +2177,8 @@ pub(crate) mod work_counts {
         pub gc_entries: usize,
         pub artifact_bytes: usize,
         pub artifact_opens: usize,
+        pub syncs: usize,
+        pub renames: usize,
     }
 
     thread_local! {
@@ -2185,6 +2195,12 @@ pub(crate) mod work_counts {
 
     pub(crate) fn record_open() {
         record(|counts| counts.opens += 1);
+    }
+    pub(crate) fn record_sync() {
+        record(|counts| counts.syncs += 1);
+    }
+    pub(crate) fn record_rename() {
+        record(|counts| counts.renames += 1);
     }
     pub(crate) fn record_bytes(bytes: usize) {
         record(|counts| counts.artifact_bytes += bytes);

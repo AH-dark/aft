@@ -1357,17 +1357,8 @@ async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
     let task = registry.task(&task_id).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if task
-                .state
-                .lock()
-                .unwrap()
-                .metadata
-                .remote
-                .as_ref()
-                .unwrap()
-                .last_seq
-                .is_some_and(|s| s >= 10)
-            {
+            // Cancel during active output, without waiting for a durable checkpoint.
+            if fs::metadata(&task.paths.stdout).unwrap().len() >= 11 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1514,6 +1505,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -1529,6 +1521,9 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         .consume(StreamRecord::Accepted(Accepted::new(id(), 1)), &mut sink)
         .unwrap();
     for (seq, b) in [(0, b'A'), (1, b'B')] {
+        // Checkpoint B explicitly; A's first-output running transition is
+        // durable, while ordinary output now checkpoints at most once a second.
+        sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
         consumer
             .consume(
                 StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(vec![b]))),
@@ -1886,6 +1881,703 @@ async fn exec_remote_bash_terminal_gap_keeps_outcome_when_attach_is_unavailable(
         .any(|(_, b)| b["method"] == "exec.run"));
 }
 
+#[test]
+fn exec_remote_bash_plain_output_has_no_per_record_durable_io() {
+    use crate::bash_background::persistence::work_counts;
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("unavailable-connection"),
+        "printf remote",
+    );
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    // Keep this operation-count measurement independent of host speed. The
+    // separate checkpoint test advances the persistence deadline explicitly.
+    sink.last_progress_persist = Instant::now() + Duration::from_secs(60);
+    work_counts::reset();
+    let started = Instant::now();
+    const RECORDS: u64 = 1000;
+    for seq in 1..=RECORDS {
+        sink.output(seq, OutputStream::Stdout, b"stdout\n").unwrap();
+        sink.output(seq + RECORDS, OutputStream::Stderr, b"stderr\n")
+            .unwrap();
+        sink.unknown_output(seq + 2 * RECORDS, b"unknown\n")
+            .unwrap();
+    }
+    let counts = work_counts::get();
+    eprintln!(
+        "relay persistence: {} records, {} sync_all, {} renames, {:?}",
+        RECORDS * 3,
+        counts.syncs,
+        counts.renames,
+        started.elapsed()
+    );
+    assert_eq!(counts.syncs, 0, "plain output must not sync files");
+    assert_eq!(counts.renames, 0, "plain output must not replace metadata");
+    assert_eq!(
+        fs::read(&paths.stdout).unwrap(),
+        b"stdout\n".repeat(RECORDS as usize)
+    );
+    assert_eq!(
+        fs::read(&paths.stderr).unwrap(),
+        b"stderr\n".repeat(RECORDS as usize)
+    );
+    assert_eq!(sink.output_progress.last_seq, Some(3 * RECORDS));
+    assert_eq!(
+        task.state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .last_seq,
+        Some(0)
+    );
+}
+
+#[test]
+fn exec_remote_bash_state_transitions_are_durable() {
+    use crate::bash_background::persistence::work_counts;
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task).unwrap();
+    work_counts::reset();
+    sink.accepted(&Accepted::new(id(), 7)).unwrap();
+    let remote = read_task(&paths.json).unwrap().remote.unwrap();
+    assert_eq!(remote.job_id, Some(id()));
+    assert_eq!(
+        RemotePhase::of(&remote),
+        RemotePhase::Queued { position: 7 }
+    );
+    assert!(work_counts::get().syncs >= 2);
+    assert!(work_counts::get().renames >= 1);
+
+    work_counts::reset();
+    // An older runner's first output is a running transition, not just progress.
+    sink.output(0, OutputStream::Stdout, b"old runner").unwrap();
+    assert_eq!(
+        RemotePhase::of(&read_task(&paths.json).unwrap().remote.unwrap()),
+        RemotePhase::Running
+    );
+    assert_eq!(work_counts::get().syncs, 3);
+    assert_eq!(work_counts::get().renames, 1);
+
+    work_counts::reset();
+    sink.started(&Started::new(1, 123, 1)).unwrap();
+    let remote = read_task(&paths.json).unwrap().remote.unwrap();
+    assert_eq!(remote.started.unwrap().seq, 1);
+    assert_eq!(remote.last_seq, Some(1));
+    assert_eq!(work_counts::get().syncs, 2);
+    assert_eq!(work_counts::get().renames, 1);
+}
+
+#[test]
+fn exec_remote_bash_progress_checkpoints_are_coalesced() {
+    use crate::bash_background::persistence::work_counts;
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.output(1, OutputStream::Stdout, b"A").unwrap();
+    assert_eq!(
+        read_task(&paths.json).unwrap().remote.unwrap().last_seq,
+        Some(0)
+    );
+    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    work_counts::reset();
+    sink.output(2, OutputStream::Stderr, b"B").unwrap();
+    let remote = read_task(&paths.json).unwrap().remote.unwrap();
+    assert_eq!(
+        (remote.last_seq, remote.stdout_len, remote.stderr_len),
+        (Some(2), 1, 1)
+    );
+    assert_eq!(work_counts::get().syncs, 4);
+    assert_eq!(work_counts::get().renames, 1);
+    work_counts::reset();
+    sink.output(3, OutputStream::Stdout, b"C").unwrap();
+    assert_eq!(work_counts::get().syncs, 0);
+    assert_eq!(work_counts::get().renames, 0);
+    assert_eq!(
+        read_task(&paths.json).unwrap().remote.unwrap().last_seq,
+        Some(2)
+    );
+}
+
+#[test]
+fn exec_remote_bash_cancel_persists_only_durable_output_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.last_progress_persist = Instant::now() + Duration::from_secs(60);
+    sink.output(1, OutputStream::Stdout, b"tail").unwrap();
+    registry.record_remote_cancel(&task).unwrap();
+    let disk = read_task(&paths.json).unwrap();
+    let remote = disk.remote.as_ref().unwrap();
+    assert!(remote.cancel_requested);
+    assert_eq!(
+        (remote.last_seq, remote.stdout_len),
+        (Some(0), 0),
+        "cancel must not publish the unsynced output cursor"
+    );
+    let point = remote.point().unwrap();
+    drop(sink);
+    drop(registry);
+    // Simulate a host crash losing the stdout bytes written since the checkpoint.
+    fs::write(&paths.stdout, b"").unwrap();
+    let restarted = self::registry();
+    restarted
+        .insert_rehydrated_task(disk, paths.clone(), false)
+        .unwrap();
+    let task = restarted.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&restarted, task).unwrap();
+    let mut consumer = exec::StreamConsumer::resume(point);
+    consumer
+        .consume(
+            StreamRecord::Output(Output::new(
+                1,
+                OutputStream::Stdout,
+                BytePayload(b"tail".to_vec()),
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"tail");
+}
+
+#[test]
+fn exec_remote_bash_checkpoint_syncs_dirty_output_before_metadata() {
+    use crate::bash_background::persistence::{with_task_io_fault, work_counts, TaskIoFault};
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.last_progress_persist = Instant::now() + Duration::from_secs(60);
+    for seq in 1..=10 {
+        sink.output(seq, OutputStream::Stdout, b"A").unwrap();
+        sink.output(seq + 10, OutputStream::Stderr, b"B").unwrap();
+        sink.unknown_output(seq + 20, b"C").unwrap();
+    }
+    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    work_counts::reset();
+    sink.unknown_output(31, b"").unwrap();
+    assert_eq!(
+        work_counts::get().syncs,
+        5,
+        "three dirty files plus metadata"
+    );
+    assert_eq!(work_counts::get().renames, 1);
+    let remote = read_task(&paths.json).unwrap().remote.unwrap();
+    assert_eq!(
+        (remote.stdout_len, remote.stderr_len, remote.unknown_len),
+        (10, 10, 10)
+    );
+    assert_eq!(remote.last_seq, Some(31));
+
+    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    work_counts::reset();
+    sink.unknown_output(32, b"").unwrap();
+    assert_eq!(
+        work_counts::get().syncs,
+        2,
+        "clean files must not sync again"
+    );
+
+    sink.output(33, OutputStream::Stdout, b"tail").unwrap();
+    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+    work_counts::reset();
+    let result = with_task_io_fault(TaskIoFault::RunningEnospc, || sink.unknown_output(34, b""));
+    assert!(result.is_err());
+    assert_eq!(
+        work_counts::get().syncs,
+        1,
+        "dirty stdout must sync before the metadata write fails"
+    );
+    assert_eq!(
+        read_task(&paths.json).unwrap().remote.unwrap().last_seq,
+        Some(32)
+    );
+    work_counts::reset();
+    sink.unknown_output(34, b"").unwrap();
+    assert_eq!(
+        work_counts::get().syncs,
+        2,
+        "a metadata retry must not resync clean output"
+    );
+}
+
+#[test]
+fn exec_remote_bash_terminal_syncs_dirty_output_before_metadata() {
+    use crate::bash_background::persistence::{with_task_io_fault, work_counts, TaskIoFault};
+    for fail_metadata in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, task_id, paths) =
+            persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+        let task = registry.task(&task_id).unwrap();
+        let mut sink = TaskSink::new(&registry, task).unwrap();
+        sink.started(&Started::new(0, 123, 1)).unwrap();
+        sink.last_progress_persist = Instant::now() + Duration::from_secs(60);
+        sink.output(1, OutputStream::Stdout, b"A").unwrap();
+        sink.output(2, OutputStream::Stderr, b"B").unwrap();
+        sink.unknown_output(3, b"C").unwrap();
+        let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0);
+        let verdict = Verdict::Exited { code: 0 };
+        work_counts::reset();
+        if fail_metadata {
+            let result = with_task_io_fault(TaskIoFault::RunningEnospc, || {
+                sink.terminal(&record, &verdict)
+            });
+            assert!(result.is_err());
+            assert_eq!(
+                work_counts::get().syncs,
+                3,
+                "all dirty output must sync before the terminal proof write"
+            );
+            assert!(read_task(&paths.json)
+                .unwrap()
+                .remote
+                .unwrap()
+                .terminal
+                .is_none());
+            work_counts::reset();
+        }
+        sink.terminal(&record, &verdict).unwrap();
+        assert_eq!(work_counts::get().syncs, if fail_metadata { 2 } else { 5 });
+        assert_eq!(work_counts::get().renames, 1);
+        let remote = read_task(&paths.json).unwrap().remote.unwrap();
+        assert!(remote.terminal.is_some());
+        assert_eq!(
+            (
+                remote.last_seq,
+                remote.stdout_len,
+                remote.stderr_len,
+                remote.unknown_len
+            ),
+            (Some(3), 1, 1, 1)
+        );
+    }
+}
+
+#[test]
+fn exec_remote_bash_terminal_proof_is_durable_before_completion() {
+    use crate::bash_background::persistence::{with_task_io_fault, work_counts, TaskIoFault};
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let mut consumer = exec::StreamConsumer::new();
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(id(), 1)), &mut sink)
+        .unwrap();
+    consumer
+        .consume(StreamRecord::Started(Started::new(0, 123, 1)), &mut sink)
+        .unwrap();
+    sink.output(1, OutputStream::Stdout, b"tail").unwrap();
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
+    let result = with_task_io_fault(TaskIoFault::RunningEnospc, || {
+        consumer.consume(StreamRecord::Terminal(record.clone()), &mut sink)
+    });
+    assert!(
+        result.is_err(),
+        "a failed durable write must not complete the stream"
+    );
+    assert!(consumer.finish().is_err());
+    assert!(task
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .terminal
+        .is_none());
+    assert!(read_task(&paths.json)
+        .unwrap()
+        .remote
+        .unwrap()
+        .terminal
+        .is_none());
+    work_counts::reset();
+    consumer
+        .consume(StreamRecord::Terminal(record), &mut sink)
+        .unwrap();
+    assert!(consumer.finish().is_ok());
+    assert_eq!(
+        work_counts::get().syncs,
+        2,
+        "proof file and parent directory must both sync"
+    );
+    assert_eq!(work_counts::get().renames, 1);
+    let persisted = read_task(&paths.json).unwrap();
+    let remote = persisted.remote.unwrap();
+    assert!(remote.terminal.is_some());
+    assert_eq!((remote.last_seq, remote.stdout_len), (Some(1), 4));
+    // Simulate a crash before remote_terminal publishes the registry status.
+    assert_eq!(persisted.status, BgTaskStatus::Running);
+    let readonly = self::registry();
+    assert_eq!(
+        readonly
+            .terminal_status_from_disk(&task_id, "session", Some(dir.path()), dir.path())
+            .unwrap()
+            .0
+            .info
+            .status,
+        BgTaskStatus::Completed
+    );
+}
+
+#[test]
+fn exec_remote_bash_restart_short_checkpoint_never_zero_fills() {
+    for (terminal_proof, unknown_missing) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (original, task_id, paths) =
+            persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+        let task = original.task(&task_id).unwrap();
+        let mut sink = TaskSink::new(&original, task).unwrap();
+        sink.started(&Started::new(0, 123, 1)).unwrap();
+        sink.output(1, OutputStream::Stdout, b"stdout").unwrap();
+        sink.output(2, OutputStream::Stderr, b"stderr").unwrap();
+        sink.unknown_output(3, b"unknown").unwrap();
+        if terminal_proof {
+            sink.terminal(
+                &TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0),
+                &Verdict::Exited { code: 0 },
+            )
+            .unwrap();
+        } else {
+            sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+            sink.unknown_output(4, b"").unwrap();
+        }
+        drop(sink);
+        drop(original);
+        let unknown_path = paths.io_dir.join("remote-unknown-output");
+        fs::write(&paths.stdout, b"out").unwrap();
+        fs::write(&paths.stderr, b"err").unwrap();
+        if unknown_missing {
+            fs::remove_file(&unknown_path).unwrap();
+        } else {
+            fs::write(&unknown_path, b"unk").unwrap();
+        }
+        let disk = read_task(&paths.json).unwrap();
+        let seq = disk.remote.as_ref().unwrap().last_seq;
+        let restarted = registry();
+        restarted
+            .insert_rehydrated_task(disk, paths.clone(), false)
+            .unwrap();
+        let task = restarted.task(&task_id).unwrap();
+        let mut sink = TaskSink::new(&restarted, task).unwrap();
+        assert_eq!(
+            fs::read(&paths.stdout).unwrap(),
+            b"out",
+            "short stdout must not be padded"
+        );
+        assert_eq!(
+            fs::read(&paths.stderr).unwrap(),
+            b"err",
+            "short stderr must not be padded"
+        );
+        let disk = read_task(&paths.json).unwrap();
+        let incomplete = disk
+            .remote
+            .as_ref()
+            .unwrap()
+            .output_incomplete
+            .as_ref()
+            .expect("short checkpoint loss is stored structurally");
+        assert!(
+            incomplete.reason == RemoteOutputIncompleteReason::CheckpointShort,
+            "{incomplete:?}"
+        );
+        for stream in [
+            RemoteOutputStream::Stdout,
+            RemoteOutputStream::Stderr,
+            RemoteOutputStream::Unknown,
+        ] {
+            assert!(
+                incomplete.streams.iter().any(|loss| loss.stream == stream),
+                "missing {stream:?}: {incomplete:?}"
+            );
+        }
+        assert!(!disk
+            .execution_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Output incomplete"));
+        let remote = disk.remote.unwrap();
+        assert_eq!(
+            (remote.stdout_len, remote.stderr_len, remote.unknown_len),
+            (3, 3, if unknown_missing { 0 } else { 3 })
+        );
+        assert_eq!(
+            remote.last_seq, seq,
+            "byte losses have no safe sequence mapping"
+        );
+        assert_eq!(remote.terminal.is_some(), terminal_proof);
+        if !terminal_proof {
+            sink.output(seq.unwrap() + 1, OutputStream::Stdout, b"next")
+                .unwrap();
+            sink.unknown_output(seq.unwrap() + 2, b"new").unwrap();
+            assert_eq!(fs::read(&paths.stdout).unwrap(), b"outnext");
+            assert_eq!(
+                fs::read(&unknown_path).unwrap(),
+                if unknown_missing {
+                    b"new".as_slice()
+                } else {
+                    b"unknew".as_slice()
+                }
+            );
+        }
+        drop(sink);
+        drop(restarted);
+        let disk = read_task(&paths.json).unwrap();
+        let again = registry();
+        again
+            .insert_rehydrated_task(disk, paths.clone(), false)
+            .unwrap();
+        let task = again.task(&task_id).unwrap();
+        let _sink = TaskSink::new(&again, task).unwrap();
+        let disk = read_task(&paths.json).unwrap();
+        assert!(disk.remote.as_ref().unwrap().output_incomplete.is_some());
+        assert!(!disk
+            .execution_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Output incomplete"));
+        assert!(!fs::read(&paths.stdout).unwrap().contains(&0));
+        assert!(!fs::read(&paths.stderr).unwrap().contains(&0));
+    }
+}
+
+fn recover_short_checkpoint(
+    terminal_proof: bool,
+) -> (
+    tempfile::TempDir,
+    BgTaskRegistry,
+    String,
+    TaskPaths,
+    Arc<BgTask>,
+    Option<TerminalRecord>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        dir.path().join("unused-connection"),
+        "printf remote",
+    );
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.output(1, OutputStream::Stdout, b"stdout").unwrap();
+    sink.output(2, OutputStream::Stderr, b"stderr").unwrap();
+    sink.unknown_output(3, b"unknown").unwrap();
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0);
+    if terminal_proof {
+        sink.terminal(&record, &exec::grade(&record)).unwrap();
+    } else {
+        sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
+        sink.unknown_output(4, b"").unwrap();
+    }
+    drop(sink);
+    drop(original);
+
+    fs::write(&paths.stdout, b"out").unwrap();
+    fs::write(&paths.stderr, b"err").unwrap();
+    fs::write(paths.io_dir.join("remote-unknown-output"), b"unk").unwrap();
+    let disk = read_task(&paths.json).unwrap();
+    let restarted = registry();
+    restarted
+        .insert_rehydrated_task(disk, paths.clone(), false)
+        .unwrap();
+    let task = restarted.task(&task_id).unwrap();
+    drop(TaskSink::new(&restarted, task.clone()).unwrap());
+
+    (
+        dir,
+        restarted,
+        task_id,
+        paths,
+        task,
+        terminal_proof.then_some(record),
+    )
+}
+
+fn assert_checkpoint_warning_is_visible(registry: &BgTaskRegistry, task_id: &str) {
+    let task = registry.task(task_id).unwrap();
+    let metadata = task.state.lock().unwrap().metadata.clone();
+    let incomplete = metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .output_incomplete
+        .as_ref()
+        .expect("short checkpoint loss remains in remote metadata");
+    let warning = incomplete.warning_line();
+    let note = registry.execution_note(task_id, "session").unwrap();
+    assert!(note.starts_with(&warning), "{note}");
+    assert!(!metadata
+        .execution_note
+        .as_deref()
+        .unwrap_or_default()
+        .contains("Output incomplete"));
+    let snapshot = registry.observed_status(task_id, "session", 8192).unwrap();
+    assert_eq!(snapshot.info.status, BgTaskStatus::Completed);
+    assert!(snapshot.output_preview.contains(&warning), "{snapshot:?}");
+}
+
+fn assert_checkpoint_warning_is_in_completion(registry: &BgTaskRegistry, task_id: &str) {
+    let completion = registry
+        .drain_completions()
+        .into_iter()
+        .find(|completion| completion.task_id == task_id)
+        .expect("completed remote task queues a completion notice");
+    assert!(
+        completion
+            .output_preview
+            .contains("Output incomplete (remote_output_checkpoint_short)"),
+        "{completion:?}"
+    );
+}
+
+#[test]
+fn exec_remote_bash_short_checkpoint_warning_survives_normal_completion() {
+    let (_dir, registry, task_id, _paths, task, _) = recover_short_checkpoint(false);
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0);
+    sink.terminal(&record, &exec::grade(&record)).unwrap();
+    drop(sink);
+
+    registry.remote_terminal(&task, exec::grade(&record), None);
+
+    assert_checkpoint_warning_is_visible(&registry, &task_id);
+    assert_checkpoint_warning_is_in_completion(&registry, &task_id);
+}
+
+#[test]
+fn exec_remote_bash_short_checkpoint_warning_survives_saved_terminal_proof() {
+    let (_dir, registry, task_id, _paths, task, record) = recover_short_checkpoint(true);
+    registry.remote_terminal(&task, exec::grade(&record.unwrap()), None);
+
+    assert_checkpoint_warning_is_visible(&registry, &task_id);
+    assert_checkpoint_warning_is_in_completion(&registry, &task_id);
+}
+
+#[test]
+fn exec_remote_bash_short_checkpoint_warning_survives_second_restart() {
+    let (dir, task_registry, task_id, _paths, task, _) = recover_short_checkpoint(false);
+    let mut sink = TaskSink::new(&task_registry, task.clone()).unwrap();
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 3, 0, 0);
+    sink.terminal(&record, &exec::grade(&record)).unwrap();
+    drop(sink);
+    task_registry.remote_terminal(&task, exec::grade(&record), None);
+    drop(task);
+    drop(task_registry);
+
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+
+    assert_checkpoint_warning_is_visible(&restarted, &task_id);
+}
+
+#[test]
+fn exec_remote_bash_old_record_without_output_incomplete_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_registry, _task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let bytes = fs::read(&paths.json).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value["remote"].get("output_incomplete").is_none());
+
+    let loaded = read_task(&paths.json).unwrap();
+
+    assert!(loaded.remote.unwrap().output_incomplete.is_none());
+}
+
+#[test]
+fn exec_remote_bash_restart_replays_uncheckpointed_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task).unwrap();
+    sink.started(&Started::new(0, 123, 1)).unwrap();
+    sink.output(1, OutputStream::Stdout, b"uncheckpointed")
+        .unwrap();
+    sink.output(2, OutputStream::Stderr, b"stderr tail")
+        .unwrap();
+    sink.unknown_output(3, b"unknown tail").unwrap();
+    drop(sink);
+    drop(original);
+    let disk = read_task(&paths.json).unwrap();
+    assert_eq!(disk.remote.as_ref().unwrap().last_seq, Some(0));
+    let restarted = registry();
+    restarted
+        .insert_rehydrated_task(disk, paths.clone(), false)
+        .unwrap();
+    let task = restarted.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&restarted, task.clone()).unwrap();
+    assert!(fs::read(&paths.stdout).unwrap().is_empty());
+    assert!(fs::read(&paths.stderr).unwrap().is_empty());
+    assert!(fs::read(paths.io_dir.join("remote-unknown-output"))
+        .unwrap()
+        .is_empty());
+    let point = task
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .point()
+        .unwrap();
+    let mut consumer = exec::StreamConsumer::resume(point);
+    for (seq, stream, bytes) in [
+        (1, OutputStream::Stdout, b"replayed".to_vec()),
+        (2, OutputStream::Stderr, b"stderr".to_vec()),
+    ] {
+        consumer
+            .consume(
+                StreamRecord::Output(Output::new(seq, stream, BytePayload(bytes))),
+                &mut sink,
+            )
+            .unwrap();
+    }
+    consumer
+        .consume(
+            StreamRecord::Terminal(TerminalRecord::new(
+                id(),
+                Outcome::Exit { code: 0 },
+                1,
+                0,
+                0,
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    assert!(consumer.finish().is_ok());
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"replayed");
+    assert_eq!(fs::read(&paths.stderr).unwrap(), b"stderr");
+    assert_eq!(
+        read_task(&paths.json).unwrap().remote.unwrap().last_seq,
+        Some(2)
+    );
+}
+
 fn persist_accepted_with_snapshot(
     dir: &Path,
     connection: PathBuf,
@@ -1961,6 +2653,7 @@ fn persist_accepted_with_snapshot(
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -2321,6 +3014,7 @@ fn exec_remote_bash_unknown_output_bytes_are_durable_without_misattribution() {
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
     let task = registry.task(&task_id).unwrap();
     let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.last_progress_persist = Instant::now() - Duration::from_secs(1);
     sink.unknown_output(0, b"future").unwrap();
     drop(sink);
     let mut sink = TaskSink::new(&registry, task).unwrap();
@@ -3815,6 +4509,7 @@ fn remote_phase_comes_from_acceptance_started_or_output() {
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::WaitingOnRunner);
     remote.job_id = Some(id());
@@ -3921,6 +4616,7 @@ fn remote_phase_note_says_queued_until_started_then_names_the_runner_stop() {
         queue_position: None,
         output_received: false,
         retry: None,
+        output_incomplete: None,
     });
     let now = 1_042_900;
     // Before acceptance there is no position to report.
