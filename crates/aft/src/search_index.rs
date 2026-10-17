@@ -2256,7 +2256,11 @@ impl SearchIndex {
         let mut root_bytes = vec![0u8; root_len];
         reader.read_exact(&mut root_bytes).ok()?;
         let stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
-        let project_root = current_canonical_root.to_path_buf();
+        // Resolve root aliases before deriving any file keys. Queries canonicalize
+        // their scope, and new files use canonical keys; retaining a symlink or
+        // differently cased root only for cached files would hide them from search.
+        let project_root = fs::canonicalize(current_canonical_root)
+            .unwrap_or_else(|_| current_canonical_root.to_path_buf());
         // Snapshot paths are stored relative to the root that wrote them and
         // are re-rooted onto the loading root. That is only sound when both
         // roots sit at the same place in their checkouts: a snapshot written
@@ -9361,6 +9365,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
+        let project = fs::canonicalize(&project).expect("canonical project root");
         let a = project.join("a.txt");
         let b = project.join("b.txt");
         fs::write(&a, "abc old").expect("write a");
@@ -11941,6 +11946,75 @@ mod warm_reload_verification_tests {
     use super::*;
 
     #[test]
+    #[cfg(any(unix, windows))]
+    fn warm_refresh_keeps_cached_and_new_files_visible_through_root_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("checkout");
+        fs::create_dir_all(real_root.join("src")).unwrap();
+        #[cfg(unix)]
+        let alias_root = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let alias_root = dir.path().join("CHECKOUT");
+        let canonical_root = fs::canonicalize(&real_root).unwrap();
+        assert_ne!(alias_root, canonical_root);
+        assert_eq!(fs::canonicalize(&alias_root).unwrap(), canonical_root);
+        let changed = real_root.join("src/changed.rs");
+        fs::write(&changed, "fn before() {}\n").unwrap();
+        fs::write(
+            real_root.join("src/unchanged.rs"),
+            "// UnchangedAliasNeedle\n",
+        )
+        .unwrap();
+        let original_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&changed).unwrap());
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&real_root);
+        assert!(built.write_to_disk(cache.path(), None));
+        fs::write(&changed, "// ChangedAliasNeedle with different size\n").unwrap();
+        filetime::set_file_mtime(&changed, original_mtime).unwrap();
+        fs::write(real_root.join("src/new.rs"), "// NewAliasNeedle\n").unwrap();
+
+        for strategy in [
+            cache_freshness::VerifyStrategy::StatFirst,
+            cache_freshness::VerifyStrategy::Strict,
+        ] {
+            assert!(built.write_to_disk(cache.path(), None));
+            let baseline = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
+            let mut refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                baseline,
+                &alias_root,
+                DEFAULT_MAX_FILE_SIZE,
+                None,
+                strategy,
+                Some(2),
+            )
+            .expect("one cached edit and one new file fit the two-path budget");
+            for persisted in [false, true] {
+                if persisted {
+                    assert!(refreshed.write_to_disk(cache.path(), None));
+                }
+                for scope in [alias_root.clone(), canonical_root.join("src")] {
+                    for needle in [
+                        "ChangedAliasNeedle",
+                        "UnchangedAliasNeedle",
+                        "NewAliasNeedle",
+                    ] {
+                        assert_eq!(
+                            refreshed.grep(needle, true, &[], &[], &scope, 10).matches.len(),
+                            1,
+                            "ready index must find {needle} through {scope:?} (persisted={persisted}, strategy={strategy:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn warm_refresh_preserves_loaded_path_keys_across_root_spellings() {
         let dir = tempfile::tempdir().unwrap();
         let verbatim_root = fs::canonicalize(dir.path()).unwrap();
@@ -11959,6 +12033,7 @@ mod warm_reload_verification_tests {
                     cache_freshness::VerifyStrategy::Strict,
                 ] {
                     let baseline = SearchIndex::read_from_disk(cache.path(), loading_root).unwrap();
+                    let loaded_root = baseline.project_root.clone();
                     let original_keys = baseline.path_to_id.clone();
                     let refreshed = SearchIndex::refresh_cached_with_diff_limit(
                         baseline,
@@ -11970,7 +12045,8 @@ mod warm_reload_verification_tests {
                     )
                     .expect("unchanged cached paths must fit a zero-path budget");
                     assert!(refreshed.is_ready());
-                    assert_eq!(refreshed.project_root, *loading_root);
+                    assert_eq!(refreshed.project_root, loaded_root);
+                    assert_eq!(refreshed.project_root, verbatim_root);
                     assert_eq!(refreshed.path_to_id, original_keys);
                     assert_eq!(
                         refreshed
