@@ -7552,6 +7552,16 @@ impl BgTaskRegistry {
     /// Schedule scratch deletion without waiting for filesystem work. Keep the
     /// task record and watchdog candidate until a later observer sees success.
     pub(crate) fn cleanup_terminal_task_temp(&self, task: &BgTask) -> std::io::Result<bool> {
+        // Schema probes reuse the launch sandbox after the command exits. Its
+        // scratch paths must still exist until the probe has finished, even if
+        // another observer or the watchdog sees a quiescent process group.
+        #[cfg(unix)]
+        if self
+            .db_hint_job(&task.task_id)
+            .is_some_and(|job| !job.is_finished())
+        {
+            return Ok(false);
+        }
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task
             .lock_state()
@@ -12926,6 +12936,57 @@ mod tests {
         assert!(first.output_preview.starts_with("compressed "));
         assert_eq!(second.output_preview, first.output_preview);
         assert_eq!(listed[0].output_preview, first.output_preview);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bash_background_terminal_temp_cleanup_waits_for_db_hint() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, task) = insert_terminal_piped_task(&registry, &dir, "true", "", "", false);
+        let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+        {
+            let mut state = task.lock_state().unwrap();
+            state.metadata.sandbox_temp_dir = Some(scratch.clone());
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        let job = Arc::new(crate::bash_db_hints::HintJob::new(
+            "sqlite3 store.db 'SELECT substrate FROM tasks'",
+            dir.path(),
+            &HashMap::new(),
+            &SpawnPlan::Unsandboxed,
+            true,
+        ));
+        registry
+            .inner
+            .db_hint_jobs
+            .lock()
+            .unwrap()
+            .insert(task.task_id.clone(), (Arc::downgrade(&task), job.clone()));
+        assert!(!registry.cleanup_terminal_task_temp(&task).unwrap());
+        assert!(task.lock_state().unwrap().temp_cleanup.is_none());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let hint = std::thread::spawn(move || {
+            job.finish_with_output(
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    "no such column: substrate"
+                },
+                Some(1),
+            );
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!registry.cleanup_terminal_task_temp(&task).unwrap());
+        assert!(task.lock_state().unwrap().temp_cleanup.is_none());
+        assert!(scratch.exists(), "in-flight hint lost its launch sandbox");
+        release_tx.send(()).unwrap();
+        hint.join().unwrap();
+        wait_for_task_temp_cleanup(&registry, &task);
+        assert!(!scratch.exists(), "finished hint leaked task scratch");
+        assert!(!scratch.with_extension("owner").exists());
     }
 
     #[test]

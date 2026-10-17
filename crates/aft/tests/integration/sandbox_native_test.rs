@@ -571,11 +571,13 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
     assert!(!outside_file.exists());
 
     let temp_path_file = project.join("task-temp-path.txt");
+    // Scratch belongs to the running command, not its retained result. Verify
+    // its contents before exit, since terminal cleanup may precede this reply.
     let temp_probe = foreground(
         &mut aft,
         "native-temp-write",
         &format!(
-            "printf '%s' \"$TMPDIR\" > {}; printf temp-ok > \"$TMPDIR/probe.txt\"",
+            "printf '%s' \"$TMPDIR\" > {}; printf temp-ok > \"$TMPDIR/probe.txt\" && test \"$(cat \"$TMPDIR/probe.txt\")\" = temp-ok && echo TEMP_READ_OK",
             quote(&temp_path_file)
         ),
     );
@@ -593,9 +595,12 @@ fn native_sandbox_enforces_writes_temp_cache_and_reports_scanner_findings() {
         "task temp must live in the short private root: {}",
         task_temp.display()
     );
-    assert_eq!(
-        std::fs::read_to_string(task_temp.join("probe.txt")).unwrap(),
-        "temp-ok"
+    assert!(
+        temp_probe["output"]
+            .as_str()
+            .unwrap()
+            .contains("TEMP_READ_OK"),
+        "temp contents were not verified: {temp_probe:?}"
     );
 
     let cache_file = npm_cache.join("native-cache-write.txt");

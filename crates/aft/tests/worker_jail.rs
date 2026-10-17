@@ -418,29 +418,34 @@ impl Jail {
         assert_eq!(response, ModuleControlResponse::RouteBindAck {});
     }
 
+    async fn submit_tool(&mut self, name: &str, arguments: Value) -> u64 {
+        let corr = self.next_corr;
+        self.next_corr += 1;
+        let body = json!({
+            "name": name,
+            "preset": "worker",
+            "arguments": arguments,
+        });
+        write_frame(
+            &mut self.stream,
+            &Frame::build(
+                FrameType::Request,
+                flags(),
+                1,
+                1,
+                corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        corr
+    }
+
     async fn tool_reply(&mut self, name: &str, arguments: Value) -> Value {
         for _ in 0..200 {
-            let corr = self.next_corr;
-            self.next_corr += 1;
-            let body = json!({
-                "name": name,
-                "preset": "worker",
-                "arguments": arguments,
-            });
-            write_frame(
-                &mut self.stream,
-                &Frame::build(
-                    FrameType::Request,
-                    flags(),
-                    1,
-                    1,
-                    corr,
-                    serde_json::to_vec(&body).unwrap(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+            let corr = self.submit_tool(name, arguments.clone()).await;
             let frame = loop {
                 let frame = next_frame(&mut self.stream).await;
                 if frame.header.channel == 1 && frame.header.corr == corr {
@@ -1424,9 +1429,27 @@ async fn worker_jail_temp_denies_other_task_directory() {
     }
     let mut jail = Jail::start().await;
     let recorded = jail.worktree.join("first-temp.txt");
-    let reply = jail.bash(&format!("printf '%s' \"$TMPDIR\" > {}; printf original > \"$TMPDIR/sentinel\" && echo FIRST_TEMP_OK", quote(&recorded))).await;
-    assert!(reply.contains("FIRST_TEMP_OK"), "{reply}");
-    let first = PathBuf::from(std::fs::read_to_string(recorded).unwrap());
+    let release = jail.worktree.join("release-first-temp");
+    // Keep the first command alive while checking isolation. Finished commands
+    // relinquish scratch, so a sequential probe could mistake deletion for denial.
+    let ready = jail.bash("true").await;
+    let first_corr = jail.submit_tool("bash", json!({
+        "command": format!("printf original > \"$TMPDIR/sentinel\" && printf '%s' \"$TMPDIR\" > {}; while [ ! -f {} ]; do sleep 0.05; done", quote(&recorded), quote(&release)),
+        "timeout": 30_000,
+    })).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let first = loop {
+        if let Ok(path) = std::fs::read_to_string(&recorded) {
+            if !path.is_empty() {
+                break PathBuf::from(path);
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first temp was not published for request {first_corr}; initialization: {ready}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert!(first.join("sentinel").is_file());
     let script = r#"import errno, os, pathlib, sys
 own = pathlib.Path(os.environ['TMPDIR'])
@@ -1452,6 +1475,16 @@ else:
         std::fs::read_to_string(first.join("sentinel")).unwrap(),
         "original"
     );
+    std::fs::write(&release, "done").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while first.exists() || first.with_extension("owner").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "finished task leaked scratch: {}",
+            first.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]

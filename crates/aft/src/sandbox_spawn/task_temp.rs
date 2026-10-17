@@ -247,8 +247,16 @@ fn sweep_stale(
                     record
                         .and_then(|path| crate::bash_background::persistence::read_task(&path).ok())
                         .is_some_and(|metadata| {
+                            // A long-running command can exit with already-old
+                            // scratch. Give terminal output enrichment time to
+                            // finish before another process's stale sweep reclaims it.
+                            let finished = SystemTime::UNIX_EPOCH
+                                + Duration::from_millis(
+                                    metadata.finished_at.unwrap_or(metadata.started_at),
+                                );
                             metadata.sandbox_temp_dir.as_deref()
                                 == Some(parent.path.join(task).as_path())
+                                && now.duration_since(finished).unwrap_or_default() >= STALE_AFTER
                                 && crate::bash_background::persistence::task_temp_quiescent(
                                     &metadata,
                                 )
@@ -304,6 +312,51 @@ mod tests {
             .remove(second.file_name().unwrap().to_str().unwrap())
             .unwrap();
         assert_eq!(fs::read_dir(&parent.path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sandbox_task_temp_sweep_keeps_just_finished_old_scratch() {
+        use crate::bash_background::{persistence, BgTaskStatus};
+        let root = tempfile::tempdir().unwrap();
+        let parent = Parent::open(&root.path().join("aft-w")).unwrap();
+        let paths =
+            persistence::create_task_layout(root.path(), "session", "bash-0000000000000001")
+                .unwrap()
+                .paths;
+        fs::create_dir_all(&paths.io_dir).unwrap();
+        let scratch = parent.allocate(&paths.io_dir).unwrap();
+        let now = SystemTime::now();
+        let old = filetime::FileTime::from_system_time(now - STALE_AFTER - Duration::from_secs(1));
+        filetime::set_file_mtime(&scratch, old).unwrap();
+        filetime::set_file_mtime(scratch.with_extension("owner"), old).unwrap();
+        let mut metadata = persistence::PersistedTask::starting(
+            paths.task_id.clone(),
+            "session".into(),
+            "true".into(),
+            root.path().into(),
+            None,
+            None,
+            false,
+            false,
+        );
+        metadata.sandbox_temp_dir = Some(scratch.clone());
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        persistence::write_task(&paths.json, &metadata).unwrap();
+        let mut cursor = None;
+        sweep_stale(&parent, &mut cursor, SystemTime::now()).unwrap();
+        assert!(
+            scratch.is_dir(),
+            "just-finished task lost its launch sandbox"
+        );
+        cursor = None;
+        sweep_stale(
+            &parent,
+            &mut cursor,
+            SystemTime::now() + STALE_AFTER + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(!scratch.exists(), "stale terminal task scratch was leaked");
+        assert!(!scratch.with_extension("owner").exists());
     }
 
     #[test]
