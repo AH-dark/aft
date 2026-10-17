@@ -99,7 +99,9 @@ pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
     // such as `[`, `]`, `*`, `?`, or `{`. This prevents files in directories
     // with brackets (e.g. `src/[another]/file.rs`) from being misclassified as
     // globs.
-    if should_treat_as_glob(file, ctx) {
+    // A refused target goes to the single-file handler, whose own validation
+    // returns the refusal to the caller.
+    if classify_edit_target(file, ctx, &req.id) == EditTargetKind::Glob {
         return handle_glob_edit_match(req, ctx, file, match_str, replacement, &op_id);
     }
 
@@ -416,37 +418,60 @@ fn append_bytes(writer: &mut impl Write, content: &[u8]) -> (usize, Option<std::
     (written, None)
 }
 
-/// Returns true if the file path contains glob characters.
-fn is_glob_pattern(path: &str) -> bool {
+/// Returns true if the file path contains glob characters. This is only a
+/// spelling check; [`classify_edit_target`] makes the actual decision.
+pub(crate) fn is_glob_pattern(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('{') || path.contains('[')
 }
 
-/// Returns true when `file` should be treated as a glob pattern rather than a
-/// literal path. A path that exists on disk is always treated literally, even
-/// if its name contains glob metacharacters such as `[`, `]`, `*`, `?`, or `{`.
-/// This defends against directories or files with brackets in their
-/// names being misclassified as glob patterns (see issue #132).
+/// How an edit target is interpreted: one file, or a pattern over many.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditTargetKind {
+    /// A concrete file path: either spelled without glob characters, or one
+    /// that names an existing path even though it contains them.
+    Literal,
+    /// A glob pattern: spelled with glob characters and nothing exists at
+    /// that literal path.
+    Glob,
+    /// Spelled with glob characters, but path validation refused the target
+    /// (outside the roots, denied, or waiting on the person's permission), so
+    /// its existence was never probed.
+    Refused,
+}
+
+/// Decides whether `file` is a glob pattern or a literal path. A path that
+/// exists on disk is always literal, even if its name contains glob
+/// metacharacters such as `[`, `]`, `*`, `?`, or `{`. This defends against
+/// directories or files with brackets in their names (Next.js routes such as
+/// `app/[id]/page.tsx`) being misclassified as glob patterns (issues #132 and
+/// #486).
 ///
-/// Resolution mirrors `ctx.validate_path` so the literal-vs-glob decision stays
-/// consistent with the single-file path handler's interpretation.
-fn should_treat_as_glob(file: &str, ctx: &AppContext) -> bool {
+/// Resolution goes through `ctx.validate_path`, the same validation the
+/// single-file handlers apply. `req_id` is the id of the request being served,
+/// so per-request access rules (such as a forced project-root restriction)
+/// apply to this check exactly as they apply to the edit. The existence probe
+/// runs only on a path validation allowed; otherwise the result is
+/// [`EditTargetKind::Refused`] and each caller picks its own safe fallback.
+/// A refusal here never prompts the person: a permission request is only
+/// raised when the refusal is returned as a response.
+///
+/// Both `edit_match` and the agent-facing `edit` translator (through
+/// `run_tool_call`) use this function so the two cannot disagree about which
+/// targets are files.
+pub(crate) fn classify_edit_target(file: &str, ctx: &AppContext, req_id: &str) -> EditTargetKind {
     if !is_glob_pattern(file) {
-        return false;
+        return EditTargetKind::Literal;
     }
-    match ctx.validate_path("literal-check", Path::new(file)) {
-        Ok(candidate) => !candidate.exists(),
-        Err(resp)
-            if resp.data.get("code").and_then(|c| c.as_str()) == Some("path_outside_root") =>
-        {
-            false
-        }
+    match ctx.validate_path(req_id, Path::new(file)) {
+        Ok(candidate) if candidate.exists() => EditTargetKind::Literal,
+        Ok(_) => EditTargetKind::Glob,
         Err(resp) => {
             log::debug!(
-                "edit_match: validate_path failed for '{}', deferring to single-file handler: {:?}",
+                "edit target: validate_path refused '{}': {:?}",
                 file,
                 resp.data
             );
-            false
+            EditTargetKind::Refused
         }
     }
 }

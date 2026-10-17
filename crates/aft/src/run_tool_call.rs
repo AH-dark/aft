@@ -376,11 +376,22 @@ pub(crate) fn prepare_tool_call(
         _ => bare_name,
     };
     let (command, translated_args) = if crate::subc_translate::supports_tool(translated_bare_name) {
-        match crate::subc_translate::subc_translate_owned_with_context(
+        // An edit target spelled with glob characters may still be an
+        // existing file (`app/[id]/page.tsx`). Classify it with the same
+        // validation and request id the dispatched command will use; a target
+        // that validation refuses stays a glob, so the translator refuses it
+        // as before instead of dispatching it for a permission request.
+        let request_id = ctx.request_id.as_str();
+        let edit_target_is_glob = |resolved: &str| {
+            crate::commands::edit_match::classify_edit_target(resolved, app_ctx, request_id)
+                != crate::commands::edit_match::EditTargetKind::Literal
+        };
+        match crate::subc_translate::subc_translate_owned_with_edit_target_probe(
             translated_bare_name,
             sanitized_args,
             ctx.project_root.as_path(),
             translate_context,
+            &edit_target_is_glob,
         ) {
             Ok(translated) => (translated.command, translated.args),
             Err(err) => {

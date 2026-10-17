@@ -1154,6 +1154,36 @@ pub fn subc_translate_owned_with_context(
     project_root: &Path,
     ctx: TranslateContext,
 ) -> Result<Translated, TranslateError> {
+    subc_translate_owned_with_edit_target_probe(
+        bare_name,
+        agent_args,
+        project_root,
+        ctx,
+        &spelling_only_edit_target,
+    )
+}
+
+/// Without filesystem access a glob-spelled edit target is assumed to be a
+/// glob, which was the translator's only behaviour before callers could
+/// supply a probe.
+fn spelling_only_edit_target(_resolved: &str) -> bool {
+    true
+}
+
+/// Like [`subc_translate_owned_with_context`], with a probe that tells the
+/// `edit` translator whether a target spelled with glob characters really is
+/// a glob. The probe receives the target resolved against `project_root` and
+/// returns `false` only when that path names an existing file the caller is
+/// allowed to edit, which lets `app/[id]/page.tsx` take multi-item and
+/// line-range edits. It is consulted only for edits a glob target cannot
+/// take, so a real glob is refused before any request is dispatched.
+pub fn subc_translate_owned_with_edit_target_probe(
+    bare_name: &str,
+    agent_args: Value,
+    project_root: &Path,
+    ctx: TranslateContext,
+    edit_target_is_glob: &dyn Fn(&str) -> bool,
+) -> Result<Translated, TranslateError> {
     if bare_name == "edit" && ctx.effective_hashline {
         return crate::hashline::integration::translate_gate_on_edit(&agent_args)
             .map(|translation| {
@@ -1189,7 +1219,7 @@ pub fn subc_translate_owned_with_context(
         }),
         "read" => translate_read(agent_args, project_root),
         "write" => translate_write(agent_args, project_root, ctx),
-        "edit" => translate_edit(agent_args, project_root, ctx),
+        "edit" => translate_edit(agent_args, project_root, ctx, edit_target_is_glob),
         "apply_patch" => translate_apply_patch(agent_args),
         "grep" => translate_grep(agent_args, project_root),
         "glob" => translate_glob(agent_args, project_root),
@@ -1640,6 +1670,7 @@ fn translate_edit(
     args: Value,
     project_root: &Path,
     ctx: TranslateContext,
+    edit_target_is_glob: &dyn Fn(&str) -> bool,
 ) -> Result<Translated, TranslateError> {
     let map_in = agent_args_map(args);
 
@@ -1708,10 +1739,11 @@ fn translate_edit(
             )));
         }
         // The batch command is single-file only; glob targets are an
-        // edit_match capability. A glob path with one find/replace item
-        // (the folded single-edit form included) must keep routing to
-        // edit_match or glob edits silently break with "file not found".
-        if path_is_glob_pattern(file_path) {
+        // edit_match capability. A glob-spelled path with one find/replace
+        // item (the folded single-edit form included) must keep routing to
+        // edit_match, which decides itself whether the path is a glob, or
+        // glob edits silently break with "file not found".
+        if crate::commands::edit_match::is_glob_pattern(file_path) {
             if let [single] = edits.as_slice() {
                 if let Some(obj) = single.as_object() {
                     let is_find_replace = obj.contains_key("oldString")
@@ -1722,11 +1754,16 @@ fn translate_edit(
                     }
                 }
             }
-            return Err(invalid_request(
-                "edit: glob targets support exactly one find/replace edit \
-                 (oldString/newString); line-range and multi-item batches \
-                 need a concrete file path",
-            ));
+            // Any other shape needs one concrete file. Glob characters do not
+            // rule that out: an existing `app/[id]/page.tsx` is a file, and
+            // goes to `batch` like any other path.
+            if edit_target_is_glob(&file_str) {
+                return Err(invalid_request(
+                    "edit: glob targets support exactly one find/replace edit \
+                     (oldString/newString); line-range and multi-item batches \
+                     need a concrete file path",
+                ));
+            }
         }
         let mut out = Map::new();
         out.insert("file".to_string(), Value::String(file_str));
@@ -1786,11 +1823,6 @@ fn translate_edit(
     Err(invalid_request(
         "edit: no edit mode resolved from arguments.",
     ))
-}
-
-/// A glob spelling in an edit target (single-file batch is the alternative).
-fn path_is_glob_pattern(path: &str) -> bool {
-    path.contains('*') || path.contains('?') || path.contains('{') || path.contains('[')
 }
 
 /// Route one find/replace edit to the `edit_match` command, which owns both
@@ -3322,6 +3354,84 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[test]
+    fn edit_target_probe_lets_existing_bracketed_files_take_batches() {
+        // Next.js routes such as `app/[id]/page.tsx` are files whose names
+        // contain glob characters. The caller's probe decides; without one
+        // the spelling alone keeps the glob refusal.
+        let project = Path::new("/project");
+        let expected_file = resolve_path_from_project_root(project, "app/[id]/page.tsx")
+            .to_string_lossy()
+            .into_owned();
+        for (label, edits) in [
+            (
+                "two items",
+                serde_json::json!([
+                    { "oldString": "a", "newString": "b" },
+                    { "oldString": "c", "newString": "d" },
+                ]),
+            ),
+            (
+                "line range",
+                serde_json::json!([{ "startLine": 1, "endLine": 1, "content": "x" }]),
+            ),
+        ] {
+            let args = serde_json::json!({ "path": "app/[id]/page.tsx", "edits": edits });
+            let refused = subc_translate_owned("edit", args.clone(), project).expect_err(label);
+            assert!(
+                refused.message.contains("glob targets"),
+                "{label}: {}",
+                refused.message
+            );
+
+            let probed = std::cell::RefCell::new(Vec::new());
+            let probe = |resolved: &str| {
+                probed.borrow_mut().push(resolved.to_string());
+                false
+            };
+            let translated = subc_translate_owned_with_edit_target_probe(
+                "edit",
+                args.clone(),
+                project,
+                TranslateContext::default(),
+                &probe,
+            )
+            .expect(label);
+            assert_eq!(translated.command, "batch", "{label}");
+            assert_eq!(
+                translated.args["file"].as_str(),
+                Some(expected_file.as_str())
+            );
+            assert_eq!(*probed.borrow(), vec![expected_file.clone()], "{label}");
+
+            let still_glob = subc_translate_owned_with_edit_target_probe(
+                "edit",
+                args,
+                project,
+                TranslateContext::default(),
+                &|_| true,
+            )
+            .expect_err(label);
+            assert_eq!(still_glob, refused, "{label}");
+        }
+
+        // One find/replace keeps routing to edit_match, which classifies the
+        // target itself, so the probe is not consulted.
+        let probe = |_: &str| -> bool { panic!("probe must not run for a single find/replace") };
+        let single = subc_translate_owned_with_edit_target_probe(
+            "edit",
+            serde_json::json!({
+                "path": "app/[id]/page.tsx",
+                "edits": [{ "oldString": "a", "newString": "b" }],
+            }),
+            project,
+            TranslateContext::default(),
+            &probe,
+        )
+        .expect("single find/replace");
+        assert_eq!(single.command, "edit_match");
     }
 
     #[test]
