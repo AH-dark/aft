@@ -5,5 +5,5 @@
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "The ranking-fenced semantic_search/mod.rs changes only the error gap for an immediately refused query embedding. Successful query ranking and routing are unchanged; benchmark rows must remain byte-equal. Paused embeddings use the existing lexical fallback path with the approved fixed sentence."
+  "note": "The ranking-fenced semantic_search/mod.rs changes only the gap wording while the Synapse embedding lane is paused: an immediately refused query embedding, and a lane that is not ready while the pause is recorded, both open with the approved fixed sentence. semantic_index.rs changes only pause-checkpoint resume (dropping saved rows of deleted or changed files) and is unreached by healthy builds and searches. Successful query ranking and routing are unchanged; benchmark rows must remain byte-equal. Paused embeddings use the existing lexical fallback path."
 }
