@@ -10673,6 +10673,17 @@ mod tests {
         assert_ready_indexed_literal_match(r"foo\.bar");
     }
 
+    thread_local! {
+        static FROZEN_GREP_SCAN_START: Instant = Instant::now();
+    }
+
+    /// A scan clock that ignores real time: a fixed per-thread instant plus
+    /// whatever the test has added to the injected advance.
+    fn frozen_grep_scan_now() -> Instant {
+        FROZEN_GREP_SCAN_START.with(|start| *start)
+            + GREP_SCAN_CLOCK_ADVANCE.with(std::cell::Cell::get)
+    }
+
     /// Resets the injected clock after a deadline test, including on panic.
     struct GrepScanClockGuard;
 
@@ -10865,13 +10876,27 @@ mod tests {
         }
 
         for (arm, pattern) in &arms {
+            let budget = Duration::from_secs(2);
+            let _clock = GrepScanClockGuard::install();
             let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
             let probe_calls = calls.clone();
-            let _probe = install_line_details_probe(move || probe_calls.set(probe_calls.get() + 1));
-            // The budget only lets a regressed, per-occurrence scan end; the
-            // assertion is on the work done, not on the time taken.
-            let result =
-                indexed_grep_with_budget(&index, &project, pattern, 100, Duration::from_secs(2));
+            // The scan clock is frozen and moves only when line details are
+            // built: half the budget per build. One build, the correct work,
+            // never reaches the deadline however slow the runner is; a
+            // regressed per-occurrence scan reaches it on its second build and
+            // ends quickly, failing the count below.
+            let _probe = install_line_details_probe(move || {
+                probe_calls.set(probe_calls.get() + 1);
+                GREP_SCAN_CLOCK_ADVANCE.with(|advance| advance.set(advance.get() + budget / 2));
+            });
+            let result = indexed_grep_with_clock(
+                &index,
+                &project,
+                pattern,
+                100,
+                budget,
+                frozen_grep_scan_now,
+            );
 
             assert_eq!(
                 calls.get(),
