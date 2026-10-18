@@ -225,6 +225,8 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
     if let Some(known) = confinement_from_memory(ctx, identity) {
         return known;
     }
+    #[cfg(test)]
+    ctx.run_after_policy_memory_miss_hook_for_test();
     let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
         // A busy handle slot can hide an empty, never-configured store from
         // the memory probe. Recheck after waiting for the slot off the loop.
