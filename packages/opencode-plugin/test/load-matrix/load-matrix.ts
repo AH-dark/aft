@@ -2671,8 +2671,8 @@ export default { id: original.id, effect };
   // The subc daemon serves every head bound to a project from one AFT module,
   // so this row binds an OpenCode 1-style head beside the GA host's session on
   // one root and checks each keeps its own tool names. The e2e test starts its
-  // own isolated daemon and skips, saying why, when no subc-core binary is
-  // available (set SUBC_CORE_BIN).
+  // own isolated daemon; beta-pin-gate supplies the pinned wire-v2 binary via
+  // SUBC_CORE_BIN so this row exercises the daemon instead of skipping it.
   test("GA host on the subc daemon keeps its tool names beside an OpenCode 1 head", async () => {
     const { v2 } = await ensureHostInstalls();
     const result = await withOperatorCanary("v2-subc-tool-names", () =>
