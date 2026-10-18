@@ -875,6 +875,19 @@ pub fn session_tasks_dir(storage_dir: &Path, session_id: &str) -> PathBuf {
     if direct.exists() {
         return direct;
     }
+    // Configure replays through a harness root. Live pre-namespace tasks must
+    // retain their original paths until their detached writers have stopped.
+    if storage_dir
+        .file_name()
+        .is_some_and(|name| name == "opencode" || name == "pi")
+    {
+        if let Some(root) = storage_dir.parent() {
+            let legacy = root.join("bash-tasks").join(&session_hash);
+            if legacy.exists() {
+                return legacy;
+            }
+        }
+    }
     let mut harness_matches = ["opencode", "pi"]
         .into_iter()
         .map(|harness| {

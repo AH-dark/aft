@@ -27,6 +27,7 @@
 - Daemon CPU: the once-a-minute sweep of persisted background bash task folders remembers tasks it must keep (undelivered results, recently written tasks) and skips them on later laps with a few `stat` calls instead of reopening their folders and rereading their metadata twice, so a store of thousands of kept tasks no longer costs steady file-open churn. What gets deleted and when is unchanged; health `bash_task_retention.disk_sweeps` reports roots whose last pass stopped at its budget (backlog still draining) and roots whose store could not be read.
 - bash: an empty `runon` (sent by models that fill every optional parameter) now runs the command locally instead of being refused as a remote run.
 - write / edit / apply_patch: when a call creates a file that does not parse, the reply now ends with "Syntax check: the new file does not parse (first error near line N); it was written as given." (in apply_patch, directly under that file's line). Existing files still roll back as before, and a new Swift file that `swiftc -parse` accepts gets no line.
+- Storage on several volumes: legacy folder moves, state-file repair and filter-folder repair fall back to copying (or keep the original and say so) when a storage folder sits on another volume, retention retires a cache folder that is itself a mount point by emptying it on its own volume, and the storage migration checks free space on each destination volume.
 
 ## Sandbox profiles
 

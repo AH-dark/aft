@@ -1331,6 +1331,12 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
     if !dir_has_entries(&root_tasks) {
         return;
     }
+    // Detached writers retain both open output handles and absolute marker paths.
+    // Even a same-volume rename can strand their later path-based writes. Keep
+    // the entire legacy tree readable in place until every task is quiescent.
+    if !legacy_root_tasks_quiescent(&root_tasks).unwrap_or(false) {
+        return;
+    }
 
     let harness_tasks = storage_root
         .join(harness.storage_segment())
@@ -1352,32 +1358,97 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
         let _ = std::fs::remove_dir(&harness_tasks);
     }
 
-    match std::fs::rename(&root_tasks, &harness_tasks) {
-        Ok(()) => crate::slog_info!(
-            "moved legacy root bash tasks into harness namespace: {}",
-            harness_tasks.display()
-        ),
+    // The harness folder and the root normally share a volume, but a move
+    // that crosses volumes falls back to a copy instead of failing.
+    match crate::cross_volume::move_path(&root_tasks, &harness_tasks) {
+        Ok(moved) => {
+            moved.warn_if_incomplete(&root_tasks, &harness_tasks);
+            crate::slog_info!(
+                "moved legacy root bash tasks into harness namespace: {}",
+                harness_tasks.display()
+            );
+        }
         Err(error) => {
             crate::slog_warn!(
                 "failed to move legacy root bash tasks into {}: {}; trying child merge",
                 harness_tasks.display(),
                 error
             );
-            if crate::private_storage::create_dir_all(&harness_tasks).is_err() {
+            if let Err(error) = crate::private_storage::create_dir_all(&harness_tasks) {
+                crate::slog_warn!(
+                    "legacy root bash tasks kept in {}: cannot create {}: {}",
+                    root_tasks.display(),
+                    harness_tasks.display(),
+                    error
+                );
                 return;
             }
             if let Ok(entries) = std::fs::read_dir(&root_tasks) {
                 for entry in entries.flatten() {
                     let source = entry.path();
                     let target = harness_tasks.join(entry.file_name());
-                    if !target.exists() {
-                        let _ = std::fs::rename(source, target);
+                    if target.exists() {
+                        continue;
+                    }
+                    match crate::cross_volume::move_path(&source, &target) {
+                        Ok(moved) => moved.warn_if_incomplete(&source, &target),
+                        Err(error) => {
+                            // A task that cannot be moved stays readable in the
+                            // root `bash-tasks/` folder; log the move failure
+                            // instead of dropping it.
+                            crate::slog_warn!(
+                                "legacy bash task {} kept in place: cannot move it to {}: {}",
+                                source.display(),
+                                target.display(),
+                                error
+                            );
+                        }
                     }
                 }
             }
+            // Removes the legacy folder only when every task left it.
             let _ = std::fs::remove_dir(&root_tasks);
         }
     }
+}
+
+fn legacy_root_tasks_quiescent(root: &std::path::Path) -> std::io::Result<bool> {
+    use persistence::{discover_task_ids, read_exit_marker, read_task_at, resolve_task_layout};
+    for session in std::fs::read_dir(root)? {
+        let session = session?;
+        if !session.file_type()?.is_dir() {
+            return Ok(false);
+        }
+        let (ids, invalid) = discover_task_ids(&session.path())?;
+        if !invalid.is_empty() {
+            return Ok(false);
+        }
+        for id in ids {
+            let task = resolve_task_layout(&session.path(), &id)?;
+            let metadata = read_task_at(&task)?;
+            if read_exit_marker(&task.paths)?.is_some() {
+                continue;
+            }
+            if !metadata.is_terminal() {
+                return Ok(false);
+            }
+            if metadata.child_pid.is_none() && metadata.pgid.is_none() {
+                continue;
+            }
+            #[cfg(unix)]
+            if let Some(pgid) = metadata.pgid.filter(|pgid| *pgid > 0) {
+                // Only ESRCH proves that no group member can still write. A
+                // permission error or an unsupported probe keeps the task put.
+                if unsafe { libc::kill(-pgid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    continue;
+                }
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn dir_has_entries(path: &std::path::Path) -> bool {
@@ -1623,6 +1694,144 @@ mod shell_resolution_tests {
             pty.file_name().and_then(|name| name.to_str()),
             Some("sh"),
             "the PTY launcher must come from the bash resolver, not from $SHELL"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_root_task_repair_tests {
+    use std::fs;
+
+    use crate::harness::Harness;
+    use crate::walk_boundary::simulated_volumes::simulate;
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_background_legacy_live_writer_survives_cross_volume_repair_and_replay() {
+        use super::persistence::*;
+        use super::registry::BgTaskRegistry;
+        use super::BgTaskStatus;
+        use std::process::{Command, Stdio};
+
+        let storage = tempfile::tempdir().unwrap();
+        let session = "legacy-live-writer";
+        let id = "bash-0123456789abcdef";
+        let task = create_task_layout(storage.path(), session, id).unwrap();
+        let handles = TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        let release = storage.path().join("release");
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf before; while ! test -f \"$1\"; do sleep 0.02; done; printf after; printf error-after >&2; printf 37 > \"$2\"; exit 37",
+            "legacy-writer",
+        ]);
+        command.arg(&release).arg(&task.paths.exit);
+        command.stdout(Stdio::from(
+            handles.clone_file(TaskArtifact::Stdout).unwrap(),
+        ));
+        command.stderr(Stdio::from(
+            handles.clone_file(TaskArtifact::Stderr).unwrap(),
+        ));
+        super::process::start_new_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut metadata = PersistedTask::starting(
+            id.into(),
+            session.into(),
+            "legacy writer".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.mark_running(child.id(), child.id() as i32);
+        write_task_at(&task, &metadata).unwrap();
+        let harness = storage.path().join(Harness::Opencode.storage_segment());
+        fs::create_dir_all(&harness).unwrap();
+        let _volume = simulate(&harness, u64::MAX - 20);
+
+        super::repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+        let registry = BgTaskRegistry::default();
+        registry.replay_session(&harness, session).unwrap();
+        let running = registry.status(id, session, None, None, 4096).unwrap();
+        let replay_exit = registry.task_exit_path(id, session);
+        // Release even on the broken implementation so no child is left waiting.
+        fs::write(&release, b"finish").unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(37));
+        assert_eq!(running.info.status, BgTaskStatus::Running);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let completed = loop {
+            let snapshot = registry.status(id, session, None, None, 4096).unwrap();
+            if snapshot.info.status.is_terminal() {
+                break snapshot;
+            }
+            assert!(std::time::Instant::now() < deadline, "task did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(completed.exit_code, Some(37));
+        assert_eq!(completed.info.status, BgTaskStatus::Failed);
+        assert_eq!(replay_exit, Some(task.paths.exit.clone()));
+        assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"beforeafter");
+        assert_eq!(fs::read(&task.paths.stderr).unwrap(), b"error-after");
+        assert!(task.paths.exit.exists());
+        registry.repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+        assert!(
+            task.paths.exit.exists(),
+            "repeated configure must retain pinned paths"
+        );
+        registry.detach();
+        drop(registry);
+        drop(handles);
+        drop(task);
+
+        super::repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+        assert!(!storage.path().join("bash-tasks").exists());
+        let moved = resolve_task(&harness, session, id).unwrap();
+        assert_eq!(read_task_at(&moved).unwrap().exit_code, Some(37));
+        assert_eq!(fs::read(&moved.paths.stdout).unwrap(), b"beforeafter");
+        assert_eq!(
+            read_exit_marker(&moved.paths).unwrap(),
+            Some(ExitMarker::Code(37))
+        );
+    }
+
+    #[test]
+    fn legacy_root_tasks_move_into_a_harness_folder_on_another_volume() {
+        use super::persistence::*;
+        let storage = tempfile::tempdir().unwrap();
+        let root_tasks = storage.path().join("bash-tasks");
+        let id = "bash-0123456789abcdef";
+        let task = create_task_layout(storage.path(), "terminal", id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            id.into(),
+            "terminal".into(),
+            "done".into(),
+            storage.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.mark_terminal(super::BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&task, &metadata).unwrap();
+        drop(task);
+        let harness_dir = storage.path().join(Harness::Opencode.storage_segment());
+        fs::create_dir_all(&harness_dir).unwrap();
+        // Every rename from the root into the harness folder now fails with EXDEV.
+        let _volume = simulate(&harness_dir, u64::MAX - 20);
+
+        super::repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+
+        assert_eq!(
+            read_task_at(&resolve_task(&harness_dir, "terminal", id).unwrap())
+                .unwrap()
+                .exit_code,
+            Some(0),
+            "the task must reach the harness folder"
+        );
+        assert!(
+            !root_tasks.exists(),
+            "the legacy folder is removed after the copy"
         );
     }
 }

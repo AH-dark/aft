@@ -2909,8 +2909,18 @@ impl BackupStore {
     }
 
     fn session_dir(&self, session: &str) -> Option<PathBuf> {
-        self.backups_dir()
-            .map(|d| d.join(Self::session_hash(session)))
+        let direct = self.backups_dir()?.join(Self::session_hash(session));
+        if !direct.exists() && self.effective_storage_harness().is_some() {
+            let legacy = self
+                .storage_dir
+                .as_ref()?
+                .join("backups")
+                .join(Self::session_hash(session));
+            if legacy.exists() {
+                return Some(legacy);
+            }
+        }
+        Some(direct)
     }
 
     fn session_hash(session: &str) -> String {
@@ -2964,48 +2974,42 @@ impl BackupStore {
             return;
         }
         let harness_backups = storage_dir.join(harness).join("backups");
-        if dir_has_entries(&harness_backups) {
+        if let Err(error) = create_private_durable_dir(&harness_backups) {
+            crate::slog_warn!(
+                "cannot create harness backup dir {}: {error}",
+                harness_backups.display()
+            );
             return;
         }
-        if let Some(parent) = harness_backups.parent() {
-            if let Err(error) = create_private_durable_dir(parent) {
-                crate::slog_warn!(
-                    "failed to create harness backup dir {}: {}",
-                    parent.display(),
-                    error
-                );
-                return;
+        let Ok(entries) = std::fs::read_dir(&root_backups) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let source = entry.path();
+            let target = harness_backups.join(entry.file_name());
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || target.exists() {
+                continue;
             }
-        }
-        if harness_backups.exists() {
-            let _ = std::fs::remove_dir(&harness_backups);
-        }
-        match std::fs::rename(&root_backups, &harness_backups) {
-            Ok(()) => {
-                crate::slog_info!(
-                    "moved legacy root backups into harness namespace: {}",
-                    harness_backups.display()
-                );
-            }
-            Err(error) => {
-                crate::slog_warn!(
-                    "failed to move legacy root backups into {}: {}; trying child merge",
-                    harness_backups.display(),
-                    error
-                );
-                if create_private_durable_dir(&harness_backups).is_err() {
-                    return;
+            // Use the same admission gate and stack leases as stale-session GC:
+            // a paused writer must finish before copy+unlink can move its files.
+            let Ok(Some(_gate)) = session_gc_gate(&source, false) else {
+                continue;
+            };
+            let Ok(Some(leases)) = acquire_inactive_session_leases(&source) else {
+                continue;
+            };
+            // The gate prevents new leases. Close probe handles before moving
+            // the session, and keep stable gate files in their original parent.
+            drop(leases);
+            match crate::cross_volume::move_path(&source, &target) {
+                Ok(moved) => moved.warn_if_incomplete(&source, &target),
+                Err(error) => {
+                    crate::slog_warn!(
+                        "legacy backup {} kept in place: cannot move it to {}: {error}",
+                        source.display(),
+                        target.display()
+                    );
                 }
-                if let Ok(entries) = std::fs::read_dir(&root_backups) {
-                    for entry in entries.flatten() {
-                        let source = entry.path();
-                        let target = harness_backups.join(entry.file_name());
-                        if !target.exists() {
-                            let _ = std::fs::rename(source, target);
-                        }
-                    }
-                }
-                let _ = std::fs::remove_dir(&root_backups);
             }
         }
     }
@@ -3483,6 +3487,12 @@ impl BackupStore {
             path: gate_path.display().to_string(),
             message: error.to_string(),
         })?;
+        if self.session_dir(session).as_ref() != Some(&session_dir) {
+            // Repair may have migrated an inactive session while we waited for
+            // its gate. Resolve again instead of recreating its legacy folder.
+            drop(_gate);
+            return self.acquire_stack_disk_lock(session, key);
+        }
         create_private_durable_dir(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
             message: error.to_string(),
@@ -5607,6 +5617,40 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cross_volume_legacy_backup_repair_keeps_active_stack_writer() {
+        use std::io::Write;
+        let storage = tempfile::tempdir().unwrap();
+        let mut writer = BackupStore::new();
+        writer.set_storage_dir(storage.path().to_path_buf(), 72);
+        let session = "legacy-writer";
+        let key = storage.path().join("source.txt");
+        let lock = writer.acquire_stack_disk_lock(session, &key).unwrap();
+        let legacy = writer.session_dir(session).unwrap();
+        let mut output = std::fs::File::create(legacy.join("payload")).unwrap();
+        output.write_all(b"before").unwrap();
+        let mut repair = BackupStore::new();
+        repair.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        let harness = storage.path().join("opencode");
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(&harness, u64::MAX - 20);
+        repair.repair_root_backups_if_needed();
+        output.write_all(b"after").unwrap();
+        drop(output);
+        assert_eq!(fs::read(legacy.join("payload")).unwrap(), b"beforeafter");
+        assert_eq!(repair.session_dir(session), Some(legacy.clone()));
+        drop(lock);
+        repair.repair_root_backups_if_needed();
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read(repair.session_dir(session).unwrap().join("payload")).unwrap(),
+            b"beforeafter"
+        );
+    }
+
+    #[test]
     fn stale_session_gc_preserves_active_stack_lease() {
         let storage = tempfile::tempdir().unwrap();
         let mut writer = BackupStore::new();
@@ -7062,6 +7106,34 @@ mod tests {
         assert!(store.tracked_files(DEFAULT_SESSION_ID).is_empty());
         let _ = fs::remove_dir_all(&dir_a);
         let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn legacy_root_backups_move_into_a_harness_folder_on_another_volume() {
+        let storage = tempfile::tempdir().unwrap();
+        let root_backups = storage.path().join("backups");
+        fs::create_dir_all(root_backups.join("session-a")).unwrap();
+        fs::write(root_backups.join("session-a/meta.json"), b"{}").unwrap();
+        let harness = crate::harness::Harness::Opencode;
+        let harness_dir = storage.path().join(harness.storage_segment());
+        fs::create_dir_all(&harness_dir).unwrap();
+        // Every rename from the root into the harness folder now fails with EXDEV.
+        let _volume =
+            crate::walk_boundary::simulated_volumes::simulate(&harness_dir, u64::MAX - 21);
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(storage.path().to_path_buf(), harness, 72);
+        store.repair_root_backups_if_needed();
+
+        assert_eq!(
+            fs::read(harness_dir.join("backups/session-a/meta.json")).unwrap(),
+            b"{}",
+            "the backup history must reach the harness folder"
+        );
+        assert!(
+            !root_backups.join("session-a").exists(),
+            "the session is removed after the copy; stable admission gates stay"
+        );
     }
 
     #[test]

@@ -156,17 +156,17 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
         }
     };
 
-    let free_bytes = match options.disk_free_override {
-        Some(bytes) => Ok(bytes),
-        None => free_bytes_at(&args.to),
-    };
-    let free_bytes = match free_bytes {
-        Ok(bytes) => bytes,
-        Err(error) => {
+    // Each destination volume must hold twice the bytes headed for it. The
+    // cache folders (index, semantic, symbols) may be on a different volume
+    // from the target root, so the root's free space alone says nothing about
+    // them.
+    let volumes = match destination_volumes(&args, source_bytes, &options) {
+        Ok(volumes) => volumes,
+        Err((path, error)) => {
             log.write(serde_json::json!({
                 "level": "error",
                 "step": "preflight",
-                "path": args.to,
+                "path": path,
                 "status": "disk_check_failed",
                 "bytes_source": source_bytes,
                 "error": error.to_string(),
@@ -174,16 +174,21 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
             return ExitStatus::MigrationFailed;
         }
     };
-    let required = source_bytes.saturating_mul(2);
-    let has_space = free_bytes >= required;
-    log.write(serde_json::json!({
-        "level": if has_space { "info" } else { "error" },
-        "step": "preflight",
-        "bytes_source": source_bytes,
-        "bytes_free": free_bytes,
-        "bytes_required": required,
-        "ok": has_space,
-    }));
+    let mut has_space = true;
+    for volume in &volumes {
+        let required = volume.source_bytes.saturating_mul(2);
+        let ok = volume.free_bytes >= required;
+        has_space &= ok;
+        log.write(serde_json::json!({
+            "level": if ok { "info" } else { "error" },
+            "step": "preflight",
+            "path": volume.path,
+            "bytes_source": volume.source_bytes,
+            "bytes_free": volume.free_bytes,
+            "bytes_required": required,
+            "ok": ok,
+        }));
+    }
     if !has_space {
         return ExitStatus::InsufficientDisk;
     }
@@ -560,7 +565,7 @@ fn migrate_whole(
     log: &mut JsonLogger,
 ) -> io::Result<()> {
     let final_path = target_path(args, item);
-    if final_path.exists() {
+    if already_published(&final_path) {
         log.write(serde_json::json!({
             "level": "warn",
             "step": "copy",
@@ -609,7 +614,7 @@ fn migrate_child_union(
         let name = entry.file_name();
         let child_source = entry.path();
         let child_final = final_dir.join(&name);
-        if child_final.exists() {
+        if already_published(&child_final) {
             log.write(serde_json::json!({
                 "level": "warn",
                 "step": "copy",
@@ -765,11 +770,164 @@ fn source_size(path: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
+/// Whether the copy step skips this destination because an earlier run already
+/// published it there. `migrate_whole`, `migrate_child_union` and the
+/// free-space preflight all use this one rule, so a retried migration is
+/// charged only for the data it will actually copy.
+fn already_published(final_path: &Path) -> bool {
+    final_path.exists()
+}
+
+/// Source bytes of one migration item: all of them, and the part the copy
+/// step will still copy (what `already_published` does not skip).
+struct ItemBytes {
+    total: u64,
+    pending: u64,
+}
+
+fn item_bytes(args: &MigrationArgs, item: MigrationItem) -> io::Result<ItemBytes> {
+    let source = args.from.join(item.source_name);
+    if !source.exists() {
+        return Ok(ItemBytes {
+            total: 0,
+            pending: 0,
+        });
+    }
+    let final_path = target_path(args, item);
+    match item.merge {
+        MergeKind::ChildUnion if source.is_dir() => {
+            let mut bytes = ItemBytes {
+                total: 0,
+                pending: 0,
+            };
+            for entry in fs::read_dir(&source)? {
+                let entry = entry?;
+                let child = source_size(&entry.path())?;
+                bytes.total = bytes.total.saturating_add(child);
+                if !already_published(&final_path.join(entry.file_name())) {
+                    bytes.pending = bytes.pending.saturating_add(child);
+                }
+            }
+            Ok(bytes)
+        }
+        MergeKind::Whole if already_published(&final_path) => Ok(ItemBytes {
+            total: source_size(&source)?,
+            pending: 0,
+        }),
+        // The remaining cases count the whole source: a `Whole` item whose
+        // destination does not exist yet, the `TrustJson` list (merged into
+        // the target file on every run), and a `ChildUnion` whose source is a
+        // plain file rather than a folder (the copy step reports that as an
+        // error; the preflight only sizes it).
+        MergeKind::Whole | MergeKind::ChildUnion | MergeKind::TrustJson => {
+            let total = source_size(&source)?;
+            Ok(ItemBytes {
+                total,
+                pending: total,
+            })
+        }
+    }
+}
+
+/// One destination volume of a migration and the source bytes this run will
+/// copy onto it.
+struct DestinationVolume {
+    /// A folder on that volume: the target root, or the first destination
+    /// found on another volume.
+    path: PathBuf,
+    source_bytes: u64,
+    free_bytes: u64,
+}
+
+/// Group the bytes still to copy by the volume each destination is on, and
+/// read each volume's free space. Entries an earlier run already published
+/// (see `already_published`) are not counted, so a retry after a partial run
+/// needs room only for what is left. The target root's volume is charged with
+/// every source byte that is neither headed to another volume nor already
+/// published, including files outside the migrated items, as the check has
+/// always counted. An error names the path whose volume or size could not be
+/// read.
+fn destination_volumes(
+    args: &MigrationArgs,
+    source_bytes: u64,
+    options: &Options,
+) -> Result<Vec<DestinationVolume>, (PathBuf, io::Error)> {
+    let device = |path: &Path| {
+        crate::walk_boundary::filesystem_device_id(existing_ancestor(path))
+            .map_err(|error| (path.to_path_buf(), error))
+    };
+    let free_at = |path: &Path| {
+        options
+            .disk_free_override
+            .map_or_else(|| free_bytes_at(path), Ok)
+            .map_err(|error| (path.to_path_buf(), error))
+    };
+    let root_device = device(&args.to)?;
+    // Source bytes the root's volume does not need room for: everything headed
+    // to another volume, and whatever the copy step will skip on the root's.
+    let mut not_for_root = 0_u64;
+    let mut elsewhere: Vec<(Option<u64>, PathBuf, u64)> = Vec::new();
+    for &item in migration_items() {
+        let destination = target_path(args, item);
+        let destination_device = device(&destination)?;
+        let item_bytes =
+            item_bytes(args, item).map_err(|error| (args.from.join(item.source_name), error))?;
+        if destination_device == root_device {
+            not_for_root =
+                not_for_root.saturating_add(item_bytes.total.saturating_sub(item_bytes.pending));
+            continue;
+        }
+        not_for_root = not_for_root.saturating_add(item_bytes.total);
+        let bytes = item_bytes.pending;
+        match elsewhere
+            .iter_mut()
+            .find(|(device, _, _)| *device == destination_device)
+        {
+            Some(volume) => volume.2 = volume.2.saturating_add(bytes),
+            None => elsewhere.push((
+                destination_device,
+                existing_ancestor(&destination).to_path_buf(),
+                bytes,
+            )),
+        }
+    }
+    let mut volumes = vec![DestinationVolume {
+        path: args.to.clone(),
+        source_bytes: source_bytes.saturating_sub(not_for_root),
+        free_bytes: free_at(&args.to)?,
+    }];
+    for (_, path, bytes) in elsewhere {
+        volumes.push(DestinationVolume {
+            free_bytes: free_at(&path)?,
+            path,
+            source_bytes: bytes,
+        });
+    }
+    Ok(volumes)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Free bytes reported for folders at or under each path, so a test can
+    /// give a simulated second volume less room than the target root.
+    static FREE_BYTES_FOR_TEST: std::cell::RefCell<Vec<(PathBuf, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[cfg(unix)]
 fn free_bytes_at(path: &Path) -> io::Result<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
+    #[cfg(test)]
+    if let Some(bytes) = FREE_BYTES_FOR_TEST.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|(root, _)| path.starts_with(root))
+            .map(|(_, bytes)| *bytes)
+    }) {
+        return Ok(bytes);
+    }
     let probe = existing_ancestor(path);
     let c_path = CString::new(probe.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL byte"))?;
@@ -786,10 +944,18 @@ fn free_bytes_at(path: &Path) -> io::Result<u64> {
 fn free_bytes_at(_path: &Path) -> io::Result<u64> {
     // v0.27 is Unix-prioritized. Windows disk preflight should be wired to
     // GetDiskFreeSpaceExW through windows-sys in a follow-up.
+    #[cfg(test)]
+    if let Some(bytes) = FREE_BYTES_FOR_TEST.with(|slot| {
+        slot.borrow()
+            .iter()
+            .find(|(root, _)| _path.starts_with(root))
+            .map(|(_, bytes)| *bytes)
+    }) {
+        return Ok(bytes);
+    }
     Ok(u64::MAX)
 }
 
-#[cfg(unix)]
 fn existing_ancestor(path: &Path) -> &Path {
     let mut current = path;
     while !current.exists() {
@@ -949,6 +1115,165 @@ fn after_publish(source: &Path, target: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_checks_free_space_on_the_volume_of_each_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("legacy");
+        fs::create_dir_all(from.join("index/key")).unwrap();
+        fs::write(from.join("index/key/cache.bin"), vec![0_u8; 1000]).unwrap();
+        fs::create_dir_all(from.join("backups")).unwrap();
+        fs::write(from.join("backups/meta.json"), b"{}").unwrap();
+        let to = dir.path().join("target");
+        let index = to.join("index");
+        fs::create_dir_all(&index).unwrap();
+        // The index folder is a separate volume with room for less than twice
+        // the index bytes; the target root itself has plenty of room.
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(&index, u64::MAX - 30);
+        FREE_BYTES_FOR_TEST
+            .with(|slot| *slot.borrow_mut() = vec![(index.clone(), 1500), (to.clone(), u64::MAX)]);
+        let log = dir.path().join("migration.jsonl");
+
+        let status = run_with_options(
+            Args {
+                from: Some(from),
+                to: to.clone(),
+                harness: Harness::Opencode,
+                log: Some(log.clone()),
+                status: false,
+            },
+            Options::default(),
+        );
+        FREE_BYTES_FOR_TEST.with(|slot| slot.borrow_mut().clear());
+
+        assert_eq!(status, ExitStatus::InsufficientDisk);
+        let preflight = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["step"] == "preflight")
+            .collect::<Vec<_>>();
+        let index_line = preflight
+            .iter()
+            .find(|record| record["path"] == serde_json::json!(index))
+            .expect("the index volume is checked on its own");
+        assert_eq!(index_line["bytes_source"], 1000);
+        assert_eq!(index_line["ok"], false);
+        let root_line = preflight
+            .iter()
+            .find(|record| record["path"] == serde_json::json!(to))
+            .expect("the target root is checked");
+        assert_eq!(
+            root_line["bytes_source"], 2,
+            "bytes headed to the index volume are not charged to the root"
+        );
+        assert_eq!(root_line["ok"], true);
+    }
+
+    /// A legacy tree whose `index` has two cache folders, `a` (1000 bytes) and
+    /// `b` (100 bytes), migrating to a target whose `index` folder is its own
+    /// volume. An earlier run already published `index/a` there and stopped
+    /// before writing either completion marker. Returns the temporary folder,
+    /// the arguments for the retry, and the destination `index` folder.
+    fn partially_migrated_index() -> (tempfile::TempDir, Args, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("legacy");
+        for (child, size) in [("a", 1000), ("b", 100)] {
+            fs::create_dir_all(from.join("index").join(child)).unwrap();
+            fs::write(
+                from.join("index").join(child).join("cache.bin"),
+                vec![0_u8; size],
+            )
+            .unwrap();
+        }
+        fs::create_dir_all(from.join("backups")).unwrap();
+        fs::write(from.join("backups/meta.json"), b"{}").unwrap();
+        let to = dir.path().join("target");
+        let index = to.join("index");
+        fs::create_dir_all(index.join("a")).unwrap();
+        fs::write(index.join("a/cache.bin"), vec![0_u8; 1000]).unwrap();
+        let args = Args {
+            from: Some(from),
+            to,
+            harness: Harness::Opencode,
+            log: Some(dir.path().join("migration.jsonl")),
+            status: false,
+        };
+        (dir, args, index)
+    }
+
+    fn preflight_records(log: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["step"] == "preflight")
+            .collect()
+    }
+
+    #[test]
+    fn preflight_retry_counts_only_children_still_to_copy() {
+        let (_dir, args, index) = partially_migrated_index();
+        let to = args.to.clone();
+        let log = args.log.clone().unwrap();
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(&index, u64::MAX - 31);
+        // Twice the whole index (2200) does not fit, but twice the 100 bytes
+        // of `b` that are still to copy does.
+        FREE_BYTES_FOR_TEST
+            .with(|slot| *slot.borrow_mut() = vec![(index.clone(), 1500), (to.clone(), u64::MAX)]);
+
+        let status = run_with_options(args, Options::default());
+        FREE_BYTES_FOR_TEST.with(|slot| slot.borrow_mut().clear());
+
+        let preflight = preflight_records(&log);
+        assert_eq!(status, ExitStatus::Success, "preflight: {preflight:?}");
+        let index_line = preflight
+            .iter()
+            .find(|record| record["path"] == serde_json::json!(index))
+            .expect("the index volume is checked on its own");
+        assert_eq!(index_line["bytes_source"], 100);
+        assert_eq!(index_line["bytes_required"], 200);
+        assert_eq!(index_line["ok"], true);
+        let root_line = preflight
+            .iter()
+            .find(|record| record["path"] == serde_json::json!(to))
+            .expect("the target root is checked");
+        assert_eq!(
+            root_line["bytes_source"], 2,
+            "index bytes, copied or not, are not charged to the root"
+        );
+        assert_eq!(fs::read(index.join("b/cache.bin")).unwrap().len(), 100);
+        assert_eq!(fs::read(index.join("a/cache.bin")).unwrap().len(), 1000);
+        assert!(target_marker_path_from(&to, &Harness::Opencode).exists());
+    }
+
+    #[test]
+    fn preflight_retry_refuses_when_remaining_children_do_not_fit() {
+        let (_dir, args, index) = partially_migrated_index();
+        let to = args.to.clone();
+        let log = args.log.clone().unwrap();
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(&index, u64::MAX - 32);
+        // Twice the 100 bytes still to copy is more than the volume's 150.
+        FREE_BYTES_FOR_TEST
+            .with(|slot| *slot.borrow_mut() = vec![(index.clone(), 150), (to.clone(), u64::MAX)]);
+
+        let status = run_with_options(args, Options::default());
+        FREE_BYTES_FOR_TEST.with(|slot| slot.borrow_mut().clear());
+
+        assert_eq!(status, ExitStatus::InsufficientDisk);
+        let preflight = preflight_records(&log);
+        let index_line = preflight
+            .iter()
+            .find(|record| record["path"] == serde_json::json!(index))
+            .expect("the refusal names the index volume");
+        assert_eq!(index_line["bytes_source"], 100);
+        assert_eq!(index_line["bytes_free"], 150);
+        assert_eq!(index_line["ok"], false);
+        assert!(
+            !index.join("b").exists(),
+            "a refused preflight copies nothing"
+        );
+    }
 
     #[test]
     fn migration_marker_does_not_truncate_a_colliding_temporary() {

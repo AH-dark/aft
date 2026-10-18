@@ -460,8 +460,8 @@ fn backup_process_maintenance_repairs_legacy_root_backups() {
         "legacy root backups should be moved under the configured harness"
     );
     assert!(
-        !storage.path().join("backups").exists(),
-        "legacy root backups directory should be removed after repair"
+        !legacy.exists(),
+        "legacy session should be removed after repair; stable admission gates stay"
     );
 }
 

@@ -6496,7 +6496,8 @@ fn replay_configure_session_parts(
     session_id: &str,
     root_path: &Path,
 ) {
-    crate::bash_background::repair_legacy_root_tasks(storage_root, harness);
+    ctx.bash_background()
+        .repair_legacy_root_tasks(storage_root, harness);
     // A replayed task a worker was waiting on is granted one worker wait
     // window from now, so the registry needs the configured window first.
     ctx.bash_background()
