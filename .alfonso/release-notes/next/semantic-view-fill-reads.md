@@ -1,1 +1,1 @@
-Semantic indexing now avoids rereading large cached vector payloads when sibling checkouts reuse them within the same garbage-collection epoch.
+- Semantic indexing for a new worker checkout reads far less from disk when it reuses vectors already stored for a sibling checkout.
