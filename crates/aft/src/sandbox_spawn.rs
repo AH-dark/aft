@@ -2650,6 +2650,23 @@ struct GitPolicyCache {
 }
 
 #[cfg(unix)]
+struct GitPolicyFlightGuard {
+    key: GitPolicyCacheKey,
+}
+
+#[cfg(unix)]
+impl Drop for GitPolicyFlightGuard {
+    fn drop(&mut self) {
+        git_policy_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .in_flight
+            .remove(&self.key);
+        git_policy_cache_changed().notify_all();
+    }
+}
+
+#[cfg(unix)]
 impl GitPolicyCache {
     fn new() -> Self {
         Self {
@@ -2704,6 +2721,40 @@ fn git_policy_cache() -> &'static Mutex<GitPolicyCache> {
 fn git_policy_cache_changed() -> &'static Condvar {
     static CHANGED: OnceLock<Condvar> = OnceLock::new();
     CHANGED.get_or_init(Condvar::new)
+}
+
+#[cfg(all(test, unix))]
+const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(all(not(test), unix))]
+const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(all(test, unix))]
+struct GitPolicyTestUncachedGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<bool>,
+}
+
+#[cfg(all(test, unix))]
+fn git_policy_test_uncached_gate() -> &'static Mutex<Option<GitPolicyTestUncachedGate>> {
+    static GATE: OnceLock<Mutex<Option<GitPolicyTestUncachedGate>>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(test, unix))]
+fn git_policy_test_waiter_signal() -> &'static Mutex<Option<std::sync::mpsc::Sender<()>>> {
+    static SIGNAL: OnceLock<Mutex<Option<std::sync::mpsc::Sender<()>>>> = OnceLock::new();
+    SIGNAL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(test, unix))]
+fn signal_git_policy_waiter_for_test() {
+    let signal = git_policy_test_waiter_signal()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(signal) = signal {
+        let _ = signal.send(());
+    }
 }
 
 #[cfg(unix)]
@@ -3144,22 +3195,35 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         return resolve_git_policy_uncached(project_root, environment, worker)
             .map(|(policy, _)| policy);
     };
+    let wait_deadline = Instant::now() + GIT_POLICY_FLIGHT_WAIT_TIMEOUT;
 
     loop {
-        let (cached, owns_miss) = {
+        let (cached, flight_guard, waiter_timed_out) = {
             let mut cache = git_policy_cache()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             if let Some(cached) = cache.get(&key) {
-                (Some(cached), false)
+                (Some(cached), None, false)
             } else if cache.in_flight.contains(&key) {
-                let _cache = git_policy_cache_changed()
-                    .wait(cache)
-                    .unwrap_or_else(|error| error.into_inner());
-                (None, false)
+                let remaining = wait_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    (None, None, true)
+                } else {
+                    #[cfg(test)]
+                    signal_git_policy_waiter_for_test();
+                    let (cache, timeout) = git_policy_cache_changed()
+                        .wait_timeout(cache, remaining)
+                        .unwrap_or_else(|error| error.into_inner());
+                    drop(cache);
+                    (
+                        None,
+                        None,
+                        timeout.timed_out() || Instant::now() >= wait_deadline,
+                    )
+                }
             } else {
                 cache.in_flight.insert(key.clone());
-                (None, true)
+                (None, Some(GitPolicyFlightGuard { key: key.clone() }), false)
             }
         };
 
@@ -3173,9 +3237,13 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
                 .remove_if_same(&key, &cached);
             continue;
         }
-        if !owns_miss {
-            continue;
+        if waiter_timed_out {
+            return resolve_git_policy_uncached(project_root, environment, worker)
+                .map(|(policy, _)| policy);
         }
+        let Some(flight_guard) = flight_guard else {
+            continue;
+        };
 
         // The in-flight marker serializes misses for this exact worktree and
         // input environment; filesystem checks and git subprocesses stay unlocked.
@@ -3200,9 +3268,8 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
             } else {
                 cache.remove(&key);
             }
-            cache.in_flight.remove(&key);
         }
-        git_policy_cache_changed().notify_all();
+        drop(flight_guard);
         return result.map(|(policy, _)| policy);
     }
 }
@@ -3213,6 +3280,19 @@ fn resolve_git_policy_uncached(
     environment: Vec<(OsString, OsString)>,
     worker: bool,
 ) -> Result<(GitPolicy, Option<GitPolicyInputs>), String> {
+    #[cfg(test)]
+    let test_gate = git_policy_test_uncached_gate()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    #[cfg(test)]
+    if let Some(gate) = test_gate {
+        let _ = gate.entered.send(());
+        if gate.release.recv().unwrap() {
+            panic!("test-injected panic during Git policy resolution");
+        }
+    }
+
     let dot_git = project_root.join(".git");
     let dot_git_identity = git_input_identity(&dot_git).ok();
     let metadata = match std::fs::symlink_metadata(&dot_git) {
@@ -6303,6 +6383,12 @@ mod git_policy_cache_tests {
             *git_policy_test_environment()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = None;
+            *git_policy_test_uncached_gate()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+            *git_policy_test_waiter_signal()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
         }
     }
 
@@ -6569,6 +6655,118 @@ mod git_policy_cache_tests {
             expected_queries,
             "concurrent cold misses should run one complete Git query batch"
         );
+    }
+
+    #[test]
+    fn git_policy_cache_owner_panic_releases_waiting_callers() {
+        let fixture = Fixture::new();
+        let key = git_policy_cache_key(&fixture.root, &git_policy_environment(), true).unwrap();
+        git_policy_cache().lock().unwrap().remove(&key);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *git_policy_test_uncached_gate()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(GitPolicyTestUncachedGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let owner_root = fixture.root.clone();
+        let owner =
+            std::thread::spawn(move || with_worker_jail(true, || resolve_git_policy(&owner_root)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("miss owner did not enter uncached resolution");
+
+        let (waiter_signal_tx, waiter_signal_rx) = std::sync::mpsc::channel();
+        *git_policy_test_waiter_signal()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(waiter_signal_tx);
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::channel();
+        let waiter_root = fixture.root.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = with_worker_jail(true, || resolve_git_policy(&waiter_root))
+                .map(|policy| policy.hooks);
+            let _ = waiter_result_tx.send(result);
+        });
+        waiter_signal_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("same-key caller did not wait for the miss owner");
+
+        release_tx.send(true).unwrap();
+        assert!(
+            owner.join().is_err(),
+            "test hook should panic the miss owner"
+        );
+        let completed_before_cleanup =
+            waiter_result_rx.recv_timeout(GIT_POLICY_FLIGHT_WAIT_TIMEOUT + Duration::from_secs(3));
+        let stranded = git_policy_cache().lock().unwrap().in_flight.contains(&key);
+        if stranded {
+            git_policy_cache().lock().unwrap().in_flight.remove(&key);
+            git_policy_cache_changed().notify_all();
+        }
+        let waiter_result = completed_before_cleanup
+            .or_else(|_| waiter_result_rx.recv_timeout(Duration::from_secs(3)))
+            .expect("waiter did not finish after flight cleanup")
+            .expect("waiter policy resolution failed");
+        waiter.join().unwrap();
+
+        assert!(!stranded, "panicked owner left a permanent in-flight key");
+        assert!(!waiter_result.is_empty());
+    }
+
+    #[test]
+    fn git_policy_cache_waiter_resolves_uncached_after_owner_stalls() {
+        let fixture = Fixture::new();
+        let key = git_policy_cache_key(&fixture.root, &git_policy_environment(), true).unwrap();
+        git_policy_cache().lock().unwrap().remove(&key);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *git_policy_test_uncached_gate()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(GitPolicyTestUncachedGate {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let owner_root = fixture.root.clone();
+        let owner =
+            std::thread::spawn(move || with_worker_jail(true, || resolve_git_policy(&owner_root)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("miss owner did not enter uncached resolution");
+
+        let (waiter_signal_tx, waiter_signal_rx) = std::sync::mpsc::channel();
+        *git_policy_test_waiter_signal()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(waiter_signal_tx);
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::channel();
+        let waiter_root = fixture.root.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = with_worker_jail(true, || resolve_git_policy(&waiter_root))
+                .map(|policy| policy.hooks);
+            let _ = waiter_result_tx.send(result);
+        });
+        waiter_signal_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("same-key caller did not wait for the miss owner");
+
+        let completed_before_release =
+            waiter_result_rx.recv_timeout(GIT_POLICY_FLIGHT_WAIT_TIMEOUT + Duration::from_secs(3));
+        let waiter_finished_without_owner = completed_before_release.is_ok();
+        release_tx.send(false).unwrap();
+        owner.join().unwrap().expect("miss owner resolution failed");
+        let waiter_result = completed_before_release
+            .or_else(|_| waiter_result_rx.recv_timeout(Duration::from_secs(3)))
+            .expect("waiter did not finish after owner release")
+            .expect("waiter policy resolution failed");
+        waiter.join().unwrap();
+
+        assert!(
+            waiter_finished_without_owner,
+            "waiter must resolve uncached before a stalled owner is released"
+        );
+        assert!(!waiter_result.is_empty());
     }
 
     #[test]
