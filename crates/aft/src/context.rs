@@ -15628,6 +15628,82 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
+    #[test]
+    fn views_keyed_generation_inspect_reports_pending_while_derived_store_is_busy() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.ctx.set_harness(crate::harness::Harness::Runner);
+        fixture.publish();
+        let inspect = || {
+            crate::commands::inspect::handle_inspect(
+                &RawRequest {
+                    id: "views-inspect".to_owned(),
+                    command: "inspect".to_owned(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({
+                        "scope": ["lib.rs"],
+                        "sections": ["dead_code", "unused_exports"],
+                    }),
+                },
+                &fixture.ctx,
+            )
+        };
+        let busy = fixture.hold_pinned_derived_busy();
+
+        let response = inspect();
+
+        assert!(response.success, "{:#}", response.data);
+        assert_eq!(
+            response.data["summary"]["dead_code"]["status"], "pending",
+            "{:#}",
+            response.data
+        );
+        assert_eq!(
+            response.data["summary"]["dead_code"]["code"], "callgraph_building",
+            "{:#}",
+            response.data
+        );
+        assert_eq!(
+            response.data["summary"]["dead_code"]["index"]["status"], "building",
+            "{:#}",
+            response.data
+        );
+        assert_eq!(
+            response.data["summary"]["unused_exports"]["status"], "pending",
+            "{:#}",
+            response.data
+        );
+        assert_eq!(response.data["complete"], false, "{:#}", response.data);
+        assert!(
+            response.data["text"].as_str().is_some_and(|text| {
+                text.starts_with("PARTIAL — dead code, unused exports still building")
+                    && text.contains(
+                        "Dead code: pending (waiting for or projecting the checkout call graph)",
+                    )
+            }),
+            "{:#}",
+            response.data
+        );
+
+        drop(busy);
+        let response = inspect();
+        assert!(response.success, "{:#}", response.data);
+        assert!(
+            response.data["summary"]["dead_code"]["count"]
+                .as_u64()
+                .is_some(),
+            "dead-code analysis should resolve after the database lock is released: {:#}",
+            response.data
+        );
+        assert!(
+            response.data["summary"]["unused_exports"]["count"]
+                .as_u64()
+                .is_some(),
+            "unused-export analysis should resolve after the database lock is released: {:#}",
+            response.data
+        );
+    }
+
     /// Zoom's call graph field reads the same store as `callers` and must give
     /// the same verdict for a busy database: building, retry shortly. A busy
     /// open says nothing about whether the graph exists, so reporting it as

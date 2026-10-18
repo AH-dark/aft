@@ -1559,39 +1559,8 @@ fn zoom_one_symbol_inner(
 /// worktree served by a view, whose graph is built on first use, this zoom
 /// counts as that first use and can start the build.
 fn unavailable_callgraph_field(ctx: &AppContext) -> Option<serde_json::Value> {
-    use crate::feature_status::{
-        callgraph_access_observation, observed_index_status, IndexEffective, IndexObservation,
-        IndexPlane,
-    };
-    // Only roots already served by a view use this zero-wait access. It opens
-    // their pinned plane, never the legacy cold-build path; observing a legacy
-    // root below stays passive. The view refusal also names keyless generations.
-    let served_by_view = ctx.checkout_query_runtime_active()
-        || (ctx.config().views.enabled
-            && ctx
-                .pinned_view_runtime()
-                .is_some_and(|view| view.manifest.is_some()));
-    let observation = if served_by_view {
-        let access = ctx.callgraph_store_for_query_without_wait();
-        match &access {
-            // A view reader opens the published database without a busy wait,
-            // so a publication checkpointing it (or a writer holding it) makes
-            // the open fail with SQLite busy/locked for a moment. That is not
-            // a verdict about the graph: report it as building, the same
-            // retryable answer `callers` and the other graph commands give.
-            crate::context::CallgraphStoreAccess::Error(error)
-                if error.is_transient_lock_contention() =>
-            {
-                IndexObservation::building()
-            }
-            crate::context::CallgraphStoreAccess::Error(error) => {
-                IndexObservation::unavailable(error.to_string())
-            }
-            _ => callgraph_access_observation(ctx, &access),
-        }
-    } else {
-        observed_index_status(ctx, IndexPlane::Callgraph)
-    };
+    use crate::feature_status::{observe_callgraph_query, IndexEffective};
+    let observation = observe_callgraph_query(ctx);
     let code = match observation.effective {
         IndexEffective::Ready => return None,
         IndexEffective::Off => "callgraph_off",
