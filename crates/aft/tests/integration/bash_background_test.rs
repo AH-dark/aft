@@ -145,8 +145,11 @@ fn wait_for_status(aft: &mut AftProcess, task_id: &str, expected: &str) -> Value
                 "got terminal status '{observed}', expected '{expected}'. last metadata: {response:?}"
             );
         }
+        // A hang guard only: a loaded Windows runner can take seconds to start
+        // a shell or to notice a deadline, and every caller waits for a status
+        // that does arrive.
         assert!(
-            started.elapsed() < Duration::from_secs(8),
+            started.elapsed() < Duration::from_secs(30),
             "timed out waiting for {expected}: {response:?}"
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -1536,15 +1539,19 @@ fn background_spawn_honors_timeout() {
     let mut aft = AftProcess::spawn();
     let _dir = configure_background(&mut aft);
 
+    // The command would run for a minute, so finishing well inside that proves
+    // the 0.2 s timeout ended it. The 30 s bound (also the status wait's hang
+    // guard) leaves a loaded Windows runner seconds to notice the deadline and
+    // kill the process tree.
     let task_id = spawn_bg_params(
         &mut aft,
         "spawn-bg-timeout",
-        json!({ "command": "sleep 5", "background": true, "timeout": 200 }),
+        json!({ "command": "sleep 60", "background": true, "timeout": 200 }),
     );
     let started = Instant::now();
     let failed = wait_for_status(&mut aft, &task_id, "timed_out");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(30),
         "timeout took too long: {failed:?}"
     );
     assert_eq!(failed["exit_code"], 124);
