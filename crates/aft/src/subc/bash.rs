@@ -905,12 +905,44 @@ pub(super) fn unanswered_bash_reply_deadline(
     capture_deadline: Option<Instant>,
     command_timeout_ms: u64,
 ) -> Instant {
-    let reply_wait_ms = wait_window_ms.min(command_timeout_ms);
+    // Local command timeouts start at launch, not receipt. Allow startup before
+    // that timeout while keeping the reply wait cap measured from receipt.
+    let reply_wait_ms = wait_window_ms.min(startup_window_ms.saturating_add(command_timeout_ms));
     let mut deadline = received_at + Duration::from_millis(startup_window_ms.max(reply_wait_ms));
     if let Some(capture_deadline) = capture_deadline {
         deadline = deadline.max(capture_deadline);
     }
     deadline
+}
+
+#[cfg(test)]
+mod unanswered_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn command_timeout_watchdog_includes_startup_but_respects_reply_cap() {
+        let received_at = Instant::now();
+        for (wait_ms, startup_ms, timeout_ms, capture_ms, expected_ms) in [
+            (120_000, 5_000, 30_000, None, 35_000),
+            (32_000, 5_000, 30_000, None, 32_000),
+            (2_000, 5_000, 30_000, None, 5_000),
+            (120_000, 5_000, 30_000, Some(60_000), 60_000),
+            (120_000, 5_000, u64::MAX, None, 120_000),
+        ] {
+            let deadline = unanswered_bash_reply_deadline(
+                received_at,
+                wait_ms,
+                startup_ms,
+                capture_ms.map(|ms| received_at + Duration::from_millis(ms)),
+                timeout_ms,
+            );
+            assert_eq!(
+                deadline.duration_since(received_at),
+                Duration::from_millis(expected_ms),
+                "wait={wait_ms} startup={startup_ms} timeout={timeout_ms} capture={capture_ms:?}"
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

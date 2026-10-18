@@ -636,7 +636,7 @@ impl DispatchPathMetrics {
             })
             .unwrap_or_else(|| "undecoded".into());
         let client_deadline = if name == "bash" {
-            body.and_then(|body| client_deadline(body, received_at))
+            body.and_then(client_deadline)
         } else {
             None
         };
@@ -1278,14 +1278,17 @@ struct UnansweredTool {
     warned: bool,
 }
 
-fn client_deadline(body: &Value, received_at: Instant) -> Option<Instant> {
+fn client_deadline(body: &Value) -> Option<Instant> {
     let deadline_ms = body.get("deadline_ms")?.as_u64()?;
+    // Pair the clocks here: the reader's receipt instant can predate this
+    // wall-clock sample by time spent queued for dispatch.
+    let now = Instant::now();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64;
-    received_at.checked_add(Duration::from_millis(deadline_ms.saturating_sub(now_ms)))
+    now.checked_add(Duration::from_millis(deadline_ms.saturating_sub(now_ms)))
 }
 
 pub(super) struct DeferredBashWaitGuard {
@@ -3359,6 +3362,47 @@ mod tests {
             1,
             "warn only once per unanswered call"
         );
+    }
+
+    #[test]
+    fn bash_client_deadline_watchdog_does_not_double_count_reader_queue_time() {
+        use std::cell::RefCell;
+
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let now_ms = super::SystemTime::now()
+            .duration_since(super::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let request = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            24,
+            1,
+            1190,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "bash",
+                "deadline_ms": now_ms + 10_000,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&request, now - super::Duration::from_secs(5));
+
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(9), &sink);
+        assert!(
+            lines.borrow().is_empty(),
+            "reader queue time must not shorten the client's remaining ten seconds: {:?}",
+            lines.borrow()
+        );
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(11), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1190"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(12), &sink);
+        assert_eq!(lines.borrow().len(), 1, "each call warns only once");
     }
 
     #[test]
