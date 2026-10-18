@@ -4541,7 +4541,7 @@ mod route_tests {
             "held-cold-build".into(),
             Box::new(move |_| {
                 heavy_started.send(()).unwrap();
-                heavy_release.recv().unwrap();
+                let _ = heavy_release.recv();
                 Response::success("heavy", json!({}))
             }),
         );
@@ -4564,17 +4564,18 @@ mod route_tests {
         submit_provider_read(
             &writer,
             &frame,
-            test_support::route_identity(&root, ""),
+            test_support::route_identity(&root, "catalog-session"),
             &executor,
             &Arc::default(),
             &Arc::new(DispatchPathMetrics::new()),
             "tool.catalog",
             json!({}),
+            PhaseTrace::new(Instant::now()),
         )
         .await
         .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), replies.recv())
+            tokio::time::timeout(Duration::from_millis(80), replies.recv())
                 .await
                 .is_err(),
             "catalogs must share existing read permits"
@@ -4586,6 +4587,36 @@ mod route_tests {
             .unwrap()
             .unwrap();
         assert_eq!(reply.header.ty, FrameType::Response);
+        let trace = reply
+            .tool_response_trace
+            .expect("tool.catalog replies must carry response timing");
+        let now = Instant::now();
+        let completed = trace
+            .finish(now, now, now, reply.frame.body.len())
+            .expect("tool.catalog trace must have executor and writer timings");
+        assert!(completed.phases.total > Duration::from_millis(50));
+        assert!(completed.phases.queue > Duration::from_millis(50));
+        let _ = crate::logging::take_slow_tool_call_logs_for_test();
+        crate::log_ctx::with_session(Some(completed.session.clone()), || {
+            crate::logging::note_tool_call_trace(
+                &completed.name,
+                &completed.session,
+                &completed.root,
+                completed.channel,
+                completed.corr,
+                completed.phases,
+                crate::logging::ToolCallCaller::Agent,
+            );
+        });
+        let lines = crate::logging::take_slow_tool_call_logs_for_test();
+        let slow_line = lines
+            .iter()
+            .find(|line| line.contains("slow tool_call name=tool.catalog"))
+            .expect("delayed catalog response should produce a slow tool_call log");
+        assert!(slow_line.contains("session=catalog-session"));
+        assert!(slow_line.contains("queue="));
+        assert!(slow_line.contains("exec="));
+        assert!(slow_line.contains("egress="));
         assert!(ctx.database_runtime_pending("write"));
         assert_eq!(executor.heavy_permits(), 1);
         release_heavy.send(()).unwrap();

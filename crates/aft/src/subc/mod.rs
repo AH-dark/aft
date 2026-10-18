@@ -1186,15 +1186,13 @@ pub(super) fn trust_for_principal(principal: &Option<Principal>) -> BindTrust {
         // accept a module's NEW name in a released binary before the module
         // starts using it, and the old name stays until the flip has settled.
         // That is why transitional pairs appear here: llm-runner/broca was the
-        // previous rename, alfonso-core/prefrontal is the current one. When
-        // retiring an old name, confirm the fleet no longer spawns it — a
-        // stale entry here is inert, but a missing one silently downgrades a
-        // first-party module to Untrusted and revokes its bash access.
+        // previous rename. When retiring an old id, confirm the fleet no longer
+        // spawns it. Stale entries are inert, but omitting a live id silently
+        // downgrades a first-party module to Untrusted and revokes its bash access.
         Some(Principal::Reserved { module_id })
             if module_id == "llm-runner"
                 || module_id == "aft"
                 || module_id == "broca"
-                || module_id == "alfonso-core"
                 || module_id == "prefrontal"
                 || module_id == "prefrontal-core" =>
         {
@@ -6212,7 +6210,15 @@ where
             )
             .await;
             metrics.writer_active.store(false, Ordering::Relaxed);
-            let write_timing = write_timing?;
+            let write_timing = match write_timing {
+                Ok(write_timing) => write_timing,
+                Err(error) => {
+                    if let Some(trace) = queued.tool_response_trace.as_ref() {
+                        trace.note_write_failure(&error.to_string());
+                    }
+                    return Err(error);
+                }
+            };
             metrics.tool_replied(queued.frame());
 
             if let (Some(trace), Some(dequeued), Some(write_timing)) =
@@ -6224,9 +6230,11 @@ where
                     write_timing.write_finished,
                     write_timing.frame_bytes,
                 ) {
-                    log_ctx::with_session(Some(completed.session), || {
+                    let session = completed.session.clone();
+                    log_ctx::with_session(Some(session.clone()), || {
                         crate::logging::note_tool_call_trace(
                             &completed.name,
+                            &session,
                             &completed.root,
                             completed.channel,
                             completed.corr,
@@ -7993,6 +8001,7 @@ async fn submit_provider_read(
     metrics: &Arc<DispatchPathMetrics>,
     operation: &str,
     body: Value,
+    mut phase_trace: PhaseTrace,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let corr = frame.header.corr;
@@ -8000,6 +8009,9 @@ async fn submit_provider_read(
     let flags = frame.header.flags;
     let operation = operation.to_string();
     let job_operation = operation.clone();
+    let job_session = identity.session.clone();
+    let session = identity.session.clone();
+    let project_root = identity.project_root.clone();
     let request_id = format!("subc-{}-{}", route.channel, corr);
     let job_id = request_id.clone();
     // Worker catalogs can materialize persisted launch params even on a
@@ -8010,6 +8022,8 @@ async fn submit_provider_read(
             .get("params")
             .and_then(Value::as_object)
             .is_some_and(|p| p.contains_key("allow_paths"));
+    phase_trace.mark_executor_submitted();
+    let (trace_tx, trace_rx) = oneshot::channel();
     let rx = submit_active_tool_call(
         executor,
         active,
@@ -8026,6 +8040,7 @@ async fn submit_provider_read(
         &operation,
         RequestFrameMeta { ver, flags },
         Box::new(move |ctx| {
+            phase_trace.mark_job_admitted();
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
             } else if job_operation.starts_with("grants.") {
@@ -8045,6 +8060,20 @@ async fn submit_provider_read(
                 }
                 remote_policy::catalog(body, &identity, ctx)
             };
+            if job_operation == "tool.catalog" {
+                if let Err(error) = &result {
+                    log::warn!(
+                        "tool.catalog fetch failed session={} channel={} epoch={} corr={} error_code={}",
+                        job_session,
+                        route.channel,
+                        route.epoch,
+                        corr,
+                        error.code
+                    );
+                }
+            }
+            phase_trace.mark_provider_read_done();
+            let _ = trace_tx.send(phase_trace);
             Response::success(
                 job_id,
                 match result {
@@ -8059,7 +8088,17 @@ async fn submit_provider_read(
     let active = active.clone();
     tokio::spawn(async move {
         let response = await_executor_response(rx, request_id).await;
+        let phase_trace = trace_rx.await.ok();
         if !claim_active_tool_call(&active, route, corr) {
+            if operation == "tool.catalog" {
+                log::warn!(
+                    "tool.catalog reply could not be sent session={} channel={} epoch={} corr={} reason=route_released",
+                    session,
+                    route.channel,
+                    route.epoch,
+                    corr
+                );
+            }
             return;
         }
         let (ty, body) = if let Some(error) = response.data.get("error") {
@@ -8072,12 +8111,75 @@ async fn submit_provider_read(
                 json!({"code": "executor_failure", "message": "provider read did not complete", "detail": response.data}),
             )
         };
-        if let Ok(body) = serde_json::to_vec(&body) {
-            if let Ok(frame) =
-                Frame::build_with_version(ver, ty, flags, route.channel, route.epoch, corr, body)
-            {
-                let _ = send_reliable_writer_frame(&tx, &metrics, frame, "v1 read reply").await;
+        let body = match serde_json::to_vec(&body) {
+            Ok(body) => body,
+            Err(error) => {
+                log::warn!(
+                    "tool-provider read reply could not be sent op={} session={} channel={} epoch={} corr={} error={error}",
+                    operation,
+                    session,
+                    route.channel,
+                    route.epoch,
+                    corr
+                );
+                finish_active_tool_call(&active, route, corr);
+                return;
             }
+        };
+        let response_frame = match Frame::build_with_version(
+            ver,
+            ty,
+            flags,
+            route.channel,
+            route.epoch,
+            corr,
+            body,
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                log::warn!(
+                    "tool-provider read reply could not be sent op={} session={} channel={} epoch={} corr={} error={error}",
+                    operation,
+                    session,
+                    route.channel,
+                    route.epoch,
+                    corr
+                );
+                finish_active_tool_call(&active, route, corr);
+                return;
+            }
+        };
+        let send_result = match phase_trace {
+            Some(phase_trace) => {
+                send_traced_tool_response_frame(
+                    &tx,
+                    &metrics,
+                    response_frame,
+                    ToolResponseWriteTrace::new(
+                        phase_trace,
+                        operation.clone(),
+                        crate::logging::ToolCallCaller::Agent,
+                        project_root,
+                        session.clone(),
+                        route.channel,
+                        corr,
+                    ),
+                )
+                .await
+            }
+            None => {
+                send_reliable_writer_frame(&tx, &metrics, response_frame, "v1 read reply").await
+            }
+        };
+        if let Err(error) = send_result {
+            log::warn!(
+                "tool-provider read reply could not be sent op={} session={} channel={} epoch={} corr={} error={error}",
+                operation,
+                session,
+                route.channel,
+                route.epoch,
+                corr
+            );
         }
         finish_active_tool_call(&active, route, corr);
     });
@@ -8455,6 +8557,7 @@ async fn handle_tool_call(
                 metrics,
                 operation,
                 body,
+                phase_trace,
             )
             .await;
         }
@@ -16231,7 +16334,6 @@ mod tests {
             "llm-runner",
             "aft",
             "broca",
-            "alfonso-core",
             "prefrontal",
             "prefrontal-core",
         ] {
@@ -16243,6 +16345,12 @@ mod tests {
                 "reserved module id '{module_id}' must resolve to first-party trust"
             );
         }
+        assert_eq!(
+            trust_for_principal(&Some(Principal::Reserved {
+                module_id: "alfonso-core".to_string(),
+            })),
+            BindTrust::Untrusted
+        );
         assert_eq!(
             trust_for_principal(&Some(Principal::Reserved {
                 module_id: "subc-mcp".to_string(),
@@ -16480,7 +16588,6 @@ mod tests {
                 "llm-runner",
                 "aft",
                 "broca",
-                "alfonso-core",
                 "prefrontal",
                 "prefrontal-core",
             ] {
@@ -16490,6 +16597,11 @@ mod tests {
                     "reserved module id {module_id:?} must stay first-party on {harness}"
                 );
             }
+            assert_eq!(
+                trust_for_bind(harness, &reserved("alfonso-core")),
+                BindTrust::Untrusted,
+                "retired module id alfonso-core must not be first-party on {harness}"
+            );
         }
     }
 

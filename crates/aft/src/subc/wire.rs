@@ -58,6 +58,18 @@ impl ToolResponseWriteTrace {
         }
     }
 
+    pub(super) fn note_write_failure(&self, error: &str) {
+        if self.name == "tool.catalog" {
+            log::warn!(
+                "tool.catalog reply could not be sent session={} channel={} corr={} error={}",
+                self.session,
+                self.channel,
+                self.corr,
+                error
+            );
+        }
+    }
+
     fn mark_writer_queue_full(&mut self) {
         self.writer_queue_was_full = true;
     }
