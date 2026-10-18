@@ -1008,6 +1008,145 @@ fn running_helper_timeout_has_only_native_platform_hint() {
 }
 
 #[test]
+fn walk_probe_shared_waiter_uses_running_access_deadline() {
+    for shorter_waiter in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let mut gate = stall_walk_at(&path, 1);
+        let mut budget = Budget::after(Duration::from_secs(5));
+        budget.access_budget = Duration::from_millis(200);
+        let owner_budget = budget.clone();
+        let owner_path = path.clone();
+        let owner = std::thread::spawn(move || {
+            with_budget(Some(owner_budget), || {
+                run_walk(&owner_path, Instant::now() + IO_BUDGET, |path, _| {
+                    probe_directory(&path, None)
+                })
+            })
+        });
+        gate.blocked.recv_timeout(IO_BUDGET).unwrap();
+        // The inline probe has started. Waiters follow its access cap unless
+        // their own request deadline expires first.
+        let wait = if shorter_waiter {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_secs(1)
+        };
+        let error = with_budget(Some(budget), || {
+            probe_directory(&path, Some(Instant::now() + wait))
+        })
+        .unwrap_err();
+        gate.release();
+        owner.join().unwrap().unwrap();
+        let expected = if shorter_waiter {
+            "read_io_queue_timeout"
+        } else {
+            "read_blocked"
+        };
+        assert_eq!(timeout_code(&error), expected, "{error}");
+    }
+}
+
+#[test]
+fn walk_request_expiry_before_stall_window_is_not_read_blocked() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        with_budget(Some(Budget::after(Duration::from_millis(300))), || {
+            run_walk(
+                Path::new("short-walk"),
+                Instant::now() + IO_BUDGET,
+                move |_, _| {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(IO_BUDGET);
+                },
+            )
+        })
+    });
+    started_rx.recv_timeout(IO_BUDGET).unwrap();
+    let end = caller.join().unwrap().unwrap();
+    release_tx.send(()).unwrap();
+    assert!(
+        matches!(end, WalkEnd::Stopped { stall: None, .. }),
+        "request expiry alone must not claim a stalled OS call"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_walk_gets_full_stall_window_after_helper_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queued-walk");
+    let gate = stall_helper(&path);
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (result_tx, result_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        with_single_access_budget(Duration::from_millis(400), || {
+            let end = run_walk_with_limiter(
+                &path,
+                Instant::now() + Duration::from_secs(5),
+                Arc::new(Limiter::new(1)),
+                move |_, _| {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(IO_BUDGET);
+                    42
+                },
+            );
+            result_tx.send(end).unwrap();
+        });
+    });
+    gate.reached.recv_timeout(IO_BUDGET).unwrap();
+    // Queue longer than the stall window, then let the access use less than
+    // its own window. Scheduling time must not make the running walk stall.
+    assert!(result_rx.recv_timeout(Duration::from_millis(600)).is_err());
+    drop(gate);
+    started_rx.recv_timeout(IO_BUDGET).unwrap();
+    let early = result_rx.recv_timeout(Duration::from_millis(250));
+    let _ = release_tx.send(());
+    caller.join().unwrap();
+    assert!(
+        early.is_err(),
+        "queue time was charged against the access window"
+    );
+    let end = result_rx.recv_timeout(IO_BUDGET).unwrap().unwrap();
+    assert!(matches!(end, WalkEnd::Finished(42)));
+}
+
+#[cfg(unix)]
+#[test]
+fn unscheduled_walk_expires_at_queue_deadline_and_never_runs_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unscheduled-walk");
+    let gate = stall_helper(&path);
+    let fired = Arc::new(AtomicBool::new(false));
+    let work_fired = Arc::clone(&fired);
+    let limiter = Arc::new(Limiter::new(1));
+    let walker_limiter = Arc::clone(&limiter);
+    let (result_tx, result_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        with_budget(Some(Budget::after(Duration::from_secs(5))), || {
+            let end = run_walk_with_limiter(
+                &path,
+                Instant::now() + Duration::from_millis(200),
+                walker_limiter,
+                move |_, _| {
+                    work_fired.store(true, Ordering::Relaxed);
+                },
+            );
+            result_tx.send(end).unwrap();
+        });
+    });
+    gate.reached.recv_timeout(IO_BUDGET).unwrap();
+    let early = result_rx.recv_timeout(Duration::from_secs(1));
+    drop(gate);
+    caller.join().unwrap();
+    let end = early.expect("an unstarted walk must stop waiting at its queue deadline");
+    assert_eq!(timeout_code(&end.err().unwrap()), "read_io_queue_timeout");
+    assert!(!fired.load(Ordering::Relaxed));
+}
+
+#[test]
 fn walk_deadline_is_not_cut_to_the_single_access_limit() {
     let limiter = Arc::new(Limiter::new(1));
     let budget = Budget::after(Duration::from_secs(30));

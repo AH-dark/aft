@@ -603,6 +603,16 @@ fn run_with_timeout<T: Send + 'static>(
                 "the walk reached its deadline before this call",
             ));
         }
+        if let Some(probe) = &probe {
+            // This probe runs on the walk's existing helper. Publish its access
+            // phase just as a newly scheduled helper would, so shared waiters
+            // use the running call's cap rather than a stale queue deadline.
+            let started = Instant::now();
+            let deadline = request_deadline(at).map_or(started + access_budget, |at| {
+                at.min(started + access_budget)
+            });
+            probe.set_deadline(deadline, Some(started));
+        }
         walk.reached(path);
         let result = work(path.to_path_buf());
         walk.step();
@@ -857,6 +867,11 @@ pub(crate) enum WalkEnd<T> {
     },
 }
 
+enum WalkMessage<T> {
+    Started,
+    Finished(T),
+}
+
 /// One filesystem call inside a walk that stopped making progress.
 pub(crate) struct WalkStall {
     path: PathBuf,
@@ -1007,8 +1022,8 @@ fn run_walk_with_limiter<T: Send + 'static>(
         counts.round_trips.fetch_add(1, Ordering::Relaxed);
         counts.spawns.fetch_add(1, Ordering::Relaxed);
     }
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let running = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let running = Arc::new(Mutex::new(false));
     let helper_running = Arc::clone(&running);
     let helper_control = Arc::clone(&control);
     std::thread::Builder::new()
@@ -1016,12 +1031,16 @@ fn run_walk_with_limiter<T: Send + 'static>(
         .spawn(move || {
             #[cfg(test)]
             regression_tests::before_helper(&owned);
-            // Never start a walk whose deadline passed while it was scheduled.
+            // Publish helper start and its first progress together. A waiter
+            // must never charge scheduling delay against the stall window.
+            let mut running = helper_running.lock().unwrap_or_else(|e| e.into_inner());
             if helper_control.expired() {
                 return;
             }
-            helper_running.store(true, Ordering::Release);
             helper_control.step();
+            *running = true;
+            drop(running);
+            let _ = tx.send(WalkMessage::Started);
             WALK.with(|walk| *walk.borrow_mut() = Some(Arc::clone(&helper_control)));
             let result = crate::context::confinement::inherit(confinement, || {
                 with_budget(budget, || work(owned, &helper_control))
@@ -1030,16 +1049,21 @@ fn run_walk_with_limiter<T: Send + 'static>(
             // The walk is done with the filesystem: free its slot before the
             // reply, so the next request can take it as soon as this one ends.
             drop(permit);
-            let _ = tx.send(result);
+            let _ = tx.send(WalkMessage::Finished(result));
         })?;
     let window = single_access_budget();
     loop {
-        let wake = wait_deadline.min(control.last_progress() + window);
+        let wake = if *running.lock().unwrap_or_else(|e| e.into_inner()) {
+            wait_deadline.min(control.last_progress() + window)
+        } else {
+            walk_deadline
+        };
         match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
-            Ok(result) => return Ok(WalkEnd::Finished(result)),
+            Ok(WalkMessage::Started) => continue,
+            Ok(WalkMessage::Finished(result)) => return Ok(WalkEnd::Finished(result)),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 control.stop.store(true, Ordering::Relaxed);
-                if !running.load(Ordering::Acquire) {
+                if !*running.lock().unwrap_or_else(|e| e.into_inner()) {
                     return Err(failure(
                         path,
                         "read_io_queue_timeout",
@@ -1050,9 +1074,10 @@ fn run_walk_with_limiter<T: Send + 'static>(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
-                if !running.load(Ordering::Acquire) {
+                let running = running.lock().unwrap_or_else(|e| e.into_inner());
+                if !*running {
                     // Not yet scheduled: a scheduling delay is not a stall.
-                    if now >= wait_deadline {
+                    if now >= walk_deadline {
                         control.stop.store(true, Ordering::Relaxed);
                         return Err(failure(
                             path,
@@ -1062,11 +1087,12 @@ fn run_walk_with_limiter<T: Send + 'static>(
                     }
                     continue;
                 }
+                drop(running);
                 let last = control.last_progress();
                 let waited = now.saturating_duration_since(last);
-                // At the request's end, a call that began before the walk's
-                // own deadline and is still running has outlived the walk.
-                let stalled = waited >= window || (now >= wait_deadline && last < walk_deadline);
+                // Request expiry alone does not mean an OS call stalled for
+                // the single-access window; return an ordinary walk partial.
+                let stalled = waited >= window;
                 if stalled || now >= wait_deadline {
                     control.stop.store(true, Ordering::Relaxed);
                     let stall = stalled.then(|| WalkStall {
@@ -1444,13 +1470,13 @@ pub(crate) fn metadata(path: &Path) -> io::Result<std::fs::Metadata> {
 #[cfg(test)]
 #[path = "bounded_io_tests.rs"]
 mod regression_tests;
-#[cfg(all(test, unix))]
-pub(crate) use regression_tests::{stall_helper, stall_running_helper};
 #[cfg(test)]
 pub(crate) use regression_tests::{
     block_stat, expire_walk_after_entries, many_entry_tree, run_walk_in_own_slot, slow_walk,
     slow_walk_entries, stall_walk_at, stall_walk_entry, with_single_access_budget,
 };
+#[cfg(all(test, unix))]
+pub(crate) use regression_tests::{stall_helper, stall_running_helper};
 #[cfg(all(test, unix))]
 pub(crate) fn stall_helper_if_requested(path: &Path) {
     regression_tests::before_helper(path);
