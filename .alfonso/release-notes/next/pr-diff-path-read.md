@@ -1,1 +1,1 @@
-- Reading files from pull request diffs now works for large pull requests.
+- `read` of a pull request diff (`pr://N/diff` or `pr://N/diff/<path>`) works again; it failed with a `gh` flag error.
