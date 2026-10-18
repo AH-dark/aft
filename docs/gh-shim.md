@@ -315,10 +315,13 @@ workflow YAML (including trigger aliases, anchors or merged mappings), or a
 limit: 15 seconds for the whole check, 128 workflow files, 16 MiB for tree output
 and 1 MiB per workflow. The operator can explicitly accept the risk with
 `GH_SHIM_RENAME_PUBLISHED=allow` alongside `GH_SHIM_BYPASS=operator`; only the exact
-value `allow` skips the check. The synced `operator-bypass.jsonl` line records
-`rename_published_override: "allow"`. `published_paths` is null when skipped
-because no inspection was performed, and an empty array after a verified clear
-check. This guard does not change other administration verbs or the v19 manifest.
+value `allow` enables the override, which still runs this bounded inspection but
+never refuses the rename based on its result. The synced `operator-bypass.jsonl`
+line records `rename_published_override: "allow"`
+and the full sorted `published_paths` list, including an empty array when the
+inspection succeeds without finding any. If inspection fails or times out, it
+records `published_paths: null` and the reason in `published_paths_unverified`.
+This guard does not change other administration verbs or the v19 manifest.
 
 `workflow disable` and `workflow enable` take the same operator gate, for the
 same reason `run cancel` does: a workflow that keeps refusing every attempt

@@ -223,6 +223,24 @@ fn gh_shim_rename_api_failure_is_unverified() {
 }
 
 #[test]
+fn gh_shim_rename_override_audits_tree_read_failure() {
+    let fixture = RenameFixture::new(&[], "");
+    let output = fixture
+        .command(&["repo", "rename", "new-name", "--yes"], "cortexkit/aft")
+        .env("GH_RENAME_API_FAIL", "yes")
+        .env("GH_SHIM_RENAME_PUBLISHED", "allow")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(73), "{output:?}");
+    let audit = fixture.base.audit_records();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0]["rename_published_override"], "allow");
+    assert_eq!(audit[0]["published_paths"], Value::Null);
+    let reason = audit[0]["published_paths_unverified"].as_str().unwrap();
+    assert!(reason.contains("HTTP 403"), "{reason}");
+}
+
+#[test]
 fn gh_shim_rename_unparseable_workflow_is_unverified() {
     RenameFixture::new(&[".github/workflows/build.yml"], "on: [\n")
         .refused("gh_shim_rename_unverified", "YAML");
@@ -240,10 +258,11 @@ fn gh_shim_rename_override_is_exact_and_audited_before_passthrough() {
     let audit = fixture.base.audit_records();
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0]["rename_published_override"], "allow");
-    assert_eq!(audit[0]["published_paths"], Value::Null);
-    assert!(!fs::read_to_string(&fixture.base.recorder)
+    assert_eq!(audit[0]["published_paths"], json!(["action.yml"]));
+    assert!(fs::read_to_string(&fixture.base.recorder)
         .unwrap()
-        .contains("api "));
+        .lines()
+        .any(|line| line.contains("/git/trees/")));
     let output = fixture
         .command(&["repo", "rename", "new-name", "--yes"], "cortexkit/aft")
         .env("GH_SHIM_RENAME_PUBLISHED", "ALLOW")

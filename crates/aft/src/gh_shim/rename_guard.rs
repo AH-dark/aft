@@ -18,22 +18,18 @@ pub(super) struct RenameCheck {
     pub repository: Option<String>,
     pub overridden: bool,
     pub published_paths: Option<Vec<String>>,
+    pub published_paths_unverified: Option<String>,
 }
 
 pub(super) fn check(
     args: &[OsString],
     repository: Option<&str>,
 ) -> Result<RenameCheck, (RefusalCode, String)> {
-    if std::env::var_os("GH_SHIM_RENAME_PUBLISHED").as_deref() == Some("allow".as_ref()) {
-        // Skipping network reads means the published paths are unknown, not empty.
-        return Ok(RenameCheck {
-            repository: repository.map(str::to_owned),
-            overridden: true,
-            published_paths: None,
-        });
-    }
+    let overridden =
+        std::env::var_os("GH_SHIM_RENAME_PUBLISHED").as_deref() == Some("allow".as_ref());
     let deadline = Instant::now() + CHECK_BUDGET;
     let mut repo = repository.unwrap_or("the current repository").to_string();
+    let mut audit_repository = repository.map(str::to_owned);
     let result = (|| {
         let real_gh = resolve_real_gh(&executing_image()).ok_or("real gh was not found")?;
         // Let gh select the current repository (including GH_REPO and remote
@@ -51,6 +47,7 @@ pub(super) fn check(
             .filter(|name| valid_repo(name))
             .ok_or("repository metadata has no valid nameWithOwner")?
             .to_string();
+        audit_repository = Some(repo.clone());
         // The selected remote can be on a different host from GH_HOST. Pin API
         // reads to gh's resolved repository so a namesake cannot certify it.
         let url = url::Url::parse(
@@ -102,10 +99,11 @@ pub(super) fn check(
         Ok::<_, String>(published)
     })();
     match result {
-        Ok(paths) if paths.is_empty() => Ok(RenameCheck {
+        Ok(paths) if paths.is_empty() || overridden => Ok(RenameCheck {
             repository: Some(repo),
-            overridden: false,
+            overridden,
             published_paths: Some(paths),
+            published_paths_unverified: None,
         }),
         Ok(paths) => Err((
             RefusalCode::RenamePublished,
@@ -122,6 +120,12 @@ pub(super) fn check(
                         .join(", "),
                 ),
         )),
+        Err(reason) if overridden => Ok(RenameCheck {
+            repository: audit_repository,
+            overridden: true,
+            published_paths: None,
+            published_paths_unverified: Some(reason),
+        }),
         Err(reason) => Err((
             RefusalCode::RenameUnverified,
             UNVERIFIED_MESSAGE

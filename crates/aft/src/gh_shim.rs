@@ -1201,16 +1201,19 @@ where
 {
     let audit = if tuple == "repo rename" {
         match rename_guard::check(args, repository) {
-            Ok(check) => append_bypass_audit_record(
-                paths,
-                &json!({
+            Ok(check) => {
+                let mut record = json!({
                     "as_of_unix_secs": now,
                     "tuple": tuple,
                     "repository": check.repository,
                     "rename_published_override": check.overridden.then_some("allow"),
                     "published_paths": check.published_paths,
-                }),
-            ),
+                });
+                if let Some(reason) = check.published_paths_unverified {
+                    record["published_paths_unverified"] = json!(reason);
+                }
+                append_bypass_audit_record(paths, &record)
+            }
             Err((code, text)) => return refuse(code, &text),
         }
     } else {
