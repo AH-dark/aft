@@ -222,7 +222,7 @@ impl Drop for Process {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = child.kill();
         let _ = child.wait();
-        if std::thread::panicking() {
+        if std::thread::panicking() || std::env::var_os("AFT_TEST_TRACE_DAEMON_STDERR").is_some() {
             eprintln!(
                 "conformance daemon stderr for {}:\n{}",
                 self.root.display(),

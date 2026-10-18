@@ -2884,6 +2884,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let response = handle_configure_inner(req, ctx);
     // A successful configure applied the files it read; record them so a live
     // config reload can tell later edits apart and knows what is deferred.
+    ctx.begin_configure_ack_step("finish_configure");
     crate::config_live::finish_configure(ctx, response.success);
     response
 }
@@ -2977,11 +2978,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    ctx.begin_configure_ack_step("tier_file_reads");
     let (tiers, user_config_migration) =
         match resolve_config_tiers_for_configure(params, &root_path, Some(&harness)) {
             Ok(read) => read,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
+    ctx.begin_configure_ack_step("tier_merge");
     let config_diagnostics =
         crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
             &tiers,
@@ -3001,12 +3004,14 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             ),
         );
     }
+    ctx.begin_configure_ack_step("source_tracking");
     crate::config_live::stage_configure_sources(crate::config_live::ConfigSources::from_configure(
         parse_cortexkit_user_config_path(params).ok().flatten(),
         &root_path,
         &tiers,
         &next_config,
     ));
+    ctx.begin_configure_ack_step("validate_params");
     let mut configure_warnings = config_diagnostics
         .warnings
         .into_iter()
@@ -3131,6 +3136,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // Resolve both plugin-injected and plugin-less paths through the shared
     // storage resolver. This keeps AFT_STORAGE_DIR ahead of a wire value and
     // gives every artifact lane one concrete absolute root.
+    ctx.begin_configure_ack_step("storage_root");
     let resolved_storage_dir =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     if let Err(error) = crate::private_storage::open_root(&resolved_storage_dir) {
@@ -3142,7 +3148,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // Check the reader floor (and write today's formats as its baseline)
     // before this configure reads or writes anything under the storage root,
     // so a build below the floor refuses the affected components by name.
+    ctx.begin_configure_ack_step("reader_floor");
     crate::reader_floor::prepare(&resolved_storage_dir);
+    ctx.begin_configure_ack_step("validate_runtime_params");
     next_config.storage_dir = Some(resolved_storage_dir);
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
@@ -3632,6 +3640,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             || next_config.indexes.semantic
             || next_config.indexes.callgraph);
     ctx.begin_configure_ack_phase("cache_key_resolve");
+    ctx.begin_configure_ack_step("artifact_key");
     let mut cache_key_profile = CacheKeyResolveProfile::new(&canonical_cache_root);
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
@@ -3665,6 +3674,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
+    ctx.begin_configure_ack_step("retention_bind");
     let retention_started = Instant::now();
     let retention_result = crate::storage_retention::record_bind(
         &storage_root,
@@ -3679,6 +3689,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             format!("cannot protect checkout cache binding: {error}"),
         );
     }
+    ctx.begin_configure_ack_step("format_preflight");
     if let Some(project_key) = project_key.as_ref() {
         // Read only the version headers of this project's shared artifacts
         // before any loader, builder or owner claim touches them, so a format

@@ -241,6 +241,7 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
     if !success {
         return;
     }
+    ctx.begin_configure_ack_step("config_sources_commit");
     {
         let _reload = ctx.config_live().reload_lock.lock();
         *ctx.config_live().sources.lock() = Some(sources);
@@ -249,6 +250,7 @@ pub fn finish_configure(ctx: &AppContext, success: bool) {
             .project_hold_active
             .store(false, Ordering::Release);
     }
+    ctx.begin_configure_ack_step("config_watches");
     sync_config_watches(ctx);
 }
 

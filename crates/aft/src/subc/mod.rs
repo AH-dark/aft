@@ -7262,6 +7262,7 @@ async fn handle_control_request(
                     let standing_actor = Arc::clone(standing_actor);
                     Arc::new(move |ctx| {
                         log_ctx::with_session(Some(configure_session.clone()), || {
+                            let bind_started = Instant::now();
                             let response = dispatch(configure_req.clone(), ctx);
                             if response.success {
                                 // Revoke matching standing publication before the
@@ -7269,6 +7270,13 @@ async fn handle_control_request(
                                 // Contention is covered by the normal bind deadline;
                                 // health and other routes remain serviceable.
                                 standing_actor.begin_session_bind(ctx);
+                            }
+                            ctx.begin_configure_ack_phase("bind_response_ready");
+                            let timings = ctx.configure_ack_phase_snapshot();
+                            if bind_started.elapsed() >= Duration::from_secs(1) {
+                                log::info!("subc attach: bind configure finished: {timings}");
+                            } else {
+                                log::debug!("subc attach: bind configure finished: {timings}");
                             }
                             response
                         })
@@ -12277,16 +12285,25 @@ mod tests {
             Config {
                 project_root: Some(root.as_path().to_path_buf()),
                 storage_dir: Some(dir.path().join("storage")),
+                index: crate::config::IndexConfig {
+                    roots: vec![crate::config::IndexRootConfig {
+                        path: root.as_path().to_string_lossy().into_owned(),
+                        indexes: vec![crate::config::IndexKind::Search],
+                    }],
+                },
                 ..Config::default()
             },
         ));
         ctx.set_canonical_cache_root(root.as_path().to_path_buf());
         ctx.set_harness(crate::harness::Harness::Opencode);
-        executor.register_actor(root.clone(), ctx);
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
         let actor = Arc::new(standing::StandingActor::new(
             Arc::clone(&app),
             Arc::clone(&executor),
         ));
+        // This fixture needs a real standing publisher: an empty startup is
+        // deliberately no longer a dependency of the bind ACK.
+        actor.begin_session_bind(&ctx);
         let held_actor = Arc::clone(&actor);
         let (held_tx, held_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
