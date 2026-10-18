@@ -104,7 +104,7 @@ fn handle_restore_checkpoint_impl(
     }
 }
 
-fn requested_restore_paths(
+pub(crate) fn requested_restore_paths(
     req: &RawRequest,
     ctx: &AppContext,
 ) -> Result<Option<Vec<PathBuf>>, Response> {

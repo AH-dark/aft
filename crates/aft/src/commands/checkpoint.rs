@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::checkpoint::checkpoint_durability;
+use crate::commands::restore_checkpoint::requested_restore_paths;
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -135,7 +136,7 @@ fn validate_checkpoint_files(
 
 /// Handle the `checkpoint_paths` command: return paths a checkpoint restore would write.
 ///
-/// Params: `name` (string, required) — checkpoint name.
+/// Params: `name` (string, required) — checkpoint name, plus optional `file`/`files` scope.
 /// Returns: `{ name, paths, file_count }` without mutating checkpoint or filesystem state.
 pub fn handle_checkpoint_paths(req: &RawRequest, ctx: &AppContext) -> Response {
     let name = match req.params.get("name").and_then(|v| v.as_str()) {
@@ -149,16 +150,41 @@ pub fn handle_checkpoint_paths(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    let requested_paths = match requested_restore_paths(req, ctx) {
+        Ok(paths) => paths,
+        Err(response) => return response,
+    };
+
     let mut checkpoint_store = ctx.checkpoint().lock();
     match checkpoint_store.absolute_file_paths(req.session(), name) {
-        Ok(paths) => Response::success(
-            &req.id,
-            serde_json::json!({
-                "name": name,
-                "paths": paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-                "file_count": paths.len(),
-            }),
-        ),
+        Ok(paths) => {
+            let paths = match requested_paths {
+                Some(requested_paths) => {
+                    for path in &requested_paths {
+                        if !paths.contains(path) {
+                            return Response::error(
+                                &req.id,
+                                "invalid_request",
+                                format!(
+                                    "checkpoint_paths: requested path '{}' is not in checkpoint '{name}'",
+                                    path.display()
+                                ),
+                            );
+                        }
+                    }
+                    requested_paths
+                }
+                None => paths,
+            };
+            Response::success(
+                &req.id,
+                serde_json::json!({
+                    "name": name,
+                    "paths": paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                    "file_count": paths.len(),
+                }),
+            )
+        }
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
 }

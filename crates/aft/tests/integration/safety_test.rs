@@ -1979,6 +1979,22 @@ fn checkpoint_paths_reports_restore_targets_without_mutating() {
     assert_eq!(fs::read_to_string(&file_a).unwrap(), "modified-a");
     assert_eq!(fs::read_to_string(&file_b).unwrap(), "modified-b");
 
+    let scoped_preview = aft.send(&format!(
+        r#"{{"id":"checkpoint-paths-scoped","command":"checkpoint_paths","name":"paths","file":{}}}"#,
+        crate::helpers::json_string(&file_a.display())
+    ));
+    assert_eq!(
+        scoped_preview["success"], true,
+        "scoped checkpoint paths: {scoped_preview:?}"
+    );
+    assert_eq!(scoped_preview["file_count"], 1);
+    assert_eq!(
+        scoped_preview["paths"],
+        serde_json::json!([file_a.to_str().unwrap()])
+    );
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "modified-a");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "modified-b");
+
     let restore = aft
         .send(r#"{"id":"checkpoint-paths-restore","command":"restore_checkpoint","name":"paths"}"#);
     assert_eq!(restore["success"], true, "restore: {restore:?}");

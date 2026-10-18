@@ -4,14 +4,19 @@ import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { prepareToolMap } from "../normalize-schemas.js";
 import type { PluginContext } from "../types.js";
-import { callBridge, callToolCall, expandTilde, resolveProjectRoot } from "./_shared.js";
+import {
+  callBridge,
+  callToolCall,
+  expandTilde,
+  resolvePathFromProjectRoot,
+  resolveProjectRoot,
+} from "./_shared.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
   permissionDeniedResponse,
   resolveAbsolutePath,
   resolveRelativePatternFromAbsolute,
-  workspacePattern,
 } from "./permissions.js";
 
 const z = tool.schema;
@@ -147,7 +152,16 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         }
 
         if (op === "restore") {
-          const preview = await callBridge(ctx, context, "checkpoint_paths", { name: args.name });
+          const projectRoot = await resolveProjectRoot(ctx, context);
+          const previewParams: Record<string, unknown> = { name: args.name };
+          if (typeof args.path === "string") {
+            previewParams.file = resolvePathFromProjectRoot(projectRoot, args.path);
+          }
+          const previewFiles = coerceStringArray(args.files).map((file) =>
+            resolvePathFromProjectRoot(projectRoot, file),
+          );
+          if (previewFiles.length > 0) previewParams.files = previewFiles;
+          const preview = await callBridge(ctx, context, "checkpoint_paths", previewParams);
           if (preview.success === false) {
             throw new Error(bridgeErrorMessage(preview, "checkpoint path preview failed"));
           }
@@ -157,9 +171,11 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
             if (denial) return permissionDeniedResponse(denial);
           }
 
-          const permissionError = await askEditPermission(context, [workspacePattern(context)], {
-            checkpoint: args.name,
-          });
+          const permissionError = await askEditPermission(
+            context,
+            relativePatternsFromPaths(context, Array.from(new Set(responsePaths(preview)))),
+            { checkpoint: args.name },
+          );
           if (permissionError) return permissionDeniedResponse(permissionError);
         }
 
