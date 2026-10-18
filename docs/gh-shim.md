@@ -298,6 +298,31 @@ synced before upstream execution. A new repository cannot already be bot-bound:
 operator bypass, including from a bound checkout. There is no unapproved create
 exception. These commands do not enter the bot-speech relay.
 
+Before an operator-bypassed `repo rename`, the shim checks the existing target
+repository using the real `gh` and the operator's login: `-R`/`--repo` wins,
+otherwise `gh` selects the current repository (including `GH_REPO`). It reads
+one recursive tree of the default branch and only fetches workflow blobs from
+that tree. Any `action.yml` or `action.yaml` anywhere, or a direct
+`.github/workflows/*.yml`/`*.yaml` file whose parsed YAML `on` includes
+`workflow_call`, refuses the rename with exit 86 and `gh_shim_rename_published`.
+The refusal names up to five paths and the total count. GitHub does not redirect
+other repositories' `uses: owner/repo[/path]@ref` or reusable-workflow references
+after a rename, so those workflows would silently break.
+
+The check fails closed with exit 86 and `gh_shim_rename_unverified` on API errors,
+an incomplete/truncated tree, a missing default branch, invalid or uninspectable
+workflow YAML (including trigger aliases, anchors or merged mappings), or a
+limit: 15 seconds for the whole check, 128 workflow files, 16 MiB for tree output
+and 1 MiB per workflow. The operator can explicitly accept the risk with
+`GH_SHIM_RENAME_PUBLISHED=allow` alongside `GH_SHIM_BYPASS=operator`; only the exact
+value `allow` enables the override, which still runs this bounded inspection but
+never refuses the rename based on its result. The synced `operator-bypass.jsonl`
+line records `rename_published_override: "allow"`
+and the full sorted `published_paths` list, including an empty array when the
+inspection succeeds without finding any. If inspection fails or times out, it
+records `published_paths: null` and the reason in `published_paths_unverified`.
+This guard does not change other administration verbs or the v19 manifest.
+
 `workflow disable` and `workflow enable` take the same operator gate, for the
 same reason `run cancel` does: a workflow that keeps refusing every attempt
 otherwise piles up failed runs with no way to stop it short of a token only the

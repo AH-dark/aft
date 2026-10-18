@@ -177,26 +177,43 @@ fn v19_pr_ready_undo_reaches_the_daemon_wire() {
     }
 }
 
-struct BypassEnv(Option<OsString>);
+struct BypassEnv(&'static str, Option<OsString>);
 
 impl BypassEnv {
     fn set(value: Option<&str>) -> Self {
-        let previous = std::env::var_os("GH_SHIM_BYPASS");
+        Self::set_key("GH_SHIM_BYPASS", value)
+    }
+
+    fn set_key(key: &'static str, value: Option<&str>) -> Self {
+        let previous = std::env::var_os(key);
         match value {
-            Some(value) => std::env::set_var("GH_SHIM_BYPASS", value),
-            None => std::env::remove_var("GH_SHIM_BYPASS"),
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
         }
-        Self(previous)
+        Self(key, previous)
     }
 }
 
 impl Drop for BypassEnv {
     fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var("GH_SHIM_BYPASS", value),
-            None => std::env::remove_var("GH_SHIM_BYPASS"),
+        match &self.1 {
+            Some(value) => std::env::set_var(self.0, value),
+            None => std::env::remove_var(self.0),
         }
     }
+}
+
+fn fake_rename_preflight(args: &[String]) -> Result<String, String> {
+    let expected = [
+        "repo",
+        "view",
+        "cortexkit/aft",
+        "--json",
+        "nameWithOwner,defaultBranchRef,url",
+    ]
+    .map(str::to_owned);
+    assert_eq!(args, expected);
+    Err("injected gh preflight runner".into())
 }
 
 fn check_admin(raw: &[&str], tuple: &str) {
@@ -268,7 +285,23 @@ fn check_admin(raw: &[&str], tuple: &str) {
     assert_eq!(dispatch(), REFUSAL_EXIT_STATUS);
     assert!(!paths.bypass_audit.exists());
     let _operator = BypassEnv::set(Some("operator"));
-    assert_eq!(dispatch(), 73);
+    // This classifier test has no upstream gh; the runtime fixtures exercise
+    // the rename preflight, while this row verifies its explicit override.
+    let _rename_override = (tuple == "repo rename")
+        .then(|| BypassEnv::set_key("GH_SHIM_RENAME_PUBLISHED", Some("allow")));
+    let result = if tuple == "repo rename" {
+        // Keep a broken injection from accidentally finding and invoking the
+        // developer's real gh while this test verifies the fake runner.
+        let path = directory.path().to_string_lossy().into_owned();
+        let _path = BypassEnv::set_key("PATH", Some(&path));
+        let (result, calls) =
+            rename_guard::with_test_preflight_runner(fake_rename_preflight, dispatch);
+        assert_eq!(calls, 1, "the injected gh preflight runner must be called");
+        result
+    } else {
+        dispatch()
+    };
+    assert_eq!(result, 73);
 }
 
 #[test]

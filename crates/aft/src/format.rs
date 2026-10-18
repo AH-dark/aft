@@ -120,10 +120,10 @@ pub(crate) fn isolate_in_process_group(_cmd: &mut Command) {
     // in kill_process_tree so .cmd wrappers and grandchildren are terminated.
 }
 
-/// Kill the child and (on Unix) its entire process group, so orphaned
-/// grandchildren don't keep pipes open after a timeout.
+/// Kill the child and, where supported, its entire process tree so wrapper
+/// scripts cannot leave descendants running after a timeout.
 #[cfg(unix)]
-fn kill_process_tree(child: &mut Child) {
+pub(crate) fn kill_process_tree(child: &mut Child) {
     let pid = child.id() as i32;
     if pid > 0 {
         // SAFETY: killpg with SIGKILL on a process group leader is safe.
@@ -136,7 +136,7 @@ fn kill_process_tree(child: &mut Child) {
 }
 
 #[cfg(windows)]
-fn kill_process_tree(child: &mut Child) {
+pub(crate) fn kill_process_tree(child: &mut Child) {
     let pid = child.id().to_string();
     let _ = Command::new("taskkill")
         .args(["/PID", pid.as_str(), "/T", "/F"])
@@ -148,7 +148,7 @@ fn kill_process_tree(child: &mut Child) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn kill_process_tree(child: &mut Child) {
+pub(crate) fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
