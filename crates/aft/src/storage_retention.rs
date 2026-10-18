@@ -1108,12 +1108,12 @@ fn validate_tree(
 /// the domain folder above it) cannot be renamed into the domain's trash: the
 /// rename would cross volumes, and a mount point cannot be moved anyway. Its
 /// contents are retired instead, see `retire_mount_point_contents`.
-fn retire_directory(cache: &Path) -> io::Result<()> {
+fn retire_directory(storage: &Path, cache: &Path) -> io::Result<()> {
     let parent = cache
         .parent()
         .ok_or_else(|| io::Error::other("missing cache parent"))?;
     if crate::cross_volume::is_mount_point(cache)? {
-        return retire_mount_point_contents(cache);
+        return retire_mount_point_contents(storage, cache);
     }
     let trash = parent.join(".retention-trash");
     fs::create_dir_all(&trash)?;
@@ -1136,13 +1136,19 @@ fn retire_directory(cache: &Path) -> io::Result<()> {
 /// while the caller holds admission and SQLite's filesystem guard; the reaper
 /// discovers mount-local trash independently and does the slow unlink later.
 /// The mount point itself stays even after its retired contents are reclaimed.
-fn retire_mount_point_contents(cache: &Path) -> io::Result<()> {
+fn retire_mount_point_contents(storage: &Path, cache: &Path) -> io::Result<()> {
     let trash = cache.join(".retention-trash");
-    #[cfg(test)]
-    test_hook(cache, "rename-root");
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    let retired = trash.join(format!("retired-{:032x}", u128::from_le_bytes(nonce)));
+    let nonce = format!("{:032x}", u128::from_le_bytes(nonce));
+    // Cache-level mounts are rare. Publish a durable hint before moving data
+    // so ordinary reaper passes need not probe every cache's filesystem. Each
+    // retirement replaces the generation under admission, letting the reaper
+    // detect a newer retirement before it clears the hint.
+    atomic_json(&storage.join("retention/mount-trash-pending"), &nonce)?;
+    #[cfg(test)]
+    test_hook(cache, "rename-root");
+    let retired = trash.join(format!("retired-{nonce}"));
     loop {
         fs::create_dir_all(&trash)?;
         if !fs::symlink_metadata(&trash)?.is_dir() {
@@ -1183,7 +1189,9 @@ fn retired_mount_point(cache: &Path) -> bool {
         })
 }
 
-fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<()> {
+/// Returns whether any recognizable tombstones could not be reclaimed. A busy
+/// mount-local snapshot also keeps the pending hint for a later reaper pass.
+fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<bool> {
     let entries = {
         // Snapshot mount-local tombstones under admission so a concurrent
         // retirement finishes moving entries before any of them are unlinked.
@@ -1192,7 +1200,7 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<()>
             match crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
             {
                 Ok(lease) => Some(lease),
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(true),
             }
         } else {
             None
@@ -1207,10 +1215,11 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<()>
                 entries.collect::<io::Result<Vec<_>>>()?
             }
             Ok(_) => return Err(io::Error::other("non-directory retention trash retained")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         }
     };
+    let mut pending = false;
     for entry in entries {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -1221,11 +1230,13 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<()>
         }
         let path = entry.path();
         if mount_local && crate::cross_volume::is_mount_point(&path)? {
+            pending = true;
             continue;
         }
         // Check entry types and filesystem boundaries again after a restart;
         // an unexpected symlink or mount must keep the trash, not be unlinked.
         if let Err(error) = validate_tree(&path, Instant::now() + Duration::from_secs(60), false) {
+            pending = true;
             crate::slog_warn!(
                 "storage retention trash={} retained: {error}",
                 path.display()
@@ -1235,6 +1246,7 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<()>
         #[cfg(test)]
         test_hook(storage, "reap-root");
         if let Err(error) = fs::remove_dir_all(&path) {
+            pending = true;
             crate::slog_warn!(
                 "storage retention trash={} unlink deferred: {error}",
                 path.display()
@@ -1247,7 +1259,7 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<()>
         // safe outside admission and leaves any new tombstones for a later pass.
         let _ = fs::remove_dir(trash);
     }
-    Ok(())
+    Ok(pending)
 }
 
 fn reap_retired(storage: &Path) -> io::Result<()> {
@@ -1255,11 +1267,21 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
     // is separate from admission: slow unlinks must not block binds or pins.
     let _lease = crate::fs_lock::try_acquire(&storage.join("retention/reap.lock"), Duration::ZERO)
         .map_err(|error| io::Error::other(error.to_string()))?;
+    let marker = storage.join("retention/mount-trash-pending");
+    let mount_scan = match fs::read(&marker) {
+        Ok(generation) => Some(generation),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut mount_trash_pending = false;
     for (domain, flat) in domain_paths(storage)? {
         if flat {
             continue;
         }
         reap_trash(storage, &domain.join(".retention-trash"), false)?;
+        if mount_scan.is_none() {
+            continue;
+        }
         let entries = match fs::read_dir(&domain) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -1271,6 +1293,8 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
             if !key_valid(&entry.file_name().to_string_lossy()) || !entry.file_type()?.is_dir() {
                 continue;
             }
+            #[cfg(test)]
+            test_hook(storage, "mount-trash-probe");
             let mounted = match crate::cross_volume::is_mount_point(&cache) {
                 Ok(mounted) => mounted,
                 // A normal cache can be retired while the reaper lists mounts.
@@ -1278,7 +1302,30 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
                 Err(error) => return Err(error),
             };
             if mounted {
-                reap_trash(storage, &cache.join(".retention-trash"), true)?;
+                mount_trash_pending |= reap_trash(storage, &cache.join(".retention-trash"), true)?;
+            }
+        }
+    }
+    if !mount_trash_pending {
+        if let Some(scanned) = mount_scan {
+            #[cfg(test)]
+            test_hook(storage, "mount-trash-scanned");
+            let Ok(_admission) =
+                crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
+            else {
+                return Ok(());
+            };
+            // Retirements publish under the same sweep.lock held by _admission.
+            // Keep a newer generation: it may describe trash created after this
+            // reaper scanned that domain.
+            match fs::read(&marker) {
+                Ok(current) if current == scanned => {
+                    fs::remove_file(&marker)?;
+                    crate::durability::sync_dir(&storage.join("retention"))?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1618,7 +1665,7 @@ impl PreparedDue {
             return Ok(());
         }
         let phase = Instant::now();
-        retire_directory(&cache)?;
+        retire_directory(storage, &cache)?;
         *report.timings_ms.entry("due_rename".into()).or_default() +=
             phase.elapsed().as_millis() as u64;
         report.removed_roots += 1;
@@ -2067,7 +2114,7 @@ fn candidate_inner(
             }
         }
     } else {
-        retire_directory(&cache)?;
+        retire_directory(storage, &cache)?;
         report.removed_bytes += after_views
             .iter()
             .map(|(_, bytes)| bytes)
@@ -3693,6 +3740,45 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn retention_reaper_skips_mount_probes_without_pending_marker() {
+        let (temp, _, scope, _) = due_cache_fixture();
+        cache(temp.path(), "callgraph", &scope);
+        let ordinary = temp
+            .path()
+            .join(format!("views/.retention-trash/retired-{:032x}", 1));
+        fs::create_dir_all(&ordinary).unwrap();
+        fs::write(ordinary.join("payload.bin"), b"retired").unwrap();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = probes.clone();
+        let _hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "mount-trash-probe" {
+                    observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }),
+        );
+        reap_retired(temp.path()).unwrap();
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no marker means no cache-folder mount probes"
+        );
+        assert!(!ordinary.exists(), "domain-local trash still gets reaped");
+
+        let marker = temp.path().join("retention/mount-trash-pending");
+        {
+            let _admission = barrier(temp.path()).unwrap();
+            atomic_json(&marker, &"scan").unwrap();
+        }
+        reap_retired(temp.path()).unwrap();
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!marker.exists(), "a clean scan clears the marker");
+        reap_retired(temp.path()).unwrap();
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn retention_reaper_resumes_interrupted_mount_point_retirement() {
         let (temp, _, _, path) = due_cache_fixture();
         let _views = crate::walk_boundary::simulated_volumes::simulate(
@@ -3701,10 +3787,34 @@ mod storage_retention_tests {
         );
         let _mount = crate::walk_boundary::simulated_volumes::simulate(&path, u64::MAX - 11);
         let trash = path.join(".retention-trash");
-        let retired = trash.join(format!("retired-{:032x}", 1));
-        fs::create_dir_all(&retired).unwrap();
-        // Model a daemon exit after the last rename, before any unlink.
-        fs::rename(path.join("payload.bin"), retired.join("payload.bin")).unwrap();
+        let marker = temp.path().join("retention/mount-trash-pending");
+        let before_moves = path.clone();
+        let pending = marker.clone();
+        let _hook = observe_test_hook(
+            &path,
+            Arc::new(move |step| {
+                if step == "rename-root" {
+                    assert!(
+                        pending.is_file(),
+                        "publish the marker before moving entries"
+                    );
+                    assert!(before_moves.join("payload.bin").exists());
+                }
+            }),
+        );
+        {
+            let _admission = barrier(temp.path()).unwrap();
+            // Model a daemon exit after all moves but before the reaper runs.
+            retire_directory(temp.path(), &path).unwrap();
+        }
+        let retired = fs::read_dir(&trash)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(retired.join("payload.bin").exists());
+        assert!(marker.exists());
         assert!(!emptied_mount_point(&path), "retired data is still on disk");
 
         reap_retired(temp.path()).unwrap();
@@ -3712,6 +3822,7 @@ mod storage_retention_tests {
             !trash.exists(),
             "a later reaper pass must reclaim local trash"
         );
+        assert!(!marker.exists(), "a clean reap clears the marker");
         assert!(path.is_dir(), "the mount point itself must stay");
         assert!(emptied_mount_point(&path));
 
@@ -3722,10 +3833,79 @@ mod storage_retention_tests {
         fs::write(unknown.join("important"), b"not retired").unwrap();
         fs::write(foreign.join("important"), b"another volume").unwrap();
         let _foreign = crate::walk_boundary::simulated_volumes::simulate(&foreign, u64::MAX - 12);
+        {
+            let _admission = barrier(temp.path()).unwrap();
+            atomic_json(&marker, &"protected").unwrap();
+        }
         reap_retired(temp.path()).unwrap();
         assert!(unknown.join("important").exists());
         assert!(foreign.join("important").exists());
         assert!(!emptied_mount_point(&path));
+        assert!(marker.exists(), "unreaped tombstones keep the marker");
+    }
+
+    #[test]
+    fn retention_mount_trash_marker_survives_concurrent_retirement() {
+        let (temp, _, _, path) = due_cache_fixture();
+        let _views = crate::walk_boundary::simulated_volumes::simulate(
+            &temp.path().join("views"),
+            u64::MAX - 10,
+        );
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&path, u64::MAX - 11);
+        {
+            let _admission = barrier(temp.path()).unwrap();
+            retire_directory(temp.path(), &path).unwrap();
+        }
+        let marker = temp.path().join("retention/mount-trash-pending");
+        let previous = fs::read(&marker).unwrap();
+        let (scanned_tx, scanned_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let hook = observe_test_hook(
+            temp.path(),
+            Arc::new(move |step| {
+                if step == "mount-trash-scanned" {
+                    scanned_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }),
+        );
+        let storage = temp.path().to_path_buf();
+        let worker = std::thread::spawn(move || reap_retired(&storage));
+        scanned_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        {
+            let _admission = barrier(temp.path()).unwrap();
+            fs::write(path.join("new-payload.bin"), b"retired after the scan").unwrap();
+            retire_directory(temp.path(), &path).unwrap();
+        }
+        let current = fs::read(&marker).unwrap();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        drop(hook);
+        assert_ne!(
+            previous, current,
+            "each retirement publishes a new generation"
+        );
+        assert_eq!(
+            fs::read(&marker).expect("a concurrent retirement's marker must survive"),
+            current,
+            "a concurrent retirement's marker must survive"
+        );
+        let trash = path.join(".retention-trash");
+        let retired = fs::read_dir(&trash)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(retired.join("new-payload.bin").exists());
+        reap_retired(temp.path()).unwrap();
+        assert!(!trash.exists());
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -3796,7 +3976,7 @@ mod storage_retention_tests {
     #[test]
     fn retention_reaper_resumes_retired_roots_without_a_pass() {
         let (temp, _, _, path) = due_cache_fixture();
-        retire_directory(&path).unwrap();
+        retire_directory(temp.path(), &path).unwrap();
         let trash = temp.path().join("views/.retention-trash");
         assert_eq!(fs::read_dir(&trash).unwrap().count(), 1);
         assert!(!path.exists());
@@ -3853,7 +4033,7 @@ mod storage_retention_tests {
         let report = run_pass(temp.path(), &|| false);
         assert_eq!(report.removed_roots, 0, "{report:?}");
         assert!(path.exists());
-        retire_directory(&path).unwrap();
+        retire_directory(temp.path(), &path).unwrap();
         reap_retired(temp.path()).unwrap();
         assert_eq!(
             fs::read_dir(temp.path().join("views/.retention-trash"))
