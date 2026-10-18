@@ -36,6 +36,10 @@ export interface GithubServerSpec {
   readonly layout: "distribution" | "standalone";
   /** A short, non-interactive command that must exit successfully before exposing the install. */
   readonly smokeArgs: readonly string[];
+  /** Runtime entries relative to the extraction root, checked without hashing their contents. */
+  readonly requiredRuntimePaths?: (
+    version: string,
+  ) => readonly { path: string; kind: "file" | "directory" }[];
   /** Returns the asset filename and archive type for the given platform/arch + version. */
   readonly resolveAsset: (
     platform: Platform,
@@ -74,6 +78,7 @@ const CLANGD: GithubServerSpec = {
   // clangd locates its bundled lib/clang builtin headers relative to bin/clangd.
   layout: "distribution",
   smokeArgs: ["--version"],
+  requiredRuntimePaths: (version) => [{ path: `clangd_${version}/lib/clang`, kind: "directory" }],
   resolveAsset: (platform, _arch, version) => {
     const platformName = platform === "darwin" ? "mac" : platform === "linux" ? "linux" : "windows";
     return { name: `clangd-${platformName}-${version}.zip`, archive: "zip" };
@@ -95,6 +100,10 @@ const LUA_LS: GithubServerSpec = {
   // LuaLS bootstraps main.lua and its runtime from the extracted distribution.
   layout: "distribution",
   smokeArgs: ["--version"],
+  requiredRuntimePaths: () => [
+    { path: "main.lua", kind: "file" },
+    { path: "script", kind: "directory" },
+  ],
   resolveAsset: (platform, arch, version) => {
     const ext: ArchiveType = platform === "win32" ? "zip" : "tar.gz";
     const platformName =

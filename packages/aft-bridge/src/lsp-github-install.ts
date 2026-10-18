@@ -14,11 +14,11 @@
  *
  * Extraction containment:
  *   1. Download to `<id>/<asset-name>` with a hard size cap.
- *   2. Extract into a quarantine dir `<id>/.staging-<rand>/`.
+ *   2. Extract into a staging dir `<id>/extracted.staging-<rand>/`.
  *   3. Walk the staging tree and reject any entry that is a symlink, hardlink,
  *      or whose canonical path escapes the staging root.
- *   4. Only after validation: `renameSync(staging, extracted)` atomically
- *      replaces any prior extraction.
+ *   4. Check the staged executable and runtime, then rename the old extraction
+ *      aside and swap the staged tree in, restoring the old tree if the swap fails.
  *   5. Stage dir is always cleaned up — success or failure.
  *
  * GitHub pin resolution:
@@ -107,6 +107,8 @@ export interface GithubInstallerHost {
     intervalMs: number,
   ): boolean;
   withInstallLock<T>(repo: string, action: () => Promise<T>): Promise<T | null>;
+  /** Non-blocking acquisition of the same lease used by withInstallLock. */
+  acquireInstallLock(repo: string): { release(): void } | null;
   hasRootMarker(root: string, markers: readonly string[] | undefined): boolean;
   relevantExtensionsInProject(
     root: string,
@@ -126,6 +128,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     writeVersionCheck,
     shouldRecheckVersion,
     withInstallLock,
+    acquireInstallLock,
     hasRootMarker,
     relevantExtensionsInProject,
   } = services;
@@ -1025,6 +1028,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     archivePath: string,
     destDir: string,
     archiveType: string,
+    validateStaged?: (stagingDir: string) => Promise<void>,
   ): Promise<void> {
     // Per-process random suffix avoids collisions if two installs of the
     // same package somehow race past the install lock (defense in depth).
@@ -1044,15 +1048,24 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       await precheckArchiveContents(archivePath, archiveType);
       await runPlatformExtractor(archivePath, stagingDir, archiveType);
       validateExtraction(stagingDir);
+      await validateStaged?.(stagingDir);
 
-      // Atomic publish: remove old destDir THEN rename staging into place.
-      // The order matters because rename-over-existing-dir fails on Windows.
+      // Keep the previous distribution available for rollback until the swap succeeds.
+      // Renaming over a nonempty directory is not supported on Windows.
+      const previousDir = `${destDir}.previous-${suffix}`;
+      const hadPrevious = existsSync(destDir);
+      if (hadPrevious) renameSync(destDir, previousDir);
       try {
-        rmSync(destDir, { recursive: true, force: true });
-      } catch {
-        // ignore — final renameSync will fail loudly if removal didn't work
+        renameSync(stagingDir, destDir);
+      } catch (err) {
+        if (hadPrevious) renameSync(previousDir, destDir);
+        throw err;
       }
-      renameSync(stagingDir, destDir);
+      try {
+        rmSync(previousDir, { recursive: true, force: true });
+      } catch (err) {
+        warn(`[lsp] could not remove previous extraction ${previousDir}: ${err}`);
+      }
     } catch (err) {
       // Always clean up the staging dir on any failure path.
       try {
@@ -1128,8 +1141,40 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     });
   }
 
-  /** Return known verdicts immediately; only unverified or legacy caches need a subprocess. */
+  function hasRequiredRuntime(
+    spec: GithubServerSpec,
+    extractDir: string,
+    version: string,
+  ): boolean {
+    return (spec.requiredRuntimePaths?.(stripTagV(version)) ?? []).every(({ path, kind }) => {
+      try {
+        const info = statSync(join(extractDir, path));
+        return kind === "file" ? info.isFile() : info.isDirectory();
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  /** Return known verdicts immediately without racing an install or waiting for its lock. */
   function validateCachedGithubInstall(
+    spec: GithubServerSpec,
+    platform: Platform,
+  ): boolean | null | Promise<boolean> {
+    const lease = acquireInstallLock(spec.githubRepo);
+    if (!lease) return null;
+    try {
+      const validation = validateCachedGithubInstallUnderLock(spec, platform);
+      if (typeof validation !== "boolean") return validation.finally(() => lease.release());
+      lease.release();
+      return validation;
+    } catch (err) {
+      lease.release();
+      throw err;
+    }
+  }
+
+  function validateCachedGithubInstallUnderLock(
     spec: GithubServerSpec,
     platform: Platform,
   ): boolean | Promise<boolean> {
@@ -1166,11 +1211,16 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       meta.sha256 === currentHash &&
       meta.binarySha256 === currentHash &&
       meta.layout === spec.layout &&
-      meta.smoke?.binarySha256 === currentHash
+      meta.smoke?.binarySha256 === currentHash &&
+      hasRequiredRuntime(spec, ghExtractDir(spec), meta.version)
     ) {
       return true;
     }
     return (async () => {
+      if (!hasRequiredRuntime(spec, ghExtractDir(spec), meta.version)) {
+        quarantineCachedGithubInstall(spec, "missing required runtime files");
+        return false;
+      }
       const verdict = await smokeGithubBinary(spec, binaryPath);
       if (verdict === "failed") {
         quarantineCachedGithubInstall(spec, "cached binary failed runtime smoke check");
@@ -1311,8 +1361,31 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       return { ok: false, sha256: archiveSha256, error: message };
     }
 
+    let binarySha256 = "";
+    let smokeVerdict: "passed" | "timeout" = "passed";
+    const binaryRelativePath = spec.binaryPathInArchive(platform, arch, version);
     try {
-      await extractArchiveSafely(archivePath, extractDir, expected.archive);
+      await extractArchiveSafely(archivePath, extractDir, expected.archive, async (stagingDir) => {
+        const stagedBinary = join(stagingDir, binaryRelativePath);
+        if (!existsSync(stagedBinary) || !statSync(stagedBinary).isFile()) {
+          throw new Error(`extracted binary not found at ${stagedBinary}`);
+        }
+        if (!hasRequiredRuntime(spec, stagingDir, version)) {
+          throw new Error("missing required runtime files in staged distribution");
+        }
+        if (platform !== "win32") {
+          const { chmodSync } = await import("node:fs");
+          chmodSync(stagedBinary, 0o755);
+        }
+        const verdict = await smokeGithubBinary(spec, stagedBinary);
+        if (verdict === "failed") throw new Error("staged binary failed runtime smoke check");
+        smokeVerdict = verdict;
+        const identityBeforeHash = fileIdentity(stagedBinary);
+        binarySha256 = await sha256OfFile(stagedBinary);
+        if (fileIdentity(stagedBinary) !== identityBeforeHash) {
+          throw new Error("staged executable changed while hashing");
+        }
+      });
     } catch (err) {
       const message = `extract failed: ${err instanceof Error ? err.message : String(err)}`;
       error(`[lsp] extract ${spec.id} failed: ${err}`);
@@ -1325,21 +1398,24 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       }
     }
 
-    const innerBinaryPath = join(extractDir, spec.binaryPathInArchive(platform, arch, version));
-    if (!existsSync(innerBinaryPath)) {
-      const message = `extracted binary not found at ${innerBinaryPath}`;
-      error(`[lsp] ${spec.id}: ${message}`);
-      return { ok: false, sha256: archiveSha256, error: message };
-    }
+    const innerBinaryPath = join(extractDir, binaryRelativePath);
 
     const targetBinary =
       spec.layout === "distribution" ? innerBinaryPath : ghBinaryPath(spec, platform);
     mkdirSync(dirname(targetBinary), { recursive: true });
     try {
-      if (spec.layout === "standalone") copyFileSync(innerBinaryPath, targetBinary);
-      if (platform !== "win32") {
-        const { chmodSync } = await import("node:fs");
-        chmodSync(targetBinary, 0o755);
+      if (spec.layout === "standalone") {
+        const stagedBinary = `${targetBinary}.staging-${randomBytes(8).toString("hex")}`;
+        try {
+          copyFileSync(innerBinaryPath, stagedBinary);
+          if (platform !== "win32") {
+            const { chmodSync } = await import("node:fs");
+            chmodSync(stagedBinary, 0o755);
+          }
+          renameSync(stagedBinary, targetBinary);
+        } finally {
+          rmSync(stagedBinary, { force: true });
+        }
       }
     } catch (err) {
       const message = `failed to place binary at ${targetBinary}: ${err instanceof Error ? err.message : String(err)}`;
@@ -1347,24 +1423,12 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       return { ok: false, sha256: archiveSha256, error: message };
     }
 
-    const smokeVerdict = await smokeGithubBinary(spec, targetBinary);
-    if (smokeVerdict === "failed") {
-      return {
-        ok: false,
-        sha256: archiveSha256,
-        error: "installed binary failed runtime smoke check",
-      };
-    }
-
     try {
-      const identityBeforeHash = fileIdentity(targetBinary);
-      const binarySha256 = await sha256OfFile(targetBinary);
-      // The refresh after installs settle validates this binary again; remember
-      // the digest just computed so that check does not hash it a second time.
-      if (fileIdentity(targetBinary) === identityBeforeHash) {
-        binaryDigestMemo.set(targetBinary, { identity: identityBeforeHash, digest: binarySha256 });
-        writeStampedFileDigest(targetBinary, binarySha256, identityBeforeHash);
-      }
+      const identity = fileIdentity(targetBinary);
+      // The staged executable was hashed before publication. Remember its new
+      // identity so the refresh does not hash the same bytes again.
+      binaryDigestMemo.set(targetBinary, { identity, digest: binarySha256 });
+      writeStampedFileDigest(targetBinary, binarySha256, identity);
       log(`[lsp] installed ${spec.id} ${tag} at ${targetBinary}`);
       log(`[lsp] ${spec.id} ${tag} binary_sha256=${binarySha256}`);
       return {
@@ -1545,6 +1609,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       const validation = isGithubInstalled(spec, host.platform)
         ? validateCachedGithubInstall(spec, host.platform)
         : false;
+      if (validation === null) skipped.push({ id: spec.id, reason: "another install in progress" });
       if (validation === true) cachedBinDirs.push(ghBinDir(spec));
       const cacheReady = Promise.resolve(validation).then((healthy) => {
         if (healthy && validation !== true) cachedBinDirs.push(ghBinDir(spec));

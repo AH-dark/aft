@@ -1,6 +1,7 @@
 import { createGithubInstaller } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
+  acquireInstallLock,
   readVersionCheck,
   shouldRecheckVersion,
   withInstallLock,
@@ -32,6 +33,7 @@ export const {
   _precheckArchiveSizeForTesting,
   _runArchiveToolForTesting,
 } = createGithubInstaller({
+  acquireInstallLock,
   log,
   warn,
   error,

@@ -1,11 +1,20 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { writeStampedFileDigest } from "../../binary-identity.js";
-import { execFileSync } from "../../child-process.js";
+import { execFileSync, spawn } from "../../child-process.js";
 import { acquireEnv } from "./env-guard.js";
+import { writeSmokeBinary } from "./smoke-binary.js";
 
 interface Installer {
   __githubBinaryHashCountForTests: () => number;
@@ -25,12 +34,25 @@ interface Installer {
     fetchImpl: typeof fetch,
   ) => {
     cachedBinDirs: string[];
+    skipped: Array<{ id: string; reason: string }>;
     installsComplete: Promise<void>;
     getCachedBinDirs: () => Promise<string[]>;
   };
 }
 
 export function githubLayoutTests(installer: Installer): void {
+  test("Windows smoke fixture adds the executable suffix only once", () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-smoke-suffix-"));
+    try {
+      const executable = join(root, "texlab.exe");
+      expect(writeSmokeBinary(join(root, "texlab"), "win32")).toBe(executable);
+      expect(writeSmokeBinary(executable, "win32")).toBe(executable);
+      expect(existsSync(executable)).toBe(true);
+      expect(existsSync(`${executable}.exe`)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   const withoutInstall = {
     autoInstall: false,
     graceDays: 7,
@@ -87,6 +109,14 @@ export function githubLayoutTests(installer: Installer): void {
           },
         ];
         const digest = createHash("sha256").update(script).digest("hex");
+        const luaRoot = join(root, "lsp-binaries", "lua-ls", "extracted");
+        mkdirSync(luaRoot, { recursive: true });
+        writeFileSync(join(luaRoot, "main.lua"), "-- runtime\n");
+        mkdirSync(join(luaRoot, "script"));
+        mkdirSync(
+          join(root, "lsp-binaries", "clangd", "extracted", "clangd_1.0.0", "lib", "clang"),
+          { recursive: true },
+        );
         for (const cached of caches) {
           mkdirSync(dirname(cached.binary), { recursive: true });
           writeFileSync(cached.binary, script, { mode: 0o755 });
@@ -303,6 +333,152 @@ export function githubLayoutTests(installer: Installer): void {
     },
   );
   test.skipIf(process.platform === "win32")(
+    "validation defers to another process holding the install lock without quarantine",
+    async () => {
+      const script = "#!/bin/sh\nexit 0\n";
+      await withCachedServer(script, async (binary, root) => {
+        const first = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+        await first.installsComplete;
+        const lock = join(
+          root,
+          "lsp-packages",
+          encodeURIComponent("latex-lsp/texlab"),
+          ".aft-installing",
+        );
+        const child = spawn(
+          process.execPath,
+          [
+            "-e",
+            `
+          const fs = require("node:fs");
+          const path = ${JSON.stringify(lock)};
+          fs.mkdirSync(require("node:path").dirname(path), { recursive: true });
+          fs.writeFileSync(path, process.pid + "\\n" + new Date().toISOString() + "\\nfixture-owner\\n", { flag: "wx" });
+          process.stdout.write("locked");
+          process.stdin.once("data", () => { fs.unlinkSync(path); process.exit(0); });
+        `,
+          ],
+          { stdio: ["pipe", "pipe", "pipe"] },
+        );
+        const exited = new Promise<void>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("exit", (code) =>
+            code === 0 ? resolve() : reject(new Error(`lock owner exited ${code}`)),
+          );
+        });
+        try {
+          await Promise.race([
+            new Promise<void>((resolve) => child.stdout!.once("data", () => resolve())),
+            exited.then(() => {
+              throw new Error("lock owner exited before readiness");
+            }),
+          ]);
+          const held = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+          expect(held.cachedBinDirs).not.toContain(dirname(binary));
+          expect(held.skipped).toContainEqual({
+            id: "texlab",
+            reason: "another install in progress",
+          });
+          await held.installsComplete;
+          writeFileSync(binary, `${script}# upgrade in progress\n`, { mode: 0o755 });
+          expect(await held.getCachedBinDirs()).not.toContain(dirname(binary));
+          expect(existsSync(binary)).toBe(true);
+          expect(existsSync(join(root, "lsp-binaries", ".quarantine"))).toBe(false);
+          writeFileSync(binary, script, { mode: 0o755 });
+          child.stdin!.end("release");
+          await exited;
+          expect(await held.getCachedBinDirs()).toContain(dirname(binary));
+        } finally {
+          if (child.exitCode === null) child.kill();
+          await exited.catch(() => {});
+        }
+      });
+    },
+  );
+  test.skipIf(process.platform === "win32")(
+    "failed distribution upgrade preserves the old executable and runtime",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "aft-upgrade-layout-"));
+      const releaseEnv = await acquireEnv({ AFT_CACHE_DIR: root });
+      try {
+        const source = join(root, "fixture");
+        mkdirSync(join(source, "bin"), { recursive: true });
+        mkdirSync(join(source, "script"));
+        const script = '#!/bin/sh\ncat "$(dirname "$0")/../main.lua"\n';
+        const sourceBinary = join(source, "bin", "lua-language-server");
+        writeFileSync(sourceBinary, script, { mode: 0o755 });
+        writeFileSync(join(source, "main.lua"), "working old runtime\n");
+        const archive = join(root, "fixture.tar.gz");
+        const pack = () =>
+          execFileSync("tar", ["-czf", archive, "-C", source, "bin", "main.lua", "script"]);
+        pack();
+        const fetchImpl = (async (input: string | URL | Request) => {
+          if (String(input).includes("/releases/tags/")) {
+            const version = String(input).split("/").pop();
+            const asset = `lua-language-server-${version}-${process.platform}-${process.arch}.tar.gz`;
+            return Response.json({
+              tag_name: version,
+              assets: [
+                {
+                  name: asset,
+                  browser_download_url: `https://github.com/LuaLS/lua-language-server/releases/download/${version}/${asset}`,
+                },
+              ],
+            });
+          }
+          return new Response(readFileSync(archive));
+        }) as typeof fetch;
+        const install = (version: string) =>
+          installer.runGithubAutoInstall(
+            new Set(["lua-ls"]),
+            {
+              ...withoutInstall,
+              autoInstall: true,
+              versions: { "LuaLS/lua-language-server": version },
+            },
+            fetchImpl,
+          );
+        const first = install("3.19.1");
+        await first.installsComplete;
+        const pkg = join(root, "lsp-binaries", "lua-ls");
+        const executable = join(pkg, "extracted", "bin", "lua-language-server");
+        expect(execFileSync(executable, ["--version"], { encoding: "utf8" }).trim()).toBe(
+          "working old runtime",
+        );
+        const meta = readFileSync(join(pkg, ".aft-installed"), "utf8");
+
+        for (const failure of ["missing executable", "failed smoke"]) {
+          writeFileSync(join(source, "main.lua"), "replacement runtime\n");
+          if (failure === "missing executable") rmSync(sourceBinary);
+          else writeFileSync(sourceBinary, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+          pack();
+          const upgrade = install(failure === "missing executable" ? "3.19.2" : "3.19.3");
+          await upgrade.installsComplete;
+          expect(existsSync(join(pkg, ".aft-install-failed.json"))).toBe(true);
+          expect(readFileSync(join(pkg, ".aft-install-failed.json"), "utf8")).toContain(
+            failure === "missing executable"
+              ? "extracted binary not found"
+              : "failed runtime smoke",
+          );
+          expect(existsSync(executable)).toBe(true);
+          expect(execFileSync(executable, ["--version"], { encoding: "utf8" }).trim()).toBe(
+            "working old runtime",
+          );
+          expect(readFileSync(join(pkg, ".aft-installed"), "utf8")).toBe(meta);
+          expect(await upgrade.getCachedBinDirs()).toContain(dirname(executable));
+          expect(
+            readdirSync(pkg).filter(
+              (name) => name.includes(".staging-") || name.includes(".previous-"),
+            ),
+          ).toEqual([]);
+        }
+      } finally {
+        releaseEnv();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+  test.skipIf(process.platform === "win32")(
     "LuaLS distribution runs and repairs a legacy copy-out cache",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "aft-luals-layout-"));
@@ -310,11 +486,12 @@ export function githubLayoutTests(installer: Installer): void {
       try {
         const source = join(root, "fixture", "bin");
         mkdirSync(source, { recursive: true });
-        const script = '#!/bin/sh\ncat "$(dirname "$0")/main.lua"\n';
+        const script = '#!/bin/sh\ncat "$(dirname "$0")/../main.lua"\n';
         writeFileSync(join(source, "lua-language-server"), script, { mode: 0o755 });
-        writeFileSync(join(source, "main.lua"), "3.19.1\n");
+        writeFileSync(join(dirname(source), "main.lua"), "3.19.1\n");
+        mkdirSync(join(dirname(source), "script"));
         const archive = join(root, "fixture.tar.gz");
-        execFileSync("tar", ["-czf", archive, "-C", dirname(source), "bin"]);
+        execFileSync("tar", ["-czf", archive, "-C", dirname(source), "bin", "main.lua", "script"]);
         const asset = `lua-language-server-3.19.1-${process.platform}-${process.arch}.tar.gz`;
         let downloads = 0;
         const fetchImpl = (async (input: string | URL | Request) => {
@@ -369,17 +546,22 @@ export function githubLayoutTests(installer: Installer): void {
         expect(cached.cachedBinDirs).toContain(realBin);
         expect(downloads).toBe(1);
 
-        rmSync(join(realBin, "main.lua"));
-        // Simulate a pre-verdict cache: runtime resources are re-probed when no verdict exists.
-        const metaPath = join(pkg, ".aft-installed");
-        const meta = JSON.parse(readFileSync(metaPath, "utf8"));
-        delete meta.smoke;
-        writeFileSync(metaPath, JSON.stringify(meta));
+        rmSync(join(realBin, "..", "main.lua"));
         const damaged = installer.runGithubAutoInstall(new Set(["lua-ls"]), config, fetchImpl);
         expect(damaged.cachedBinDirs).not.toContain(realBin);
         await damaged.installsComplete;
         expect(await damaged.getCachedBinDirs()).toContain(realBin);
         expect(downloads).toBe(2);
+        rmSync(join(realBin, "..", "script"), { recursive: true });
+        const missingScript = installer.runGithubAutoInstall(
+          new Set(["lua-ls"]),
+          config,
+          fetchImpl,
+        );
+        expect(missingScript.cachedBinDirs).not.toContain(realBin);
+        await missingScript.installsComplete;
+        expect(await missingScript.getCachedBinDirs()).toContain(realBin);
+        expect(downloads).toBe(3);
       } finally {
         releaseEnv();
         rmSync(root, { recursive: true, force: true });
