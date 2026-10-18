@@ -378,10 +378,21 @@ fn repair_root_scoped_harness_file(
             repair_test_hook("after_move");
             harness_path
         }
+        Err(error @ crate::cross_volume::MoveError::AlreadyPublished { .. }) => {
+            // A different process won publication. Its file may already hold
+            // newer state, so adopt it without removing or replaying the root.
+            error.warn_if_incomplete(&harness_path);
+            harness_path
+        }
         Err(error) => {
             // Another repair may have published the destination after our
             // existence checks. Never recreate a root file that readers ignore.
             if harness_path.exists() {
+                crate::slog_warn!(
+                    "using {} after a failed move from {}: {error}",
+                    harness_path.display(),
+                    root_path.display()
+                );
                 return harness_path;
             }
             crate::slog_warn!(
@@ -555,6 +566,41 @@ mod tests {
         assert_eq!(path, harness_dir.join("last_announced_version"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "0.40.0");
         assert!(!temp.path().join("last_announced_version").exists());
+    }
+
+    #[test]
+    fn cross_volume_two_staged_repairs_adopt_the_winners_new_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| config.storage_dir = Some(temp.path().to_path_buf()));
+        ctx.set_harness(Harness::Opencode);
+        let source = temp.path().join("last_announced_version");
+        fs::write(&source, "old").unwrap();
+        let harness_dir = temp.path().join("opencode");
+        fs::create_dir(&harness_dir).unwrap();
+        let _volume =
+            crate::walk_boundary::simulated_volumes::simulate(&harness_dir, u64::MAX - 25);
+        let destination = harness_dir.join("last_announced_version");
+        let winner = destination.clone();
+        crate::cross_volume::BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // Both copies contain old state; this models the other process
+                // publishing and saving new state while our copy is paused.
+                crate::cross_volume::move_path(&source, &winner)
+                    .unwrap()
+                    .warn_if_incomplete(&source, &winner);
+                atomic_write(&winner, b"new")
+            }));
+        });
+        assert_eq!(
+            repair_root_scoped_harness_file(&ctx, &harness_dir, "last_announced_version"),
+            destination
+        );
+        let request = state_request("db_get_state", json!({ "key": "last_announced_version" }));
+        let response = handle_db_get_state(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["value"], "new");
+        assert_eq!(fs::read_dir(&harness_dir).unwrap().count(), 1);
     }
 
     #[test]

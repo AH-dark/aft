@@ -6,9 +6,10 @@
 //! volume to another fails with `EXDEV` (`ERROR_NOT_SAME_DEVICE` on Windows),
 //! so a move whose source and destination folders can differ in volume goes
 //! through [`move_path`], which falls back to a copy that is published by a
-//! same-folder rename in the destination and only then removes the source.
+//! same-folder, no-replace rename in the destination and only then removes the
+//! source.
 //!
-//! [`rename`] is the plain rename every such move starts with. Tests make it
+//! [`rename`] also refuses to replace an existing destination. Tests make it
 //! report the cross-device error for folders registered with
 //! `crate::walk_boundary::simulated_volumes`, because CI has no second volume.
 
@@ -41,9 +42,17 @@ fn cross_device_error() -> io::Error {
     return io::Error::from(io::ErrorKind::CrossesDevices);
 }
 
-/// `fs::rename`, except that under test a move between two folders on
-/// different simulated volumes fails exactly as a real cross-volume rename.
+/// Rename without replacing a destination, including an empty directory.
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    if let Some(error) = publish_no_replace(from, to)? {
+        Moved::PublishedWithWarning(error).warn_if_incomplete(from, to);
+    }
+    Ok(())
+}
+
+/// A warning means publication succeeded, but the hard-link fallback could
+/// not unlink its source. Never turn that into a pre-publication failure.
+fn publish_no_replace(from: &Path, to: &Path) -> io::Result<Option<io::Error>> {
     #[cfg(test)]
     {
         use crate::walk_boundary::simulated_volumes::device_of;
@@ -53,7 +62,106 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
             return Err(cross_device_error());
         }
     }
-    fs::rename(from, to)
+    native_publish_no_replace(from, to)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn native_publish_no_replace(from: &Path, to: &Path) -> io::Result<Option<io::Error>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let source = CString::new(from.as_os_str().as_bytes())?;
+    let destination = CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: both paths are NUL-terminated and live through the syscall.
+    #[cfg(target_os = "macos")]
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    let result = if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    #[cfg(target_os = "macos")]
+    return result.map(|()| None);
+    #[cfg(target_os = "linux")]
+    linux_rename_or_link(from, to, result)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rename_or_link(
+    from: &Path,
+    to: &Path,
+    result: io::Result<()>,
+) -> io::Result<Option<io::Error>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
+            // Hard links publish regular files atomically on older kernels and
+            // filesystems. There is no safe equivalent for directory trees.
+            if !fs::symlink_metadata(from)?.is_file() {
+                return Err(error);
+            }
+            fs::hard_link(from, to)?;
+            Ok(fs::remove_file(from).err().map(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not unlink published source {}: {error}",
+                        from.display()
+                    ),
+                )
+            }))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn native_publish_no_replace(from: &Path, to: &Path) -> io::Result<Option<io::Error>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+    let source = wide(from)?;
+    let destination = wide(to)?;
+    // SAFETY: valid, NUL-terminated paths. No REPLACE_EXISTING or COPY_ALLOWED:
+    // collisions must be refused and cross-volume moves must use our staging.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } != 0 {
+        Ok(None)
+    } else {
+        let error = io::Error::last_os_error();
+        // Windows may report ACCESS_DENIED for an existing directory. Check
+        // only after the atomic refusal; this check never authorizes replacement.
+        if error.kind() == io::ErrorKind::PermissionDenied && fs::symlink_metadata(to).is_ok() {
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, error))
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn native_publish_no_replace(_from: &Path, _to: &Path) -> io::Result<Option<io::Error>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace publication is unavailable on this platform",
+    ))
 }
 
 /// True when `path` is on a different volume from its parent folder, which is
@@ -95,60 +203,119 @@ impl Moved {
     }
 }
 
+/// A collision leaves the source untouched and belongs to the caller's policy:
+/// state repair adopts the winner, while data migrations retain their source.
+#[derive(Debug)]
+pub(crate) enum MoveError {
+    AlreadyPublished { cleanup_warning: Option<io::Error> },
+    Failed(io::Error),
+}
+
+impl MoveError {
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::AlreadyPublished { .. } => io::ErrorKind::AlreadyExists,
+            Self::Failed(error) => error.kind(),
+        }
+    }
+
+    pub(crate) fn warn_if_incomplete(&self, to: &Path) {
+        if let Self::AlreadyPublished {
+            cleanup_warning: Some(error),
+        } = self
+        {
+            crate::slog_warn!("using already-published {}: {error}", to.display());
+        }
+    }
+}
+
+impl std::fmt::Display for MoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyPublished { cleanup_warning } => {
+                write!(f, "destination already published; source left in place")?;
+                if let Some(warning) = cleanup_warning {
+                    write!(f, "; {warning}")?;
+                }
+                Ok(())
+            }
+            Self::Failed(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for MoveError {}
+
+impl From<io::Error> for MoveError {
+    fn from(error: io::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// Move the file or directory `from` to `to`, which must not exist.
 ///
 /// A same-volume move is one rename. A cross-volume move copies `from` into a
 /// staging name inside `to`'s own folder, syncs every copied file and folder,
-/// renames the staging copy to `to`, and removes `from` last. If the copy
-/// fails, the staging copy is removed and `from` is left untouched, so an
-/// `Err` means no destination was published and the source is authoritative.
+/// publishes the staging copy without replacement, and removes `from` last. If
+/// the copy fails, staging cleanup is attempted and `from` is left untouched.
+/// The source is authoritative unless [`MoveError::AlreadyPublished`]
+/// identifies a destination won by another mover. That outcome never removes
+/// the source and carries any staging-cleanup warning for the caller to report.
 /// Once published, directory sync or source removal failures return
 /// [`Moved::PublishedWithWarning`]: callers must report the warning and use `to`.
-pub(crate) fn move_path(from: &Path, to: &Path) -> io::Result<Moved> {
+pub(crate) fn move_path(from: &Path, to: &Path) -> Result<Moved, MoveError> {
     let parent = to
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let error = match rename(from, to) {
-        Ok(()) => {
-            return Ok(match crate::durability::sync_dir(parent) {
-                Ok(()) => Moved::Renamed,
-                Err(error) => Moved::PublishedWithWarning(error),
-            });
+    let error = match publish_no_replace(from, to) {
+        Ok(warning) => {
+            return Ok(finish_publication(warning, parent, Moved::Renamed));
         }
         Err(error) => error,
     };
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        return Err(MoveError::AlreadyPublished {
+            cleanup_warning: None,
+        });
+    }
     if !is_cross_device(&error) {
-        return Err(error);
+        return Err(error.into());
     }
     if fs::symlink_metadata(to).is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "cannot move {} across volumes: {} already exists",
-                from.display(),
-                to.display()
-            ),
-        ));
+        return Err(MoveError::AlreadyPublished {
+            cleanup_warning: None,
+        });
     }
     let staging = staging_path(parent, to)?;
-    if let Err(error) = copy_tree(from, &staging).and_then(|()| {
-        // Same folder, so this rename stays on the destination volume.
-        fs::rename(&staging, to)
-    }) {
-        remove_path(&staging).ok();
-        return Err(io::Error::new(
-            error.kind(),
-            format!(
-                "cannot move {} across volumes to {}: {error}; the source was left in place",
-                from.display(),
-                to.display()
-            ),
-        ));
-    }
+    let mut publishing = false;
+    let publication = copy_tree(from, &staging).and_then(|()| {
+        #[cfg(test)]
+        before_publish()?;
+        publishing = true;
+        publish_no_replace(&staging, to)
+    });
+    let warning = match publication {
+        Ok(warning) => warning,
+        Err(error) => {
+            let cleanup_warning = cleanup_staging(&staging).err();
+            if publishing && error.kind() == io::ErrorKind::AlreadyExists {
+                return Err(MoveError::AlreadyPublished { cleanup_warning });
+            }
+            let cleanup = cleanup_warning
+                .map(|warning| format!("; {warning}"))
+                .unwrap_or_default();
+            let message = format!(
+                    "cannot move {} across volumes to {}: {error}; the source was left in place{cleanup}",
+                    from.display(), to.display(),
+                );
+            return Err(io::Error::new(error.kind(), message).into());
+        }
+    };
     // Publication has committed the destination's authority. Keep the source
     // until that directory entry is synced, but never select it for new writes.
-    if let Err(error) = crate::durability::sync_dir(parent) {
+    if let Moved::PublishedWithWarning(error) = finish_publication(warning, parent, Moved::Copied) {
         return Ok(Moved::PublishedWithWarning(error));
     }
     if let Err(error) = remove_path(from) {
@@ -158,6 +325,59 @@ pub(crate) fn move_path(from: &Path, to: &Path) -> io::Result<Moved> {
         )));
     }
     Ok(Moved::Copied)
+}
+
+fn finish_publication(warning: Option<io::Error>, parent: &Path, success: Moved) -> Moved {
+    let sync_error = crate::durability::sync_dir(parent).err();
+    match (warning, sync_error) {
+        (None, None) => success,
+        (Some(error), None) | (None, Some(error)) => Moved::PublishedWithWarning(error),
+        (Some(error), Some(sync)) => Moved::PublishedWithWarning(io::Error::new(
+            error.kind(),
+            format!("{error}; directory sync failed: {sync}"),
+        )),
+    }
+}
+
+fn cleanup_staging(path: &Path) -> io::Result<()> {
+    let cleanup = || {
+        #[cfg(windows)]
+        clear_staging_readonly(path)?;
+        #[cfg(test)]
+        before_staging_removal(path);
+        remove_path(path)
+    };
+    cleanup().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not remove staging copy {}: {error}", path.display()),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn clear_staging_readonly(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    // Only unpublished copies are made writable. Never follow a link into
+    // source data, or change permissions on a published destination.
+    if metadata.is_symlink() {
+        return Ok(());
+    }
+    if metadata.permissions().readonly() {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            clear_staging_readonly(&entry?.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn staging_path(parent: &Path, to: &Path) -> io::Result<PathBuf> {
@@ -229,9 +449,29 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static BEFORE_STAGING_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const {
+        std::cell::RefCell::new(None)
+    };
     static FAIL_SOURCE_REMOVAL: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
+}
+
+#[cfg(test)]
+fn before_publish() -> io::Result<()> {
+    let hook = BEFORE_PUBLISH.with(|slot| slot.borrow_mut().take());
+    hook.map_or(Ok(()), |hook| hook())
+}
+
+#[cfg(test)]
+fn before_staging_removal(path: &Path) {
+    let hook = BEFORE_STAGING_REMOVAL.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
@@ -259,6 +499,251 @@ fn remove_path(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::walk_boundary::simulated_volumes::simulate;
+
+    #[test]
+    fn cross_volume_racing_file_publish_keeps_the_winners_new_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("state.json");
+        fs::write(&source, b"old").unwrap();
+        let other = temp.path().join("other-volume");
+        fs::create_dir(&other).unwrap();
+        let _volume = simulate(&other, u64::MAX - 10);
+        let destination = other.join("state.json");
+        let source_clone = source.clone();
+        let destination_clone = destination.clone();
+        BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                // The outer copier has staged the old bytes. A second process
+                // stages the same bytes, publishes first, and then saves state.
+                assert!(matches!(
+                    move_path(&source_clone, &destination_clone).unwrap(),
+                    Moved::Copied
+                ));
+                fs::write(destination_clone, b"new")
+            }));
+        });
+
+        let result = move_path(&source, &destination);
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(matches!(
+            result,
+            Err(MoveError::AlreadyPublished {
+                cleanup_warning: None
+            })
+        ));
+        assert_eq!(fs::read_dir(other).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cross_volume_racing_directory_publish_preserves_the_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        let other = temp.path().join("other-volume");
+        fs::create_dir(&other).unwrap();
+        let _volume = simulate(&other, u64::MAX - 11);
+        let destination = other.join("directory");
+        let source_clone = source.clone();
+        let destination_clone = destination.clone();
+        BEFORE_PUBLISH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(matches!(
+                    move_path(&source_clone, &destination_clone).unwrap(),
+                    Moved::Copied
+                ));
+                // Leave the winner empty: POSIX rename can replace an empty
+                // directory too, even though it refuses a nonempty directory.
+                Ok(())
+            }));
+        });
+
+        let result = move_path(&source, &destination);
+        assert!(
+            matches!(
+                result,
+                Err(MoveError::AlreadyPublished {
+                    cleanup_warning: None
+                })
+            ),
+            "the losing directory publisher must refuse: {result:?}"
+        );
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(other).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn same_volume_move_never_replaces_a_file_or_empty_directory() {
+        for directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            if directory {
+                fs::create_dir(&source).unwrap();
+                fs::create_dir(&destination).unwrap();
+            } else {
+                fs::write(&source, b"old").unwrap();
+                fs::write(&destination, b"new").unwrap();
+            }
+            assert!(matches!(
+                move_path(&source, &destination),
+                Err(MoveError::AlreadyPublished {
+                    cleanup_warning: None
+                })
+            ));
+            assert!(source.exists());
+            if !directory {
+                assert_eq!(fs::read(&destination).unwrap(), b"new");
+                assert_eq!(fs::read(&source).unwrap(), b"old");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_old_kernel_fallback_publishes_only_regular_files_without_replacement() {
+        for errno in [libc::EINVAL, libc::ENOSYS] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            fs::write(&source, b"old").unwrap();
+            fs::write(&destination, b"new").unwrap();
+            let unsupported = || Err(io::Error::from_raw_os_error(errno));
+            assert_eq!(
+                linux_rename_or_link(&source, &destination, unsupported())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(fs::read(&destination).unwrap(), b"new");
+            fs::remove_file(&destination).unwrap();
+            assert!(linux_rename_or_link(&source, &destination, unsupported())
+                .unwrap()
+                .is_none());
+            assert!(!source.exists());
+            assert_eq!(fs::read(&destination).unwrap(), b"old");
+            fs::create_dir(&source).unwrap();
+            fs::remove_file(&destination).unwrap();
+            fs::create_dir(&destination).unwrap();
+            assert_eq!(
+                linux_rename_or_link(&source, &destination, unsupported())
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(errno)
+            );
+            assert!(source.is_dir());
+            assert!(destination.is_dir());
+        }
+    }
+
+    #[test]
+    fn failed_move_carries_staging_cleanup_failure_with_its_path() {
+        for collision in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::write(&source, b"old").unwrap();
+            let other = temp.path().join("other-volume");
+            fs::create_dir(&other).unwrap();
+            let _volume = simulate(&other, u64::MAX - 13);
+            let destination = other.join("destination");
+            let destination_clone = destination.clone();
+            BEFORE_PUBLISH.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    if collision {
+                        fs::write(destination_clone, b"new")
+                    } else {
+                        Err(io::Error::other("injected publication failure"))
+                    }
+                }));
+            });
+            BEFORE_STAGING_REMOVAL.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|staging| {
+                    FAIL_SOURCE_REMOVAL
+                        .with(|slot| *slot.borrow_mut() = Some(staging.to_path_buf()));
+                }));
+            });
+            let error = move_path(&source, &destination).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("could not remove staging copy"),
+                "{message}"
+            );
+            assert!(message.contains(".destination.aft-move-"), "{message}");
+            assert!(
+                message.contains("injected source removal failure"),
+                "{message}"
+            );
+            assert_eq!(
+                matches!(
+                    error,
+                    MoveError::AlreadyPublished {
+                        cleanup_warning: Some(_)
+                    }
+                ),
+                collision
+            );
+            assert_eq!(fs::read(&source).unwrap(), b"old");
+            if collision {
+                assert_eq!(fs::read(&destination).unwrap(), b"new");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cross_volume_failed_publish_cleans_readonly_staging() {
+        for directory in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let file = if directory {
+                fs::create_dir_all(source.join("nested")).unwrap();
+                source.join("nested/state.json")
+            } else {
+                source.clone()
+            };
+            fs::write(&file, b"old").unwrap();
+            let mut permissions = fs::metadata(&file).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&file, permissions).unwrap();
+            let other = temp.path().join("other-volume");
+            fs::create_dir(&other).unwrap();
+            let _volume = simulate(&other, u64::MAX - 12);
+            BEFORE_PUBLISH.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|| {
+                    Err(io::Error::other("injected publication failure"))
+                }));
+            });
+            BEFORE_STAGING_REMOVAL.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|staging| {
+                    fn assert_writable(path: &Path) {
+                        let metadata = fs::symlink_metadata(path).unwrap();
+                        assert!(
+                            !metadata.permissions().readonly(),
+                            "staging must be writable before unlink: {}",
+                            path.display()
+                        );
+                        if metadata.is_dir() {
+                            for entry in fs::read_dir(path).unwrap() {
+                                assert_writable(&entry.unwrap().path());
+                            }
+                        }
+                    }
+                    // Newer Windows versions can ignore readonly during unlink.
+                    // Check the actual attributes too, so older hosts stay safe.
+                    assert_writable(staging);
+                }));
+            });
+
+            let error = move_path(&source, &other.join("destination")).unwrap_err();
+            let leftovers = fs::read_dir(&other).unwrap().count();
+            let source_readonly = fs::metadata(&file).unwrap().permissions().readonly();
+            let mut permissions = fs::metadata(&file).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&file, permissions).unwrap();
+            assert!(error.to_string().contains("injected publication failure"));
+            assert_eq!(leftovers, 0, "readonly staging must be removed");
+            assert!(source_readonly, "cleanup must not change the source");
+        }
+    }
 
     #[test]
     fn cross_volume_move_copies_publishes_and_removes_the_source() {
