@@ -872,10 +872,20 @@ mod audit_regressions {
             ("./foo.jsx", "project/foo.tsx"),
             ("./user.service.js", "project/user.service.ts"),
         ] {
-            assert!(
-                import_path_matches_file(module, consumer, Path::new(target)),
-                "{module} should resolve {target}"
-            );
+            for extension in ["ts", "tsx", "mts", "cts"] {
+                let typescript_consumer = consumer.with_extension(extension);
+                assert!(
+                    import_path_matches_file(module, &typescript_consumer, Path::new(target)),
+                    "{typescript_consumer:?}: {module} should resolve {target}"
+                );
+            }
+            for extension in ["js", "jsx", "mjs", "cjs"] {
+                let javascript_consumer = consumer.with_extension(extension);
+                assert!(
+                    !import_path_matches_file(module, &javascript_consumer, Path::new(target)),
+                    "{javascript_consumer:?} must not substitute {module} with {target}"
+                );
+            }
         }
         for (module, target) in [
             ("./user.service", "project/user.ts"),
@@ -892,17 +902,37 @@ mod audit_regressions {
 
     #[test]
     fn symbol_move_rewrites_explicit_js_consumer() {
+        assert_explicit_js_consumer_move("consumer.ts", false, true);
+    }
+
+    #[test]
+    fn javascript_consumer_preserves_literal_js_neighbor() {
+        assert_explicit_js_consumer_move("consumer.js", true, false);
+    }
+
+    #[test]
+    fn typescript_consumer_prefers_ts_source_over_js_neighbor() {
+        assert_explicit_js_consumer_move("consumer.ts", true, true);
+    }
+
+    fn assert_explicit_js_consumer_move(
+        consumer_name: &str,
+        js_neighbor: bool,
+        expect_rewrite: bool,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let source = dir.path().join("foo.ts");
         let destination = dir.path().join("moved.ts");
-        let consumer = dir.path().join("consumer.ts");
+        let consumer = dir.path().join(consumer_name);
+        let literal_javascript = dir.path().join("foo.js");
+        let javascript_source = "export function moved() { return 99; }\n";
+        if js_neighbor {
+            std::fs::write(&literal_javascript, javascript_source).unwrap();
+        }
+        let original_consumer = "import { moved } from './foo.js';\nconsole.log(moved());\n";
         std::fs::write(&source, "export function moved() { return 1; }\n").unwrap();
-        std::fs::write(
-            &consumer,
-            "import { moved } from './foo.js';\nconsole.log(moved());\n",
-        )
-        .unwrap();
+        std::fs::write(&consumer, original_consumer).unwrap();
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
@@ -921,10 +951,23 @@ mod audit_regressions {
         .unwrap();
         let response = handle_move_symbol(&request, &ctx);
         assert!(response.success, "{:?}", response.data);
-        assert_eq!(response.data["consumers_updated"], 1);
+        assert_eq!(
+            response.data["consumers_updated"],
+            usize::from(expect_rewrite)
+        );
         let updated = std::fs::read_to_string(consumer).unwrap();
-        assert!(updated.contains("from './moved'"), "{updated}");
-        assert!(!updated.contains("./foo.js"), "{updated}");
+        if expect_rewrite {
+            assert!(updated.contains("from './moved'"), "{updated}");
+            assert!(!updated.contains("./foo.js"), "{updated}");
+        } else {
+            assert_eq!(updated, original_consumer);
+        }
+        if js_neighbor {
+            assert_eq!(
+                std::fs::read_to_string(literal_javascript).unwrap(),
+                javascript_source
+            );
+        }
         assert!(std::fs::read_to_string(destination)
             .unwrap()
             .contains("function moved"));
@@ -1032,13 +1075,21 @@ fn import_path_matches_file(import_module: &str, consumer_file: &Path, target_fi
         return true;
     }
 
-    // TypeScript consumers can name the emitted JavaScript file while the
-    // declaration still lives in a TypeScript source file.
-    let source_extensions: &[&str] = match resolved.extension().and_then(|ext| ext.to_str()) {
-        Some("js") => &["ts", "tsx"],
-        Some("mjs") => &["mts"],
-        Some("cjs") => &["cts"],
-        Some("jsx") => &["tsx"],
+    // TypeScript's file-extension substitution probes .ts/.tsx before .js,
+    // even when foo.js exists. Apply that compiler rule only to TS consumers:
+    // https://www.typescriptlang.org/docs/handbook/modules/reference.html#file-extension-substitution
+    let typescript_consumer = matches!(
+        consumer_file.extension().and_then(|ext| ext.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts")
+    );
+    let source_extensions: &[&str] = match (
+        typescript_consumer,
+        resolved.extension().and_then(|ext| ext.to_str()),
+    ) {
+        (true, Some("js")) => &["ts", "tsx"],
+        (true, Some("mjs")) => &["mts"],
+        (true, Some("cjs")) => &["cts"],
+        (true, Some("jsx")) => &["tsx"],
         _ => &[],
     };
     for extension in source_extensions {

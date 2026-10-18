@@ -246,13 +246,8 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         String::new()
     };
 
-    let mut file_handle = match std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path.as_path())
-    {
-        Ok(file_handle) => file_handle,
+    let (mut file_handle, read_access) = match open_append_file(path.as_path()) {
+        Ok(opened) => opened,
         Err(error) => {
             if !existed {
                 ctx.backup()
@@ -274,7 +269,15 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     if let Err((bytes_written, error, restore_error)) = append_with_rollback(
         &mut file_handle,
         append_content.as_bytes(),
-        |file, appended| restore_append_length(file, original_len, appended),
+        |file, appended| {
+            if !read_access {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "rollback could not be verified without read access",
+                ));
+            }
+            restore_append_length(file, original_len, appended)
+        },
     ) {
         let restored = restore_error.is_none();
         drop(file_handle);
@@ -464,6 +467,27 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         edit::attach_edit_diff(&mut result, &req.params, file, &before_content, content);
     }
     Response::success(&req.id, result)
+}
+
+fn open_append_file(path: &Path) -> std::io::Result<(std::fs::File, bool)> {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        // Read access enables verified rollback, but is not a prerequisite for
+        // appending when the caller has chosen to proceed without a backup.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map(|file| (file, false))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -1764,6 +1788,76 @@ mod replace_all_tests {
 #[cfg(test)]
 mod audit_regressions {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_only_file_accepts_append_when_backup_disabled() {
+        assert_write_only_append(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_write_only_append_retains_unverified_partial_bytes() {
+        assert_write_only_append(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_write_only_append(fail: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write-only.txt");
+        std::fs::write(&path, "before").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        assert_eq!(
+            std::fs::File::open(&path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "this test requires a user whose read access is denied by mode 0200"
+        );
+        let mut config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        config.backup.enabled = Some(false);
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        // Direct handler fixtures must apply configure's backup-store policy.
+        ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
+            enabled: false,
+            ..Default::default()
+        });
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "write-only-append", "command": "edit_match", "op": "append", "file": path, "append_content": "after"
+        })).unwrap();
+        if fail {
+            APPEND_FAILURE.with(|slot| *slot.borrow_mut() = Some((1, Box::new(|| {}))));
+        }
+        let response = handle_edit_match(&request, &ctx);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if fail {
+            APPEND_FAILURE.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "append injection was not reached: {:?}",
+                    response.data
+                )
+            });
+            assert!(!response.success, "{:?}", response.data);
+            assert_eq!(response.data["bytes_written"], 1);
+            assert_eq!(response.data["rolled_back"], false);
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("rollback could not be verified without read access"),
+                "{:?}",
+                response.data
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "beforea");
+        } else {
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["bytes_written"], 5);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "beforeafter");
+        }
+    }
 
     #[test]
     fn failed_append_preserves_concurrent_suffix_and_backup() {
