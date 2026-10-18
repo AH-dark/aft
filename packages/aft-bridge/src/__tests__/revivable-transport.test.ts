@@ -10,6 +10,7 @@ import type {
 } from "@cortexkit/subc-client";
 import { getActiveLogger, setActiveLogger } from "../active-logger.js";
 import type { Logger } from "../logger.js";
+import { BridgePool } from "../pool.js";
 import { RevivableTransportPool } from "../revivable-transport.js";
 import {
   type SubcClientLike,
@@ -333,4 +334,76 @@ describe("RevivableTransportPool", () => {
       "transport was shut down (reason: dispose) but new demand arrived — reviving",
     );
   });
+});
+
+for (const removal of ["eviction", "replacement"] as const) {
+  test(`standalone ${removal} detaches status and preserves held facades`, async () => {
+    const pool = new BridgePool("/unused/aft", { maxPoolSize: 1, idleTimeoutMs: Infinity });
+    const owner = new RevivableTransportPool(pool, async () => pool);
+    const held = owner.getBridge(TEST_PROJECT_ROOT);
+    const oldBridge = pool.getBridge(TEST_PROJECT_ROOT);
+    oldBridge.isAlive = () => true;
+    const unsubscribe = held.subscribeStatus(() => {});
+    try {
+      expect((oldBridge as any).statusListeners.size).toBe(1);
+      if (removal === "replacement") await owner.replaceBinary("/replacement/aft");
+      else pool.getBridge(`${TEST_PROJECT_ROOT}/other`);
+      expect((oldBridge as any).statusListeners.size).toBe(0);
+      expect((owner as any).transports.has(TEST_PROJECT_ROOT)).toBe(false);
+      const successor = pool.getBridge(TEST_PROJECT_ROOT);
+      successor.isAlive = () => true;
+      successor.send = async () => ({ success: true });
+      expect((await held.send("status")).success).toBe(true);
+      expect((successor as any).statusListeners.size).toBe(1);
+      unsubscribe();
+      expect((successor as any).statusListeners.size).toBe(0);
+    } finally {
+      unsubscribe();
+      await owner.shutdown();
+    }
+  });
+}
+
+test("shutdown cancels delayed revival before creating another concrete pool", async () => {
+  let created = 0;
+  const pool = makeSubcPool(new FakeClient());
+  const owner = new RevivableTransportPool(null, async () => {
+    if (++created === 1) throw new Error("first connection failed");
+    return pool;
+  });
+  await expect(owner.ensureActivePool()).rejects.toThrow("first connection failed");
+  const pending = owner.ensureActivePool();
+  void pending.catch(() => {});
+  let stopped = false;
+  const shutdown = owner.shutdown().then(() => {
+    stopped = true;
+  });
+  try {
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    expect(stopped).toBe(true);
+    await expect(pending).rejects.toThrow("cancelled by shutdown");
+    expect(created).toBe(1);
+  } finally {
+    await Promise.allSettled([pending, shutdown]);
+    await pool.shutdown();
+  }
+});
+
+test("typed facade demand hook runs against the current concrete pool", async () => {
+  const pool = makeSubcPool(new FakeClient());
+  const demands: unknown[] = [];
+  const owner = new RevivableTransportPool(
+    pool,
+    async () => pool,
+    undefined,
+    (active, root) => {
+      demands.push([active, root]);
+    },
+  );
+  try {
+    owner.getBridge(TEST_PROJECT_ROOT);
+    expect(demands).toEqual([[pool, TEST_PROJECT_ROOT]]);
+  } finally {
+    await owner.shutdown();
+  }
 });

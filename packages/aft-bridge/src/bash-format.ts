@@ -1,5 +1,9 @@
 /** Shared pure formatting helpers for host bash tool wrappers. */
 
+import { isTerminalBashStatus } from "./protocol.js";
+
+export { TERMINAL_BG_TASK_STATUSES } from "./protocol.js";
+
 /** Render a millisecond duration as a compact seconds string (8000 -> "8s", 5500 -> "5.5s"). */
 export function formatSeconds(ms: number): string {
   return `${Number((ms / 1000).toFixed(1))}s`;
@@ -29,18 +33,8 @@ export function formatForegroundResult(data: Record<string, unknown>): string {
   return rendered;
 }
 
-export const TERMINAL_BG_TASK_STATUSES = Object.freeze([
-  "completed",
-  "failed",
-  "killed",
-  "timed_out",
-  "fate_unknown",
-] as const);
-
-const terminalBgTaskStatusSet = new Set<string>(TERMINAL_BG_TASK_STATUSES);
-
 export function isTerminalStatus(status: unknown): boolean {
-  return typeof status === "string" && terminalBgTaskStatusSet.has(status);
+  return isTerminalBashStatus(status);
 }
 
 export function isLiveBackgroundTaskReply(
@@ -52,7 +46,7 @@ export function isLiveBackgroundTaskReply(
     typeof response.task_id === "string" &&
     response.task_id.length > 0 &&
     typeof response.status === "string" &&
-    !terminalBgTaskStatusSet.has(response.status)
+    !isTerminalBashStatus(response.status)
   );
 }
 

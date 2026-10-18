@@ -61,6 +61,17 @@ describe("findBinary async download", () => {
     expect(seenVersions).toEqual(["0.99.0-test"]);
   });
 
+  test("unversioned resolution downloads the bridge package version rather than latest", async () => {
+    const seenVersions: Array<string | undefined> = [];
+    __setEnsureBinaryForTests(async (version?: string) => {
+      seenVersions.push(version);
+      return "/downloaded/aft";
+    });
+    await expect(findBinary()).resolves.toBe("/downloaded/aft");
+    const packageJson = await Bun.file(join(import.meta.dir, "../../package.json")).json();
+    expect(seenVersions).toEqual([packageJson.version]);
+  });
+
   test("logs auto-download as the successful resolution source", () => {
     const packageRoot = join(import.meta.dir, "..", "..");
     const result = spawnSync(

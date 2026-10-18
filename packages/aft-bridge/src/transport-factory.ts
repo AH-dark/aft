@@ -22,12 +22,10 @@ import {
   resolveSubcConnectionFilePath,
 } from "./config-error.js";
 import {
-  asCanonicalRootPath,
   type CanonicalRootPath,
   type ConcretePoolId,
   getLifecycleRegistry,
   type LifecycleRegistry,
-  type RootGeneration,
 } from "./lifecycle-registry.js";
 import { BridgePool, type PoolOptions } from "./pool.js";
 import { RevivableTransportPool } from "./revivable-transport.js";
@@ -101,32 +99,6 @@ function booleanOption(value: unknown): boolean | undefined {
 }
 
 /**
- * The wrapper owns the outer facade map. The map is intentionally private to
- * RevivableTransportPool; this narrow adapter keeps the lifecycle callback
- * synchronous without exposing that implementation detail as a public API.
- */
-function evictRevivableFacade(
-  wrapper: RevivableTransportPool,
-  root: CanonicalRootPath,
-  _generation: RootGeneration,
-): void {
-  // A registry callback is generation-matched before it reaches this function.
-  // Check the non-creating active lookup as an additional guard so a successor
-  // already exposed by a different concrete pool is never removed.
-  if (wrapper.currentBridge(root) !== null) return;
-  const internals = wrapper as unknown as { transports: Map<string, unknown> };
-  internals.transports.delete(root);
-}
-
-function satisfyLifecycleDemand(wrapper: RevivableTransportPool, projectRoot: string): void {
-  const activePool = (wrapper as unknown as { activePool: AftTransportPool }).activePool;
-  if (activePool.isShutdown() || !(activePool instanceof SubcTransportPool)) return;
-  // The outer wrapper's synchronous getBridge is the explicit demand boundary.
-  // Register the concrete root before the wrapper creates and returns its facade.
-  activePool.getBridgeForCanonicalRoot(asCanonicalRootPath(projectRoot));
-}
-
-/**
  * Construct the transport pool for this plugin process. Async because the subc
  * presence check stats the connection file. Returns a pool satisfying
  * {@link AftTransportPool} either way; the caller's downstream code does not
@@ -154,7 +126,7 @@ export async function createAftTransportPool(
     if (!owner) throw new Error("subc lifecycle registration requires its wrapper");
     pool.registerLifecyclePool(lifecycleRegistry, {
       reapingEnabled,
-      evictOuterFacade: (root, generation) => evictRevivableFacade(owner, root, generation),
+      evictOuterFacade: (root) => owner.evictInactiveFacade(root),
     });
   };
 
@@ -168,17 +140,18 @@ export async function createAftTransportPool(
     registerConcretePool(replacement);
     return replacement;
   };
-  wrapper = new RevivableTransportPool(initialPool, createRegisteredPool, (path) => {
-    binaryPath = path;
-  });
-  if (reapingEnabled) {
-    const owner = wrapper;
-    const getBridge = owner.getBridgeForCanonicalRoot.bind(owner);
-    owner.getBridgeForCanonicalRoot = (projectRoot) => {
-      satisfyLifecycleDemand(owner, projectRoot);
-      return getBridge(projectRoot);
-    };
-  }
+  wrapper = new RevivableTransportPool(
+    initialPool,
+    createRegisteredPool,
+    (path) => {
+      binaryPath = path;
+    },
+    reapingEnabled
+      ? (pool, root) => {
+          if (pool instanceof SubcTransportPool) pool.getBridgeForCanonicalRoot(root);
+        }
+      : undefined,
+  );
   registerConcretePool(initialPool);
   return wrapper;
 }

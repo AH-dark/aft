@@ -3,13 +3,12 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
-import { TERMINAL_BG_TASK_STATUSES } from "./bash-format.js";
 import { binaryContentHash, binaryStampKey, peekBinaryContentHash } from "./binary-identity.js";
 import { type ChildProcess, spawn } from "./child-process.js";
 import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { withPathPrepended } from "./path-env.js";
-import type { BgCompletion, StatusCompression } from "./protocol.js";
+import { type BgCompletion, isTerminalBashStatus, type StatusCompression } from "./protocol.js";
 import type {
   AftProjectTransport,
   ToolCallArguments,
@@ -25,17 +24,6 @@ const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 const MALFORMED_STDOUT_LOG_CHARS = 512;
 const HASHLINE_REGISTRATION_LOG_INTERVAL_MS = 60_000;
 const HASHLINE_REGISTRATION_LOG_STATE_LIMIT = 256;
-const TERMINAL_BASH_STATUSES = new Set<string>([
-  ...TERMINAL_BG_TASK_STATUSES,
-  // Historical/defensive aliases seen in plugin-side compatibility code.
-  "cancelled",
-  "timeout",
-]);
-
-function isTerminalBashStatus(status: unknown): boolean {
-  return typeof status === "string" && TERMINAL_BASH_STATUSES.has(status);
-}
-
 function bashTaskIdFrom(response: Record<string, unknown>): string | undefined {
   const snakeCase = response.task_id;
   if (typeof snakeCase === "string" && snakeCase.length > 0) return snakeCase;
@@ -138,37 +126,50 @@ export function shouldSurfaceStderrLine(line: string): boolean {
 }
 
 export function compareSemver(a: string, b: string): number {
-  const [aMain, aPre] = a.split("-", 2);
-  const [bMain, bPre] = b.split("-", 2);
-  const aParts = aMain.split(".").map(Number);
-  const bParts = bMain.split(".").map(Number);
+  const parse = (version: string): { core: string[]; pre: string[] } => {
+    const match =
+      /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(
+        version,
+      );
+    const pre = match?.[4]?.split(".") ?? [];
+    if (!match || pre.some((id) => /^\d+$/.test(id) && id.length > 1 && id[0] === "0")) {
+      throw new Error(`Invalid semantic version: ${version}`);
+    }
+    return { core: match.slice(1, 4), pre };
+  };
+  // Compare numeric identifiers as strings so even large valid identifiers
+  // retain their order without Number rounding or overflow.
+  const numeric = (a: string, b: string): number =>
+    a.length !== b.length ? a.length - b.length : a === b ? 0 : a < b ? -1 : 1;
+  const left = parse(a);
+  const right = parse(b);
   for (let i = 0; i < 3; i++) {
-    if (aParts[i] !== bParts[i]) return (aParts[i] ?? 0) - (bParts[i] ?? 0);
+    const diff = numeric(left.core[i], right.core[i]);
+    if (diff !== 0) return diff;
   }
-  if (!aPre && !bPre) return 0;
-  if (!aPre) return 1;
-  if (!bPre) return -1;
-
-  const aIds = aPre.split(".");
-  const bIds = bPre.split(".");
-  for (let i = 0; i < Math.max(aIds.length, bIds.length); i++) {
-    const ai = aIds[i];
-    const bi = bIds[i];
+  if (left.pre.length === 0 || right.pre.length === 0) {
+    return left.pre.length === right.pre.length ? 0 : left.pre.length === 0 ? 1 : -1;
+  }
+  for (let i = 0; i < Math.max(left.pre.length, right.pre.length); i++) {
+    const ai = left.pre[i];
+    const bi = right.pre[i];
     if (ai === undefined) return -1;
     if (bi === undefined) return 1;
     const aNum = /^\d+$/.test(ai);
     const bNum = /^\d+$/.test(bi);
-    if (aNum && bNum) {
-      const diff = Number.parseInt(ai, 10) - Number.parseInt(bi, 10);
-      if (diff !== 0) return diff;
-    } else if (aNum) {
-      return -1;
-    } else if (bNum) {
-      return 1;
-    } else {
-      const cmp = ai.localeCompare(bi);
-      if (cmp !== 0) return cmp;
-    }
+    const diff =
+      aNum && bNum
+        ? numeric(ai, bi)
+        : aNum !== bNum
+          ? aNum
+            ? -1
+            : 1
+          : ai === bi
+            ? 0
+            : ai < bi
+              ? -1
+              : 1;
+    if (diff !== 0) return diff;
   }
   return 0;
 }
@@ -498,6 +499,7 @@ export class BinaryBridge implements AftProjectTransport {
   private statusListeners = new Set<(snapshot: StatusSnapshot) => void>();
   /** Notification clients keyed by session_id for async configure warning pushes. */
   private configureWarningClients = new Map<string, unknown>();
+  private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private restartResetTimer: ReturnType<typeof setTimeout> | null = null;
   /** Updated after every successfully parsed stdout frame from the child. */
   private lastChildActivityAt = 0;
@@ -942,14 +944,6 @@ export class BinaryBridge implements AftProjectTransport {
 
       this.ensureSpawned(requestSessionId);
 
-      // Auto-configure can reuse the initiating session's notification client
-      // when the deferred configure warning frame arrives later. One project
-      // bridge can serve many sessions, so keep this per-session instead of one
-      // bridge-wide "last client".
-      if (requestSessionId && options?.configureWarningClient !== undefined) {
-        this.configureWarningClients.set(requestSessionId, options.configureWarningClient);
-      }
-
       // Per-op timeout override: tool wrappers can pass longer budgets for
       // commands that legitimately need them (callers, trace_to, grep on big
       // repos). Defaults to the bridge-wide timeout otherwise.
@@ -975,6 +969,15 @@ export class BinaryBridge implements AftProjectTransport {
       if (!this.configured) {
         if (command !== "configure" && command !== "version") {
           if (!this._configurePromise) {
+            // Only the initiating session owns configure's deferred delivery.
+            // Later requests must not retain unrelated notification clients.
+            if (
+              this.onConfigureWarnings &&
+              requestSessionId &&
+              options?.configureWarningClient !== undefined
+            ) {
+              this.configureWarningClients.set(requestSessionId, options.configureWarningClient);
+            }
             const configuringChild = this.process;
             const requireConfiguringChild = (): void => {
               if (this.process !== configuringChild) {
@@ -1025,6 +1028,10 @@ export class BinaryBridge implements AftProjectTransport {
                   );
                 }
                 this.configured = true;
+              } catch (error) {
+                if (sessionIdForConfigure)
+                  this.configureWarningClients.delete(sessionIdForConfigure);
+                throw error;
               } finally {
                 this._configurePromise = null;
               }
@@ -1229,64 +1236,58 @@ export class BinaryBridge implements AftProjectTransport {
     params: Record<string, unknown>,
     options: SendOptions | undefined,
   ): Promise<void> {
+    const sessionId = typeof params.session_id === "string" ? params.session_id : undefined;
+    const client =
+      options?.configureWarningClient ??
+      (sessionId ? this.configureWarningClients.get(sessionId) : undefined);
+    // Capture ownership before dispatch. A hung host callback must neither hold
+    // configure readiness nor delay releasing the terminal delivery's client.
+    if (sessionId && configResult.warnings_pending !== true)
+      this.configureWarningClients.delete(sessionId);
     if (!this.onConfigureWarnings) return;
     const warnings = Array.isArray(configResult.warnings)
       ? (configResult.warnings as ConfigureWarning[])
       : [];
     const configDroppedKeys = coerceConfigureDroppedKeys(configResult.config_dropped_keys);
     if (warnings.length === 0 && configDroppedKeys.length === 0) return;
-
-    const sessionId = typeof params.session_id === "string" ? params.session_id : undefined;
     const context: ConfigureWarningsContext = {
       projectRoot: this.cwd,
       sessionId,
-      client:
-        options?.configureWarningClient ??
-        (sessionId ? this.configureWarningClients.get(sessionId) : undefined),
+      client,
       warnings,
     };
-    if (configDroppedKeys.length > 0) {
-      context.configDroppedKeys = configDroppedKeys;
-    }
-    try {
-      await this.onConfigureWarnings(context);
-    } catch (err) {
-      this.warnVia(
-        `configure warning delivery failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      if (sessionId) {
-        this.configureWarningClients.delete(sessionId);
-      }
-    }
+    if (configDroppedKeys.length > 0) context.configDroppedKeys = configDroppedKeys;
+    this.dispatchHostCallback("configure warning", () => this.onConfigureWarnings?.(context));
   }
 
-  /**
-   * Handle the `configure_warnings` push frame the Rust binary emits after
-   * configure has returned. The frame carries the warnings produced by the
-   * deferred file walk + missing-binary detection. Forwards to the same
-   * `onConfigureWarnings` handler used for synchronous warnings so plugins
-   * don't need to know about the async path.
-   */
+  /** Release deferred-warning ownership even when the terminal frame has no warnings. */
   private async handleConfigureWarningsFrame(frame: Record<string, unknown>): Promise<void> {
-    if (!this.onConfigureWarnings) return;
-    const warnings = frame.warnings;
-    if (!Array.isArray(warnings) || warnings.length === 0) return;
-    const projectRoot = typeof frame.project_root === "string" ? frame.project_root : this.cwd;
-    const rawSessionId = frame.session_id;
     const sessionId =
-      typeof rawSessionId === "string" && rawSessionId.length > 0 ? rawSessionId : null;
-    try {
-      await this.onConfigureWarnings({
-        projectRoot,
+      typeof frame.session_id === "string" && frame.session_id.length > 0 ? frame.session_id : null;
+    const client = sessionId ? this.configureWarningClients.get(sessionId) : undefined;
+    if (sessionId) this.configureWarningClients.delete(sessionId);
+    if (!this.onConfigureWarnings || !Array.isArray(frame.warnings) || frame.warnings.length === 0)
+      return;
+    this.dispatchHostCallback("configure warning", () =>
+      this.onConfigureWarnings?.({
+        projectRoot: typeof frame.project_root === "string" ? frame.project_root : this.cwd,
         sessionId,
-        client: sessionId ? this.configureWarningClients.get(sessionId) : undefined,
-        warnings: warnings as ConfigureWarning[],
-      });
-    } finally {
-      if (sessionId) {
-        this.configureWarningClients.delete(sessionId);
-      }
+        client,
+        warnings: frame.warnings as ConfigureWarning[],
+      }),
+    );
+  }
+
+  private dispatchHostCallback(label: string, callback: () => void | Promise<void>): void {
+    const failed = (error: unknown): void => {
+      this.warnVia(
+        `${label} delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    };
+    try {
+      void Promise.resolve(callback()).catch(failed);
+    } catch (error) {
+      failed(error);
     }
   }
 
@@ -1318,6 +1319,7 @@ export class BinaryBridge implements AftProjectTransport {
     this._shuttingDown = true;
     this.spawnedBinaryFingerprint = null;
     this.clearRestartResetTimer();
+    this.clearRestartTimer();
     this.configureWarningClients.clear();
     this.rejectAllPending(
       new BridgeTransportUnknownOutcomeError(`${this.errorPrefix} Bridge shutting down`),
@@ -1431,6 +1433,7 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private spawnProcess(triggeringSessionId?: string): void {
+    this.clearRestartTimer();
     this._retiringDueToBinaryChange = false;
     if (triggeringSessionId) {
       this.sessionLogVia(
@@ -1531,6 +1534,17 @@ export class BinaryBridge implements AftProjectTransport {
       env: spawnEnv,
     });
     const currentChild = child;
+    // Writable streams emit an error in addition to invoking write callbacks.
+    // Keep retired children observed too, but only retire the current transport.
+    child.stdin?.on("error", (cause) => {
+      if (this.process !== currentChild) return;
+      this.invalidateTransportProcess(
+        new BridgeTransportUnknownOutcomeError(
+          `${this.errorPrefix} Failed to write to stdin: ${cause.message}`,
+          { cause },
+        ),
+      );
+    });
 
     const stdoutDecoder = new StringDecoder("utf8");
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -1666,13 +1680,14 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private onStdoutData(data: string): void {
-    // Unprocessed bytes are the carried partial line plus this chunk.
-    if (this.stdoutPendingLength + data.length > MAX_STDOUT_BUFFER) {
+    const exceedsLimit = (fragment: string): boolean => {
+      if (this.stdoutPendingLength + Buffer.byteLength(fragment, "utf8") <= MAX_STDOUT_BUFFER)
+        return false;
       this.handleCrash(
         new Error(`aft bridge stdout buffer exceeded ${MAX_STDOUT_BUFFER} bytes — killing bridge`),
       );
-      return;
-    }
+      return true;
+    };
 
     // Only the new chunk is searched for newlines: the carried chunks are
     // already known to contain none.
@@ -1682,6 +1697,7 @@ export class BinaryBridge implements AftProjectTransport {
     let newlineIdx = data.indexOf("\n");
     while (newlineIdx !== -1) {
       let line = data.slice(start, newlineIdx);
+      if (exceedsLimit(line)) return;
       if (this.stdoutPending.length > 0) {
         this.stdoutPending.push(line);
         line = this.stdoutPending.join("");
@@ -1701,8 +1717,9 @@ export class BinaryBridge implements AftProjectTransport {
 
     if (start < data.length) {
       const rest = start === 0 ? data : data.slice(start);
+      if (exceedsLimit(rest)) return;
       this.stdoutPending.push(rest);
-      this.stdoutPendingLength += rest.length;
+      this.stdoutPendingLength += Buffer.byteLength(rest, "utf8");
     }
   }
 
@@ -1746,15 +1763,21 @@ export class BinaryBridge implements AftProjectTransport {
         const taskId = bashTaskIdFrom(response);
         if (taskId) this.outstandingBackgroundTaskIds.delete(taskId);
         this.syncEventLoopHold();
-        this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
+        this.dispatchHostCallback("bash completion", () =>
+          this.onBashCompletion?.(response as unknown as BashCompletedPayload, this),
+        );
         return;
       }
       if (response.type === "bash_long_running") {
-        this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this);
+        this.dispatchHostCallback("bash long-running", () =>
+          this.onBashLongRunning?.(response as unknown as BashLongRunningPayload, this),
+        );
         return;
       }
       if (response.type === "bash_pattern_match") {
-        this.onBashPatternMatch?.(response as unknown as BashPatternMatchFrame, this);
+        this.dispatchHostCallback("bash pattern-match", () =>
+          this.onBashPatternMatch?.(response as unknown as BashPatternMatchFrame, this),
+        );
         return;
       }
       if (response.type === "configure_warnings") {
@@ -1811,7 +1834,7 @@ export class BinaryBridge implements AftProjectTransport {
     const taskId = bashTaskIdFrom(response);
     if (!taskId) return;
 
-    if (isTerminalBashStatus(response.status)) {
+    if (isTerminalBashStatus(response.status, true)) {
       this.outstandingBackgroundTaskIds.delete(taskId);
       return;
     }
@@ -1881,6 +1904,7 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private handleCrash(cause?: Error): void {
+    this.clearRestartTimer();
     const proc = this.process;
     this.process = null;
     this.spawnedBinaryFingerprint = null;
@@ -1924,7 +1948,8 @@ export class BinaryBridge implements AftProjectTransport {
       this._restartCount++;
       this.logVia(`Auto-restart #${this._restartCount} in ${delay}ms`);
 
-      const restartTimer = setTimeout(() => {
+      this.restartTimer = setTimeout(() => {
+        this.restartTimer = null;
         if (!this._shuttingDown && !this.isAlive()) {
           try {
             this.spawnProcess();
@@ -1935,7 +1960,7 @@ export class BinaryBridge implements AftProjectTransport {
       }, delay);
       // The crash already rejected every pending request, so nothing waits on
       // this restart; it must not keep a host that is otherwise done alive.
-      restartTimer.unref?.();
+      this.restartTimer.unref?.();
       // Also decay the counter over time so repeated crashes without any
       // successful response don't permanently wedge the bridge.
       this.scheduleRestartCountReset();
@@ -1948,6 +1973,7 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private rejectAllPending(error: BridgeTransportUnavailableError): void {
+    this.configureWarningClients.clear();
     for (const [_id, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.onSettled?.();
@@ -1957,6 +1983,7 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private scheduleRestartCountReset(): void {
+    if (this._restartCount === 0) return;
     this.clearRestartResetTimer();
     this.restartResetTimer = setTimeout(() => {
       this._restartCount = 0;
@@ -1964,6 +1991,11 @@ export class BinaryBridge implements AftProjectTransport {
     }, BinaryBridge.RESTART_RESET_MS);
     // Bookkeeping only: a five-minute counter reset must not hold the host open.
     this.restartResetTimer.unref?.();
+  }
+
+  private clearRestartTimer(): void {
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.restartTimer = null;
   }
 
   private clearRestartResetTimer(): void {

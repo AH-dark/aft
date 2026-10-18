@@ -21,7 +21,8 @@
  * map directly without round-tripping through the spawn pipeline.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { BridgePool } from "../pool.js";
 
 describe("BridgePool.setConfigureOverride", () => {
@@ -172,4 +173,21 @@ describe("BridgePool.setConfigureOverride", () => {
       AFT_CACHE_DIR: "/tmp/scoped-cache",
     });
   });
+});
+
+test("reconfigure canonicalizes once and preserves pool-wide future overrides", async () => {
+  const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
+  const root = process.cwd();
+  const bridge = pool.getBridge(root);
+  bridge.isAlive = () => true;
+  bridge.send = async () => ({ success: true });
+  const realpaths = spyOn(fs, "realpathSync");
+  try {
+    await pool.reconfigure(root, { lsp_paths_extra: ["/cache/bin"] });
+    expect(realpaths.mock.calls.length).toBe(1);
+    expect(pool._testGetConfigOverrides().lsp_paths_extra).toEqual(["/cache/bin"]);
+  } finally {
+    realpaths.mockRestore();
+    await pool.shutdown();
+  }
 });

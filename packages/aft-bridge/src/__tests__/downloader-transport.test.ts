@@ -62,6 +62,39 @@ describe("downloadBinary hardened transport", () => {
     return assetName;
   }
 
+  test("download interruption does not re-signal a host with its own SIGINT policy", async () => {
+    const { downloadBinary } = await import(`../downloader.js?signal-policy-${Date.now()}`);
+    let entered!: () => void;
+    const fetched = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    globalThis.fetch = ((_url: unknown, options: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new Error("interrupted")), {
+          once: true,
+        });
+        entered();
+      })) as typeof fetch;
+    const originalKill = process.kill;
+    let reSignals = 0;
+    const hostHandler = () => {};
+    process.on("SIGINT", hostHandler);
+    process.kill = (() => {
+      reSignals++;
+      return true;
+    }) as typeof process.kill;
+    const download = downloadBinary("1.2.3");
+    try {
+      await fetched;
+      process.emit("SIGINT");
+      await download;
+      expect(reSignals).toBe(0);
+    } finally {
+      process.kill = originalKill;
+      process.off("SIGINT", hostHandler);
+    }
+  });
+
   test("dedupes concurrent same-version downloads and writes one final binary", async () => {
     if (!shellFixtureAvailable()) return;
     const { downloadBinary, getBinaryName } = await import(

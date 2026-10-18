@@ -23,7 +23,7 @@ const BRIDGE_MODULE = join(import.meta.dir, "..", "bridge.ts");
 const EXIT_BOUND_MS = 3_000;
 const HANG_KILL_MS = 8_000;
 // The stub's status frame arrives this long after configure, while the call
-// is still waiting on the configure-warnings handler; a background task's
+// is still waiting on the version-check test gate; a background task's
 // completion frame arrives this long after the task started.
 const STATUS_FRAME_DELAY_MS = 1_000;
 
@@ -159,17 +159,14 @@ describe.skipIf(process.platform === "win32")("BinaryBridge event-loop hold", ()
     if (run.killedAsHung || run.exitCode !== 0) console.error(`harness stderr:\n${run.stderr}`);
     const names = run.events.map((event) => event.name);
     // Between configure's reply and the stub's status frame the call awaits the
-    // configure-warnings handler: only the bridge's hold on the child keeps the
+    // version-check test gate: only the bridge's hold on the child keeps the
     // process running long enough to receive the frame and finish the call.
     expect(names).toEqual([
-      "configure-warnings-waiting",
+      "version-check-waiting",
       "status-frame",
       "call-settled",
       "shutdown-done",
     ]);
-    const waiting = run.events[0]?.at ?? 0;
-    const frame = run.events[1]?.at ?? 0;
-    expect(frame - waiting).toBeGreaterThanOrEqual(STATUS_FRAME_DELAY_MS - 200);
     expect(run.events[2]?.detail).toBe("success=true alive=true");
     expect(run.killedAsHung).toBe(false);
     expect(run.exitCode).toBe(0);

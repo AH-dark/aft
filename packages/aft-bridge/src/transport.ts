@@ -119,6 +119,8 @@ export interface AftTransportPool {
     options?: ToolCallOptions,
   ): Promise<ToolCallResult>;
   getActiveBridgeForRoot(projectRoot: string): AftProjectTransport | null;
+  /** Observe concrete eviction without creating a replacement bridge. */
+  subscribeBridgeEvictions?(listener: (canonicalRoot: string) => void): () => void;
   /**
    * All currently-live project transports, for session-scoped signals (e.g.
    * bash wait-detach) that must reach their target even when the caller's

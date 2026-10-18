@@ -12,20 +12,12 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { spawn, spawnSync } from "./child-process.js";
+import { spawn } from "./child-process.js";
 import { type LegacyAftConfigSource, resolveHarnessStoragePath } from "./paths.js";
 import { findBinary } from "./resolver.js";
 import { resolveCortexKitStorageRoot } from "./storage-paths.js";
 
 export { resolveCortexKitStorageRoot } from "./storage-paths.js";
-
-type SpawnSyncForMigration = typeof spawnSync;
-
-let spawnSyncForMigration: SpawnSyncForMigration = spawnSync;
-
-export function __setSpawnSyncForTests(impl: SpawnSyncForMigration | null): void {
-  spawnSyncForMigration = impl ?? spawnSync;
-}
 
 /** Keep only diagnostic tails while the migrator writes its complete log to disk. */
 let migrationAsyncSpawns = 0;
@@ -36,6 +28,7 @@ function runMigration(
   binary: string,
   args: string[],
   timeoutMs: number,
+  captureStatus = false,
 ): Promise<{
   error?: Error;
   status: number | null;
@@ -52,7 +45,14 @@ function runMigration(
     child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
-      stdout = (stdout + chunk).slice(-4000);
+      if (captureStatus) {
+        stdout += chunk;
+        if (Buffer.byteLength(stdout, "utf8") > 1024 * 1024) {
+          error = new Error("migration status exceeded the subprocess output limit");
+          child.kill("SIGKILL");
+          stdout = "";
+        }
+      } else stdout = (stdout + chunk).slice(-4000);
     });
     child.stderr?.on("data", (chunk: string) => {
       stderr = (stderr + chunk).slice(-4000);
@@ -71,11 +71,18 @@ function runMigration(
   });
 }
 
+let migrationStatusRunner = runMigration;
+export function __setMigrationStatusRunnerForTests(impl: typeof runMigration | null): void {
+  migrationStatusRunner = impl ?? runMigration;
+}
+
 export type MigrationHarness = "opencode" | "pi";
 
 export interface MigrationOptions {
   harness: MigrationHarness;
   binaryPath?: string;
+  /** Caller-known version for fallback resolution when the host bundles the bridge. */
+  expectedVersion?: string;
   logger?: {
     warn?: (msg: string) => void;
     info?: (msg: string) => void;
@@ -647,7 +654,7 @@ export async function ensureStorageMigrated(opts: MigrationOptions): Promise<voi
   }
 
   const logPath = migrationLogPath(newRoot, opts.harness, opts.logger);
-  const binaryPath = opts.binaryPath ?? (await findBinary());
+  const binaryPath = opts.binaryPath ?? (await findBinary(opts.expectedVersion));
   const startMs = Date.now();
   info?.(
     `AFT storage migration starting for ${opts.harness}: ${legacyRoot} -> ${newRoot} ` +
@@ -727,7 +734,7 @@ export async function getMigrationStatus(opts: {
   const newRoot = resolveCortexKitStorageRoot();
   const legacyRoot = resolveLegacyStorageRoot(opts.harness);
   const binaryPath = opts.binaryPath ?? (await findBinary());
-  const result = spawnSyncForMigration(
+  const result = await migrationStatusRunner(
     binaryPath,
     [
       "migrate-storage",
@@ -739,11 +746,8 @@ export async function getMigrationStatus(opts: {
       "--harness",
       opts.harness,
     ],
-    {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: DEFAULT_TIMEOUT_MS,
-    },
+    DEFAULT_TIMEOUT_MS,
+    true,
   );
 
   if (result.error || result.status !== 0) {
