@@ -9536,7 +9536,9 @@ mod tests {
         started
             .send(())
             .expect("signal blocked backend probe start");
-        release.recv().expect("release blocked backend probe");
+        // Bounded so a regression that makes status or search wait on this
+        // probe fails the test's elapsed-time check instead of hanging it.
+        let _ = release.recv_timeout(Duration::from_secs(5));
         Ok(())
     }
 
