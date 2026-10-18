@@ -77,33 +77,125 @@ fn views_tier2_published_plane_never_refreshes_legacy() {
     );
 }
 
+fn run_checkout_verification_with_deadline(
+    timeout: Duration,
+    verify: impl FnOnce(&dyn Fn(&'static str)) + Send + 'static,
+) {
+    enum Progress {
+        Phase(&'static str),
+        Finished(std::thread::Result<()>),
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let deadline = Instant::now() + timeout;
+    std::thread::Builder::new()
+        .name("inspect-warm-verification".into())
+        .spawn(move || {
+            // Keep the fixture, thread-local IO counters, and assertions on one
+            // thread. Report completion only after fixture cleanup has finished.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                verify(&|phase| {
+                    let _ = tx.send(Progress::Phase(phase));
+                });
+            }));
+            let _ = tx.send(Progress::Finished(result));
+        })
+        .expect("spawn inspect warm verification worker");
+
+    let mut phase = "starting worker";
+    loop {
+        // One absolute deadline includes setup, verification, and cleanup;
+        // progress cannot extend it. Do not join a worker that may be blocked.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(Progress::Phase(next)) if !remaining.is_zero() => phase = next,
+            Ok(Progress::Finished(Ok(()))) => return,
+            Ok(Progress::Finished(Err(panic))) => std::panic::resume_unwind(panic),
+            Ok(Progress::Phase(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("inspect warm verification timed out after {timeout:?} during {phase}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("inspect warm verification worker disconnected during {phase}");
+            }
+        }
+    }
+}
+
+#[test]
+fn checkout_verification_deadline_reports_last_phase() {
+    let (release, blocked) = std::sync::mpsc::channel();
+    let result = std::panic::catch_unwind(|| {
+        run_checkout_verification_with_deadline(Duration::from_secs(1), move |phase| {
+            phase("injected blocked operation");
+            blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+    });
+    // Release the simulated stall even when the assertion below fails.
+    let _ = release.send(());
+    let panic = result.expect_err("a blocked verification must fail before the libtest timeout");
+    assert_eq!(
+        panic.downcast_ref::<String>().unwrap(),
+        "inspect warm verification timed out after 1s during injected blocked operation"
+    );
+}
+
+#[test]
+fn checkout_verification_deadline_preserves_assertion_panics() {
+    let result = std::panic::catch_unwind(|| {
+        run_checkout_verification_with_deadline(Duration::from_secs(10), |_| {
+            panic!("verification assertion failed");
+        });
+    });
+    assert_eq!(
+        result.unwrap_err().downcast_ref::<&str>(),
+        Some(&"verification assertion failed")
+    );
+}
+
 #[test]
 fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
+    run_checkout_verification_with_deadline(
+        Duration::from_secs(180),
+        verify_checkout_view_corpus,
+    );
+}
+
+fn verify_checkout_view_corpus(phase: &dyn Fn(&'static str)) {
     // IO counters and refusal reports are thread-local. Invalidation tickets
     // are keyed by this private project directory, which has no watcher, so
     // other libtest threads cannot move this fixture's ticket or counters.
+    phase("building initial checkout and callgraph fixture");
     let (_project, _storage, mut job, mut request) = view_projection_fixture();
+    phase("writing 3000 source files");
     for i in 0..3000 {
         write_projection_cache_file(&job.project_root.join(format!("source_{i}.ts")), &format!("export function source_{i}() {{ return {i}; }}\n"));
     }
     for args in [vec!["add", "."], vec!["-c", "user.name=AFT", "-c", "user.email=aft@example.com", "commit", "--quiet", "-m", "large fixture"]] {
+        phase(if args[0] == "add" { "git add corpus" } else { "git commit corpus" });
         let mut git = std::process::Command::new("git");
         crate::test_env::apply_hermetic_git_env(git.current_dir(&job.project_root));
         assert!(git.args(args).status().unwrap().success());
     }
+    phase("reading HEAD tree");
     request.desired_head = crate::views::assembly::head_tree_fingerprint(&crate::alias::head_tree_entries(&job.project_root).unwrap());
+    phase("publishing checkout view");
     crate::views::assembly::publish_checkout(&request).unwrap();
+    phase("walking published source files");
     job.scope_files = crate::callgraph::walk_project_files(&job.project_root).collect();
+    phase("creating inspect snapshot and manager");
     let snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
     let manager = InspectManager::new();
+    phase("collecting source stats");
     let stats = job.scope_files.iter().map(|path| {
         let metadata = std::fs::metadata(path).unwrap();
         (path.clone(), metadata.len(), metadata.modified().unwrap())
     }).collect::<Vec<_>>();
     crate::views::read::take_verification_io();
+    phase("cold checkout verification");
     let cold_view = manager.current_checkout_view(&snapshot, Some(&stats));
     assert!(cold_view.is_some(), "cold checkout view refused: {:?}; root={:?} desired_head={} observed_files={}", take_checkout_view_refusal(), job.project_root, request.desired_head, stats.len());
     let cold = crate::views::read::take_verification_io();
+    phase("warm checkout verification with known stats");
     assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_some(), "warm checkout view refused: {:?}", take_checkout_view_refusal());
     let warm = crate::views::read::take_verification_io();
     eprintln!("inspect_view_verification fixture_files={} cold={cold:?} warm={warm:?}", job.scope_files.len());
@@ -111,6 +203,7 @@ fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
     assert_eq!(warm.bytes_hashed, 0, "unchanged view verification rehashed source bytes: {warm:?}");
     assert_eq!(warm.files_statd, 0, "blocking inspection must reuse the root stats it already collected");
     assert_eq!(cold.files_read, 3002, "first verification must actually read the entire source set");
+    phase("standalone checkout verification");
     assert!(manager.current_checkout_view(&snapshot, None).is_some(), "standalone checkout view refused: {:?}", take_checkout_view_refusal());
     let standalone = crate::views::read::take_verification_io();
     eprintln!("inspect_view_verification standalone={standalone:?}");
@@ -118,14 +211,18 @@ fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
     assert_eq!(standalone.files_read, 0);
     // A watcher event must defeat the memo even if an external writer preserved
     // both size and mtime. The known root stats deliberately remain unchanged.
+    phase("editing source while preserving size and mtime");
     let edited = job.project_root.join("source_0.ts");
     let modified = std::fs::metadata(&edited).unwrap().modified().unwrap();
     std::fs::write(&edited, "export function source_0() { return 9; }\n").unwrap();
     // Windows requires write access to change a file's timestamps.
     std::fs::OpenOptions::new().write(true).open(&edited).unwrap().set_modified(modified).unwrap();
+    phase("invalidating verification memo");
     crate::cache_freshness::invalidate_verify_memo(&job.project_root);
+    phase("checkout verification after invalidation");
     assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_none());
     assert!(crate::views::read::take_verification_io().files_read > 0);
+    phase("dropping fixture and manager");
 }
 
 #[test]
