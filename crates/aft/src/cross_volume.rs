@@ -188,7 +188,28 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     }
     if kind.is_file() {
         fs::copy(from, to)?;
+        #[cfg(not(windows))]
         fs::File::open(to)?.sync_all()?;
+        #[cfg(windows)]
+        {
+            // FlushFileBuffers requires a writable handle. fs::copy preserves
+            // the readonly attribute, so clear it on the unpublished copy only
+            // and restore it even if opening or syncing the file fails.
+            let permissions = fs::metadata(to)?.permissions();
+            if permissions.readonly() {
+                let mut writable = permissions.clone();
+                writable.set_readonly(false);
+                fs::set_permissions(to, writable)?;
+            }
+            let synced = fs::OpenOptions::new()
+                .write(true)
+                .open(to)
+                .and_then(|file| file.sync_all());
+            if permissions.readonly() {
+                fs::set_permissions(to, permissions)?;
+            }
+            synced?;
+        }
         return Ok(());
     }
     if !kind.is_dir() {
@@ -284,6 +305,31 @@ mod tests {
             Moved::Renamed
         ));
         assert_eq!(fs::read(destination).unwrap(), b"x");
+    }
+
+    #[test]
+    fn copied_readonly_file_is_synced_and_keeps_its_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("readonly.json");
+        fs::write(&source, b"keep").unwrap();
+        let original_permissions = fs::metadata(&source).unwrap().permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&source, readonly).unwrap();
+        let destination = temp.path().join("staging.json");
+
+        let copied = copy_tree(&source, &destination);
+        let source_readonly = fs::metadata(&source).unwrap().permissions().readonly();
+        let destination_readonly = fs::metadata(&destination).unwrap().permissions().readonly();
+        // Restore writable permissions before asserting so Windows can clean
+        // up the fixture even when the copy or permission assertion fails.
+        fs::set_permissions(&source, original_permissions.clone()).unwrap();
+        fs::set_permissions(&destination, original_permissions).unwrap();
+
+        copied.unwrap();
+        assert!(source_readonly, "the source permissions must not change");
+        assert!(destination_readonly, "the copy must keep its permissions");
+        assert_eq!(fs::read(&destination).unwrap(), b"keep");
     }
 
     #[test]
