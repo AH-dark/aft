@@ -55,7 +55,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { cachedFileSha256Sync, writeStampedFileDigest } from "./binary-identity.js";
 import { getAftLspBinariesDir } from "./cache-paths.js";
-import { execFile, spawnSync } from "./child-process.js";
+import { execFile, spawn } from "./child-process.js";
 import {
   assertSafeVersion,
   isSafeVersion,
@@ -80,19 +80,20 @@ export interface GithubInstallConfig {
   disabled: ReadonlySet<string>;
 }
 export interface GithubAutoInstallResult {
+  /** Validated cache directories, populated as background validation completes. */
   cachedBinDirs: string[];
   installsStarted: number;
   /** Binary names whose installs are actively in flight at return time. */
   installingBinaries: string[];
   skipped: Array<{ id: string; reason: string }>;
   /**
-   * Promise that resolves when every backgrounded GitHub install settles.
+   * Promise that resolves when cached validation and backgrounded installs settle.
    * Each install holds its per-package install lock for its full duration.
-   * Plugin startup ignores this; tests await it.
+   * Hosts continue startup immediately and await this in their background path refresh.
    */
   installsComplete: Promise<void>;
   /** Re-scan the cache after background installs settle. */
-  getCachedBinDirs: () => string[];
+  getCachedBinDirs: () => Promise<string[]>;
 }
 
 export interface GithubInstallerHost {
@@ -158,6 +159,11 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     at: string;
   }
 
+  interface GithubSmokeVerdict {
+    binarySha256: string;
+    verdict: "passed" | "timeout";
+  }
+
   interface GithubInstalledMeta {
     version: string;
     installedAt: string;
@@ -167,6 +173,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     /** Audit-only hash of the downloaded release archive. */
     archiveSha256?: string;
     layout?: GithubServerSpec["layout"];
+    smoke?: GithubSmokeVerdict;
   }
 
   function installFailureMarkerPath(spec: GithubServerSpec): string {
@@ -281,6 +288,10 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         ...(typeof parsed.binarySha256 === "string" && parsed.binarySha256.length > 0
           ? { binarySha256: parsed.binarySha256 }
           : {}),
+        ...(typeof parsed.smoke?.binarySha256 === "string" &&
+        (parsed.smoke.verdict === "passed" || parsed.smoke.verdict === "timeout")
+          ? { smoke: parsed.smoke }
+          : {}),
         ...(parsed.layout === "distribution" || parsed.layout === "standalone"
           ? { layout: parsed.layout }
           : {}),
@@ -299,6 +310,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     binarySha256: string,
     archiveSha256?: string,
     layout?: GithubServerSpec["layout"],
+    smoke?: GithubSmokeVerdict,
   ): void {
     try {
       mkdirSync(installDir, { recursive: true });
@@ -309,6 +321,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         binarySha256,
         ...(archiveSha256 ? { archiveSha256 } : {}),
         ...(layout ? { layout } : {}),
+        ...(smoke ? { smoke } : {}),
       };
       writeFileSync(join(installDir, INSTALLED_META_FILE), JSON.stringify(meta), "utf8");
     } catch (err) {
@@ -1064,22 +1077,61 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     }
   }
 
-  function smokeGithubBinary(spec: GithubServerSpec, binaryPath: string): boolean {
-    const result = spawnSync(binaryPath, [...spec.smokeArgs], {
-      timeout: 2_000,
-      killSignal: "SIGKILL",
-      maxBuffer: 64 * 1024,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+  /** A timeout is inconclusive: a cold or loaded server may simply need longer to start. */
+  async function smokeGithubBinary(
+    spec: GithubServerSpec,
+    binaryPath: string,
+  ): Promise<"passed" | "timeout" | "failed"> {
+    return new Promise((resolveSmoke) => {
+      let child: ReturnType<typeof spawn> | undefined;
+      let settled = false;
+      let output = Buffer.alloc(0);
+      const finish = (verdict: "passed" | "timeout" | "failed", detail?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child?.stdout?.destroy();
+        child?.stderr?.destroy();
+        if (verdict !== "passed") {
+          warn(
+            `[lsp] ${spec.id}: runtime smoke ${verdict} at ${binaryPath}: ${detail ?? output.toString("utf8").trim()}`,
+          );
+        }
+        resolveSmoke(verdict);
+      };
+      const timer = setTimeout(() => {
+        child?.kill("SIGKILL");
+        child?.unref();
+        finish("timeout", "exceeded 2000 ms; keeping install");
+      }, 2_000);
+      const capture = (chunk: Buffer | string) => {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        const available = 64 * 1024 - output.length;
+        output = Buffer.concat([output, bytes.subarray(0, available)]);
+        if (bytes.length > available) {
+          child?.kill("SIGKILL");
+          finish("failed", "exceeded 64 KiB output limit");
+        }
+      };
+      try {
+        child = spawn(binaryPath, [...spec.smokeArgs], { stdio: ["ignore", "pipe", "pipe"] });
+        child.stdout?.on("data", capture);
+        child.stderr?.on("data", capture);
+        child.once("error", (error) => finish("failed", String(error)));
+        // Do not wait for pipe EOF: descendants may inherit handles after the server exits.
+        child.once("exit", (code, signal) =>
+          finish(code === 0 ? "passed" : "failed", `exit=${code}, signal=${signal}`),
+        );
+      } catch (error) {
+        finish("failed", String(error));
+      }
     });
-    if (result.status === 0 && !result.error) return true;
-    warn(
-      `[lsp] ${spec.id}: runtime smoke failed at ${binaryPath}: ${result.error ?? result.stderr ?? result.status}`,
-    );
-    return false;
   }
 
-  function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform): boolean {
+  async function validateCachedGithubInstall(
+    spec: GithubServerSpec,
+    platform: Platform,
+  ): Promise<boolean> {
     const packageDir = ghPackageDir(spec);
     const meta = readGithubInstalledMetaIn(packageDir);
     const binaryPath = ghBinaryCandidates(spec, platform)
@@ -1095,31 +1147,39 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       quarantineCachedGithubInstall(spec, "missing/unsafe metadata or binary");
       return false;
     }
+    if (spec.layout === "distribution" && meta.layout !== "distribution") {
+      // Layout must be checked even if an older installer recorded a successful smoke.
+      quarantineCachedGithubInstall(spec, "distribution was installed without its runtime layout");
+      return false;
+    }
     const currentHash = cachedBinarySha256(binaryPath);
     const recordedBinaryHash = meta.binarySha256 ?? meta.sha256;
     // Legacy metadata recorded the archive digest in sha256. Retain its audit
-    // value while migrating to the executable digest, but only after it runs.
+    // value while migrating to the executable digest, but only after validation.
     const legacyArchiveHash = meta.sha256 && !meta.binarySha256 && !meta.archiveSha256;
     if (!recordedBinaryHash || (!legacyArchiveHash && currentHash !== recordedBinaryHash)) {
       quarantineCachedGithubInstall(spec, `recorded ${recordedBinaryHash}, current ${currentHash}`);
       return false;
     }
-    if (!smokeGithubBinary(spec, binaryPath)) {
-      quarantineCachedGithubInstall(spec, "cached binary failed runtime smoke check");
-      return false;
+    let smoke = meta.smoke;
+    if (smoke?.binarySha256 !== currentHash) {
+      const verdict = await smokeGithubBinary(spec, binaryPath);
+      if (verdict === "failed") {
+        quarantineCachedGithubInstall(spec, "cached binary failed runtime smoke check");
+        return false;
+      }
+      // Do not certify a different executable if it changed while the subprocess ran.
+      if (!existsSync(binaryPath) || cachedBinarySha256(binaryPath) !== currentHash) return false;
+      smoke = { binarySha256: currentHash, verdict };
     }
-    if (spec.layout === "distribution" && meta.layout !== "distribution") {
-      // Even a successful --version cannot prove that clangd can find its headers.
-      quarantineCachedGithubInstall(spec, "distribution was installed without its runtime layout");
-      return false;
-    }
-    if (meta.sha256 !== currentHash || meta.binarySha256 !== currentHash) {
+    if (meta.sha256 !== currentHash || meta.binarySha256 !== currentHash || meta.smoke !== smoke) {
       writeGithubInstalledMetaIn(
         packageDir,
         meta.version,
         currentHash,
         legacyArchiveHash ? meta.sha256 : meta.archiveSha256,
         meta.layout,
+        smoke,
       );
     }
     return true;
@@ -1164,7 +1224,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   /* ─────────────────────────── install pipeline ─────────────────────────── */
 
   type GithubDownloadResult =
-    | { ok: true; archiveSha256: string; binarySha256: string }
+    | { ok: true; archiveSha256: string; binarySha256: string; smoke: GithubSmokeVerdict }
     | { ok: false; sha256: string; error: string };
 
   /**
@@ -1282,7 +1342,8 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       return { ok: false, sha256: archiveSha256, error: message };
     }
 
-    if (!smokeGithubBinary(spec, targetBinary)) {
+    const smokeVerdict = await smokeGithubBinary(spec, targetBinary);
+    if (smokeVerdict === "failed") {
       return {
         ok: false,
         sha256: archiveSha256,
@@ -1301,7 +1362,12 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       }
       log(`[lsp] installed ${spec.id} ${tag} at ${targetBinary}`);
       log(`[lsp] ${spec.id} ${tag} binary_sha256=${binarySha256}`);
-      return { ok: true, archiveSha256, binarySha256 };
+      return {
+        ok: true,
+        archiveSha256,
+        binarySha256,
+        smoke: { binarySha256, verdict: smokeVerdict },
+      };
     } catch (err) {
       const message = `failed to hash installed binary: ${err instanceof Error ? err.message : String(err)}`;
       error(`[lsp] ${spec.id}: ${message}`);
@@ -1398,6 +1464,7 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         installResult.binarySha256,
         installResult.archiveSha256,
         spec.layout,
+        installResult.smoke,
       );
       return { started: true };
     });
@@ -1441,9 +1508,9 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   /**
    * Run the GitHub-release auto-install pass for every Pattern C server.
    *
-   * Sync return: per-server cached bin dirs + skipped reasons known at decision
-   * time. Backgrounded installs settle into `installsComplete` so plugin
-   * startup is not blocked on slow downloads.
+   * Sync return: background validation/install handles and skipped reasons.
+   * Cached paths populate asynchronously; callers await installsComplete before
+   * refreshing paths, so a slow server never blocks unrelated host startup.
    */
   function runGithubAutoInstall(
     relevantServers: ReadonlySet<string>,
@@ -1465,17 +1532,19 @@ export function createGithubInstaller(services: GithubInstallerHost) {
         installingBinaries: [],
         skipped,
         installsComplete: Promise.resolve(),
-        getCachedBinDirs: () => [...cachedBinDirs],
+        getCachedBinDirs: async () => [...cachedBinDirs],
       };
     }
 
     for (const spec of GITHUB_LSP_TABLE) {
-      if (
-        isGithubInstalled(spec, host.platform) &&
-        validateCachedGithubInstall(spec, host.platform)
-      ) {
-        cachedBinDirs.push(ghBinDir(spec));
-      }
+      const cacheReady = (
+        isGithubInstalled(spec, host.platform)
+          ? validateCachedGithubInstall(spec, host.platform)
+          : Promise.resolve(false)
+      ).then((healthy) => {
+        if (healthy) cachedBinDirs.push(ghBinDir(spec));
+      });
+      installPromises.push(cacheReady);
 
       if (config.disabled.has(spec.id)) {
         skipped.push({ id: spec.id, reason: "disabled by config" });
@@ -1495,27 +1564,31 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       installsStarted += 1;
       if (services.reportInstallingBinaries) installingBinaries.push(spec.binary);
       const controller = new AbortController();
-      const promise = ensureGithubInstalled(
-        spec,
-        config,
-        fetchImpl,
-        host.platform,
-        host.arch,
-        controller.signal,
-      ).then(
-        (outcome) => {
-          if (!outcome.started) installsStarted -= 1;
-          if (outcome.reason && outcome.reason !== "already installed") {
-            skipped.push({ id: spec.id, reason: outcome.reason });
-          }
-        },
-        (err) => {
-          installsStarted -= 1;
-          const reason = err instanceof Error ? err.message : String(err);
-          skipped.push({ id: spec.id, reason: `install error: ${reason}` });
-          error(`[lsp] github install ${spec.id} promise rejected: ${reason}`);
-        },
-      );
+      const promise = cacheReady
+        .then(() =>
+          ensureGithubInstalled(
+            spec,
+            config,
+            fetchImpl,
+            host.platform,
+            host.arch,
+            controller.signal,
+          ),
+        )
+        .then(
+          (outcome) => {
+            if (!outcome.started) installsStarted -= 1;
+            if (outcome.reason && outcome.reason !== "already installed") {
+              skipped.push({ id: spec.id, reason: outcome.reason });
+            }
+          },
+          (err) => {
+            installsStarted -= 1;
+            const reason = err instanceof Error ? err.message : String(err);
+            skipped.push({ id: spec.id, reason: `install error: ${reason}` });
+            error(`[lsp] github install ${spec.id} promise rejected: ${reason}`);
+          },
+        );
       installPromises.push(trackInFlightGithubInstall(controller, promise));
     }
 
@@ -1527,14 +1600,18 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       },
       skipped,
       installsComplete: Promise.all(installPromises).then(() => {}),
-      getCachedBinDirs: () => {
+      getCachedBinDirs: async () => {
         const currentHost = detectHostPlatform();
         if (!currentHost) return [];
-        return GITHUB_LSP_TABLE.filter(
-          (spec) =>
+        const directories = await Promise.all(
+          GITHUB_LSP_TABLE.map(async (spec) =>
             isGithubInstalled(spec, currentHost.platform) &&
-            validateCachedGithubInstall(spec, currentHost.platform),
-        ).map((spec) => ghBinDir(spec));
+            (await validateCachedGithubInstall(spec, currentHost.platform))
+              ? ghBinDir(spec)
+              : null,
+          ),
+        );
+        return directories.filter((directory): directory is string => directory !== null);
       },
     };
   }

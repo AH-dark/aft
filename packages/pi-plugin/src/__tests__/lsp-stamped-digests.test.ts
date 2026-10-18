@@ -44,8 +44,9 @@ test("stamped npm and GitHub startups hash zero bytes with auto-install off", as
     const gh = runGithubAutoInstall(new Set(), config);
     expect(npm.cachedBinDirs).toContain(npmBin);
     expect(npm.getCachedBinDirs()).toContain(npmBin);
+    await gh.installsComplete;
     expect(gh.cachedBinDirs).toContain(ghBin);
-    expect(gh.getCachedBinDirs()).toContain(ghBin);
+    expect(await gh.getCachedBinDirs()).toContain(ghBin);
   }
   expect(__githubBinaryHashCountForTests() - ghBefore).toBe(0);
   expect(__fileDigestWorkForTests().syncHashes - before.syncHashes).toBe(0);

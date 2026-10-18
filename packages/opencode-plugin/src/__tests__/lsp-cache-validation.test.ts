@@ -87,6 +87,7 @@ describe("cached LSP validation before lsp_paths_extra", () => {
       disabled: new Set(),
     });
 
+    await result.installsComplete;
     expect(result.cachedBinDirs).not.toContain(binDir);
     const quarantine = join(root, "lsp-binaries", ".quarantine", "clangd");
     expect(existsSync(quarantine)).toBe(true);
@@ -118,14 +119,15 @@ describe("cached LSP validation before lsp_paths_extra", () => {
       versions: {},
       disabled: new Set(),
     });
+    await result.installsComplete;
     expect(result.cachedBinDirs).toContain(binDir);
-    expect(result.getCachedBinDirs()).toContain(binDir);
-    expect(result.getCachedBinDirs()).toContain(binDir);
+    expect(await result.getCachedBinDirs()).toContain(binDir);
+    expect(await result.getCachedBinDirs()).toContain(binDir);
     expect(__githubBinaryHashCountForTests() - before).toBe(1);
 
     // A changed binary is hashed again and caught by the recorded digest.
     writeFileSync(binary, "tampered-binary");
-    expect(result.getCachedBinDirs()).not.toContain(binDir);
+    expect(await result.getCachedBinDirs()).not.toContain(binDir);
     expect(__githubBinaryHashCountForTests() - before).toBe(2);
     expect(existsSync(join(root, "lsp-binaries", ".quarantine", "texlab"))).toBe(true);
   });

@@ -705,11 +705,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       // default logging see them. Routine skips (already-installed,
       // not-relevant, disabled) stay out of the warning summary.
       const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
-        .then(() => {
-          if (installsWereStarted || skippedByRecentAutoInstall) {
-            return [...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()])];
-          }
-          return null;
+        .then(async () => {
+          return [
+            ...new Set([...npmResult.getCachedBinDirs(), ...(await ghResult.getCachedBinDirs())]),
+          ];
         })
         .then((updatedPaths) => {
           const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
@@ -739,20 +738,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           lspAutoInstallPassLease?.release();
           lspAutoInstallPassLease = null;
         });
-      if (installsWereStarted || skippedByRecentAutoInstall) {
-        installCompletion.then((updatedPaths) => {
-          if (!updatedPaths) return;
-          void pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths)
-            .then(() => {
-              log(
-                `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
-              );
-            })
-            .catch((err) => {
-              warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
-            });
-        });
-      }
+      installCompletion.then((updatedPaths) => {
+        if (!updatedPaths) return;
+        void pushLspPathsAfterAutoInstall(pool, projectRoot, updatedPaths)
+          .then(() => {
+            log(
+              `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
+            );
+          })
+          .catch((err) => {
+            warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
+          });
+      });
     } catch (err) {
       lspAutoInstallPassLease?.release();
       lspAutoInstallPassLease = null;

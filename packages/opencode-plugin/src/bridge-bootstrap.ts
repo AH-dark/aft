@@ -257,10 +257,9 @@ function startLspAutoInstall(
     // summary listing only reasons the user can act on ("grace blocked":
     // pin a version; "install failed": check the log), never routine skips.
     const completion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
-      .then(() => {
-        if (!installsWereStarted && !skippedByRecentAutoInstall) return null;
+      .then(async () => {
         const updatedPaths = [
-          ...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()]),
+          ...new Set([...npmResult.getCachedBinDirs(), ...(await ghResult.getCachedBinDirs())]),
         ];
         if (updatedPaths.length > 0) configOverrides.lsp_paths_extra = updatedPaths;
         else delete configOverrides.lsp_paths_extra;
@@ -296,7 +295,7 @@ function startLspAutoInstall(
         lease?.release();
         lease = null;
       });
-    return installsWereStarted || skippedByRecentAutoInstall ? completion : null;
+    return completion;
   } catch (err) {
     lease?.release();
     lease = null;

@@ -183,6 +183,7 @@ describe("runGithubAutoInstall", () => {
       },
       fakeFetch,
     );
+    await result.installsComplete;
     expect(result.cachedBinDirs.length).toBeGreaterThan(0);
     expect(result.installsStarted).toBe(0);
     expect(
