@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use crate::config::{Config, UserServerDef};
 use crate::lsp::roots::{
-    find_rust_workspace_root, find_workspace_root, find_workspace_root_within,
-    outermost_marker_root,
+    find_rust_workspace_root_with_mode, find_workspace_root_with_mode,
+    outermost_marker_root_with_mode, RootPathMode,
 };
 use crate::lsp::typescript_project::{native_typescript_for, NATIVE_SERVER_ARGS};
 
@@ -387,8 +387,17 @@ impl ServerDef {
         file_path: &Path,
         project_root: Option<&Path>,
     ) -> Option<PathBuf> {
+        self.workspace_root_with_mode(file_path, project_root, RootPathMode::Resolve)
+    }
+
+    pub(crate) fn workspace_root_with_mode(
+        &self,
+        file_path: &Path,
+        project_root: Option<&Path>,
+        mode: RootPathMode,
+    ) -> Option<PathBuf> {
         if self.kind == ServerKind::Rust {
-            if let Some(root) = find_rust_workspace_root(file_path, project_root) {
+            if let Some(root) = find_rust_workspace_root_with_mode(file_path, project_root, mode) {
                 return Some(root);
             }
         }
@@ -397,20 +406,21 @@ impl ServerDef {
             self.kind,
             ServerKind::Rust | ServerKind::Python | ServerKind::Ty
         );
-        let nearest = match self.nearest_marker_root(file_path, project_root, bounded_to_project) {
-            Some(nearest) => nearest,
-            // A Python script with no project file above it (a helper under
-            // `scripts/`, say) is still Python that Pyright can check with its
-            // defaults. Serving it from the project root keeps such files from
-            // being permanently "no workspace root" gaps in a scoped inspect.
-            None if matches!(self.kind, ServerKind::Python | ServerKind::Ty) => {
-                let project_root = crate::inspect::job::canonicalize_normalized(project_root?);
-                crate::inspect::job::canonicalize_normalized(file_path)
-                    .starts_with(&project_root)
-                    .then_some(project_root)?
-            }
-            None => return None,
-        };
+        let nearest =
+            match self.nearest_marker_root(file_path, project_root, bounded_to_project, mode) {
+                Some(nearest) => nearest,
+                // A Python script with no project file above it (a helper under
+                // `scripts/`, say) is still Python that Pyright can check with its
+                // defaults. Serving it from the project root keeps such files from
+                // being permanently "no workspace root" gaps in a scoped inspect.
+                None if matches!(self.kind, ServerKind::Python | ServerKind::Ty) => {
+                    let project_root = mode.resolve(project_root?);
+                    mode.resolve(file_path)
+                        .starts_with(&project_root)
+                        .then_some(project_root)?
+                }
+                None => return None,
+            };
         let Some(project_root) = project_root else {
             return Some(nearest);
         };
@@ -425,17 +435,19 @@ impl ServerDef {
                     &nearest,
                     project_root,
                     |dir| self.has_root_marker(dir),
+                    mode,
                 ))
             }
             // Bash and YAML servers analyze each file on its own; their
             // workspace root only bounds background indexing. Their markers
             // (`package.json`, `.git`) mark every JavaScript package, which
             // started one server per package for the same project.
-            ServerKind::Bash | ServerKind::Yaml => {
-                Some(outermost_marker_root(&nearest, project_root, |dir| {
-                    self.has_root_marker(dir)
-                }))
-            }
+            ServerKind::Bash | ServerKind::Yaml => Some(outermost_marker_root_with_mode(
+                &nearest,
+                project_root,
+                |dir| self.has_root_marker(dir),
+                mode,
+            )),
             _ => Some(nearest),
         }
     }
@@ -452,23 +464,17 @@ impl ServerDef {
         file_path: &Path,
         project_root: Option<&Path>,
         bounded_to_project: bool,
+        mode: RootPathMode,
     ) -> Option<PathBuf> {
+        let boundary = project_root.filter(|_| bounded_to_project);
         for marker in &self.priority_root_markers {
-            let root = if bounded_to_project {
-                find_workspace_root_within(file_path, &[marker.as_str()], project_root)
-            } else {
-                find_workspace_root(file_path, &[marker.as_str()])
-            };
+            let root = find_workspace_root_with_mode(file_path, &[marker.as_str()], boundary, mode);
             if let Some(root) = root {
                 return Some(root);
             }
         }
 
-        if bounded_to_project {
-            find_workspace_root_within(file_path, &self.root_markers, project_root)
-        } else {
-            find_workspace_root(file_path, &self.root_markers)
-        }
+        find_workspace_root_with_mode(file_path, &self.root_markers, boundary, mode)
     }
 
     /// Check if this server handles a given file extension.
@@ -888,6 +894,14 @@ pub fn builtin_servers() -> Vec<ServerDef> {
 
 /// Find all server definitions that handle a given file path.
 pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
+    servers_for_file_with_mode(path, config, RootPathMode::Resolve)
+}
+
+pub(crate) fn servers_for_file_with_mode(
+    path: &Path,
+    config: &Config,
+    mode: RootPathMode,
+) -> Vec<ServerDef> {
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -916,9 +930,9 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         // The swap runs after the disabled filter, so `lsp.disabled:
         // ["typescript"]` still turns TypeScript off for native projects;
         // the second filter lets `typescript-native` be disabled on its own.
-        .map(|server| select_typescript_server(server, path, config))
+        .map(|server| select_typescript_server(server, path, config, mode))
         .filter(|server| !is_disabled(server, config))
-        .filter(|server| !biome_config_excludes(server, path))
+        .filter(|server| !biome_config_excludes(server, path, mode))
         .collect()
 }
 
@@ -928,11 +942,11 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
 /// so every `.json` under `crates/` is excluded) left that file a permanent
 /// "published no diagnostics" gap in every scoped inspect. A configuration
 /// without `files.includes`, or one that cannot be read, includes every file.
-fn biome_config_excludes(server: &ServerDef, path: &Path) -> bool {
+fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) -> bool {
     if server.kind != ServerKind::Biome {
         return false;
     }
-    let Some(root) = server.workspace_root_for_file(path) else {
+    let Some(root) = server.workspace_root_with_mode(path, None, mode) else {
         return false;
     };
     let Some(config_path) = ["biome.json", "biome.jsonc"]
@@ -945,7 +959,7 @@ fn biome_config_excludes(server: &ServerDef, path: &Path) -> bool {
     let Some(includes) = biome_includes(&config_path) else {
         return false;
     };
-    let path = crate::inspect::job::canonicalize_normalized(path);
+    let path = mode.resolve(path);
     let Ok(relative) = path.strip_prefix(&root) else {
         return false;
     };
@@ -1026,7 +1040,12 @@ const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
 /// packages. The binary shown here is the platform binary when it resolves;
 /// the manager resolves it again at spawn and reports a named gap, without
 /// spawning anything, when it does not.
-fn select_typescript_server(server: ServerDef, path: &Path, config: &Config) -> ServerDef {
+fn select_typescript_server(
+    server: ServerDef,
+    path: &Path,
+    config: &Config,
+    mode: RootPathMode,
+) -> ServerDef {
     // Only the built-in program is swapped: a user who pointed the
     // `typescript` server at another binary has chosen their own server.
     if server.kind != ServerKind::TypeScript || server.binary != TYPESCRIPT_LANGUAGE_SERVER {
@@ -1040,8 +1059,8 @@ fn select_typescript_server(server: ServerDef, path: &Path, config: &Config) -> 
         server.priority_root_markers.hash(&mut hasher);
         hasher.finish()
     };
-    let Some(native) = native_typescript_for(path, project_root, markers, || {
-        server.workspace_root_for_file_with_project_root(path, project_root)
+    let Some(native) = native_typescript_for(path, project_root, markers, mode, || {
+        server.workspace_root_with_mode(path, project_root, mode)
     }) else {
         return server;
     };

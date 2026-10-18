@@ -2,6 +2,24 @@ use std::path::{Path, PathBuf};
 
 use crate::lsp::registry::ServerKind;
 
+/// Walk entries below a canonical root already have resolved parents: the
+/// applicability walker never descends through directory symlinks. Other callers
+/// must resolve arbitrary paths before comparing workspace boundaries.
+#[derive(Clone, Copy)]
+pub(crate) enum RootPathMode {
+    Resolve,
+    WalkEntry,
+}
+
+impl RootPathMode {
+    pub(crate) fn resolve(self, path: &Path) -> PathBuf {
+        match self {
+            Self::Resolve => crate::inspect::job::canonicalize_normalized(path),
+            Self::WalkEntry => path.to_path_buf(),
+        }
+    }
+}
+
 pub fn find_workspace_root<S>(file_path: &Path, markers: &[S]) -> Option<PathBuf>
 where
     S: AsRef<str>,
@@ -18,6 +36,15 @@ pub fn find_workspace_root_within<S>(
 where
     S: AsRef<str>,
 {
+    find_workspace_root_with_mode(file_path, markers, project_root, RootPathMode::Resolve)
+}
+
+pub(crate) fn find_workspace_root_with_mode<S: AsRef<str>>(
+    file_path: &Path,
+    markers: &[S],
+    project_root: Option<&Path>,
+    mode: RootPathMode,
+) -> Option<PathBuf> {
     // Route canonicalization through `canonicalize_normalized` so the returned
     // root is never a Windows verbatim (`\\?\C:\...`) path. This root flows into
     // `LspClient::spawn` -> `Command::current_dir(&root)`, and `CreateProcess`
@@ -31,7 +58,7 @@ where
     // `canonicalize_normalized` falls back to lexical `.`/`..` collapse when
     // `fs::canonicalize` fails (e.g. the file is gone), matching the prior
     // fallback to the raw `file_path` for paths without `.`/`..` components.
-    let resolved_path = crate::inspect::job::canonicalize_normalized(file_path);
+    let resolved_path = mode.resolve(file_path);
 
     let start_dir = if resolved_path.is_dir() {
         resolved_path
@@ -39,7 +66,7 @@ where
         resolved_path.parent()?.to_path_buf()
     };
 
-    let project_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+    let project_root = project_root.map(|path| mode.resolve(path));
     // Do not walk upward out of a mounted start directory. This keeps an explicit
     // file on that mount usable while preventing root discovery from crossing it;
     // recursive descendants avoid ReadDir::drop's ENXIO daemon-abort failure too.
@@ -89,13 +116,21 @@ where
 /// optional project root bounds the walk so an enclosing checkout cannot claim
 /// a nested session as one of its workspaces.
 pub fn find_rust_workspace_root(file_path: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
-    let resolved_path = crate::inspect::job::canonicalize_normalized(file_path);
+    find_rust_workspace_root_with_mode(file_path, project_root, RootPathMode::Resolve)
+}
+
+pub(crate) fn find_rust_workspace_root_with_mode(
+    file_path: &Path,
+    project_root: Option<&Path>,
+    mode: RootPathMode,
+) -> Option<PathBuf> {
+    let resolved_path = mode.resolve(file_path);
     let start_dir = if resolved_path.is_dir() {
         resolved_path
     } else {
         resolved_path.parent()?.to_path_buf()
     };
-    let project_root = project_root.map(crate::inspect::job::canonicalize_normalized);
+    let project_root = project_root.map(|path| mode.resolve(path));
     // See `find_workspace_root_within`: stay on the start filesystem while
     // discovering an LSP root, but permit the explicitly named mount itself.
     let device_boundary = crate::walk_boundary::DeviceBoundary::for_root(&start_dir).ok();
@@ -123,7 +158,7 @@ pub fn find_rust_workspace_root(file_path: &Path, project_root: Option<&Path>) -
             break;
         }
         if cargo_workspace_contains_crate(dir, &crate_root) {
-            return Some(crate::inspect::job::canonicalize_normalized(dir));
+            return Some(mode.resolve(dir));
         }
         if project_root.as_deref() == Some(dir) {
             break;
@@ -233,7 +268,16 @@ pub fn outermost_marker_root(
     project_root: &Path,
     has_marker: impl Fn(&Path) -> bool,
 ) -> PathBuf {
-    let project_root = crate::inspect::job::canonicalize_normalized(project_root);
+    outermost_marker_root_with_mode(nearest, project_root, has_marker, RootPathMode::Resolve)
+}
+
+pub(crate) fn outermost_marker_root_with_mode(
+    nearest: &Path,
+    project_root: &Path,
+    has_marker: impl Fn(&Path) -> bool,
+    mode: RootPathMode,
+) -> PathBuf {
+    let project_root = mode.resolve(project_root);
     let mut chosen = nearest.to_path_buf();
     if !nearest.starts_with(&project_root) {
         return chosen;

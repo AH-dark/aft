@@ -6872,11 +6872,22 @@ impl AppContext {
                 if !current() {
                     return;
                 }
-                let Ok(walk) =
-                    crate::lsp::manager::walk_applicable_area(&root, None, &config, None)
-                else {
-                    return;
-                };
+                let walk =
+                    match crate::lsp::manager::walk_applicable_area(&root, None, &config, None) {
+                        Ok(walk) => walk,
+                        Err(error) => {
+                            crate::slog_warn!(
+                                "language-server applicability walk stopped early: {error:?}"
+                            );
+                            if current() {
+                                let mut lsp = manager.lock();
+                                if current() {
+                                    lsp.clear_project_applicability();
+                                }
+                            }
+                            return;
+                        }
+                    };
                 {
                     let mut lsp = manager.lock();
                     if !current() {
@@ -11135,6 +11146,8 @@ impl AppContext {
         _thread_id: Option<std::thread::ThreadId>,
     ) {
         let root = self.watcher_root_path();
+        // Changes made while no watcher was installed were not observable.
+        crate::lsp::manager::invalidate_applicability_walk(&root);
         let gitignore_generation = self.gitignore_generation.load(Ordering::SeqCst);
         let _runtime_guard = self.watcher_runtime_lock.lock();
         let replaced = self.watcher_thread.lock().replace(runtime);
@@ -11217,7 +11230,9 @@ impl AppContext {
         *self.watcher_rx.lock() = None;
         *self.watcher_drain_slice.lock() = None;
         *self.watcher.lock() = None;
-        self.watcher_runtime_identity.lock().take();
+        if let Some(identity) = self.watcher_runtime_identity.lock().take() {
+            crate::lsp::manager::invalidate_applicability_walk(&identity.root);
+        }
         runtime
     }
 
@@ -11254,7 +11269,9 @@ impl AppContext {
             *self.watcher_rx.lock() = None;
             *self.watcher_drain_slice.lock() = None;
             *self.watcher.lock() = None;
-            self.watcher_runtime_identity.lock().take();
+            if let Some(identity) = self.watcher_runtime_identity.lock().take() {
+                crate::lsp::manager::invalidate_applicability_walk(&identity.root);
+            }
             runtime
         };
         if let Some(runtime) = runtime {
@@ -11709,6 +11726,7 @@ impl AppContext {
         if paths.is_empty() {
             return;
         }
+        self.invalidate_project_applicability();
         self.lsp_forward_or_queue_watcher_changes(paths, false);
     }
 
@@ -11719,7 +11737,16 @@ impl AppContext {
     /// them more than a missed notification for files AFT resyncs when it
     /// next opens or edits them.
     pub fn lsp_reload_rust_workspaces_after_lost_watcher_events(&self) {
+        self.invalidate_project_applicability();
         self.lsp_forward_or_queue_watcher_changes(&[], true);
+    }
+
+    fn invalidate_project_applicability(&self) {
+        let config = self.config();
+        if let Some(root) = &config.project_root {
+            crate::lsp::manager::invalidate_applicability_walk(root);
+            self.refresh_project_applicability(config, false);
+        }
     }
 
     /// Deliver watcher changes to the LSP manager without making the drain

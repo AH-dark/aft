@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "lsp/manager.rs",
+        enclosing_item: "walk_applicable_area_uncached",
+        location_or_primitive: "visited >= entry_limit",
+        reason: "internal applicability discovery, not a response list; exhausting the iterator budget returns an explicit incomplete-walk error instead of certifying a partial server set",
+    },
+    ExclusionEntry {
         file: "runtime_drain.rs",
         enclosing_item: "collect_mutation_paths",
         location_or_primitive: "budget.exhausted()",
