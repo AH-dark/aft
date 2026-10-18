@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, BufWriter};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -2521,24 +2521,27 @@ struct PathRestrictionRootMemo {
     resolved_root: PathBuf,
 }
 
-/// Normalize a path by resolving `.` and `..` components lexically,
-/// without touching the filesystem. This prevents path traversal
-/// attacks when `fs::canonicalize` fails (e.g. for non-existent paths).
+/// Normalize a comparison path lexically, without touching the filesystem.
+/// This does not validate containment; callers still compare the result
+/// against the project root.
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                // Pop the last component unless we're at root or have no components
-                if !result.pop() {
-                    result.push(component);
-                }
-            }
-            Component::CurDir => {} // Skip `.`
-            _ => result.push(component),
+    crate::path_identity::lexical_normalize(path)
+}
+
+#[cfg(test)]
+mod lexical_comparison_tests {
+    /// Unmatched leading `..` components must survive comparison normalization:
+    /// dropping them makes a path that escapes upward look like a nearby child.
+    #[test]
+    fn comparison_adapter_preserves_relative_parent_components() {
+        for (input, expected) in [("../../x", "../../x"), ("a/../../x", "../x")] {
+            assert_eq!(
+                super::normalize_path(std::path::Path::new(input)),
+                std::path::PathBuf::from(expected),
+                "{input}"
+            );
         }
     }
-    result
 }
 
 fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {

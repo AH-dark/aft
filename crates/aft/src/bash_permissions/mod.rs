@@ -10,7 +10,7 @@ pub(crate) mod synthetic_load;
 
 use crate::context::AppContext;
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionAsk {
@@ -109,25 +109,26 @@ fn resolve_with_existing_ancestors(path: &Path) -> PathBuf {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !result.pop() {
-                    result.push(component.as_os_str());
-                }
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
+    crate::path_identity::lexical_normalize(path)
 }
 
 #[cfg(test)]
 mod system_temp_path_tests {
     use super::is_system_temp_path;
     use std::path::Path;
+
+    /// Unmatched leading `..` components must survive comparison normalization:
+    /// dropping them makes a path that escapes upward look like a nearby child.
+    #[test]
+    fn comparison_adapter_preserves_relative_parent_components() {
+        for (input, expected) in [("../../x", "../../x"), ("a/../../x", "../x")] {
+            assert_eq!(
+                super::normalize_path(std::path::Path::new(input)),
+                std::path::PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

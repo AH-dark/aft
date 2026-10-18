@@ -992,19 +992,7 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     let path = &crate::windows_path::normalize_windows_path(path);
 
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !result.pop() {
-                    result.push(component);
-                }
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
+    crate::path_identity::lexical_normalize(path)
 }
 
 /// Canonicalize a path for comparison inside the inspect subsystem.
@@ -1034,6 +1022,19 @@ thread_local! {
 #[cfg(test)]
 mod test_support_tests {
     use super::{is_test_file, is_test_support_file};
+
+    /// Unmatched leading `..` components must survive comparison normalization:
+    /// dropping them makes a path that escapes upward look like a nearby child.
+    #[test]
+    fn comparison_adapter_preserves_relative_parent_components() {
+        for (input, expected) in [("../../x", "../../x"), ("a/../../x", "../x")] {
+            assert_eq!(
+                super::normalize_path(std::path::Path::new(input)),
+                std::path::PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
 
     #[test]
     fn is_test_file_matches_real_test_files() {

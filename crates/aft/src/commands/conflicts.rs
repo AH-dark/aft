@@ -31,22 +31,21 @@ fn git_toplevel(base_path: &Path) -> Result<PathBuf, String> {
     if !crate::developer_tools::git_usable() {
         return Err(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
     }
-    let output = crate::effective_path::new_command("git")
-        .build()
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(working_dir)
-        .output()
-        .map_err(|e| format!("failed to run git: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("not a git repository") {
-            return Err("not a git repository".to_string());
+    let stdout = match crate::git_probe::toplevel(working_dir) {
+        Ok(stdout) => stdout,
+        Err(crate::git_probe::ProbeError::Spawn(error)) => {
+            return Err(format!("failed to run git: {error}"));
         }
-        return Err(format!("git rev-parse failed: {}", stderr.trim()));
-    }
+        Err(crate::git_probe::ProbeError::Failed { kind, output }) => {
+            if kind == crate::git_probe::FailureKind::NotRepository {
+                return Err("not a git repository".to_string());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git rev-parse failed: {}", stderr.trim()));
+        }
+    };
 
-    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let toplevel = String::from_utf8_lossy(&stdout).trim().to_string();
     if toplevel.is_empty() {
         return Err("git rev-parse returned an empty toplevel".to_string());
     }
@@ -84,22 +83,21 @@ fn discover_conflicted_files(
     let mut seen = HashSet::new();
     let mut unmerged_files = HashSet::new();
 
-    let output = crate::effective_path::new_command("git")
-        .build()
-        .args(["ls-files", "--unmerged", "-z"])
-        .current_dir(&toplevel)
-        .output()
-        .map_err(|e| format!("failed to run git: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("not a git repository") {
-            return Err("not a git repository".to_string());
+    let output = match crate::git_probe::probe(&toplevel, &["ls-files", "--unmerged", "-z"]) {
+        Ok(stdout) => stdout,
+        Err(crate::git_probe::ProbeError::Spawn(error)) => {
+            return Err(format!("failed to run git: {error}"));
         }
-        return Err(format!("git ls-files failed: {}", stderr.trim()));
-    }
+        Err(crate::git_probe::ProbeError::Failed { kind, output }) => {
+            if kind == crate::git_probe::FailureKind::NotRepository {
+                return Err("not a git repository".to_string());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("git ls-files failed: {}", stderr.trim()));
+        }
+    };
 
-    for record in output.stdout.split(|byte| *byte == b'\0') {
+    for record in output.split(|byte| *byte == b'\0') {
         // Format: "<mode> <hash> <stage>\t<filename>\0"
         if let Some(tab_pos) = record.iter().position(|byte| *byte == b'\t') {
             let path = path_from_git_bytes(&record[tab_pos + 1..]);
@@ -111,8 +109,7 @@ fn discover_conflicted_files(
     }
 
     let mut sweep_error = None;
-    match crate::effective_path::new_command("git")
-        .build()
+    match crate::git_probe::command()
         .args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
         .current_dir(&toplevel)
         .output()
@@ -441,6 +438,17 @@ mod tests {
     use crate::config::Config;
     use crate::context::default_language_provider_factory;
     use crate::protocol::RawRequest;
+
+    /// An empty `.git` directory makes Git print its ordinary "not a git
+    /// repository" message. That is damaged metadata, not proof of absence.
+    #[test]
+    fn corrupt_repository_metadata_is_a_git_failure_not_absence() {
+        assert!(crate::developer_tools::git_usable());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let error = git_toplevel(dir.path()).unwrap_err();
+        assert!(error.starts_with("git rev-parse failed:"), "{error}");
+    }
 
     #[test]
     fn test_find_conflict_regions_basic() {
