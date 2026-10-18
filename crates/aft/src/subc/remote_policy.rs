@@ -228,22 +228,28 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
     let (Some(key), Some(db)) = (key(identity, Some("worker")), ctx.db()) else {
         return Err(policy_unavailable());
     };
-    // Capture the memo generation before reading aft.db: if a policy saving
-    // `confine: "root"` commits after this read, the read's "unconfined"
-    // answer is not remembered (see `AppContext::remember_unconfined_policy_key`).
-    let generation = ctx.policy_confinement_generation();
-    ctx.note_policy_confinement_read();
-    let conn = db.lock().map_err(|_| policy_unavailable())?;
-    let confined = store::confined(&conn, &key).map_err(|_| policy_unavailable())?;
-    drop(conn);
-    #[cfg(test)]
-    ctx.run_after_policy_read_hook_for_test();
-    if confined {
-        ctx.remember_confined_policy_key(key);
-    } else {
-        ctx.remember_unconfined_policy_key(key, generation, &db);
+    // A confining save can invalidate another epoch's fallback read. Retry
+    // when it races this read so even this call cannot use a stale answer;
+    // bounding retries refuses admission if saves keep invalidating reads.
+    for _ in 0..3 {
+        let generation = ctx.policy_confinement_generation();
+        ctx.note_policy_confinement_read();
+        let conn = db.lock().map_err(|_| policy_unavailable())?;
+        let confined = store::confined(&conn, &key).map_err(|_| policy_unavailable())?;
+        drop(conn);
+        #[cfg(test)]
+        ctx.run_after_policy_read_hook_for_test();
+        if ctx.policy_confinement_generation() != generation {
+            continue;
+        }
+        if confined {
+            ctx.remember_confined_policy_key(key);
+        } else {
+            ctx.remember_unconfined_policy_key(key, generation, &db);
+        }
+        return Ok(confined);
     }
-    Ok(confined)
+    Err(policy_unavailable())
 }
 
 /// A route's saved confinement: whether its scoped worker saved
@@ -260,7 +266,8 @@ pub(super) fn policy_unavailable() -> subc_protocol::ErrorBody {
 /// The answer [`confined`] gives when it needs no aft.db read: a route that
 /// cannot hold a saved fence, a key whose confinement this context already
 /// read or saved, or a context with no database handle. `None` means the
-/// saved policy must be read from aft.db.
+/// saved policy must be read from aft.db off the frame loop, including when
+/// the database handle slot is busy opening a database.
 pub(super) fn confinement_from_memory(
     ctx: &AppContext,
     identity: &RouteIdentity,
@@ -271,7 +278,7 @@ pub(super) fn confinement_from_memory(
     if let Some(confined) = ctx.policy_key_confinement(&key) {
         return Some(Ok(confined));
     }
-    if ctx.db().is_some() {
+    if ctx.app().try_db()?.is_some() {
         return None;
     }
     // A database that is still opening or failed to open may hold a saved

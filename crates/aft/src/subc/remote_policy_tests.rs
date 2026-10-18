@@ -172,9 +172,7 @@ fn remembered_unconfined_answer_cannot_outlive_a_confining_save() {
 
 /// A worker's later epoch with no saved row of its own reads the older
 /// epoch's row. If a save of `confine: "root"` for the older epoch lands
-/// between reading the later epoch as unconfined and remembering that answer,
-/// the answer must not be remembered: the later epoch is confined from then
-/// on, and its next call must read aft.db again and be confined.
+/// during that read, even the racing call must observe the saved fence.
 #[test]
 fn unconfined_read_racing_a_confining_save_is_not_remembered() {
     let root = tempfile::tempdir().unwrap();
@@ -182,6 +180,11 @@ fn unconfined_read_racing_a_confining_save_is_not_remembered() {
     let ctx = context(root.path(), storage.path(), None);
     let older = identity(root.path(), "designer", 7, true);
     let newer = identity(root.path(), "designer", 8, true);
+    let delayed = identity(root.path(), "designer", 9, true);
+    let db = ctx.db().unwrap();
+    let delayed_key = key(&delayed, Some("worker")).unwrap();
+    let generation = ctx.policy_confinement_generation();
+    assert!(!store::confined(&db.lock().unwrap(), &delayed_key).unwrap());
     let saving = older.clone();
     ctx.after_next_policy_read_for_test(move |ctx| {
         catalog(
@@ -193,25 +196,138 @@ fn unconfined_read_racing_a_confining_save_is_not_remembered() {
     });
     // No row is saved yet, so the newer epoch reads as unconfined; the older
     // epoch's confining save then commits before that answer is remembered.
-    assert_eq!(confined(&ctx, &newer), Ok(false));
-    assert_eq!(confinement_from_memory(&ctx, &older), Some(Ok(true)));
+    let read = confined(&ctx, &newer);
     assert_eq!(
-        confinement_from_memory(&ctx, &newer),
-        None,
-        "an unconfined answer read before a confining save was remembered"
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", Some(&read))
+            .unwrap_err()
+            .code,
+        "tool_not_offered_confined"
     );
+    assert_eq!(read, Ok(true));
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 2);
+    assert_eq!(confinement_from_memory(&ctx, &older), Some(Ok(true)));
+    assert_eq!(confinement_from_memory(&ctx, &newer), Some(Ok(true)));
     let reads = ctx.policy_confinement_reads_for_test();
     assert_eq!(
         admit_confined(&ctx, &newer, "bash").unwrap_err().code,
         "tool_not_offered_confined"
     );
-    assert_eq!(ctx.policy_confinement_reads_for_test(), reads + 1);
+    assert_eq!(ctx.policy_confinement_reads_for_test(), reads);
     assert_eq!(
         admit_confined_on_frame_loop(&ctx, &newer, "bash", None)
             .unwrap_err()
             .code,
         "tool_not_offered_confined"
     );
+
+    // The other read finished before the save, but has not been memoized yet.
+    // Even with read retries, memoization must reject a stale generation: a
+    // save can land after the retry's generation check and before remembering.
+    ctx.remember_unconfined_policy_key(delayed_key, generation, &db);
+    assert_eq!(
+        confinement_from_memory(&ctx, &delayed),
+        None,
+        "an unconfined answer read before a confining save was remembered"
+    );
+    assert_eq!(confined(&ctx, &delayed), Ok(true));
+}
+
+#[test]
+fn confine_bash_admission_racing_a_confining_save_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    ctx.after_next_policy_read_for_test(move |ctx| {
+        catalog(
+            json!({"preset":"worker", "params":{"confine":"root"}}),
+            &older,
+            ctx,
+        )
+        .unwrap();
+    });
+    assert_eq!(
+        admit_confined(&ctx, &newer, "bash").unwrap_err().code,
+        "tool_not_offered_confined"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 2);
+}
+
+#[test]
+fn confine_lookup_fails_closed_when_generation_keeps_changing() {
+    fn invalidate_next_read(ctx: &AppContext, key: store::PolicyKey) {
+        ctx.after_next_policy_read_for_test(move |ctx| {
+            ctx.remember_confined_policy_key(key.clone());
+            invalidate_next_read(ctx, key);
+        });
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let older = identity(root.path(), "designer", 7, true);
+    let newer = identity(root.path(), "designer", 8, true);
+    invalidate_next_read(&ctx, key(&older, Some("worker")).unwrap());
+    let read = confined(&ctx, &newer);
+    assert_eq!(
+        read.as_ref().unwrap_err().code,
+        "confine_policy_unavailable"
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 3);
+    assert_eq!(confinement_from_memory(&ctx, &newer), None);
+    assert_eq!(
+        admit_confined_on_frame_loop(&ctx, &newer, "bash", Some(&read))
+            .unwrap_err()
+            .code,
+        "confine_policy_unavailable"
+    );
+}
+
+#[test]
+fn confine_lookup_never_waits_for_the_database_handle_slot_on_the_frame_loop() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = Arc::new(context(root.path(), storage.path(), None));
+    let route = identity(root.path(), "designer", 7, true);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let app = ctx.app();
+    let holder = std::thread::spawn(move || {
+        app.with_database_slot_locked_for_test(|| {
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    let answer = confinement_from_memory(&ctx, &route);
+    let elapsed = started.elapsed();
+
+    let (answer_tx, answer_rx) = mpsc::channel();
+    let reading = Arc::clone(&ctx);
+    let background = std::thread::spawn(move || {
+        answer_tx.send(confined(&reading, &route)).unwrap();
+    });
+    let before_release = answer_rx.recv_timeout(Duration::from_millis(50));
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    background.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "frame loop waited {elapsed:?}"
+    );
+    assert_eq!(answer, None);
+    assert_eq!(before_release, Err(mpsc::RecvTimeoutError::Timeout));
+    assert_eq!(
+        answer_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Ok(false)
+    );
+    assert_eq!(ctx.policy_confinement_reads_for_test(), 1);
 }
 
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {

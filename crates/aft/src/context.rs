@@ -3038,6 +3038,12 @@ impl App {
             .map(|slot| slot.as_ref().map(|(_, conn)| Arc::clone(conn)))
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_database_slot_locked_for_test(&self, f: impl FnOnce()) {
+        let _slot = self.db.lock();
+        f();
+    }
+
     /// The resident handle only when it was opened for `path`. Callers that must
     /// not open a second connection to a file this process already holds use
     /// this to tell "holding it" from "holding some other database".
