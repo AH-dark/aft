@@ -2264,7 +2264,8 @@ fn force_restricted_checkpoint_restore_replaces_external_target_symlink() {
             restrict_to_project_root: false,
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let create: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "force-checkpoint-external-target",
         "command": "checkpoint",

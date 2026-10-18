@@ -142,7 +142,8 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     // Libtest runs these independent contexts in one process, whereas nextest
     // gives each test a process and therefore a separate production limiter.
     // Preserve the production cap within each context without cross-test denial.
@@ -179,7 +180,8 @@ fn configured_restricted_context(root: &Path) -> AppContext {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.isolate_cold_build_limiter_for_test(2);
     let configure = request(json!({
         "id": "configure-restricted",
@@ -207,7 +209,8 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.isolate_cold_build_limiter_for_test(2);
     let configure = request(json!({
         "id": "configure",
@@ -1689,7 +1692,8 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
             storage_dir: Some(storage.clone()),
             ..Config::default()
         },
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.isolate_cold_build_limiter_for_test(2);
     let configured = handle_configure(
         &request(json!({
@@ -1828,7 +1832,8 @@ fn inspect_views_owner_persists_and_reuses_tier2_contributions() {
             storage_dir: Some(storage.clone()),
             ..Config::default()
         },
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.isolate_cold_build_limiter_for_test(2);
     let configured = handle_configure(
         &request(json!({
@@ -6119,7 +6124,8 @@ fn configured_context_with_held_applicability(
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.isolate_cold_build_limiter_for_test(2);
     let hold = ctx.hold_project_applicability_walks_for_test();
     let configure = request(json!({
@@ -6422,7 +6428,8 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
             }],
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     crate::helpers::disable_in_process_file_watcher();
     let configure = request(json!({
         "id": "configure",
@@ -7318,7 +7325,8 @@ fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
                 storage_dir: Some(storage.clone()),
                 ..Config::default()
             },
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.isolate_cold_build_limiter_for_test(2);
         let response = handle_configure(
             &request(json!({
@@ -7441,7 +7449,8 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
                 storage_dir: Some(storage.clone()),
                 ..Config::default()
             },
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.isolate_cold_build_limiter_for_test(2);
         let response = handle_configure(
             &request(json!({
@@ -7591,7 +7600,8 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
                 storage_dir: Some(storage.clone()),
                 ..Config::default()
             },
-        );
+        )
+        .with_test_checkpoint_store();
         ctx.isolate_cold_build_limiter_for_test(2);
         let response = handle_configure(
             &request(

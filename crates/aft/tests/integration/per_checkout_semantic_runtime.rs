@@ -231,10 +231,13 @@ fn request(value: Value) -> RawRequest {
 const MODEL: &str = "views-semantic-mock";
 
 fn configure(root: &Path, storage: &Path, server: &MockEmbedder, views: bool) -> Arc<AppContext> {
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config::default()),
-    ));
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
     send_configure(&ctx, root, storage, server, views, MODEL);
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
     ctx
@@ -561,10 +564,13 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
     );
 
     let legacy_storage = tempfile::tempdir().unwrap();
-    let legacy = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config::default()),
-    ));
+    let legacy = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
     send_configure(
         &legacy,
         &repo.main,
@@ -598,10 +604,13 @@ fn views_on_back_to_back_configures_leave_one_worker() {
     let repo = repository();
     let storage = tempfile::tempdir().unwrap();
     let chunks = unique_chunks(&repo.main);
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config::default()),
-    ));
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
     send_configure(
         &ctx,
         &repo.main,

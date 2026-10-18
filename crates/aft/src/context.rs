@@ -4407,6 +4407,8 @@ impl AppContext {
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
             ),
         };
+        #[cfg(test)]
+        let context = context.with_test_checkpoint_store();
         crate::logging::sync_storage_root(context.storage_dir());
         context
     }
@@ -6362,6 +6364,17 @@ impl AppContext {
     pub(crate) fn replace_checkpoint_store_for_test(&self, mut store: CheckpointStore) {
         store.use_namespace_request(self.checkpoint_namespace_request.clone());
         *self.checkpoint.lock() = store;
+    }
+
+    /// Give a newly constructed test context private pre-configure checkpoints.
+    /// Integration and binary tests link the library without `cfg(test)`, so
+    /// their helpers must opt in explicitly; production construction is unchanged.
+    #[doc(hidden)]
+    pub fn with_test_checkpoint_store(self) -> Self {
+        let mut store = CheckpointStore::unbound_in_for_test(&self.storage_dir());
+        store.use_namespace_request(self.checkpoint_namespace_request.clone());
+        *self.checkpoint.lock() = store;
+        self
     }
 
     pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
@@ -17584,10 +17597,13 @@ mod harness_path_tests {
     use crate::parser::TreeSitterProvider;
 
     fn ctx_with_storage_and_harness(storage_dir: PathBuf, harness: Harness) -> AppContext {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-        ctx.update_config(|config| {
-            config.storage_dir = Some(storage_dir);
-        });
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage_dir),
+                ..Config::default()
+            },
+        );
         ctx.set_harness(harness);
         ctx
     }

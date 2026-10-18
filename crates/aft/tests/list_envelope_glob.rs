@@ -32,6 +32,7 @@ fn test_context(project_root: &Path) -> AppContext {
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn assert_no_bare_list_envelope_key(val: &Value) {

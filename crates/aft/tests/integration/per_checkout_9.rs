@@ -226,10 +226,13 @@ fn child_trigram_doc() -> Value {
 }
 
 fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config::default()),
-    ));
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
     let configured = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-parent-folder",
@@ -1256,10 +1259,13 @@ fn slow_discovery_never_delays_the_bind() {
         std::fs::create_dir_all(root.join(format!("repo-{index:02}")).join(".git")).unwrap();
     }
     let discovery = aft::views::parent::hold_discovery_for_test(&root);
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config::default()),
-    ));
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
     let started = Instant::now();
     let configured = aft::commands::configure::handle_configure(
         &request(json!({

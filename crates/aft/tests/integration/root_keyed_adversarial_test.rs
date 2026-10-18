@@ -585,7 +585,8 @@ fn root_keyed_context(root: &Path, storage: &Path) -> AppContext {
             },
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.to_path_buf());
     ctx.set_cache_role(false, None);

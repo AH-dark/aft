@@ -94,6 +94,7 @@ fn test_context(project_root: &Path) -> AppContext {
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn test_context_with_storage(project_root: &Path, storage_dir: &Path) -> AppContext {
@@ -105,6 +106,7 @@ fn test_context_with_storage(project_root: &Path, storage_dir: &Path) -> AppCont
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn git_command(root: &Path) -> std::process::Command {
@@ -317,6 +319,7 @@ fn openai_context(project_root: &Path, base_url: String) -> AppContext {
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn openai_context_with_storage(
@@ -343,6 +346,7 @@ fn openai_context_with_storage(
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 fn project_with_needle() -> (tempfile::TempDir, std::path::PathBuf, &'static str) {
@@ -887,7 +891,8 @@ fn restricted_paths_keep_same_root_local_and_refuse_external_root() {
             restrict_to_project_root: true,
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;

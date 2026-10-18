@@ -552,7 +552,8 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
             project_root: Some(project_root.to_path_buf()),
             ..aft::config::Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =

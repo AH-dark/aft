@@ -347,7 +347,6 @@ impl CheckpointStore {
     /// A store in the state `new()` leaves it before configure (durable
     /// checkpoints under `<storage>/unbound/checkpoints`), but with `<storage>`
     /// a test-owned directory instead of the process-wide cache.
-    #[cfg(test)]
     pub(crate) fn unbound_in_for_test(storage_dir: &Path) -> Self {
         let lock_path = storage_dir
             .join("checkpoints")
@@ -357,6 +356,11 @@ impl CheckpointStore {
         store.storage_dir = Some(storage_dir.to_path_buf());
         store.storage_harness = Some(UNBOUND_HARNESS_SEGMENT.to_string());
         store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_path_for_test(&self) -> &Path {
+        &self.lock_path
     }
 
     /// Point this store's mutation lock at a private path. Tests use this for
@@ -400,7 +404,6 @@ impl CheckpointStore {
 
     /// Make this store read namespace requests from `request`, the handle the
     /// `AppContext` that now owns this store gives configure.
-    #[cfg(test)]
     pub(crate) fn use_namespace_request(&mut self, request: CheckpointNamespaceRequest) {
         self.namespace_request = request;
     }

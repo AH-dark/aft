@@ -35,7 +35,8 @@ fn context_without_db(project_root: &Path, harness: Harness) -> AppContext {
             project_root: Some(project_root.to_path_buf()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.set_harness(harness);
     ctx
 }

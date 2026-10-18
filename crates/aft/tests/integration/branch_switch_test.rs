@@ -321,10 +321,13 @@ fn configure_context_with_views(
     ram_overlay: bool,
     views_enabled: bool,
 ) -> Arc<AppContext> {
-    let ctx = Arc::new(AppContext::new(
-        Box::new(TreeSitterProvider::new()),
-        crate::context_storage::isolate(Config::default()),
-    ));
+    let ctx = Arc::new(
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::context_storage::isolate(Config::default()),
+        )
+        .with_test_checkpoint_store(),
+    );
     let configure = request(json!({
         "id": "configure-branch-switch",
         "command": "configure",

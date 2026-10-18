@@ -27,6 +27,7 @@ fn grep_ctx(project: &Path) -> aft::context::AppContext {
         aft::context::App::default_shared(),
         crate::context_storage::isolate(config),
     )
+    .with_test_checkpoint_store()
 }
 
 /// Run grep through the command handler and the agent-facing formatter,

@@ -45,7 +45,8 @@ fn configured_context(root: &Path) -> AppContext {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let configure = request(json!({
         "id": "configure",
         "command": "configure",

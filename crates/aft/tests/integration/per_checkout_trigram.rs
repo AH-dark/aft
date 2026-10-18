@@ -363,7 +363,8 @@ fn trigram_import_mutator_records_intent_without_watcher() {
             project_root: Some(root.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let request: RawRequest = serde_json::from_value(serde_json::json!({"id":"intent-import", "command":"add_import", "file": root.join("a.ts"), "module":"needle", "names":["thing"]})).unwrap();
     let result = aft::commands::add_import::handle_add_import(&request, &ctx);
     let result = serde_json::to_value(result).unwrap();
@@ -748,7 +749,8 @@ fn trigram_write_success_and_validation_rollback_without_watcher() {
             project_root: Some(root.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let request = |content: &str| {
         serde_json::from_value::<RawRequest>(serde_json::json!({"id":"intent-write", "command":"write", "file":root.join("a.ts"), "content":content})).unwrap()
     };

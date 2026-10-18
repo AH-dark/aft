@@ -103,7 +103,8 @@ fn query_fixture(with_graph: bool) -> QueryFixture {
     let ctx = aft::context::AppContext::new(
         Box::new(aft::parser::TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.install_checkout_query_runtime(Arc::new(
         aft::views::query_wait::CheckoutQueryRuntime::new(
             access.clone(),

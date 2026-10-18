@@ -280,7 +280,8 @@ fn app_context_with_fake_lsp() -> AppContext {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     ctx
@@ -290,7 +291,8 @@ fn app_context_with_fake_typescript_lsp() -> AppContext {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     ctx
@@ -596,7 +598,8 @@ fn watched_config_file_event_types_follow_current_file_state() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
 
@@ -639,7 +642,8 @@ fn watched_config_file_event_types_accept_explicit_created_changed_deleted() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
 
@@ -679,7 +683,8 @@ fn write_command_reports_created_for_new_config_file() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -715,7 +720,8 @@ fn write_command_reports_created_for_new_tsconfig_file() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -752,7 +758,8 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -881,7 +888,8 @@ fn custom_lsp_root_marker_edit_notifies_workspace_server() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp().override_binary(
         ServerKind::Custom(std::sync::Arc::from(server_id)),
         fake_server_path(),
@@ -924,7 +932,8 @@ fn write_command_reports_changed_for_existing_config_file() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -961,7 +970,8 @@ fn delete_file_command_reports_deleted_for_config_file() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -1389,7 +1399,8 @@ fn test_lsp_module_not_found_hint_uses_package_manager_path_and_binary() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     let (_script_dir, script) = executable_crashing_lsp_script(
         "Error: Cannot find module '/Users/me/.local/share/pnpm/global/5/.pnpm/typescript-language-server@4.3.4/node_modules/typescript-language-server/lib/cli.mjs'
 code: 'MODULE_NOT_FOUND'
@@ -1573,7 +1584,8 @@ fn test_no_lsp_server_returns_honest_note() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "diag-noop",
@@ -1989,7 +2001,8 @@ fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
             project_root: Some(root),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
 
@@ -2305,7 +2318,8 @@ fn post_edit_rejects_publish_with_stale_version() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     {
         let mut lsp = ctx.lsp();
         lsp.override_binary(ServerKind::Rust, fake_server_path());
@@ -2454,7 +2468,8 @@ fn directory_mode_with_walk_truncation_reports_complete_false() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     let req: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "diag-dir-truncated",
         "command": "lsp_diagnostics",
@@ -2489,7 +2504,8 @@ fn directory_mode_requires_each_matching_server_to_cover_file() {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(config),
-    );
+    )
+    .with_test_checkpoint_store();
     {
         let mut lsp = ctx.lsp();
         // TypeScript and Biome both match .ts. Only Biome is allowed to start,
@@ -2795,7 +2811,8 @@ fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Val
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     let configure: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "configure",
         "command": "configure",
@@ -3080,7 +3097,8 @@ fn fake_rust_server_with_watcher(
             project_root: Some(root.clone()),
             ..Config::default()
         }),
-    );
+    )
+    .with_test_checkpoint_store();
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     for (key, value) in env(&root) {

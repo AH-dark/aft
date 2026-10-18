@@ -17,6 +17,7 @@ fn compress_context() -> AppContext {
             ..Config::default()
         }),
     )
+    .with_test_checkpoint_store()
 }
 
 #[test]

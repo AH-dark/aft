@@ -90,7 +90,8 @@ fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
         crate::context_storage::isolate(Config::default()),
-    );
+    )
+    .with_test_checkpoint_store();
     let response = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-worktree-callgraph",
