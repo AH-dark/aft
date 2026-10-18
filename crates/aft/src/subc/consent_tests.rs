@@ -1286,7 +1286,6 @@ async fn consent_scope_write_cards_keep_the_original_capability() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let db = f.ctx.db().unwrap();
-    let conn = db.lock().unwrap();
     for (kind, path, expected_reason, expected_pattern) in [
         (GrantKind::File, f.head_root.join("shared.txt"),
          "Allow scope: read/write access for all AFT file tools to the displayed file only. Protected paths remain denied.",
@@ -1296,7 +1295,7 @@ async fn consent_scope_write_cards_keep_the_original_capability() {
          format!("{}/**", f.head_root.display())),
     ] {
         let grant = AccessGrant { path: path.clone(), kind, operation: AccessOperation::Write };
-        let Prep::Ask(prep) = prepare(&conn, &f.ctx, &f.worker, "write", &json!({"path":path}), &grant, &grant, None).unwrap() else {
+        let Prep::Ask(prep) = prepare(&db, &f.ctx, &f.worker, "write", &json!({"path":path}), &grant, &grant, None).unwrap() else {
             panic!("expected a fresh write card");
         };
         assert_eq!(prep.request["pattern"], expected_pattern);
@@ -1601,14 +1600,13 @@ async fn consent_scope_old_broad_card_is_restricted_to_file() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let db = f.ctx.db().unwrap();
-    let conn = db.lock().unwrap();
     let grant = AccessGrant {
         path: PathBuf::from("/x"),
         kind: GrantKind::File,
         operation: AccessOperation::Read,
     };
     let Prep::Ask(mut prep) = prepare(
-        &conn,
+        &db,
         &f.ctx,
         &f.worker,
         "read",
@@ -2759,4 +2757,70 @@ async fn consent_native_windows_drive_path_is_denied_without_sending_a_request()
     // UNC coverage enters the same guard without touching a network share.
     assert_unrepresentable_paths_send_nothing(vec![PathBuf::from(r"\\server\share\file.txt")])
         .await;
+}
+
+/// A worker's ask and a head's allow answer both judge the head's policy,
+/// which resolves paths on disk. Both must do so with aft.db unlocked, so a
+/// slow or stalled filesystem never keeps other routes from the database.
+#[tokio::test]
+async fn consent_head_policy_resolves_with_database_unlocked() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let db = f.ctx.db().unwrap();
+    let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let hook = {
+        let (probes, db) = (probes.clone(), db.clone());
+        access_grants::resolve_hook::install(move || {
+            probes.borrow_mut().push(db.try_lock().is_ok())
+        })
+    };
+    let target = f.head_root.join("shared.txt");
+    let grant = AccessGrant {
+        path: target.clone(),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let Prep::Ask(prep) = prepare(
+        &db,
+        &f.ctx,
+        &f.worker,
+        "read",
+        &json!({"path":target}),
+        &grant,
+        &grant,
+        None,
+    )
+    .unwrap() else {
+        panic!("expected a fresh ask");
+    };
+    assert_eq!(prep.request["head_policy"], "allow", "{}", prep.request);
+    let asked = probes.borrow().len();
+    assert!(asked > 0, "preparing the ask resolved the head's policy");
+
+    let applied = apply_allow(
+        &db,
+        &f.ctx,
+        &f.worker,
+        &prep.key,
+        &prep.call_key,
+        &asks::new_holder(),
+        &prep.grant,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(
+        matches!(applied, Applied::Run(_)),
+        "the head's answer applies"
+    );
+    drop(hook);
+    let probes = probes.borrow();
+    assert!(
+        probes.len() > asked,
+        "applying the head's answer resolved the head's policy"
+    );
+    assert!(
+        probes.iter().all(|unlocked| *unlocked),
+        "aft.db was locked during resolution: {probes:?}"
+    );
 }

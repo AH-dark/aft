@@ -135,8 +135,9 @@ pub(super) async fn dispatch(
     .await
 }
 
-/// `parent_wait` bounds how long the read waits for the parent head's
-/// database and scope registration; tests shorten it.
+/// `parent_wait` is the read's time limit: it bounds the wait for the parent
+/// head's database and scope registration, and every wait for the aft.db
+/// lock to read the parent's access policy. Tests shorten it.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_with_wait(
     tx: &WriterSender,
@@ -203,12 +204,12 @@ async fn dispatch_with_wait(
         let result = match admission {
             Err(error) => Err(error.error()),
             Ok(()) => {
+                let child = identity.scope.as_ref().expect("child route was checked");
+                let mut deadline = Instant::now() + parent_wait;
+                if let Ok(expiry) = read_deadline(child) {
+                    deadline = deadline.min(expiry);
+                }
                 if let Some(ctx) = executor.actor_context(&parent.root) {
-                    let child = identity.scope.as_ref().expect("child route was checked");
-                    let mut deadline = Instant::now() + parent_wait;
-                    if let Ok(expiry) = read_deadline(child) {
-                        deadline = deadline.min(expiry);
-                    }
                     wait_for_parent_policy(&ctx, access_grants::scope_key(&parent), deadline).await;
                 }
                 if !active_tool_call_is_registered(&active, route, corr) {
@@ -226,7 +227,7 @@ async fn dispatch_with_wait(
                     request_id.clone(),
                     file_read_exact::OPERATION,
                     Box::new(move |ctx| {
-                        let result = read_as_parent(&identity, &parent, &envelope, ctx);
+                        let result = read_as_parent(&identity, &parent, &envelope, ctx, deadline);
                         Response::success(
                             job_id,
                             match result {
@@ -270,17 +271,22 @@ async fn dispatch_with_wait(
     Ok(())
 }
 
+/// `limit` is the read's own time limit. Waiting for the database lock to
+/// read the parent's access policy stops at it (or at the scope's expiry, if
+/// sooner).
 fn read_as_parent(
     identity: &RouteIdentity,
     parent: &RouteIdentity,
     envelope: &Value,
     ctx: &AppContext,
+    limit: Instant,
 ) -> Result<Value, Refusal> {
     read_as_parent_with_hooks(
         identity,
         parent,
         envelope,
         ctx,
+        limit,
         file_read_exact::ReadHooks::default(),
     )
 }
@@ -290,6 +296,7 @@ fn read_as_parent_with_hooks(
     parent: &RouteIdentity,
     envelope: &Value,
     ctx: &AppContext,
+    limit: Instant,
     hooks: file_read_exact::ReadHooks,
 ) -> Result<Value, Refusal> {
     use crate::access_policy::{AccessDecision, AccessOperation};
@@ -306,7 +313,19 @@ fn read_as_parent_with_hooks(
     let path = PathBuf::from(path);
     let deadline = read_deadline(stamp)?;
     let key = access_grants::scope_key(parent);
-    let initial = parent_policy_snapshot(ctx, &key)?;
+    let policy_deadline = deadline.min(limit);
+    let snapshot = || {
+        parent_policy_snapshot(ctx, &key, policy_deadline).map_err(|error| {
+            // A wait cut short by the scope's expiry reports the expiry, as
+            // every other expiry check here does.
+            if error == Refusal::PolicyTimeout && unexpired(stamp).is_err() {
+                Refusal::RouteNotAdmitted("expiry")
+            } else {
+                error
+            }
+        })
+    };
+    let initial = snapshot()?;
     let storage = ctx.storage_dir();
     let read_storage = storage.clone();
     let root = parent.project_root.clone();
@@ -317,7 +336,7 @@ fn read_as_parent_with_hooks(
 
     // Recheck the actual resolved target, not an alias that may now point elsewhere.
     // Each snapshot releases its database lock before its filesystem work starts.
-    let current = parent_policy_snapshot(ctx, &key)?;
+    let current = snapshot()?;
     let allowed = timed_io(stamp, deadline, &read.resolved, move |resolved| {
         Ok(current
             .resolve(&storage)
@@ -330,20 +349,55 @@ fn read_as_parent_with_hooks(
     Ok(read.value)
 }
 
+/// Copy the parent's stored access policy, waiting for the aft.db lock no
+/// later than `deadline`; a lock still held then is `PolicyTimeout`.
 fn parent_policy_snapshot(
     ctx: &AppContext,
     key: &crate::db::access_grants::ScopeKey,
+    deadline: Instant,
 ) -> Result<access_grants::PolicySnapshot, Refusal> {
     let db = ctx.db().ok_or(Refusal::IoError)?;
-    let conn = db.lock().map_err(|_| Refusal::IoError)?;
+    let conn = lock_by(&db, deadline)?;
     access_grants::policy_snapshot(&conn, key)
         .map_err(|_| Refusal::IoError)?
         .ok_or(Refusal::AccessDenied)
 }
 
+/// Longest pause between attempts to take a busy aft.db lock.
+const LOCK_RETRY_MAX: Duration = Duration::from_millis(20);
+
+/// Take the aft.db lock, waiting no later than `deadline`. Other routes hold
+/// this lock for unbounded work, so a plain blocking `lock()` could keep the
+/// read past its time limit. Polling with `try_lock` leaves no thread behind
+/// still waiting for the lock once the read has given up. The lock is always
+/// tried once, so a free lock is taken even when the deadline has passed.
+fn lock_by(
+    db: &StdMutex<crate::db::TrackedConnection>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'_, crate::db::TrackedConnection>, Refusal> {
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match db.try_lock() {
+            Ok(conn) => return Ok(conn),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Refusal::IoError),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(Refusal::PolicyTimeout);
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(LOCK_RETRY_MAX);
+    }
+}
+
 /// How often a waiting read looks for its parent's scope row even without a
 /// wake-up, in case the row was written by a path that sends none.
 const SCOPE_RECHECK: Duration = Duration::from_millis(100);
+
+/// How long past the deadline a parent-policy probe may take to start on the
+/// blocking pool before the wait stops waiting for it.
+const PROBE_START_GRACE: Duration = Duration::from_millis(100);
 
 /// The parent head's bind is acknowledged before its database opens and its
 /// scope row is registered, and both happen in queued jobs that this read's
@@ -371,11 +425,24 @@ async fn wait_for_parent_policy(
             return;
         }
         let (probe_ctx, probe_key) = (ctx.clone(), key.clone());
-        let probe =
-            tokio::task::spawn_blocking(move || parent_policy_snapshot(&probe_ctx, &probe_key))
-                .await;
+        // The probe gives up on a busy lock at the deadline itself. The outer
+        // timeout, a little later, only covers a blocking pool too busy to
+        // start the probe at all; an earlier one could abandon a probe that
+        // is holding the lock for its brief read, and the read that follows
+        // would then find the lock busy at its deadline and time out. A probe
+        // abandoned here only returns its snapshot to a dropped handle: the
+        // reply is sent by this task alone.
+        let probe = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline + PROBE_START_GRACE),
+            tokio::task::spawn_blocking(move || {
+                parent_policy_snapshot(&probe_ctx, &probe_key, deadline)
+            }),
+        )
+        .await;
         // Only a missing row is worth waiting for; any other answer is final.
-        if !matches!(probe, Ok(Err(Refusal::AccessDenied))) {
+        // A probe that timed out ends the wait too, and the read then reports
+        // the timeout itself.
+        if !matches!(probe, Ok(Ok(Err(Refusal::AccessDenied)))) {
             return;
         }
         let now = Instant::now();

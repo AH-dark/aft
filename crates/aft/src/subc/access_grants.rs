@@ -323,6 +323,10 @@ pub(super) fn launch_key(
     remote_policy::key(identity, Some(preset))
 }
 
+/// Build a scope's policy while holding the connection's lock throughout.
+/// Production paths take a `PolicySnapshot` under the lock and resolve it
+/// after releasing the lock instead; tests use this as a shorthand.
+#[cfg(test)]
 pub(super) fn policy_for_scope(
     conn: &rusqlite::Connection,
     key: &ScopeKey,
@@ -331,11 +335,31 @@ pub(super) fn policy_for_scope(
     Ok(policy_snapshot(conn, key)?.map(|snapshot| snapshot.resolve(&ctx.storage_dir())))
 }
 
+#[derive(Clone)]
 pub(super) struct PolicySnapshot {
     config: Config,
     mode: crate::access_policy::ApprovalMode,
     grants: Vec<AccessGrant>,
     worker: bool,
+}
+
+/// Two snapshots are equal when they hold the same stored authority. `Config`
+/// has no `PartialEq`, so it is compared through its serialized form; a
+/// config that cannot be serialized compares unequal, which only makes a
+/// caller re-read the snapshot.
+impl PartialEq for PolicySnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.worker == other.worker
+            && self.grants == other.grants
+            && match (
+                serde_json::to_value(&self.config),
+                serde_json::to_value(&other.config),
+            ) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            }
+    }
 }
 
 /// Copy database-backed authority without probing any filesystem paths.
@@ -357,6 +381,8 @@ pub(super) fn policy_snapshot(
 impl PolicySnapshot {
     /// Resolve filesystem-backed path identities separately from the database snapshot.
     pub(super) fn resolve(self, storage: &Path) -> AccessPolicy {
+        #[cfg(test)]
+        resolve_hook::run();
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
@@ -373,6 +399,102 @@ impl PolicySnapshot {
         // are installed here rather than while the database lock is held.
         policy.install_scope_grants(self.grants, self.worker);
         policy
+    }
+}
+
+/// Tests observe each `PolicySnapshot::resolve` call on their own thread, to
+/// check that it runs with the aft.db lock released.
+#[cfg(test)]
+pub(super) mod resolve_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+    }
+
+    /// Removes the hook when dropped.
+    pub(in crate::subc) struct Installed(());
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            HOOK.with(|hook| hook.borrow_mut().take());
+        }
+    }
+
+    pub(in crate::subc) fn install(hook: impl Fn() + 'static) -> Installed {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Installed(())
+    }
+
+    pub(super) fn run() {
+        HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook();
+            }
+        });
+    }
+}
+
+/// The policy of the head a worker's consent check is judged against, as
+/// stored: `None` when the worker has no head or the head has no scope row.
+#[derive(Clone, Default, PartialEq)]
+pub(super) struct HeadSnapshot {
+    key: Option<ScopeKey>,
+    policy: Option<PolicySnapshot>,
+}
+
+impl HeadSnapshot {
+    /// Probes the filesystem: call it with the aft.db lock released.
+    pub(super) fn resolve(&self, storage: &Path) -> Option<AccessPolicy> {
+        self.policy.clone().map(|policy| policy.resolve(storage))
+    }
+}
+
+/// Read the stored policy of the head that `consent_head` names.
+pub(super) fn consent_head_snapshot(
+    conn: &rusqlite::Connection,
+    identity: &RouteIdentity,
+) -> rusqlite::Result<HeadSnapshot> {
+    let Some(key) = consent_head(conn, identity)? else {
+        return Ok(HeadSnapshot::default());
+    };
+    let policy = policy_snapshot(conn, &key)?;
+    Ok(HeadSnapshot {
+        key: Some(key),
+        policy,
+    })
+}
+
+/// Run `commit` under the aft.db lock with what `resolve` derived from a
+/// database snapshot taken by `read`, without holding the lock while
+/// `resolve` probes the filesystem.
+///
+/// The snapshot is taken under the lock, `resolve` runs after it is
+/// released, and `commit` runs only once a fresh `read` under the lock again
+/// matches the resolved snapshot. The result is therefore the same as doing
+/// all three under one lock: if another route changed the stored policy in
+/// between, the new snapshot is resolved and checked again. Each retry needs
+/// such a concurrent change, so the loop ends once the stored policy stops
+/// changing.
+pub(super) fn resolve_unlocked<S: PartialEq, R, T, E>(
+    db: &std::sync::Mutex<crate::db::TrackedConnection>,
+    read: impl Fn(&rusqlite::Connection) -> Result<S, E>,
+    resolve: impl Fn(&S) -> R,
+    commit: impl FnOnce(&rusqlite::Connection, R) -> Result<T, E>,
+    poisoned: impl Fn() -> E,
+) -> Result<T, E> {
+    let mut snapshot = {
+        let conn = db.lock().map_err(|_| poisoned())?;
+        read(&conn)?
+    };
+    loop {
+        let resolved = resolve(&snapshot);
+        let conn = db.lock().map_err(|_| poisoned())?;
+        let current = read(&conn)?;
+        if current == snapshot {
+            return commit(&conn, resolved);
+        }
+        snapshot = current;
     }
 }
 
@@ -482,28 +604,70 @@ pub(super) fn catalog(
         }
         return Ok(());
     };
-    let conn = db
-        .lock()
-        .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))?;
-    register_on(&conn, identity, ctx)?;
-    let head = head_scope(identity)
-        .map(|key| policy_for_scope(&conn, &key, ctx))
-        .transpose()
-        .map_err(|e| refusal("grants_unavailable", e.to_string()))?
-        .flatten();
-    if let Some(raw) = raw {
-        validate(raw, head.as_ref())?;
-    }
-    if let Some(key) = launch_key(identity, preset) {
-        let stored = store::launch_params(&conn, &key)
-            .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
+    let lock = || {
+        db.lock()
+            .map_err(|_| refusal("grants_unavailable", "grant database lock poisoned"))
+    };
+    let head_key = head_scope(identity);
+    let read_head = |conn: &rusqlite::Connection| {
+        head_key
+            .as_ref()
+            .map(|key| policy_snapshot(conn, key))
+            .transpose()
+            .map(Option::flatten)
+            .map_err(|e| refusal("grants_unavailable", e.to_string()))
+    };
+    let launch = launch_key(identity, preset);
+    let launch_params = |conn: &rusqlite::Connection, key: &crate::db::remote_exec::PolicyKey| {
+        store::launch_params(conn, key).map_err(|e| refusal("grants_unavailable", e.to_string()))
+    };
+    let storage = ctx.storage_dir();
+    // The head's policy and `validate` both resolve paths on disk, so they
+    // run with the lock released. Each later locked step first checks that
+    // the head's stored policy is unchanged, and starts over with the new
+    // one if it changed; the materialized grants are therefore those a
+    // single locked pass would produce. A refusal from `validate` writes
+    // nothing and is the answer for the snapshot it was checked against.
+    let mut snapshot = {
+        let conn = lock()?;
+        register_on(&conn, identity, ctx)?;
+        read_head(&conn)?
+    };
+    loop {
+        let head = snapshot.clone().map(|policy| policy.resolve(&storage));
+        if let Some(raw) = raw {
+            validate(raw, head.as_ref())?;
+        }
+        let Some(key) = launch.as_ref() else {
+            return Ok(());
+        };
+        let stored = {
+            let conn = lock()?;
+            let current = read_head(&conn)?;
+            if current != snapshot {
+                snapshot = current;
+                continue;
+            }
+            launch_params(&conn, key)?
+        };
         let empty = json!([]);
-        let raw = stored.as_ref().or(raw).unwrap_or(&empty);
-        let grants = validate(raw, head.as_ref())?;
-        store::materialize(&conn, &key, raw, &grants)
+        let chosen = stored.as_ref().or(raw).unwrap_or(&empty);
+        let grants = validate(chosen, head.as_ref())?;
+        let conn = lock()?;
+        let current = read_head(&conn)?;
+        if current != snapshot {
+            snapshot = current;
+            continue;
+        }
+        // Another launch can store this scope's parameters first; validate
+        // those instead.
+        if launch_params(&conn, key)? != stored {
+            continue;
+        }
+        store::materialize(&conn, key, chosen, &grants)
             .map_err(|e| refusal("grants_unavailable", e.to_string()))?;
+        return Ok(());
     }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -408,6 +408,9 @@ pub(crate) enum ReadExactRefusal {
     TooLarge,
     RouteNotAdmitted(&'static str),
     IoError,
+    /// The parent head's access policy was still locked by other work when
+    /// the read's time limit ran out. Reported under the I/O error code.
+    PolicyTimeout,
 }
 
 impl ReadExactRefusal {
@@ -419,7 +422,7 @@ impl ReadExactRefusal {
             Self::NotRegular => "file_read_exact_not_regular",
             Self::TooLarge => "file_read_exact_too_large",
             Self::RouteNotAdmitted(_) => "file_read_exact_route_not_admitted",
-            Self::IoError => "file_read_exact_io_error",
+            Self::IoError | Self::PolicyTimeout => "file_read_exact_io_error",
         }
     }
 
@@ -432,6 +435,10 @@ impl ReadExactRefusal {
             Self::TooLarge => "File exceeds the 1048576-byte limit.".into(),
             Self::RouteNotAdmitted(check) => format!("Route not admitted: {check}."),
             Self::IoError => "The file could not be read.".into(),
+            Self::PolicyTimeout => {
+                "The parent head's access policy could not be read within the read's time limit."
+                    .into()
+            }
         }
     }
 

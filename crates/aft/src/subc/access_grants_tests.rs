@@ -680,3 +680,33 @@ fn grants_launch_fixture_roots_do_not_contain_windows_verbatim_glob_prefix() {
         assert_eq!(root, &policy_path(root));
     }
 }
+
+/// The launch check resolves the head's policy, which probes the filesystem.
+/// It must do so with aft.db unlocked, so a slow or stalled filesystem never
+/// keeps other routes (such as a flow read of the head's files) from the
+/// database.
+#[test]
+fn grants_catalog_resolves_head_policy_with_database_unlocked() {
+    let (_dir, ctx, head, worker) = fixture();
+    let target = head.project_root.join("shared");
+    let raw = json!([{"path":target,"mode":"read"}]);
+    let db = ctx.db().unwrap();
+    let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let hook = {
+        let probes = probes.clone();
+        resolve_hook::install(move || probes.borrow_mut().push(db.try_lock().is_ok()))
+    };
+    remote_policy::catalog(catalog_request(raw), &worker, &ctx).unwrap();
+    drop(hook);
+    let probes = probes.borrow();
+    assert!(
+        !probes.is_empty(),
+        "the launch check resolved the head's policy"
+    );
+    assert!(
+        probes.iter().all(|unlocked| *unlocked),
+        "aft.db was locked during resolution: {probes:?}"
+    );
+    let granted = operation(json!({"scope":"worker"}), "grants.list", &head, &ctx).unwrap();
+    assert_eq!(granted["grants"].as_array().unwrap().len(), 1, "{granted}");
+}

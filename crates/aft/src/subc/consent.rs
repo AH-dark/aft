@@ -27,7 +27,9 @@
 //! - `consent.withdraw {elicitation_id}` settles a pending ask as
 //!   `access_withdrawn` and returns the record.
 use super::*;
-use crate::access_policy::{AccessGrant, AccessOperation, AskRoute, GrantKind, HeadPolicy};
+use crate::access_policy::{
+    AccessGrant, AccessOperation, AccessPolicy, AskRoute, GrantKind, HeadPolicy,
+};
 use crate::db::access_asks::{self as asks, AskKey};
 use std::future::Future;
 use std::pin::Pin;
@@ -507,6 +509,23 @@ async fn with_db<T: Send + 'static>(
     call: &HeldCall,
     work: impl FnOnce(&rusqlite::Connection, &AppContext) -> rusqlite::Result<T> + Send + 'static,
 ) -> Result<T, String> {
+    with_db_handle(call, move |db, ctx| {
+        let conn = db.lock().map_err(|_| POISONED.to_string())?;
+        work(&conn, ctx).map_err(|error| error.to_string())
+    })
+    .await
+}
+
+const POISONED: &str = "aft.db mutex is poisoned";
+
+/// Run `work` on a blocking thread with the aft.db handle unlocked, for work
+/// that takes the lock itself, possibly more than once.
+async fn with_db_handle<T: Send + 'static>(
+    call: &HeldCall,
+    work: impl FnOnce(&std::sync::Mutex<crate::db::TrackedConnection>, &AppContext) -> Result<T, String>
+        + Send
+        + 'static,
+) -> Result<T, String> {
     let Some(ctx) = call.executor.actor_context(&call.identity.root) else {
         return Err("executor actor is not registered".into());
     };
@@ -514,10 +533,7 @@ async fn with_db<T: Send + 'static>(
         let db = ctx
             .db()
             .ok_or_else(|| "aft.db is unavailable".to_string())?;
-        let conn = db
-            .lock()
-            .map_err(|_| "aft.db mutex is poisoned".to_string())?;
-        work(&conn, &ctx).map_err(|error| error.to_string())
+        work(&db, &ctx)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -570,17 +586,34 @@ fn args_hash(identity: &RouteIdentity, tool: &str, arguments: &Value) -> String 
 
 /// Whether the worker's head holds `grant` itself, by its own policy or a
 /// standing grant. A worker with no head never has an `allow` head policy.
-fn head_policy(
-    conn: &rusqlite::Connection,
+fn head_policy(head: Option<&AccessPolicy>, grant: &AccessGrant) -> HeadPolicy {
+    head.map_or(HeadPolicy::NotHeld, |policy| policy.head_policy(grant))
+}
+
+/// Run `commit` under the aft.db lock with the worker's head policy, when
+/// `needed`, resolved on disk while the lock is released.
+fn with_head_policy<T>(
+    db: &std::sync::Mutex<crate::db::TrackedConnection>,
     ctx: &AppContext,
     identity: &RouteIdentity,
-    grant: &AccessGrant,
-) -> rusqlite::Result<HeadPolicy> {
-    let Some(head) = access_grants::consent_head(conn, identity)? else {
-        return Ok(HeadPolicy::NotHeld);
-    };
-    Ok(access_grants::policy_for_scope(conn, &head, ctx)?
-        .map_or(HeadPolicy::NotHeld, |policy| policy.head_policy(grant)))
+    needed: bool,
+    commit: impl FnOnce(&rusqlite::Connection, Option<AccessPolicy>) -> rusqlite::Result<T>,
+) -> Result<T, String> {
+    let storage = ctx.storage_dir();
+    access_grants::resolve_unlocked(
+        db,
+        |conn| {
+            if needed {
+                access_grants::consent_head_snapshot(conn, identity)
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(access_grants::HeadSnapshot::default())
+            }
+        },
+        |head| head.resolve(&storage),
+        |conn, head| commit(conn, head).map_err(|error| error.to_string()),
+        || POISONED.to_string(),
+    )
 }
 
 fn new_call_key() -> String {
@@ -590,10 +623,44 @@ fn new_call_key() -> String {
     format!("aft-ask-{hex}")
 }
 
+/// Prepare an ask. A worker's ask carries its head's policy, which is resolved
+/// on disk with the aft.db lock released; the ask's records are read and
+/// written under the lock.
 #[allow(clippy::too_many_arguments)]
 fn prepare(
-    conn: &rusqlite::Connection,
+    db: &std::sync::Mutex<crate::db::TrackedConnection>,
     ctx: &AppContext,
+    identity: &RouteIdentity,
+    tool: &str,
+    arguments: &Value,
+    grant: &AccessGrant,
+    directory_scope: &AccessGrant,
+    own_holder: Option<&str>,
+) -> Result<Prep, String> {
+    let worker = identity
+        .scope
+        .as_ref()
+        .is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Worker);
+    with_head_policy(db, ctx, identity, worker, |conn, head| {
+        prepare_locked(
+            conn,
+            head.as_ref(),
+            identity,
+            tool,
+            arguments,
+            grant,
+            directory_scope,
+            own_holder,
+        )
+    })
+}
+
+/// `head_access` is the worker's resolved head policy; it is only read for
+/// asks from a `worker` scope.
+#[allow(clippy::too_many_arguments)]
+fn prepare_locked(
+    conn: &rusqlite::Connection,
+    head_access: Option<&AccessPolicy>,
     identity: &RouteIdentity,
     tool: &str,
     arguments: &Value,
@@ -642,12 +709,12 @@ fn prepare(
     // it on asks from a `worker` scope and refuses it on every other kind.
     let head = match identity.scope.as_ref().map(|stamp| stamp.kind) {
         Some(subc_protocol::scope::ScopeKind::Worker) => {
-            let file_head = head_policy(conn, ctx, identity, grant)?;
+            let file_head = head_policy(head_access, grant);
             // A head can approve a file without holding its containing tree.
             // Advertise that tree only when the head can delegate both choices.
             if file_head != HeadPolicy::Allow
                 || (scope_grant != *grant
-                    && head_policy(conn, ctx, identity, &scope_grant)? != HeadPolicy::Allow)
+                    && head_policy(head_access, &scope_grant) != HeadPolicy::Allow)
             {
                 scope_grant = grant.clone();
             }
@@ -1191,9 +1258,9 @@ async fn hold(
     let arguments = call.arguments.clone();
     let asked = grant.clone();
     let directory_scope = scope_before_db(&grant).await;
-    let prepared = with_db(call, move |conn, ctx| {
+    let prepared = with_db_handle(call, move |db, ctx| {
         prepare(
-            conn,
+            db,
             ctx,
             &identity,
             &tool,
@@ -1347,24 +1414,10 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
                 prep.grant.clone()
             };
             let claimant = holder.clone();
-            let applied = with_db(call, move |conn, ctx| {
-                // A head may pass on only what it holds now: its authority is
-                // checked again against the head's current policy and grants.
-                if !by_user && head_policy(conn, ctx, &identity, &grant)? != HeadPolicy::Allow {
-                    asks::discard(conn, &key)?;
-                    return Ok(Applied::HeadNotHeld);
-                }
-                let Some(approved) = asks::claim(conn, &key, &call_key, &claimant)? else {
-                    return Ok(Applied::NotClaimed);
-                };
-                if scope {
-                    crate::db::access_grants::insert(
-                        conn,
-                        &access_grants::policy_scope_key(&identity),
-                        &grant,
-                    )?;
-                }
-                Ok(Applied::Run(approved))
+            let applied = with_db_handle(call, move |db, ctx| {
+                apply_allow(
+                    db, ctx, &identity, &key, &call_key, &claimant, &grant, scope, by_user,
+                )
             })
             .await;
             match applied {
@@ -1384,6 +1437,42 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
             }
         }
     }
+}
+
+/// Record an allow answer: claim the ask's approvals and, for a scope answer,
+/// store the grant. A head's answer is first checked against the head's
+/// current policy, resolved on disk with the aft.db lock released.
+#[allow(clippy::too_many_arguments)]
+fn apply_allow(
+    db: &std::sync::Mutex<crate::db::TrackedConnection>,
+    ctx: &AppContext,
+    identity: &RouteIdentity,
+    key: &AskKey,
+    call_key: &str,
+    claimant: &str,
+    grant: &AccessGrant,
+    scope: bool,
+    by_user: bool,
+) -> Result<Applied, String> {
+    with_head_policy(db, ctx, identity, !by_user, |conn, head| {
+        // A head may pass on only what it holds now: its authority is
+        // checked again against the head's current policy and grants.
+        if !by_user && head_policy(head.as_ref(), grant) != HeadPolicy::Allow {
+            asks::discard(conn, key)?;
+            return Ok(Applied::HeadNotHeld);
+        }
+        let Some(approved) = asks::claim(conn, key, call_key, claimant)? else {
+            return Ok(Applied::NotClaimed);
+        };
+        if scope {
+            crate::db::access_grants::insert(
+                conn,
+                &access_grants::policy_scope_key(identity),
+                grant,
+            )?;
+        }
+        Ok(Applied::Run(approved))
+    })
 }
 
 /// A run-scoped call that ends with `access_pending` leaves its ask with the

@@ -383,11 +383,12 @@ fn flow_read_parent_root_and_grants() {
     )));
     access_grants::register(&head, &ctx).unwrap();
     assert_eq!(
-        read_as_parent(&child, &head, &json!({"path":"script"}), &ctx).unwrap()["bytes_base64"],
+        read_as_parent(&child, &head, &json!({"path":"script"}), &ctx, limit()).unwrap()
+            ["bytes_base64"],
         "YWJj"
     );
     assert_eq!(
-        read_as_parent(&child, &head, &json!({"path":outside}), &ctx),
+        read_as_parent(&child, &head, &json!({"path":outside}), &ctx, limit()),
         Err(Refusal::AccessDenied)
     );
     let key = access_grants::scope_key(&head);
@@ -406,7 +407,7 @@ fn flow_read_parent_root_and_grants() {
         .unwrap();
     }
     assert_eq!(
-        read_as_parent(&child, &head, &json!({"path":outside}), &ctx),
+        read_as_parent(&child, &head, &json!({"path":outside}), &ctx, limit()),
         Err(Refusal::AccessDenied)
     );
     let mut ended = stamp();
@@ -416,7 +417,8 @@ fn flow_read_parent_root_and_grants() {
             &identity(&basal_root, ended, "reserved:basal"),
             &head,
             &json!({"path":"script"}),
-            &ctx
+            &ctx,
+            limit()
         ),
         Err(Refusal::RouteNotAdmitted("expiry"))
     );
@@ -449,7 +451,13 @@ fn flow_read_parent_floor_from_stored_policy() {
     basal_ctx.set_db(db);
     access_grants::register(&child, &basal_ctx).unwrap();
     assert_eq!(
-        read_as_parent(&child, &parent, &json!({"path":"secret"}), &basal_ctx),
+        read_as_parent(
+            &child,
+            &parent,
+            &json!({"path":"secret"}),
+            &basal_ctx,
+            limit()
+        ),
         Err(Refusal::AccessDenied)
     );
 }
@@ -465,7 +473,7 @@ fn flow_read_bad_request() {
     );
     for body in [json!({}), json!({"path": 123}), json!({"path": ""})] {
         assert_eq!(
-            read_as_parent(&child, &parent, &body, &ctx),
+            read_as_parent(&child, &parent, &body, &ctx, limit()),
             Err(Refusal::BadRequest)
         );
     }
@@ -481,9 +489,14 @@ fn flow_read_persistence_unavailable() {
         Config::default(),
     );
     assert_eq!(
-        read_as_parent(&child, &parent, &json!({"path":"script"}), &ctx),
+        read_as_parent(&child, &parent, &json!({"path":"script"}), &ctx, limit()),
         Err(Refusal::IoError)
     );
+}
+
+/// The production time limit, for reads whose tests do not exercise it.
+fn limit() -> Instant {
+    Instant::now() + persistence::WAIT_BUDGET
 }
 
 fn read_fixture() -> (
@@ -570,6 +583,7 @@ fn flow_read_database_lock_released_during_read() {
             &parent,
             &json!({"path":"script"}),
             &reader_ctx,
+            limit(),
             hooks,
         )
     });
@@ -627,6 +641,7 @@ fn flow_read_revoked_between_snapshot_and_recheck() {
             &parent,
             &json!({"path":"script"}),
             &reader_ctx,
+            limit(),
             hooks,
         )
     });
@@ -651,8 +666,14 @@ fn flow_read_stalled_read_expires_without_late_success() {
     let (hooks, mut pause) = pause_read();
     let (done, result) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let answer =
-            read_as_parent_with_hooks(&child, &parent, &json!({"path":"script"}), &ctx, hooks);
+        let answer = read_as_parent_with_hooks(
+            &child,
+            &parent,
+            &json!({"path":"script"}),
+            &ctx,
+            limit(),
+            hooks,
+        );
         let _ = done.send(answer);
     });
     pause.wait();
@@ -840,4 +861,59 @@ async fn flow_read_refuses_after_bound_when_parent_never_registers() {
     let body: Value = serde_json::from_slice(&answer.body).unwrap();
     assert_eq!(answer.header.ty, FrameType::Error, "{body}");
     assert_eq!(body["code"], "file_read_exact_io_error");
+}
+
+/// Another route can hold aft.db for a long time, for example while it
+/// resolves paths on a stalled filesystem. A flow read must still answer
+/// within its own time limit, with the policy timeout, and releasing the lock
+/// afterwards must not send a second answer.
+#[tokio::test]
+async fn flow_read_policy_lock_held_past_limit_replies_once_with_timeout() {
+    let (_dir, ctx, parent, child) = read_fixture();
+    let executor = Arc::new(Executor::new());
+    executor.register_actor(parent.root.clone(), ctx.clone());
+    let db = ctx.db().unwrap();
+    let (held_tx, held) = std::sync::mpsc::sync_channel(0);
+    let (release, released) = std::sync::mpsc::sync_channel::<()>(0);
+    let holder = std::thread::spawn(move || {
+        let _conn = db.lock().unwrap();
+        held_tx.send(()).unwrap();
+        // Held until the test releases it, or until the test fails and drops
+        // the sender.
+        let _ = released.recv();
+    });
+    held.recv().unwrap();
+
+    let read_limit = Duration::from_millis(400);
+    let started = Instant::now();
+    let mut output = start_live_read(&executor, &parent, child, read_limit).await;
+    let answer = tokio::time::timeout(Duration::from_secs(5), output.recv())
+        .await
+        .expect("the read answers while aft.db is still held")
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= read_limit,
+        "answered before its limit: {elapsed:?}"
+    );
+    assert!(
+        elapsed < read_limit + Duration::from_secs(1),
+        "answered long after its limit: {elapsed:?}"
+    );
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(answer.header.ty, FrameType::Error, "{body}");
+    assert_eq!(body["code"], "file_read_exact_io_error");
+    assert_eq!(
+        body["message"],
+        "The parent head's access policy could not be read within the read's time limit."
+    );
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    if let Ok(Some(late)) = tokio::time::timeout(Duration::from_millis(500), output.recv()).await {
+        panic!(
+            "a second answer followed the lock's release: {}",
+            String::from_utf8_lossy(&late.body)
+        );
+    }
 }
