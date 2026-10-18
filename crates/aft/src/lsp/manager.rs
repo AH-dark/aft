@@ -42,6 +42,10 @@ use crate::lsp::LspError;
 use crate::slog_error;
 use crate::slog_info;
 
+#[cfg(test)]
+#[path = "applicability_walk_tests.rs"]
+mod applicability_walk_tests;
+
 const STDERR_REASON_BYTES: usize = 2 * 1024;
 
 /// Leads the failure reason for TypeScript files that neither an installed
@@ -7122,6 +7126,52 @@ pub fn walk_applicable_area(
     config: &Config,
     deadline: Option<std::time::Instant>,
 ) -> Result<ApplicabilityWalk, ApplicabilityResolutionError> {
+    let root = crate::inspect::job::canonicalize_normalized(project_root);
+    let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
+    let mut config = config.clone();
+    if let Some(config_root) = &config.project_root {
+        config.project_root = Some(if config_root == project_root {
+            root.clone()
+        } else {
+            crate::inspect::job::canonicalize_normalized(config_root)
+        });
+    }
+    let scan = || {
+        walk_applicable_area_uncached(
+            &root,
+            scope_roots,
+            &config,
+            deadline,
+            200_000,
+            crate::lsp::roots::RootPathMode::WalkEntry,
+        )
+    };
+    if scope_roots.is_none_or(|roots| roots.is_empty()) {
+        super::applicability_cache::shared().walk(&root, &config, deadline, scan)
+    } else {
+        scan()
+    }
+}
+
+/// Watcher batches also include source creation/removal, ignored-file changes
+/// and renames. Conservatively invalidate on every batch: a source extension or
+/// a custom marker can affect applicability just as a built-in manifest can.
+pub(crate) fn invalidate_applicability_walk(root: &Path) {
+    let root = crate::inspect::job::canonicalize_normalized(root);
+    // Invalidate selectors before waking a new scan, even when forwarding the
+    // watcher events to a busy language-server manager has to be queued.
+    super::typescript_project::clear_typescript_selection();
+    super::applicability_cache::shared().invalidate(&root);
+}
+
+fn walk_applicable_area_uncached(
+    project_root: &Path,
+    scope_roots: Option<&[PathBuf]>,
+    config: &Config,
+    deadline: Instant,
+    entry_limit: usize,
+    mode: crate::lsp::roots::RootPathMode,
+) -> Result<ApplicabilityWalk, ApplicabilityResolutionError> {
     if !project_root.is_dir() {
         return Err(ApplicabilityResolutionError::RootUnreadable {
             root: project_root.to_path_buf(),
@@ -7131,7 +7181,12 @@ pub fn walk_applicable_area(
     delay_applicability_walk_for_test();
 
     let walk_roots = match scope_roots.filter(|roots| !roots.is_empty()) {
-        Some(roots) => roots.to_vec(),
+        // Explicit scope roots can contain symlinked parent components. Resolve
+        // those once; recursive entries below them never follow symlinks.
+        Some(roots) => roots
+            .iter()
+            .map(|root| crate::inspect::job::canonicalize_normalized(root))
+            .collect(),
         None => vec![project_root.to_path_buf()],
     };
 
@@ -7143,7 +7198,10 @@ pub fn walk_applicable_area(
     for root in &walk_roots[1..] {
         builder.add(root);
     }
-    builder.same_file_system(true).standard_filters(true);
+    builder
+        .same_file_system(true)
+        .standard_filters(true)
+        .follow_links(false);
     let walker = crate::context::apply_project_ignore_rules(&mut builder, &walk_roots[0])
         .filter_entry(|entry| {
             !crate::lsp::roots::skip_in_server_walk(
@@ -7153,10 +7211,17 @@ pub fn walk_applicable_area(
         })
         .build();
 
-    for entry in walker {
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+    let mut roots_by_directory = HashMap::new();
+    for (visited, entry) in walker.enumerate() {
+        if std::time::Instant::now() >= deadline {
             return Err(ApplicabilityResolutionError::RequestDeadline {
                 root: project_root.to_path_buf(),
+            });
+        }
+        if visited >= entry_limit {
+            return Err(ApplicabilityResolutionError::RootUnreadable {
+                root: project_root.to_path_buf(),
+                reason: format!("applicability walk incomplete: entry limit {entry_limit} reached"),
             });
         }
         let entry = entry.map_err(|error| ApplicabilityResolutionError::RootUnreadable {
@@ -7184,8 +7249,19 @@ pub fn walk_applicable_area(
                 (definition, marker_dir, marker_name),
             );
         }
-        for definition in servers_for_file(file, config) {
-            let Some(key) = server_key_for_definition(&definition, file, config) else {
+        for definition in crate::lsp::registry::servers_for_file_with_mode(file, config, mode) {
+            let parent = file.parent().unwrap_or(project_root);
+            let key = roots_by_directory
+                .entry((definition.kind.clone(), parent.to_path_buf()))
+                .or_insert_with(|| {
+                    definition
+                        .workspace_root_with_mode(file, config.project_root.as_deref(), mode)
+                        .map(|root| ServerKey {
+                            kind: definition.kind.clone(),
+                            root,
+                        })
+                });
+            let Some(key) = key.clone() else {
                 continue;
             };
             // Whether a key starts or fails depends only on the key and its

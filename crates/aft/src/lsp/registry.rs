@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use crate::config::{Config, UserServerDef};
 use crate::lsp::roots::{
-    find_rust_workspace_root, find_workspace_root, find_workspace_root_within,
-    outermost_marker_root,
+    find_rust_workspace_root_with_mode, find_workspace_root_with_mode,
+    outermost_marker_root_with_mode, RootPathMode,
 };
 use crate::lsp::typescript_project::{native_typescript_for, NATIVE_SERVER_ARGS};
 
@@ -387,8 +387,17 @@ impl ServerDef {
         file_path: &Path,
         project_root: Option<&Path>,
     ) -> Option<PathBuf> {
+        self.workspace_root_with_mode(file_path, project_root, RootPathMode::Resolve)
+    }
+
+    pub(crate) fn workspace_root_with_mode(
+        &self,
+        file_path: &Path,
+        project_root: Option<&Path>,
+        mode: RootPathMode,
+    ) -> Option<PathBuf> {
         if self.kind == ServerKind::Rust {
-            if let Some(root) = find_rust_workspace_root(file_path, project_root) {
+            if let Some(root) = find_rust_workspace_root_with_mode(file_path, project_root, mode) {
                 return Some(root);
             }
         }
@@ -397,20 +406,21 @@ impl ServerDef {
             self.kind,
             ServerKind::Rust | ServerKind::Python | ServerKind::Ty
         );
-        let nearest = match self.nearest_marker_root(file_path, project_root, bounded_to_project) {
-            Some(nearest) => nearest,
-            // A Python script with no project file above it (a helper under
-            // `scripts/`, say) is still Python that Pyright can check with its
-            // defaults. Serving it from the project root keeps such files from
-            // being permanently "no workspace root" gaps in a scoped inspect.
-            None if matches!(self.kind, ServerKind::Python | ServerKind::Ty) => {
-                let project_root = crate::inspect::job::canonicalize_normalized(project_root?);
-                crate::inspect::job::canonicalize_normalized(file_path)
-                    .starts_with(&project_root)
-                    .then_some(project_root)?
-            }
-            None => return None,
-        };
+        let nearest =
+            match self.nearest_marker_root(file_path, project_root, bounded_to_project, mode) {
+                Some(nearest) => nearest,
+                // A Python script with no project file above it (a helper under
+                // `scripts/`, say) is still Python that Pyright can check with its
+                // defaults. Serving it from the project root keeps such files from
+                // being permanently "no workspace root" gaps in a scoped inspect.
+                None if matches!(self.kind, ServerKind::Python | ServerKind::Ty) => {
+                    let project_root = mode.resolve(project_root?);
+                    mode.resolve(file_path)
+                        .starts_with(&project_root)
+                        .then_some(project_root)?
+                }
+                None => return None,
+            };
         let Some(project_root) = project_root else {
             return Some(nearest);
         };
@@ -425,17 +435,19 @@ impl ServerDef {
                     &nearest,
                     project_root,
                     |dir| self.has_root_marker(dir),
+                    mode,
                 ))
             }
             // Bash and YAML servers analyze each file on its own; their
             // workspace root only bounds background indexing. Their markers
             // (`package.json`, `.git`) mark every JavaScript package, which
             // started one server per package for the same project.
-            ServerKind::Bash | ServerKind::Yaml => {
-                Some(outermost_marker_root(&nearest, project_root, |dir| {
-                    self.has_root_marker(dir)
-                }))
-            }
+            ServerKind::Bash | ServerKind::Yaml => Some(outermost_marker_root_with_mode(
+                &nearest,
+                project_root,
+                |dir| self.has_root_marker(dir),
+                mode,
+            )),
             _ => Some(nearest),
         }
     }
@@ -444,7 +456,11 @@ impl ServerDef {
         self.root_markers
             .iter()
             .chain(self.priority_root_markers.iter())
-            .any(|marker| dir.join(marker).exists())
+            .any(|marker| {
+                let path = dir.join(marker);
+                super::applicability_cache::observe_path(&path);
+                path.exists()
+            })
     }
 
     fn nearest_marker_root(
@@ -452,23 +468,17 @@ impl ServerDef {
         file_path: &Path,
         project_root: Option<&Path>,
         bounded_to_project: bool,
+        mode: RootPathMode,
     ) -> Option<PathBuf> {
+        let boundary = project_root.filter(|_| bounded_to_project);
         for marker in &self.priority_root_markers {
-            let root = if bounded_to_project {
-                find_workspace_root_within(file_path, &[marker.as_str()], project_root)
-            } else {
-                find_workspace_root(file_path, &[marker.as_str()])
-            };
+            let root = find_workspace_root_with_mode(file_path, &[marker.as_str()], boundary, mode);
             if let Some(root) = root {
                 return Some(root);
             }
         }
 
-        if bounded_to_project {
-            find_workspace_root_within(file_path, &self.root_markers, project_root)
-        } else {
-            find_workspace_root(file_path, &self.root_markers)
-        }
+        find_workspace_root_with_mode(file_path, &self.root_markers, boundary, mode)
     }
 
     /// Check if this server handles a given file extension.
@@ -888,6 +898,14 @@ pub fn builtin_servers() -> Vec<ServerDef> {
 
 /// Find all server definitions that handle a given file path.
 pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
+    servers_for_file_with_mode(path, config, RootPathMode::Resolve)
+}
+
+pub(crate) fn servers_for_file_with_mode(
+    path: &Path,
+    config: &Config,
+    mode: RootPathMode,
+) -> Vec<ServerDef> {
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -916,9 +934,9 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         // The swap runs after the disabled filter, so `lsp.disabled:
         // ["typescript"]` still turns TypeScript off for native projects;
         // the second filter lets `typescript-native` be disabled on its own.
-        .map(|server| select_typescript_server(server, path, config))
+        .map(|server| select_typescript_server(server, path, config, mode))
         .filter(|server| !is_disabled(server, config))
-        .filter(|server| !biome_config_excludes(server, path))
+        .filter(|server| !biome_config_excludes(server, path, mode))
         .collect()
 }
 
@@ -928,24 +946,27 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
 /// so every `.json` under `crates/` is excluded) left that file a permanent
 /// "published no diagnostics" gap in every scoped inspect. A configuration
 /// without `files.includes`, or one that cannot be read, includes every file.
-fn biome_config_excludes(server: &ServerDef, path: &Path) -> bool {
+fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) -> bool {
     if server.kind != ServerKind::Biome {
         return false;
     }
-    let Some(root) = server.workspace_root_for_file(path) else {
+    let Some(root) = server.workspace_root_with_mode(path, None, mode) else {
         return false;
     };
     let Some(config_path) = ["biome.json", "biome.jsonc"]
         .iter()
         .map(|name| root.join(name))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| {
+            super::applicability_cache::observe_path(candidate);
+            candidate.is_file()
+        })
     else {
         return false;
     };
     let Some(includes) = biome_includes(&config_path) else {
         return false;
     };
-    let path = crate::inspect::job::canonicalize_normalized(path);
+    let path = mode.resolve(path);
     let Ok(relative) = path.strip_prefix(&root) else {
         return false;
     };
@@ -971,24 +992,31 @@ impl BiomeIncludes {
 }
 
 /// Parsed `files.includes` of one Biome configuration, memoized by path and
-/// modification time so a walk over thousands of files reads it once.
+/// file identity so a walk over thousands of files reads it once. Identity
+/// covers replacement as well as edits (inode and change time on Unix, size
+/// and modification time everywhere), because an ancestor configuration above
+/// the project root can change without a watcher event.
 fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
     type Memo = parking_lot::Mutex<
-        HashMap<PathBuf, (Option<std::time::SystemTime>, Option<Arc<BiomeIncludes>>)>,
+        HashMap<PathBuf, (Option<BiomeConfigStamp>, Option<Arc<BiomeIncludes>>)>,
     >;
     static MEMO: OnceLock<Memo> = OnceLock::new();
-    let modified = std::fs::metadata(config_path)
-        .and_then(|metadata| metadata.modified())
-        .ok();
+    let stamp = std::fs::metadata(config_path)
+        .ok()
+        .map(|metadata| BiomeConfigStamp::of(config_path, &metadata));
     let memo = MEMO.get_or_init(Default::default);
-    if let Some((at, includes)) = memo.lock().get(config_path) {
-        if *at == modified {
-            return includes.clone();
+    if stamp.is_some() {
+        if let Some((at, includes)) = memo.lock().get(config_path) {
+            if *at == stamp {
+                return includes.clone();
+            }
         }
     }
     let parsed = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|source| {
+            #[cfg(test)]
+            BIOME_PARSES.with(|parses| parses.set(parses.get() + 1));
             serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&source)).ok()
         })
         .and_then(|config| {
@@ -1010,8 +1038,56 @@ fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
             Some(Arc::new(BiomeIncludes { patterns }))
         });
     memo.lock()
-        .insert(config_path.to_path_buf(), (modified, parsed.clone()));
+        .insert(config_path.to_path_buf(), (stamp, parsed.clone()));
     parsed
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Biome configuration parses made by this thread.
+    static BIOME_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The identity of a Biome configuration file as `biome_includes` last parsed it.
+///
+/// On Unix the inode and change time reveal any edit or replacement. Windows
+/// exposes neither through stable std APIs, and NTFS can carry a replaced
+/// file's creation time over to its successor, so there the stamp hashes the
+/// file's bytes: still far cheaper than parsing and compiling its globs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BiomeConfigStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+    #[cfg(not(unix))]
+    content: Option<u64>,
+}
+
+impl BiomeConfigStamp {
+    fn of(path: &Path, metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        #[cfg(unix)]
+        let _ = path;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            inode: (metadata.dev(), metadata.ino()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            #[cfg(not(unix))]
+            content: std::fs::read(path).ok().map(|bytes| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            }),
+        }
+    }
 }
 
 const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
@@ -1026,7 +1102,12 @@ const TYPESCRIPT_LANGUAGE_SERVER: &str = "typescript-language-server";
 /// packages. The binary shown here is the platform binary when it resolves;
 /// the manager resolves it again at spawn and reports a named gap, without
 /// spawning anything, when it does not.
-fn select_typescript_server(server: ServerDef, path: &Path, config: &Config) -> ServerDef {
+fn select_typescript_server(
+    server: ServerDef,
+    path: &Path,
+    config: &Config,
+    mode: RootPathMode,
+) -> ServerDef {
     // Only the built-in program is swapped: a user who pointed the
     // `typescript` server at another binary has chosen their own server.
     if server.kind != ServerKind::TypeScript || server.binary != TYPESCRIPT_LANGUAGE_SERVER {
@@ -1040,8 +1121,8 @@ fn select_typescript_server(server: ServerDef, path: &Path, config: &Config) -> 
         server.priority_root_markers.hash(&mut hasher);
         hasher.finish()
     };
-    let Some(native) = native_typescript_for(path, project_root, markers, || {
-        server.workspace_root_for_file_with_project_root(path, project_root)
+    let Some(native) = native_typescript_for(path, project_root, markers, mode, || {
+        server.workspace_root_with_mode(path, project_root, mode)
     }) else {
         return server;
     };
@@ -1372,8 +1453,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        builtin_servers, is_config_file_path, resolve_lsp_binary, resolve_server_binary,
-        servers_for_file, ServerDef, ServerKind,
+        biome_includes, builtin_servers, is_config_file_path, resolve_lsp_binary,
+        resolve_server_binary, servers_for_file, ServerDef, ServerKind, BIOME_PARSES,
     };
     use crate::config::{Config, UserServerDef};
 
@@ -1471,6 +1552,40 @@ mod tests {
         assert_eq!(server_root("cli"), root);
         assert_eq!(server_root("plugin"), root);
         assert_eq!(server_root("old"), root.join("packages/old"));
+    }
+
+    /// One parse serves every file of a walk, including a configuration above
+    /// the project root, and replacing the file is still noticed.
+    #[test]
+    fn biome_config_is_parsed_once_until_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("biome.json");
+        write_file(&config_path, r#"{"files":{"includes":["a/**"]}}"#);
+        let parses = || BIOME_PARSES.with(std::cell::Cell::get);
+        let before = parses();
+        for _ in 0..50 {
+            assert!(biome_includes(&config_path).is_some());
+        }
+        assert_eq!(parses() - before, 1, "one parse serves every lookup");
+
+        // Replace the file with same-length content and restore its old
+        // modification time: only its identity (Unix) or bytes (Windows) differ.
+        let modified = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        let staged = temp.path().join("biome.json.new");
+        write_file(&staged, r#"{"files":{"includes":["b/**"]}}"#);
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&staged, &config_path).unwrap();
+        assert!(biome_includes(&config_path).is_some());
+        assert_eq!(
+            parses() - before,
+            2,
+            "a replaced configuration is parsed again"
+        );
     }
 
     /// Biome is not a producer for a file its `files.includes` leaves out, so

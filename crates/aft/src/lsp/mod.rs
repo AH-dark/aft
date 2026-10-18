@@ -1,3 +1,4 @@
+mod applicability_cache;
 pub mod child_registry;
 pub mod client;
 pub(crate) mod completed_rust_check;

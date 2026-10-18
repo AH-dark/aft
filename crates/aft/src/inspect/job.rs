@@ -1014,10 +1014,21 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
 /// the same comparison is this subsystem's recurring bug class. Both branches
 /// route through [`normalize_path`].
 pub(crate) fn canonicalize_normalized(path: &Path) -> PathBuf {
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|calls| {
+        if let Some(calls) = calls.borrow_mut().as_mut() {
+            calls.push(path.to_path_buf());
+        }
+    });
     match std::fs::canonicalize(path) {
         Ok(canonical) => normalize_path(&canonical),
         Err(_) => normalize_path(path),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CANONICALIZE_CALLS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
