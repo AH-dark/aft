@@ -3277,13 +3277,13 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
                 }
                 // A wakeup or an elapsed deadline does not imply ownership.
                 // Recheck the entry and flight under the lock before deciding
-                // whether to reuse, become the next owner, or fail closed.
+                // whether to reuse, become the next owner, or bypass a stalled
+                // owner so its slow Git discovery does not block another call.
                 let remaining = git_policy_wait_remaining(project_root, wait_deadline);
                 if remaining.is_zero() {
-                    return Err(format!(
-                        "timed out waiting for Git policy discovery for {}",
-                        project_root.display()
-                    ));
+                    drop(cache);
+                    return resolve_git_policy_uncached(project_root, environment, worker)
+                        .map(|(policy, _)| policy);
                 }
                 #[cfg(test)]
                 signal_git_policy_waiter_for_test(project_root);
@@ -3309,7 +3309,8 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
         };
 
         // The in-flight marker serializes misses for this exact worktree and
-        // input environment; filesystem checks and git subprocesses stay unlocked.
+        // input environment until a waiter's deadline. Filesystem checks and
+        // Git subprocesses stay unlocked.
         let result = resolve_git_policy_uncached(project_root, environment.clone(), worker);
         let entry = result.as_ref().ok().and_then(|(policy, inputs)| {
             let current_key = git_policy_cache_key(project_root, &environment, worker);
@@ -7150,11 +7151,17 @@ mod git_policy_cache_tests {
     }
 
     #[test]
-    fn git_policy_cache_waiter_times_out_without_parallel_discovery() {
+    fn git_policy_cache_waiter_resolves_uncached_after_owner_stalls() {
         let fixture = Fixture::new();
+        let expected_queries = fixture.resolve().1;
+        assert!(expected_queries > 0);
+        let key = git_policy_cache_key(&fixture.root, &git_policy_environment(&fixture.root), true)
+            .unwrap();
+        git_policy_cache().lock().unwrap().remove(&key);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         fixture.state(|state| {
+            state.calls = 0;
             state.uncached_gate = Some(GitPolicyTestUncachedGate {
                 entered: entered_tx,
                 release: release_rx,
@@ -7168,19 +7175,33 @@ mod git_policy_cache_tests {
             .expect("miss owner did not enter uncached resolution");
 
         fixture.state(|state| state.expire_wait = true);
-        let waiter_result = with_worker_jail(true, || resolve_git_policy(&fixture.root));
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::channel();
+        let waiter_root = fixture.root.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = with_worker_jail(true, || resolve_git_policy(&waiter_root));
+            let _ = waiter_result_tx.send(result);
+        });
+        let completed_before_release = waiter_result_rx.recv_timeout(Duration::from_secs(5));
+        let waiter_finished_without_owner = completed_before_release.is_ok();
         let waiter_queries = fixture.state(|state| state.calls);
         fixture.state(|state| state.expire_wait = false);
         release_tx.send(false).unwrap();
-        owner.join().unwrap().expect("miss owner resolution failed");
+        let owner_policy = owner.join().unwrap().expect("miss owner resolution failed");
+        let waiter_result = completed_before_release
+            .or_else(|_| waiter_result_rx.recv_timeout(Duration::from_secs(5)))
+            .expect("waiter did not finish after owner release");
+        waiter.join().unwrap();
 
         assert!(
-            waiter_result
-                .unwrap_err()
-                .contains("timed out waiting for Git policy discovery"),
-            "a stalled owner must not cause parallel Git discovery"
+            waiter_finished_without_owner,
+            "waiter must resolve uncached before a stalled owner is released"
         );
-        assert_eq!(waiter_queries, 0, "the waiter must not run Git queries");
+        let waiter_policy = waiter_result.expect("waiter policy resolution failed");
+        assert_eq!(waiter_policy.hooks, owner_policy.hooks);
+        assert_eq!(
+            waiter_queries, expected_queries,
+            "the waiter must complete its own query batch while the owner is held"
+        );
         assert_eq!(fixture.resolve().1, 0, "the owner should still publish");
     }
 

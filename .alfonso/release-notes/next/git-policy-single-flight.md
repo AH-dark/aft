@@ -1,1 +1,1 @@
-- Sandboxed bash avoids duplicate Git discovery when concurrent policy lookups exceed their wait budget, and reports a timeout if discovery is still running.
+- Concurrent sandboxed bash commands in one checkout no longer each run their own Git policy lookup.
