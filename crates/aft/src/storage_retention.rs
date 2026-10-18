@@ -1348,6 +1348,8 @@ fn reap_retired(storage: &Path) -> io::Result<()> {
 }
 
 fn schedule_reaper(storage: &Path) {
+    #[cfg(test)]
+    test_hook(storage, "reaper-launch");
     {
         let mut states = states()
             .lock()
@@ -2557,7 +2559,11 @@ fn run_pass_with_budget(
         report
             .timings_ms
             .insert("roots".into(), phase.elapsed().as_millis() as u64);
-        schedule_reaper(storage);
+        // A stopped pass leaves pending mount trash for a later pass instead
+        // of starting new mount scans and unlinks after cancellation or expiry.
+        if !report.cancelled && !cancelled() && clock() < deadline {
+            schedule_reaper(storage);
+        }
         Ok(())
     })();
     if let Err(error) = result {
@@ -3793,6 +3799,93 @@ mod storage_retention_tests {
         assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    fn stopped_pass_keeps_mount_trash(cancel: bool) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (temp, _, _, path) = due_cache_fixture();
+        let _views = crate::walk_boundary::simulated_volumes::simulate(
+            &temp.path().join("views"),
+            u64::MAX - 10,
+        );
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&path, u64::MAX - 11);
+        {
+            let _admission = barrier(temp.path()).unwrap();
+            retire_directory(temp.path(), &path).unwrap();
+        }
+        let trash = path.join(".retention-trash");
+        let retired = fs::read_dir(&trash)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let marker = temp.path().join("retention/mount-trash-pending");
+        let generation = fs::read(&marker).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let stopped = stopped.clone();
+            let launches = launches.clone();
+            observe_test_hook(
+                temp.path(),
+                Arc::new(move |step| match step {
+                    // Stop after due-first has returned, so the root lane must
+                    // refuse reaper launch instead of relying on its early return.
+                    "cursor-commit" => stopped.store(true, Ordering::SeqCst),
+                    "reaper-launch" => {
+                        launches.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }),
+            )
+        };
+        // Keep a regressed launch from unlinking the fixture asynchronously.
+        let reaper =
+            crate::fs_lock::try_acquire(&temp.path().join("retention/reap.lock"), Duration::ZERO)
+                .unwrap();
+        let started = Instant::now();
+        let clock = || {
+            started
+                + if !cancel && stopped.load(Ordering::SeqCst) {
+                    NO_TIME_BOUND * 2
+                } else {
+                    Duration::ZERO
+                }
+        };
+        let report = run_pass_with_budget(
+            temp.path(),
+            &|| cancel && stopped.load(Ordering::SeqCst),
+            &clock,
+            NO_TIME_BOUND,
+        );
+        assert!(stopped.load(Ordering::SeqCst), "stop hook was not reached");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.cancelled, cancel, "{report:?}");
+        assert!(cancel || report.stopped_early, "{report:?}");
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            0,
+            "a cancelled or expired pass must not launch the reaper"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), generation);
+        assert!(retired.join("payload.bin").exists());
+        drop(hook);
+        drop(reaper);
+        reap_retired(temp.path()).unwrap();
+        assert!(!trash.exists(), "a later reaper can reclaim the trash");
+        assert!(!marker.exists(), "a later durable reap clears the marker");
+    }
+
+    #[test]
+    fn retention_cancelled_pass_does_not_launch_mount_trash_reaper() {
+        stopped_pass_keeps_mount_trash(true);
+    }
+
+    #[test]
+    fn retention_expired_pass_does_not_launch_mount_trash_reaper() {
+        stopped_pass_keeps_mount_trash(false);
+    }
+
     #[test]
     fn retention_reaper_resumes_interrupted_mount_point_retirement() {
         let (temp, _, _, path) = due_cache_fixture();
@@ -4010,13 +4103,23 @@ mod storage_retention_tests {
             }),
         );
         let mut report = SweepReport::default();
-        retire_due_cache(
+        let mut due = DueBatch::default();
+        let deadline = Instant::now() + PASS_BUDGET;
+        prepare_due_cache(
             temp.path(),
             &temp.path().join("views"),
             &scope,
             &bindings(temp.path()).unwrap(),
+            deadline,
+            &mut due,
+            &mut report,
+        )
+        .unwrap();
+        due.flush(
+            temp.path(),
             crate::pins::now_ms(),
-            Instant::now() + PASS_BUDGET,
+            deadline,
+            &Instant::now,
             &|| false,
             &mut report,
         )
