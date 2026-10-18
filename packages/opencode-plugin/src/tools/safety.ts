@@ -146,7 +146,11 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         }
 
         if (op === "restore") {
-          const preview = await callBridge(ctx, context, "checkpoint_paths", { name: args.name });
+          const previewParams: Record<string, unknown> = { name: args.name };
+          if (typeof args.path === "string") previewParams.file = expandTilde(args.path);
+          const previewFiles = coerceStringArray(args.files).map(expandTilde);
+          if (previewFiles.length > 0) previewParams.files = previewFiles;
+          const preview = await callBridge(ctx, context, "checkpoint_paths", previewParams);
           if (preview.success === false) {
             throw new Error(bridgeErrorMessage(preview, "checkpoint path preview failed"));
           }
