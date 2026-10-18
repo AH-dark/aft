@@ -173,7 +173,7 @@ fn resolve_in_path(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
     }
     std::env::split_paths(path).find_map(|directory| {
         let candidate = directory.join(program);
-        (executable_file(&candidate) && script_interpreter_is_available(&candidate, path))
+        (executable_file(&candidate) && script_interpreter_is_available(&candidate))
             .then_some(candidate)
     })
 }
@@ -189,7 +189,7 @@ fn executable_file(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn script_interpreter_is_available(script: &Path, path: &OsStr) -> bool {
+fn script_interpreter_is_available(script: &Path) -> bool {
     const SHEBANG_LIMIT: usize = 256;
 
     let Ok(mut file) = File::open(script) else {
@@ -231,35 +231,7 @@ fn script_interpreter_is_available(script: &Path, path: &OsStr) -> bool {
     if !executable_file(interpreter) {
         return false;
     }
-
-    // `/usr/bin/env NAME` starts env successfully even when NAME is absent, so
-    // check that bare tool against the same effective PATH before choosing the
-    // script. Other env option forms are left to the kernel and env itself.
-    if interpreter == Path::new("/usr/bin/env") && complete_line {
-        if let Some(name) = words.next() {
-            let has_extra_words = words.next().is_some();
-            if !has_extra_words
-                && !name.starts_with(b"-")
-                && !name.contains(&b'=')
-                && !name.contains(&b'/')
-                && !executable_named_in_path(OsStr::from_bytes(name), path)
-            {
-                return false;
-            }
-        }
-    }
     true
-}
-
-#[cfg(unix)]
-fn executable_named_in_path(program: &OsStr, path: &OsStr) -> bool {
-    if program.is_empty() || program.as_bytes().contains(&b'/') {
-        return false;
-    }
-    if !std::env::split_paths(path).all(|directory| directory.is_absolute()) {
-        return false;
-    }
-    std::env::split_paths(path).any(|directory| executable_file(&directory.join(program)))
 }
 
 /// On Windows the process PATH is already correct (registry-backed
@@ -1053,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_effective_path_skips_env_script_with_a_missing_tool() {
+    fn distinct_effective_path_preserves_env_script_execvp_behavior() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let name = "aft-path-probe-env-tool";
@@ -1071,9 +1043,19 @@ mod tests {
 
         let output = command_with_path(OsStr::new(name), &path)
             .output()
-            .expect("the env executable itself can start");
-        assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, b"later candidate ran");
+            .expect("the first candidate's env interpreter can start");
+        let shell_output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(name)
+            .env("PATH", &path)
+            .output()
+            .expect("run the same bare name through shell PATH lookup");
+
+        assert_eq!(output.status.code(), Some(127), "{output:?}");
+        assert_eq!(shell_output.status.code(), Some(127), "{shell_output:?}");
+        assert_eq!(output.stdout, shell_output.stdout);
+        assert_eq!(output.stderr, shell_output.stderr);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&missing));
     }
 
     use super::*;
