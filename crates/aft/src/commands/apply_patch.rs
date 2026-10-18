@@ -943,7 +943,8 @@ mod audit_regressions {
                 "source before".into(),
                 "destination after".into(),
                 "failed-move",
-                &mut backed
+                &mut backed,
+                false
             )
             .is_err());
             if existed {
