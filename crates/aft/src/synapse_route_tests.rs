@@ -6,6 +6,7 @@ use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VER
 #[derive(Default)]
 pub(crate) struct Counts {
     pub opens: usize,
+    pub closes: usize,
     pub active: usize,
     pub queries: usize,
     pub connections: usize,
@@ -18,10 +19,23 @@ pub(crate) struct Daemon {
     stop: tokio::sync::oneshot::Sender<()>,
     server: std::thread::JoinHandle<()>,
     release: tokio::sync::watch::Sender<bool>,
+    release_open: tokio::sync::watch::Sender<bool>,
 }
 
 impl Daemon {
     pub fn start(query_group: usize, disconnect_first_group: bool) -> Self {
+        Self::start_inner(query_group, disconnect_first_group, None)
+    }
+
+    pub fn with_held_consent_open(scope: Value) -> Self {
+        Self::start_inner(1, false, Some(scope))
+    }
+
+    fn start_inner(
+        query_group: usize,
+        disconnect_first_group: bool,
+        held_open_scope: Option<Value>,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("connection.json");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -48,6 +62,7 @@ impl Daemon {
         let recorded = counts.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::watch::channel(false);
+        let (release_open, open_released) = tokio::sync::watch::channel(false);
         let server = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -61,12 +76,15 @@ impl Daemon {
                             let key = key.clone();
                             let counts = recorded.clone();
                             let mut released = released.clone();
+                            let mut open_released = open_released.clone();
+                            let held_open_scope = held_open_scope.clone();
                             tasks.spawn(async move {
                                 subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "route-test", Duration::from_secs(2)).await.unwrap();
                                 counts.0.lock().unwrap().connections += 1;
                                 let mut active = 0;
                                 let mut pending = Vec::new();
                                 let mut held = Vec::new();
+                                let mut held_opens = Vec::new();
                                 let mut generation = 0;
                                 loop {
                                     let request = tokio::select! {
@@ -76,14 +94,22 @@ impl Daemon {
                                         },
                                         Ok(()) = released.changed() => {
                                             for (request, value) in held.drain(..) {
-                                                respond(&mut stream, &request, query_reply(&value), false).await;
+                                                respond(&mut stream, &request, value, false).await;
+                                            }
+                                            continue;
+                                        },
+                                        Ok(()) = open_released.changed() => {
+                                            for (request, value) in held_opens.drain(..) {
+                                                respond(&mut stream, &request, value, false).await;
                                             }
                                             continue;
                                         }
                                     };
                                     if request.header.ty == FrameType::Goodbye {
                                         active -= 1;
-                                        counts.0.lock().unwrap().active -= 1;
+                                        let mut count = counts.0.lock().unwrap();
+                                        count.active -= 1;
+                                        count.closes += 1;
                                         counts.1.notify_all();
                                         continue;
                                     }
@@ -95,12 +121,20 @@ impl Daemon {
                                             "operations":[{"name":"models.list","kind":"query"},{"name":"embed.query","kind":"query"},{"name":"embed.batch","kind":"query"},{"name":"rerank.score","kind":"query"}],
                                             "config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}],"subc_ops":["catalog.list","route.open"]}),
                                         Some("route.open") => {
-                                            let mut count = counts.0.lock().unwrap();
-                                            count.opens += 1;
-                                            generation = count.opens;
-                                            count.active += 1;
+                                            {
+                                                let mut count = counts.0.lock().unwrap();
+                                                count.opens += 1;
+                                                generation = count.opens;
+                                                count.active += 1;
+                                            }
                                             active += 1;
-                                            json!({"op":"route.open","route_channel":7,"route_epoch":1})
+                                            counts.1.notify_all();
+                                            let reply = json!({"op":"route.open","route_channel":6 + generation,"route_epoch":1});
+                                            if held_open_scope.as_ref() == Some(&value["scope"]) && !*open_released.borrow() {
+                                                held_opens.push((request, reply));
+                                                continue;
+                                            }
+                                            reply
                                         },
                                         _ if value["method"] == MODELS_LIST_OPERATION => json!({"models":[{"model":pause_test_support::MODEL,"fingerprint":"pinned","table_epoch":1,"dims":2,"recommended_batch":{"rows":100,"token_budget":8192}}]}),
                                         _ if value["method"] == QUERY_OPERATION || value["method"] == "rerank.score" => {
@@ -109,7 +143,7 @@ impl Daemon {
                                             match value["params"]["text"].as_str() {
                                                 Some("timeout") => continue,
                                                 Some("held") if !*released.borrow() => {
-                                                    held.push((request, value));
+                                                    held.push((request, query_reply(&value)));
                                                     continue;
                                                 },
                                                 Some("module-error") => {
@@ -145,6 +179,15 @@ impl Daemon {
                                             counts.1.notify_all();
                                             continue;
                                         },
+                                        _ if value["method"] == "consent.test_held" => {
+                                            counts.0.lock().unwrap().queries += 1;
+                                            counts.1.notify_all();
+                                            if !*released.borrow() {
+                                                held.push((request, json!({"result":{"ok":true}})));
+                                                continue;
+                                            }
+                                            json!({"result":{"ok":true}})
+                                        },
                                         _ if value["method"] == "consent.test_error" => {
                                             respond(&mut stream, &request, json!({"code":"test_refused","message":"refused"}), true).await;
                                             continue;
@@ -169,7 +212,16 @@ impl Daemon {
             stop,
             server,
             release,
+            release_open,
         }
+    }
+
+    pub fn release_consent_open(&self) {
+        self.release_open.send(true).unwrap();
+    }
+
+    pub fn release_replies(&self) {
+        self.release.send(true).unwrap();
     }
 
     pub fn config(&self, root: usize) -> SemanticBackendConfig {
