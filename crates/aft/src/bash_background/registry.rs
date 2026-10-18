@@ -5979,10 +5979,20 @@ impl BgTaskRegistry {
             crate::persisted_format::PersistedStore::BashTask,
             &root,
         );
+        let root_key = canonicalized_path(&root);
+        let memo = super::gc_memo::GcMemo::new(root_key.clone());
+        let walk = gc_batches(&root, root_key);
+        let mut pass = super::gc_memo::PassReport {
+            walk_finished: walk.finished,
+            root_missing: walk.missing,
+            error: walk.error,
+            ..super::gc_memo::PassReport::default()
+        };
         let mut retired = 0;
         {
-            for batch in gc_batches(&root) {
+            for batch in walk.batches {
                 let session_dir = batch.session;
+                pass.tasks += batch.ids.len();
                 // Replay recovery rewrites the metadata of every task it
                 // restores, so while it runs this directory's contents are
                 // mid-flight rather than abandoned. Judging a task from a
@@ -6024,7 +6034,29 @@ impl BgTaskRegistry {
                         .get_or_insert_with(|| registry.db_live_process_task_ids(&task_ids))
                         .contains(task_id)
                 };
+                // Stamped before any task in this batch is read, so a task
+                // layout created or removed beside them while the batch runs
+                // invalidates what this batch remembers about them.
+                let session_stamp = super::gc_memo::Stamp::of(&session_dir).ok();
                 for task_id in &task_ids {
+                    // A task judged not deletable on an earlier lap, whose
+                    // folders and metadata are unchanged since, is skipped
+                    // without opening anything (see `gc_memo`).
+                    if memo.still_waiting(
+                        &session_dir,
+                        session_stamp.as_ref(),
+                        task_id,
+                        PERSISTED_GC_GRACE,
+                        unix_millis(),
+                    ) {
+                        pass.unchanged += 1;
+                        continue;
+                    }
+                    pass.evaluated += 1;
+                    // Stamped before the resolver opens `control/` and `io/`
+                    // through it, so a folder replaced after this point never
+                    // matches a verdict remembered below.
+                    let task_dir_stamp = super::gc_memo::Stamp::of(&session_dir.join(task_id)).ok();
                     let resolved = match resolve_task_layout(&session_dir, &task_id) {
                         Ok(task) => task,
                         // Uncertainty never quarantines: if the age probe itself
@@ -6076,7 +6108,25 @@ impl BgTaskRegistry {
                             continue;
                         }
                     };
+                    // Taken before the metadata judged below is read: a write
+                    // after this point changes the stamp, so a verdict drawn
+                    // from older content is never trusted on a later lap.
+                    let mut evidence = session_stamp.and_then(|session| {
+                        let task_dir = match resolved.paths.layout {
+                            super::persistence::TaskLayout::Directory => Some(task_dir_stamp?),
+                            super::persistence::TaskLayout::Flat => None,
+                        };
+                        Some(super::gc_memo::Evidence {
+                            layout: resolved.paths.layout,
+                            session,
+                            task_dir,
+                            metadata: super::gc_memo::Stamp::of(&resolved.paths.json).ok()?,
+                        })
+                    });
                     if modified_within(&resolved.paths.json, PERSISTED_GC_GRACE) {
+                        if let Some(evidence) = evidence.take() {
+                            memo.remember_grace(&session_dir, task_id, evidence);
+                        }
                         continue;
                     }
                     let mut metadata = match read_task_at(&resolved) {
@@ -6136,14 +6186,40 @@ impl BgTaskRegistry {
                             metadata.finished_at = Some(finished_at);
                             metadata.duration_ms =
                                 Some(finished_at.saturating_sub(metadata.started_at));
-                            self.persist_task(&resolved.paths, &metadata)
-                                .map_err(|error| error.to_string())?;
+                            // The stamps predate this rewrite; nothing they
+                            // describe may be remembered.
+                            evidence = None;
+                            if let Err(error) = self.persist_task(&resolved.paths, &metadata) {
+                                pass.error = Some(format!(
+                                    "failed to persist recovered exit of background task {task_id}: {error}"
+                                ));
+                                memo.finish_pass(pass);
+                                return Err(error.to_string());
+                            }
                         }
                     }
                     let abandoned = abandoned_completion(&metadata, unix_millis());
                     if !metadata.status.is_terminal()
                         || (!metadata.completion_delivered && !abandoned)
                     {
+                        // Only a finished, undelivered result is remembered: a
+                        // delivery rewrites its metadata, and abandonment is
+                        // checked again on every visit. Unfinished tasks
+                        // depend on processes, so they are judged every time.
+                        if metadata.status.is_terminal() {
+                            if let Some(evidence) = evidence.take() {
+                                memo.remember_undelivered(
+                                    &session_dir,
+                                    task_id,
+                                    evidence,
+                                    super::gc_memo::AbandonmentInput {
+                                        finished_at: metadata.finished_at,
+                                        project_root: metadata.project_root.as_deref(),
+                                        workdir: &metadata.workdir,
+                                    },
+                                );
+                            }
+                        }
                         continue;
                     }
                     // Another project's registry may own this scratch removal.
@@ -6168,8 +6244,13 @@ impl BgTaskRegistry {
                         // Persist retirement before deleting the bundle so a
                         // failed delete is retried as delivered, never re-pushed.
                         metadata.completion_delivered = true;
-                        self.persist_task(&resolved.paths, &metadata)
-                            .map_err(|error| error.to_string())?;
+                        if let Err(error) = self.persist_task(&resolved.paths, &metadata) {
+                            pass.error = Some(format!(
+                                "failed to persist retirement of background task {task_id}: {error}"
+                            ));
+                            memo.finish_pass(pass);
+                            return Err(error.to_string());
+                        }
                         retired += 1;
                         self.inner
                             .retired_undelivered_completions
@@ -6198,6 +6279,7 @@ impl BgTaskRegistry {
             }
         }
         crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
+        memo.finish_pass(pass);
         gc_quarantine(storage_dir);
         Ok(deleted)
     }
@@ -10627,7 +10709,9 @@ fn task_artifacts_exist(session_dir: &Path, task_id: &str) -> bool {
 
 /// Quarantine history uses the same resumable iterator budget as task history.
 fn gc_quarantine(storage_dir: &Path) {
-    for batch in gc_batches(&storage_dir.join("bash-tasks-quarantine")) {
+    let root = storage_dir.join("bash-tasks-quarantine");
+    let key = canonicalized_path(&root);
+    for batch in gc_batches(&root, key).batches {
         for name in batch.names {
             let path = batch.session.join(name);
             if modified_within(&path, QUARANTINE_GC_GRACE) {
@@ -10649,35 +10733,66 @@ fn gc_quarantine(storage_dir: &Path) {
     }
 }
 
-fn gc_batches(root: &Path) -> Vec<super::gc_cursor::Batch> {
+/// One pass's share of a resumable walk over a GC root.
+struct GcWalk {
+    batches: Vec<super::gc_cursor::Batch>,
+    /// The walk reached the end of the root in this pass (or the root does
+    /// not exist); the next pass starts a new lap from the beginning.
+    finished: bool,
+    /// The root does not exist.
+    missing: bool,
+    /// The root exists but could not be read, so this pass saw nothing.
+    error: Option<String>,
+}
+
+/// The next budgeted slice of the walk over `root`, resuming where the
+/// previous pass over the same canonical root (`key`) stopped.
+fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
     static CURSORS: std::sync::OnceLock<Mutex<HashMap<PathBuf, super::gc_cursor::Cursor>>> =
         std::sync::OnceLock::new();
     let mut cursors = CURSORS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let key = canonicalized_path(root);
     if !cursors.contains_key(&key) {
         match super::gc_cursor::Cursor::new(root) {
             Ok(cursor) => {
                 cursors.insert(key.clone(), cursor);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return GcWalk {
+                    batches: Vec::new(),
+                    finished: true,
+                    missing: true,
+                    error: None,
+                }
+            }
             Err(error) => {
                 crate::slog_warn!(
                     "failed to read background GC root {}: {error}",
                     root.display()
                 );
-                return Vec::new();
+                return GcWalk {
+                    batches: Vec::new(),
+                    finished: false,
+                    missing: false,
+                    error: Some(format!("failed to read {}: {error}", root.display())),
+                };
             }
         }
     }
     let cursor = cursors.get_mut(&key).expect("GC cursor inserted");
     let batches = cursor.next_batch();
-    if cursor.finished {
+    let finished = cursor.finished;
+    if finished {
         cursors.remove(&key);
     }
-    batches
+    GcWalk {
+        batches,
+        finished,
+        missing: false,
+        error: None,
+    }
 }
 
 fn is_harness_store(path: &Path) -> bool {
@@ -10736,17 +10851,14 @@ fn gc_harness_stores(base: &Path) -> Vec<PathBuf> {
 }
 
 fn abandoned_completion(metadata: &PersistedTask, now_ms: u64) -> bool {
-    const ABANDONMENT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
     metadata.status.is_terminal()
         && !metadata.completion_delivered
-        && metadata
-            .finished_at
-            .is_some_and(|finished| now_ms.saturating_sub(finished) > ABANDONMENT_MS)
-        && metadata
-            .project_root
-            .as_ref()
-            .is_some_and(|root| matches!(root.try_exists(), Ok(false)))
-        && matches!(metadata.workdir.try_exists(), Ok(false))
+        && super::gc_memo::abandonment_due(
+            metadata.finished_at,
+            metadata.project_root.as_deref(),
+            &metadata.workdir,
+            now_ms,
+        )
 }
 
 fn read_for_token_count_from_disk(

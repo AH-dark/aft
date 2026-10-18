@@ -179,6 +179,213 @@ fn watchdog_cost_persisted_gc_is_bounded_at_directory_iterator() {
     assert!(paths.iter().all(|path| !path.json.exists()));
 }
 
+/// Rewrites a fixture's metadata the way the daemon does (atomic replacement)
+/// and backdates it past the modification grace.
+fn rewrite_fixture(paths: &TaskPaths, update: impl FnOnce(&mut PersistedTask)) {
+    let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id).unwrap();
+    let mut metadata = read_task_at(&resolved).unwrap();
+    update(&mut metadata);
+    write_task_at(&resolved, &metadata).unwrap();
+    filetime::set_file_mtime(
+        &paths.json,
+        filetime::FileTime::from_unix_time((unix_millis() / 1000) as i64 - 25 * 60 * 60, 0),
+    )
+    .unwrap();
+}
+
+/// A lap over a store where nothing is deletable must not be repeated on
+/// every later lap: a task whose files are unchanged is skipped without
+/// opening its folders or reading its metadata, and only the tasks that
+/// changed are opened again.
+#[test]
+fn watchdog_cost_persisted_gc_reopens_only_changed_tasks() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let mut paths = Vec::new();
+    for index in 0..300 {
+        // Finished two days ago, result never delivered, worktree gone: kept
+        // until delivered or seven days old.
+        paths.push(fixture(storage.path(), &format!("session-{}", index % 3), false, 2).1);
+    }
+    // Three sessions of 100 tasks are 307 directory-iterator steps per lap,
+    // three passes at 128 steps each; eight passes cover two whole laps.
+    for _ in 0..8 {
+        registry.maybe_gc_persisted(storage.path()).unwrap();
+    }
+    work_counts::reset();
+    for _ in 0..8 {
+        assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 0);
+    }
+    let unchanged = work_counts::get();
+    eprintln!("8 passes over 300 unchanged undeletable tasks: {unchanged:?}");
+    assert_eq!(
+        unchanged.metadata_reads, 0,
+        "unchanged undeletable tasks were reread on every lap: {unchanged:?}"
+    );
+    // The only opens left are the walk's own: the root and each session
+    // folder once per lap (at most three laps begun in eight passes), plus
+    // one attempt per pass to open the absent quarantine root.
+    assert!(
+        unchanged.opens <= 3 * 4 + 8,
+        "unchanged undeletable tasks were reopened on every lap: {unchanged:?}"
+    );
+
+    let changed = 5;
+    for path in paths.iter().step_by(37).take(changed) {
+        rewrite_fixture(path, |metadata| metadata.command.push_str(" # edited"));
+    }
+    work_counts::reset();
+    // Three passes from anywhere in the lap reach every task at least once.
+    for _ in 0..3 {
+        assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 0);
+    }
+    let after_change = work_counts::get();
+    eprintln!("3 passes after {changed} rewrites: {after_change:?}");
+    assert!(
+        after_change.metadata_reads >= changed && after_change.metadata_reads <= 2 * changed,
+        "expected only the {changed} rewritten tasks to be read again: {after_change:?}"
+    );
+    assert!(paths.iter().all(|path| path.json.exists()));
+}
+
+fn gc_health(storage: &Path) -> crate::bash_background::PersistedGcHealth {
+    super::super::gc_memo::persisted_gc_health_for(&canonicalized_path(&storage.join("bash-tasks")))
+        .expect("sweep health recorded")
+}
+
+/// Runs sweep passes until `laps` laps over the store have completed.
+fn gc_until_lap(registry: &BgTaskRegistry, storage: &Path, laps: u64) {
+    for _ in 0..64 {
+        registry.maybe_gc_persisted(storage).unwrap();
+        if gc_health(storage).laps_completed >= laps {
+            return;
+        }
+    }
+    panic!("the sweep never completed lap {laps}");
+}
+
+/// Remembering undeletable tasks must not delay or prevent deletion: a pass
+/// that runs out of budget says so and the next resumes where it stopped,
+/// deletable tasks are all removed within one lap, and a remembered task that
+/// becomes deletable (its result is delivered) is removed on the next lap.
+#[test]
+fn watchdog_cost_persisted_gc_resumes_partial_pass_and_still_deletes() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let mut due = Vec::new();
+    let mut kept = Vec::new();
+    for index in 0..400 {
+        if index % 2 == 0 {
+            due.push(fixture(storage.path(), "session", true, 2).1);
+        } else {
+            kept.push(fixture(storage.path(), "session", false, 2).1);
+        }
+    }
+
+    let first = registry.maybe_gc_persisted(storage.path()).unwrap();
+    let health = gc_health(storage.path());
+    assert!(
+        health.last_pass_out_of_budget,
+        "a pass that stopped at its budget did not say so: {health:?}"
+    );
+    assert!(health.last_pass_tasks < 128, "{health:?}");
+    assert_eq!(health.last_pass_evaluated, health.last_pass_tasks);
+    assert!(first > 0 && first < due.len(), "first pass deleted {first}");
+
+    let second = registry.maybe_gc_persisted(storage.path()).unwrap();
+    let health = gc_health(storage.path());
+    assert!(second > 0, "the second pass made no progress");
+    // Resumed past the first pass: none of its tasks were reached again.
+    assert_eq!(health.last_pass_unchanged, 0, "{health:?}");
+    assert_eq!(health.last_pass_evaluated, health.last_pass_tasks);
+
+    gc_until_lap(&registry, storage.path(), 1);
+    let health = gc_health(storage.path());
+    assert!(!health.last_pass_out_of_budget, "{health:?}");
+    assert!(health.last_error.is_none(), "{health:?}");
+    assert_eq!(health.remembered_tasks, kept.len(), "{health:?}");
+    assert!(
+        due.iter().all(|path| !path.dir.exists()),
+        "a delivered task survived a whole lap"
+    );
+    assert!(kept.iter().all(|path| path.json.exists()));
+
+    // Deleting the delivered tasks changed their session folder, which is
+    // part of every remembered verdict there, so the next lap judges the kept
+    // tasks once more. The lap after that judges nothing.
+    gc_until_lap(&registry, storage.path(), 2);
+    for _ in 0..8 {
+        registry.maybe_gc_persisted(storage.path()).unwrap();
+        let health = gc_health(storage.path());
+        assert_eq!(health.last_pass_evaluated, 0, "{health:?}");
+        if health.laps_completed >= 3 {
+            break;
+        }
+    }
+
+    rewrite_fixture(&kept[0], |metadata| metadata.completion_delivered = true);
+    let laps = gc_health(storage.path()).laps_completed;
+    gc_until_lap(&registry, storage.path(), laps + 1);
+    assert!(
+        !kept[0].dir.exists(),
+        "a remembered task stayed after its result was delivered"
+    );
+    assert!(kept[1..].iter().all(|path| path.json.exists()));
+    assert_eq!(
+        gc_health(storage.path()).remembered_tasks,
+        kept.len() - 1,
+        "the deleted task's verdict outlived it"
+    );
+}
+
+/// A task store that exists but cannot be walked is reported on the health
+/// surface; the pass must not look like a sweep that found nothing to do.
+#[test]
+fn watchdog_cost_unreadable_task_store_is_reported_not_treated_as_empty() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    fs::write(storage.path().join("bash-tasks"), b"not a folder").unwrap();
+    assert_eq!(registry.maybe_gc_persisted(storage.path()).unwrap(), 0);
+    let health = gc_health(storage.path());
+    assert!(health.last_error.is_some(), "{health:?}");
+    assert_eq!(health.laps_completed, 0, "{health:?}");
+    assert!(crate::bash_background::persisted_gc_health().roots_failing >= 1);
+}
+
+/// Abandonment depends on the worktree existing, not on the task's files, so
+/// a remembered undelivered result is retired once its worktree is deleted.
+#[test]
+fn watchdog_cost_remembered_task_is_retired_when_its_worktree_goes() {
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let worktree = storage.path().join("worktree");
+    fs::create_dir_all(&worktree).unwrap();
+    let (_, paths) = fixture(storage.path(), "session", false, 8);
+    rewrite_fixture(&paths, |metadata| {
+        metadata.project_root = Some(worktree.clone());
+    });
+    gc_until_lap(&registry, storage.path(), 1);
+    assert!(
+        paths.json.exists(),
+        "a result whose worktree exists was retired"
+    );
+    assert_eq!(gc_health(storage.path()).remembered_tasks, 1);
+
+    fs::remove_dir_all(&worktree).unwrap();
+    registry.maybe_gc_persisted(storage.path()).unwrap();
+    assert!(
+        !paths.dir.exists(),
+        "a remembered result outlived its deleted worktree"
+    );
+    assert_eq!(
+        registry
+            .try_health_counts()
+            .unwrap()
+            .retired_undelivered_completions,
+        1
+    );
+}
+
 #[test]
 fn watchdog_cost_abandonment_requires_both_paths_missing_and_seven_days() {
     let storage = tempfile::tempdir().unwrap();
