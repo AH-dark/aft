@@ -18,19 +18,55 @@ type Key = (PathBuf, Vec<u8>);
 #[derive(Default)]
 struct State {
     generation: u64,
-    running: bool,
+    running: Option<Arc<RunningScan>>,
     result: Option<ApplicabilityWalk>,
 }
 
 #[derive(Default)]
 struct Flight {
     state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct Completion {
+    finished: bool,
+    result: Option<Result<ApplicabilityWalk, ApplicabilityResolutionError>>,
+}
+
+#[derive(Default)]
+struct RunningScan {
+    generation: u64,
+    completion: Mutex<Completion>,
     changed: Condvar,
+}
+
+struct ScanGuard<'a> {
+    flight: &'a Flight,
+    scan: Arc<RunningScan>,
+}
+
+impl Drop for ScanGuard<'_> {
+    fn drop(&mut self) {
+        // Unwinding must release both the root's reservation and callers parked
+        // on this scan. A missing result tells those callers to try a new scan.
+        let mut state = self.flight.state.lock();
+        if state
+            .running
+            .as_ref()
+            .is_some_and(|scan| Arc::ptr_eq(scan, &self.scan))
+        {
+            state.running = None;
+        }
+        self.scan.completion.lock().finished = true;
+        self.scan.changed.notify_all();
+    }
 }
 
 #[derive(Default)]
 pub(super) struct ApplicabilityCache {
     entries: Mutex<HashMap<Key, Arc<Flight>>>,
+    #[cfg(test)]
+    waiter_joined: (Mutex<bool>, Condvar),
 }
 
 pub(super) fn shared() -> &'static ApplicabilityCache {
@@ -39,6 +75,24 @@ pub(super) fn shared() -> &'static ApplicabilityCache {
 }
 
 impl ApplicabilityCache {
+    #[cfg(test)]
+    pub(super) fn wait_for_waiter_for_test(&self, deadline: Instant) -> bool {
+        let (joined, changed) = &self.waiter_joined;
+        let mut joined = joined.lock();
+        while !*joined {
+            if changed.wait_until(&mut joined, deadline).timed_out() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn note_waiter_for_test(&self) {
+        *self.waiter_joined.0.lock() = true;
+        self.waiter_joined.1.notify_all();
+    }
+
     pub(super) fn walk(
         &self,
         root: &Path,
@@ -71,25 +125,56 @@ impl ApplicabilityCache {
             if let Some(result) = &state.result {
                 return Ok(result.clone());
             }
-            if state.running {
-                flight.changed.wait_until(&mut state, deadline);
+            if let Some(running) = &state.running {
+                let running = Arc::clone(running);
+                let joined_generation = running.generation == state.generation;
+                drop(state);
+                let mut completion = running.completion.lock();
+                #[cfg(test)]
+                self.note_waiter_for_test();
+                while !completion.finished {
+                    if running
+                        .changed
+                        .wait_until(&mut completion, deadline)
+                        .timed_out()
+                    {
+                        return Err(ApplicabilityResolutionError::RequestDeadline {
+                            root: root.into(),
+                        });
+                    }
+                }
+                // Retain a per-scan completion for its original waiter cohort.
+                // Later binds must not consume a result invalidated before they
+                // arrived, even if they waited for that scan to release the root.
+                if joined_generation {
+                    if let Some(result) = &completion.result {
+                        return result.clone();
+                    }
+                }
                 continue;
             }
-            state.running = true;
-            let generation = state.generation;
+            let running = Arc::new(RunningScan {
+                generation: state.generation,
+                ..RunningScan::default()
+            });
+            state.running = Some(Arc::clone(&running));
             drop(state);
+            let guard = ScanGuard {
+                flight: &flight,
+                scan: Arc::clone(&running),
+            };
             let result = scan();
             let mut state = flight.state.lock();
-            state.running = false;
-            flight.changed.notify_all();
-            // A watcher event during a scan invalidates that scan too, not
-            // just the result of the next bind. Retry against the new tree.
-            if state.generation != generation {
-                continue;
+            // Under continuous edits, returning one uncached scan preserves the
+            // uncached walk's progress. Only unchanged scans may serve new binds.
+            if state.generation == running.generation {
+                if let Ok(walk) = &result {
+                    state.result = Some(walk.clone());
+                }
             }
-            if let Ok(walk) = &result {
-                state.result = Some(walk.clone());
-            }
+            drop(state);
+            running.completion.lock().result = Some(result.clone());
+            drop(guard);
             return result;
         }
     }

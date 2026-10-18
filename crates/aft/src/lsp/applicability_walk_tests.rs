@@ -129,33 +129,139 @@ fn applicability_walk_manifest_change_invalidates_from_watcher() {
 }
 
 #[test]
-fn applicability_walk_manifest_change_during_scan_is_not_cached() {
+fn applicability_walk_invalidation_returns_uncached_result_to_parked_callers() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let config = config(&root);
     let cache = ApplicabilityCache::default();
-    let mut scans = 0;
-    let walk = cache
+    let scans = std::sync::atomic::AtomicUsize::new(0);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let (caller, waiter) = std::thread::scope(|scope| {
+        let caller = scope.spawn(|| {
+            cache.walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(5),
+                || {
+                    let attempt = scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let result = scan(&root, &config);
+                    if attempt == 0 {
+                        started_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    Ok(result)
+                },
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let waiter = scope.spawn(|| {
+            cache.walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(5),
+                || {
+                    scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(scan(&root, &config))
+                },
+            )
+        });
+        assert!(cache.wait_for_waiter_for_test(Instant::now() + Duration::from_secs(5)));
+        std::fs::write(root.join("new.py"), "").unwrap();
+        cache.invalidate(&root);
+        release_tx.send(()).unwrap();
+        (
+            caller.join().unwrap().unwrap(),
+            waiter.join().unwrap().unwrap(),
+        )
+    });
+    assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(caller.candidates.is_empty());
+    assert_eq!(signature(&caller), signature(&waiter));
+    let next = cache
         .walk(
             &root,
             &config,
-            Instant::now() + Duration::from_secs(10),
+            Instant::now() + Duration::from_secs(5),
             || {
-                scans += 1;
-                let result = scan(&root, &config);
-                if scans == 1 {
-                    std::fs::write(root.join("new.py"), "").unwrap();
-                    cache.invalidate(&root);
-                }
-                Ok(result)
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(scan(&root, &config))
             },
         )
         .unwrap();
-    assert_eq!(scans, 2);
-    assert!(walk
+    assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(next
         .candidates
         .iter()
         .any(|c| c.key.kind == ServerKind::Python));
+}
+
+#[test]
+fn applicability_walk_panic_releases_flight_for_next_caller() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    std::fs::write(root.join("main.py"), "").unwrap();
+    let config = config(&root);
+    let cache = ApplicabilityCache::default();
+    let scans = std::sync::atomic::AtomicUsize::new(0);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let recovered = std::thread::scope(|scope| {
+        let caller = scope.spawn(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cache.walk(
+                    &root,
+                    &config,
+                    Instant::now() + Duration::from_secs(5),
+                    || {
+                        scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        started_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        panic!("injected scan panic");
+                    },
+                )
+            }))
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let waiter = scope.spawn(|| {
+            cache.walk(
+                &root,
+                &config,
+                Instant::now() + Duration::from_secs(2),
+                || {
+                    scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(scan(&root, &config))
+                },
+            )
+        });
+        assert!(cache.wait_for_waiter_for_test(Instant::now() + Duration::from_secs(5)));
+        release_tx.send(()).unwrap();
+        assert!(caller.join().unwrap().is_err());
+        waiter
+            .join()
+            .unwrap()
+            .expect("panic must release the parked caller, not leave it waiting for its deadline")
+    });
+    let next = cache
+        .walk(
+            &root,
+            &config,
+            Instant::now() + Duration::from_secs(2),
+            || panic!("the successful recovery scan should be cached"),
+        )
+        .unwrap();
+    assert_eq!(signature(&next), signature(&recovered));
+    assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 #[test]
