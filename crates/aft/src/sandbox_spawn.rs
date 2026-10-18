@@ -7205,6 +7205,55 @@ mod git_policy_cache_tests {
         assert_eq!(fixture.resolve().1, 0, "the owner should still publish");
     }
 
+    /// The simulated-expiry tests skip the condvar wait. This one keeps the
+    /// real deadline: a waiter behind a stalled owner must neither bypass it at
+    /// once nor wait past its own deadline.
+    #[test]
+    fn git_policy_cache_waiter_honours_its_real_wait_deadline() {
+        let fixture = Fixture::new();
+        let key = git_policy_cache_key(&fixture.root, &git_policy_environment(&fixture.root), true)
+            .unwrap();
+        git_policy_cache().lock().unwrap().remove(&key);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        fixture.state(|state| {
+            state.uncached_gate = Some(GitPolicyTestUncachedGate {
+                entered: entered_tx,
+                release: release_rx,
+            })
+        });
+        let owner_root = fixture.root.clone();
+        let owner =
+            std::thread::spawn(move || with_worker_jail(true, || resolve_git_policy(&owner_root)));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("miss owner did not enter uncached resolution");
+
+        let (waiter_result_tx, waiter_result_rx) = std::sync::mpsc::channel();
+        let waiter_root = fixture.root.clone();
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = with_worker_jail(true, || resolve_git_policy(&waiter_root));
+            let _ = waiter_result_tx.send((result, started.elapsed()));
+        });
+        // Generous hang guard: a waiter that ignores its deadline never returns
+        // while the owner is held.
+        let waited = waiter_result_rx.recv_timeout(Duration::from_secs(60));
+        release_tx.send(false).unwrap();
+        owner.join().unwrap().expect("miss owner resolution failed");
+        waiter.join().unwrap();
+
+        let (result, elapsed) =
+            waited.expect("waiter did not stop waiting at its deadline while the owner was held");
+        result.expect("waiter policy resolution failed");
+        // The deadline is taken inside the call, so on a monotonic clock a
+        // waiter that really waited cannot return sooner than the budget.
+        assert!(
+            elapsed >= GIT_POLICY_FLIGHT_WAIT_TIMEOUT,
+            "waiter bypassed the in-flight owner after {elapsed:?}, before its {GIT_POLICY_FLIGHT_WAIT_TIMEOUT:?} deadline"
+        );
+    }
+
     #[test]
     fn git_policy_cache_uncached_owner_hands_off_to_next_flight() {
         let fixture = Fixture::new();
