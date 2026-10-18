@@ -2089,6 +2089,13 @@ mod tests {
 
     fn measured_grep(ctx: &AppContext) -> (Duration, usize, usize) {
         let budget = crate::bounded_io::Budget::after(Duration::from_secs(60));
+        measured_grep_with_budget(ctx, budget)
+    }
+
+    fn measured_grep_with_budget(
+        ctx: &AppContext,
+        budget: crate::bounded_io::Budget,
+    ) -> (Duration, usize, usize) {
         let request = crate::protocol::RawRequest {
             id: "grep-io-measurement".into(),
             command: "grep".into(),
@@ -2126,6 +2133,64 @@ mod tests {
         let (_, spawns, round_trips) = pool.install(|| measured_grep(&ctx));
         assert!(spawns > 0);
         assert!(spawns <= 132 && round_trips <= 132, "the fallback walk must reuse its bounded helper: spawns={spawns} round_trips={round_trips}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn ten_thousand_file_grep_keeps_root_probe_budget_after_queueing() {
+        // The probe is held queued for QUEUE_HOLD, then held running for
+        // RUNNING_HOLD: their sum exceeds the cap, so the probe fails if queue
+        // time is charged to it. Each hold alone stays well below the cap,
+        // because on a loaded runner the release and the real root access that
+        // follows it can take seconds; a 1.5 s margin was not enough in CI.
+        const ROOT_ACCESS_CAP: Duration = Duration::from_secs(12);
+        const QUEUE_HOLD: Duration = Duration::from_secs(8);
+        const RUNNING_HOLD: Duration = Duration::from_secs(6);
+        let (_fixture, ctx) = grep_io_fixture();
+        let root = project_root(&ctx);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for indexed in [true, false] {
+            if !indexed {
+                *ctx.search_index().write().unwrap() = None;
+            }
+            let queued = crate::bounded_io::stall_helper(&root);
+            let running = crate::bounded_io::stall_running_helper(&root);
+            let budget = crate::bounded_io::Budget::after(Duration::from_secs(60))
+                .with_path_access_budget(&root, ROOT_ACCESS_CAP);
+            let observed = budget.clone();
+            std::thread::scope(|scope| {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let pool = &pool;
+                let ctx = &ctx;
+                let caller = scope.spawn(move || {
+                    let result = pool.install(|| measured_grep_with_budget(ctx, budget));
+                    let _ = done_tx.send(());
+                    result
+                });
+                queued
+                    .reached
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+                // The first helper is command admission's metadata(root), before
+                // the root listing or any indexed/fallback candidate reads.
+                let cold_measurements = observed.measurements();
+                let before_start = done_rx.recv_timeout(QUEUE_HOLD);
+                drop(queued);
+                let started = running.reached.recv_timeout(Duration::from_secs(30));
+                let before_release = done_rx.recv_timeout(RUNNING_HOLD);
+                drop(running);
+                let (_, spawns, round_trips) = caller.join().unwrap();
+                assert_eq!(cold_measurements.1, 1);
+                assert!(before_start.is_err());
+                started.expect("the fixture-root metadata helper must start");
+                assert!(before_release.is_err());
+                assert!(spawns <= 132 && round_trips <= 132,
+                    "indexed={indexed}: directory probes, not per-file helpers: spawns={spawns} round_trips={round_trips}");
+            });
+        }
     }
 
     #[test]

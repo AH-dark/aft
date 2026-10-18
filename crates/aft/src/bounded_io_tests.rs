@@ -9,10 +9,13 @@ struct HelperGate {
 
 static HELPER_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static RUNNING_GATES: LazyLock<Mutex<HashMap<PathBuf, HelperGate>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(unix)]
 pub(crate) struct HelperStall {
     path: PathBuf,
+    gates: &'static Mutex<HashMap<PathBuf, HelperGate>>,
     pub(crate) reached: Receiver<()>,
     release: Sender<()>,
     finished: Receiver<()>,
@@ -21,7 +24,7 @@ pub(crate) struct HelperStall {
 #[cfg(unix)]
 impl Drop for HelperStall {
     fn drop(&mut self) {
-        HELPER_GATES.lock().unwrap().remove(&self.path);
+        self.gates.lock().unwrap().remove(&self.path);
         if self.release.send(()).is_ok() {
             let _ = self.finished.recv_timeout(IO_BUDGET);
         }
@@ -30,10 +33,23 @@ impl Drop for HelperStall {
 
 #[cfg(unix)]
 pub(crate) fn stall_helper(path: &Path) -> HelperStall {
+    stall_helper_at(path, &HELPER_GATES)
+}
+
+#[cfg(unix)]
+pub(crate) fn stall_running_helper(path: &Path) -> HelperStall {
+    stall_helper_at(path, &RUNNING_GATES)
+}
+
+#[cfg(unix)]
+fn stall_helper_at(
+    path: &Path,
+    gates: &'static Mutex<HashMap<PathBuf, HelperGate>>,
+) -> HelperStall {
     let (reached, reached_rx) = channel();
     let (release, release_rx) = channel();
     let (finished, finished_rx) = channel();
-    HELPER_GATES.lock().unwrap().insert(
+    gates.lock().unwrap().insert(
         path.to_path_buf(),
         HelperGate {
             reached,
@@ -43,6 +59,7 @@ pub(crate) fn stall_helper(path: &Path) -> HelperStall {
     );
     HelperStall {
         path: path.to_path_buf(),
+        gates,
         reached: reached_rx,
         release,
         finished: finished_rx,
@@ -53,7 +70,15 @@ static BLOCKED_DIRECTORIES: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> 
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(super) fn before_helper(path: &Path) {
-    let gate = HELPER_GATES.lock().unwrap().remove(path);
+    wait_at_gate(path, &HELPER_GATES);
+}
+
+pub(super) fn after_helper_start(path: &Path) {
+    wait_at_gate(path, &RUNNING_GATES);
+}
+
+fn wait_at_gate(path: &Path, gates: &Mutex<HashMap<PathBuf, HelperGate>>) {
+    let gate = gates.lock().unwrap().remove(path);
     if let Some(gate) = gate {
         let _ = gate.reached.send(());
         let _ = gate.release.recv();
@@ -394,6 +419,262 @@ fn saturated_limiter_is_queue_timeout_and_does_not_start_work() {
         response.data["code"], "read_io_queue_timeout",
         "{response:?}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_time_does_not_consume_running_access_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queued-then-healthy");
+    let gate = stall_helper(&path);
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (result_tx, result_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        result_tx
+            .send(with_budget(
+                Some(Budget::after(Duration::from_secs(5))),
+                || {
+                    run_with_timeout(
+                        &path,
+                        None,
+                        Arc::new(Limiter::new(1)),
+                        Duration::from_secs(1),
+                        None,
+                        move |_| {
+                            started_tx.send(()).unwrap();
+                            let _ = release_rx.recv();
+                            Ok(42)
+                        },
+                    )
+                },
+            ))
+            .unwrap();
+    });
+    gate.reached.recv_timeout(IO_BUDGET).unwrap();
+    // Model a loaded runner that schedules the helper late, then a healthy
+    // operation taking less than its own access budget, but not the leftover.
+    assert!(result_rx.recv_timeout(Duration::from_millis(750)).is_err());
+    drop(gate);
+    let started = started_rx.recv_timeout(IO_BUDGET);
+    let early = result_rx.recv_timeout(Duration::from_millis(500));
+    let _ = release_tx.send(());
+    caller.join().unwrap();
+    started.expect("the filesystem operation must actually start");
+    let result = early.unwrap_or_else(|_| result_rx.recv_timeout(IO_BUDGET).unwrap());
+    assert_eq!(
+        result.unwrap(),
+        42,
+        "queueing must not exhaust the access cap"
+    );
+}
+
+#[test]
+fn running_access_keeps_shorter_request_deadline() {
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (finished_tx, finished_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        with_budget(Some(Budget::after(Duration::from_millis(80))), || {
+            run_with_timeout(
+                Path::new("running-past-request"),
+                None,
+                Arc::new(Limiter::new(1)),
+                Duration::from_secs(1),
+                None,
+                move |_| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                    let _ = finished_tx.send(());
+                    Ok(())
+                },
+            )
+        })
+    });
+    let started = started_rx.recv_timeout(IO_BUDGET);
+    let error = caller.join().unwrap().unwrap_err();
+    let _ = release_tx.send(());
+    finished_rx.recv_timeout(IO_BUDGET).unwrap();
+    started.expect("the filesystem operation must actually start");
+    assert_eq!(timeout_code(&error), "read_blocked");
+    let message = error.to_string();
+    let duration = message
+        .split_once("within ")
+        .unwrap()
+        .1
+        .split_once(" s")
+        .unwrap()
+        .0
+        .parse::<f64>()
+        .unwrap();
+    assert!((0.0..=0.080).contains(&duration), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_time_without_request_budget_does_not_consume_running_access_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queued-without-request-budget");
+    let gate = stall_helper(&path);
+    let (started_tx, started_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (result_tx, result_rx) = channel();
+    let caller = std::thread::spawn(move || {
+        assert!(current().is_none(), "this call must have no request budget");
+        result_tx
+            .send(run_with_timeout(
+                &path,
+                None,
+                Arc::new(Limiter::new(1)),
+                Duration::from_secs(1),
+                None,
+                move |_| {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    Ok(42)
+                },
+            ))
+            .unwrap();
+    });
+    gate.reached.recv_timeout(IO_BUDGET).unwrap();
+    assert!(result_rx.recv_timeout(Duration::from_millis(750)).is_err());
+    drop(gate);
+    let started = started_rx.recv_timeout(IO_BUDGET);
+    let early = result_rx.recv_timeout(Duration::from_millis(500));
+    let _ = release_tx.send(());
+    caller.join().unwrap();
+    started.expect("the filesystem operation must actually start");
+    let result = early.unwrap_or_else(|_| result_rx.recv_timeout(IO_BUDGET).unwrap());
+    assert_eq!(result.unwrap(), 42, "queueing is not a request deadline");
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_probe_waiter_follows_queued_then_running_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let queued = stall_helper(&path);
+    let running = stall_running_helper(&path);
+    let budget = Budget::after(Duration::from_secs(20));
+    let owner_path = path.clone();
+    let owner_budget = budget.clone();
+    let owner = std::thread::spawn(move || {
+        with_budget(Some(owner_budget), || probe_directory(&owner_path, None))
+    });
+    queued.reached.recv_timeout(IO_BUDGET).unwrap();
+    let (waiting_tx, waiting_rx) = channel();
+    let (result_tx, result_rx) = channel();
+    let waiter_budget = budget.clone();
+    let waiter = std::thread::spawn(move || {
+        with_budget(Some(waiter_budget), || {
+            waiting_tx.send(()).unwrap();
+            result_tx.send(probe_directory(&path, None)).unwrap();
+        });
+    });
+    waiting_rx.recv_timeout(IO_BUDGET).unwrap();
+    // Neither phase exceeds the access cap, but their sum exceeds the old
+    // waiter's fixed five-second allowance.
+    assert!(result_rx.recv_timeout(Duration::from_millis(3750)).is_err());
+    drop(queued);
+    running.reached.recv_timeout(IO_BUDGET).unwrap();
+    let early = result_rx.recv_timeout(Duration::from_millis(2500));
+    drop(running);
+    let owner_result = owner.join().unwrap();
+    waiter.join().unwrap();
+    let result = early.unwrap_or_else(|_| result_rx.recv_timeout(IO_BUDGET).unwrap());
+    result.expect("a shared waiter must receive the healthy owner's result");
+    owner_result.unwrap();
+    assert_eq!(budget.measurements(), (1, 1), "the probe must be shared");
+    assert!(!budget.failed.load(Ordering::Acquire));
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_probe_waiter_keeps_shorter_request_deadline_after_owner_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let queued = stall_helper(&path);
+    let running = stall_running_helper(&path);
+    let budget = Budget::after(Duration::from_secs(10));
+    let owner_path = path.clone();
+    let owner_budget = budget.clone();
+    let owner = std::thread::spawn(move || {
+        with_budget(Some(owner_budget), || probe_directory(&owner_path, None))
+    });
+    queued.reached.recv_timeout(IO_BUDGET).unwrap();
+    let (waiting_tx, waiting_rx) = channel();
+    let (result_tx, result_rx) = channel();
+    let waiter = std::thread::spawn(move || {
+        with_budget(Some(budget), || {
+            let at = Instant::now() + Duration::from_millis(500);
+            waiting_tx.send(at).unwrap();
+            result_tx.send(probe_directory(&path, Some(at))).unwrap();
+        });
+    });
+    let at = waiting_rx.recv_timeout(IO_BUDGET).unwrap();
+    assert!(result_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(queued);
+    running.reached.recv_timeout(IO_BUDGET).unwrap();
+    let result = result_rx.recv_timeout(Duration::from_secs(2));
+    let finished = Instant::now();
+    drop(running);
+    let _ = owner.join().unwrap();
+    waiter.join().unwrap();
+    let error = result.unwrap().unwrap_err();
+    assert_eq!(timeout_code(&error), "read_io_queue_timeout", "{error}");
+    assert!(finished >= at, "the waiter must not expire early");
+    assert!(finished < at + Duration::from_secs(1));
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn shared_probe_waiters_preserve_owner_queue_and_access_timeout_codes() {
+    for running in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let gate = if running {
+            stall_running_helper(&path)
+        } else {
+            stall_helper(&path)
+        };
+        let budget =
+            Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_millis(200));
+        let owner_path = path.clone();
+        let owner_budget = budget.clone();
+        let (owner_tx, owner_rx) = channel();
+        let owner = std::thread::spawn(move || {
+            let result = with_budget(Some(owner_budget), || probe_directory(&owner_path, None));
+            owner_tx.send(result).unwrap();
+        });
+        gate.reached.recv_timeout(IO_BUDGET).unwrap();
+        let (result_tx, result_rx) = channel();
+        let waiter = std::thread::spawn(move || {
+            with_budget(Some(budget), || {
+                result_tx.send(probe_directory(&path, None)).unwrap();
+            });
+        });
+        // A loaded runner can delay the test thread past an arbitrary short
+        // grace period while the timed-out helpers are still waiting at this gate.
+        // Observe both deadline results before releasing the helper.
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the shared-probe waiter must observe its deadline");
+        let owner_result = owner_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the shared-probe owner must observe its deadline");
+        drop(gate);
+        owner.join().unwrap();
+        waiter.join().unwrap();
+        let owner_error = owner_result.unwrap_err();
+        let waiter_error = result.unwrap_err();
+        let expected = if running {
+            "read_blocked"
+        } else {
+            "read_io_queue_timeout"
+        };
+        assert_eq!(timeout_code(&owner_error), expected, "{owner_error}");
+        assert_eq!(timeout_code(&waiter_error), expected, "{waiter_error}");
+    }
 }
 
 #[test]
