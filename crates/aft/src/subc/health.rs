@@ -646,7 +646,13 @@ impl DispatchPathMetrics {
                 .and_then(Value::as_u64)
                 .is_some();
         let (deadline, deadline_class_ms) = if name == "bash" {
-            let deadline = client_deadline;
+            let deadline = client_deadline.or_else(|| {
+                if client_deadline_supplied {
+                    None
+                } else {
+                    received_at.checked_add(UNANSWERED_TOOL_DEADLINE)
+                }
+            });
             let class_ms = deadline.map(|deadline| {
                 deadline
                     .saturating_duration_since(received_at)
@@ -3323,6 +3329,39 @@ mod tests {
     }
 
     #[test]
+    fn bash_call_without_submission_keeps_fallback_watchdog_deadline() {
+        use std::cell::RefCell;
+
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let request = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            24,
+            1,
+            1187,
+            serde_json::to_vec(&serde_json::json!({"name":"bash"})).unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&request, now);
+
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(24), &sink);
+        assert!(lines.borrow().is_empty());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(25), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1187"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(30), &sink);
+        assert_eq!(
+            lines.borrow().len(),
+            1,
+            "warn only once per unanswered call"
+        );
+    }
+
+    #[test]
     fn bash_deadline_watchdog_uses_each_calls_effective_deadline() {
         use std::cell::RefCell;
 
@@ -3347,14 +3386,7 @@ mod tests {
 
         let waiting = request(1188, serde_json::json!({"wait": true}));
         let waiting_deadline = super::super::bash::unanswered_bash_reply_deadline(
-            now,
-            &serde_json::json!({"wait": true}),
-            20_000,
-            120_000,
-            false,
-            false,
-            15_000,
-            None,
+            now, 120_000, 15_000, None, 1_800_000,
         );
         metrics.tool_received(&waiting, now);
         metrics.set_bash_unanswered_deadline(
@@ -3364,16 +3396,8 @@ mod tests {
         );
 
         let expiring = request(1189, serde_json::json!({"timeout": 5_000}));
-        let expiring_deadline = super::super::bash::unanswered_bash_reply_deadline(
-            now,
-            &serde_json::json!({"timeout": 5_000}),
-            20_000,
-            120_000,
-            false,
-            false,
-            20_000,
-            None,
-        );
+        let expiring_deadline =
+            super::super::bash::unanswered_bash_reply_deadline(now, 20_000, 20_000, None, 5_000);
         metrics.tool_received(&expiring, now);
         metrics.set_bash_unanswered_deadline(
             super::super::route_key(24, 1),
