@@ -307,10 +307,31 @@ fn github_diff_recorded_gh_reads_and_pages_through_protocol() {
     let bin = project.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
     let metadata = include_str!("../../src/github_read/fixtures/pr-42-diff-metadata.json");
-    let files = serde_json::from_str::<Value>(metadata).unwrap()["files"].to_string();
+    // `gh api --paginate --jq` applies the filter to each page and prints one
+    // compact JSON value per line, so the double answers with what the real
+    // projection prints, not with the raw page.
+    let files = serde_json::from_str::<Value>(metadata).unwrap()["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| json!({"path": file["path"], "previousPath": null}).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     let patch = include_str!("../../src/github_read/fixtures/pr-42.diff");
     let script = format!(
         r#"#!/bin/sh
+# Real gh refuses --slurp together with --jq or --template.
+slurp=0; filter=0
+for arg in "$@"; do
+  case "$arg" in
+    --slurp) slurp=1 ;;
+    --jq|--template) filter=1 ;;
+  esac
+done
+if [ $slurp = 1 ] && [ $filter = 1 ]; then
+  echo 'the `--slurp` option is not supported with `--jq` or `--template`' >&2
+  exit 1
+fi
 case "$1:$2" in
   pr:view) cat <<'JSON'
 {metadata}
