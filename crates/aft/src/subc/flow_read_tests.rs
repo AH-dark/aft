@@ -89,7 +89,13 @@ fn flow_read_codemode_ephemeral() {
 }
 #[test]
 fn flow_read_missing_parent() {
-    check(|s| s["parent"] = Value::Null, "reserved:basal", "parent");
+    let dir = tempfile::tempdir().unwrap();
+    let mut scope = stamp();
+    scope["parent"] = Value::Null;
+    assert_parent_refusal(
+        route_checks(&identity(dir.path(), scope, "reserved:basal")).unwrap_err(),
+        "the flow-read scope carries no parent scope",
+    );
 }
 #[test]
 fn flow_read_expired() {
@@ -135,14 +141,22 @@ fn reply(stamp: &ScopeStamp, status: ScopeStatus) -> ModuleControlResponseToModu
         owner_configured: true,
     }
 }
+fn assert_parent_refusal(error: Refusal, reason: &str) {
+    let error = error.error();
+    assert_eq!(error.code, "file_read_exact_route_not_admitted");
+    assert_eq!(
+        error.message,
+        format!("Route not admitted: parent: {reason}.")
+    );
+}
 #[test]
 fn flow_read_dead_parent() {
     let dir = tempfile::tempdir().unwrap();
     let head = head(dir.path());
     let stamp = head.scope.as_ref().unwrap();
-    assert_eq!(
-        live_parent(stamp, &reply(stamp, ScopeStatus::NotLive)),
-        Err(Refusal::RouteNotAdmitted("parent"))
+    assert_parent_refusal(
+        live_parent(stamp, &reply(stamp, ScopeStatus::NotLive)).unwrap_err(),
+        "the daemon reports the parent scope is not live",
     );
 }
 #[test]
@@ -150,28 +164,140 @@ fn flow_read_ended_parent() {
     let dir = tempfile::tempdir().unwrap();
     let head = head(dir.path());
     let stamp = head.scope.as_ref().unwrap();
-    assert_eq!(
-        live_parent(stamp, &reply(stamp, ScopeStatus::Ended)),
-        Err(Refusal::RouteNotAdmitted("parent"))
+    assert_parent_refusal(
+        live_parent(stamp, &reply(stamp, ScopeStatus::Ended)).unwrap_err(),
+        "the daemon reports the parent scope ended",
     );
 }
 #[test]
-fn flow_read_parent_mismatch() {
+fn flow_read_parent_unexpected_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = head(dir.path());
+    assert_parent_refusal(
+        live_parent(
+            head.scope.as_ref().unwrap(),
+            &ModuleControlResponseToModule::CatalogUpdate {},
+        )
+        .unwrap_err(),
+        "the daemon did not return a scope.describe response for the parent scope",
+    );
+}
+#[test]
+fn flow_read_parent_epoch_mismatch() {
     let dir = tempfile::tempdir().unwrap();
     let head = head(dir.path());
     let stamp = head.scope.as_ref().unwrap();
     let mut changed = stamp.clone();
     changed.scope_epoch += 1;
-    assert_eq!(
-        live_parent(stamp, &reply(&changed, ScopeStatus::Live)),
-        Err(Refusal::RouteNotAdmitted("parent"))
+    assert_parent_refusal(
+        live_parent(stamp, &reply(&changed, ScopeStatus::Live)).unwrap_err(),
+        "the daemon reports the parent scope is live at epoch 8, not 7",
+    );
+    let mut response = reply(stamp, ScopeStatus::Live);
+    if let ModuleControlResponseToModule::ScopeDescribe { scope_epoch, .. } = &mut response {
+        *scope_epoch = None;
+    }
+    assert_parent_refusal(
+        live_parent(stamp, &response).unwrap_err(),
+        "the daemon reports the parent scope is live without an epoch (expected 7)",
+    );
+    let mut response = reply(&changed, ScopeStatus::Live);
+    if let ModuleControlResponseToModule::ScopeDescribe { scope_epoch, .. } = &mut response {
+        *scope_epoch = Some(7);
+    }
+    assert_parent_refusal(
+        live_parent(stamp, &response).unwrap_err(),
+        "the daemon's parent scope stamp has epoch 8, not 7",
+    );
+}
+#[test]
+fn flow_read_parent_stamp_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let head = head(dir.path());
+    let stamp = head.scope.as_ref().unwrap();
+    let mut changed = stamp.clone();
+    changed.kind = ScopeKind::Worker;
+    assert_parent_refusal(
+        live_parent(stamp, &reply(&changed, ScopeStatus::Live)).unwrap_err(),
+        "the daemon's parent scope is not a head scope",
     );
     changed = stamp.clone();
-    changed.kind = ScopeKind::Worker;
-    assert_eq!(
-        live_parent(stamp, &reply(&changed, ScopeStatus::Live)),
-        Err(Refusal::RouteNotAdmitted("parent"))
+    changed.owner_authorized = false;
+    assert_parent_refusal(
+        live_parent(stamp, &reply(&changed, ScopeStatus::Live)).unwrap_err(),
+        "the daemon's parent scope is not owner-authorized",
     );
+    changed = stamp.clone();
+    changed.expires_at_ms = Some(1);
+    assert_parent_refusal(
+        live_parent(stamp, &reply(&changed, ScopeStatus::Live)).unwrap_err(),
+        "the daemon's parent scope has expired",
+    );
+    changed = stamp.clone();
+    changed.scope_ref = "another-head".into();
+    assert_parent_refusal(
+        live_parent(stamp, &reply(&changed, ScopeStatus::Live)).unwrap_err(),
+        "the daemon's parent scope reference does not match the requested parent",
+    );
+    changed = stamp.clone();
+    changed.owner = Principal::Reserved {
+        module_id: "basal".into(),
+    };
+    assert_parent_refusal(
+        live_parent(stamp, &reply(&changed, ScopeStatus::Live)).unwrap_err(),
+        "the daemon's parent scope owner does not match the requested parent",
+    );
+    let mut response = reply(stamp, ScopeStatus::Live);
+    if let ModuleControlResponseToModule::ScopeDescribe { scope, .. } = &mut response {
+        *scope = None;
+    }
+    assert_parent_refusal(
+        live_parent(stamp, &response).unwrap_err(),
+        "the daemon reports the parent scope is live without a scope stamp",
+    );
+}
+
+#[test]
+fn flow_read_parent_route_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let child: ScopeStamp = serde_json::from_value(stamp()).unwrap();
+    let reason = "no open AFT route for the parent head scope head at epoch 7 (the head must have an AFT route open at the epoch core stamped)";
+    assert_parent_refusal(parent_route(&child, &HashMap::new()).unwrap_err(), reason);
+    let mut missing_parent = child.clone();
+    missing_parent.parent = None;
+    assert_parent_refusal(
+        parent_route(&missing_parent, &HashMap::new()).unwrap_err(),
+        "the flow-read scope carries no parent scope",
+    );
+    let mut routes = HashMap::new();
+    for (channel, epoch) in [(42, 9), (43, 6), (44, 9)] {
+        let mut scope = serde_json::to_value(head(dir.path()).scope.as_ref().unwrap()).unwrap();
+        scope["scope_epoch"] = json!(epoch);
+        routes.insert(
+            route_key(channel, 1),
+            identity(dir.path(), scope, "reserved:broca"),
+        );
+    }
+    let mut unrelated = serde_json::to_value(head(dir.path()).scope.as_ref().unwrap()).unwrap();
+    unrelated["ref"] = json!("unrelated");
+    unrelated["scope_epoch"] = json!(99);
+    routes.insert(
+        route_key(45, 1),
+        identity(dir.path(), unrelated, "reserved:broca"),
+    );
+    let mut other_owner = serde_json::to_value(head(dir.path()).scope.as_ref().unwrap()).unwrap();
+    other_owner["owner"]["module_id"] = json!("basal");
+    other_owner["scope_epoch"] = json!(100);
+    routes.insert(
+        route_key(46, 1),
+        identity(dir.path(), other_owner, "reserved:basal"),
+    );
+    assert_parent_refusal(
+        parent_route(&child, &routes).unwrap_err(),
+        &format!("{reason}; open routes for that owner and scope reference have epochs [6, 9]"),
+    );
+    routes.insert(route_key(47, 1), head(dir.path()));
+    assert!(parent_route(&child, &routes).is_ok());
 }
 
 #[tokio::test]
@@ -197,7 +323,12 @@ async fn flow_read_daemon_parent_confirmation() {
     access_grants::register(&parent, &ctx).unwrap();
     let executor = Arc::new(Executor::new());
     executor.register_actor(parent.root.clone(), ctx);
-    for status in [ScopeStatus::Live, ScopeStatus::NotLive, ScopeStatus::Ended] {
+    for (status, refusal) in [
+        (Some(ScopeStatus::Live), None),
+        (Some(ScopeStatus::NotLive), Some("Route not admitted: parent: the daemon reports the parent scope is not live.")),
+        (Some(ScopeStatus::Ended), Some("Route not admitted: parent: the daemon reports the parent scope ended.")),
+        (None, Some("Route not admitted: parent: the daemon scope.describe request for the parent scope failed.")),
+    ] {
         let child = identity(&basal_root, stamp(), "reserved:basal");
         let routes = HashMap::from([
             (route_key(41, 1), child.clone()),
@@ -247,14 +378,24 @@ async fn flow_read_daemon_parent_confirmation() {
         let query: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(query["op"], "scope.describe");
         assert_eq!(query["ref"], "head");
+        let (ty, response) = match &status {
+            Some(status) => (
+                FrameType::Response,
+                serde_json::to_vec(&reply(parent.scope.as_ref().unwrap(), status.clone())).unwrap(),
+            ),
+            None => (
+                FrameType::Error,
+                serde_json::to_vec(&ErrorBody::new("internal", "secret daemon details")).unwrap(),
+            ),
+        };
         assert!(pending.resolve(
             Frame::build(
-                FrameType::Response,
+                ty,
                 control_flags(),
                 0,
                 0,
                 request.header.corr,
-                serde_json::to_vec(&reply(parent.scope.as_ref().unwrap(), status.clone())).unwrap()
+                response,
             )
             .unwrap()
         ));
@@ -263,17 +404,57 @@ async fn flow_read_daemon_parent_confirmation() {
             .unwrap()
             .unwrap();
         let body: Value = serde_json::from_slice(&answer.body).unwrap();
-        if status == ScopeStatus::Live {
+        if let Some(refusal) = refusal {
+            assert_eq!(answer.header.ty, FrameType::Error);
+            assert_eq!(body["code"], "file_read_exact_route_not_admitted");
+            assert_eq!(body["message"], refusal);
+        } else {
             assert_eq!(answer.header.ty, FrameType::Response);
             assert_eq!(
                 body,
                 json!({"bytes_base64":"YWJj", "size":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"})
             );
-        } else {
-            assert_eq!(answer.header.ty, FrameType::Error);
-            assert_eq!(body["message"], "Route not admitted: parent.");
         }
     }
+}
+
+#[tokio::test]
+async fn flow_read_missing_daemon_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = identity(dir.path(), stamp(), "reserved:basal");
+    let routes = HashMap::from([(route_key(42, 1), head(dir.path()))]);
+    let (writer, mut output) = mpsc::channel(8);
+    let body = json!({"op":"file.read_exact","path":"script"});
+    let frame = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        41,
+        1,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    dispatch(
+        &writer,
+        &Arc::new(DispatchPathMetrics::new()),
+        &frame,
+        child,
+        body,
+        &routes,
+        &Arc::new(Executor::new()),
+        &Arc::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let answer = output.recv().await.unwrap();
+    assert_eq!(answer.header.ty, FrameType::Error);
+    let body: Value = serde_json::from_slice(&answer.body).unwrap();
+    assert_eq!(body["code"], "file_read_exact_route_not_admitted");
+    assert_eq!(
+        body["message"],
+        "Route not admitted: parent: cannot ask the daemon whether the parent scope is live."
+    );
 }
 
 async fn wire(identity: RouteIdentity, body: Value) -> Value {

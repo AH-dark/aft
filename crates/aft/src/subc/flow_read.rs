@@ -27,7 +27,9 @@ fn route_checks(identity: &RouteIdentity) -> Result<&ScopeStamp, Refusal> {
         return Err(Refusal::RouteNotAdmitted("scope_ref"));
     }
     if stamp.parent.is_none() {
-        return Err(Refusal::RouteNotAdmitted("parent"));
+        return Err(Refusal::ParentNotAdmitted(
+            "the flow-read scope carries no parent scope".into(),
+        ));
     }
     unexpired(stamp)?;
     Ok(stamp)
@@ -48,36 +50,71 @@ fn live_parent(
     expected: &ScopeStamp,
     reply: &ModuleControlResponseToModule,
 ) -> Result<(), Refusal> {
-    match reply {
-        ModuleControlResponseToModule::ScopeDescribe {
-            status: ScopeStatus::Live,
-            scope_epoch: Some(epoch),
-            scope: Some(stamp),
-            ..
-        } if *epoch == expected.scope_epoch
-            && stamp.scope_epoch == *epoch
-            && stamp.owner == expected.owner
-            && stamp.scope_ref == expected.scope_ref
-            && stamp.kind == ScopeKind::Head
-            && stamp.owner_authorized
-            && stamp
+    let ModuleControlResponseToModule::ScopeDescribe {
+        status,
+        scope_epoch,
+        scope,
+        ..
+    } = reply
+    else {
+        return Err(Refusal::ParentNotAdmitted(
+            "the daemon did not return a scope.describe response for the parent scope".into(),
+        ));
+    };
+    let reason = match status {
+        ScopeStatus::NotLive => "the daemon reports the parent scope is not live".into(),
+        ScopeStatus::Ended => "the daemon reports the parent scope ended".into(),
+        ScopeStatus::Live => {
+            let epoch = scope_epoch.ok_or_else(|| {
+                Refusal::ParentNotAdmitted(format!(
+                    "the daemon reports the parent scope is live without an epoch (expected {})",
+                    expected.scope_epoch
+                ))
+            })?;
+            if epoch != expected.scope_epoch {
+                return Err(Refusal::ParentNotAdmitted(format!(
+                    "the daemon reports the parent scope is live at epoch {epoch}, not {}",
+                    expected.scope_epoch
+                )));
+            }
+            let stamp = scope.as_ref().ok_or_else(|| {
+                Refusal::ParentNotAdmitted(
+                    "the daemon reports the parent scope is live without a scope stamp".into(),
+                )
+            })?;
+            if stamp.scope_epoch != epoch {
+                format!(
+                    "the daemon's parent scope stamp has epoch {}, not {epoch}",
+                    stamp.scope_epoch
+                )
+            } else if stamp.owner != expected.owner {
+                "the daemon's parent scope owner does not match the requested parent".into()
+            } else if stamp.scope_ref != expected.scope_ref {
+                "the daemon's parent scope reference does not match the requested parent".into()
+            } else if stamp.kind != ScopeKind::Head {
+                "the daemon's parent scope is not a head scope".into()
+            } else if !stamp.owner_authorized {
+                "the daemon's parent scope is not owner-authorized".into()
+            } else if stamp
                 .expires_at_ms
-                .is_none_or(|at| at > crate::db::call_ledger::now_ms() as u64) =>
-        {
-            Ok(())
+                .is_some_and(|at| at <= crate::db::call_ledger::now_ms() as u64)
+            {
+                "the daemon's parent scope has expired".into()
+            } else {
+                return Ok(());
+            }
         }
-        _ => Err(Refusal::RouteNotAdmitted("parent")),
-    }
+    };
+    Err(Refusal::ParentNotAdmitted(reason))
 }
 
 fn parent_route<'a>(
     stamp: &ScopeStamp,
     routes: &'a HashMap<RouteChannel, RouteIdentity>,
 ) -> Result<&'a RouteIdentity, Refusal> {
-    let parent = stamp
-        .parent
-        .as_ref()
-        .ok_or(Refusal::RouteNotAdmitted("parent"))?;
+    let parent = stamp.parent.as_ref().ok_or_else(|| {
+        Refusal::ParentNotAdmitted("the flow-read scope carries no parent scope".into())
+    })?;
     routes
         .values()
         .find(|route| {
@@ -89,7 +126,23 @@ fn parent_route<'a>(
                     && s.owner_authorized
             })
         })
-        .ok_or(Refusal::RouteNotAdmitted("parent"))
+        .ok_or_else(|| {
+            let mut reason = format!(
+                "no open AFT route for the parent head scope {} at epoch {} (the head must have an AFT route open at the epoch core stamped)",
+                parent.scope_ref, parent.scope_epoch
+            );
+            let epochs = routes.values()
+                .filter_map(|route| route.scope.as_ref())
+                .filter(|scope| scope.owner == parent.owner && scope.scope_ref == parent.scope_ref && scope.scope_epoch != parent.scope_epoch)
+                .map(|scope| scope.scope_epoch)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !epochs.is_empty() {
+                reason.push_str(&format!("; open routes for that owner and scope reference have epochs {epochs:?}"));
+            }
+            Refusal::ParentNotAdmitted(reason)
+        })
 }
 
 /// Intercept before watcher restoration, catalogs, grant operations or tool dispatch.
@@ -167,9 +220,11 @@ async fn dispatch_with_wait(
         }
         let stamp = route_checks(&identity)?;
         let parent = parent_route(stamp, routes)?.clone();
-        let control = control
-            .cloned()
-            .ok_or(Refusal::RouteNotAdmitted("parent"))?;
+        let control = control.cloned().ok_or_else(|| {
+            Refusal::ParentNotAdmitted(
+                "cannot ask the daemon whether the parent scope is live".into(),
+            )
+        })?;
         let expiry = read_deadline(stamp)?;
         Ok((parent, control, expiry.min(limit), expiry <= limit))
     };
@@ -216,7 +271,9 @@ async fn dispatch_with_wait(
             let admission = match control.describe(parent_stamp).await {
                 Ok(reply) => live_parent(parent_stamp, &reply)
                     .and_then(|_| unexpired(identity.scope.as_ref().unwrap())),
-                Err(_) => Err(Refusal::RouteNotAdmitted("parent")),
+                Err(_) => Err(Refusal::ParentNotAdmitted(
+                    "the daemon scope.describe request for the parent scope failed".into(),
+                )),
             };
             match admission {
                 Err(error) => Err(error.error()),
