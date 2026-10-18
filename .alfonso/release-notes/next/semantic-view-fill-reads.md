@@ -1,0 +1,1 @@
+- Semantic indexing for a new worker checkout reads far less from disk when it reuses vectors already stored for a sibling checkout.

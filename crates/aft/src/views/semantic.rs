@@ -1722,6 +1722,7 @@ impl super::first_load::CompositePlane for SemanticPlane {
 
 #[cfg(test)]
 mod tests {
+    include!("semantic_read_tests.rs");
     use super::*;
     use crate::views::contracts::PlaneLoader;
     use crate::views::first_load::{
