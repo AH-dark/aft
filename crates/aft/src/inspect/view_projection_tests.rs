@@ -267,13 +267,18 @@ fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
 }
 
 fn verify_checkout_view_corpus(phase: &PhaseReport) {
+    // Every count below follows from the corpus size, and none of them needs a
+    // large corpus. Keep it small: on a loaded Windows CI runner this fixture
+    // (file writes, `git add`, a cold publication) runs about ten times slower
+    // than on an idle machine, and a 3000-file corpus took about 20 seconds idle.
+    const CORPUS_FILES: usize = 300;
     // IO counters and refusal reports are thread-local. Invalidation tickets
     // are keyed by this private project directory, which has no watcher, so
     // other libtest threads cannot move this fixture's ticket or counters.
     phase("building initial checkout and callgraph fixture");
     let (_project, _storage, mut job, mut request) = view_projection_fixture();
-    phase("writing 3000 source files");
-    for i in 0..3000 {
+    phase(&format!("writing {CORPUS_FILES} source files"));
+    for i in 0..CORPUS_FILES {
         write_projection_cache_file(
             &job.project_root.join(format!("source_{i}.ts")),
             &format!("export function source_{i}() {{ return {i}; }}\n"),
@@ -366,7 +371,8 @@ fn verify_checkout_view_corpus(phase: &PhaseReport) {
         "blocking inspection must reuse the root stats it already collected"
     );
     assert_eq!(
-        cold.files_read, 3002,
+        cold.files_read,
+        CORPUS_FILES + 2,
         "first verification must actually read the entire source set"
     );
     phase("standalone checkout verification");
@@ -377,7 +383,7 @@ fn verify_checkout_view_corpus(phase: &PhaseReport) {
     );
     let standalone = crate::views::read::take_verification_io();
     eprintln!("inspect_view_verification standalone={standalone:?}");
-    assert_eq!(standalone.files_statd, 3002);
+    assert_eq!(standalone.files_statd, CORPUS_FILES + 2);
     assert_eq!(standalone.files_read, 0);
     // A watcher event must defeat the memo even if an external writer preserved
     // both size and mtime. The known root stats deliberately remain unchanged.
@@ -408,10 +414,28 @@ fn publish_checkout_reporting_steps(
     request: &crate::views::assembly::AssemblyRequest,
     phase: &PhaseReport,
 ) {
+    publish_checkout_reporting_steps_with_hold(request, phase, None);
+}
+
+/// As [`publish_checkout_reporting_steps`]. With `hold`, publication stops
+/// right after the named step until the receiver gets a message (or a minute
+/// passes), which simulates a stall in the step that follows it.
+fn publish_checkout_reporting_steps_with_hold(
+    request: &crate::views::assembly::AssemblyRequest,
+    phase: &PhaseReport,
+    hold: Option<(&'static str, std::sync::mpsc::Receiver<()>)>,
+) {
     // Steps report as they finish, so a stall is in the step after the last one.
     let _observer = crate::views::observe_publication_phases_for_test({
         let phase = Arc::clone(phase);
-        move |step| phase(&format!("publishing checkout view: after {step}"))
+        move |step| {
+            phase(&format!("publishing checkout view: after {step}"));
+            if let Some((held_step, release)) = &hold {
+                if step == *held_step {
+                    let _ = release.recv_timeout(Duration::from_secs(60));
+                }
+            }
+        }
     });
     let mut prepared = crate::views::assembly::prepare_checkout(request, &mut |stage| {
         phase(&format!("publishing checkout view: {stage}"));
@@ -420,6 +444,47 @@ fn publish_checkout_reporting_steps(
     .unwrap();
     phase("publishing checkout view: committing generation pointer");
     prepared.commit().unwrap();
+}
+
+#[test]
+fn checkout_verification_deadline_names_the_stalled_publication_step() {
+    let (project, storage, _job, request) = view_projection_fixture();
+    let (release, held) = std::sync::mpsc::channel();
+    let result = std::panic::catch_unwind(|| {
+        // Ten seconds covers a two-file publication up to the hold even on a
+        // slow runner; the hold then outlasts the deadline.
+        run_checkout_verification_watchdog(
+            Duration::from_secs(10),
+            DeadlineStart::FirstPhase,
+            move |phase| {
+                // The worker outlives the timeout, so it owns the fixture
+                // folders and removes them once the released publication ends.
+                let _fixture = (project, storage);
+                phase("publishing checkout view");
+                publish_checkout_reporting_steps_with_hold(
+                    &request,
+                    phase,
+                    Some(("derived_clone", held)),
+                );
+            },
+        );
+    });
+    // Release the simulated stall even when the assertion below fails.
+    let _ = release.send(());
+    let panic = result.expect_err("a held publication must time out");
+    let message = panic.downcast_ref::<String>().unwrap();
+    assert!(
+        message.starts_with(
+            "inspect warm verification timed out after 10s during \
+             publishing checkout view: after derived_clone; timeline: \
+             publishing checkout view@"
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains("publishing checkout view: working_tree_read@"),
+        "{message}"
+    );
 }
 
 #[test]
