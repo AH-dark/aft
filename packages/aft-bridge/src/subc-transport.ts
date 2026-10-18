@@ -674,7 +674,7 @@ class BgSubscription {
     private readonly dropClient: (client: SubcClientLike, cause: ClientDropCause) => void,
     private readonly openRoute: (client: SubcClientLike) => Promise<RouteHandle>,
     private readonly onNudge: (observedEvent: boolean) => void,
-    private readonly sleep: (ms: number) => Promise<void>,
+    private readonly sleep: ((ms: number) => Promise<void>) | undefined,
     private readonly canAttach: () => boolean,
     private readonly onRootAttachFailure: (error: unknown) => boolean,
     private readonly onDormant: () => void,
@@ -702,8 +702,11 @@ class BgSubscription {
     return this.route;
   }
 
+  private cancelBackoff: (() => void) | null = null;
+
   async stop(): Promise<void> {
     this.stopped = true;
+    this.cancelBackoff?.();
     // Wake a live `await sub.closed`; the loop's `finally` remains the sole
     // owner of closeRouteChannel, avoiding a double close from stop() + run().
     const sub = this.current;
@@ -964,7 +967,32 @@ class BgSubscription {
   }
 
   private async backoff(attempt: number): Promise<void> {
-    await this.sleep(reconnectBackoffMs(attempt));
+    if (this.stopped) return;
+    await new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let finished = false;
+      const settle = (error?: unknown): void => {
+        if (finished) return;
+        finished = true;
+        if (timer) clearTimeout(timer);
+        this.cancelBackoff = null;
+        if (error !== undefined) reject(error);
+        else resolve();
+      };
+      this.cancelBackoff = () => settle();
+      const delay = reconnectBackoffMs(attempt);
+      if (this.sleep) {
+        // An injected sleeper may not be cancellable. Observe its eventual
+        // rejection, but let stop release the subscription without awaiting it.
+        try {
+          void this.sleep(delay).then(() => settle(), settle);
+        } catch (error) {
+          settle(error);
+        }
+      } else {
+        timer = setTimeout(() => settle(), delay);
+      }
+    });
   }
 }
 
@@ -1023,16 +1051,25 @@ function callDeadlinePassedError(lastError: unknown, callDeadlineMs: number): un
   );
 }
 
+export const __withDeadlineSuffixForTests = withDeadlineSuffix;
+
 function withDeadlineSuffix(error: unknown, suffix: string): unknown {
-  if (error instanceof Error) {
-    try {
-      error.message += suffix;
-      return error;
-    } catch {
-      // A frozen SDK error cannot carry the suffix; retain its message in a wrapper.
-    }
+  if (!(error instanceof Error)) return new Error(`${String(error)}${suffix}`, { cause: error });
+  const message = `${error.message}${suffix}`;
+  if (error instanceof SubcCallError) {
+    const wrapped = new SubcCallError(error.kind, message, error.code, error);
+    // SubcCallError's detail getter only unwraps a direct SubcError cause.
+    Object.defineProperty(wrapped, "detail", { value: error.detail });
+    return wrapped;
   }
-  return new Error(`${String(error)}${suffix}`);
+  if (error instanceof SubcError) {
+    const wrapped = new SubcError(message, error.code, error.detail, error.closeReason);
+    Object.defineProperty(wrapped, "cause", { value: error });
+    return wrapped;
+  }
+  const wrapped = new Error(message, { cause: error });
+  wrapped.name = error.name;
+  return wrapped;
 }
 
 /**
@@ -1379,7 +1416,7 @@ export class SubcTransportPool implements AftTransportPool {
 
   private readonly onBgEventsNudge?: (projectRoot: string, session: string) => void;
   private readonly onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
-  private readonly bgBackoffSleep: (ms: number) => Promise<void>;
+  private readonly bgBackoffSleep: ((ms: number) => Promise<void>) | undefined;
   private readonly routeRetrySleep: (ms: number) => Promise<void>;
   private readonly bgDispatchProbeIntervalMs: number;
   private readonly livenessProbeTimeoutMs: number;
@@ -1433,8 +1470,8 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly transports = new Map<CanonicalRootPath, SubcTransport>();
   private readonly generationRejections = new Set<string>();
   private readonly nudgeDeliveryLogState = new Map<
-    string,
-    { lastEmittedAt: number; suppressed: number }
+    IdentityKey,
+    Map<string, { lastEmittedAt: number; suppressed: number }>
   >();
   private readonly pendingRootCleanups = new Set<Promise<unknown>>();
   private shuttingDown = false;
@@ -1450,8 +1487,7 @@ export class SubcTransportPool implements AftTransportPool {
     this.connectFn = options.connect ?? ((opts) => SubcClient.connect(opts));
     this.onBgEventsNudge = options.onBgEventsNudge;
     this.onBgEventsNudgeRef = options.onBgEventsNudgeRef;
-    this.bgBackoffSleep =
-      options.bgBackoffSleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.bgBackoffSleep = options.bgBackoffSleep;
     this.routeRetrySleep =
       options.routeRetrySleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.bgDispatchProbeIntervalMs =
@@ -1895,8 +1931,11 @@ export class SubcTransportPool implements AftTransportPool {
    * always nudges a drain, replaying completions queued while no carrier existed.
    */
   async reapIdleSessions(now = Date.now()): Promise<void> {
-    for (const [key, state] of this.nudgeDeliveryLogState) {
-      if (now - state.lastEmittedAt >= 15 * 60_000) this.nudgeDeliveryLogState.delete(key);
+    for (const [key, bucket] of this.nudgeDeliveryLogState) {
+      for (const [kind, state] of bucket) {
+        if (now - state.lastEmittedAt >= 15 * 60_000) bucket.delete(kind);
+      }
+      if (bucket.size === 0) this.nudgeDeliveryLogState.delete(key);
     }
     const detached: DetachedSession[] = [];
     for (const [key, record] of this.sessions) {
@@ -2083,15 +2122,19 @@ export class SubcTransportPool implements AftTransportPool {
   }
 
   private logNudgeDelivery(kind: string, record: SessionRecord, message: string): void {
-    const key = `${kind}\u0000${record.identityKey}`;
+    let bucket = this.nudgeDeliveryLogState.get(record.identityKey);
+    if (!bucket) {
+      bucket = new Map();
+      this.nudgeDeliveryLogState.set(record.identityKey, bucket);
+    }
     const now = Date.now();
-    const state = this.nudgeDeliveryLogState.get(key);
+    const state = bucket.get(kind);
     if (state && now - state.lastEmittedAt < BG_LIFECYCLE_LOG_INTERVAL_MS) {
       state.suppressed += 1;
       return;
     }
     const suppressed = state?.suppressed ?? 0;
-    this.nudgeDeliveryLogState.set(key, { lastEmittedAt: now, suppressed: 0 });
+    bucket.set(kind, { lastEmittedAt: now, suppressed: 0 });
     const suffix = suppressed > 0 ? ` suppressed=${suppressed}` : "";
     log(`subc bg_events: ${message}${suffix}`, { sessionId: record.identity.session });
   }
@@ -2140,9 +2183,7 @@ export class SubcTransportPool implements AftTransportPool {
     record.teardownReason = reason;
     this.sessions.delete(key);
     this.removeIndexMembership(record);
-    for (const logKey of this.nudgeDeliveryLogState.keys()) {
-      if (logKey.endsWith(`\u0000${key}`)) this.nudgeDeliveryLogState.delete(logKey);
-    }
+    this.nudgeDeliveryLogState.delete(key);
 
     const bgSub = record.bgSub;
     record.bgSub = null;
@@ -3203,6 +3244,15 @@ export class SubcTransportPool implements AftTransportPool {
     if (!this.rootCanAttach(record.canonicalRoot)) return;
 
     const nudgeRef = this.nudgeRefFor(record);
+    const dispatch = (callback: () => unknown): void => {
+      const failed = (error: unknown): void =>
+        warn(`subc bg nudge delivery failed: ${describeFailure(error)}`);
+      try {
+        void Promise.resolve(callback()).catch(failed);
+      } catch (error) {
+        failed(error);
+      }
+    };
     const onNudge = (observedEvent: boolean): void => {
       const currentRecord = this.currentSessionForNudge(identity);
       if (!currentRecord) {
@@ -3226,7 +3276,7 @@ export class SubcTransportPool implements AftTransportPool {
       const currentRef = this.nudgeRefFor(currentRecord);
       let delivered = false;
       if (currentRef && this.onBgEventsNudgeRef) {
-        this.onBgEventsNudgeRef(currentRef);
+        dispatch(() => this.onBgEventsNudgeRef?.(currentRef));
         delivered = true;
       }
       if (this.onBgEventsNudge) {
@@ -3237,7 +3287,12 @@ export class SubcTransportPool implements AftTransportPool {
             `nudge dispatch fallback=root-session-handler cause=generation-provenance-unavailable root=${currentRecord.canonicalRoot}`,
           );
         }
-        this.onBgEventsNudge(currentRecord.identity.project_root, currentRecord.identity.session);
+        dispatch(() =>
+          this.onBgEventsNudge?.(
+            currentRecord.identity.project_root,
+            currentRecord.identity.session,
+          ),
+        );
         delivered = true;
       }
       if (delivered) return;

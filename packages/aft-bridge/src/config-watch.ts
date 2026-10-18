@@ -308,6 +308,8 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   const watchImpl = options.watchImpl ?? watch;
   let rejectedRetries = 0;
   const check = (): void => {
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = null;
     timer = null;
     firstPendingAt = null;
     if (stopped) return;
@@ -340,6 +342,8 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   const schedule = (): void => {
     if (stopped) return;
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = null;
     const now = Date.now();
     firstPendingAt ??= now;
     if (timer) clearTimeout(timer);

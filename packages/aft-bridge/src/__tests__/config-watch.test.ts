@@ -483,3 +483,46 @@ describe("watchAftConfigFiles registration and retries", () => {
     }
   });
 });
+
+test("fresh filesystem events supersede rejected config retry timers", () => {
+  const file = join(tempDir(), "aft.jsonc");
+  writeFileSync(file, "{}");
+  const pending = new Map<object, () => void>();
+  const originalSet = globalThis.setTimeout;
+  const originalClear = globalThis.clearTimeout;
+  let emit!: () => void;
+  let stop: (() => void) | undefined;
+  globalThis.setTimeout = ((callback: () => void) => {
+    const timer = { unref() {} };
+    pending.set(timer, callback);
+    return timer;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: object) => {
+    pending.delete(timer);
+  }) as unknown as typeof clearTimeout;
+  try {
+    stop = watchAftConfigFiles({
+      paths: [file],
+      checkAtStart: true,
+      initialTexts: { [file]: null },
+      onChange: () => false,
+      watchImpl: ((_path: string, _options: unknown, callback: () => void) => {
+        emit = callback;
+        return { close() {}, on() {} };
+      }) as unknown as typeof import("node:fs").watch,
+    });
+    expect(pending.size).toBe(1);
+    emit();
+    expect(pending.size).toBe(1);
+    const [timer, check] = pending.entries().next().value!;
+    pending.delete(timer);
+    check();
+    expect(pending.size).toBe(1);
+    stop();
+    expect(pending.size).toBe(0);
+  } finally {
+    stop?.();
+    globalThis.setTimeout = originalSet;
+    globalThis.clearTimeout = originalClear;
+  }
+});

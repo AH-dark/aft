@@ -128,6 +128,7 @@ export interface PoolOptions extends BridgeOptions {
  * it removes the real RAM multiplier.
  */
 export class BridgePool implements AftTransportPool {
+  private readonly evictionListeners = new Set<(root: string) => void>();
   /** Project-root → bridge. Key is a normalized canonical path. */
   private readonly bridges = new Map<string, PoolEntry>();
   private readonly staleBridges = new Set<BinaryBridge>();
@@ -286,6 +287,18 @@ export class BridgePool implements AftTransportPool {
     return this.getBridge(projectRoot).toolCall(runtime.sessionID, name, rawArgs, options);
   }
 
+  subscribeBridgeEvictions(listener: (root: string) => void): () => void {
+    this.evictionListeners.add(listener);
+    return () => {
+      this.evictionListeners.delete(listener);
+    };
+  }
+
+  private removeBridge(root: string): void {
+    if (!this.bridges.delete(root)) return;
+    for (const listener of this.evictionListeners) listener(root);
+  }
+
   /** Periodic pool maintenance: retire updated binaries and evict idle bridges. */
   private cleanup(): void {
     const now = Date.now();
@@ -294,12 +307,12 @@ export class BridgePool implements AftTransportPool {
         continue;
       if (entry.bridge.maybeScheduleRespawnForUpdatedBinary(CLEANUP_INTERVAL_MS, now)) {
         this.staleBridges.add(entry.bridge);
-        this.bridges.delete(dir);
+        this.removeBridge(dir);
         continue;
       }
       if (now - entry.lastUsed > this.idleTimeoutMs) {
         entry.bridge.shutdown().catch((err) => this.error("cleanup shutdown failed:", err));
-        this.bridges.delete(dir);
+        this.removeBridge(dir);
       }
     }
 
@@ -325,7 +338,7 @@ export class BridgePool implements AftTransportPool {
     if (oldestDir) {
       const entry = this.bridges.get(oldestDir);
       entry?.bridge.shutdown().catch((err) => this.error("eviction shutdown failed:", err));
-      this.bridges.delete(oldestDir);
+      this.removeBridge(oldestDir);
     }
   }
 
@@ -349,7 +362,7 @@ export class BridgePool implements AftTransportPool {
       ...Array.from(this.bridges.values(), (e) => e.bridge.shutdown()),
       ...Array.from(this.staleBridges.values(), (bridge) => bridge.shutdown()),
     ];
-    this.bridges.clear();
+    for (const root of Array.from(this.bridges.keys())) this.removeBridge(root);
     this.staleBridges.clear();
     await Promise.allSettled(shutdowns);
   }
@@ -376,7 +389,7 @@ export class BridgePool implements AftTransportPool {
     for (const entry of this.bridges.values()) {
       this.staleBridges.add(entry.bridge);
     }
-    this.bridges.clear();
+    for (const root of Array.from(this.bridges.keys())) this.removeBridge(root);
     this.log(
       `Binary path updated to ${newPath}. Active bridges marked stale — next calls will use the new binary.`,
     );
@@ -454,6 +467,9 @@ export class BridgePool implements AftTransportPool {
   /**
    * Reapply configure overrides to a live bridge without replacing it.
    *
+   * The root selects the immediate live refresh. Overrides also persist
+   * pool-wide for future bridges, including bridges for other roots.
+   *
    * Async resources such as the LSP install cache can become available after a
    * bridge has configured. Sending a normal configure request keeps the bridge's
    * warm Rust state while allowing those process-state paths to take effect.
@@ -464,8 +480,10 @@ export class BridgePool implements AftTransportPool {
       this.setConfigureOverride(name, value);
     }
 
-    const bridge = this.getActiveBridgeForRoot(key);
-    if (!bridge) return;
+    const entry = this.shutdownCalled ? undefined : this.bridges.get(key);
+    if (!entry?.bridge.isAlive()) return;
+    entry.lastUsed = Date.now();
+    const bridge = entry.bridge;
 
     const projectOverrides = this.loadProjectOverrides(key);
     const response = await bridge.send("configure", {

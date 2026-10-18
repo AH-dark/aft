@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { __setSpawnSyncForTests, getMigrationStatus } from "../migration.js";
+import { __setMigrationStatusRunnerForTests, getMigrationStatus } from "../migration.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
 describe("storage migration status", () => {
@@ -24,17 +24,17 @@ describe("storage migration status", () => {
   });
 
   afterEach(() => {
-    __setSpawnSyncForTests(null);
+    __setMigrationStatusRunnerForTests(null);
     releaseEnv?.();
     releaseEnv = undefined;
     rmSync(tempDir, { recursive: true, force: true });
     mock.restore();
   });
 
-  function setSpawnResult(result: unknown) {
-    const spawnSync = mock(() => result);
-    __setSpawnSyncForTests(spawnSync as never);
-    return spawnSync;
+  function setRunnerResult(result: unknown) {
+    const statusRunner = mock(async () => result);
+    __setMigrationStatusRunnerForTests(statusRunner as never);
+    return statusRunner;
   }
 
   test("getMigrationStatus_returns_migrated_true_when_marker_exists", async () => {
@@ -47,7 +47,7 @@ describe("storage migration status", () => {
       source_path: "/legacy/aft",
       aft_version: "0.27.0",
     };
-    const spawnSync = setSpawnResult({
+    const statusRunner = setRunnerResult({
       status: 0,
       signal: null,
       error: undefined,
@@ -58,7 +58,7 @@ describe("storage migration status", () => {
     await expect(
       getMigrationStatus({ harness: "opencode", binaryPath: "/bin/aft" }),
     ).resolves.toEqual(payload);
-    expect(spawnSync).toHaveBeenCalledWith(
+    expect(statusRunner).toHaveBeenCalledWith(
       "/bin/aft",
       [
         "migrate-storage",
@@ -70,7 +70,8 @@ describe("storage migration status", () => {
         "--harness",
         "opencode",
       ],
-      expect.any(Object),
+      30 * 60 * 1000,
+      true,
     );
   });
 
@@ -80,7 +81,7 @@ describe("storage migration status", () => {
       target_root: join(tempDir, "cortexkit", "aft"),
       migrated: false,
     };
-    setSpawnResult({
+    setRunnerResult({
       status: 0,
       signal: null,
       error: undefined,
@@ -109,7 +110,7 @@ describe("storage migration status", () => {
       source_marker_present: true,
       partial_state: true,
     };
-    setSpawnResult({
+    setRunnerResult({
       status: 0,
       signal: null,
       error: undefined,
@@ -123,7 +124,7 @@ describe("storage migration status", () => {
   });
 
   test("getMigrationStatus_throws_on_invalid_json", async () => {
-    setSpawnResult({
+    setRunnerResult({
       status: 0,
       signal: null,
       error: undefined,
@@ -137,7 +138,7 @@ describe("storage migration status", () => {
   });
 
   test("getMigrationStatus_handles_nonzero_exit", async () => {
-    setSpawnResult({
+    setRunnerResult({
       status: 1,
       signal: null,
       error: undefined,

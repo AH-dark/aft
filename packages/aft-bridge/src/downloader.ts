@@ -205,9 +205,9 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   const handleSigint = () => {
     cleanUpInterruptedDownload();
     process.off("SIGINT", handleSigint);
-    // Installing a signal listener suppresses Node's default SIGINT exit. Send
-    // the signal again after synchronous cleanup to preserve that default.
-    process.kill(process.pid, "SIGINT");
+    // The host's remaining listeners already received this signal. Only
+    // restore the default exit policy when no host listener owns SIGINT.
+    if (process.listenerCount("SIGINT") === 0) process.kill(process.pid, "SIGINT");
   };
   const handleExit = () => cleanUpInterruptedDownload();
 

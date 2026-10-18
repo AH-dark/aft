@@ -445,14 +445,14 @@ async function findProbedBinary(
       warn(`PATH binary at ${candidate} is not a native executable (script shim?); skipping`);
       continue;
     }
-    const usable = await probeBinaryCandidateOffThread(candidate, "PATH", expectedVersion);
+    const usable = await probeBinaryCandidateOffThread(candidate, "PATH", pluginVersion);
     if (usable) return { path: usable, source: "PATH" };
   }
 
   // 3. ~/.cargo/bin/aft
   const cargoPath = join(homeDirFromEnv(env), ".cargo", "bin", `aft${ext}`);
   if (existsSync(cargoPath)) {
-    const usable = await probeBinaryCandidateOffThread(cargoPath, "cargo", expectedVersion);
+    const usable = await probeBinaryCandidateOffThread(cargoPath, "cargo", pluginVersion);
     if (usable) return { path: usable, source: "cargo" };
   }
 
@@ -482,6 +482,9 @@ export const __test__ = {
  * Throws a descriptive error with install instructions if all sources fail.
  */
 export async function findBinary(expectedVersion?: string): Promise<string> {
+  expectedVersion ??= ownPackageVersion() ?? undefined;
+  if (!expectedVersion)
+    throw new Error("Cannot determine the AFT bridge package version for binary resolution");
   const env = { ...process.env };
 
   const explicitBinary = explicitBinaryOverride(env);

@@ -35,6 +35,10 @@ export class RevivableTransportPool implements AftTransportPool {
   private revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
   private revivalRetryNotBefore = 0;
   private shutdownReason: string | null = null;
+  private readonly statusTransports = new Set<RevivableProjectTransport>();
+  private readonly evictionListeners = new Set<(root: string) => void>();
+  private unsubscribeEvictions: (() => void) | undefined;
+  private cancelRevivalDelay: (() => void) | undefined;
   private readonly transports = new Map<string, RevivableProjectTransport>();
   private readonly configureOverrides = new Map<string, unknown>();
   private editSlotSurvivesCaptured = false;
@@ -46,8 +50,10 @@ export class RevivableTransportPool implements AftTransportPool {
     initialPool: AftTransportPool | null,
     private readonly createPool: PoolFactory,
     private readonly onBinaryReplaced?: (path: string) => void,
+    private readonly onDemand?: (pool: AftTransportPool, canonicalRoot: CanonicalRootPath) => void,
   ) {
     this.activePool = initialPool;
+    this.bindEvictions(initialPool);
   }
 
   getBridge(projectRoot: string): RevivableProjectTransport {
@@ -57,12 +63,47 @@ export class RevivableTransportPool implements AftTransportPool {
   }
 
   getBridgeForCanonicalRoot(key: CanonicalRootPath): RevivableProjectTransport {
+    if (this.activePool && !this.activePool.isShutdown()) this.onDemand?.(this.activePool, key);
     let transport = this.transports.get(key);
     if (!transport) {
       transport = new RevivableProjectTransport(this, key);
       this.transports.set(key, transport);
     }
     return transport;
+  }
+
+  subscribeBridgeEvictions(listener: (root: string) => void): () => void {
+    this.evictionListeners.add(listener);
+    return () => {
+      this.evictionListeners.delete(listener);
+    };
+  }
+
+  private bindEvictions(pool: AftTransportPool | null): void {
+    this.unsubscribeEvictions?.();
+    this.unsubscribeEvictions = pool?.subscribeBridgeEvictions?.((root) =>
+      this.evictInactiveFacade(root),
+    );
+  }
+
+  /** Ignore a late eviction from an earlier pool when the root already has a live replacement bridge. */
+  evictInactiveFacade(root: string): void {
+    if (this.currentBridge(root) !== null) return;
+    this.refreshRootStatus(root, null);
+    this.transports.delete(root);
+    for (const listener of this.evictionListeners) listener(root);
+  }
+
+  trackStatusFacade(transport: RevivableProjectTransport, tracked: boolean): void {
+    if (tracked) this.statusTransports.add(transport);
+    else this.statusTransports.delete(transport);
+  }
+
+  private refreshRootStatus(root: string, bridge: AftProjectTransport | null): void {
+    this.transports.get(root)?.refreshStatusSubscription(bridge);
+    for (const transport of this.statusTransports) {
+      if (transport.getCwd() === root) transport.refreshStatusSubscription(bridge);
+    }
   }
 
   observeSessionStart(projectRoot: string, session: string): void {
@@ -161,6 +202,9 @@ export class RevivableTransportPool implements AftTransportPool {
 
   async replaceBinary(path: string): Promise<string> {
     const replaced = this.activePool ? await this.activePool.replaceBinary(path) : path;
+    for (const transport of new Set([...this.transports.values(), ...this.statusTransports])) {
+      transport.refreshStatusSubscription(this.currentBridge(transport.getCwd()));
+    }
     this.onBinaryReplaced?.(replaced);
     return replaced;
   }
@@ -170,13 +214,14 @@ export class RevivableTransportPool implements AftTransportPool {
   }
 
   async shutdown(reason = "unknown"): Promise<void> {
+    this.cancelRevivalDelay?.();
     const revival = this.revival;
     if (revival) {
       await Promise.allSettled([revival]);
     }
     this.shutdownReason = reason;
     await this.activePool?.shutdown(reason);
-    for (const transport of this.transports.values()) {
+    for (const transport of new Set([...this.transports.values(), ...this.statusTransports])) {
       transport.refreshStatusSubscription(null);
     }
   }
@@ -192,7 +237,18 @@ export class RevivableTransportPool implements AftTransportPool {
     const delay = Math.max(0, this.revivalRetryNotBefore - Date.now());
     if (delay > 0) {
       let scheduled!: Promise<AftTransportPool>;
-      scheduled = new Promise<void>((resolve) => setTimeout(resolve, delay)).then(() => {
+      scheduled = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.cancelRevivalDelay = undefined;
+          resolve();
+        }, delay);
+        this.cancelRevivalDelay = () => {
+          clearTimeout(timer);
+          this.cancelRevivalDelay = undefined;
+          if (this.revival === scheduled) this.revival = null;
+          reject(new Error("Transport revival cancelled by shutdown"));
+        };
+      }).then(() => {
         if (this.revival === scheduled) this.revival = null;
         return this.ensureActivePool();
       });
@@ -216,6 +272,7 @@ export class RevivableTransportPool implements AftTransportPool {
           pool.setConfigureOverride(key, value);
         }
         this.activePool = pool;
+        this.bindEvictions(pool);
         for (const [root, session] of this.pendingSessionStarts.values()) {
           pool.observeSessionStart?.(root, session);
         }
@@ -223,8 +280,8 @@ export class RevivableTransportPool implements AftTransportPool {
         this.shutdownReason = null;
         this.revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
         this.revivalRetryNotBefore = 0;
-        for (const [root, transport] of this.transports) {
-          transport.refreshStatusSubscription(pool.getActiveBridgeForRoot(root));
+        for (const transport of new Set([...this.transports.values(), ...this.statusTransports])) {
+          transport.refreshStatusSubscription(pool.getActiveBridgeForRoot(transport.getCwd()));
         }
         return pool;
       });
@@ -306,7 +363,7 @@ export class RevivableTransportPool implements AftTransportPool {
     this.getBridgeForCanonicalRoot(projectRoot);
     const pool = await this.ensureActivePool();
     const bridge = pool.getBridgeForCanonicalRoot?.(projectRoot) ?? pool.getBridge(projectRoot);
-    this.transports.get(projectRoot)?.refreshStatusSubscription(bridge);
+    this.refreshRootStatus(projectRoot, bridge);
     return bridge.send(command, params, options);
   }
 
@@ -336,7 +393,7 @@ export class RevivableTransportPool implements AftTransportPool {
     this.getBridgeForCanonicalRoot(projectRoot);
     const pool = await this.ensureActivePool();
     const bridge = pool.getBridgeForCanonicalRoot?.(projectRoot) ?? pool.getBridge(projectRoot);
-    this.transports.get(projectRoot)?.refreshStatusSubscription(bridge);
+    this.refreshRootStatus(projectRoot, bridge);
     return bridge.toolCall(sessionId, name, rawArgs, options);
   }
 }
@@ -386,6 +443,7 @@ class RevivableProjectTransport implements AftProjectTransport {
   subscribeStatus(listener: StatusListener): () => void {
     if (this.statusListeners.has(listener)) return () => this.removeStatusListener(listener);
     this.statusListeners.set(listener, () => {});
+    this.owner.trackStatusFacade(this, true);
     this.bindStatusListener(listener, this.owner.currentBridge(this.projectRoot));
     return () => this.removeStatusListener(listener);
   }
@@ -413,6 +471,7 @@ class RevivableProjectTransport implements AftProjectTransport {
     const unsubscribe = this.statusListeners.get(listener);
     this.statusListeners.delete(listener);
     this.statusBridges.delete(listener);
+    if (this.statusListeners.size === 0) this.owner.trackStatusFacade(this, false);
     unsubscribe?.();
   }
 }
