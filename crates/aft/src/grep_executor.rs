@@ -2136,17 +2136,21 @@ mod tests {
     }
 
     // Grep reads files on rayon workers, then stats each matched file on the
-    // thread that sorts the results. Run from a thread outside any rayon pool,
-    // that thread reads no files itself, so each directory's probe must reach
-    // it from the request, not from its own per-thread memo. How many
-    // directories the sorting thread happens to read itself depends on rayon
-    // scheduling, which is why the pooled tests only failed sometimes.
+    // thread that sorts the results. Called from a thread outside any rayon
+    // pool, the sorting thread reads no files itself. Each directory's access
+    // probe (`bounded_io::probe_directory`) must then reach it from the
+    // request's shared probe map, not from its own per-thread cache, or it
+    // spawns a filesystem helper thread again for every directory. In the
+    // pooled tests the sorting thread reads some directories itself, how many
+    // depending on rayon scheduling, which is why they failed only sometimes.
     //
-    // With the default access cap the fallback walk probes all 100 fixture
-    // directories inside its own helper, which spawns nothing, so only the
-    // fixed root work is left: at most 32 helpers, the allowance for root work
-    // in the 132 bound the pooled tests use. A helper per directory or per
-    // file here means a directory the request already probed was probed again.
+    // With the default 5 s access cap, the fallback walk probes all 100 fixture
+    // directories inside its own helper, which spawns nothing. What is left is
+    // fixed work on the project root (its admission stat and listing, and the
+    // walk's helper): at most 32 helpers, the root allowance in the pooled
+    // tests' bound of 132 = 100 directories + 32. A helper per directory or
+    // per file here means a directory the request already probed was probed
+    // again.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ten_thousand_file_grep_sorts_matches_without_per_directory_respawns() {
