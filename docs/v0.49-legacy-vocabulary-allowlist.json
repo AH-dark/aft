@@ -85,6 +85,17 @@
     },
     {
       "path": "crates/aft/src/commands/apply_patch.rs",
+      "line": 118,
+      "column": 44,
+      "token": "filePath",
+      "text": "// without changing the operation's filePath or the absolute fallback.",
+      "location": "line 118, column 44",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/apply_patch.rs",
       "line": 888,
       "column": 18,
       "token": "filePath",
@@ -101,6 +112,17 @@
       "token": "filePath",
       "text": ".or_else(|| file.get(\"filePath\"))",
       "location": "line 1011, column 43",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/apply_patch.rs",
+      "line": 1240,
+      "column": 34,
+      "token": "filePath",
+      "text": "assert_eq!(files[0][\"filePath\"], path_string(&file_path));",
+      "location": "line 1240, column 34",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
