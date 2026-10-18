@@ -1584,6 +1584,7 @@ async fn exercise_catalog_remote_bash(
         &Arc::new(DispatchPathMetrics::new()),
         "tool.catalog",
         fetch(&plan("broca-worker")),
+        PhaseTrace::new(Instant::now()),
     )
     .await
     .unwrap();

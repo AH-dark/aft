@@ -170,6 +170,7 @@ jobs:
       - name: Nightly cost gate measurement checks
         run: |
           python3 scripts/telemetry/test_cpu_precision.py
+          python3 scripts/telemetry/test_index_census_slow_lines.py
           scripts/telemetry/cost-gate.sh --self-test
       - name: Merge queue workflow and search contracts
         run: |

@@ -138,6 +138,15 @@ impl PhaseTrace {
         self.wait_ms = wait_ms;
     }
 
+    pub(crate) fn mark_provider_read_done(&mut self) {
+        // Provider reads have no tool translation, formatting, or finalization
+        // phases; keep their executor wait and operation time in the shared trace.
+        self.translate_done = self.job_admitted;
+        self.mark_execute_done();
+        self.format_done = self.execute_done;
+        self.finalize_done = self.execute_done;
+    }
+
     fn mark_format_done(&mut self) {
         self.format_done = Some(Instant::now());
     }

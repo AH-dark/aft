@@ -2056,6 +2056,17 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+pub(crate) fn take_slow_tool_call_logs_for_test() -> Vec<String> {
+    SLOW_TOOL_CALL_CAPTURE.with(|captured| {
+        captured
+            .borrow_mut()
+            .drain(..)
+            .map(|(_, message)| message)
+            .collect()
+    })
+}
+
 /// Log level for a tool call that exceeded `SLOW_TOOL_CALL_THRESHOLD`.
 ///
 /// Plugin plumbing calls (completion drains, status polls, detach checks) run
@@ -2069,11 +2080,12 @@ fn slow_tool_call_level(caller: ToolCallCaller) -> log::Level {
     }
 }
 
-/// Record a completed subc tool call for slow-call diagnostics and the standing
-/// perf-tick window. The writer calls this only after `write_all` has handed the
-/// complete response frame to the transport.
+/// Record a completed subc tool call or provider read for slow-call diagnostics
+/// and the standing perf-tick window. The writer calls this only after
+/// `write_all` has handed the complete response frame to the transport.
 pub fn note_tool_call_trace(
     name: &str,
+    session: &str,
     root: &Path,
     channel: u16,
     corr: u64,
@@ -2094,8 +2106,9 @@ pub fn note_tool_call_trace(
 
     let waiting_on_build_id = phases.waiting_on_build_id.as_deref().unwrap_or("-");
     crate::slog_debug!(
-        "tool_call phase name={} channel={} corr={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
+        "tool_call phase name={} session={} channel={} corr={} total_ms={:.3} queue_ms={:.3} translate_ms={:.3} exec_ms={:.3} format_ms={:.3} finalize_ms={:.3} egress_ms={:.3} egress_enqueue_ms={:.3} egress_queue_ms={:.3} egress_prepare_ms={:.3} egress_write_ms={:.3} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
         name,
+        session,
         channel,
         corr,
         duration_millis_f64(phases.total),
@@ -2123,8 +2136,9 @@ pub fn note_tool_call_trace(
     if phases.total > SLOW_TOOL_CALL_THRESHOLD {
         let level = slow_tool_call_level(caller);
         let message = format!(
-            "slow tool_call name={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
+            "slow tool_call name={} session={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
             name,
+            session,
             channel,
             corr,
             duration_millis_u64(phases.total),
@@ -2879,7 +2893,15 @@ mod tests {
 
     fn slow_call_levels(name: &str, caller: ToolCallCaller) -> Vec<log::Level> {
         SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.borrow_mut().clear());
-        note_tool_call_trace(name, Path::new("/repo"), 7, 1, slow_phases(), caller);
+        note_tool_call_trace(
+            name,
+            "test-session",
+            Path::new("/repo"),
+            7,
+            1,
+            slow_phases(),
+            caller,
+        );
         SLOW_TOOL_CALL_CAPTURE.with(|captured| {
             captured
                 .borrow_mut()
@@ -2919,6 +2941,7 @@ mod tests {
         SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.borrow_mut().clear());
         note_tool_call_trace(
             "read",
+            "test-session",
             Path::new("/repo"),
             7,
             1,
@@ -2926,6 +2949,23 @@ mod tests {
             ToolCallCaller::Agent,
         );
         assert!(SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.borrow().is_empty()));
+    }
+
+    #[test]
+    fn subc_tool_catalog_fast_answer_does_not_emit_slow_call_line() {
+        let mut phases = slow_phases();
+        phases.total = SLOW_TOOL_CALL_THRESHOLD;
+        let _ = take_slow_tool_call_logs_for_test();
+        note_tool_call_trace(
+            "tool.catalog",
+            "catalog-fast",
+            Path::new("/repo"),
+            7,
+            1,
+            phases,
+            ToolCallCaller::Agent,
+        );
+        assert!(take_slow_tool_call_logs_for_test().is_empty());
     }
 
     #[test]
