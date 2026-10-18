@@ -897,6 +897,62 @@ fn finish_bash_poll_done(
     response
 }
 
+/// Return the latest expected bash reply time from the call's own wait limits.
+pub(super) fn unanswered_bash_reply_deadline(
+    received_at: Instant,
+    raw_args: &Value,
+    foreground_wait_window_ms: u64,
+    worker_wait_max_ms: u64,
+    run_scoped: bool,
+    server_completion: bool,
+    startup_window_ms: u64,
+    capture_deadline: Option<Instant>,
+) -> Instant {
+    let wait = raw_args
+        .get("wait")
+        .and_then(crate::subc_translate::model_boolean)
+        == Some(true);
+    let block_to_completion = raw_args
+        .get("block_to_completion")
+        .and_then(crate::subc_translate::model_boolean)
+        == Some(true);
+    let blocking_intent = wait || block_to_completion;
+    let blocking_cap_ms = crate::commands::bash_orchestrate::blocking_wait_cap_ms(
+        blocking_intent,
+        worker_wait_max_ms,
+    );
+    let timeout_ms = raw_args.get("timeout").and_then(Value::as_u64);
+    let worker_cap_ms = if run_scoped { None } else { blocking_cap_ms };
+    let mut wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
+        crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
+            crate::commands::bash_orchestrate::resolve_foreground_wait_window_ms(
+                foreground_wait_window_ms,
+            ),
+            timeout_ms,
+            wait,
+        )
+    });
+    if !wait && !block_to_completion && !server_completion {
+        wait_window_ms = wait_window_ms.min(20_000);
+    }
+    if raw_args
+        .get("background")
+        .and_then(crate::subc_translate::model_boolean)
+        == Some(true)
+    {
+        wait_window_ms = 0;
+    }
+
+    let command_timeout_ms = timeout_ms
+        .unwrap_or_else(|| crate::bash_background::registry::DEFAULT_BG_TIMEOUT.as_millis() as u64);
+    let reply_wait_ms = wait_window_ms.min(command_timeout_ms);
+    let mut deadline = received_at + Duration::from_millis(startup_window_ms.max(reply_wait_ms));
+    if let Some(capture_deadline) = capture_deadline {
+        deadline = deadline.max(capture_deadline);
+    }
+    deadline
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn submit_deferred_bash(
     executor: &Arc<Executor>,
@@ -991,9 +1047,10 @@ pub(super) fn submit_deferred_bash(
         .and_then(crate::subc_translate::model_boolean)
         == Some(true)
         && !server_completion;
+    let worker_wait_max_ms = crate::commands::bash_orchestrate::worker_wait_max_ms(&spawn_ctx);
     let blocking_cap_ms = crate::commands::bash_orchestrate::blocking_wait_cap_ms(
         blocking_intent,
-        crate::commands::bash_orchestrate::worker_wait_max_ms(&spawn_ctx),
+        worker_wait_max_ms,
     );
     let capture_deadline = raw_args
         .get("runon")
@@ -1032,6 +1089,17 @@ pub(super) fn submit_deferred_bash(
         )
     }
     .min(20_000);
+    let unanswered_deadline = unanswered_bash_reply_deadline(
+        received_at,
+        raw_args,
+        spawn_ctx.config().foreground_wait_window_ms,
+        worker_wait_max_ms,
+        run_scoped,
+        server_completion,
+        startup_window,
+        capture_deadline,
+    );
+    metrics.set_bash_unanswered_deadline(route, corr, unanswered_deadline);
     let startup_deadline = received_at + Duration::from_millis(startup_window);
     let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(startup_deadline));
     let receipt_for_spawn = Arc::clone(&receipt);
