@@ -133,7 +133,13 @@ pub(super) fn fetch_diff(
             "PR changed paths reached the {MAX_DIFF_BYTES}-byte fetch ceiling; no diff returned."
         )));
     }
-    let mut lines: Vec<_> = file_bytes.split(|byte| *byte == b'\n').collect();
+    // A PR whose changes were all reverted lists no files: `.[]` prints
+    // nothing, which is an empty list rather than an invalid line.
+    let mut lines: Vec<_> = if file_bytes.is_empty() {
+        Vec::new()
+    } else {
+        file_bytes.split(|byte| *byte == b'\n').collect()
+    };
     if file_bytes.last() == Some(&b'\n') {
         lines.pop();
     }
@@ -564,6 +570,21 @@ mod tests {
         let diff = fetch(runner, "pr://42/diff/src/new.rs").unwrap();
         assert!(diff.header.contains("renamed from src/old.rs"));
         assert!(diff.body.contains("+new name"));
+    }
+
+    #[test]
+    fn zero_file_pr_returns_an_empty_diff() {
+        let mut runner = FixtureRunner::recorded();
+        runner.metadata["changedFiles"] = serde_json::json!(0);
+        runner.metadata["files"] = serde_json::json!([]);
+        runner.file_list_response = Some(Vec::new());
+        runner.patch = Vec::new();
+
+        let diff = fetch(runner, "pr://42/diff").unwrap();
+        let page = diff.page(GithubReadSelector::WholeDocument);
+        assert!(page
+            .content
+            .starts_with("PR owner/repo#42 diff — head 0123456"));
     }
 
     #[test]
