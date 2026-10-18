@@ -949,6 +949,51 @@ async fn consent_scope_old_pending_file_is_not_widened() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn consent_scope_persisted_non_parent_pattern_is_refused() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for offer_ancestor in [false, true] {
+        let f = fixture(FakeCingulate::up());
+        set_hold_budget_for_test(Some(Duration::from_millis(100)));
+        let target = f.head_root.join("shared.txt");
+        assert_eq!(
+            code(&f.read(&f.worker, &target, 201).await),
+            "access_pending"
+        );
+        let record = f.asks().pop().unwrap();
+        let mut request = record.request.unwrap();
+        let directory = if offer_ancestor {
+            f.head_root.parent().unwrap().to_path_buf()
+        } else {
+            f.head_root.join("unrelated")
+        };
+        request["pattern"] = json!(format!("{}/**", directory.display()));
+        {
+            let db = f.ctx.db().unwrap();
+            asks::open(
+                &db.lock().unwrap(),
+                &record.key,
+                record.call_key.as_deref().unwrap(),
+                &record.selector,
+                &request,
+                &record.pending.unwrap(),
+                crate::db::call_ledger::now_ms(),
+            )
+            .unwrap();
+        }
+        f.fake.answer(
+            record.call_key.as_deref().unwrap(),
+            json!({"state":"settled", "outcome":"allow_scope", "answered_by":"head"}),
+        );
+        let declined = f.read(&f.worker, &target, 202).await;
+        assert_eq!(code(&declined), "access_declined", "{declined}");
+        assert!(!text(&declined).contains("head-owned contents"));
+        assert!(f.worker_grants().is_empty());
+        assert!(f.asks().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn consent_scope_head_file_grant_allows_once_without_delegating_directory() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
@@ -1242,7 +1287,7 @@ async fn consent_stalled_home_scope_probe_is_single_flight_and_file_only() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn consent_scope_stalled_finish_probe_is_bounded_and_releases_database() {
+async fn consent_scope_held_probe_at_settlement_keeps_advertised_tree_and_sibling_access() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     set_hold_budget_for_test(Some(Duration::from_millis(100)));
@@ -1251,17 +1296,12 @@ async fn consent_scope_stalled_finish_probe_is_bounded_and_releases_database() {
         code(&f.read(&f.worker, &target, 201).await),
         "access_pending"
     );
-    let record = f.asks().pop().unwrap();
-    let prep = Prepared {
-        key: record.key,
-        call_key: record.call_key.unwrap(),
-        request: record.request.unwrap(),
-        selector: selector(f.worker.scope.as_ref().unwrap()),
-        grant: record.pending.unwrap(),
-    };
-    let call = Arc::new(scope_probe_call(&f, &target));
-    // Simulate a card answered after its directory memo has expired. A warm
-    // memo intentionally avoids filesystem work during settlement.
+    let request = &f.fake.calls("consent.request")[0];
+    assert_eq!(request["pattern"], format!("{}/**", f.head_root.display()));
+    assert_eq!(request["reason"], READ_TREE_SCOPE_REASON);
+    assert_eq!(request["head_policy"], "allow");
+    // A head may answer after the directory memo expires, while another
+    // filesystem probe owns the only permit.
     if let Some(probe) = DIRECTORY_SCOPE_PROBES
         .lock()
         .unwrap()
@@ -1272,43 +1312,29 @@ async fn consent_scope_stalled_finish_probe_is_bounded_and_releases_database() {
             *at -= DIRECTORY_SCOPE_MEMO_TTL;
         }
     }
-    let gate = crate::bounded_io::stall_helper(&f.head_root);
-    let running_call = Arc::clone(&call);
-    let task = tokio::spawn(async move {
-        finish(
-            &running_call,
-            &prep,
-            Settlement::Allow {
-                scope: true,
-                by_user: true,
-            },
-        )
-        .await
-    });
-    let _gate = tokio::task::spawn_blocking(move || {
-        gate.reached
-            .recv_timeout(Duration::from_secs(1))
-            .expect("settlement probe entered the bounded helper");
-        gate
-    })
-    .await
-    .unwrap();
-    assert_probe_leaves_database_available(&call).await;
-    let result = tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .expect("settlement probe has a deadline")
-        .unwrap();
-    assert!(matches!(result, Hold::Run { .. }));
+    let _permit = DIRECTORY_SCOPE_PROBE_LIMITER
+        .try_acquire()
+        .expect("the test owns the directory probe permit");
+    f.fake.answer(
+        request["call_key"].as_str().unwrap(),
+        json!({"state":"settled", "outcome":"allow_scope", "answered_by":"head"}),
+    );
+    let allowed = f.read(&f.worker, &target, 202).await;
+    assert!(text(&allowed).contains("head-owned contents"), "{allowed}");
     assert_eq!(
         f.worker_grants(),
         vec![AccessGrant {
-            path: target,
-            kind: GrantKind::File,
+            path: f.head_root.clone(),
+            kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         }]
     );
-    drop(_gate);
-    wait_for_scope_probe_idle().await;
+    let count = f.fake.calls("consent.request").len();
+    let sibling = f.head_root.join("sibling.txt");
+    std::fs::write(&sibling, "sibling contents").unwrap();
+    let reply = f.read(&f.worker, &sibling, 203).await;
+    assert!(text(&reply).contains("sibling contents"), "{reply}");
+    assert_eq!(f.fake.calls("consent.request").len(), count);
 }
 
 // Cingulate accepts only `/`-rooted paths, and native Windows drive or UNC
@@ -1336,7 +1362,7 @@ async fn consent_scope_write_cards_keep_the_original_capability() {
         assert_eq!(prep.request["pattern"], expected_pattern);
         assert_eq!(prep.request["reason"], expected_reason);
         assert_eq!(prep.request["operation"], "write");
-        assert_eq!(advertised_scope(&prep, grant.clone()), grant);
+        assert_eq!(advertised_scope(&prep), Some(grant));
         FakeAccessRequest::decode(&prep.request).unwrap();
     }
 }
@@ -1886,7 +1912,7 @@ fn consent_scope_rejects_physical_directory_aliases() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn consent_scope_old_broad_card_is_restricted_to_file() {
+async fn consent_scope_old_root_card_is_refused() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let db = f.ctx.db().unwrap();
@@ -1911,7 +1937,52 @@ async fn consent_scope_old_broad_card_is_restricted_to_file() {
     assert_eq!(prep.request["pattern"], "/x");
     assert_eq!(prep.request["reason"], "Allow scope: read-only access for all AFT read tools to the displayed file only. Protected paths remain denied.");
     prep.request["pattern"] = json!("/**");
-    assert_eq!(advertised_scope(&prep, grant.clone()), grant);
+    assert_eq!(advertised_scope(&prep), None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn consent_scope_reconstruction_checks_kind_and_operation() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let target = f.head_root.join("shared.txt");
+    let grant = AccessGrant {
+        path: target.clone(),
+        kind: GrantKind::File,
+        operation: AccessOperation::Read,
+    };
+    let directory = AccessGrant {
+        path: f.head_root.clone(),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    let Prep::Ask(prep) = prepare(
+        &f.ctx.db().unwrap(),
+        &f.ctx,
+        &f.worker,
+        "read",
+        &json!({"path": target}),
+        &grant,
+        &directory,
+        None,
+    )
+    .unwrap() else {
+        panic!("expected a directory scope card");
+    };
+    assert_eq!(advertised_scope(&prep), Some(directory));
+    let mut mismatched = prep.clone();
+    mismatched.request["kind"] = json!("command");
+    assert_eq!(advertised_scope(&mismatched), None);
+    let mut mismatched = prep.clone();
+    mismatched.request["operation"] = json!("write");
+    assert_eq!(advertised_scope(&mismatched), None);
+    let mut mismatched = prep.clone();
+    mismatched.grant.operation = AccessOperation::Write;
+    mismatched.request["operation"] = json!("write");
+    assert_eq!(advertised_scope(&mismatched), None);
+    let mut mismatched = prep;
+    mismatched.grant.kind = GrantKind::Subtree;
+    assert_eq!(advertised_scope(&mismatched), None);
 }
 
 #[tokio::test]
@@ -1982,6 +2053,7 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
     assert_eq!(code(&pending), "access_pending", "{pending}");
     let request = &f.fake.calls("consent.request")[0];
     assert_eq!(request["head_policy"], "allow");
+    assert_eq!(request["pattern"], pattern(&head_grant));
     // The head's only covering grant is revoked while the ask is pending.
     {
         let db = f.ctx.db().unwrap();
@@ -1989,6 +2061,17 @@ async fn consent_head_answer_is_rechecked_against_the_current_head_policy() {
             &db.lock().unwrap(),
             &access_grants::scope_key(&f.head),
             &head_grant.path,
+        )
+        .unwrap();
+        // The head still holds the file, but cannot delegate its former tree.
+        crate::db::access_grants::insert(
+            &db.lock().unwrap(),
+            &access_grants::scope_key(&f.head),
+            &AccessGrant {
+                path: crate::access_policy::policy_path(&target),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            },
         )
         .unwrap();
     }
