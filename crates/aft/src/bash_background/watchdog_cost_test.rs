@@ -353,6 +353,65 @@ fn watchdog_cost_unreadable_task_store_is_reported_not_treated_as_empty() {
     assert!(crate::bash_background::persisted_gc_health().roots_failing >= 1);
 }
 
+/// A session that cannot be opened must not keep readable sessions from being swept.
+#[cfg(unix)]
+#[test]
+fn watchdog_cost_unreadable_session_does_not_hide_remaining_tasks() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ =
+                fs::set_permissions(&self.0, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        }
+    }
+
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (_, readable) = fixture(storage.path(), "readable-session", true, 2);
+    let (_, unreadable) = fixture(storage.path(), "unreadable-session", true, 2);
+    let restore = RestorePermissions(unreadable.session_dir.clone());
+    fs::set_permissions(
+        &unreadable.session_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0),
+    )
+    .unwrap();
+
+    registry.maybe_gc_persisted(storage.path()).unwrap();
+
+    drop(restore);
+    assert!(
+        !readable.dir.exists(),
+        "a due task in a readable session was not deleted"
+    );
+    assert!(
+        unreadable.dir.exists(),
+        "a task in the unreadable session should not have been visited"
+    );
+    let health = gc_health(storage.path());
+    assert_eq!(health.last_pass_unreadable_sessions, 1, "{health:?}");
+    assert_eq!(health.last_pass_directory_read_errors, 0, "{health:?}");
+    assert!(
+        health
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains(&unreadable.session_dir.display().to_string())),
+        "the skipped session was not named in health: {health:?}"
+    );
+    assert_eq!(
+        health.laps_completed, 0,
+        "an incomplete scan looked clean: {health:?}"
+    );
+    assert!(
+        !health.last_pass_out_of_budget,
+        "the scan error is not a budget overrun: {health:?}"
+    );
+    assert!(crate::bash_background::persisted_gc_health().roots_failing >= 1);
+}
+
 /// Abandonment depends on the worktree existing, not on the task's files, so
 /// a remembered undelivered result is retired once its worktree is deleted.
 #[test]

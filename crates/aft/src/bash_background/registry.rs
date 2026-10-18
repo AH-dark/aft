@@ -5986,6 +5986,8 @@ impl BgTaskRegistry {
             walk_finished: walk.finished,
             root_missing: walk.missing,
             error: walk.error,
+            unreadable_sessions: walk.unreadable_sessions,
+            directory_read_errors: walk.directory_read_errors,
             ..super::gc_memo::PassReport::default()
         };
         let mut retired = 0;
@@ -6191,9 +6193,9 @@ impl BgTaskRegistry {
                             // drop them so this visit remembers nothing.
                             evidence = None;
                             if let Err(error) = self.persist_task(&resolved.paths, &metadata) {
-                                pass.error = Some(format!(
-                                    "failed to persist recovered exit of background task {task_id}: {error}"
-                                ));
+                                pass.error.get_or_insert_with(|| {
+                                    format!("failed to persist recovered exit of background task {task_id}: {error}")
+                                });
                                 memo.finish_pass(pass);
                                 return Err(error.to_string());
                             }
@@ -6246,9 +6248,9 @@ impl BgTaskRegistry {
                         // failed delete is retried as delivered, never re-pushed.
                         metadata.completion_delivered = true;
                         if let Err(error) = self.persist_task(&resolved.paths, &metadata) {
-                            pass.error = Some(format!(
-                                "failed to persist retirement of background task {task_id}: {error}"
-                            ));
+                            pass.error.get_or_insert_with(|| {
+                                format!("failed to persist retirement of background task {task_id}: {error}")
+                            });
                             memo.finish_pass(pass);
                             return Err(error.to_string());
                         }
@@ -10712,7 +10714,16 @@ fn task_artifacts_exist(session_dir: &Path, task_id: &str) -> bool {
 fn gc_quarantine(storage_dir: &Path) {
     let root = storage_dir.join("bash-tasks-quarantine");
     let key = canonicalized_path(&root);
-    for batch in gc_batches(&root, key).batches {
+    let walk = gc_batches(&root, key);
+    if let Some(error) = &walk.error {
+        crate::slog_warn!(
+            "incomplete background task quarantine walk {} ({} unreadable sessions, {} directory read errors): {error}",
+            root.display(),
+            walk.unreadable_sessions,
+            walk.directory_read_errors,
+        );
+    }
+    for batch in walk.batches {
         for name in batch.names {
             let path = batch.session.join(name);
             if modified_within(&path, QUARANTINE_GC_GRACE) {
@@ -10744,6 +10755,8 @@ struct GcWalk {
     missing: bool,
     /// The root exists but could not be read, so this pass saw nothing.
     error: Option<String>,
+    unreadable_sessions: usize,
+    directory_read_errors: usize,
 }
 
 /// The next budgeted slice of the walk over `root`, resuming where the
@@ -10766,6 +10779,8 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
                     finished: true,
                     missing: true,
                     error: None,
+                    unreadable_sessions: 0,
+                    directory_read_errors: 0,
                 }
             }
             Err(error) => {
@@ -10778,21 +10793,25 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
                     finished: false,
                     missing: false,
                     error: Some(format!("failed to read {}: {error}", root.display())),
+                    unreadable_sessions: 0,
+                    directory_read_errors: 0,
                 };
             }
         }
     }
     let cursor = cursors.get_mut(&key).expect("GC cursor inserted");
-    let batches = cursor.next_batch();
+    let result = cursor.next_batch();
     let finished = cursor.finished;
     if finished {
         cursors.remove(&key);
     }
     GcWalk {
-        batches,
+        batches: result.batches,
         finished,
         missing: false,
-        error: None,
+        error: result.first_error,
+        unreadable_sessions: result.unreadable_sessions,
+        directory_read_errors: result.directory_read_errors,
     }
 }
 

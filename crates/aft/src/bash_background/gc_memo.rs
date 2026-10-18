@@ -202,6 +202,10 @@ pub struct PersistedGcHealth {
     pub last_pass_tasks: usize,
     pub last_pass_evaluated: usize,
     pub last_pass_unchanged: usize,
+    /// Session folders that could not be opened during the last pass.
+    pub last_pass_unreadable_sessions: usize,
+    /// Directory-entry reads that failed during the last pass.
+    pub last_pass_directory_read_errors: usize,
     /// Tasks currently remembered as not deletable.
     pub remembered_tasks: usize,
     /// Why the last pass could not walk the store, if it could not. Such a
@@ -413,6 +417,8 @@ impl GcMemo {
             health.last_pass_tasks = pass.tasks;
             health.last_pass_evaluated = pass.evaluated;
             health.last_pass_unchanged = pass.unchanged;
+            health.last_pass_unreadable_sessions = pass.unreadable_sessions;
+            health.last_pass_directory_read_errors = pass.directory_read_errors;
             health.remembered_tasks = remembered;
             health.last_error = pass.error;
         });
@@ -430,6 +436,8 @@ pub(crate) struct PassReport {
     pub tasks: usize,
     pub evaluated: usize,
     pub unchanged: usize,
+    pub unreadable_sessions: usize,
+    pub directory_read_errors: usize,
 }
 
 /// A storage root whose last sweep pass could not walk it.
