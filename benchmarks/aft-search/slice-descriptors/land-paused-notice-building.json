@@ -1,9 +1,12 @@
 {
-  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
+  "slice_class": "engine_unwired",
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "The paused-lane notice replaces only the semantic readiness line when embedding is paused and the semantic lane is unavailable. Keyword-index building disclosures and ranked rows remain unchanged."
+  "fenced_files": [
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "note": "- Ranking and routing are unchanged; benchmark rows must remain byte-identical."
 }
