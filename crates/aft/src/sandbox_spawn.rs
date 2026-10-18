@@ -4238,12 +4238,7 @@ pub(crate) fn apply_marker_fd_allowlist(
 ) -> Result<(RawFd, RawFd), String> {
     use std::os::unix::process::CommandExt;
 
-    let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    let fd_limit = if fd_limit > 0 {
-        (fd_limit as RawFd).min(65_536)
-    } else {
-        1_024
-    };
+    let open_fds = open_descriptor_snapshot().map_err(|error| error.to_string())?;
     unsafe {
         command.pre_exec(move || {
             let exit_copy = libc::fcntl(exit_fd, libc::F_DUPFD_CLOEXEC, 6);
@@ -4266,16 +4261,155 @@ pub(crate) fn apply_marker_fd_allowlist(
             }
             libc::close(exit_copy);
             libc::close(failure_copy);
-            for fd in (CHILD_FAILURE_FD + 1)..fd_limit {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags >= 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-                }
-            }
-            Ok(())
+            mark_extra_fds_cloexec(&open_fds)
         });
     }
     Ok((CHILD_EXIT_FD, CHILD_FAILURE_FD))
+}
+
+#[cfg(unix)]
+fn open_descriptor_snapshot() -> std::io::Result<Vec<RawFd>> {
+    // Enumerate and allocate before fork: the child only visits actual descriptors,
+    // not every unused number below RLIMIT_NOFILE. Descriptors opened by other
+    // threads or spawn machinery after this snapshot must retain atomic CLOEXEC;
+    // pre_exec hooks must not create additional inheritable descriptors. Only the
+    // two explicitly remapped markers are exempt from that invariant.
+    let mut fds = list_open_descriptors()?;
+    fds.retain(|fd| *fd > CHILD_FAILURE_FD);
+    fds.sort_unstable();
+    fds.dedup();
+    Ok(fds)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn list_open_descriptors() -> std::io::Result<Vec<RawFd>> {
+    let directory = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let mut fds = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        if let Some(fd) = entry?
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        {
+            fds.push(fd);
+        }
+    }
+    Ok(fds)
+}
+
+#[cfg(target_os = "macos")]
+fn list_open_descriptors() -> std::io::Result<Vec<RawFd>> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcFdInfo {
+        fd: i32,
+        fd_type: u32,
+    }
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: i32,
+            flavor: i32,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            size: i32,
+        ) -> i32;
+    }
+    const PROC_PIDLISTFDS: i32 = 1;
+    let pid = unsafe { libc::getpid() };
+    let size = unsafe { proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let record_size = std::mem::size_of::<ProcFdInfo>();
+    let mut capacity = size as usize / record_size + 32;
+    loop {
+        let byte_size = capacity
+            .checked_mul(record_size)
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .ok_or_else(|| std::io::Error::other("descriptor inventory is too large"))?;
+        let mut records = vec![ProcFdInfo { fd: 0, fd_type: 0 }; capacity];
+        let written = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDLISTFDS,
+                0,
+                records.as_mut_ptr().cast(),
+                byte_size,
+            )
+        };
+        if written <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if written >= byte_size {
+            // A full buffer may omit concurrent opens. Retry with room to grow
+            // rather than silently dropping the highest descriptor entries.
+            capacity = capacity
+                .checked_mul(2)
+                .ok_or_else(|| std::io::Error::other("descriptor inventory capacity overflow"))?;
+            continue;
+        }
+        if written as usize % record_size != 0 {
+            return Err(std::io::Error::other("partial descriptor inventory record"));
+        }
+        return Ok(records[..written as usize / record_size]
+            .iter()
+            .map(|record| record.fd)
+            .collect());
+    }
+}
+
+#[cfg(unix)]
+fn mark_extra_fds_cloexec(open_fds: &[RawFd]) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    // CLOEXEC leaves Rust's spawn-error pipe usable until exec succeeds and
+    // preserves the two marker descriptors below the range.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            (CHILD_FAILURE_FD + 1) as u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    mark_extra_fds_cloexec_fallback(open_fds)
+}
+
+#[cfg(unix)]
+fn mark_extra_fds_cloexec_fallback(open_fds: &[RawFd]) -> std::io::Result<()> {
+    mark_extra_fds_cloexec_fallback_with(open_fds, |fd, operation, flags| unsafe {
+        libc::fcntl(fd, operation, flags)
+    })
+}
+
+#[cfg(unix)]
+fn mark_extra_fds_cloexec_fallback_with(
+    fds: &[RawFd],
+    mut fcntl: impl FnMut(RawFd, libc::c_int, libc::c_int) -> libc::c_int,
+) -> std::io::Result<()> {
+    for &fd in fds {
+        let flags = fcntl(fd, libc::F_GETFD, 0);
+        if flags < 0 {
+            let error = std::io::Error::last_os_error();
+            // The listing handle or another thread's descriptor may have closed
+            // since the parent snapshot. No descriptor remains to protect then.
+            if error.raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(error);
+        }
+        if flags & libc::FD_CLOEXEC == 0 && fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -4934,6 +5068,237 @@ pub(crate) mod environment_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn isolated_descriptor_test(name: &str) -> bool {
+        const KEY: &str = "AFT_TEST_DESCRIPTOR_ISOLATION";
+        if std::env::var(KEY).as_deref() == Ok(name) {
+            return true;
+        }
+        // A deliberately inheritable FD must not overlap other tests' forks.
+        // Keep its creation and the parent-side snapshot in a one-test process.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(KEY, name)
+            .output()
+            .unwrap();
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "isolated descriptor test failed: {output:?}"
+        );
+        false
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn high_descriptor_target(hard_limit: u64) -> Option<RawFd> {
+        let target = hard_limit.saturating_sub(16).min((RawFd::MAX - 1) as u64);
+        (target > 1024).then_some(target as RawFd)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn high_descriptor_target_respects_the_actual_hard_limit() {
+        for hard in [2048, 65_536, 1_048_576] {
+            let fd = high_descriptor_target(hard).unwrap();
+            assert!(fd > 1024 && (fd as u64) < hard);
+        }
+        assert_eq!(high_descriptor_target(1024), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn high_descriptor_for_test(cloexec: bool) -> Option<OwnedFd> {
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let maximum = if limit.rlim_max == libc::RLIM_INFINITY {
+            #[cfg(target_os = "linux")]
+            let maximum = std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap();
+            #[cfg(target_os = "macos")]
+            let maximum = {
+                let mut maximum: libc::c_int = 0;
+                let mut size = std::mem::size_of_val(&maximum);
+                assert_eq!(
+                    unsafe {
+                        libc::sysctlbyname(
+                            c"kern.maxfilesperproc".as_ptr(),
+                            (&mut maximum as *mut libc::c_int).cast(),
+                            &mut size,
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    },
+                    0
+                );
+                u64::try_from(maximum).unwrap()
+            };
+            maximum
+        } else {
+            limit.rlim_max as u64
+        };
+        let Some(target) = high_descriptor_target(maximum) else {
+            eprintln!("SKIP high-descriptor test: effective hard RLIMIT_NOFILE={maximum} is too low for a descriptor above 1024 with a safety margin");
+            return None;
+        };
+        limit.rlim_cur = limit.rlim_cur.max((target as u64 + 1) as libc::rlim_t);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let source = tempfile::tempfile().unwrap();
+        let operation = if cloexec {
+            libc::F_DUPFD_CLOEXEC
+        } else {
+            libc::F_DUPFD
+        };
+        let fd = unsafe { libc::fcntl(source.as_raw_fd(), operation, target) };
+        assert!(
+            fd >= target,
+            "cannot allocate high descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        let high = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert!(
+            std::fs::metadata(descriptor_path_for_test(fd)).is_ok(),
+            "descriptor path must exist before exec"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC != 0,
+            cloexec
+        );
+        eprintln!("high-descriptor test: hard={maximum}, fd={fd}, cloexec={cloexec}");
+        Some(high)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn descriptor_path_for_test(fd: RawFd) -> String {
+        if cfg!(target_os = "linux") {
+            format!("/proc/self/fd/{fd}")
+        } else {
+            format!("/dev/fd/{fd}")
+        }
+    }
+
+    #[test]
+    fn fallback_fcntl_work_tracks_open_descriptors_not_their_numbers() {
+        let open = [7, 70_000];
+        let mut gets = 0;
+        let mut sets = Vec::new();
+        mark_extra_fds_cloexec_fallback_with(&open, |fd, operation, flags| {
+            if operation == libc::F_GETFD {
+                gets += 1;
+                if fd == open[0] {
+                    0
+                } else if fd == open[1] {
+                    libc::FD_CLOEXEC
+                } else {
+                    unsafe { libc::fcntl(-1, libc::F_GETFD) }
+                }
+            } else {
+                assert_eq!(operation, libc::F_SETFD);
+                sets.push((fd, flags));
+                0
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            gets,
+            open.len(),
+            "fallback must not probe unused descriptor numbers"
+        );
+        assert_eq!(sets, [(open[0], libc::FD_CLOEXEC)]);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn marker_allowlist_closes_high_fds_and_preserves_markers() {
+        if !isolated_descriptor_test(
+            "sandbox_spawn::tests::marker_allowlist_closes_high_fds_and_preserves_markers",
+        ) {
+            return;
+        }
+        let Some(high) = high_descriptor_for_test(false) else {
+            return;
+        };
+        let exit = tempfile::tempfile().unwrap();
+        let failure = tempfile::tempfile().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "test ! -e \"$1\" || exit 99; printf exit >&3; printf failure >&4",
+            "marker-test",
+        ]);
+        command.arg(descriptor_path_for_test(high.as_raw_fd()));
+        apply_marker_fd_allowlist(&mut command, exit.as_raw_fd(), failure.as_raw_fd()).unwrap();
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "high descriptor leaked: {output:?}"
+        );
+        let mut exit_text = String::new();
+        let mut failure_text = String::new();
+        let mut exit = exit;
+        let mut failure = failure;
+        exit.seek(SeekFrom::Start(0)).unwrap();
+        failure.seek(SeekFrom::Start(0)).unwrap();
+        exit.read_to_string(&mut exit_text).unwrap();
+        failure.read_to_string(&mut failure_text).unwrap();
+        assert_eq!(exit_text, "exit");
+        assert_eq!(failure_text, "failure");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fallback_sweep_covers_high_descriptor_range() {
+        use std::os::unix::process::CommandExt;
+        if !isolated_descriptor_test(
+            "sandbox_spawn::tests::fallback_sweep_covers_high_descriptor_range",
+        ) {
+            return;
+        }
+        let Some(high) = high_descriptor_for_test(false) else {
+            return;
+        };
+        let open_fds = open_descriptor_snapshot().unwrap();
+        assert!(
+            open_fds.contains(&high.as_raw_fd()),
+            "parent inventory omitted the high descriptor"
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "test ! -e \"$1\"", "fallback-test"]);
+        command.arg(descriptor_path_for_test(high.as_raw_fd()));
+        unsafe {
+            command.pre_exec(move || mark_extra_fds_cloexec_fallback(&open_fds));
+        }
+        assert!(command.status().unwrap().success());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fallback_preserves_cloexec_for_descriptors_opened_after_snapshot() {
+        use std::os::unix::process::CommandExt;
+        if !isolated_descriptor_test("sandbox_spawn::tests::fallback_preserves_cloexec_for_descriptors_opened_after_snapshot") {
+            return;
+        }
+        let open_fds = open_descriptor_snapshot().unwrap();
+        let Some(high) = high_descriptor_for_test(true) else {
+            return;
+        };
+        assert!(!open_fds.contains(&high.as_raw_fd()));
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "test ! -e \"$1\"", "late-open-test"]);
+        command.arg(descriptor_path_for_test(high.as_raw_fd()));
+        unsafe {
+            command.pre_exec(move || mark_extra_fds_cloexec_fallback(&open_fds));
+        }
+        assert!(command.status().unwrap().success());
+    }
 
     #[test]
     fn shell_containment_requires_strict_native_plan() {

@@ -403,10 +403,9 @@ fn watcher_path_is_ignored_by_matcher_with_kind(
         return true;
     }
 
-    let guard = matcher
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    watcher_path_is_ignored(guard.as_deref(), path, is_dir)
+    with_matcher_snapshot(matcher, |snapshot| {
+        watcher_path_is_ignored(snapshot, path, is_dir)
+    })
 }
 
 pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
@@ -415,10 +414,21 @@ pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path:
     if path.components().any(|part| part.as_os_str() == ".git") {
         return false;
     }
-    let guard = matcher
+    with_matcher_snapshot(matcher, |snapshot| {
+        watcher_path_is_ignored(snapshot, path, false)
+    })
+}
+
+fn with_matcher_snapshot<T>(
+    matcher: &SharedGitignore,
+    apply: impl FnOnce(Option<&Gitignore>) -> T,
+) -> T {
+    // Filesystem work uses an immutable snapshot, not the rebuild writer's lock.
+    let snapshot = matcher
         .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    watcher_path_is_ignored(guard.as_deref(), path, false)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    apply(snapshot.as_deref())
 }
 
 fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path, is_dir: bool) -> bool {
@@ -454,17 +464,14 @@ fn watcher_directory_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> boo
 /// True when `path` is an in-tree ignore rule file inside an ignored directory.
 /// A rule file that matches itself still supplies rules for its directory and
 /// must be reloaded when its contents change.
-fn ignore_file_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
+fn ignore_file_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
     if !watcher_path_is_ignore_file(path) {
         return false;
     }
     let Some(parent) = path.parent() else {
         return false;
     };
-    let guard = matcher
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.as_deref().is_some_and(|matcher| {
+    matcher.is_some_and(|matcher| {
         path.starts_with(matcher.path())
             && parent != matcher.path()
             && matcher
@@ -2014,64 +2021,63 @@ fn filter_canonical_paths(
     matcher: &SharedGitignore,
     raw_paths: BTreeSet<PathBuf>,
 ) -> FilteredWatcherPaths {
-    // Resolve control paths once for this flush, not once for every source
-    // change. A fresh resolution on the next flush observes HEAD/ref and global
-    // ignore configuration changes without a process-lifetime cache.
-    let metadata = WatcherBatchMetadata::resolve(config);
-    // A `.gitignore` written inside a directory the current rules already
-    // ignore cannot change the corpus: git never descends into an ignored
-    // directory to read one, and neither does the matcher. wrangler, for one,
-    // writes a `.gitignore` into every dev directory it creates under an
-    // ignored `.wrangler/tmp/`; treating each as a rule change rebuilt the
-    // matcher and cold-rebuilt the search index every few seconds for an hour
-    // (2026-09-18). A rule file whose parent is not ignored, or any rule file
-    // while no matcher exists yet, still counts.
-    let ignore_file_paths = raw_paths
-        .iter()
-        .filter(|path| {
-            metadata.can_change_corpus_ignore(config, path)
-                && !ignore_file_is_ignored_by_matcher(matcher, path)
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let ignore_file_changed = !ignore_file_paths.is_empty();
+    with_matcher_snapshot(matcher, |matcher| {
+        // Resolve control paths once for this flush, not once for every source
+        // change. A fresh resolution on the next flush observes HEAD/ref and global
+        // ignore configuration changes without a process-lifetime cache.
+        let metadata = WatcherBatchMetadata::resolve(config);
+        // A `.gitignore` written inside a directory the current rules already
+        // ignore cannot change the corpus: git never descends into an ignored
+        // directory to read one, and neither does the matcher. wrangler, for one,
+        // writes a `.gitignore` into every dev directory it creates under an
+        // ignored `.wrangler/tmp/`; treating each as a rule change rebuilt the
+        // matcher and cold-rebuilt the search index every few seconds for an hour
+        // (2026-09-18). A rule file whose parent is not ignored, or any rule file
+        // while no matcher exists yet, still counts.
+        let ignore_file_paths = raw_paths
+            .iter()
+            .filter(|path| {
+                metadata.can_change_corpus_ignore(config, path)
+                    && !ignore_file_is_ignored(matcher, path)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let ignore_file_changed = !ignore_file_paths.is_empty();
 
-    let matcher = matcher
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let changed = raw_paths
-        .into_iter()
-        .filter(|path| {
-            if metadata.head_paths.contains(path) {
-                return true;
-            }
-            if watcher_path_is_infra_skip_under(&config.project_root, path) {
-                return false;
-            }
+        let changed = raw_paths
+            .into_iter()
+            .filter(|path| {
+                if metadata.head_paths.contains(path) {
+                    return true;
+                }
+                if watcher_path_is_infra_skip_under(&config.project_root, path) {
+                    return false;
+                }
 
-            if metadata.external_ignore_paths.contains(path) {
-                return false;
-            }
+                if metadata.external_ignore_paths.contains(path) {
+                    return false;
+                }
 
-            // raw_paths were canonicalized before the flush. Repeating that
-            // I/O here buys nothing and charges every checkout path twice.
-            if matcher.as_deref().is_some_and(|matcher| {
-                path.starts_with(matcher.path())
-                    && matcher
-                        .matched_path_or_any_parents(path, path.is_dir())
-                        .is_ignore()
-            }) {
-                return false;
-            }
-            true
-        })
-        .collect();
+                // raw_paths were canonicalized before the flush. Repeating that
+                // I/O here buys nothing and charges every checkout path twice.
+                if matcher.is_some_and(|matcher| {
+                    path.starts_with(matcher.path())
+                        && matcher
+                            .matched_path_or_any_parents(path, path.is_dir())
+                            .is_ignore()
+                }) {
+                    return false;
+                }
+                true
+            })
+            .collect();
 
-    FilteredWatcherPaths {
-        changed,
-        ignore_file_changed,
-        ignore_file_paths,
-    }
+        FilteredWatcherPaths {
+            changed,
+            ignore_file_changed,
+            ignore_file_paths,
+        }
+    })
 }
 
 pub fn filter_watcher_raw_paths_for_test<I>(
@@ -2592,6 +2598,24 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn matcher_snapshot_releases_read_lock_before_path_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let matcher = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(
+            ignore::gitignore::GitignoreBuilder::new(directory.path())
+                .build()
+                .unwrap(),
+        ))));
+        super::with_matcher_snapshot(&matcher, |snapshot| {
+            assert_eq!(snapshot.unwrap().path(), directory.path());
+            let mut writer = matcher
+                .try_write()
+                .expect("path work must not hold the matcher lock");
+            *writer = None;
+            assert_eq!(snapshot.unwrap().path(), directory.path());
+        });
+    }
+
     #[test]
     fn lexical_matcher_preserves_directory_rules_without_stat() {
         use super::*;

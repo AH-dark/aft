@@ -289,8 +289,12 @@ impl Drop for ProjectWatcher {
     }
 }
 
-/// Non-recursive path watches share one native stream. FSEvents itself is
-/// recursive; the callback admits only the path and its immediate children.
+/// One native stream owns a batch of non-recursive attachments. A nonempty
+/// `watch_paths` call replaces the entire batch atomically; `watch` replaces it
+/// with a single attachment, and `unwatch` stops the whole stream regardless of
+/// its path argument. Incremental multi-path watch/unwatch is not supported.
+/// FSEvents itself is recursive; the callback admits only each attachment and
+/// its immediate children.
 pub(crate) struct DirectoryWatcher {
     stream: Option<FsEventsStream>,
     sender: mpsc::Sender<notify::Result<Event>>,

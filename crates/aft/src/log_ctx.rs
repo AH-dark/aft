@@ -96,6 +96,38 @@ pub fn session_prefix() -> String {
     }
 }
 
+#[doc(hidden)]
+pub fn format_session_message(message: std::fmt::Arguments<'_>) -> String {
+    let mut line = String::new();
+    write_session_message(&mut line, message).expect("writing to a String cannot fail");
+    line
+}
+
+fn write_session_message(
+    writer: &mut impl std::fmt::Write,
+    message: std::fmt::Arguments<'_>,
+) -> std::fmt::Result {
+    CURRENT_SESSION.with(|current| {
+        LAST_SESSION.with(|last| {
+            let current = current.borrow();
+            let last = last.borrow();
+            if let Some(sid) = current.as_deref().or(last.as_deref()) {
+                writer.write_str(if sid.starts_with("ses_") {
+                    "["
+                } else {
+                    "[ses_"
+                })?;
+                writer.write_str(sid)?;
+                writer.write_str("] ")?;
+            }
+            Ok(())
+        })
+    })?;
+    // Release the session borrows before user-provided Display implementations
+    // run; formatting a message may itself change the logging context.
+    writer.write_fmt(message)
+}
+
 /// Log at INFO level with the optional `[ses_xxx]` session tag.
 ///
 /// Use this instead of `log::info!(...)` in per-request code paths.
@@ -116,7 +148,7 @@ macro_rules! slog_info {
         if $crate::logging::slog_info_enabled(module_path!()) {
             $crate::logging::emit_slog_info(
                 module_path!(),
-                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+                $crate::log_ctx::format_session_message(format_args!($($arg)*)),
             )
         }
     };
@@ -131,7 +163,7 @@ macro_rules! slog_warn {
         if $crate::logging::slog_warn_enabled(module_path!()) {
             $crate::logging::emit_slog_warn(
                 module_path!(),
-                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+                $crate::log_ctx::format_session_message(format_args!($($arg)*)),
             )
         }
     };
@@ -146,7 +178,7 @@ macro_rules! slog_error {
         if $crate::logging::slog_error_enabled(module_path!()) {
             $crate::logging::emit_slog_error(
                 module_path!(),
-                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+                $crate::log_ctx::format_session_message(format_args!($($arg)*)),
             )
         }
     };
@@ -164,7 +196,7 @@ macro_rules! slog_debug {
         if $crate::logging::slog_debug_enabled(module_path!()) {
             $crate::logging::emit_slog_debug(
                 module_path!(),
-                format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+                $crate::log_ctx::format_session_message(format_args!($($arg)*)),
             )
         }
     };
@@ -172,6 +204,50 @@ macro_rules! slog_debug {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_message_streams_borrowed_session_and_message() {
+        use super::*;
+        struct Writer {
+            sid: *const u8,
+            saw_sid: bool,
+            saw_message: bool,
+        }
+        impl std::fmt::Write for Writer {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                if value == "borrow-check" {
+                    assert_eq!(
+                        value.as_ptr(),
+                        self.sid,
+                        "session was cloned before formatting"
+                    );
+                    self.saw_sid = true;
+                }
+                if value == "message" {
+                    self.saw_message = true;
+                }
+                assert!(
+                    !value.contains("message") || value == "message",
+                    "message was preformatted"
+                );
+                Ok(())
+            }
+        }
+        with_session(Some("borrow-check".to_string()), || {
+            let sid = CURRENT_SESSION.with(|s| s.borrow().as_ref().unwrap().as_ptr());
+            let mut writer = Writer {
+                sid,
+                saw_sid: false,
+                saw_message: false,
+            };
+            write_session_message(&mut writer, format_args!("message")).unwrap();
+            assert!(writer.saw_sid && writer.saw_message);
+            assert_eq!(
+                format_session_message(format_args!("message")),
+                "[ses_borrow-check] message"
+            );
+        });
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::fmt;

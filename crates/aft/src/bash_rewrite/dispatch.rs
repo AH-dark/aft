@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bash_rewrite::catalog::ControlRole;
 use crate::bash_rewrite::rules::{
-    CatAppendRule, CatRule, FindRule, GrepRule, HeadRule, LsRule, RgRule, SedRule, TailRule,
+    CatAppendRule, CatRule, FindRule, GrepRule, HeadRule, LsRule, ParsedRewriteRule, RgRule,
+    SedRule, TailRule,
 };
-use crate::bash_rewrite::RewriteRule;
 use crate::context::AppContext;
 use crate::protocol::Response;
 
@@ -130,7 +130,8 @@ pub fn dispatch_for_request(
         return None;
     }
 
-    let rules: [&dyn RewriteRule; 9] = [
+    let parsed = crate::bash_rewrite::parser::parse(command);
+    let rules: [&dyn ParsedRewriteRule; 9] = [
         &GrepRule,
         &RgRule,
         &FindRule,
@@ -143,7 +144,7 @@ pub fn dispatch_for_request(
     ];
 
     for rule in rules {
-        let decision = rule.decide(command, request_id, session_id, ctx);
+        let decision = rule.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx);
         match decision {
             crate::bash_rewrite::RewriteDecision::Accept(mut request) => {
                 // The footer appended to a rewritten command names the caller's
@@ -199,6 +200,36 @@ pub fn dispatch_for_request(
 mod tests {
     use super::*;
     use crate::bash_rewrite::catalog::ControlRole;
+
+    #[test]
+    fn dispatch_parses_once_even_when_every_rule_declines() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(root.path().join("storage")),
+                experimental_bash_rewrite: true,
+                ..crate::config::Config::default()
+            },
+        );
+        for command in ["printf hi", "printf $(date)"] {
+            crate::bash_rewrite::parser::take_parse_calls();
+            assert!(dispatch_for_request(
+                command,
+                "parse-once",
+                None,
+                &crate::host_tool_names::HostToolNames::default(),
+                &ctx
+            )
+            .is_none());
+            assert_eq!(
+                crate::bash_rewrite::parser::take_parse_calls(),
+                1,
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn route_records_are_request_correlated_and_replaceable() {
