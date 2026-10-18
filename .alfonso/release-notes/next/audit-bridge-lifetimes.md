@@ -1,1 +1,1 @@
-- - The plugin bridge no longer blocks the host while it checks migration status, extracts the ONNX runtime or delivers configure warnings, and a project opened at a filesystem root stays at that root.
+- The plugin bridge no longer blocks the host while it checks migration status, extracts the ONNX runtime or delivers configure warnings, and a project opened at a filesystem root stays at that root.

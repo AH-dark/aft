@@ -23,43 +23,7 @@ pub fn render_memory_census(
 ) -> Value {
     let mut roots = Map::new();
     for (root, detail) in &snapshot.roots {
-        let search = detail.trigram.estimated_bytes.unwrap_or(0);
-        let semantic = detail.semantic.estimated_bytes.unwrap_or(0);
-        let symbols = detail.symbols.estimated_bytes.unwrap_or(0);
-        let callgraph = detail.callgraph.estimated_bytes.unwrap_or(0);
-        let callgraph_projection = detail.callgraph_projection.estimated_bytes.unwrap_or(0);
-        let inspect = detail.inspect.estimated_bytes.unwrap_or(0);
-        let pending_install = detail.pending_install.estimated_bytes.unwrap_or(0);
-        let planes_total = search
-            .saturating_add(semantic)
-            .saturating_add(symbols)
-            .saturating_add(callgraph)
-            .saturating_add(callgraph_projection)
-            .saturating_add(inspect)
-            .saturating_add(pending_install);
-        let mut row = json!({
-            "root": root,
-            "root_id": root,
-            "bound_routes": 0,
-            "last_request_age_ms": 0,
-            "idle_ttl_ms": 0,
-            "lsp_idle_ttl_ms": 0,
-            "evictable_in_ms": Value::Null,
-            "planes": {
-                "search": search,
-                "semantic": semantic,
-                "symbols": symbols,
-                "callgraph": callgraph,
-                "callgraph_projection": callgraph_projection,
-                "inspect": inspect,
-                "pending_install": pending_install,
-            },
-            "attributed_bytes": planes_total,
-            // Included in the semantic plane, not an additional plane to sum.
-            "semantic_worker_bytes": detail.semantic.counts.get("worker_index_bytes").copied().unwrap_or(0),
-            "evictable_bytes": detail.evictable_bytes(),
-            "lsp_children": { "count": 0, "rss_bytes": 0 },
-        });
+        let mut row = render_root_row(root, detail);
         if let Some(lifecycle_row) = lifecycle
             .and_then(|value| value.get(root))
             .and_then(Value::as_object)
@@ -72,7 +36,13 @@ pub fn render_memory_census(
         }
         roots.insert(root.clone(), row);
     }
+    render_memory_census_with_roots(snapshot, roots)
+}
 
+pub(crate) fn render_memory_census_with_roots(
+    snapshot: &crate::memory::MemorySnapshot,
+    roots: Map<String, Value>,
+) -> Value {
     let process = &snapshot.process;
     let dead_code_snapshots = crate::inspect::InspectManager::dead_code_snapshot_census();
     let slack = process.allocator.retained_slack_bytes.unwrap_or(0);
@@ -131,6 +101,86 @@ pub fn render_memory_census(
     })
 }
 
+fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Value {
+    #[cfg(test)]
+    ROOT_ROW_RENDERS.with(|renders| renders.set(renders.get() + 1));
+    let search = detail.trigram.estimated_bytes.unwrap_or(0);
+    let semantic = detail.semantic.estimated_bytes.unwrap_or(0);
+    let symbols = detail.symbols.estimated_bytes.unwrap_or(0);
+    let callgraph = detail.callgraph.estimated_bytes.unwrap_or(0);
+    let callgraph_projection = detail.callgraph_projection.estimated_bytes.unwrap_or(0);
+    let inspect = detail.inspect.estimated_bytes.unwrap_or(0);
+    let pending_install = detail.pending_install.estimated_bytes.unwrap_or(0);
+    let planes_total = search
+        .saturating_add(semantic)
+        .saturating_add(symbols)
+        .saturating_add(callgraph)
+        .saturating_add(callgraph_projection)
+        .saturating_add(inspect)
+        .saturating_add(pending_install);
+    json!({
+        "root": root,
+        "root_id": root,
+        "bound_routes": 0,
+        "last_request_age_ms": 0,
+        "idle_ttl_ms": 0,
+        "lsp_idle_ttl_ms": 0,
+        "evictable_in_ms": Value::Null,
+        "planes": {
+            "search": search,
+            "semantic": semantic,
+            "symbols": symbols,
+            "callgraph": callgraph,
+            "callgraph_projection": callgraph_projection,
+            "inspect": inspect,
+            "pending_install": pending_install,
+        },
+        "attributed_bytes": planes_total,
+        // Included in the semantic plane, not an additional plane to sum.
+        "semantic_worker_bytes": detail.semantic.counts.get("worker_index_bytes").copied().unwrap_or(0),
+        "evictable_bytes": detail.evictable_bytes(),
+        "lsp_children": { "count": 0, "rss_bytes": 0 },
+    })
+}
+
+/// Cache only snapshot-derived rows. Process counters and lifecycle overlays
+/// remain live, and the health publisher adds the current index-walk ages.
+#[derive(Default)]
+pub(crate) struct CensusRootRows {
+    rows: std::collections::BTreeMap<String, (crate::memory::RootMemorySnapshot, Value)>,
+}
+
+impl CensusRootRows {
+    pub(crate) fn render(
+        &mut self,
+        snapshot: &crate::memory::MemorySnapshot,
+    ) -> Map<String, Value> {
+        self.rows
+            .retain(|root, _| snapshot.roots.contains_key(root));
+        snapshot
+            .roots
+            .iter()
+            .map(|(root, detail)| {
+                let entry = self
+                    .rows
+                    .entry(root.clone())
+                    .or_insert_with(|| (detail.clone(), render_root_row(root, detail)));
+                // Equality validates every input to the pure row renderer; no
+                // timestamp is reset and no live health state is cached here.
+                if entry.0 != *detail {
+                    *entry = (detail.clone(), render_root_row(root, detail));
+                }
+                (root.clone(), entry.1.clone())
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_ROW_RENDERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Bytes the process holds beyond the per-root attribution, floored at zero.
 /// `slack` is the retained allocator slack still counted in `held` (zero when
 /// `held` is a physical footprint, which already excludes it).
@@ -146,6 +196,56 @@ mod tests {
     use crate::memory::{MemoryEstimate, MemorySnapshot, RootMemorySnapshot};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    fn row_cache_fixture() -> MemorySnapshot {
+        let zero = MemoryEstimate::estimated(0);
+        let root = RootMemorySnapshot::new(
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero,
+        );
+        MemorySnapshot::new("ready", BTreeMap::from([("/repo".to_string(), root)]))
+    }
+
+    #[test]
+    fn census_row_cache_reuses_unchanged_rows() {
+        let snapshot = row_cache_fixture();
+        let mut cache = CensusRootRows::default();
+        let before = ROOT_ROW_RENDERS.with(|renders| renders.get());
+        let first = cache.render(&snapshot);
+        let second = cache.render(&snapshot);
+        assert_eq!(ROOT_ROW_RENDERS.with(|renders| renders.get()) - before, 1);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn census_row_cache_invalidates_changed_inputs() {
+        let mut snapshot = row_cache_fixture();
+        let mut cache = CensusRootRows::default();
+        cache.render(&snapshot);
+        snapshot.roots.get_mut("/repo").unwrap().trigram = MemoryEstimate::estimated(42);
+        let before = ROOT_ROW_RENDERS.with(|renders| renders.get());
+        let updated = cache.render(&snapshot);
+        assert_eq!(ROOT_ROW_RENDERS.with(|renders| renders.get()) - before, 1);
+        assert_eq!(updated["/repo"]["planes"]["search"], 42);
+        assert_eq!(updated["/repo"]["attributed_bytes"], 42);
+    }
+
+    #[test]
+    fn census_row_cache_prunes_departed_roots() {
+        let mut snapshot = row_cache_fixture();
+        let mut cache = CensusRootRows::default();
+        cache.render(&snapshot);
+        snapshot.roots.clear();
+        assert!(cache.render(&snapshot).is_empty());
+        assert!(cache.rows.is_empty());
+    }
 
     /// macOS phys_footprint excludes MADV_FREE slack, so subtracting slack again
     /// rendered `unattributed: -1023 MB` on the first live run (footprint 3.2 GB,

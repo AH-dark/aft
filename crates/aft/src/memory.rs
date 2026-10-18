@@ -328,6 +328,24 @@ pub enum AllocatorSource {
     Measure,
 }
 
+/// One allocator reading shared by all memory surfaces in a health refresh.
+#[derive(Clone)]
+pub(crate) struct AllocatorObservation {
+    pub(crate) snapshot: AllocatorMemorySnapshot,
+    pub(crate) age_ms: Option<u64>,
+}
+
+impl AllocatorObservation {
+    fn from_source(source: AllocatorSource) -> Self {
+        let (snapshot, age_ms) = allocator_observation(source);
+        Self { snapshot, age_ms }
+    }
+
+    pub(crate) fn measure() -> Self {
+        Self::from_source(AllocatorSource::Measure)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProcessMemorySnapshot {
     pub rss_status: &'static str,
@@ -487,7 +505,7 @@ impl ProcessMemorySnapshot {
             rollups.iter(),
             roots.len(),
             shared_semantic_bases,
-            AllocatorSource::Measure,
+            AllocatorObservation::measure(),
         )
     }
 
@@ -495,7 +513,7 @@ impl ProcessMemorySnapshot {
         roots: impl Iterator<Item = &'a RootMemoryRollup>,
         root_count: usize,
         shared_semantic_bases: &MemoryEstimate,
-        allocator_source: AllocatorSource,
+        allocator_observation: AllocatorObservation,
     ) -> Self {
         let mut root_attributed_bytes = 0u64;
         let mut busy_subsystems = 0usize;
@@ -507,7 +525,10 @@ impl ProcessMemorySnapshot {
                 not_estimated_subsystems.saturating_add(root.not_estimated_subsystems);
         }
         let sqlite = SqliteMemorySnapshot::measure();
-        let (allocator, allocator_observation_age_ms) = allocator_observation(allocator_source);
+        let AllocatorObservation {
+            snapshot: allocator,
+            age_ms: allocator_observation_age_ms,
+        } = allocator_observation;
         let total_attributed_bytes = root_attributed_bytes
             .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
             .saturating_add(sqlite.memory_used_bytes);
@@ -586,13 +607,14 @@ impl MemoryRollupSnapshot {
     pub(crate) fn new(
         roots_status: &'static str,
         roots: BTreeMap<String, RootMemoryRollup>,
+        allocator: AllocatorObservation,
     ) -> Self {
         let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
         let process = ProcessMemorySnapshot::from_root_rollups(
             roots.values(),
             roots.len(),
             &shared_semantic_bases,
-            AllocatorSource::Measure,
+            allocator,
         );
         let roots_total = roots.len();
         let (roots, roots_omitted, roots_omitted_bytes) =
@@ -610,7 +632,12 @@ impl MemoryRollupSnapshot {
 
 impl MemorySnapshot {
     pub fn new(roots_status: &'static str, roots: BTreeMap<String, RootMemorySnapshot>) -> Self {
-        Self::with_cap(roots_status, roots, true, AllocatorSource::Cached)
+        Self::with_cap(
+            roots_status,
+            roots,
+            true,
+            AllocatorObservation::from_source(AllocatorSource::Cached),
+        )
     }
 
     /// Build the uncapped form used by the explicit memory census operation.
@@ -618,14 +645,22 @@ impl MemorySnapshot {
         roots_status: &'static str,
         roots: BTreeMap<String, RootMemorySnapshot>,
     ) -> Self {
-        Self::with_cap(roots_status, roots, false, AllocatorSource::Measure)
+        Self::new_uncapped_with_allocator(roots_status, roots, AllocatorObservation::measure())
+    }
+
+    pub(crate) fn new_uncapped_with_allocator(
+        roots_status: &'static str,
+        roots: BTreeMap<String, RootMemorySnapshot>,
+        allocator: AllocatorObservation,
+    ) -> Self {
+        Self::with_cap(roots_status, roots, false, allocator)
     }
 
     fn with_cap(
         roots_status: &'static str,
         roots: BTreeMap<String, RootMemorySnapshot>,
         cap_detail: bool,
-        allocator_source: AllocatorSource,
+        allocator: AllocatorObservation,
     ) -> Self {
         let shared_semantic_bases = crate::semantic_index::shared_semantic_bases_memory();
         // Totals cover EVERY root before the detail map is capped.
@@ -634,7 +669,7 @@ impl MemorySnapshot {
             rollups.iter(),
             roots.len(),
             &shared_semantic_bases,
-            allocator_source,
+            allocator,
         );
         let roots_total = roots.len();
         let (roots, roots_omitted, roots_omitted_bytes) = if cap_detail {
@@ -749,7 +784,7 @@ mod snapshot_cap_tests {
                 root_with_bytes((i as u64 + 1) * 1000).rollup(),
             );
         }
-        let snapshot = MemoryRollupSnapshot::new("ready", roots);
+        let snapshot = MemoryRollupSnapshot::new("ready", roots, AllocatorObservation::measure());
 
         assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
         assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 4);
@@ -773,7 +808,7 @@ mod snapshot_cap_tests {
             root_with_bytes(20_000).rollup().with_standing(),
         );
 
-        let snapshot = MemoryRollupSnapshot::new("ready", roots);
+        let snapshot = MemoryRollupSnapshot::new("ready", roots, AllocatorObservation::measure());
         assert_eq!(snapshot.roots.len(), MEMORY_SNAPSHOT_ROOT_DETAIL_CAP);
         assert_eq!(snapshot.roots_total, MEMORY_SNAPSHOT_ROOT_DETAIL_CAP + 2);
         assert_eq!(snapshot.roots_omitted, 2);
