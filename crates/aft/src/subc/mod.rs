@@ -1879,6 +1879,13 @@ fn quiesce_unbound_root(
         // ConfigureTail cannot release gates, install a watcher, or reserve a
         // callgraph build after this transition becomes visible.
         ctx.mark_subc_unbound();
+        // Parent folders have no local build progress to retain. Their watcher
+        // owns exclusion retries independently of the child-reader session, so
+        // release both lifetimes when the final route closes.
+        if crate::views::parent::release_context(ctx) || ctx.root_too_broad() {
+            ctx.stop_watcher_runtime();
+            ctx.invalidate_artifacts_after_watcher_gap();
+        }
         // Detach under the root's manager lock before allowing a rebind. The
         // reaper owns only the old clients, never servers a new route starts.
         let clients = ctx.lsp().quiesce();
@@ -1891,19 +1898,14 @@ fn quiesce_unbound_root(
     } else {
         executor.cancel_root_maintenance(root_id)
     };
-    // Transient unbind keeps the root WARM: the watcher stays running (its
-    // events accumulate and replay on rebind, so no unobserved gap exists) and
-    // resident artifacts stay resident. Host restarts unbind every root and
-    // rebind seconds later; stopping the watcher here would force strict
-    // re-verification plus a full callgraph rebuild on every restart. The
-    // expensive teardown (watcher stop + gap invalidation) belongs to the
-    // idle-TTL reaper and the root-deleted path.
-    // Drop queued maintenance and refuse new work immediately, but preserve
-    // running builds and inspect during the 120-second abandonment grace.
-    // Host/module restarts briefly unbind every root; cancelling here would
-    // throw away fleet-wide cold-build progress on every reconnect. Running
-    // tokens poll the synchronized lifecycle at batch/parse checkpoints and
-    // cancel only past grace, or immediately when the checkout disappears.
+    // Ordinary projects keep their watcher and resident artifacts across brief
+    // unbinds, so a reconnect can replay observed changes without re-reading the
+    // entire checkout. Parent folders and broad roots were stopped above.
+    // Queued maintenance is dropped immediately, but running project builds and
+    // inspect jobs retain a 120-second abandonment grace: their cancellation
+    // checks stop them after that grace, or as soon as the checkout disappears.
+    // The idle-TTL reaper stops project watchers later and marks their cached
+    // artifacts for verification because changes after shutdown were not seen.
     let discarded = ctx
         .map(|ctx| crate::commands::configure::cancel_deferred_configure_maintenance(&ctx))
         .unwrap_or(0);
@@ -15137,6 +15139,93 @@ mod tests {
         assert!(!live_roots[&root].unbound_quiesced);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_folder_last_route_close_stops_watcher_and_exclusion_retries() {
+        let _env = crate::test_env::hermetic_git_env_guard();
+        let (dir, root) = test_root("parent-last-route");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("child/.git")).unwrap();
+        let ctx = test_ctx();
+        ctx.mark_subc_bound();
+        let request = crate::protocol::RawRequest {
+            id: "parent-bind".into(),
+            command: "configure".into(),
+            session_id: None,
+            lsp_hints: None,
+            params: json!({
+                "project_root": dir.path(), "storage_dir": storage.path(), "harness": "runner",
+                "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
+                    "views": {"enabled": true},
+                    "indexes": {"trigram": false, "semantic": false, "callgraph": false}
+                }).to_string()}],
+            }),
+        };
+        let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
+        assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
+        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        let parent = crate::views::parent::session_for(&ctx).expect("parent session");
+        assert!(parent.wait_rounds(1, Duration::from_secs(5)));
+        wait_for_watcher_count(&ctx, 1);
+        let counters = crate::context::watcher_counters_for_root(root.as_path());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while counters
+            .snapshot()
+            .exclusion_planning
+            .is_none_or(|plan| plan.attempts < 2)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "backend must exercise exclusion retries"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let mut channels = HashMap::from([(
+            root.clone(),
+            HashSet::from([route_key(7, 1), route_key(8, 1)]),
+        )]);
+        remove_root_channel(&mut channels, &root, route_key(7, 1));
+        if !channels.contains_key(&root) {
+            quiesce_unbound_root(&root, &mut roots, &executor);
+        }
+        assert!(ctx.watcher_runtime_active());
+        assert!(!parent.stopped());
+        remove_root_channel(&mut channels, &root, route_key(8, 1));
+        if !channels.contains_key(&root) {
+            quiesce_unbound_root(&root, &mut roots, &executor);
+        }
+        assert!(roots[&root].unbound_quiesced);
+        assert!(
+            !ctx.watcher_runtime_active(),
+            "last parent route must stop its watcher"
+        );
+        wait_for_watcher_count(&ctx, 0);
+        assert!(
+            parent.stopped(),
+            "last parent route must release its child readers"
+        );
+        assert!(crate::views::parent::session_for_root(root.as_path()).is_none());
+        assert!(ctx.watcher_rx().lock().is_none());
+        crate::commands::configure::ensure_project_watcher(&ctx);
+        assert!(
+            !ctx.watcher_runtime_active(),
+            "unbound roots cannot reattach a watcher"
+        );
+        ctx.mark_subc_bound();
+        roots.get_mut(&root).unwrap().reactivate_bound();
+        assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
+        crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
+        let rebound = crate::views::parent::session_for(&ctx).expect("rebound parent session");
+        assert!(!Arc::ptr_eq(&parent, &rebound));
+        assert!(rebound.wait_rounds(1, Duration::from_secs(5)));
+        wait_for_watcher_count(&ctx, 1);
+        quiesce_unbound_root(&root, &mut roots, &executor);
+        wait_for_watcher_count(&ctx, 0);
+    }
+
     #[test]
     fn allocator_pressure_relief_requires_every_root_to_be_idle() {
         let (_idle_dir, idle_root) = test_root("allocator-relief-idle");
@@ -15633,7 +15722,7 @@ mod tests {
             storage_root: storage_root.clone(),
             harness_dir: storage_root.join("opencode"),
             session_id: "first-search-admission".to_string(),
-            home_match: false,
+            root_too_broad: false,
             format_tool_cache_clear_needed: false,
             run_bash_replay: false,
             configure_database_runtime: false,

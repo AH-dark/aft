@@ -50,6 +50,47 @@ pub fn project_scope_key(project_root: &Path) -> String {
     hash16(&canonical)
 }
 
+/// Inputs are canonical policy identities, including home aliases and native
+/// volume roots. Exclude root-level system directories and all home ancestors.
+pub(crate) fn directory_scope_is_narrow(directory: &Path, home: &Path, volume: &Path) -> bool {
+    directory.is_absolute()
+        && directory.parent().and_then(Path::parent).is_some()
+        && !home.starts_with(directory)
+        && directory != volume
+        && directory.parent() != Some(volume)
+}
+
+/// Bind mounts can preserve a protected directory's identity without preserving
+/// its path spelling. Device/inode checks also catch same-device volume aliases.
+#[cfg(unix)]
+pub(crate) fn directory_is_protected_alias(
+    directory: &Path,
+    home: &Path,
+    volume: &Path,
+) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |path: &Path| {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    let candidate = identity(directory)?;
+    for ancestor in home.ancestors().chain(std::iter::once(volume)) {
+        if identity(ancestor)? == candidate {
+            return Some(true);
+        }
+    }
+    Some(identity(directory.parent()?)? == identity(volume)?)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn directory_is_protected_alias(
+    _directory: &Path,
+    _home: &Path,
+    _volume: &Path,
+) -> Option<bool> {
+    Some(false)
+}
+
 fn hash16(path: &Path) -> String {
     use sha2::{Digest, Sha256};
 

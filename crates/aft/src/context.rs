@@ -1939,7 +1939,7 @@ pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) storage_root: PathBuf,
     pub(crate) harness_dir: PathBuf,
     pub(crate) session_id: String,
-    pub(crate) home_match: bool,
+    pub(crate) root_too_broad: bool,
     pub(crate) format_tool_cache_clear_needed: bool,
     pub(crate) run_bash_replay: bool,
     pub(crate) configure_database_runtime: bool,
@@ -7595,6 +7595,13 @@ impl AppContext {
             .lock()
             .iter()
             .any(|reason| reason == "home_root")
+    }
+
+    pub fn root_too_broad(&self) -> bool {
+        self.degraded_reasons
+            .lock()
+            .iter()
+            .any(|reason| reason == "root_too_broad")
     }
 
     pub fn cache_role(&self) -> &'static str {

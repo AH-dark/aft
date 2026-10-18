@@ -1,0 +1,7 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "other",
+  "kind": "ranking",
+  "fixtures": ["crates/aft/src/commands/configure.rs"],
+  "note": "Reporting-only change in the search ranking fence: safety-disabled roots report off with root_too_broad and direct callers to a project subdirectory. No ranking, routing, candidate, or result changes. Configure regressions exercise the actual search refusal."
+}

@@ -548,7 +548,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
         Err(response) => {
             if matches!(
                 response.data.get("code").and_then(Value::as_str),
-                Some("path_not_found" | "path_outside_root")
+                Some("path_not_found" | "path_outside_root" | "root_too_broad")
             ) {
                 return response;
             }
@@ -2658,6 +2658,15 @@ impl Sections {
 }
 
 fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
+    // Inspect's applicability and freshness passes walk the project before
+    // scanner admission, so refuse broad roots before creating their snapshot.
+    if ctx.root_too_broad() {
+        return Err(Response::error(
+            "inspect",
+            "root_too_broad",
+            "inspect: project-wide analysis is off for this broad root; open a project subdirectory",
+        ));
+    }
     if ctx.harness_opt().is_none() {
         return Err(Response::error(
             "inspect",
@@ -7169,6 +7178,19 @@ mod fresh_payload_tests {
 
 #[cfg(test)]
 mod deferred_terminal_tests {
+    #[test]
+    fn root_too_broad_inspect_refuses_snapshot() {
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        ctx.set_degraded_reasons(vec!["root_too_broad".into()]);
+        let response = super::build_snapshot(&ctx)
+            .err()
+            .expect("broad root must not create a snapshot");
+        assert_eq!(response.data["code"], "root_too_broad");
+    }
+
     use super::*;
 
     #[test]

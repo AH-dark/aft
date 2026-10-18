@@ -1258,20 +1258,65 @@ pub(crate) fn derive_watcher_exclusion_plan(
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> ExclusionPlanOutcome {
+    #[cfg(test)]
+    if forced_exclusion_failures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(root)
+    {
+        return Err(ExclusionPlanUnavailable::IoDeadline);
+    }
     let root = root.to_path_buf();
     let matcher = matcher.clone();
-    run_bounded_exclusion_planner(
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let result = run_bounded_exclusion_planner(
         Duration::from_secs(2),
         exclusion_planner_pool(),
         move || {
-            derive_exclusion_plan(
+            derive_exclusion_plan_cancellable(
                 &root,
                 &matcher,
                 max_paths,
                 crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+                Some(&worker_cancelled),
             )
         },
-    )
+    );
+    // A timed-out plan has no consumer. Stop its walk at the next filesystem
+    // checkpoint instead of leaving a detached helper traversing the root.
+    cancelled.store(true, Ordering::Release);
+    result
+}
+
+#[cfg(test)]
+fn forced_exclusion_failures() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) struct ForcedExclusionFailure(PathBuf);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+impl Drop for ForcedExclusionFailure {
+    fn drop(&mut self) {
+        forced_exclusion_failures()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn force_exclusion_failure_for_test(root: &Path) -> ForcedExclusionFailure {
+    let root = root.canonicalize().unwrap();
+    forced_exclusion_failures()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(root.clone());
+    ForcedExclusionFailure(root)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1385,12 +1430,23 @@ pub(crate) fn derive_excluded_subtrees(
 }
 
 /// [`derive_watcher_exclusion_plan`] for a stated backend coverage.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(test)]
 fn derive_exclusion_plan(
     root: &Path,
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
     coverage: WatcherExclusionCoverage,
+) -> WatcherExclusionPlan {
+    derive_exclusion_plan_cancellable(root, matcher, max_paths, coverage, None)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn derive_exclusion_plan_cancellable(
+    root: &Path,
+    matcher: &SharedGitignore,
+    max_paths: Option<usize>,
+    coverage: WatcherExclusionCoverage,
+    cancelled: Option<&AtomicBool>,
 ) -> WatcherExclusionPlan {
     #[derive(Debug)]
     struct Candidate {
@@ -1468,6 +1524,9 @@ fn derive_exclusion_plan(
     let mut stack = vec![(root.clone(), 0usize)];
 
     while let Some((directory, depth)) = stack.pop() {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return WatcherExclusionPlan::default();
+        }
         if !boundary.allows_directory(&directory) {
             continue;
         }
@@ -1475,6 +1534,9 @@ fn derive_exclusion_plan(
             continue;
         };
         for entry in entries.flatten() {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return WatcherExclusionPlan::default();
+            }
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -2613,6 +2675,29 @@ mod tests {
                 .expect("path work must not hold the matcher lock");
             *writer = None;
             assert_eq!(snapshot.unwrap().path(), directory.path());
+        });
+    }
+
+    #[test]
+    fn watcher_exclusion_walk_stops_after_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("source/nested")).unwrap();
+        let matcher = std::sync::Arc::new(std::sync::RwLock::new(None));
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        super::EXCLUSION_TEST_OPENS.with(|opens| opens.borrow_mut().clear());
+        let plan = super::derive_exclusion_plan_cancellable(
+            root.path(),
+            &matcher,
+            None,
+            crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+            Some(&cancelled),
+        );
+        assert!(plan.selected.is_empty());
+        super::EXCLUSION_TEST_OPENS.with(|opens| {
+            assert!(
+                opens.borrow().is_empty(),
+                "cancelled exclusion walk must not open directories"
+            );
         });
     }
 

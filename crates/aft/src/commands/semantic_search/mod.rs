@@ -1818,7 +1818,10 @@ impl SearchLaneStatus {
                         "unavailable: {}",
                         lane.unavailable_reason.as_deref().unwrap_or("unknown")
                     ),
-                    IndexEffective::Off => "unavailable: disabled".to_string(),
+                    IndexEffective::Off => lane.unavailable_reason.as_deref().map_or_else(
+                        || "unavailable: disabled".to_string(),
+                        |reason| format!("off: {reason}"),
+                    ),
                     _ => lane.effective.as_str().to_string(),
                 };
                 let state = if name == "semantic" {
@@ -1868,7 +1871,12 @@ impl SearchLaneStatus {
         }
         let both_off = self.trigram.effective == IndexEffective::Off
             && self.semantic.effective == IndexEffective::Off;
-        let (code, message) = if both_off {
+        let (code, message) = if ctx.root_too_broad() {
+            (
+                "no_search_lanes_enabled",
+                "aft_search indexing is off: root_too_broad. Open a project subdirectory, or use grep with an explicit path.",
+            )
+        } else if both_off {
             (
                 "no_search_lanes_enabled",
                 "aft_search has no index lane enabled: indexes.trigram and indexes.semantic are both off. Enable one with aft setup, or use grep.",
