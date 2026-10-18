@@ -3015,6 +3015,89 @@ mod tests {
         assert_eq!(forks, 0, "run_external_tool_capture used fork+exec");
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn process_state_for_test(pid: u32) -> String {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("read process state with ps");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "ps failed: {output:?}"
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_state_for_test(pid: u32) -> String {
+        // Sandboxed macOS tests cannot spawn the setuid ps binary. A nonzero
+        // PROC_PIDTBSDINFO argument includes zombies in the native lookup.
+        let pid = libc::pid_t::try_from(pid).expect("pid fits pid_t");
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: the buffer points to a proc_bsdinfo with its exact size.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read == size {
+            // SAFETY: the successful full-size query initialized the structure.
+            let info = unsafe { info.assume_init() };
+            return if info.pbi_status == libc::SZOMB {
+                "Z".to_string()
+            } else {
+                info.pbi_status.to_string()
+            };
+        }
+        let query_error = std::io::Error::last_os_error();
+        // A failed query is not proof of exit; only ESRCH confirms absence.
+        // SAFETY: signal zero checks existence without signalling the process.
+        let absent = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        assert!(absent, "proc_pidinfo({pid}) returned {read}: {query_error}");
+        String::new()
+    }
+
+    #[cfg(unix)]
+    fn process_is_running_for_test(pid: u32) -> bool {
+        // kill(pid, 0) also succeeds for exited processes awaiting reaping.
+        // Container PID 1 may leave those zombies around indefinitely.
+        let state = process_state_for_test(pid);
+        !state.is_empty() && !state.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_is_running_excludes_unreaped_zombies() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = process_state_for_test(pid);
+        while !state.starts_with('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            state = process_state_for_test(pid);
+        }
+        let running = process_is_running_for_test(pid);
+        child.wait().unwrap();
+        assert!(
+            state.starts_with('Z'),
+            "expected an unreaped zombie, got {state:?}"
+        );
+        assert!(!running, "an unreaped zombie is not running");
+        assert!(
+            !process_is_running_for_test(pid),
+            "a reaped child is not running"
+        );
+    }
+
     /// The timeout kill reaches the tool's own children through its process
     /// group, so a grandchild cannot keep the output pipes open.
     #[cfg(unix)]
@@ -3034,11 +3117,11 @@ mod tests {
             .parse()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+        while process_is_running_for_test(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            !crate::bash_background::process::is_process_alive(pid),
+            !process_is_running_for_test(pid),
             "grandchild {pid} survived the timeout kill"
         );
     }

@@ -7246,27 +7246,37 @@ pub(crate) fn canonical_git_root_commit_identity(
 /// therefore be retried, and callers that need stable identity can refuse path
 /// fallback when the result is still ambiguous after retry.
 fn repo_root_commit_with_retry(project_root: &Path) -> RootCommitResolution {
+    repo_root_commit_with_probe(project_root, || {
+        repo_root_commit_with_retry_profiled(project_root, &mut ArtifactCacheKeyTimings::default())
+    })
+}
+
+fn repo_root_commit_with_probe(
+    project_root: &Path,
+    probe: impl FnOnce() -> RootCommitResolution,
+) -> RootCommitResolution {
     // Callers on this path (the call-graph store refreshes after every edit,
     // inspect scans, scoped keys) re-derive the key for the same root many
-    // times a minute. The answer depends only on what HEAD names, so reuse it
-    // while the repository files that decide HEAD are unchanged.
+    // times a minute. Reuse the answer while the repository files that decide
+    // HEAD and its history view are unchanged.
     let stamp = RootCommitStamp::capture(project_root);
     if let Some(stamp) = stamp.as_ref() {
         if let Some(cached) = cached_root_commit(project_root, stamp) {
             return RootCommitResolution::Commit(cached);
         }
     }
-    let resolution =
-        repo_root_commit_with_retry_profiled(project_root, &mut ArtifactCacheKeyTimings::default());
-    // The stamp was taken before git ran: a HEAD move during the probe leaves
-    // an older stamp beside the result, so the next lookup misses and
-    // re-probes. Only commit identities are kept; a repository without a
-    // commit yet must be seen again once its first commit lands.
+    let resolution = probe();
+    // A checkout or history-view change during the probe can pair the result
+    // with an unrelated stamp. Recheck before caching, but return the probe's
+    // result even when the repository moved. A repository without a commit
+    // must also be probed again once its first commit lands.
     if let (Some(stamp), RootCommitResolution::Commit(commit)) = (stamp, &resolution) {
-        root_commit_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(project_root.to_path_buf(), (stamp, commit.clone()));
+        if RootCommitStamp::capture(project_root).as_ref() == Some(&stamp) {
+            root_commit_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(project_root.to_path_buf(), (stamp, commit.clone()));
+        }
     }
     resolution
 }
@@ -7304,8 +7314,8 @@ fn cached_root_commit(project_root: &Path, stamp: &RootCommitStamp) -> Option<St
 /// kept by content (the commit id itself); packed refs, shallow boundaries,
 /// grafts and replace refs by file identity. Anything this does not model
 /// (environment overrides of the repository location or history view, a
-/// `.git` file it cannot follow) makes `capture` return `None`, and the caller
-/// then asks git on every lookup.
+/// `.git` file it cannot follow, or a symlink among the watched paths) makes
+/// `capture` return `None`, and the caller then asks git on every lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RootCommitStamp {
     git_marker: Option<RootCommitFileIdentity>,
@@ -7331,6 +7341,11 @@ impl RootCommitFileIdentity {
     fn of(path: &Path, directory_contents: bool) -> Option<Option<Self>> {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
+                // Link identity does not cover changes to the target's history
+                // data, so leave linked files and directories uncached.
+                if metadata.file_type().is_symlink() {
+                    return None;
+                }
                 #[cfg(unix)]
                 use std::os::unix::fs::MetadataExt;
                 #[cfg(unix)]
@@ -10894,6 +10909,95 @@ mod tests {
         git(&["checkout", "--quiet", "--detach", &second]);
         assert_eq!(artifact_cache_key(&root), first);
         assert_eq!(root_commit_git_runs_for_test(&root), 4);
+    }
+
+    fn root_commit_test_git(root: &Path, args: &[&str]) -> String {
+        let output = git_command_for_test(root)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft@example.com",
+            ])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn root_commit_cache_does_not_store_a_probe_across_history_changes() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| root_commit_test_git(&root, args);
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "first root"]);
+        let first = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "--quiet", "--orphan", "other"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "unrelated root"]);
+        let other = git(&["rev-parse", "HEAD"]);
+        assert_ne!(first, other);
+        git(&["checkout", "--quiet", "--detach", &first]);
+
+        let resolution = repo_root_commit_with_probe(&root, || {
+            // Move to an unrelated history after the first stamp but before git
+            // reads HEAD, leaving the second stamp to observe the new history.
+            git(&["checkout", "--quiet", "--detach", &other]);
+            repo_root_commit_with_retry_profiled(&root, &mut ArtifactCacheKeyTimings::default())
+        });
+        assert!(matches!(resolution, RootCommitResolution::Commit(commit) if commit == other));
+        assert_eq!(root_commit_git_runs_for_test(&root), 1);
+        assert!(
+            !root_commit_cache().lock().unwrap().contains_key(&root),
+            "a probe spanning different repository stamps must not be cached"
+        );
+
+        // Returning to the first stamp must not reuse the unrelated root.
+        git(&["checkout", "--quiet", "--detach", &first]);
+        assert!(matches!(repo_root_commit_with_retry(&root),
+            RootCommitResolution::Commit(commit) if commit == first));
+        assert_eq!(root_commit_git_runs_for_test(&root), 2);
+        let _ = repo_root_commit_with_retry(&root);
+        assert_eq!(root_commit_git_runs_for_test(&root), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_commit_cache_bypasses_symlinked_grafts() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let git = |args: &[&str]| root_commit_test_git(&root, args);
+        git(&["init", "--quiet"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "first"]);
+        let first = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "second"]);
+        let second = git(&["rev-parse", "HEAD"]);
+        let shared = root.join("shared-grafts");
+        fs::write(&shared, "").unwrap();
+        std::os::unix::fs::symlink(&shared, root.join(".git/info/grafts")).unwrap();
+
+        assert_eq!(
+            artifact_cache_key(&root),
+            artifact_key_from_git_identity(&first)
+        );
+        // Only the target changes: the graft turns the second commit into a root.
+        fs::write(&shared, format!("{second}\n")).unwrap();
+        assert_eq!(
+            artifact_cache_key(&root),
+            artifact_key_from_git_identity(&second)
+        );
+        assert_eq!(root_commit_git_runs_for_test(&root), 2);
+        assert_eq!(
+            artifact_cache_key(&root),
+            artifact_key_from_git_identity(&second)
+        );
+        assert_eq!(root_commit_git_runs_for_test(&root), 3);
+        assert!(!root_commit_cache().lock().unwrap().contains_key(&root));
     }
 
     #[test]
