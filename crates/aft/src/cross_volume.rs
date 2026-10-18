@@ -7,7 +7,8 @@
 //! so a move whose source and destination folders can differ in volume goes
 //! through [`move_path`], which falls back to a copy that is published by a
 //! same-folder, no-replace rename in the destination and only then removes the
-//! source.
+//! source. Filesystems without no-replace support use an atomic hard link for
+//! regular files and a non-atomic existence check before renaming directories.
 //!
 //! [`rename`] also refuses to replace an existing destination. Tests make it
 //! report the cross-device error for folders registered with
@@ -43,6 +44,8 @@ fn cross_device_error() -> io::Error {
 }
 
 /// Rename without replacing a destination, including an empty directory.
+/// When the filesystem lacks no-replace support, directory publication falls
+/// back to a non-atomic existence check and rename, with a process-wide warning.
 pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     if let Some(error) = publish_no_replace(from, to)? {
         Moved::PublishedWithWarning(error).warn_if_incomplete(from, to);
@@ -67,6 +70,16 @@ fn publish_no_replace(from: &Path, to: &Path) -> io::Result<Option<io::Error>> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn native_publish_no_replace(from: &Path, to: &Path) -> io::Result<Option<io::Error>> {
+    let result = flagged_rename(from, to);
+    rename_or_fallback(from, to, result)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flagged_rename(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = UNSUPPORTED_RENAME.with(|slot| slot.take()) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let source = CString::new(from.as_os_str().as_bytes())?;
@@ -86,29 +99,47 @@ fn native_publish_no_replace(from: &Path, to: &Path) -> io::Result<Option<io::Er
             libc::RENAME_NOREPLACE,
         )
     };
-    let result = if result == 0 {
+    if result == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
-    };
-    #[cfg(target_os = "macos")]
-    return result.map(|()| None);
-    #[cfg(target_os = "linux")]
-    linux_rename_or_link(from, to, result)
+    }
 }
 
-#[cfg(target_os = "linux")]
-fn linux_rename_or_link(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_or_fallback(
     from: &Path,
     to: &Path,
     result: io::Result<()>,
 ) -> io::Result<Option<io::Error>> {
     match result {
         Ok(()) => Ok(None),
-        Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
-            // Hard links publish regular files atomically on older kernels and
-            // filesystems. There is no safe equivalent for directory trees.
-            if !fs::symlink_metadata(from)?.is_file() {
+        Err(error) if no_replace_unsupported(&error) => {
+            let metadata = fs::symlink_metadata(from)?;
+            if metadata.is_dir() {
+                // Some external/network filesystems cannot enforce no-replace.
+                // Preserve directory retirement there with the old rename
+                // behavior, but check first. Another process can still create
+                // an empty destination between this check and the rename; this
+                // race is confined to filesystems without the native flag.
+                static WARN: std::sync::Once = std::sync::Once::new();
+                WARN.call_once(|| {
+                    crate::slog_warn!(
+                        "atomic no-replace rename is unavailable at {}; directory moves use a non-atomic existence check and can race with destination creation",
+                        to.display()
+                    );
+                });
+                match fs::symlink_metadata(to) {
+                    Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                fs::rename(from, to)?;
+                return Ok(None);
+            }
+            // Hard links still publish regular files atomically when native
+            // no-replace flags are unavailable. Other entry types are refused.
+            if !metadata.is_file() {
                 return Err(error);
             }
             fs::hard_link(from, to)?;
@@ -124,6 +155,17 @@ fn linux_rename_or_link(
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn no_replace_unsupported(error: &io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    return error.raw_os_error() == Some(libc::ENOTSUP);
+    #[cfg(target_os = "linux")]
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)
+    )
 }
 
 #[cfg(windows)]
@@ -262,6 +304,8 @@ impl From<io::Error> for MoveError {
 /// The source is authoritative unless [`MoveError::AlreadyPublished`]
 /// identifies a destination won by another mover. That outcome never removes
 /// the source and carries any staging-cleanup warning for the caller to report.
+/// Directory moves on filesystems without native no-replace support instead
+/// use the checked, non-atomic fallback described by [`rename`].
 /// Once published, directory sync or source removal failures return
 /// [`Moved::PublishedWithWarning`]: callers must report the warning and use `to`.
 pub(crate) fn move_path(from: &Path, to: &Path) -> Result<Moved, MoveError> {
@@ -449,6 +493,8 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 thread_local! {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static UNSUPPORTED_RENAME: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     pub(crate) static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = const {
         std::cell::RefCell::new(None)
     };
@@ -499,6 +545,93 @@ fn remove_path(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::walk_boundary::simulated_volumes::simulate;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unsupported_flag_file_fallback_moves_without_replacing_an_existing_destination() {
+        unsupported_flag_fallback(false);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unsupported_flag_directory_fallback_moves_without_replacing_an_existing_destination() {
+        unsupported_flag_fallback(true);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unsupported_flag_fallback(directory: bool) {
+        #[cfg(target_os = "linux")]
+        let errors = [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP];
+        #[cfg(target_os = "macos")]
+        let errors = [libc::ENOTSUP];
+        for errno in errors {
+            for cross_volume in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let source = temp.path().join("source");
+                let other = temp.path().join("destination-volume");
+                fs::create_dir(&other).unwrap();
+                let _volume = cross_volume.then(|| simulate(&other, u64::MAX - 14));
+                let destination = other.join("destination");
+                let create_source = || {
+                    if directory {
+                        fs::create_dir(&source).unwrap();
+                        fs::write(source.join("state.json"), b"old").unwrap();
+                    } else {
+                        fs::write(&source, b"old").unwrap();
+                    }
+                };
+                create_source();
+                UNSUPPORTED_RENAME.with(|slot| slot.set(Some(errno)));
+                let result = move_path(&source, &destination);
+                assert!(
+                    UNSUPPORTED_RENAME.with(|slot| slot.take()).is_none(),
+                    "the unsupported syscall seam must execute"
+                );
+                assert!(result.is_ok(), "fallback must move the source: {result:?}");
+                assert!(!source.exists());
+                let saved = if directory {
+                    destination.join("state.json")
+                } else {
+                    destination.clone()
+                };
+                assert_eq!(fs::read(&saved).unwrap(), b"old");
+
+                if cross_volume {
+                    continue;
+                }
+                create_source();
+                fs::write(&saved, b"new").unwrap();
+                if directory {
+                    // Empty destinations are replaceable by POSIX rename, so
+                    // the fallback's existence check must protect them too.
+                    fs::remove_file(&saved).unwrap();
+                }
+                UNSUPPORTED_RENAME.with(|slot| slot.set(Some(errno)));
+                let result = move_path(&source, &destination);
+                assert!(
+                    UNSUPPORTED_RENAME.with(|slot| slot.take()).is_none(),
+                    "the collision must reach the unsupported syscall seam"
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Err(MoveError::AlreadyPublished {
+                            cleanup_warning: None
+                        })
+                    ),
+                    "{result:?}"
+                );
+                assert!(source.exists(), "collision must keep the source");
+                if directory {
+                    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+                    assert_eq!(fs::read(source.join("state.json")).unwrap(), b"old");
+                } else {
+                    assert_eq!(fs::read(&saved).unwrap(), b"new");
+                    assert_eq!(fs::read(&source).unwrap(), b"old");
+                }
+            }
+        }
+    }
 
     #[test]
     fn cross_volume_racing_file_publish_keeps_the_winners_new_value() {
@@ -595,43 +728,6 @@ mod tests {
                 assert_eq!(fs::read(&destination).unwrap(), b"new");
                 assert_eq!(fs::read(&source).unwrap(), b"old");
             }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_old_kernel_fallback_publishes_only_regular_files_without_replacement() {
-        for errno in [libc::EINVAL, libc::ENOSYS] {
-            let temp = tempfile::tempdir().unwrap();
-            let source = temp.path().join("source");
-            let destination = temp.path().join("destination");
-            fs::write(&source, b"old").unwrap();
-            fs::write(&destination, b"new").unwrap();
-            let unsupported = || Err(io::Error::from_raw_os_error(errno));
-            assert_eq!(
-                linux_rename_or_link(&source, &destination, unsupported())
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::AlreadyExists
-            );
-            assert_eq!(fs::read(&destination).unwrap(), b"new");
-            fs::remove_file(&destination).unwrap();
-            assert!(linux_rename_or_link(&source, &destination, unsupported())
-                .unwrap()
-                .is_none());
-            assert!(!source.exists());
-            assert_eq!(fs::read(&destination).unwrap(), b"old");
-            fs::create_dir(&source).unwrap();
-            fs::remove_file(&destination).unwrap();
-            fs::create_dir(&destination).unwrap();
-            assert_eq!(
-                linux_rename_or_link(&source, &destination, unsupported())
-                    .unwrap_err()
-                    .raw_os_error(),
-                Some(errno)
-            );
-            assert!(source.is_dir());
-            assert!(destination.is_dir());
         }
     }
 
