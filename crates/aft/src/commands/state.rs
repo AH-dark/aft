@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -434,29 +434,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         crate::private_storage::open_dir(parent, parent)?;
     }
-    let tmp_path = path.with_file_name(format!(
-        "{}.tmp.{}.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        std::process::id(),
-        unix_millis()
-    ));
-
-    let mut file = crate::private_storage::create(&tmp_path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-
-    if let Err(error) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-
+    crate::durability::atomic_write(path, bytes, crate::durability::AtomicWriteDurability::File)?;
+    // File durability is required; directory durability remains a best-effort mirror policy.
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        let _ = crate::durability::sync_dir(parent);
     }
 
     Ok(())
@@ -489,6 +470,101 @@ mod tests {
             session_id: None,
             params,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_private_mode_survives_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AFT_TEST_STATE_PRIVATE_UMASK";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            // Create the fixture directory first so umask cannot make it inaccessible.
+            // Only the state file is created with the restrictive mask.
+            unsafe { libc::umask(0o777) };
+            atomic_write(&path, b"state").unwrap();
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::state::tests::state_private_mode_survives_restrictive_umask",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "umask child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn state_publication_refuses_a_colliding_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, "old").unwrap();
+        let collision = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let observed = collision.clone();
+        crate::durability::BEFORE_TEMP_CREATE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |temporary| {
+                fs::write(temporary, "other writer").unwrap();
+                *observed.borrow_mut() = Some(temporary.to_path_buf());
+            }));
+        });
+
+        let result = atomic_write(&path, b"new");
+        crate::durability::BEFORE_TEMP_CREATE.with(|slot| *slot.borrow_mut() = None);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(collision.borrow().as_ref().unwrap()).unwrap(),
+            "other writer"
+        );
+    }
+
+    #[test]
+    fn state_publication_syncs_required_file_and_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, "old").unwrap();
+        crate::durability::take();
+        atomic_write(&path, b"new").unwrap();
+        let events = crate::durability::take();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert!(events.contains(&(crate::durability::EventKind::FileSync, path.clone())));
+        assert!(events.contains(&(crate::durability::EventKind::AtomicReplace, path.clone())));
+        #[cfg(unix)]
+        assert!(events.contains(&(
+            crate::durability::EventKind::DirectorySync,
+            dir.path().to_path_buf()
+        )));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn state_failed_replace_cleans_owned_temporary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::create_dir(&path).unwrap();
+        assert!(atomic_write(&path, b"cannot replace a directory").is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
