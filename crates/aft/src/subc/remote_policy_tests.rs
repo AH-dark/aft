@@ -1361,7 +1361,11 @@ async fn exec_remote_module_loop_captures_its_authenticated_daemon_endpoint() {
 async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
     for cancelled in [false, true] {
         let daemon = crate::exec_remote::wire_tests::daemon(
-            crate::exec_remote::wire_tests::Script::Cancel,
+            if cancelled {
+                crate::exec_remote::wire_tests::Script::Cancel
+            } else {
+                crate::exec_remote::wire_tests::Script::GatedAcceptance
+            },
             "exec-remote/v1",
         )
         .await;
@@ -1396,6 +1400,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
             )
             .unwrap();
         registry.begin_wait_mode_session("session", &task);
+        daemon.wait_for_requests("exec.run", 1).await;
         bash::detach_held_bash_in_background(
             drain::BashDetachTarget {
                 run_scoped: false,
@@ -1420,6 +1425,46 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         })
         .await
         .unwrap();
+        let status = registry
+            .observed_status(&task, "session", 0)
+            .unwrap()
+            .info
+            .status;
+        if cancelled {
+            assert_eq!(status, crate::bash_background::BgTaskStatus::Killed);
+        } else {
+            assert_ne!(
+                status,
+                crate::bash_background::BgTaskStatus::Killed,
+                "draining the wait must not kill the detached task"
+            );
+            assert_eq!(
+                status,
+                crate::bash_background::BgTaskStatus::Starting,
+                "the fake runner has not sent Accepted yet"
+            );
+            daemon.acceptance_gate.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let status = registry
+                        .observed_status(&task, "session", 0)
+                        .unwrap()
+                        .info
+                        .status;
+                    assert_ne!(
+                        status,
+                        crate::bash_background::BgTaskStatus::Killed,
+                        "draining the wait must not kill the detached task"
+                    );
+                    if status == crate::bash_background::BgTaskStatus::Running {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the runner's Accepted record should move the task to running");
+        }
         let status = registry
             .observed_status(&task, "session", 0)
             .unwrap()
