@@ -16580,18 +16580,49 @@ mod status_emitter_tests {
 
     #[test]
     fn status_signal_burst_builds_one_snapshot() {
-        let (ctx, rx) = ctx_with_frame_rx();
+        let (mut ctx, rx) = ctx_with_frame_rx();
+        // Status hydrates checkpoints even before configure. Keep its namespace
+        // and file lock private instead of sharing the cwd-wide default store.
+        *ctx.checkpoint().lock() = CheckpointStore::unbound_in_for_test(&ctx.storage_dir());
+        // Disconnect the constructor's idle worker and queue the whole burst
+        // before starting its replacement. Scheduler pauses must not split the
+        // signals across debounce windows.
+        let (notify, notifications) = mpsc::channel();
+        ctx.status_emitter.notify = notify;
+        let latest = Arc::clone(&ctx.status_emitter.latest);
+        let progress_sender = Arc::clone(&ctx.progress_sender);
         let ctx = Arc::new(ctx);
         ctx.bind_status_context();
         for _ in 0..12 {
             ctx.signal_status_changed();
         }
-        rx.recv_timeout(Duration::from_secs(10))
+        assert_eq!(
+            ctx.status_emitter.snapshot_builds.load(Ordering::Relaxed),
+            0
+        );
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            status_debounce_loop(notifications, latest, progress_sender);
+            let _ = done_tx.send(());
+        });
+        // These deadlines guard hangs, not the duration of a snapshot build.
+        let frame = rx
+            .recv_timeout(Duration::from_secs(60))
             .expect("status changed");
+        assert!(matches!(frame, PushFrame::StatusChanged(_)));
         assert_eq!(
             ctx.status_emitter.snapshot_builds.load(Ordering::Relaxed),
             1
         );
+        // Close the input and observe the consumer's exit before checking for
+        // extra frames: receiving the first frame alone does not drain a burst.
+        drop(ctx);
+        done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("status emitter drained and stopped");
+        worker.join().expect("status emitter worker");
+        assert!(rx.try_recv().is_err(), "one frame for the entire burst");
     }
 
     #[test]
