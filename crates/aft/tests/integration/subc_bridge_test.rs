@@ -2560,11 +2560,12 @@ fn subc_bridge_route_close_preserves_sibling_and_allows_join() {
 
 #[test]
 fn subc_bridge_l3_coalesces_already_bound_route_burst() {
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
         "subc_bridge_l3_coalesces_already_bound_route_burst",
         Duration::from_secs(30),
         drive_l3_coalescing_daemon,
         |_, _, _| {},
+        bridge_dispatch,
     );
 }
 
@@ -7791,11 +7792,22 @@ async fn drive_route_close_preserves_sibling_daemon(input: FakeDaemonInput) {
 }
 
 async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
+    let probe = input.lifecycle_probe.clone().expect("frame-loop probe");
     let FakeDaemonSession {
         mut stream,
+        root1,
         push_burst_root,
+        state,
+        executor,
+        lifecycle_events,
         ..
     } = open_fake_daemon_session(input).await;
+    let mut events = lifecycle_events.expect("frame-loop events");
+
+    // A live route with the same session but another root must not receive the
+    // configure burst. It also supplies a reliable push to pause the frame loop.
+    send_route_bind_with_session(&mut stream, 1, 14, &root1, "session-6").await;
+    expect_route_bind_ack(&mut stream, 14).await;
 
     // Keep route 6 live while route 7 configures. Project-scoped status may
     // reach the already-acknowledged sibling, but route 7 cannot receive traffic
@@ -7803,9 +7815,7 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
     send_route_bind(&mut stream, 6, 15, &push_burst_root).await;
     expect_route_bind_ack(&mut stream, 15).await;
 
-    // L3 coalescing integration: route 7's configure emits a burst for the
-    // already-bound sibling route 6. The sibling Push may arrive around route
-    // 7's ack, but the burst must still collapse.
+    let slow_bind_base = state.begin_slow_configure_wave();
     send_route_bind_with_session_and_doc(
         &mut stream,
         7,
@@ -7814,6 +7824,7 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
         "session-6",
         json!({
             "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+            "subc_test_slow_configure": true,
             "subc_test_configure_status_burst": {
                 "marker": "configure-burst",
                 "count": 16,
@@ -7821,24 +7832,50 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
         }),
     )
     .await;
+    state.wait_until("route 7 configure started", |inner| {
+        inner.slow_configure_started > slow_bind_base
+    });
+    let release_turn = probe.hold_reliable_push_turn_for_test(16);
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let ctx = executor.actor_context(&root_id).expect("root1 actor");
+    assert!(emit_push_frame(
+        &ctx,
+        bash_completed_push("coalescing-turn", "session-6")
+    ));
+    expect_priority_event(&mut events, SubcLifecycleEvent::ReliablePushTurnHeld).await;
+
+    // Queue the complete burst and bind completion before the next loop turn.
+    // Bind completions take priority, so route 7 joins the root before the
+    // status batch is coalesced and fanned out; its ACK must lead its pushes.
+    state.release_slow_configures();
+    expect_priority_event(
+        &mut events,
+        SubcLifecycleEvent::RouteBindCompletionQueued { corr: 16 },
+    )
+    .await;
+    release_turn.send(()).expect("release reliable push turn");
     let configure_burst_pushes = expect_route_bind_ack_and_status_pushes(
         &mut stream,
         16,
         "configure-burst",
-        HashSet::from([6]),
+        7,
+        HashSet::from([6, 7]),
     )
     .await;
-    assert!(
-        !configure_burst_pushes.is_empty(),
-        "configure burst should deliver at least one coalesced status frame"
+    assert_eq!(
+        configure_burst_pushes.len(),
+        2,
+        "the queued burst should collapse to one status frame per bound route"
     );
     assert!(
         configure_burst_pushes
             .iter()
-            .any(|push| push_seq(push) == Some(15)),
-        "configure burst should include the final status snapshot"
+            .all(|push| push_seq(push) == Some(15)),
+        "both bound routes should receive only the final status snapshot"
     );
-    send_route_goodbye(&mut stream, 7, 161).await;
+    // Keep route 7 bound through the sentinel: a third burst frame on either
+    // route would arrive before that route's sentinel and fail the check, so
+    // the one-frame-per-route claim covers frames queued after the first two.
     send_tool_call(
         &mut stream,
         6,
@@ -7852,11 +7889,14 @@ async fn drive_l3_coalescing_daemon(input: FakeDaemonInput) {
         160,
         "configure-burst-sentinel",
         "configure-burst",
-        HashSet::from([6]),
+        HashSet::from([6, 7]),
     )
     .await;
-    assert_eq!(sentinel_pushes.len(), 1);
-    assert_eq!(push_seq(&sentinel_pushes[0]), Some(16));
+    assert_eq!(sentinel_pushes.len(), 2);
+    assert!(sentinel_pushes
+        .iter()
+        .all(|push| push_seq(push) == Some(16)));
+    send_route_goodbye(&mut stream, 7, 161).await;
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -14729,6 +14769,7 @@ async fn expect_route_bind_ack_and_status_pushes(
     stream: &mut tokio::net::TcpStream,
     corr: u64,
     marker: &str,
+    binding_channel: u16,
     expected_channels: HashSet<u16>,
 ) -> Vec<Value> {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -14760,6 +14801,12 @@ async fn expect_route_bind_ack_and_status_pushes(
             }
             FrameType::Push => {
                 assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
+                if frame.header.channel == binding_channel {
+                    assert!(
+                        ack_seen,
+                        "channel {binding_channel} received a Push before RouteBindAck {corr}"
+                    );
+                }
                 let body: Value = serde_json::from_slice(&frame.body).expect("push body");
                 if push_marker(&body) == Some(marker) {
                     assert!(
