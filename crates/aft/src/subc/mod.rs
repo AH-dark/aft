@@ -15478,6 +15478,19 @@ mod tests {
             let live_roots = HashMap::from([(root.clone(), meta)]);
             let reap_at = now + IDLE_ROOT_TTL;
 
+            // Registration wakes the scheduler even though no jobs were queued.
+            // Wait for that event to release the scheduler lock so only the
+            // deliberately held lock can keep this root from being evicted.
+            let scheduler = executor.dispatch_loop_liveness();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while scheduler.has_pending_work() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{held:?}: the registration wake did not settle"
+                );
+                std::thread::yield_now();
+            }
+
             let holder_ctx = Arc::clone(&ctx);
             let holder_executor = Arc::clone(&executor);
             let reap_executor = Arc::clone(&executor);
