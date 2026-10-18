@@ -74,14 +74,18 @@ impl ProjectTypeScript {
     /// Whether the package ships the `lib/tsserver.js` that
     /// typescript-language-server loads.
     pub(crate) fn has_tsserver(&self) -> bool {
-        self.package_dir.join("lib").join("tsserver.js").is_file()
+        let path = self.package_dir.join("lib").join("tsserver.js");
+        super::applicability_cache::observe_path(&path);
+        path.is_file()
     }
 
     /// Read the package at `package_dir` (a `node_modules/typescript`
     /// directory). `None` when it has no package.json.
     pub(crate) fn read(package_dir: &Path) -> Option<Self> {
         PACKAGE_JSON_READS.with(|reads| reads.set(reads.get() + 1));
-        let bytes = std::fs::read(package_dir.join("package.json")).ok()?;
+        let path = package_dir.join("package.json");
+        super::applicability_cache::observe_path(&path);
+        let bytes = std::fs::read(path).ok()?;
         let version = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
             .and_then(|json| {
@@ -258,7 +262,7 @@ const SELECTION_MEMO_CAPACITY: usize = 16_384;
 /// (directory the ancestor walk starts in, configured project root, hash of
 /// the root-marker file names the server definition uses to find its
 /// workspace root).
-type SelectionKey = (PathBuf, Option<PathBuf>, u64, u64);
+type SelectionKey = (PathBuf, Option<PathBuf>, u64, u64, Option<u64>);
 
 static SELECTION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -297,7 +301,10 @@ pub(crate) fn native_typescript_for(
         project_root.map(Path::to_path_buf),
         markers,
         SELECTION_GENERATION.load(std::sync::atomic::Ordering::Acquire),
+        super::applicability_cache::capture_id(),
     );
+    // Each complete applicability scan rediscovers its external dependencies;
+    // files in the same scan still share the per-directory selection memo.
     if let Some(memoized) = selection_memo().lock().get(&key) {
         return memoized.clone();
     }
@@ -339,7 +346,7 @@ pub(crate) fn clear_typescript_selection() {
 /// Maps (nearest TypeScript root marker directory, project root) to the root
 /// the shared TypeScript server for that directory runs at. Emptied together
 /// with the selection memo.
-type SharedRootMemo = parking_lot::Mutex<HashMap<(PathBuf, PathBuf, u64), PathBuf>>;
+type SharedRootMemo = parking_lot::Mutex<HashMap<(PathBuf, PathBuf, u64, Option<u64>), PathBuf>>;
 
 fn shared_root_memo() -> &'static SharedRootMemo {
     static MEMO: OnceLock<SharedRootMemo> = OnceLock::new();
@@ -371,6 +378,7 @@ pub(crate) fn shared_typescript_server_root(
         nearest.to_path_buf(),
         project_root.clone(),
         SELECTION_GENERATION.load(std::sync::atomic::Ordering::Acquire),
+        super::applicability_cache::capture_id(),
     );
     if let Some(root) = shared_root_memo().lock().get(&key) {
         return root.clone();
@@ -521,8 +529,11 @@ pub(crate) fn resolve_native_binary(project: &ProjectTypeScript) -> Result<PathB
             ancestor.join("node_modules")
         };
         let package = modules.join(&platform_package);
-        if package.join("package.json").is_file() {
+        let manifest = package.join("package.json");
+        super::applicability_cache::observe_path(&manifest);
+        if manifest.is_file() {
             let binary = package.join("lib").join(binary_name);
+            super::applicability_cache::observe_path(&binary);
             if binary.is_file() {
                 return Ok(binary);
             }

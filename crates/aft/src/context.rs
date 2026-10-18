@@ -1055,6 +1055,32 @@ struct ProjectApplicabilityProgress {
     gate: parking_lot::Mutex<ApplicabilityWalkGate>,
     /// Signalled when a walk settles or a test hold is released.
     changed: parking_lot::Condvar,
+    refresh: parking_lot::Mutex<ApplicabilityRefreshState>,
+    #[cfg(test)]
+    refresh_spawns: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    scans: parking_lot::Mutex<ApplicabilityScanGate>,
+    #[cfg(test)]
+    scan_changed: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct ApplicabilityRefreshState {
+    running: bool,
+    pending: Option<ApplicabilityRefresh>,
+}
+
+struct ApplicabilityRefresh {
+    config: Arc<Config>,
+    epoch: u64,
+    root_changed: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ApplicabilityScanGate {
+    held: bool,
+    started: usize,
 }
 
 #[derive(Default)]
@@ -1078,6 +1104,16 @@ impl ProjectApplicabilityProgress {
         let mut gate = self.gate.lock();
         while gate.held {
             self.changed.wait(&mut gate);
+        }
+    }
+
+    #[cfg(test)]
+    fn note_scan_for_test(&self) {
+        let mut scans = self.scans.lock();
+        scans.started += 1;
+        self.scan_changed.notify_all();
+        while scans.held {
+            self.scan_changed.wait(&mut scans);
         }
     }
 }
@@ -6827,20 +6863,41 @@ impl AppContext {
         self.refresh_project_applicability(config, root_changed);
     }
 
-    /// Starts the background walk that records which language servers apply
-    /// to `config`'s project. Every call supersedes the walks started before
-    /// it: a superseded walk stops before walking, or discards its result.
+    /// Refreshes the project snapshot on one worker. Batches arriving during a
+    /// walk replace one pending request instead of creating waiting threads.
     fn refresh_project_applicability(&self, config: Arc<Config>, root_changed: bool) {
+        let progress = Arc::clone(&self.project_applicability_progress);
+        let mut refresh = progress.refresh.lock();
         let epoch = self
             .project_applicability_epoch
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
-        let Some(root) = config.project_root.clone() else {
-            self.project_applicability_progress.settle(epoch);
+        let root_changed = root_changed
+            || refresh
+                .pending
+                .as_ref()
+                .is_some_and(|request| request.root_changed);
+        refresh.pending = Some(ApplicabilityRefresh {
+            config,
+            epoch,
+            root_changed,
+        });
+        if refresh.running {
             return;
-        };
+        }
+        if refresh
+            .pending
+            .as_ref()
+            .is_some_and(|request| request.config.project_root.is_none())
+        {
+            refresh.pending = None;
+            drop(refresh);
+            progress.settle(epoch);
+            return;
+        }
+        refresh.running = true;
+        drop(refresh);
         let epochs = Arc::clone(&self.project_applicability_epoch);
-        let progress = Arc::clone(&self.project_applicability_progress);
         let manager = Arc::clone(&self.lsp_manager);
         let status_context = self
             .status_emitter
@@ -6848,32 +6905,72 @@ impl AppContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        #[cfg(test)]
+        progress.refresh_spawns.fetch_add(1, Ordering::SeqCst);
+        let worker_progress = Arc::clone(&progress);
         let spawned = std::thread::Builder::new()
             .name("aft-lsp-applicability".to_string())
             .spawn(move || {
-                // Records that this walk is over however it ends, so callers
-                // can wait for it (see `wait_for_project_applicability`).
+                // A panic must release the worker reservation as well as waiters.
+                struct WorkerGuard(Arc<ProjectApplicabilityProgress>, bool);
+                impl Drop for WorkerGuard {
+                    fn drop(&mut self) {
+                        if self.1 {
+                            let pending = {
+                                let mut refresh = self.0.refresh.lock();
+                                refresh.running = false;
+                                refresh.pending.take()
+                            };
+                            if let Some(request) = pending {
+                                self.0.settle(request.epoch);
+                            }
+                        }
+                    }
+                }
                 struct Settled(Arc<ProjectApplicabilityProgress>, u64);
                 impl Drop for Settled {
                     fn drop(&mut self) {
                         self.0.settle(self.1);
                     }
                 }
-                let settled = Settled(Arc::clone(&progress), epoch);
-                let current = || epochs.load(Ordering::SeqCst) == epoch;
-                if root_changed {
-                    // The previous root's servers say nothing about this one.
-                    let mut lsp = manager.lock();
-                    if current() {
-                        lsp.clear_project_applicability();
+                let progress = worker_progress;
+                let mut worker = WorkerGuard(Arc::clone(&progress), true);
+                loop {
+                    let request = {
+                        let mut refresh = progress.refresh.lock();
+                        match refresh.pending.take() {
+                            Some(request) => request,
+                            None => {
+                                refresh.running = false;
+                                worker.1 = false;
+                                break;
+                            }
+                        }
+                    };
+                    let ApplicabilityRefresh {
+                        config,
+                        epoch,
+                        root_changed,
+                    } = request;
+                    let settled = Settled(Arc::clone(&progress), epoch);
+                    // Even a superseded root change must clear the previous root's
+                    // snapshot: a later watcher-only request may now own publication.
+                    if root_changed {
+                        manager.lock().clear_project_applicability();
                     }
-                }
-                progress.pause_while_held();
-                if !current() {
-                    return;
-                }
-                let walk =
-                    match crate::lsp::manager::walk_applicable_area(&root, None, &config, None) {
+                    let Some(root) = config.project_root.as_deref() else {
+                        continue;
+                    };
+                    let current = || epochs.load(Ordering::SeqCst) == epoch;
+                    progress.pause_while_held();
+                    if !current() {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    progress.note_scan_for_test();
+                    let walk = match crate::lsp::manager::walk_applicable_area(
+                        root, None, &config, None,
+                    ) {
                         Ok(walk) => walk,
                         Err(error) => {
                             crate::slog_warn!(
@@ -6885,26 +6982,33 @@ impl AppContext {
                                     lsp.clear_project_applicability();
                                 }
                             }
-                            return;
+                            continue;
                         }
                     };
-                {
-                    let mut lsp = manager.lock();
-                    if !current() {
-                        return;
+                    {
+                        let mut lsp = manager.lock();
+                        if !current() {
+                            continue;
+                        }
+                        let snapshot = lsp.classify_applicable_servers(walk, &config);
+                        lsp.store_project_applicability(snapshot);
                     }
-                    let snapshot = lsp.classify_applicable_servers(walk, &config);
-                    lsp.store_project_applicability(snapshot);
-                }
-                // Waiters only need the stored result; release them before
-                // publishing the status change.
-                drop(settled);
-                if let Some(ctx) = status_context.upgrade() {
-                    ctx.signal_status_changed();
+                    // Waiters need the stored result, not status publication.
+                    drop(settled);
+                    if let Some(ctx) = status_context.upgrade() {
+                        ctx.signal_status_changed();
+                    }
                 }
             });
         if let Err(error) = spawned {
-            self.project_applicability_progress.settle(epoch);
+            let pending = {
+                let mut refresh = progress.refresh.lock();
+                refresh.running = false;
+                refresh.pending.take()
+            };
+            if let Some(request) = pending {
+                progress.settle(request.epoch);
+            }
             crate::slog_warn!("could not start the language-server applicability walk: {error}");
         }
     }
@@ -17019,6 +17123,55 @@ mod health_warming_honesty_tests {
         ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(false);
 
         assert_eq!(health_tier2_status(&ctx), "stale");
+    }
+}
+
+#[cfg(test)]
+mod configure_applicability_tests {
+    use super::*;
+
+    #[test]
+    fn configure_applicability_coalesces_watcher_batches_during_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        );
+        let progress = &ctx.project_applicability_progress;
+        progress.scans.lock().held = true;
+        ctx.refresh_project_applicability(Arc::new(config), false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut scans = progress.scans.lock();
+        while scans.started == 0 {
+            assert!(!progress
+                .scan_changed
+                .wait_until(&mut scans, deadline)
+                .timed_out());
+        }
+        drop(scans);
+        for _ in 0..32 {
+            ctx.lsp_forward_watcher_file_events(&[root.join("main.go")]);
+        }
+        // Always release the worker before assertions, including on the old
+        // implementation where every batch starts a separate waiting thread.
+        progress.scans.lock().held = false;
+        progress.scan_changed.notify_all();
+        assert!(ctx.wait_for_project_applicability(Duration::from_secs(10)));
+        assert_eq!(
+            progress.refresh_spawns.load(Ordering::SeqCst),
+            1,
+            "watcher batches must reuse the active refresh worker"
+        );
+        assert_eq!(
+            progress.scans.lock().started,
+            2,
+            "a batch burst needs only the held scan and one pending scan"
+        );
     }
 }
 

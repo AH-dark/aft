@@ -105,6 +105,142 @@ fn applicability_walk_concurrent_binds_share_one_scan() {
 }
 
 #[test]
+fn applicability_walk_rechecks_ancestor_marker_without_watcher_event() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().canonicalize().unwrap();
+    let root = parent.join("subdir");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("main.go"), "package main").unwrap();
+    let config = config(&root);
+    let before = walk_applicable_area(&root, None, &config, None).unwrap();
+    assert!(!before
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
+
+    // This marker is outside the watched project, so no watcher event arrives.
+    std::fs::write(parent.join("go.mod"), "module example.test/app\n").unwrap();
+    let after = walk_applicable_area(&root, None, &config, None).unwrap();
+    assert!(after
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
+    std::fs::remove_file(parent.join("go.mod")).unwrap();
+    let removed = walk_applicable_area(&root, None, &config, None).unwrap();
+    assert!(!removed
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Go));
+}
+
+#[test]
+fn applicability_walk_equivalent_config_sets_share_one_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let configs: Vec<_> = (0..8)
+        .map(|rotation| {
+            let mut config = config(&root);
+            for offset in 0..16 {
+                config
+                    .disabled_lsp
+                    .insert(format!("custom-{}", (offset + rotation) % 16));
+                config
+                    .lsp_auto_install_binaries
+                    .insert(format!("binary-{}", (offset + rotation) % 16));
+                config
+                    .lsp_inflight_installs
+                    .insert(format!("install-{}", (offset + rotation) % 16));
+            }
+            config
+        })
+        .collect();
+    let first = serde_json::to_vec(&configs[0]).unwrap();
+    assert!(
+        configs
+            .iter()
+            .skip(1)
+            .any(|config| serde_json::to_vec(config).unwrap() != first),
+        "fixture must exercise different HashSet serialization orders"
+    );
+    let cache = ApplicabilityCache::default();
+    let mut scans = 0;
+    for config in &configs {
+        cache
+            .walk(
+                &root,
+                config,
+                Instant::now() + Duration::from_secs(5),
+                || {
+                    scans += 1;
+                    Ok(scan(&root, config))
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(scans, 1, "equivalent set values must share a cache entry");
+}
+
+#[test]
+fn applicability_walk_keeps_ordered_server_arguments_in_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let mut first = config(&root);
+    first.lsp_servers.push(crate::config::UserServerDef {
+        id: "custom".into(),
+        args: vec!["first".into(), "second".into()],
+        ..Default::default()
+    });
+    let mut second = first.clone();
+    second.lsp_servers[0].args.reverse();
+    let cache = ApplicabilityCache::default();
+    let mut scans = 0;
+    for config in [&first, &second] {
+        cache
+            .walk(
+                &root,
+                config,
+                Instant::now() + Duration::from_secs(5),
+                || {
+                    scans += 1;
+                    Ok(scan(&root, config))
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(scans, 2, "server argument order changes the snapshot");
+}
+
+#[test]
+fn applicability_walk_rechecks_ancestor_biome_contents_and_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().canonicalize().unwrap();
+    let root = parent.join("subdir");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("main.json"), "{}").unwrap();
+    let marker = parent.join("biome.json");
+    std::fs::write(&marker, r#"{"files":{"includes":["**"]}}"#).unwrap();
+    let config = config(&root);
+    let before = walk_applicable_area(&root, None, &config, None).unwrap();
+    assert!(before
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Biome));
+
+    // Preserve mtime across replacement: identity must still invalidate both
+    // the walk result and the mtime-based Biome parse memo.
+    let modified =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&marker).unwrap());
+    std::fs::rename(&marker, parent.join("old-biome.json")).unwrap();
+    std::fs::write(&marker, r#"{"files":{"includes":["**","!**"]}}"#).unwrap();
+    filetime::set_file_mtime(&marker, modified).unwrap();
+    let after = walk_applicable_area(&root, None, &config, None).unwrap();
+    assert!(!after
+        .candidates
+        .iter()
+        .any(|c| c.key.kind == ServerKind::Biome));
+}
+
+#[test]
 fn applicability_walk_manifest_change_invalidates_from_watcher() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

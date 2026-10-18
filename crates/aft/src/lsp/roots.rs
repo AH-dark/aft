@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use super::applicability_cache::observe_path;
 use crate::lsp::registry::ServerKind;
 
 /// Walk entries below a canonical root already have resolved parents: the
@@ -80,6 +81,7 @@ pub(crate) fn find_workspace_root_with_mode<S: AsRef<str>>(
 
     let mut current = Some(start_dir.as_path());
     while let Some(dir) = current {
+        observe_path(dir);
         if device_boundary
             .as_ref()
             .is_some_and(|boundary| !boundary.should_descend(dir).unwrap_or(false))
@@ -92,10 +94,11 @@ pub(crate) fn find_workspace_root_with_mode<S: AsRef<str>>(
         {
             break;
         }
-        if markers
-            .iter()
-            .any(|marker| dir.join(marker.as_ref()).exists())
-        {
+        if markers.iter().any(|marker| {
+            let path = dir.join(marker.as_ref());
+            observe_path(&path);
+            path.exists()
+        }) {
             return Some(dir.to_path_buf());
         }
 
@@ -145,6 +148,7 @@ pub(crate) fn find_rust_workspace_root_with_mode(
     let crate_root = nearest_cargo_manifest_dir(&start_dir, project_root.as_deref())?;
     let mut current = Some(crate_root.as_path());
     while let Some(dir) = current {
+        observe_path(dir);
         if device_boundary
             .as_ref()
             .is_some_and(|boundary| !boundary.should_descend(dir).unwrap_or(false))
@@ -173,6 +177,7 @@ fn nearest_cargo_manifest_dir(start_dir: &Path, project_root: Option<&Path>) -> 
     let device_boundary = crate::walk_boundary::DeviceBoundary::for_root(start_dir).ok();
     let mut current = Some(start_dir);
     while let Some(dir) = current {
+        observe_path(dir);
         if device_boundary
             .as_ref()
             .is_some_and(|boundary| !boundary.should_descend(dir).unwrap_or(false))
@@ -182,7 +187,9 @@ fn nearest_cargo_manifest_dir(start_dir: &Path, project_root: Option<&Path>) -> 
         if project_root.is_some_and(|boundary| !dir.starts_with(boundary)) {
             break;
         }
-        if dir.join("Cargo.toml").is_file() {
+        let manifest = dir.join("Cargo.toml");
+        observe_path(&manifest);
+        if manifest.is_file() {
             return Some(dir.to_path_buf());
         }
         if project_root == Some(dir) {
@@ -194,7 +201,9 @@ fn nearest_cargo_manifest_dir(start_dir: &Path, project_root: Option<&Path>) -> 
 }
 
 fn cargo_workspace_contains_crate(workspace_root: &Path, crate_root: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(workspace_root.join("Cargo.toml")) else {
+    let path = workspace_root.join("Cargo.toml");
+    observe_path(&path);
+    let Ok(contents) = std::fs::read_to_string(path) else {
         return false;
     };
     let Ok(manifest) = contents.parse::<toml::Value>() else {

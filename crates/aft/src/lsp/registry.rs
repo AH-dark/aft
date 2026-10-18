@@ -456,7 +456,11 @@ impl ServerDef {
         self.root_markers
             .iter()
             .chain(self.priority_root_markers.iter())
-            .any(|marker| dir.join(marker).exists())
+            .any(|marker| {
+                let path = dir.join(marker);
+                super::applicability_cache::observe_path(&path);
+                path.exists()
+            })
     }
 
     fn nearest_marker_root(
@@ -952,7 +956,10 @@ fn biome_config_excludes(server: &ServerDef, path: &Path, mode: RootPathMode) ->
     let Some(config_path) = ["biome.json", "biome.jsonc"]
         .iter()
         .map(|name| root.join(name))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| {
+            super::applicability_cache::observe_path(candidate);
+            candidate.is_file()
+        })
     else {
         return false;
     };
@@ -995,9 +1002,13 @@ fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
         .and_then(|metadata| metadata.modified())
         .ok();
     let memo = MEMO.get_or_init(Default::default);
-    if let Some((at, includes)) = memo.lock().get(config_path) {
-        if *at == modified {
-            return includes.clone();
+    // An ancestor configuration can be replaced without a watcher event. Its
+    // identity is checked by the walk cache, not this mtime-only parse memo.
+    if !super::applicability_cache::is_external_input(config_path) {
+        if let Some((at, includes)) = memo.lock().get(config_path) {
+            if *at == modified {
+                return includes.clone();
+            }
         }
     }
     let parsed = std::fs::read_to_string(config_path)
