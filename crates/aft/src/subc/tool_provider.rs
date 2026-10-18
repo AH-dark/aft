@@ -5204,6 +5204,34 @@ mod route_tests {
     }
 
     #[tokio::test]
+    async fn unknown_operations_on_tool_provider_route_return_protocol_errors() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        let unknown = exchange(
+            json!({"op":"example.not_served","params":{}}),
+            RouteRole::Legacy,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(unknown.header.ty, FrameType::Error);
+        let error = error_body(&unknown);
+        assert_eq!(error.code, "unknown_op");
+        assert_eq!(
+            error.message,
+            "aft does not serve op \"example.not_served\" on this route"
+        );
+
+        let known = exchange(
+            json!({"op":"tool.catalog","params":{}}),
+            RouteRole::Legacy,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(known.header.ty, FrameType::Response);
+    }
+
+    #[tokio::test]
     async fn recognized_operations_and_v1_refusals_never_dispatch_legacy_actions() {
         let _guard = EXCHANGE_LOCK.lock().await;
         ACTIONS.store(0, Ordering::SeqCst);
