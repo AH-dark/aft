@@ -32,3 +32,7 @@ Rules:
 - **Build the notes from an inventory of every commit since the previous release,** grouped into user-visible changes. Check each change against the released code, not commit subjects: provenance merges list branches whose code never shipped. Leave out internal work (tests, CI, benchmarks, refactors) unless users feel it.
 - **Each paragraph is a single source line.** GitHub renders release bodies with hard line breaks. `node scripts/check-release-notes.mjs <file>` must pass.
 - As a guide, aim for under about 1,200 words even for a large release.
+
+## Notes for the next release
+
+Each landing PR records its user-facing line as its own file, `.alfonso/release-notes/next/<branch-name>.md` (one line, the same rules as above), instead of appending to `next-notes.md`. Separate files never conflict, so a PR merged ahead of another doesn't force a rebase. When cutting a release, fold `next-notes.md` and every file in `next/` into the release's notes, then empty them in the release PR. These lines are drafts: the inventory of commits is still the source of truth.
