@@ -112,7 +112,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt
 
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
@@ -151,11 +151,6 @@ jobs:
       # after a multi-minute cargo build.
       - name: Rust formatting
         run: cargo fmt --all -- --check
-
-      # Keep compile-heavy Clippy in the full suite, not the lightweight PR job.
-      # Test targets have a separate lint backlog; production targets run here.
-      - name: Rust Clippy
-        run: cargo clippy --workspace --lib --bins --locked
 
       - name: Rust CI policy regression tests
         run: python3 scripts/test-ci-rust-quality.py

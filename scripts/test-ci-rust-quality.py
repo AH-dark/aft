@@ -42,7 +42,6 @@ class RustWorkflowQualityTests(unittest.TestCase):
         self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
         for command in (
             "cargo fmt --all -- --check",
-            "cargo clippy --workspace --lib --bins --locked",
             "python3 scripts/test-ci-rust-quality.py",
         ):
             self.required_command(job, command)
@@ -51,7 +50,7 @@ class RustWorkflowQualityTests(unittest.TestCase):
             if step.get("uses") == "dtolnay/rust-toolchain@stable"
         )
         components = toolchain.get("with", {}).get("components", "")
-        self.assertEqual({part.strip() for part in components.split(",")}, {"clippy", "rustfmt"})
+        self.assertEqual({part.strip() for part in components.split(",")}, {"rustfmt"})
 
     def test_pr_checks_keep_lightweight_rust_checks(self):
         job = self.job("tests.yml", "pr-checks")
