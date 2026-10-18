@@ -298,13 +298,15 @@ pub fn aggregate_for_session(
     project_key: &str,
     session_id: &str,
 ) -> rusqlite::Result<CompressionAggregate> {
+    // Without statistics the planner can prefer the project index, visiting
+    // every session in the project instead of just the requested session.
     conn.query_row(
         r#"
         SELECT SUM(events), SUM(original), SUM(compressed) FROM (
             SELECT COUNT(*) AS events,
                    COALESCE(SUM(original_tokens), 0) AS original,
                    COALESCE(SUM(compressed_tokens), 0) AS compressed
-            FROM compression_events
+            FROM compression_events INDEXED BY idx_compression_session
             WHERE harness = ?1 AND project_key = ?2 AND session_id = ?3
             UNION ALL
             SELECT events, original_tokens, compressed_tokens
