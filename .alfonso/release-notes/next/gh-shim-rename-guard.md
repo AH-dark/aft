@@ -1,0 +1,1 @@
+- Repository renames now refuse to break published actions or reusable workflows unless explicitly overridden with `GH_SHIM_RENAME_PUBLISHED=allow`.

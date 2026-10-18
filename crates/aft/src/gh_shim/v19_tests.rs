@@ -177,24 +177,28 @@ fn v19_pr_ready_undo_reaches_the_daemon_wire() {
     }
 }
 
-struct BypassEnv(Option<OsString>);
+struct BypassEnv(&'static str, Option<OsString>);
 
 impl BypassEnv {
     fn set(value: Option<&str>) -> Self {
-        let previous = std::env::var_os("GH_SHIM_BYPASS");
+        Self::set_key("GH_SHIM_BYPASS", value)
+    }
+
+    fn set_key(key: &'static str, value: Option<&str>) -> Self {
+        let previous = std::env::var_os(key);
         match value {
-            Some(value) => std::env::set_var("GH_SHIM_BYPASS", value),
-            None => std::env::remove_var("GH_SHIM_BYPASS"),
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
         }
-        Self(previous)
+        Self(key, previous)
     }
 }
 
 impl Drop for BypassEnv {
     fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var("GH_SHIM_BYPASS", value),
-            None => std::env::remove_var("GH_SHIM_BYPASS"),
+        match &self.1 {
+            Some(value) => std::env::set_var(self.0, value),
+            None => std::env::remove_var(self.0),
         }
     }
 }
@@ -268,6 +272,10 @@ fn check_admin(raw: &[&str], tuple: &str) {
     assert_eq!(dispatch(), REFUSAL_EXIT_STATUS);
     assert!(!paths.bypass_audit.exists());
     let _operator = BypassEnv::set(Some("operator"));
+    // This classifier test has no upstream gh; the runtime fixtures exercise
+    // the rename preflight, while this row verifies its explicit override.
+    let _rename_override = (tuple == "repo rename")
+        .then(|| BypassEnv::set_key("GH_SHIM_RENAME_PUBLISHED", Some("allow")));
     assert_eq!(dispatch(), 73);
 }
 

@@ -32,6 +32,8 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod rename_guard;
+
 pub const SCHEMA_FLOOR: u64 = 1;
 /// Envelope version that carries the manifest as exact signed bytes. Envelope
 /// v1 re-serialized the parsed manifest at verify time; envelope v2 verifies
@@ -461,10 +463,12 @@ pub enum RefusalCode {
     OutcomeUnknown,
     UnboundTarget,
     OperatorCredentials,
+    RenamePublished,
+    RenameUnverified,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -482,6 +486,8 @@ impl RefusalCode {
         Self::OutcomeUnknown,
         Self::UnboundTarget,
         Self::OperatorCredentials,
+        Self::RenamePublished,
+        Self::RenameUnverified,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -503,6 +509,8 @@ impl RefusalCode {
             Self::OutcomeUnknown => "gh_shim_outcome_unknown",
             Self::UnboundTarget => "gh_shim_unbound_target",
             Self::OperatorCredentials => "gh_shim_operator_credentials",
+            Self::RenamePublished => "gh_shim_rename_published",
+            Self::RenameUnverified => "gh_shim_rename_unverified",
         }
     }
 }
@@ -868,13 +876,14 @@ where
                 let repository = std::env::current_dir()
                     .ok()
                     .and_then(|cwd| TargetRepository::from_invocation(args).resolve(&cwd));
-                if let Err(error) = append_bypass_audit(paths, &tuple, repository.as_deref(), now) {
-                    return refuse(
-                        RefusalCode::BypassAuditUnavailable,
-                        &format!("operator bypass audit could not be appended: {error}"),
-                    );
-                }
-                delegate_to_upstream(args)
+                dispatch_audited_bypass(
+                    args,
+                    &tuple,
+                    repository.as_deref(),
+                    paths,
+                    now,
+                    delegate_to_upstream,
+                )
             } else {
                 refuse(RefusalCode::AdminTier, &admin_refusal_text(&tuple))
             }
@@ -1169,9 +1178,45 @@ where
             &unbound_target_refusal_text(write),
         );
     }
-    if let Err(error) =
-        append_bypass_audit(paths, &write.command, write.target.audit_repository(), now)
-    {
+    dispatch_audited_bypass(
+        args,
+        &write.command,
+        write.target.audit_repository(),
+        paths,
+        now,
+        delegate_to_upstream,
+    )
+}
+
+fn dispatch_audited_bypass<F>(
+    args: &[OsString],
+    tuple: &str,
+    repository: Option<&str>,
+    paths: &StatePaths,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    let audit = if tuple == "repo rename" {
+        match rename_guard::check(args, repository) {
+            Ok(check) => append_bypass_audit_record(
+                paths,
+                &json!({
+                    "as_of_unix_secs": now,
+                    "tuple": tuple,
+                    "repository": check.repository,
+                    "rename_published_override": check.overridden.then_some("allow"),
+                    "published_paths": check.published_paths,
+                }),
+            ),
+            Err((code, text)) => return refuse(code, &text),
+        }
+    } else {
+        append_bypass_audit(paths, tuple, repository, now)
+    };
+    if let Err(error) = audit {
         return refuse(
             RefusalCode::BypassAuditUnavailable,
             &format!("operator bypass audit could not be appended: {error}"),
@@ -10238,7 +10283,7 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 17);
+        assert_eq!(RefusalCode::ALL.len(), 19);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
@@ -10253,6 +10298,14 @@ mod tests {
         assert_eq!(
             RefusalCode::UnsupportedFlag.as_str(),
             "gh_shim_unsupported_flag"
+        );
+        assert_eq!(
+            RefusalCode::RenamePublished.as_str(),
+            "gh_shim_rename_published"
+        );
+        assert_eq!(
+            RefusalCode::RenameUnverified.as_str(),
+            "gh_shim_rename_unverified"
         );
         assert_eq!(
             GOVERNANCE_UNAVAILABLE_TEXT,

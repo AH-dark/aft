@@ -487,9 +487,14 @@ fn shim_command(
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GH_REPO")
+        .env_remove("GH_SHIM_RENAME_PUBLISHED")
         .env_remove("GH_SHIM_BYPASS");
     shim
 }
+
+#[path = "gh_shim/rename_guard.rs"]
+mod rename_guard;
 
 #[test]
 fn gh_shim_child_override_leaves_operator_state_canary_untouched() {
