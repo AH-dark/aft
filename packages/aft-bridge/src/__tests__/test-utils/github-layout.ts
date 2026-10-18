@@ -3,10 +3,12 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { writeStampedFileDigest } from "../../binary-identity.js";
 import { execFileSync } from "../../child-process.js";
 import { acquireEnv } from "./env-guard.js";
 
 interface Installer {
+  __githubBinaryHashCountForTests: () => number;
   _extractArchiveSafelyForTesting: (
     archive: string,
     destination: string,
@@ -58,6 +60,95 @@ export function githubLayoutTests(installer: Installer): void {
       rmSync(root, { recursive: true, force: true });
     }
   }
+  test.skipIf(process.platform === "win32")(
+    "recorded smoke verdict exposes the stamped cache synchronously without spawning",
+    async () => {
+      const script = '#!/bin/sh\nprintf x >> "${0}.runs"\nexit 0\n';
+      await withCachedServer(script, async (binary, root) => {
+        const caches = [
+          { binary, packageDir: dirname(dirname(binary)), layout: "standalone" },
+          {
+            binary: join(root, "lsp-binaries", "lua-ls", "extracted", "bin", "lua-language-server"),
+            packageDir: join(root, "lsp-binaries", "lua-ls"),
+            layout: "distribution",
+          },
+          {
+            binary: join(
+              root,
+              "lsp-binaries",
+              "clangd",
+              "extracted",
+              "clangd_1.0.0",
+              "bin",
+              "clangd",
+            ),
+            packageDir: join(root, "lsp-binaries", "clangd"),
+            layout: "distribution",
+          },
+        ];
+        const digest = createHash("sha256").update(script).digest("hex");
+        for (const cached of caches) {
+          mkdirSync(dirname(cached.binary), { recursive: true });
+          writeFileSync(cached.binary, script, { mode: 0o755 });
+          writeStampedFileDigest(cached.binary, digest);
+        }
+        for (const verdict of ["passed", "timeout"]) {
+          for (const cached of caches) {
+            writeFileSync(
+              join(cached.packageDir, ".aft-installed"),
+              JSON.stringify({
+                version: "1.0.0",
+                installedAt: "now",
+                sha256: digest,
+                binarySha256: digest,
+                layout: cached.layout,
+                smoke: { binarySha256: digest, verdict },
+              }),
+            );
+          }
+          const hashes = installer.__githubBinaryHashCountForTests();
+          const result = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+          for (const cached of caches) {
+            expect(result.cachedBinDirs).toContain(dirname(cached.binary));
+            expect(existsSync(`${cached.binary}.runs`)).toBe(false);
+          }
+          await result.installsComplete;
+          const refreshed = await result.getCachedBinDirs();
+          for (const cached of caches) {
+            expect(refreshed).toContain(dirname(cached.binary));
+            expect(existsSync(`${cached.binary}.runs`)).toBe(false);
+          }
+          expect(installer.__githubBinaryHashCountForTests()).toBe(hashes);
+        }
+      });
+    },
+  );
+  test.skipIf(process.platform === "win32")(
+    "cache without a smoke verdict is published only after asynchronous validation",
+    async () => {
+      const script = '#!/bin/sh\nprintf x >> "${0}.runs"\nexit 0\n';
+      await withCachedServer(script, async (binary) => {
+        const digest = createHash("sha256").update(script).digest("hex");
+        writeStampedFileDigest(binary, digest);
+        writeFileSync(
+          join(dirname(binary), "..", ".aft-installed"),
+          JSON.stringify({
+            version: "1.0.0",
+            installedAt: "now",
+            sha256: digest,
+            binarySha256: digest,
+            layout: "standalone",
+          }),
+        );
+        const result = installer.runGithubAutoInstall(new Set(), withoutInstall, fetch);
+        expect(result.cachedBinDirs).not.toContain(dirname(binary));
+        await result.installsComplete;
+        expect(result.cachedBinDirs).toContain(dirname(binary));
+        expect(await result.getCachedBinDirs()).toContain(dirname(binary));
+        expect(readFileSync(`${binary}.runs`, "utf8")).toBe("x");
+      });
+    },
+  );
   test.skipIf(process.platform === "win32")(
     "runtime smoke yields to unrelated event-loop work",
     async () => {

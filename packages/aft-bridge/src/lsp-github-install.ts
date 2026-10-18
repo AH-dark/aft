@@ -80,7 +80,7 @@ export interface GithubInstallConfig {
   disabled: ReadonlySet<string>;
 }
 export interface GithubAutoInstallResult {
-  /** Validated cache directories, populated as background validation completes. */
+  /** Verified caches are available immediately; newly validated directories arrive in the background. */
   cachedBinDirs: string[];
   installsStarted: number;
   /** Binary names whose installs are actively in flight at return time. */
@@ -1128,10 +1128,11 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     });
   }
 
-  async function validateCachedGithubInstall(
+  /** Return known verdicts immediately; only unverified or legacy caches need a subprocess. */
+  function validateCachedGithubInstall(
     spec: GithubServerSpec,
     platform: Platform,
-  ): Promise<boolean> {
+  ): boolean | Promise<boolean> {
     const packageDir = ghPackageDir(spec);
     const meta = readGithubInstalledMetaIn(packageDir);
     const binaryPath = ghBinaryCandidates(spec, platform)
@@ -1161,8 +1162,15 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       quarantineCachedGithubInstall(spec, `recorded ${recordedBinaryHash}, current ${currentHash}`);
       return false;
     }
-    let smoke = meta.smoke;
-    if (smoke?.binarySha256 !== currentHash) {
+    if (
+      meta.sha256 === currentHash &&
+      meta.binarySha256 === currentHash &&
+      meta.layout === spec.layout &&
+      meta.smoke?.binarySha256 === currentHash
+    ) {
+      return true;
+    }
+    return (async () => {
       const verdict = await smokeGithubBinary(spec, binaryPath);
       if (verdict === "failed") {
         quarantineCachedGithubInstall(spec, "cached binary failed runtime smoke check");
@@ -1170,19 +1178,16 @@ export function createGithubInstaller(services: GithubInstallerHost) {
       }
       // Do not certify a different executable if it changed while the subprocess ran.
       if (!existsSync(binaryPath) || cachedBinarySha256(binaryPath) !== currentHash) return false;
-      smoke = { binarySha256: currentHash, verdict };
-    }
-    if (meta.sha256 !== currentHash || meta.binarySha256 !== currentHash || meta.smoke !== smoke) {
       writeGithubInstalledMetaIn(
         packageDir,
         meta.version,
         currentHash,
         legacyArchiveHash ? meta.sha256 : meta.archiveSha256,
-        meta.layout,
-        smoke,
+        spec.layout,
+        { binarySha256: currentHash, verdict },
       );
-    }
-    return true;
+      return true;
+    })();
   }
 
   /**
@@ -1508,9 +1513,9 @@ export function createGithubInstaller(services: GithubInstallerHost) {
   /**
    * Run the GitHub-release auto-install pass for every Pattern C server.
    *
-   * Sync return: background validation/install handles and skipped reasons.
-   * Cached paths populate asynchronously; callers await installsComplete before
-   * refreshing paths, so a slow server never blocks unrelated host startup.
+   * Previously verified caches are returned synchronously for the first configure.
+   * Unverified caches and installs settle in the background; callers await
+   * installsComplete before refreshing paths without blocking unrelated startup.
    */
   function runGithubAutoInstall(
     relevantServers: ReadonlySet<string>,
@@ -1537,12 +1542,12 @@ export function createGithubInstaller(services: GithubInstallerHost) {
     }
 
     for (const spec of GITHUB_LSP_TABLE) {
-      const cacheReady = (
-        isGithubInstalled(spec, host.platform)
-          ? validateCachedGithubInstall(spec, host.platform)
-          : Promise.resolve(false)
-      ).then((healthy) => {
-        if (healthy) cachedBinDirs.push(ghBinDir(spec));
+      const validation = isGithubInstalled(spec, host.platform)
+        ? validateCachedGithubInstall(spec, host.platform)
+        : false;
+      if (validation === true) cachedBinDirs.push(ghBinDir(spec));
+      const cacheReady = Promise.resolve(validation).then((healthy) => {
+        if (healthy && validation !== true) cachedBinDirs.push(ghBinDir(spec));
       });
       installPromises.push(cacheReady);
 
