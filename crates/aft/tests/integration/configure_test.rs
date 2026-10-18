@@ -1047,10 +1047,9 @@ fn configure_rejects_malformed_lsp_paths_extra() {
     assert!(shutdown.success());
 }
 
-/// Configure used to walk the whole project on its bind path to decide which
-/// language servers apply, so a large or busy checkout held the configure
-/// reply, and with it a route bind's deadline, for as long as the walk took.
-/// The walk now runs after the reply, on its own thread.
+/// Configure's project applicability walk runs on its own thread. Holding the
+/// walk at entry while waiting for configure's reply proves that the reply does
+/// not depend on the walk completing.
 #[test]
 fn configure_answers_before_the_language_server_applicability_walk() {
     let temp_dir = tempfile::tempdir().expect("create fixture");
@@ -1058,47 +1057,44 @@ fn configure_answers_before_the_language_server_applicability_walk() {
     fs::create_dir_all(project.join("src")).expect("create project");
     fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");
     let signal = temp_dir.path().join("walk-started");
+    let release = temp_dir.path().join("release-walk");
     let mut aft = AftProcess::spawn_with_env(&[
         (
             "AFT_TEST_APPLICABILITY_WALK_DELAY_MS",
-            std::ffi::OsStr::new("10000"),
+            std::ffi::OsStr::new("120000"),
         ),
         ("AFT_TEST_APPLICABILITY_WALK_SIGNAL", signal.as_os_str()),
+        ("AFT_TEST_APPLICABILITY_WALK_RELEASE", release.as_os_str()),
     ]);
 
-    let started = Instant::now();
-    let configure = aft.send_with_timeout(
-        &json!({
-            "id": "cfg-applicability-walk",
-            "command": "configure",
-            "harness": "opencode",
-            "project_root": project,
-            "config": user_config(json!({
-                "indexes": { "trigram": false, "semantic": false, "callgraph": false }
-            })),
-        })
-        .to_string(),
-        Duration::from_secs(30),
-    );
-    let elapsed = started.elapsed();
+    let request = json!({
+        "id": "cfg-applicability-walk",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": project,
+        "config": user_config(json!({
+            "indexes": { "trigram": false, "semantic": false, "callgraph": false }
+        })),
+    })
+    .to_string();
+    thread::scope(|scope| {
+        let configure = scope.spawn(|| aft.send_with_timeout(&request, Duration::from_secs(30)));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !signal.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the applicability walk never started after configure"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
 
-    assert_eq!(
-        configure["success"], true,
-        "configure failed: {configure:#}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "configure waited {elapsed:?} for a 10 s applicability walk"
-    );
-    // The walk still runs, after the reply.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !signal.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the applicability walk never started after configure"
+        let configure = configure.join().expect("configure request thread panicked");
+        assert_eq!(
+            configure["success"], true,
+            "configure failed: {configure:#}"
         );
-        thread::sleep(Duration::from_millis(20));
-    }
+        fs::write(&release, b"release").expect("release applicability walk");
+    });
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
 }
