@@ -124,9 +124,8 @@ pub(super) fn fetch_diff(
             request.resource.number
         ),
         "--paginate".to_string(),
-        "--slurp".to_string(),
         "--jq".to_string(),
-        "[.[][] | {path: .filename, previousPath: .previous_filename}]".to_string(),
+        ".[] | {path: .filename, previousPath: .previous_filename}".to_string(),
     ];
     let (file_bytes, file_cap) = bounded_output(runner, request, &file_args)?;
     if file_cap {
@@ -134,18 +133,21 @@ pub(super) fn fetch_diff(
             "PR changed paths reached the {MAX_DIFF_BYTES}-byte fetch ceiling; no diff returned."
         )));
     }
-    let files: Value = serde_json::from_slice(&file_bytes).map_err(|error| {
-        GithubReadError::InvalidStructuredResponse(format!(
-            "GitHub CLI returned invalid changed paths: {error}"
-        ))
-    })?;
+    let mut lines: Vec<_> = file_bytes.split(|byte| *byte == b'\n').collect();
+    if file_bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    let files = lines
+        .into_iter()
+        .map(|line| {
+            serde_json::from_slice::<Value>(line).map_err(|error| {
+                GithubReadError::InvalidStructuredResponse(format!(
+                    "GitHub CLI returned invalid changed paths: {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let paths = files
-        .as_array()
-        .ok_or_else(|| {
-            GithubReadError::InvalidStructuredResponse(
-                "GitHub diff metadata is missing changed paths".to_string(),
-            )
-        })?
         .iter()
         .map(|file| {
             file["path"].as_str().ok_or_else(|| {
@@ -214,8 +216,6 @@ pub(super) fn fetch_diff(
     let raw = String::from_utf8_lossy(&bytes);
     let mut body = String::new();
     let mut old_path = files
-        .as_array()
-        .unwrap()
         .iter()
         .find(|file| file["path"].as_str() == Some(path))
         .and_then(|file| file["previousPath"].as_str())
@@ -428,6 +428,8 @@ mod tests {
         metadata: Value,
         patch: Vec<u8>,
         calls: Mutex<Vec<Vec<String>>>,
+        file_pages: Option<Vec<Vec<Value>>>,
+        file_list_response: Option<Vec<u8>>,
         moved: bool,
         failure: bool,
     }
@@ -439,6 +441,8 @@ mod tests {
                     .unwrap(),
                 patch: include_bytes!("fixtures/pr-42.diff").to_vec(),
                 calls: Mutex::new(Vec::new()),
+                file_pages: None,
+                file_list_response: None,
                 moved: false,
                 failure: false,
             }
@@ -459,6 +463,20 @@ mod tests {
             assert_eq!(cap, MAX_DIFF_BYTES);
             let mut calls = self.calls.lock().unwrap();
             calls.push(args.to_vec());
+            if args.iter().any(|arg| arg == "--slurp")
+                && args.iter().any(|arg| arg == "--jq" || arg == "--template")
+            {
+                return Ok((
+                    GhCommandOutput {
+                        success: false,
+                        stdout: vec![],
+                        stderr:
+                            b"Error: the --slurp option is not supported with --jq or --template"
+                                .to_vec(),
+                    },
+                    false,
+                ));
+            }
             if self.failure {
                 return Ok((
                     GhCommandOutput {
@@ -491,12 +509,30 @@ mod tests {
                         &args[2..],
                         [
                             "--paginate",
-                            "--slurp",
                             "--jq",
-                            "[.[][] | {path: .filename, previousPath: .previous_filename}]"
+                            ".[] | {path: .filename, previousPath: .previous_filename}"
                         ]
                     );
-                    serde_json::to_vec(&self.metadata["files"]).unwrap()
+                    if let Some(response) = &self.file_list_response {
+                        response.clone()
+                    } else {
+                        let pages = self.file_pages.clone().unwrap_or_else(|| {
+                            vec![self.metadata["files"].as_array().unwrap().clone()]
+                        });
+                        pages
+                            .iter()
+                            .flatten()
+                            .map(|file| {
+                                serde_json::json!({
+                                    "path": file["path"],
+                                    "previousPath": file["previousPath"]
+                                })
+                                .to_string()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                            .into_bytes()
+                    }
                 }
                 _ => panic!("unexpected gh arguments {args:?}"),
             };
@@ -517,6 +553,30 @@ mod tests {
             resource: parse_resource(link).unwrap(),
             working_directory: "fixture-checkout".into(),
         })
+    }
+
+    #[test]
+    fn multi_page_file_list_preserves_renamed_paths() {
+        let mut runner = FixtureRunner::recorded();
+        let files = runner.metadata["files"].as_array().unwrap().clone();
+        runner.file_pages = Some(vec![files[..1].to_vec(), files[1..].to_vec()]);
+
+        let diff = fetch(runner, "pr://42/diff/src/new.rs").unwrap();
+        assert!(diff.header.contains("renamed from src/old.rs"));
+        assert!(diff.body.contains("+new name"));
+    }
+
+    #[test]
+    fn empty_or_invalid_changed_path_lines_are_rejected() {
+        for response in [b"\n".as_slice(), b"not json\n".as_slice()] {
+            let mut runner = FixtureRunner::recorded();
+            runner.file_list_response = Some(response.to_vec());
+
+            assert!(matches!(
+                fetch(runner, "pr://42/diff"),
+                Err(GithubReadError::InvalidStructuredResponse(_))
+            ));
+        }
     }
 
     #[test]

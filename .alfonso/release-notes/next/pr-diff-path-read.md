@@ -1,0 +1,1 @@
+- Reading files from pull request diffs now works for large pull requests.
