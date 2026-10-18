@@ -68,14 +68,31 @@ pub(crate) fn is_mount_point(path: &Path) -> io::Result<bool> {
     Ok(matches!((own, above), (Some(own), Some(above)) if own != above))
 }
 
-/// How [`move_path`] moved its source.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A successful result always makes the destination authoritative, even when
+/// finalization fails and a stale source copy remains.
+#[derive(Debug)]
+#[must_use = "report any move finalization warning before using the destination"]
 pub(crate) enum Moved {
     /// One rename: source and destination are on the same volume.
     Renamed,
     /// The volumes differ: the source was copied, published under the
     /// destination name, and then removed.
     Copied,
+    /// The destination was published, but directory sync or source cleanup
+    /// failed. Callers must use the destination, not a leftover source copy.
+    PublishedWithWarning(io::Error),
+}
+
+impl Moved {
+    pub(crate) fn warn_if_incomplete(self, from: &Path, to: &Path) {
+        if let Self::PublishedWithWarning(error) = self {
+            crate::slog_warn!(
+                "moved {} to {}, but finalization failed; using the destination: {error}",
+                from.display(),
+                to.display()
+            );
+        }
+    }
 }
 
 /// Move the file or directory `from` to `to`, which must not exist.
@@ -84,11 +101,21 @@ pub(crate) enum Moved {
 /// staging name inside `to`'s own folder, syncs every copied file and folder,
 /// renames the staging copy to `to`, and removes `from` last. If the copy
 /// fails, the staging copy is removed and `from` is left untouched, so an
-/// error never loses data. If only the final removal of `from` fails, the
-/// move has still happened: the leftover source is logged and `Ok` returned.
+/// `Err` means no destination was published and the source is authoritative.
+/// Once published, directory sync or source removal failures return
+/// [`Moved::PublishedWithWarning`]: callers must report the warning and use `to`.
 pub(crate) fn move_path(from: &Path, to: &Path) -> io::Result<Moved> {
+    let parent = to
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let error = match rename(from, to) {
-        Ok(()) => return Ok(Moved::Renamed),
+        Ok(()) => {
+            return Ok(match crate::durability::sync_dir(parent) {
+                Ok(()) => Moved::Renamed,
+                Err(error) => Moved::PublishedWithWarning(error),
+            });
+        }
         Err(error) => error,
     };
     if !is_cross_device(&error) {
@@ -104,15 +131,10 @@ pub(crate) fn move_path(from: &Path, to: &Path) -> io::Result<Moved> {
             ),
         ));
     }
-    let parent = to
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
     let staging = staging_path(parent, to)?;
     if let Err(error) = copy_tree(from, &staging).and_then(|()| {
         // Same folder, so this rename stays on the destination volume.
-        fs::rename(&staging, to)?;
-        crate::durability::sync_dir(parent)
+        fs::rename(&staging, to)
     }) {
         remove_path(&staging).ok();
         return Err(io::Error::new(
@@ -124,12 +146,16 @@ pub(crate) fn move_path(from: &Path, to: &Path) -> io::Result<Moved> {
             ),
         ));
     }
+    // Publication has committed the destination's authority. Keep the source
+    // until that directory entry is synced, but never select it for new writes.
+    if let Err(error) = crate::durability::sync_dir(parent) {
+        return Ok(Moved::PublishedWithWarning(error));
+    }
     if let Err(error) = remove_path(from) {
-        crate::slog_warn!(
-            "moved {} across volumes to {} but could not remove the source: {error}",
-            from.display(),
-            to.display()
-        );
+        return Ok(Moved::PublishedWithWarning(io::Error::new(
+            error.kind(),
+            format!("could not remove the source: {error}"),
+        )));
     }
     Ok(Moved::Copied)
 }
@@ -180,7 +206,26 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     crate::durability::sync_dir(to)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_SOURCE_REMOVAL: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 fn remove_path(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_SOURCE_REMOVAL.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_deref() == Some(path) {
+            slot.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::other("injected source removal failure"));
+    }
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
         Ok(_) => fs::remove_file(path),
@@ -210,7 +255,10 @@ mod tests {
             is_cross_device(&rename(&source, &destination).unwrap_err()),
             "the seam must reproduce the kernel's cross-volume refusal"
         );
-        assert_eq!(move_path(&source, &destination).unwrap(), Moved::Copied);
+        assert!(matches!(
+            move_path(&source, &destination).unwrap(),
+            Moved::Copied
+        ));
 
         assert!(!source.exists(), "the source is removed after the copy");
         assert_eq!(fs::read(destination.join("a.json")).unwrap(), b"first");
@@ -231,7 +279,10 @@ mod tests {
         let source = temp.path().join("file");
         fs::write(&source, b"x").unwrap();
         let destination = temp.path().join("renamed");
-        assert_eq!(move_path(&source, &destination).unwrap(), Moved::Renamed);
+        assert!(matches!(
+            move_path(&source, &destination).unwrap(),
+            Moved::Renamed
+        ));
         assert_eq!(fs::read(destination).unwrap(), b"x");
     }
 
@@ -250,6 +301,69 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&source).unwrap(), b"keep");
         assert_eq!(fs::read(&destination).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn cross_volume_published_copy_reports_directory_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("state.json");
+        fs::write(&source, b"old").unwrap();
+        let other = temp.path().join("other-volume");
+        fs::create_dir(&other).unwrap();
+        let _volume = simulate(&other, u64::MAX - 5);
+        let destination = other.join("state.json");
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            *slot.borrow_mut() = Some(other.clone());
+        });
+
+        let Moved::PublishedWithWarning(error) = move_path(&source, &destination).unwrap() else {
+            panic!("the destination is published but its directory sync failed");
+        };
+        assert_eq!(error.to_string(), "injected directory sync failure");
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        assert_eq!(fs::read(&source).unwrap(), b"old");
+    }
+
+    #[test]
+    fn cross_volume_published_copy_reports_source_removal_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("state.json");
+        fs::write(&source, b"old").unwrap();
+        let other = temp.path().join("other-volume");
+        fs::create_dir(&other).unwrap();
+        let _volume = simulate(&other, u64::MAX - 6);
+        let destination = other.join("state.json");
+        FAIL_SOURCE_REMOVAL.with(|slot| {
+            *slot.borrow_mut() = Some(source.clone());
+        });
+
+        let Moved::PublishedWithWarning(error) = move_path(&source, &destination).unwrap() else {
+            panic!("the destination is published but source cleanup failed");
+        };
+        assert_eq!(
+            error.to_string(),
+            "could not remove the source: injected source removal failure"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        assert_eq!(fs::read(&source).unwrap(), b"old");
+    }
+
+    #[test]
+    fn same_volume_published_rename_reports_directory_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("state.json");
+        fs::write(&source, b"old").unwrap();
+        let destination = temp.path().join("renamed.json");
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            *slot.borrow_mut() = Some(temp.path().to_path_buf());
+        });
+
+        let Moved::PublishedWithWarning(error) = move_path(&source, &destination).unwrap() else {
+            panic!("the destination is published but its directory sync failed");
+        };
+        assert_eq!(error.to_string(), "injected directory sync failure");
+        assert_eq!(fs::read(&destination).unwrap(), b"old");
+        assert!(!source.exists());
     }
 
     #[test]

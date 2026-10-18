@@ -1546,15 +1546,18 @@ pub(crate) fn repair_legacy_user_filter_dir(storage_dir: &Path, harness: Harness
         }
         // The harness folder and the root normally share a volume, but a move
         // that crosses volumes falls back to a copy instead of failing.
-        if let Err(error) = crate::cross_volume::move_path(&entry.path(), &target) {
-            // A filter that cannot be moved stays in the root `filters/`
-            // folder; log the move failure instead of dropping it.
-            crate::slog_warn!(
-                "legacy filter {} kept in place: cannot move it to {}: {}",
-                entry.path().display(),
-                target.display(),
-                error
-            );
+        match crate::cross_volume::move_path(&entry.path(), &target) {
+            Ok(moved) => moved.warn_if_incomplete(&entry.path(), &target),
+            Err(error) => {
+                // A filter that cannot be moved stays in the root `filters/`
+                // folder; log the move failure instead of dropping it.
+                crate::slog_warn!(
+                    "legacy filter {} kept in place: cannot move it to {}: {}",
+                    entry.path().display(),
+                    target.display(),
+                    error
+                );
+            }
         }
     }
 

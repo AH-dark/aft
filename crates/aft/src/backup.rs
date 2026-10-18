@@ -3001,12 +3001,15 @@ impl BackupStore {
             // The gate prevents new leases. Close probe handles before moving
             // the session, and keep stable gate files in their original parent.
             drop(leases);
-            if let Err(error) = crate::cross_volume::move_path(&source, &target) {
-                crate::slog_warn!(
-                    "legacy backup {} kept in place: cannot move it to {}: {error}",
-                    source.display(),
-                    target.display()
-                );
+            match crate::cross_volume::move_path(&source, &target) {
+                Ok(moved) => moved.warn_if_incomplete(&source, &target),
+                Err(error) => {
+                    crate::slog_warn!(
+                        "legacy backup {} kept in place: cannot move it to {}: {error}",
+                        source.display(),
+                        target.display()
+                    );
+                }
             }
         }
     }

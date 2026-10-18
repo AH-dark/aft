@@ -1361,10 +1361,13 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
     // The harness folder and the root normally share a volume, but a move
     // that crosses volumes falls back to a copy instead of failing.
     match crate::cross_volume::move_path(&root_tasks, &harness_tasks) {
-        Ok(_) => crate::slog_info!(
-            "moved legacy root bash tasks into harness namespace: {}",
-            harness_tasks.display()
-        ),
+        Ok(moved) => {
+            moved.warn_if_incomplete(&root_tasks, &harness_tasks);
+            crate::slog_info!(
+                "moved legacy root bash tasks into harness namespace: {}",
+                harness_tasks.display()
+            );
+        }
         Err(error) => {
             crate::slog_warn!(
                 "failed to move legacy root bash tasks into {}: {}; trying child merge",
@@ -1387,16 +1390,19 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
                     if target.exists() {
                         continue;
                     }
-                    if let Err(error) = crate::cross_volume::move_path(&source, &target) {
-                        // A task that cannot be moved stays readable in the
-                        // root `bash-tasks/` folder; log the move failure
-                        // instead of dropping it.
-                        crate::slog_warn!(
-                            "legacy bash task {} kept in place: cannot move it to {}: {}",
-                            source.display(),
-                            target.display(),
-                            error
-                        );
+                    match crate::cross_volume::move_path(&source, &target) {
+                        Ok(moved) => moved.warn_if_incomplete(&source, &target),
+                        Err(error) => {
+                            // A task that cannot be moved stays readable in the
+                            // root `bash-tasks/` folder; log the move failure
+                            // instead of dropping it.
+                            crate::slog_warn!(
+                                "legacy bash task {} kept in place: cannot move it to {}: {}",
+                                source.display(),
+                                target.display(),
+                                error
+                            );
+                        }
                     }
                 }
             }

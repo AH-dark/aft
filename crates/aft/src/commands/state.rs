@@ -332,10 +332,13 @@ fn repair_root_scoped_harness_file(
     }
     // The harness folder and the root normally share a volume, but a move
     // that crosses volumes falls back to a copy instead of failing. If the
-    // move still fails, keep using the root file rather than pointing at a
-    // harness path that holds nothing.
+    // move fails before publication, keep using the root file. A failure after
+    // publication must not redirect writes to a stale source copy.
     match crate::cross_volume::move_path(&root_path, &harness_path) {
-        Ok(_) => harness_path,
+        Ok(moved) => {
+            moved.warn_if_incomplete(&root_path, &harness_path);
+            harness_path
+        }
         Err(error) => {
             crate::slog_warn!(
                 "keeping {} at the storage root: cannot move it to {}: {}",
@@ -492,5 +495,56 @@ mod tests {
         assert_eq!(path, harness_dir.join("last_announced_version"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "0.40.0");
         assert!(!temp.path().join("last_announced_version").exists());
+    }
+
+    #[test]
+    fn cross_volume_state_write_uses_published_destination_after_directory_sync_failure() {
+        state_write_uses_published_destination_after_directory_sync_failure(true);
+    }
+
+    #[test]
+    fn same_volume_state_write_uses_published_destination_after_directory_sync_failure() {
+        state_write_uses_published_destination_after_directory_sync_failure(false);
+    }
+
+    fn state_write_uses_published_destination_after_directory_sync_failure(cross_volume: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.storage_dir = Some(temp.path().to_path_buf());
+        });
+        ctx.set_harness(Harness::Opencode);
+        let source = temp.path().join("last_announced_version");
+        std::fs::write(&source, "old").unwrap();
+        let harness_dir = temp.path().join("opencode");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        let _volume = cross_volume.then(|| {
+            crate::walk_boundary::simulated_volumes::simulate(&harness_dir, u64::MAX - 23)
+        });
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            *slot.borrow_mut() = Some(harness_dir.clone());
+        });
+
+        let set_req = state_request(
+            "db_set_state",
+            json!({ "key": "last_announced_version", "value": "new" }),
+        );
+        let response = handle_db_set_state(&set_req, &ctx);
+        assert!(response.success, "{response:?}");
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "the injected sync failure must run"
+            );
+        });
+        assert_eq!(
+            std::fs::read_to_string(harness_dir.join("last_announced_version")).unwrap(),
+            "new",
+            "a successful write must update the published destination"
+        );
+        let get_req = state_request("db_get_state", json!({ "key": "last_announced_version" }));
+        let response = handle_db_get_state(&get_req, &ctx);
+        assert!(response.success);
+        assert_eq!(response.data["value"], "new");
     }
 }
