@@ -706,6 +706,15 @@ fn handle_inspect_payload(
         } else {
             checkout_store
         };
+    let view_callgraph_observation = if needs_ephemeral_view
+        && snapshot.config.views.enabled
+        && !checkout_routed
+        && checkout_store.is_none()
+    {
+        Some(crate::feature_status::observe_callgraph_query_with_contention(ctx))
+    } else {
+        None
+    };
     let use_checkout_view = needs_ephemeral_view
         && snapshot.config.views.enabled
         && (checkout_routed || checkout_store.is_some());
@@ -951,13 +960,34 @@ fn handle_inspect_payload(
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
-                let mut payload = manager.tier2_incomplete_payload(
-                    &snapshot,
-                    *category,
-                    &scope,
-                    "tier2_unavailable",
-                    reason,
-                );
+                let callgraph_pending = view_callgraph_observation
+                    .as_ref()
+                    .is_some_and(|(_, transient_lock_contention)| *transient_lock_contention)
+                    && matches!(
+                        *category,
+                        InspectCategory::DeadCode | InspectCategory::UnusedExports
+                    );
+                let mut payload = if callgraph_pending {
+                    let (observation, _) = view_callgraph_observation
+                        .as_ref()
+                        .expect("pending callgraph observation");
+                    serde_json::json!({
+                        "status": "pending",
+                        "code": "callgraph_building",
+                        "index": observation.consumer_json(),
+                        "building": { "state": "building" },
+                        "reason": "waiting for or projecting the checkout call graph",
+                        "complete": false,
+                    })
+                } else {
+                    manager.tier2_incomplete_payload(
+                        &snapshot,
+                        *category,
+                        &scope,
+                        "tier2_unavailable",
+                        reason,
+                    )
+                };
                 // Enabling checkout views requests real scoped Tier-2 analysis.
                 // A missing or stale view is a gap, not an intentional skip.
                 if !snapshot.config.views.enabled {
@@ -3128,13 +3158,12 @@ fn build_inspect_payload_with_offset(
         let dead_code_unavailable =
             *category == InspectCategory::DeadCode && dead_code_callgraph_unavailable(payload);
         if dead_code_unavailable {
+            let (observation, transient_lock_contention) = dead_code_callgraph_observation(ctx);
             annotate_dead_code_unavailable(
                 &mut category_summary,
                 payload,
-                crate::feature_status::observed_index_status(
-                    ctx,
-                    crate::feature_status::IndexPlane::Callgraph,
-                ),
+                observation,
+                transient_lock_contention,
             );
         }
         if *category == InspectCategory::Duplicates && no_files_matched_scope {
@@ -4479,6 +4508,24 @@ fn dead_code_callgraph_unavailable(payload: &Value) -> bool {
     payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
 }
 
+fn dead_code_callgraph_observation(
+    ctx: &AppContext,
+) -> (crate::feature_status::IndexObservation, bool) {
+    let (query_observation, transient_lock_contention) =
+        crate::feature_status::observe_callgraph_query_with_contention(ctx);
+    if transient_lock_contention {
+        (query_observation, true)
+    } else {
+        (
+            crate::feature_status::observed_index_status(
+                ctx,
+                crate::feature_status::IndexPlane::Callgraph,
+            ),
+            false,
+        )
+    }
+}
+
 /// Mark an unavailable dead-code summary with the analysis code, the callgraph
 /// index status and cause, and null findings, so it can never read as zero
 /// findings. Other analyses in the same inspect response are unaffected.
@@ -4490,6 +4537,7 @@ fn annotate_dead_code_unavailable(
     summary: &mut Value,
     payload: &Value,
     observation: crate::feature_status::IndexObservation,
+    transient_lock_contention: bool,
 ) {
     use crate::feature_status::{cause, IndexEffective, IndexObservation};
     let observation = if observation.is_ready() {
@@ -4502,15 +4550,19 @@ fn annotate_dead_code_unavailable(
     } else {
         observation
     };
+    let building = transient_lock_contention;
     let code = match observation.effective {
         IndexEffective::Off => "callgraph_off",
         IndexEffective::Building => "callgraph_building",
         IndexEffective::Ready | IndexEffective::Unavailable => "callgraph_unavailable",
     };
-    summary["status"] = serde_json::json!("unavailable");
+    summary["status"] = serde_json::json!(if building { "pending" } else { "unavailable" });
     summary["code"] = serde_json::json!(code);
     summary["index"] = observation.consumer_json();
     summary["findings"] = Value::Null;
+    if building {
+        summary["building"] = serde_json::json!({ "state": "building" });
+    }
 }
 
 #[cfg(test)]
@@ -4524,7 +4576,7 @@ pub(crate) fn annotate_dead_code_unavailable_for_test(
     payload: &Value,
     observation: crate::feature_status::IndexObservation,
 ) {
-    annotate_dead_code_unavailable(summary, payload, observation);
+    annotate_dead_code_unavailable(summary, payload, observation, false);
 }
 
 fn summary_for(category: InspectCategory, payload: &Value) -> Value {

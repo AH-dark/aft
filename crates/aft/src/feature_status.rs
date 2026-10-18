@@ -411,6 +411,41 @@ pub fn callgraph_access_observation(
     }
 }
 
+/// Observe the call graph for a query that needs a current answer.
+///
+/// Published view databases are opened without waiting. SQLite busy or locked
+/// errors during that open describe temporary contention, so consumers should
+/// ask again instead of reporting that the graph is unavailable.
+pub fn observe_callgraph_query(ctx: &AppContext) -> IndexObservation {
+    observe_callgraph_query_with_contention(ctx).0
+}
+
+/// Observe a query access and indicate whether SQLite explicitly reported a
+/// transient busy or locked error while opening the published view database.
+pub fn observe_callgraph_query_with_contention(ctx: &AppContext) -> (IndexObservation, bool) {
+    let served_by_view = ctx.checkout_query_runtime_active()
+        || (ctx.config().views.enabled
+            && ctx
+                .pinned_view_runtime()
+                .is_some_and(|view| view.manifest.is_some()));
+    if !served_by_view {
+        return (observed_index_status(ctx, IndexPlane::Callgraph), false);
+    }
+
+    let access = ctx.callgraph_store_for_query_without_wait();
+    match &access {
+        crate::context::CallgraphStoreAccess::Error(error)
+            if error.is_transient_lock_contention() =>
+        {
+            (IndexObservation::building(), true)
+        }
+        crate::context::CallgraphStoreAccess::Error(error) => {
+            (IndexObservation::unavailable(error.to_string()), false)
+        }
+        _ => (callgraph_access_observation(ctx, &access), false),
+    }
+}
+
 #[cfg(test)]
 #[path = "feature_status/consumer_fixture_tests.rs"]
 mod consumer_fixture_tests;
