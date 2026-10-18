@@ -1,0 +1,1 @@
+- Sandboxed bash avoids duplicate Git discovery when concurrent policy lookups exceed their wait budget, and reports a timeout if discovery is still running.
