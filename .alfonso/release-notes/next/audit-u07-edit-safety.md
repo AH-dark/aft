@@ -1,0 +1,1 @@
+- - Edits and file moves keep their undo data when they fail, reject ambiguous input the same way across tools, and no longer overwrite a destination file created while a move is in progress.
