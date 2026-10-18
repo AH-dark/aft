@@ -1122,14 +1122,31 @@ fn scan_root_alias(directory: &Path, root: &Path) -> Option<bool> {
     Some(false)
 }
 
-/// A pending card can outlive a daemon upgrade. Widen only when its persisted
-/// display pattern offered the directory; older file-only cards stay file-only.
-fn advertised_scope(prep: &Prepared, directory: AccessGrant) -> AccessGrant {
-    if prep.request.get("pattern").and_then(Value::as_str) == Some(pattern(&directory).as_str()) {
-        directory
-    } else {
-        prep.grant.clone()
+/// Settle the persisted card, not a fresh probe that can time out minutes after
+/// the directory was offered. Older file-only cards must stay file-only.
+fn advertised_scope(prep: &Prepared) -> Option<AccessGrant> {
+    if prep.request.get("kind").and_then(Value::as_str) != Some("tool_permission")
+        || prep.request.get("operation").and_then(Value::as_str)
+            != Some(operation_name(prep.grant.operation))
+    {
+        return None;
     }
+    let advertised = prep.request.get("pattern").and_then(Value::as_str)?;
+    if advertised == pattern(&prep.grant) {
+        return Some(prep.grant.clone());
+    }
+    if prep.grant.kind != GrantKind::File || prep.grant.operation != AccessOperation::Read {
+        return None;
+    }
+    let parent = prep.grant.path.parent()?;
+    // The filesystem root is never offered as a read-file's directory scope.
+    parent.parent()?;
+    let directory = AccessGrant {
+        path: parent.to_path_buf(),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    (advertised == pattern(&directory)).then_some(directory)
 }
 
 /// The display pattern Cingulate shows for the capability an answer grants:
@@ -1562,14 +1579,16 @@ async fn finish(call: &HeldCall, prep: &Prepared, settled: Settlement) -> Hold {
             let key = prep.key.clone();
             let call_key = prep.call_key.clone();
             let grant = if scope {
-                let directory = if prep.request.get("pattern").and_then(Value::as_str)
-                    == Some(pattern(&prep.grant).as_str())
-                {
-                    prep.grant.clone()
-                } else {
-                    scope_before_db(&prep.grant).await
+                let Some(grant) = advertised_scope(prep) else {
+                    discard(call, prep).await;
+                    return Hold::Answer(refused_answer(
+                        call,
+                        &prep.grant,
+                        "access_declined",
+                        Some("the advertised scope does not match the requested permission"),
+                    ));
                 };
-                advertised_scope(prep, directory)
+                grant
             } else {
                 prep.grant.clone()
             };
