@@ -39,7 +39,10 @@ function snapshot(overrides: Record<string, unknown> = {}) {
 const RENDER_PROCESS_TIMEOUT_MS = 30_000;
 const TEST_TIMEOUT_MS = 45_000;
 
-async function renderFrame(status: unknown): Promise<string[]> {
+async function renderFrame(
+  status: unknown,
+  extraEnv: Record<string, string> = {},
+): Promise<string[]> {
   const child = spawn(
     process.execPath,
     [
@@ -53,17 +56,22 @@ async function renderFrame(status: unknown): Promise<string[]> {
         ...process.env,
         AFT_SIDEBAR_SNAPSHOT: JSON.stringify(status),
         AFT_SIDEBAR_WIDTH: String(SIDEBAR_WIDTH),
+        ...extraEnv,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
   let stdout = "";
   let stderr = "";
-  child.stdout?.on("data", (chunk: Buffer | string) => {
-    stdout += chunk.toString();
+  // Decode as a stream so a multi-byte character split across pipe chunks
+  // (the frame contains "⚠" and "—") is never garbled.
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdout += chunk;
   });
-  child.stderr?.on("data", (chunk: Buffer | string) => {
-    stderr += chunk.toString();
+  child.stderr?.on("data", (chunk: string) => {
+    stderr += chunk;
   });
 
   return await new Promise((resolve, reject) => {
@@ -146,6 +154,19 @@ describe("the sidebar at its real width", () => {
     async () => {
       const frame = await renderFrame(snapshot({ degraded_reasons: ["home_root"] }));
       expect(frame[1]).toContain("DEGRADED");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "a render slower than the default 5 s test limit still yields the complete frame",
+    async () => {
+      // The child waits 6 s before its first frame, longer than Bun's default
+      // per-test limit, so this proves the helper waits for the child to exit
+      // and returns the whole frame rather than an early or empty read.
+      const frame = await renderFrame(snapshot(), { AFT_SIDEBAR_TEST_RENDER_DELAY_MS: "6000" });
+      expect(frame[1]).toContain("AFT");
+      expect(frame.findIndex((line) => line.trim() === "Semantic Index")).toBeGreaterThan(-1);
     },
     TEST_TIMEOUT_MS,
   );
