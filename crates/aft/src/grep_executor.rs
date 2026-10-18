@@ -2138,6 +2138,15 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn ten_thousand_file_grep_keeps_root_probe_budget_after_queueing() {
+        // Shorter than the 5 s default so the test stays quick. The probe is
+        // held queued for QUEUE_HOLD, then held running for RUNNING_HOLD: their
+        // sum exceeds the cap, so the probe fails if queue time is charged to
+        // it, while RUNNING_HOLD leaves 1.5 s for the real root access on a
+        // loaded runner. A queued call may not outwait the cap either, so
+        // QUEUE_HOLD stays below it.
+        const ROOT_ACCESS_CAP: Duration = Duration::from_secs(3);
+        const QUEUE_HOLD: Duration = Duration::from_secs(2);
+        const RUNNING_HOLD: Duration = Duration::from_millis(1500);
         let (_fixture, ctx) = grep_io_fixture();
         let root = project_root(&ctx);
         let pool = rayon::ThreadPoolBuilder::new()
@@ -2151,7 +2160,7 @@ mod tests {
             let queued = crate::bounded_io::stall_helper(&root);
             let running = crate::bounded_io::stall_running_helper(&root);
             let budget = crate::bounded_io::Budget::after(Duration::from_secs(60))
-                .with_path_access_budget(&root, Duration::from_secs(1));
+                .with_path_access_budget(&root, ROOT_ACCESS_CAP);
             let observed = budget.clone();
             std::thread::scope(|scope| {
                 let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -2166,10 +2175,10 @@ mod tests {
                 // The first helper is command admission's metadata(root), before
                 // the root listing or any indexed/fallback candidate reads.
                 let cold_measurements = observed.measurements();
-                let before_start = done_rx.recv_timeout(Duration::from_millis(750));
+                let before_start = done_rx.recv_timeout(QUEUE_HOLD);
                 drop(queued);
                 let started = running.reached.recv_timeout(Duration::from_secs(5));
-                let before_release = done_rx.recv_timeout(Duration::from_millis(500));
+                let before_release = done_rx.recv_timeout(RUNNING_HOLD);
                 drop(running);
                 let (_, spawns, round_trips) = caller.join().unwrap();
                 assert_eq!(cold_measurements.1, 1);
