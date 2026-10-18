@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -126,6 +128,132 @@ class BaselineProvenanceTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             provenance = gate.write_baseline_provenance()
         self.assertTrue(provenance.startswith("local --write-baseline on "), provenance)
+
+
+class ColdIndexMeasurementTests(unittest.TestCase):
+    def test_measured_config_disables_inspect_without_serializing_indexes(self):
+        captured = []
+
+        def configure(command, **kwargs):
+            self.assertEqual(command, "configure")
+            captured.append(json.loads(kwargs["config"][0]["doc"]))
+            return {"success": False, "message": "stop after capturing configure"}
+
+        client = SimpleNamespace(proc=object(), request=configure, close=lambda: None)
+        sampler = SimpleNamespace(
+            start=lambda: None, stop=lambda: None, gaps=[], peak_rss_kb=0,
+            peak_rss_hwm_kb=0, cpu_seconds=None, cpu_precision="0.01-second", disk_write_bytes=None,
+        )
+        phases = SimpleNamespace(start=lambda: None, stop=lambda: None, gaps=[], samples=[])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(matrix, "repo_is_git", return_value=True), \
+                    patch.object(matrix, "repo_shape", return_value=(1, "Go (1)", [])), \
+                    patch.object(matrix, "NdjsonClient", return_value=client), \
+                    patch.object(matrix, "ProcessSampler", return_value=sampler), \
+                    patch.object(matrix, "PhaseSampler", return_value=phases), \
+                    patch.object(matrix, "census_metrics", return_value={}):
+                row = matrix.run_repo(Path("aft"), SCRIPT_DIR, root, root / "storage", 30)
+        self.assertEqual(captured, [{
+            "indexes": {"trigram": True, "callgraph": True, "semantic": False},
+            "inspect": {"enabled": False},
+        }])
+        self.assertEqual(row["measurement_profile"], "cold-index-no-inspect-v1")
+        self.assertIn("measurement_profile", matrix.CSV_FIELDS)
+
+    def test_millisecond_logs_retain_phase_timestamps(self):
+        line = "2026-10-18T08:02:17.561Z [aft] INFO index_event kind=build_started plane=search"
+        expected = datetime(2026, 10, 18, 8, 2, 17, 561000, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(matrix.log_seconds(line), expected)
+        timeline = matrix.build_timeline([line])
+        self.assertEqual(timeline.stages, [(expected, {"callgraph": "idle", "search": "started"})])
+
+    def test_whole_second_logs_keep_midpoint_estimate(self):
+        line = "2026-10-18T08:02:17Z [aft] INFO index_event kind=build_started plane=search"
+        expected = datetime(2026, 10, 18, 8, 2, 17, tzinfo=timezone.utc).timestamp() + 0.5
+        self.assertEqual(matrix.log_seconds(line), expected)
+
+    def test_legacy_profile_refuses_comparison_before_launch_even_if_platform_ignored(self):
+        baseline = gate.self_test_baseline()
+        args = SimpleNamespace(
+            self_test=False, baseline=Path("baseline.json"), write_baseline_from=None,
+            write_baseline=False, ignore_platform=True, repo="hugo", cache_dir=Path("."), results_dir=Path("."), aft_binary=None,
+        )
+        with patch.object(gate, "parse_args", return_value=args), \
+                patch.object(gate, "load_baseline", return_value=baseline), \
+                patch.object(gate, "ensure_release_binary", side_effect=AssertionError("legacy profile reached measurement")) as launch:
+            self.assertEqual(gate.main(), 2)
+        launch.assert_not_called()
+
+    def test_new_profile_keeps_memory_regression_strict(self):
+        baseline = {"measurement_profile": "cold-index-no-inspect-v1", "metrics": {
+            "peak_rss_mb": {"value": 177.0, "tolerance_pct": 20.0, "absolute_floor": 128.0},
+        }}
+
+        def run(value):
+            return gate.RunData(Path("fixture.csv"), "hugo", {"peak_rss_mb": value}, {}, True, {})
+
+        self.assertEqual(gate.compare_repo("hugo", baseline, [run(176.9), run(182.5)]), [])
+        failures = gate.compare_repo("hugo", baseline, [run(220.0), run(225.0)])
+        self.assertEqual([(failure.metric, failure.observed) for failure in failures], [("peak_rss_mb", 220.0)])
+
+    def test_matching_profile_reaches_both_measurements_and_passes(self):
+        baseline = gate.self_test_baseline()
+        baseline["repos"]["hugo"].update({
+            "measurement_profile": "cold-index-no-inspect-v1",
+            "metrics": {"peak_rss_mb": {"value": 177.0, "tolerance_pct": 20.0, "absolute_floor": 128.0}},
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "aft"
+            binary.write_bytes(b"fixture")
+            args = SimpleNamespace(
+                self_test=False, baseline=root / "baseline.json", write_baseline_from=None,
+                write_baseline=False, ignore_platform=False, repo="hugo", cache_dir=root / "cache",
+                results_dir=root / "results", aft_binary=None, budget_min=15,
+            )
+            run = gate.RunData(Path("fixture.csv"), "hugo", {"peak_rss_mb": 180.0}, {}, True, {})
+            with patch.object(gate, "parse_args", return_value=args), \
+                    patch.object(gate, "load_baseline", return_value=baseline), \
+                    patch.object(gate, "current_platform", return_value="linux-x86_64"), \
+                    patch.object(gate, "ensure_release_binary", return_value=binary), \
+                    patch.object(gate, "prepare_repositories", return_value={}), \
+                    patch.object(gate, "run_matrix_once", return_value=([run], root / "fixture.csv")) as measure:
+                self.assertEqual(gate.main(), 0)
+            self.assertEqual(measure.call_count, 2)
+
+    def test_writers_require_measured_profiles_and_preserve_partial_migration(self):
+        profile = "cold-index-no-inspect-v1"
+        baseline = gate.self_test_baseline()
+        metrics = {name: 1.0 for name in gate.DEFAULT_METRICS}
+        runs = {name: [gate.RunData(Path("fixture.csv"), name, metrics, {}, True,
+                                  {"measurement_profile": profile}) for _ in range(2)]
+                for name in gate.REPO_ORDER}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "baseline.json"
+            binary = root / "aft"
+            binary.write_bytes(b"binary fixture")
+            with patch.object(gate, "run_command", return_value=SimpleNamespace(stdout="a" * 40)):
+                gate.write_baseline(output, baseline, ["hugo"], runs, binary, root)
+            written = json.loads(output.read_text())
+            self.assertEqual(written["repos"]["hugo"]["measurement_profile"], profile)
+            self.assertNotIn("measurement_profile", written["repos"]["redox"])
+            output.unlink()
+            csvs = [root / f"oss-matrix-run-{index}.csv" for index in (1, 2)]
+            for path in csvs:
+                path.touch()
+            with patch.object(gate, "read_run_csv", return_value=[runs[name][0] for name in gate.REPO_ORDER]):
+                self.assertEqual(gate.write_baseline_from_results(output, baseline, root, "linux-x86_64", "CI fixture"), 0)
+            written = json.loads(output.read_text())
+            self.assertTrue(all(repo["measurement_profile"] == profile for repo in written["repos"].values()))
+            output.unlink()
+            for bad_profile in (None, "legacy", ""):
+                runs["hugo"][0].row["measurement_profile"] = bad_profile
+                with patch.object(gate, "read_run_csv", return_value=[runs[name][0] for name in gate.REPO_ORDER]):
+                    with self.assertRaisesRegex(ValueError, "measurement profile"):
+                        gate.write_baseline_from_results(output, baseline, root, "linux-x86_64", "CI fixture")
+                self.assertFalse(output.exists())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
