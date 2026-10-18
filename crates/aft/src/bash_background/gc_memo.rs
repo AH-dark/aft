@@ -216,8 +216,15 @@ pub struct PersistedGcHealth {
 
 #[derive(Default)]
 struct RootState {
+    /// Generation of the current store walk, including walks with read errors.
     lap: u64,
     sessions: HashMap<PathBuf, HashMap<String, Remembered>>,
+    /// Sessions whose task listings were read during the current store walk.
+    read_sessions: HashSet<PathBuf>,
+    /// Sessions whose task listings were incomplete during the current store walk.
+    unreadable_sessions: HashSet<PathBuf>,
+    /// Whether any root-directory entry could not be read during this store walk.
+    root_directory_unreadable: bool,
     /// Project roots and working directories are shared by many tasks; keep
     /// one copy of each.
     paths: HashSet<Arc<Path>>,
@@ -370,6 +377,29 @@ impl GcMemo {
         });
     }
 
+    /// Marks a session whose task listing was successfully read in this walk.
+    pub(crate) fn session_read(&self, session_dir: &Path) {
+        with_root(&self.root, |state| {
+            if state.sessions.contains_key(session_dir) {
+                state.read_sessions.insert(session_dir.to_path_buf());
+            }
+        });
+    }
+
+    /// Keeps memo entries for sessions whose task listing was incomplete.
+    pub(crate) fn session_unreadable(&self, session_dir: &Path) {
+        with_root(&self.root, |state| {
+            if state.sessions.contains_key(session_dir) {
+                state.unreadable_sessions.insert(session_dir.to_path_buf());
+            }
+        });
+    }
+
+    /// Keeps unseen session entries when the root listing itself was incomplete.
+    pub(crate) fn root_directory_unreadable(&self) {
+        with_root(&self.root, |state| state.root_directory_unreadable = true);
+    }
+
     pub(crate) fn forget(&self, session_dir: &Path, task_id: &str) {
         with_root(&self.root, |state| {
             if let Some(tasks) = state.sessions.get_mut(session_dir) {
@@ -381,10 +411,9 @@ impl GcMemo {
         });
     }
 
-    /// Records one pass on the health surface. `walk_finished` means the
-    /// pass reached the end of the store: the lap is over, and verdicts for
-    /// tasks the lap never reached (deleted since) are dropped. A root that
-    /// no longer exists is forgotten entirely.
+    /// Memoized task entries absent from successfully read sessions are dropped;
+    /// entries for sessions that could not be inspected are preserved. A root
+    /// that no longer exists is forgotten entirely.
     pub(crate) fn finish_pass(&self, pass: PassReport) {
         static PASS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if pass.root_missing {
@@ -397,15 +426,28 @@ impl GcMemo {
         let seq = PASS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         with_root(&self.root, |state| {
             state.last_pass_seq = seq;
-            if pass.walk_finished && pass.error.is_none() {
+            if pass.walk_finished {
                 let lap = state.lap;
-                state.sessions.retain(|_, tasks| {
-                    tasks.retain(|_, entry| entry.seen_lap >= lap);
+                let read_sessions = std::mem::take(&mut state.read_sessions);
+                let unreadable_sessions = std::mem::take(&mut state.unreadable_sessions);
+                let root_directory_unreadable =
+                    std::mem::replace(&mut state.root_directory_unreadable, false);
+                state.sessions.retain(|session_dir, tasks| {
+                    if unreadable_sessions.contains(session_dir) {
+                        // A partial listing cannot prove which remembered tasks
+                        // disappeared, so preserve the session's verdicts.
+                    } else if read_sessions.contains(session_dir) {
+                        tasks.retain(|_, entry| entry.seen_lap >= lap);
+                    } else if !root_directory_unreadable {
+                        return false;
+                    }
                     !tasks.is_empty()
                 });
                 state.paths.retain(|path| Arc::strong_count(path) > 1);
                 state.lap = lap.saturating_add(1);
-                state.health.laps_completed = state.health.laps_completed.saturating_add(1);
+                if pass.error.is_none() {
+                    state.health.laps_completed = state.health.laps_completed.saturating_add(1);
+                }
             }
             let remembered = state.remembered_tasks();
             let health = &mut state.health;

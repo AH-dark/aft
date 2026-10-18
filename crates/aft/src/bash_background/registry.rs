@@ -5982,6 +5982,12 @@ impl BgTaskRegistry {
         let root_key = canonicalized_path(&root);
         let memo = super::gc_memo::GcMemo::new(root_key.clone());
         let walk = gc_batches(&root, root_key);
+        for session_dir in &walk.unreadable_session_paths {
+            memo.session_unreadable(session_dir);
+        }
+        if walk.root_directory_read_error {
+            memo.root_directory_unreadable();
+        }
         let mut pass = super::gc_memo::PassReport {
             walk_finished: walk.finished,
             root_missing: walk.missing,
@@ -6003,6 +6009,7 @@ impl BgTaskRegistry {
                 // leave it to a later sweep.
                 let recovery_before = self.session_recovery_state(&session_dir);
                 if recovery_before.in_flight > 0 {
+                    memo.session_unreadable(&session_dir);
                     log::debug!(
                         "skipping background task session {} during GC: replay recovery in flight",
                         session_dir.display()
@@ -6279,6 +6286,7 @@ impl BgTaskRegistry {
                         }
                     }
                 }
+                memo.session_read(&session_dir);
             }
         }
         crate::slog_info!("retired {retired} undelivered completions of deleted worktrees");
@@ -10756,7 +10764,9 @@ struct GcWalk {
     /// The root exists but could not be read, so this pass saw nothing.
     error: Option<String>,
     unreadable_sessions: usize,
+    unreadable_session_paths: Vec<PathBuf>,
     directory_read_errors: usize,
+    root_directory_read_error: bool,
 }
 
 /// The next budgeted slice of the walk over `root`, resuming where the
@@ -10780,7 +10790,9 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
                     missing: true,
                     error: None,
                     unreadable_sessions: 0,
+                    unreadable_session_paths: Vec::new(),
                     directory_read_errors: 0,
+                    root_directory_read_error: false,
                 }
             }
             Err(error) => {
@@ -10794,7 +10806,9 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
                     missing: false,
                     error: Some(format!("failed to read {}: {error}", root.display())),
                     unreadable_sessions: 0,
+                    unreadable_session_paths: Vec::new(),
                     directory_read_errors: 0,
+                    root_directory_read_error: false,
                 };
             }
         }
@@ -10811,7 +10825,9 @@ fn gc_batches(root: &Path, key: PathBuf) -> GcWalk {
         missing: false,
         error: result.first_error,
         unreadable_sessions: result.unreadable_sessions,
+        unreadable_session_paths: result.unreadable_session_paths,
         directory_read_errors: result.directory_read_errors,
+        root_directory_read_error: result.root_directory_read_error,
     }
 }
 

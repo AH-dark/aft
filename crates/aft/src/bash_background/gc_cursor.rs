@@ -20,7 +20,9 @@ pub(crate) struct Batch {
 pub(crate) struct BatchResult {
     pub batches: Vec<Batch>,
     pub unreadable_sessions: usize,
+    pub unreadable_session_paths: Vec<PathBuf>,
     pub directory_read_errors: usize,
+    pub root_directory_read_error: bool,
     /// The first walk error in this lap, retained when the cursor resumes.
     pub first_error: Option<String>,
 }
@@ -60,7 +62,9 @@ impl Cursor {
     pub fn next_batch(&mut self) -> BatchResult {
         let mut batches: Vec<Batch> = Vec::new();
         let mut unreadable_sessions = 0usize;
+        let mut unreadable_session_paths = Vec::new();
         let mut directory_read_errors = 0usize;
+        let mut root_directory_read_error = false;
         let mut ids = BTreeSet::new();
         for _ in 0..GC_ENTRY_BUDGET {
             if let Some((session, entries)) = &mut self.tasks {
@@ -81,6 +85,7 @@ impl Cursor {
                     Ok(entry) => entry,
                     Err(error) => {
                         directory_read_errors = directory_read_errors.saturating_add(1);
+                        unreadable_session_paths.push(session.clone());
                         if self.first_error.is_none() {
                             self.first_error = Some(bounded_error_message(format!(
                                 "failed to read session {}: {error}",
@@ -114,6 +119,7 @@ impl Cursor {
                     Ok(entry) => entry,
                     Err(error) => {
                         directory_read_errors = directory_read_errors.saturating_add(1);
+                        root_directory_read_error = true;
                         if self.first_error.is_none() {
                             self.first_error = Some(bounded_error_message(format!(
                                 "failed to read {}: {error}",
@@ -129,6 +135,7 @@ impl Cursor {
                     Ok(_) => continue,
                     Err(error) => {
                         directory_read_errors = directory_read_errors.saturating_add(1);
+                        unreadable_session_paths.push(session.clone());
                         if self.first_error.is_none() {
                             self.first_error = Some(bounded_error_message(format!(
                                 "failed to inspect session entry {}: {error}",
@@ -142,6 +149,7 @@ impl Cursor {
                     Ok(entries) => self.tasks = Some((session, entries)),
                     Err(error) => {
                         unreadable_sessions = unreadable_sessions.saturating_add(1);
+                        unreadable_session_paths.push(session.clone());
                         if self.first_error.is_none() {
                             self.first_error = Some(bounded_error_message(format!(
                                 "failed to read session {}: {error}",
@@ -155,7 +163,9 @@ impl Cursor {
         BatchResult {
             batches,
             unreadable_sessions,
+            unreadable_session_paths,
             directory_read_errors,
+            root_directory_read_error,
             first_error: self.first_error.clone(),
         }
     }

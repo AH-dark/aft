@@ -412,6 +412,58 @@ fn watchdog_cost_unreadable_session_does_not_hide_remaining_tasks() {
     assert!(crate::bash_background::persisted_gc_health().roots_failing >= 1);
 }
 
+/// A failed session read must not prevent stale verdicts in readable sessions
+/// from being pruned at the end of the store walk.
+#[cfg(unix)]
+#[test]
+fn watchdog_cost_unreadable_session_prunes_stale_readable_memo() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    struct RestorePermissions(PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ =
+                fs::set_permissions(&self.0, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        }
+    }
+
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (_, readable) = fixture(storage.path(), "readable-session", false, 2);
+    let (_, unreadable) = fixture(storage.path(), "unreadable-session", false, 2);
+    gc_until_lap(&registry, storage.path(), 1);
+    assert_eq!(gc_health(storage.path()).remembered_tasks, 2);
+
+    fs::remove_dir_all(&readable.dir).unwrap();
+    let restore = RestorePermissions(unreadable.session_dir.clone());
+    fs::set_permissions(
+        &unreadable.session_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0),
+    )
+    .unwrap();
+
+    registry.maybe_gc_persisted(storage.path()).unwrap();
+
+    drop(restore);
+    let health = gc_health(storage.path());
+    assert_eq!(
+        health.remembered_tasks, 1,
+        "the deleted readable task's verdict survived the failed lap: {health:?}"
+    );
+    assert_eq!(health.last_pass_unreadable_sessions, 1, "{health:?}");
+    assert!(
+        health
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains(&unreadable.session_dir.display().to_string())),
+        "the unreadable session was not named in health: {health:?}"
+    );
+    assert_eq!(health.laps_completed, 1, "an incomplete scan looked clean");
+    assert!(crate::bash_background::persisted_gc_health().roots_failing >= 1);
+}
+
 /// Abandonment depends on the worktree existing, not on the task's files, so
 /// a remembered undelivered result is retired once its worktree is deleted.
 #[test]
