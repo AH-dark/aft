@@ -119,6 +119,8 @@ pub(crate) struct Budget {
     measurements: Arc<Measurements>,
     #[cfg(test)]
     access_budget: Duration,
+    #[cfg(test)]
+    access_budget_by_path: Arc<HashMap<PathBuf, Duration>>,
 }
 impl Budget {
     pub(crate) fn capped(&self, deadline: Instant) -> Self {
@@ -139,6 +141,8 @@ impl Budget {
             measurements: Arc::new(Measurements::default()),
             #[cfg(test)]
             access_budget: IO_BUDGET,
+            #[cfg(test)]
+            access_budget_by_path: Arc::new(HashMap::new()),
         }
     }
     pub(crate) fn permissions(&self) -> Vec<PermissionObservation> {
@@ -157,6 +161,11 @@ impl Budget {
     #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn with_access_budget(mut self, duration: Duration) -> Self {
         self.access_budget = duration;
+        self
+    }
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn with_path_access_budget(mut self, path: &Path, duration: Duration) -> Self {
+        Arc::make_mut(&mut self.access_budget_by_path).insert(path.to_path_buf(), duration);
         self
     }
 }
@@ -479,13 +488,22 @@ fn run_with_limiter<T: Send + 'static>(
     limiter: Arc<Limiter>,
     work: impl FnOnce(PathBuf) -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    run_with_timeout(path, at, limiter, access_budget(), None, work)
+    run_with_timeout(path, at, limiter, access_budget(path), None, work)
 }
-fn access_budget() -> Duration {
+fn access_budget(path: &Path) -> Duration {
     #[cfg(test)]
-    return current().map_or(IO_BUDGET, |budget| budget.access_budget);
+    return current().map_or(IO_BUDGET, |budget| {
+        budget
+            .access_budget_by_path
+            .get(path)
+            .copied()
+            .unwrap_or(budget.access_budget)
+    });
     #[cfg(not(test))]
-    IO_BUDGET
+    {
+        let _ = path;
+        IO_BUDGET
+    }
 }
 fn run_with_timeout<T: Send + 'static>(
     path: &Path,
@@ -646,7 +664,7 @@ fn directory(path: &Path, at: Option<Instant>) -> io::Result<Access> {
             path,
             at,
             Arc::clone(&HELPERS),
-            access_budget(),
+            access_budget(path),
             Some(Arc::clone(&probe)),
             |path| {
                 #[cfg(test)]

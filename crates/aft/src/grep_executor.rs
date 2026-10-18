@@ -2151,7 +2151,7 @@ mod tests {
             let queued = crate::bounded_io::stall_helper(&root);
             let running = crate::bounded_io::stall_running_helper(&root);
             let budget = crate::bounded_io::Budget::after(Duration::from_secs(60))
-                .with_access_budget(Duration::from_secs(1));
+                .with_path_access_budget(&root, Duration::from_secs(1));
             let observed = budget.clone();
             std::thread::scope(|scope| {
                 let (done_tx, done_rx) = std::sync::mpsc::channel();

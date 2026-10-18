@@ -641,8 +641,10 @@ fn shared_probe_waiters_preserve_owner_queue_and_access_timeout_codes() {
             Budget::after(Duration::from_secs(5)).with_access_budget(Duration::from_millis(200));
         let owner_path = path.clone();
         let owner_budget = budget.clone();
+        let (owner_tx, owner_rx) = channel();
         let owner = std::thread::spawn(move || {
-            with_budget(Some(owner_budget), || probe_directory(&owner_path, None))
+            let result = with_budget(Some(owner_budget), || probe_directory(&owner_path, None));
+            owner_tx.send(result).unwrap();
         });
         gate.reached.recv_timeout(IO_BUDGET).unwrap();
         let (result_tx, result_rx) = channel();
@@ -651,11 +653,20 @@ fn shared_probe_waiters_preserve_owner_queue_and_access_timeout_codes() {
                 result_tx.send(probe_directory(&path, None)).unwrap();
             });
         });
-        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        // A loaded runner can delay the test thread past an arbitrary short
+        // grace period while the timed-out helpers are still waiting at this gate.
+        // Observe both deadline results before releasing the helper.
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the shared-probe waiter must observe its deadline");
+        let owner_result = owner_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the shared-probe owner must observe its deadline");
         drop(gate);
-        let owner_error = owner.join().unwrap().unwrap_err();
+        owner.join().unwrap();
         waiter.join().unwrap();
-        let waiter_error = result.unwrap().unwrap_err();
+        let owner_error = owner_result.unwrap_err();
+        let waiter_error = result.unwrap_err();
         let expected = if running {
             "read_blocked"
         } else {
