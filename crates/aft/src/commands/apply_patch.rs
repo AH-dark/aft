@@ -806,14 +806,30 @@ fn apply_move_update(
     let source_snapshot_taken = if backed_paths.contains(&resolved.source.abs) {
         false
     } else {
-        edit::auto_backup(
+        if let Err(error) = edit::auto_backup(
             ctx,
             req.session(),
             &resolved.source.abs,
             "apply_patch: move source backup",
             Some(op_id),
-        )
-        .map_err(|error| error.to_string())?;
+        ) {
+            let rollback = rollback_move_destination(
+                req,
+                ctx,
+                op_id,
+                &dest.abs,
+                dest_existed,
+                dest_snapshot.as_deref(),
+                dest_snapshot_taken,
+                backed_paths,
+            );
+            return Err(match rollback {
+                Ok(()) => error.to_string(),
+                Err(restore_error) => {
+                    format!("{error}; destination rollback failed: {restore_error}")
+                }
+            });
+        }
         backed_paths.insert(resolved.source.abs.clone());
         true
     };
@@ -823,7 +839,7 @@ fn apply_move_update(
             discard_latest_backup(ctx, req, op_id, &resolved.source.abs);
             backed_paths.remove(&resolved.source.abs);
         }
-        rollback_move_destination(
+        let rollback = rollback_move_destination(
             req,
             ctx,
             op_id,
@@ -833,9 +849,13 @@ fn apply_move_update(
             dest_snapshot_taken,
             backed_paths,
         );
-        return Err(format!(
-            "move: failed to remove source after writing destination: {error}"
-        ));
+        let message = format!("move: failed to remove source after writing destination: {error}");
+        return Err(match rollback {
+            Ok(()) => message,
+            Err(restore_error) => {
+                format!("{message}; destination rollback failed: {restore_error}")
+            }
+        });
     }
     ctx.lsp_notify_watched_config_file(&resolved.source.abs, FileChangeType::DELETED);
 
@@ -860,17 +880,84 @@ fn rollback_move_destination(
     dest_snapshot: Option<&str>,
     dest_snapshot_taken: bool,
     backed_paths: &mut HashSet<PathBuf>,
-) {
+) -> Result<(), String> {
+    if dest_existed {
+        if let Some(snapshot) = dest_snapshot {
+            fs::write(dest, snapshot).map_err(|error| error.to_string())?;
+        }
+    } else if dest.exists() {
+        fs::remove_file(dest).map_err(|error| error.to_string())?;
+    }
+    // Recovery data is only expendable after the destination is restored.
     if dest_snapshot_taken {
         discard_latest_backup(ctx, req, op_id, dest);
         backed_paths.remove(dest);
     }
-    if dest_existed {
-        if let Some(snapshot) = dest_snapshot {
-            let _ = fs::write(dest, snapshot);
+    Ok(())
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn patch_move_restores_destination_after_source_backup_error() {
+        for existed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.txt");
+            fs::create_dir(&source).unwrap();
+            let destination = dir.path().join("destination.txt");
+            if existed {
+                fs::write(&destination, "destination before").unwrap();
+            }
+            let ctx = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    format_on_edit: false,
+                    ..Default::default()
+                },
+            );
+            let request =
+                serde_json::from_value(json!({"id": "backup-error", "command": "apply_patch"}))
+                    .unwrap();
+            let resolved = ResolvedHunk {
+                hunk: Hunk::Delete {
+                    path: "source.txt".into(),
+                },
+                source: ResolvedPath {
+                    abs: source.clone(),
+                    rel: "source.txt".into(),
+                },
+                move_dest: None,
+            };
+            let dest = ResolvedPath {
+                abs: destination.clone(),
+                rel: "destination.txt".into(),
+            };
+            let mut backed = HashSet::new();
+            assert!(apply_move_update(
+                &request,
+                &ctx,
+                &resolved,
+                &dest,
+                "source before".into(),
+                "destination after".into(),
+                "failed-move",
+                &mut backed,
+                false
+            )
+            .is_err());
+            if existed {
+                assert_eq!(
+                    fs::read_to_string(destination).unwrap(),
+                    "destination before"
+                );
+            } else {
+                assert!(!destination.exists());
+            }
+            assert!(source.is_dir());
+            assert!(!backed.contains(&dest.abs));
         }
-    } else if dest.exists() {
-        let _ = fs::remove_file(dest);
     }
 }
 

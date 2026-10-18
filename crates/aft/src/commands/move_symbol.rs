@@ -323,8 +323,11 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
                 captures.insert(dest_path.to_path_buf(), capture);
                 content
             }
-            Ok(None) => std::fs::read_to_string(dest_path).unwrap_or_default(),
-            Err(_) => String::new(),
+            Ok(None) => match std::fs::read_to_string(dest_path) {
+                Ok(content) => content,
+                Err(error) => return Response::error(&req.id, "io_error", error.to_string()),
+            },
+            Err(error) => return Response::error(&req.id, "io_error", error.to_string()),
         }
     } else {
         String::new()
@@ -483,7 +486,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // --- Create checkpoint (D105) ---
-    let checkpoint_name = format!("move_symbol-{symbol_name}");
+    let checkpoint_name = format!("move_symbol-{symbol_name}-{op_id}");
     {
         let mut all_files: Vec<PathBuf> = vec![source_path.to_path_buf()];
         if dest_path.exists() {
@@ -854,6 +857,208 @@ fn compute_relative_dir(from: &Path, to: &Path) -> String {
     }
 }
 
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn explicit_javascript_imports_resolve_typescript_sources() {
+        let consumer = Path::new("project/consumer.ts");
+        for (module, target) in [
+            ("./foo.js", "project/foo.ts"),
+            ("./foo.js", "project/foo.tsx"),
+            ("./foo.mjs", "project/foo.mts"),
+            ("./foo.cjs", "project/foo.cts"),
+            ("./foo.jsx", "project/foo.tsx"),
+            ("./user.service.js", "project/user.service.ts"),
+        ] {
+            for extension in ["ts", "tsx", "mts", "cts"] {
+                let typescript_consumer = consumer.with_extension(extension);
+                assert!(
+                    import_path_matches_file(module, &typescript_consumer, Path::new(target)),
+                    "{typescript_consumer:?}: {module} should resolve {target}"
+                );
+            }
+            for extension in ["js", "jsx", "mjs", "cjs"] {
+                let javascript_consumer = consumer.with_extension(extension);
+                assert!(
+                    !import_path_matches_file(module, &javascript_consumer, Path::new(target)),
+                    "{javascript_consumer:?} must not substitute {module} with {target}"
+                );
+            }
+        }
+        for (module, target) in [
+            ("./user.service", "project/user.ts"),
+            ("./foo.mjs", "project/foo.cts"),
+            ("./foo.cjs", "project/foo.mts"),
+            ("./foo.jsx", "project/foo.ts"),
+        ] {
+            assert!(
+                !import_path_matches_file(module, consumer, Path::new(target)),
+                "{module} must not resolve {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_move_rewrites_explicit_js_consumer() {
+        assert_explicit_js_consumer_move("consumer.ts", false, true);
+    }
+
+    #[test]
+    fn javascript_consumer_preserves_literal_js_neighbor() {
+        assert_explicit_js_consumer_move("consumer.js", true, false);
+    }
+
+    #[test]
+    fn typescript_consumer_prefers_ts_source_over_js_neighbor() {
+        assert_explicit_js_consumer_move("consumer.ts", true, true);
+    }
+
+    fn assert_explicit_js_consumer_move(
+        consumer_name: &str,
+        js_neighbor: bool,
+        expect_rewrite: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let source = dir.path().join("foo.ts");
+        let destination = dir.path().join("moved.ts");
+        let consumer = dir.path().join(consumer_name);
+        let literal_javascript = dir.path().join("foo.js");
+        let javascript_source = "export function moved() { return 99; }\n";
+        if js_neighbor {
+            std::fs::write(&literal_javascript, javascript_source).unwrap();
+        }
+        let original_consumer = "import { moved } from './foo.js';\nconsole.log(moved());\n";
+        std::fs::write(&source, "export function moved() { return 1; }\n").unwrap();
+        std::fs::write(&consumer, original_consumer).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "move-js-consumer", "command": "move_symbol", "file": source,
+            "destination": destination, "symbol": "moved"
+        }))
+        .unwrap();
+        let response = handle_move_symbol(&request, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(
+            response.data["consumers_updated"],
+            usize::from(expect_rewrite)
+        );
+        let updated = std::fs::read_to_string(consumer).unwrap();
+        if expect_rewrite {
+            assert!(updated.contains("from './moved'"), "{updated}");
+            assert!(!updated.contains("./foo.js"), "{updated}");
+        } else {
+            assert_eq!(updated, original_consumer);
+        }
+        if js_neighbor {
+            assert_eq!(
+                std::fs::read_to_string(literal_javascript).unwrap(),
+                javascript_source
+            );
+        }
+        assert!(std::fs::read_to_string(destination)
+            .unwrap()
+            .contains("function moved"));
+        assert!(!std::fs::read_to_string(source)
+            .unwrap()
+            .contains("function moved"));
+    }
+
+    #[test]
+    fn repeated_symbol_moves_keep_distinct_recovery_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.ts");
+        let middle = dir.path().join("middle.ts");
+        let destination = dir.path().join("destination.ts");
+        std::fs::write(&source, "export function moved() { return 1; }\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        ctx.checkpoint()
+            .lock()
+            .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
+        let mut names = Vec::new();
+        for (from, to) in [(&source, &middle), (&middle, &destination)] {
+            let request = serde_json::from_value(serde_json::json!({"id": "move", "command": "move_symbol", "file": from, "destination": to, "symbol": "moved"})).unwrap();
+            let response = handle_move_symbol(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            names.push(
+                response.data["checkpoint_name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn move_symbol_preserves_non_utf8_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.ts");
+        let destination = dir.path().join("destination.ts");
+        let original = "export function moved() { return 1; }\n";
+        std::fs::write(&source, original).unwrap();
+        std::fs::write(&destination, [0xff, 0xfe]).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(dir.path().to_path_buf()),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({"id": "binary-destination", "command": "move_symbol", "file": source, "destination": destination, "symbol": "moved"})).unwrap();
+        let response = handle_move_symbol(&request, &ctx);
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(std::fs::read(&destination).unwrap(), [0xff, 0xfe]);
+        assert_eq!(std::fs::read_to_string(source).unwrap(), original);
+    }
+
+    #[test]
+    fn dotted_module_names_resolve_without_losing_suffix() {
+        let consumer = Path::new("project/consumer.ts");
+        assert!(import_path_matches_file(
+            "./user.service",
+            consumer,
+            Path::new("project/user.service.ts")
+        ));
+        assert!(!import_path_matches_file(
+            "./user.service",
+            consumer,
+            Path::new("project/user.ts")
+        ));
+        assert!(import_path_matches_file(
+            "./user.service.ts",
+            consumer,
+            Path::new("project/user.service.ts")
+        ));
+        assert!(import_path_matches_file(
+            "./user.service",
+            consumer,
+            Path::new("project/user.service/index.ts")
+        ));
+    }
+}
+
 /// Check if a path string refers to the same file as `target`, accounting for
 /// relative path variations (with or without extension, ./ prefix, etc.).
 fn import_path_matches_file(import_module: &str, consumer_file: &Path, target_file: &Path) -> bool {
@@ -870,9 +1075,35 @@ fn import_path_matches_file(import_module: &str, consumer_file: &Path, target_fi
         return true;
     }
 
-    // Try adding common extensions
+    // TypeScript's file-extension substitution probes .ts/.tsx before .js,
+    // even when foo.js exists. Apply that compiler rule only to TS consumers:
+    // https://www.typescriptlang.org/docs/handbook/modules/reference.html#file-extension-substitution
+    let typescript_consumer = matches!(
+        consumer_file.extension().and_then(|ext| ext.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts")
+    );
+    let source_extensions: &[&str] = match (
+        typescript_consumer,
+        resolved.extension().and_then(|ext| ext.to_str()),
+    ) {
+        (true, Some("js")) => &["ts", "tsx"],
+        (true, Some("mjs")) => &["mts"],
+        (true, Some("cjs")) => &["cts"],
+        (true, Some("jsx")) => &["tsx"],
+        _ => &[],
+    };
+    for extension in source_extensions {
+        if paths_equivalent(&resolved.with_extension(extension), target_file) {
+            return true;
+        }
+    }
+
+    // Append rather than replace arbitrary dotted basename suffixes, such as
+    // `.service` in an import of `./user.service`.
     for ext in &["ts", "tsx", "js", "jsx"] {
-        let with_ext = resolved.with_extension(ext);
+        let mut name = resolved.as_os_str().to_os_string();
+        name.push(format!(".{ext}"));
+        let with_ext = std::path::PathBuf::from(name);
         if paths_equivalent(&with_ext, target_file) {
             return true;
         }

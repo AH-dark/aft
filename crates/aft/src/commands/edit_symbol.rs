@@ -333,6 +333,12 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if write_result.rolled_back {
+        ctx.backup()
+            .lock()
+            .discard_operation_entries(req.session(), &op_id);
+    }
+
     if let Some(final_content) = write_result.final_content(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, final_content, &req.params);
     }
@@ -409,22 +415,12 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         if let Some(new_content) = write_result.final_content(&path) {
             let lines: Vec<&str> = new_content.lines().collect();
             let start = original_range.start_line as usize;
-            let context_before: Vec<&str> = if start >= 3 {
-                lines[start - 3..start].to_vec()
-            } else {
-                lines[..start].to_vec()
-            };
-
             let end = if let Some(ref nr) = new_range {
                 (nr.end_line as usize + 1).min(lines.len())
             } else {
                 (original_range.end_line as usize + 1).min(lines.len())
             };
-            let context_after: Vec<&str> = if end + 3 <= lines.len() {
-                lines[end..end + 3].to_vec()
-            } else {
-                lines[end..].to_vec()
-            };
+            let (context_before, context_after) = symbol_context(&lines, start, end);
 
             result["context_before"] = serde_json::json!(context_before);
             result["context_after"] = serde_json::json!(context_after);
@@ -445,6 +441,54 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     edit::attach_edit_diff(&mut result, &req.params, file, &source, final_content);
     Response::success(&req.id, result)
+}
+
+fn symbol_context<'a>(lines: &[&'a str], start: usize, end: usize) -> (Vec<&'a str>, Vec<&'a str>) {
+    // Formatting may remove lines before the original symbol location.
+    let start = start.min(lines.len());
+    let end = end.min(lines.len());
+    (
+        lines[start.saturating_sub(3)..start].to_vec(),
+        lines[end..end.saturating_add(3).min(lines.len())].to_vec(),
+    )
+}
+
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn symbol_context_survives_formatter_shortening() {
+        assert_eq!(
+            symbol_context(&["formatted"], 99, 100),
+            (vec!["formatted"], vec![])
+        );
+    }
+
+    #[test]
+    fn symbol_rollback_discards_operation_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.ts");
+        let original = "export function ok() { return 1; }\n";
+        std::fs::write(&path, original).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "rollback", "command": "edit_symbol", "file": path, "symbol": "ok", "operation": "replace", "content": "function { broken"})).unwrap();
+        let response = handle_edit_symbol(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["rolled_back"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths(req.session())
+            .is_err());
+    }
 }
 
 fn whole_line_removal_range(source: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {

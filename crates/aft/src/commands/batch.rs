@@ -1,7 +1,7 @@
 //! Handler for the `batch` command: atomic multi-edit with rollback.
 //!
 //! Accepts an array of edits (string-match or line-range), validates all against
-//! the original content, then applies bottom-to-top to prevent line drift.
+//! the original content, then assembles resolved spans without line drift.
 //! Takes a single auto-backup before applying. No file modification on failure.
 
 use std::path::Path;
@@ -175,6 +175,12 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if write_result.rolled_back {
+        ctx.backup()
+            .lock()
+            .discard_operation_entries(req.session(), &op_id);
+    }
+
     if let Some(final_content) = write_result.final_content(&path) {
         write_result.lsp_outcome = ctx.lsp_post_write(&path, final_content, &req.params);
     }
@@ -224,6 +230,51 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     Response::success(&req.id, result)
 }
 
+#[cfg(test)]
+mod audit_regressions {
+    use super::*;
+
+    #[test]
+    fn empty_batch_match_is_rejected_before_expansion() {
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"replaceAll": true}),
+        ] {
+            let mut edit = serde_json::json!({"match": "", "replacement": "x"});
+            edit.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = resolve_edit("é\ntext\n", &edit, 0, "empty-match");
+            assert!(matches!(result, Err(response) if response.data["code"] == "invalid_request"));
+        }
+    }
+
+    #[test]
+    fn batch_rollback_discards_operation_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original.ts");
+        let original = "export function ok() { return 1; }\n";
+        std::fs::write(&path, original).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "rollback", "command": "batch", "file": path, "edits": [{"match": original, "replacement": "function { broken"}]})).unwrap();
+        let response = handle_batch(&req, &ctx);
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["rolled_back"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(ctx
+            .backup()
+            .lock()
+            .preview_last_operation_paths(req.session())
+            .is_err());
+    }
+}
+
 fn build_batch_output(
     source: &str,
     resolved: &[ResolvedEdit],
@@ -265,6 +316,13 @@ fn resolve_edit(
         .and_then(|v| v.as_str());
 
     if let Some(match_str) = match_str {
+        if match_str.is_empty() {
+            return Err(Response::error(
+                req_id,
+                "invalid_request",
+                format!("batch: edit[{}] 'match' must not be empty", index),
+            ));
+        }
         // String match-replace with progressive fuzzy matching (same as edit_match)
         let replacement = edit_val
             .get("replacement")

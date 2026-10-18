@@ -216,6 +216,28 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
+      "path": "crates/aft/src/commands/undo.rs",
+      "line": 20,
+      "column": 73,
+      "token": "filePath",
+      "text": "serde_json::json!({\"id\": \"alias-undo\", \"command\": \"undo\", \"filePath\": first}),",
+      "location": "line 20, column 73",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Regression exercises the unadvertised filePath runtime alias for single-file undo."
+    },
+    {
+      "path": "crates/aft/src/commands/undo.rs",
+      "line": 214,
+      "column": 36,
+      "token": "filePath",
+      "text": ".or_else(|| req.params.get(\"filePath\"))",
+      "location": "line 214, column 36",
+      "ordinal": 2,
+      "class": "rust-compatibility",
+      "reason": "Undo execution and preview accept the same unadvertised alias only at the request boundary."
+    },
+    {
       "path": "crates/aft/src/compress/biome.rs",
       "line": 183,
       "column": 47,

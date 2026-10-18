@@ -246,12 +246,8 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         String::new()
     };
 
-    let mut file_handle = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path.as_path())
-    {
-        Ok(file_handle) => file_handle,
+    let (mut file_handle, read_access) = match open_append_file(path.as_path()) {
+        Ok(opened) => opened,
         Err(error) => {
             if !existed {
                 ctx.backup()
@@ -266,22 +262,73 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         }
     };
 
-    let (bytes_written, write_error) = append_bytes(&mut file_handle, append_content.as_bytes());
-    let mut warnings = Vec::new();
-    if let Some(error) = write_error {
-        if bytes_written == 0 && existed {
-            return Response::error(
-                &req.id,
-                "write_error",
-                format!("edit_match append: no bytes written to {}: {}", file, error),
+    let original_len = match file_handle.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return Response::error(&req.id, "write_error", error.to_string()),
+    };
+    if let Err((bytes_written, error, restore_error)) = append_with_rollback(
+        &mut file_handle,
+        append_content.as_bytes(),
+        |file, appended| {
+            if !read_access {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "rollback could not be verified without read access",
+                ));
+            }
+            restore_append_length(file, original_len, appended)
+        },
+    ) {
+        let restored = restore_error.is_none();
+        drop(file_handle);
+        let removal_error = if !existed && restored {
+            std::fs::remove_file(path.as_path()).err()
+        } else {
+            None
+        };
+        let restore_error = restore_error.or(removal_error);
+        if restore_error.is_none() {
+            ctx.backup()
+                .lock()
+                .discard_operation_entries(req.session(), op_id);
+        }
+        let rolled_back = restore_error.is_none();
+        let mut data = serde_json::json!({
+            "bytes_written": bytes_written,
+            "rolled_back": rolled_back,
+        });
+        if !rolled_back {
+            if let Some(id) = backup_id {
+                data["backup_id"] = serde_json::json!(id);
+            }
+            edit::attach_backup_skipped_reason(
+                &mut data,
+                ctx,
+                req.session(),
+                op_id,
+                Some(path.as_path()),
             );
         }
-        warnings.push(format!(
-            "Append {}wrote {} of {} bytes to {} before failing: {}. Inspect the file or undo before retrying.",
-            if existed { "" } else { "created the file and " },
-            bytes_written, append_content.len(), file, error,
-        ));
+        return Response::error_with_data(
+            &req.id,
+            "write_error",
+            format!(
+                "edit_match append: failed after writing {} of {} bytes to {}: {}{}",
+                bytes_written,
+                append_content.len(),
+                file,
+                error,
+                restore_error
+                    .map(|error| format!(
+                        "; restore failed: {error}; inspect the file or undo before retrying"
+                    ))
+                    .unwrap_or_default(),
+            ),
+            data,
+        );
     }
+    let bytes_written = append_content.len();
+    let mut warnings = Vec::new();
 
     #[cfg(unix)]
     if !existed {
@@ -422,7 +469,39 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     Response::success(&req.id, result)
 }
 
+fn open_append_file(path: &Path) -> std::io::Result<(std::fs::File, bool)> {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        // Read access enables verified rollback, but is not a prerequisite for
+        // appending when the caller has chosen to proceed without a backup.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map(|file| (file, false))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_FAILURE: std::cell::RefCell<Option<(usize, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+}
+
 fn append_bytes(writer: &mut impl Write, content: &[u8]) -> (usize, Option<std::io::Error>) {
+    #[cfg(test)]
+    let failure = APPEND_FAILURE.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    #[cfg(test)]
+    let content = failure.as_ref().map_or(content, |(limit, _)| {
+        &content[..(*limit).min(content.len())]
+    });
     let mut written = 0;
     while written < content.len() {
         match writer.write(&content[written..]) {
@@ -432,7 +511,84 @@ fn append_bytes(writer: &mut impl Write, content: &[u8]) -> (usize, Option<std::
             Err(error) => return (written, Some(error)),
         }
     }
+    #[cfg(test)]
+    if let Some((_, interfere)) = failure {
+        interfere();
+        return (
+            written,
+            Some(std::io::Error::other("injected append failure")),
+        );
+    }
     (written, None)
+}
+
+fn append_with_rollback<W: Write>(
+    writer: &mut W,
+    content: &[u8],
+    restore: impl FnOnce(&mut W, &[u8]) -> std::io::Result<()>,
+) -> Result<(), (usize, std::io::Error, Option<std::io::Error>)> {
+    let (written, error) = append_bytes(writer, content);
+    match error {
+        Some(error) => Err((written, error, restore(writer, &content[..written]).err())),
+        None => Ok(()),
+    }
+}
+
+fn restore_append_length(file: &std::fs::File, len: u64, appended: &[u8]) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[cfg(windows)]
+    let mut rollback = {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            ReOpenFile, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Append-only handles cannot truncate on Windows. Reopen the same file
+        // object for verification and rollback, never a mutable path.
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle() as _,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        unsafe { std::fs::File::from_raw_handle(handle as _) }
+    };
+    #[cfg(not(windows))]
+    let mut rollback = file.try_clone()?;
+
+    let expected_len = len
+        .checked_add(appended.len() as u64)
+        .ok_or_else(|| std::io::Error::other("append length overflow"))?;
+    let verify_length = || -> std::io::Result<()> {
+        if file.metadata()?.len() != expected_len {
+            return Err(std::io::Error::other(
+                "file length changed; refusing to truncate unverified bytes",
+            ));
+        }
+        Ok(())
+    };
+    verify_length()?;
+    rollback.seek(SeekFrom::Start(len))?;
+    // Another writer may have appended or replaced bytes after our original
+    // length was captured. Only our exact partial suffix is safe to remove.
+    let mut buffer = [0; 8192];
+    for expected in appended.chunks(buffer.len()) {
+        let actual = &mut buffer[..expected.len()];
+        rollback.read_exact(actual)?;
+        if actual != expected {
+            return Err(std::io::Error::other(
+                "file tail changed; refusing to truncate unverified bytes",
+            ));
+        }
+    }
+    verify_length()?;
+    rollback.set_len(len)
 }
 
 /// Returns true if the file path contains glob characters. This is only a
@@ -1631,6 +1787,272 @@ mod replace_all_tests {
 
 #[cfg(test)]
 mod audit_regressions {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_only_file_accepts_append_when_backup_disabled() {
+        assert_write_only_append(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_write_only_append_retains_unverified_partial_bytes() {
+        assert_write_only_append(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_write_only_append(fail: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write-only.txt");
+        std::fs::write(&path, "before").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        match std::fs::File::open(&path) {
+            // Root (and some CI containers) read files regardless of mode 0200,
+            // so a write-only file cannot be produced and the fixture proves nothing.
+            Ok(_) => {
+                eprintln!(
+                    "skipped: mode 0200 does not deny reads for this user (running as root?)"
+                );
+                return;
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        }
+        let mut config = crate::config::Config {
+            format_on_edit: false,
+            ..Default::default()
+        };
+        config.backup.enabled = Some(false);
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        // Direct handler fixtures must apply configure's backup-store policy.
+        ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
+            enabled: false,
+            ..Default::default()
+        });
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "write-only-append", "command": "edit_match", "op": "append", "file": path, "append_content": "after"
+        })).unwrap();
+        if fail {
+            APPEND_FAILURE.with(|slot| *slot.borrow_mut() = Some((1, Box::new(|| {}))));
+        }
+        let response = handle_edit_match(&request, &ctx);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if fail {
+            APPEND_FAILURE.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "append injection was not reached: {:?}",
+                    response.data
+                )
+            });
+            assert!(!response.success, "{:?}", response.data);
+            assert_eq!(response.data["bytes_written"], 1);
+            assert_eq!(response.data["rolled_back"], false);
+            assert!(
+                response.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("rollback could not be verified without read access"),
+                "{:?}",
+                response.data
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "beforea");
+        } else {
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(response.data["bytes_written"], 5);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "beforeafter");
+        }
+    }
+
+    #[test]
+    fn failed_append_preserves_concurrent_suffix_and_backup() {
+        failed_append_preserves_external_bytes(false);
+    }
+
+    #[test]
+    fn failed_append_preserves_same_length_foreign_bytes_and_backup() {
+        failed_append_preserves_external_bytes(true);
+    }
+
+    #[test]
+    fn failed_append_rolls_back_own_suffix_and_discards_backup() {
+        for existed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("append.txt");
+            if existed {
+                std::fs::write(&path, "before").unwrap();
+            }
+            let ctx = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    format_on_edit: false,
+                    ..Default::default()
+                },
+            );
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "own-failed-append", "command": "edit_match", "op": "append", "file": path, "append_content": "after"
+            })).unwrap();
+            APPEND_FAILURE.with(|slot| *slot.borrow_mut() = Some((1, Box::new(|| {}))));
+            let response = handle_edit_match(&request, &ctx);
+            APPEND_FAILURE.with(|slot| {
+                assert!(
+                    slot.borrow().is_none(),
+                    "append failure injection was not reached: {:?}",
+                    response.data
+                )
+            });
+            assert!(!response.success);
+            assert_eq!(response.data["bytes_written"], 1);
+            assert_eq!(response.data["rolled_back"], true);
+            if existed {
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+            } else {
+                assert!(!path.exists());
+            }
+            assert!(ctx
+                .backup()
+                .lock()
+                .preview_last_operation_paths(request.session())
+                .is_err());
+        }
+    }
+
+    fn failed_append_preserves_external_bytes(replace_tail: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        std::fs::write(&path, "before").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "failed-append", "command": "edit_match", "op": "append", "file": path, "append_content": "after"
+        }))
+        .unwrap();
+        let external_path = path.clone();
+        APPEND_FAILURE.with(|slot| {
+            *slot.borrow_mut() = Some((
+                1,
+                Box::new(move || {
+                    // This separate handle writes after AFT has captured the original
+                    // length and written its first byte, but before its append fails.
+                    if replace_tail {
+                        std::fs::write(external_path, "beforeZ").unwrap();
+                    } else {
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(external_path)
+                            .unwrap()
+                            .write_all(b"external")
+                            .unwrap();
+                    }
+                }),
+            ))
+        });
+        let response = handle_edit_match(&request, &ctx);
+        APPEND_FAILURE.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "append failure injection was not reached: {:?}",
+                response.data
+            )
+        });
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            if replace_tail {
+                "beforeZ"
+            } else {
+                "beforeaexternal"
+            }
+        );
+        assert_eq!(response.data["bytes_written"], 1);
+        assert_eq!(response.data["rolled_back"], false);
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("1 of 5 bytes"));
+        assert!(
+            response.data["backup_id"].is_string(),
+            "{:?}",
+            response.data
+        );
+        let store = ctx.backup().lock();
+        let history = store.history(request.session(), &path);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content_bytes.as_ref(), b"before");
+    }
+
+    struct PartialWriter {
+        file: std::fs::File,
+        wrote: bool,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.wrote {
+                return Err(std::io::Error::other("injected partial write failure"));
+            }
+            self.wrote = true;
+            self.file.write(&bytes[..1])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    #[test]
+    fn failed_append_truncates_partial_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut writer = PartialWriter {
+            file: std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            wrote: false,
+        };
+        let error = append_with_rollback(&mut writer, b"after", |writer, appended| {
+            restore_append_length(&writer.file, 6, appended)
+        })
+        .unwrap_err();
+        assert!(error.2.is_none(), "{:?}", error.2);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+    }
+
+    #[test]
+    fn failed_append_reports_restore_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        std::fs::write(&path, "before").unwrap();
+        let mut writer = PartialWriter {
+            file: std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            wrote: false,
+        };
+        let error = append_with_rollback(&mut writer, b"after", |_, _| {
+            Err(std::io::Error::other("restore"))
+        })
+        .unwrap_err();
+        assert_eq!(error.2.unwrap().to_string(), "restore");
+    }
+
+    #[test]
+    fn ambiguity_context_is_bounded_after_source_shortens() {
+        let index = edit::SourceLineIndex::new("é\r\ntext\n");
+        assert_eq!(index.context(0, 0), "é");
+        assert_eq!(index.context(99, 2), "");
+        assert_eq!(index.context(usize::MAX, usize::MAX), "é\ntext");
+    }
+
     #[test]
     fn fuzzy_crlf_separator_is_not_duplicated() {
         let source = "a\r\nb\r\nc\r\n";
