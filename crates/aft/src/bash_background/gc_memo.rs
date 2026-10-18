@@ -185,14 +185,16 @@ struct Remembered {
 /// One storage root's sweep progress, reported on the health surface.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct PersistedGcHealth {
-    /// The `bash-tasks` folder this entry describes.
+    /// Path of the canonical `bash-tasks` folder (inside a harness storage
+    /// root) whose sweep these figures describe.
     pub root: String,
     pub passes: u64,
     /// Full laps over the store completed since the daemon started.
     pub laps_completed: u64,
-    /// The last pass used up its entry budget before reaching the end of the
-    /// store; the next pass resumes where it stopped. True on every pass but
-    /// the last of each lap over a store larger than one budget.
+    /// Set when the last pass used up its entry budget before reaching the end
+    /// of the store; the next pass resumes where it stopped. On a store larger
+    /// than one pass's budget this is set after every pass of a lap except
+    /// the last.
     pub last_pass_out_of_budget: bool,
     pub passes_out_of_budget: u64,
     /// Task names the last pass reached, how many of them it had to open and
@@ -263,8 +265,8 @@ pub(crate) struct GcMemo {
     root: PathBuf,
 }
 
-/// What a remembered verdict was derived from, taken before the metadata it
-/// judges was read.
+/// The file stamps a remembered keep-verdict depends on, captured before the
+/// sweep read the task metadata that the verdict is based on.
 pub(crate) struct Evidence {
     pub layout: TaskLayout,
     pub session: Stamp,

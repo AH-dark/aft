@@ -295,7 +295,8 @@ fn watchdog_cost_persisted_gc_resumes_partial_pass_and_still_deletes() {
     let second = registry.maybe_gc_persisted(storage.path()).unwrap();
     let health = gc_health(storage.path());
     assert!(second > 0, "the second pass made no progress");
-    // Resumed past the first pass: none of its tasks were reached again.
+    // The second pass resumed where the first stopped: it reached no task the
+    // first pass had already judged and remembered.
     assert_eq!(health.last_pass_unchanged, 0, "{health:?}");
     assert_eq!(health.last_pass_evaluated, health.last_pass_tasks);
 

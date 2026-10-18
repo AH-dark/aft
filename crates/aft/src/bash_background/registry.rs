@@ -6186,8 +6186,9 @@ impl BgTaskRegistry {
                             metadata.finished_at = Some(finished_at);
                             metadata.duration_ms =
                                 Some(finished_at.saturating_sub(metadata.started_at));
-                            // The stamps predate this rewrite; nothing they
-                            // describe may be remembered.
+                            // This rewrite changes the metadata file, so the
+                            // file stamps captured above no longer describe it;
+                            // drop them so this visit remembers nothing.
                             evidence = None;
                             if let Err(error) = self.persist_task(&resolved.paths, &metadata) {
                                 pass.error = Some(format!(
