@@ -10740,9 +10740,14 @@ mod tests {
         let request = configure_semantic_views(&canonical_root, storage.path(), &server.base_url);
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
+        // The non-probe request proves the fill reached the server's response
+        // gate. Draining maintenance only releases the worker: model startup,
+        // view loading and cold-build admission can still be queued. Allow a
+        // 60-second hang guard rather than imposing a startup latency budget.
         assert!(
-            server.wait_for_non_probe_request_count(1, Duration::from_secs(10)),
-            "the semantic view's first fill did not reach the embedding server"
+            server.wait_for_non_probe_request_count(1, Duration::from_secs(60)),
+            "the semantic view's first fill did not reach the embedding server: {}",
+            ctx.checkout_semantic().describe()
         );
         assert!(
             ctx.semantic_index()
