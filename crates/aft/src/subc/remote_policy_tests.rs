@@ -196,14 +196,14 @@ fn unconfined_read_racing_a_confining_save_is_not_remembered() {
     });
     // No row is saved yet, so the newer epoch reads as unconfined; the older
     // epoch's confining save then commits before that answer is remembered.
-    let read = confined(&ctx, &newer);
+    let read = CarriedConfinement::read(&ctx, &newer);
     assert_eq!(
         admit_confined_on_frame_loop(&ctx, &newer, "bash", Some(&read))
             .unwrap_err()
             .code,
         "tool_not_offered_confined"
     );
-    assert_eq!(read, Ok(true));
+    assert_eq!(read.read, Ok(true));
     assert_eq!(ctx.policy_confinement_reads_for_test(), 2);
     assert_eq!(confinement_from_memory(&ctx, &older), Some(Ok(true)));
     assert_eq!(confinement_from_memory(&ctx, &newer), Some(Ok(true)));
@@ -269,9 +269,9 @@ fn confine_lookup_fails_closed_when_generation_keeps_changing() {
     let older = identity(root.path(), "designer", 7, true);
     let newer = identity(root.path(), "designer", 8, true);
     invalidate_next_read(&ctx, key(&older, Some("worker")).unwrap());
-    let read = confined(&ctx, &newer);
+    let read = CarriedConfinement::read(&ctx, &newer);
     assert_eq!(
-        read.as_ref().unwrap_err().code,
+        read.read.as_ref().unwrap_err().code,
         "confine_policy_unavailable"
     );
     assert_eq!(ctx.policy_confinement_reads_for_test(), 3);
@@ -462,7 +462,10 @@ async fn uncached_calls_wait_for_busy_database_slot_and_keep_saved_confinement()
         let decoded = tokio::time::timeout(Duration::from_secs(5), waits.next())
             .await
             .unwrap();
-        assert_eq!(decoded.confinement, Some(Ok(saved_confined)));
+        assert_eq!(
+            decoded.confinement.as_ref().map(|read| &read.read),
+            Some(&Ok(saved_confined))
+        );
         let admitted =
             admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref());
         if saved_confined {
@@ -503,7 +506,10 @@ async fn keyed_call_waits_for_slow_policy_store_before_confinement_admission() {
     let decoded = tokio::time::timeout(Duration::from_secs(5), waits.next())
         .await
         .unwrap();
-    assert_eq!(decoded.confinement, Some(Ok(false)));
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Ok(false))
+    );
     assert_eq!(
         admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref()),
         Ok(false)
@@ -536,18 +542,20 @@ async fn policy_read_wait_budget_exhaustion_fails_closed() {
     // An already-expired budget avoids a ten-second sleep in this regression.
     frame.phase_trace = super::super::PhaseTrace::new(Instant::now() - Duration::from_secs(11));
     let mut waits = DatabaseWaits::default();
-    assert!(waits.read_confinement(frame, &routes, &executor).is_ok());
-    let resumed = tokio::time::timeout(Duration::from_secs(1), waits.next()).await;
-    let admitted = resumed.as_ref().ok().map(|decoded| {
-        admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref())
-    });
+    let started = Instant::now();
+    let decoded = waits
+        .read_confinement(frame, &routes, &executor)
+        .err()
+        .expect("an exhausted budget must refuse without spawning a read");
+    let admitted = admit_confined_on_frame_loop(&ctx, &route, "bash", decoded.confinement.as_ref());
+    let elapsed = started.elapsed();
     release_tx.send(()).unwrap();
     holder.join().unwrap();
-    resumed.expect("a busy slot exceeded the policy wait budget");
-    assert_eq!(
-        admitted.unwrap().unwrap_err().code,
-        "confine_policy_unavailable"
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "a busy slot exceeded the policy wait budget"
     );
+    assert_eq!(admitted.unwrap_err().code, "confine_policy_unavailable");
 }
 
 /// Force the blocking read past its memory fast path with an empty handle
@@ -617,7 +625,10 @@ async fn failed_policy_store_frame_read_fails_closed_after_off_loop_wait() {
     holder.join().unwrap();
     // Check the off-loop answer itself: the frame loop's independent memory
     // refusal must not hide a blocking read that incorrectly returned false.
-    assert_eq!(decoded.confinement, Some(Err(policy_unavailable())));
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Err(policy_unavailable()))
+    );
     assert_eq!(
         admit_confined_on_frame_loop(&ctx, &route, "read", decoded.confinement.as_ref())
             .unwrap_err()
@@ -660,11 +671,14 @@ async fn opening_policy_store_past_wait_budget_fails_closed() {
     holder.join().unwrap();
     assert_eq!(read, Err(policy_unavailable()));
 
-    assert!(waits.read_confinement(expired, &routes, &executor).is_ok());
-    let decoded = tokio::time::timeout(Duration::from_secs(1), waits.next())
-        .await
-        .unwrap();
-    assert_eq!(decoded.confinement, Some(Err(policy_unavailable())));
+    let decoded = waits
+        .read_confinement(expired, &routes, &executor)
+        .err()
+        .expect("the opening wait already exhausted the read budget");
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Err(policy_unavailable()))
+    );
     assert_eq!(
         admit_confined_on_frame_loop(&ctx, &route, "grep", decoded.confinement.as_ref())
             .unwrap_err()
@@ -709,7 +723,10 @@ async fn unconfigured_policy_store_direct_and_frame_reads_remain_unconfined() {
         .await
         .unwrap();
     holder.join().unwrap();
-    assert_eq!(decoded.confinement, Some(Ok(false)));
+    assert_eq!(
+        decoded.confinement.as_ref().map(|read| &read.read),
+        Some(&Ok(false))
+    );
     assert_eq!(
         admit_confined_on_frame_loop(&ctx, &route, "read", decoded.confinement.as_ref()),
         Ok(false)
@@ -1586,11 +1603,11 @@ async fn exercise_catalog_remote_bash(
     let routes = HashMap::from([(route_key(42, 1), bind)]);
     // The frame loop reads the worker's saved confinement off the loop before
     // admission; this route saved none.
-    let confinement = confined(
+    let confinement = CarriedConfinement::read(
         &executor.actor_context(&root_id).unwrap(),
         &routes[&route_key(42, 1)],
     );
-    assert_eq!(confinement, Ok(false));
+    assert_eq!(confinement.read, Ok(false));
     let call = Frame::build(
         FrameType::Request,
         control_flags(),

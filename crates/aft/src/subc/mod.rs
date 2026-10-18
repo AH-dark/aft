@@ -435,7 +435,7 @@ struct DecodedFrame {
     parsed_body: OnceLock<Result<Value, serde_json::Error>>,
     /// The route's confinement answer from memory or an off-loop database read
     /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
-    confinement: Option<remote_policy::ConfinementRead>,
+    confinement: Option<remote_policy::CarriedConfinement>,
 }
 
 impl DecodedFrame {
@@ -8299,7 +8299,7 @@ async fn handle_tool_call(
     tx: &WriterSender,
     frame: &Frame,
     parsed_body: Option<Result<Value, serde_json::Error>>,
-    confinement: Option<remote_policy::ConfinementRead>,
+    confinement: Option<remote_policy::CarriedConfinement>,
     mut phase_trace: PhaseTrace,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
@@ -9907,7 +9907,7 @@ fn admit_confined_call_name(
     executor: &Executor,
     identity: &RouteIdentity,
     name: &mut String,
-    confinement: Option<&remote_policy::ConfinementRead>,
+    confinement: Option<&remote_policy::CarriedConfinement>,
 ) -> Result<(), subc_protocol::ErrorBody> {
     let ctx = executor.actor_context(&identity.root).ok_or_else(|| {
         subc_protocol::ErrorBody::new("confine_policy_unavailable", "session context unavailable")

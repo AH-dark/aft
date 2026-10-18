@@ -4,11 +4,22 @@ use super::*;
 
 const WAIT_BUDGET: Duration = Duration::from_secs(10);
 const MAX_WAITERS: usize = 256;
+const MAX_CONFINEMENT_READS: usize = 8;
 
-#[derive(Default)]
 pub(super) struct DatabaseWaits {
     tasks: tokio::task::JoinSet<DecodedFrame>,
     pending: HashMap<(RouteChannel, u64), (tokio::task::AbortHandle, AdmissionWait)>,
+    confinement_reads: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for DatabaseWaits {
+    fn default() -> Self {
+        Self {
+            tasks: Default::default(),
+            pending: Default::default(),
+            confinement_reads: Arc::new(tokio::sync::Semaphore::new(MAX_CONFINEMENT_READS)),
+        }
+    }
 }
 
 impl DatabaseWaits {
@@ -190,7 +201,7 @@ impl DatabaseWaits {
         }
         let opening = remote_policy::awaits_policy_store(&ctx, identity);
         if !opening {
-            if let Some(read) = remote_policy::confinement_from_memory(&ctx, identity) {
+            if let Some(read) = remote_policy::CarriedConfinement::from_memory(&ctx, identity) {
                 // Keep the answer for admission: another route may hold the
                 // handle slot by then, making the same memory probe inconclusive.
                 decoded.confinement = Some(read);
@@ -204,9 +215,16 @@ impl DatabaseWaits {
             .unwrap_or("tool.call")
             .to_owned();
         let deadline = wait_deadline(&decoded, body.get("deadline_ms").and_then(Value::as_u64));
+        if deadline <= Instant::now() {
+            decoded.confinement = Some(remote_policy::CarriedConfinement::unavailable());
+            return Err(decoded);
+        }
         if self.pending.len() >= MAX_WAITERS {
             return Err(decoded);
         }
+        let Ok(permit) = self.confinement_reads.clone().try_acquire_owned() else {
+            return Err(decoded);
+        };
         let key = (route, decoded.frame.header.corr);
         let admission = AdmissionWait::from_decoded(&decoded, &name);
         let identity = identity.clone();
@@ -219,14 +237,24 @@ impl DatabaseWaits {
             if opening {
                 ctx.wait_for_database_open(deadline).await;
             }
+            if deadline <= Instant::now() {
+                decoded.confinement = Some(remote_policy::CarriedConfinement::unavailable());
+                return decoded;
+            }
             let read = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
-                tokio::task::spawn_blocking(move || remote_policy::confined(&ctx, &identity)),
+                tokio::task::spawn_blocking(move || {
+                    // A timed-out or cancelled waiter cannot stop this blocking
+                    // read. Count it until it finishes, including time queued
+                    // in Tokio's blocking pool or waiting for the database slot.
+                    let _permit = permit;
+                    remote_policy::CarriedConfinement::read(&ctx, &identity)
+                }),
             )
             .await
             .ok()
             .and_then(Result::ok)
-            .unwrap_or_else(|| Err(remote_policy::policy_unavailable()));
+            .unwrap_or_else(remote_policy::CarriedConfinement::unavailable);
             decoded.confinement = Some(read);
             decoded
         });
@@ -687,7 +715,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resumed.frame.header.corr, 2);
-        assert_eq!(resumed.confinement, Some(Ok(true)));
+        assert_eq!(
+            resumed.confinement.as_ref().map(|read| &read.read),
+            Some(&Ok(true))
+        );
         assert_eq!(
             remote_policy::admit_confined_on_frame_loop(
                 &ctx,
@@ -742,7 +773,10 @@ mod tests {
         let resumed = tokio::time::timeout(Duration::from_secs(5), waits.next())
             .await
             .unwrap();
-        assert_eq!(resumed.confinement, Some(Ok(false)));
+        assert_eq!(
+            resumed.confinement.as_ref().map(|read| &read.read),
+            Some(&Ok(false))
+        );
         assert_eq!(ctx.policy_confinement_reads_for_test(), 1);
 
         // Hold the aft.db lock, as a catalog fetch saving a worker's policy
@@ -765,7 +799,10 @@ mod tests {
             Ok(()) => panic!("a remembered unconfined worker was read from aft.db again"),
             Err(decoded) => decoded,
         };
-        assert_eq!(second.confinement, Some(Ok(false)));
+        assert_eq!(
+            second.confinement.as_ref().map(|read| &read.read),
+            Some(&Ok(false))
+        );
         assert!(!remote_policy::admit_confined_on_frame_loop(&ctx, &worker, "bash", None).unwrap());
         assert!(!remote_policy::admit_confined(&ctx, &worker, "bash").unwrap());
         assert!(
@@ -777,6 +814,181 @@ mod tests {
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         assert!(waits.is_empty());
+    }
+
+    fn policy_read_frame(corr: u64, deadline_ms: u64) -> DecodedFrame {
+        DecodedFrame {
+            parsed_body: Default::default(),
+            confinement: None,
+            frame: Frame::build(
+                FrameType::Request,
+                control_flags(),
+                43,
+                1,
+                corr,
+                serde_json::to_vec(&json!({"name":"bash", "arguments":{"command":"true"},
+                    "preset":"worker", "deadline_ms":deadline_ms}))
+                .unwrap(),
+            )
+            .unwrap(),
+            phase_trace: PhaseTrace::new(Instant::now()),
+        }
+    }
+
+    #[tokio::test]
+    async fn confinement_reads_refuse_over_limit_without_spawning() {
+        check_confinement_read_limit(false).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_confinement_reads_keep_permits_until_blocking_reads_finish() {
+        check_confinement_read_limit(true).await;
+    }
+
+    async fn check_confinement_read_limit(after_timeout: bool) {
+        let (dir, root) = test_support::test_root("confinement-read-limit");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let (worker, _) = scoped_worker_and_head(&root);
+        let routes = HashMap::from([(route_key(43, 1), worker.clone())]);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let app = ctx.app();
+        let holder = std::thread::spawn(move || {
+            app.with_database_slot_locked_for_test(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut waits = DatabaseWaits::default();
+        let deadline = crate::bash_background::persistence::unix_millis() + 1_000;
+        for corr in 0..MAX_CONFINEMENT_READS as u64 {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            ctx.after_next_policy_memory_miss_for_test(move || {
+                let _ = started_tx.send(());
+            });
+            assert!(waits
+                .read_confinement(policy_read_frame(corr, deadline), &routes, &executor)
+                .is_ok());
+            tokio::time::timeout(Duration::from_secs(1), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        if after_timeout {
+            for _ in 0..MAX_CONFINEMENT_READS {
+                let decoded = tokio::time::timeout(Duration::from_secs(2), waits.next())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    remote_policy::admit_confined_on_frame_loop(
+                        &ctx,
+                        &worker,
+                        "bash",
+                        decoded.confinement.as_ref()
+                    )
+                    .unwrap_err()
+                    .code,
+                    "confine_policy_unavailable"
+                );
+            }
+            assert!(waits.pending.is_empty());
+        }
+        // All reads reached the busy slot. Even after their callers time out,
+        // another frame must not queue more blocking work behind that slot.
+        let (spawned_tx, mut spawned_rx) = tokio::sync::oneshot::channel();
+        ctx.after_next_policy_memory_miss_for_test(move || {
+            let _ = spawned_tx.send(());
+        });
+        let started = Instant::now();
+        let refused = waits
+            .read_confinement(
+                policy_read_frame(MAX_CONFINEMENT_READS as u64, deadline + 5_000),
+                &routes,
+                &executor,
+            )
+            .err()
+            .expect("over-limit policy read was spawned");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            remote_policy::admit_confined_on_frame_loop(
+                &ctx,
+                &worker,
+                "bash",
+                refused.confinement.as_ref()
+            )
+            .unwrap_err()
+            .code,
+            "confine_policy_unavailable"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut spawned_rx)
+                .await
+                .is_err()
+        );
+        assert_eq!(waits.confinement_reads.available_permits(), 0);
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let permits = tokio::time::timeout(
+            Duration::from_secs(2),
+            waits
+                .confinement_reads
+                .clone()
+                .acquire_many_owned(MAX_CONFINEMENT_READS as u32),
+        )
+        .await
+        .expect("finished reads leaked their permits")
+        .unwrap();
+        drop(permits);
+        assert_eq!(
+            waits.confinement_reads.available_permits(),
+            MAX_CONFINEMENT_READS
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_confinement_read_deadline_does_not_spawn() {
+        let (dir, root) = test_support::test_root("expired-confinement-read");
+        let ctx = test_support::test_ctx();
+        ctx.set_db(Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        )));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), ctx.clone()));
+        let (worker, _) = scoped_worker_and_head(&root);
+        let routes = HashMap::from([(route_key(43, 1), worker.clone())]);
+        let (spawned_tx, mut spawned_rx) = tokio::sync::oneshot::channel();
+        ctx.after_next_policy_memory_miss_for_test(move || {
+            let _ = spawned_tx.send(());
+        });
+        let mut waits = DatabaseWaits::default();
+        let decoded = waits
+            .read_confinement(policy_read_frame(1, 1), &routes, &executor)
+            .err()
+            .expect("an expired frame queued a policy read");
+        assert!(waits.is_empty());
+        assert_eq!(
+            waits.confinement_reads.available_permits(),
+            MAX_CONFINEMENT_READS
+        );
+        assert!(spawned_rx.try_recv().is_err());
+        assert_eq!(ctx.policy_confinement_reads_for_test(), 0);
+        assert_eq!(
+            remote_policy::admit_confined_on_frame_loop(
+                &ctx,
+                &worker,
+                "bash",
+                decoded.confinement.as_ref()
+            )
+            .unwrap_err()
+            .code,
+            "confine_policy_unavailable"
+        );
     }
 
     #[tokio::test]

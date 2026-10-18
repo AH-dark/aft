@@ -3909,14 +3909,6 @@ mod route_tests {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap();
-        let (writer, mut replies) = mpsc::channel(8);
-        let (bash_tx, _bash_rx) = mpsc::channel(8);
-        let (touch_tx, _touch_rx) = mpsc::channel(8);
-        let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
-        let deferred_tx = super::super::DeferredResponseSender {
-            entries: deferred_tx,
-            wake: crate::response_finalize::DeferredResponseWake::default(),
-        };
         // As on the frame loop, a scoped worker's saved confinement is read
         // off the loop first when memory cannot answer for it.
         let decoded = DecodedFrame {
@@ -3930,6 +3922,24 @@ mod route_tests {
             Ok(()) => waits.next().await,
             Err(decoded) => decoded,
         };
+        exchange_decoded_with_actor(decoded, &routes, &executor, metrics, dispatch).await
+    }
+
+    async fn exchange_decoded_with_actor(
+        decoded: DecodedFrame,
+        routes: &HashMap<RouteChannel, RouteIdentity>,
+        executor: &Arc<Executor>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+    ) -> WriterFrame {
+        let (writer, mut replies) = mpsc::channel(8);
+        let (bash_tx, _bash_rx) = mpsc::channel(8);
+        let (touch_tx, _touch_rx) = mpsc::channel(8);
+        let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+        let deferred_tx = super::super::DeferredResponseSender {
+            entries: deferred_tx,
+            wake: crate::response_finalize::DeferredResponseWake::default(),
+        };
         let frame = decoded.frame;
         handle_tool_call(
             &writer,
@@ -3937,11 +3947,11 @@ mod route_tests {
             None,
             decoded.confinement,
             decoded.phase_trace,
-            &routes,
+            routes,
             &HashMap::new(),
             &crate::subc::ReclaimedRoutes::default(),
             &mut HashMap::new(),
-            &executor,
+            executor,
             &Arc::default(),
             &Arc::new(PendingDeferredSetups::default()),
             &Arc::new(Notify::new()),
@@ -3978,6 +3988,144 @@ mod route_tests {
                 .is_err()
         );
         reply
+    }
+
+    #[tokio::test]
+    async fn carried_unconfined_non_shell_is_refused_after_ledger_wait_and_older_epoch_save() {
+        carried_unconfined_after_ledger_wait("write", json!({"filePath":"action","content":"x"}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn carried_unconfined_bash_is_refused_after_ledger_wait_and_older_epoch_save() {
+        carried_unconfined_after_ledger_wait("bash", json!({"command":"true"})).await;
+    }
+
+    async fn carried_unconfined_after_ledger_wait(name: &str, arguments: Value) {
+        for memoized in [false, true] {
+            let (dir, root) = test_support::test_root("carried-policy-ledger-wait");
+            let ctx = test_support::test_ctx();
+            ctx.set_db(Arc::new(std::sync::Mutex::new(
+                crate::db::open(&dir.path().join("aft.db")).unwrap(),
+            )));
+            let mut older = test_support::route_identity(&root, "worker");
+            let inner = Arc::get_mut(&mut older.0).unwrap();
+            inner.role = RouteRole::ToolProviderV1;
+            inner.scope = Some(stamp("worker"));
+            inner.spawn_principal = AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.as_path().into(),
+                harness: inner.harness.clone(),
+                session_id: inner.session.clone(),
+                principal_id: Some("reserved:worker".into()),
+            };
+            remote_policy::catalog(json!({"preset":"worker"}), &older, &ctx).unwrap();
+            let mut newer = test_support::route_identity(&root, "worker");
+            let inner = Arc::get_mut(&mut newer.0).unwrap();
+            inner.role = older.role;
+            inner.scope = older.scope.clone();
+            inner.scope.as_mut().unwrap().scope_epoch += 1;
+            inner.spawn_principal = older.spawn_principal.clone();
+            if memoized {
+                assert_eq!(remote_policy::confined(&ctx, &newer), Ok(false));
+            }
+            let executor = Arc::new(Executor::new());
+            assert!(executor.register_actor(root.clone(), ctx.clone()));
+            let routes = HashMap::from([(route_key(41, 1), newer.clone())]);
+            let decoded = DecodedFrame {
+                parsed_body: Default::default(),
+                confinement: None,
+                frame: Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    41,
+                    1,
+                    7,
+                    serde_json::to_vec(&json!({"name":name,"arguments":arguments,
+                        "preset":"worker","call_key":"carried-policy"}))
+                    .unwrap(),
+                )
+                .unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            };
+            let mut waits = persistence::DatabaseWaits::default();
+            let decoded = match waits.read_confinement(decoded, &routes, &executor) {
+                Ok(()) => waits.next().await,
+                Err(decoded) => decoded,
+            };
+            assert_eq!(
+                decoded.confinement.as_ref().map(|read| &read.read),
+                Some(&Ok(false))
+            );
+
+            // Keep the keyed call in the ledger's mutating lane while an older
+            // epoch saves a fence inherited by the later epoch with no row.
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let held = executor.submit_async(
+                root,
+                crate::executor::Lane::Mutating,
+                "held-ledger-lane".into(),
+                Box::new(move |_| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Response::success("held-ledger-lane", json!({}))
+                }),
+            );
+            started_rx.await.unwrap();
+            let (edge, mut ready) = LedgerEdge::new();
+            let (writer, _replies) = mpsc::channel(8);
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            assert!(edge
+                .defer(decoded, &routes, &executor, &writer, &metrics)
+                .is_ok());
+            assert!(ready.try_recv().is_err());
+            remote_policy::catalog(
+                json!({"preset":"worker","params":{"confine":"root"}}),
+                &older,
+                &ctx,
+            )
+            .unwrap();
+            assert_eq!(remote_policy::confinement_from_memory(&ctx, &newer), None);
+            release_tx.send(()).unwrap();
+            held.await.unwrap();
+            let decoded = tokio::time::timeout(Duration::from_secs(5), ready.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!edge.finish_waiting(&decoded.frame));
+            let mut admitted_name = name.to_owned();
+            let admission = admit_confined_call_name(
+                &executor,
+                &newer,
+                &mut admitted_name,
+                decoded.confinement.as_ref(),
+            );
+            assert!(
+                admission.is_err(),
+                "{name} admitted a stale unconfined answer, memoized={memoized}"
+            );
+            let reply =
+                exchange_decoded_with_actor(decoded, &routes, &executor, &metrics, |request, _| {
+                    Response::success(request.id, json!({}))
+                })
+                .await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Error,
+                "{name}, memoized={memoized}"
+            );
+            let error: subc_protocol::ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+            assert!(
+                matches!(
+                    error.code.as_str(),
+                    "tool_not_offered_confined" | "confine_policy_unavailable"
+                ),
+                "{name}, memoized={memoized}: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

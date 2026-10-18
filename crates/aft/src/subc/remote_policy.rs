@@ -264,6 +264,42 @@ pub(super) fn confined(ctx: &AppContext, identity: &RouteIdentity) -> Confinemen
 /// `confine: "root"`, or why that could not be read.
 pub(super) type ConfinementRead = Result<bool, subc_protocol::ErrorBody>;
 
+/// A policy answer carried across admission waits. An unconfined answer is
+/// valid only until a confining save advances the context's policy generation;
+/// that save may fence a later epoch through its fallback to an older row.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct CarriedConfinement {
+    pub(super) read: ConfinementRead,
+    generation: u64,
+}
+
+impl CarriedConfinement {
+    pub(super) fn from_memory(ctx: &AppContext, identity: &RouteIdentity) -> Option<Self> {
+        let generation = ctx.policy_confinement_generation();
+        confinement_from_memory(ctx, identity).map(|read| Self { read, generation })
+    }
+
+    pub(super) fn read(ctx: &AppContext, identity: &RouteIdentity) -> Self {
+        let generation = ctx.policy_confinement_generation();
+        Self {
+            read: confined(ctx, identity),
+            generation,
+        }
+    }
+
+    pub(super) fn unavailable() -> Self {
+        Self {
+            read: Err(policy_unavailable()),
+            generation: 0,
+        }
+    }
+
+    fn current(&self, ctx: &AppContext) -> Option<ConfinementRead> {
+        (self.read != Ok(false) || self.generation == ctx.policy_confinement_generation())
+            .then(|| self.read.clone())
+    }
+}
+
 pub(super) fn policy_unavailable() -> subc_protocol::ErrorBody {
     subc_protocol::ErrorBody::new(
         "confine_policy_unavailable",
@@ -322,15 +358,18 @@ pub(super) fn admit_confined(
 /// its write lock, and the loop would stop answering health checks,
 /// cancellations and other roots meanwhile. The policy comes from memory or
 /// from `read`, the result of [`confined`] run off the loop before the call
-/// reached admission. A call with neither is refused, never run unconfined.
+/// reached admission. A carried unconfined answer invalidated during an
+/// admission wait is unknown, just like a missing read. The frame loop cannot
+/// re-read aft.db synchronously, so it refuses rather than use a stale answer.
 pub(super) fn admit_confined_on_frame_loop(
     ctx: &AppContext,
     identity: &RouteIdentity,
     name: &str,
-    read: Option<&ConfinementRead>,
+    read: Option<&CarriedConfinement>,
 ) -> Result<bool, subc_protocol::ErrorBody> {
-    let confined = confinement_from_memory(ctx, identity)
-        .or_else(|| read.cloned())
+    let confined = CarriedConfinement::from_memory(ctx, identity)
+        .and_then(|read| read.current(ctx))
+        .or_else(|| read.and_then(|read| read.current(ctx)))
         .unwrap_or_else(|| Err(policy_unavailable()))?;
     admit_confined_tool(confined, name)
 }
