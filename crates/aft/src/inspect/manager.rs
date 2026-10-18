@@ -11502,6 +11502,25 @@ mod tier2_unreadable_source_tests {
         (dir, root, snapshot)
     }
 
+    /// Block until `limiter` has a free slot, then hand it straight back. A
+    /// probe permit can only be taken once every earlier permit has been fully
+    /// returned, so this proves no background worker still holds or is still
+    /// releasing one. The deadline only guards against a hang.
+    fn wait_until_cold_build_slot_is_free(limiter: &Arc<cold_build_limiter::ColdBuildLimiter>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(probe) = limiter.try_acquire() {
+                drop(probe);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "an earlier worker never returned its cold-build permit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn aggregate(
         manager: &InspectManager,
         snapshot: &InspectSnapshot,
@@ -11639,7 +11658,8 @@ mod tier2_unreadable_source_tests {
         )
         .expect("independent live writer lease");
         let manager = Arc::new(InspectManager::new());
-        manager.set_cold_build_limiter(cold_build_limiter::test_limiter(1));
+        let limiter = cold_build_limiter::test_limiter(1);
+        manager.set_cold_build_limiter(Arc::clone(&limiter));
         let first =
             manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
         assert_eq!(first.newly_queued_categories, vec![category]);
@@ -11718,9 +11738,20 @@ mod tier2_unreadable_source_tests {
             .get_mut(&key)
             .unwrap()
             .resource_retry_at = Some((Instant::now(), unix_millis_now()));
+        // The serial worker publishes its completion (removing the category
+        // from `in_flight`) before it drops its cold-build limiter permit. While
+        // that permit is being torn down, a same-root admission is refused and
+        // the category is deferred instead of queued. Wait until the earlier
+        // worker has returned its slot, so the admission below tests only the
+        // released lease and the due retry.
+        wait_until_cold_build_slot_is_free(&limiter);
         let resumed =
             manager.submit_tier2_run_with_reuse_serial_background(snapshot.clone(), vec![category]);
-        assert_eq!(resumed.newly_queued_categories, vec![category]);
+        assert_eq!(
+            resumed.newly_queued_categories,
+            vec![category],
+            "{resumed:?}"
+        );
         let (flights, timeout) = manager
             .in_flight_changed
             .wait_timeout_while(
