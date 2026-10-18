@@ -7,6 +7,8 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+// Some binaries do not use every atomic-write durability option. Callers choose
+// whether private state needs no sync, file sync, or file plus directory sync.
 #[derive(Clone, Copy)]
 pub(crate) enum AtomicWriteDurability {
     None,
