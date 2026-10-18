@@ -2,12 +2,15 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::bash_background::persistence::{
     resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
 };
+
+#[cfg(test)]
+#[path = "retention_query_plan_tests.rs"]
+mod query_plan_tests;
 
 pub const TERMINAL_ROW_RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_TERMINAL_PRUNE_ROWS: usize = 500;
@@ -335,31 +338,25 @@ pub(crate) fn delete_prepared_terminal_rows(
     let removed = if prepared.identities.is_empty() {
         0
     } else {
-        let mut values = Vec::with_capacity(1 + prepared.identities.len() * 3);
-        values.push(Value::Integer(prepared.cutoff));
-        let identities = prepared
-            .identities
-            .into_iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                let parameter = 2 + index * 3;
-                values.extend([
-                    Value::Text(candidate.harness),
-                    Value::Text(candidate.session_id),
-                    Value::Text(candidate.task_id),
-                ]);
-                format!("(?{parameter}, ?{}, ?{})", parameter + 1, parameter + 2)
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        conn.execute(
-            &format!(
-                "DELETE FROM bash_tasks
-                 WHERE {TERMINAL_PRUNE_PREDICATE}
-                   AND (harness, session_id, task_id) IN (VALUES {identities})"
-            ),
-            params_from_iter(values),
-        )?
+        // Full key equality forces one identity lookup even without ANALYZE.
+        // A composite IN list lets SQLite scan every terminal row by status
+        // while holding the shared database mutex. Recheck eligibility here
+        // because watches and delivery state can change after preparation.
+        let mut delete = conn.prepare_cached(&format!(
+            "DELETE FROM bash_tasks
+             WHERE harness = ?2 AND session_id = ?3 AND task_id = ?4
+               AND {TERMINAL_PRUNE_PREDICATE}"
+        ))?;
+        let mut removed = 0;
+        for candidate in prepared.identities {
+            removed += delete.execute(params![
+                prepared.cutoff,
+                candidate.harness,
+                candidate.session_id,
+                candidate.task_id,
+            ])?;
+        }
+        removed
     };
 
     Ok(TerminalRowsPrune {
@@ -527,8 +524,8 @@ fn bash_task_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 /// a task directory still belongs to a live process must not restrict the
 /// lookup to one harness.
 ///
-/// This batched GC lookup uses the harness-keyed project-lookup index,
-/// reading each harness's index entries and fetching only the matching rows.
+/// The task-owner index seeks each requested task id within its harness;
+/// the project-lookup index would scan every project in that harness.
 pub fn list_bash_task_process_ids(
     conn: &Connection,
     task_ids: &[String],
@@ -542,7 +539,7 @@ pub fn list_bash_task_process_ids(
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let sql = format!(
                 "SELECT task_id, pid, pgid, started_at
-                 FROM bash_tasks INDEXED BY idx_bash_tasks_project_lookup
+                 FROM bash_tasks INDEXED BY idx_bash_tasks_task_owner
                  WHERE harness = ? AND task_id IN ({placeholders})
                    AND (pid IS NOT NULL OR pgid IS NOT NULL)"
             );
@@ -802,7 +799,7 @@ mod tests {
 
     /// The persisted-task GC asks for recorded pids once per session
     /// directory. The lookup covers every harness but must stay on the
-    /// harness-keyed index: reading the whole task history per directory is
+    /// task-keyed index: reading the whole task history per directory is
     /// the cost it exists to avoid.
     #[test]
     fn process_id_lookup_reads_pages_for_requested_tasks_not_history() {
