@@ -602,6 +602,17 @@
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 3995,
+      "column": 63,
+      "token": "filePath",
+      "text": "carried_unconfined_after_ledger_wait(\"write\", json!({\"filePath\":\"action\",\"content\":\"x\"}))",
+      "location": "line 3995, column 63",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "The confinement admission regression sends the tool provider's write wire schema through a held call-ledger wait."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
       "line": 4190,
       "column": 21,
       "token": "filePath",
