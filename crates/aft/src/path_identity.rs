@@ -1,4 +1,4 @@
-//! Project-root identity primitives (P0 of the subc migration).
+//! Project-root identity primitives for per-checkout routing and state.
 //!
 //! Three distinct identity roles live here or are named here — do NOT conflate
 //! them, because conflating them is the bug class this module exists to kill:
@@ -10,12 +10,13 @@
 //!    [`project_scope_key`]. Shared byte-for-byte with subc by construction
 //!    (same crate), so a session attaches to the same root subc routed it to.
 //!
-//! Use one shared cache key for data that can be reused across all worktrees of
-//! the same Git repository, and a separate key for checkout-specific inspect
-//! data. For Git repositories, derive the shared key from the repository's root
-//! commit so every worktree can reuse the same search cache; for non-Git
-//! projects, derive it from the canonical filesystem path. Keep the previous
-//! `project_cache_key` format for compatibility with existing caches.
+//! 2. Repository artifact identity — use one shared cache key for data that can
+//!    be reused across all worktrees of the same Git repository, and a separate
+//!    key for checkout-specific inspect data. For Git repositories, derive the
+//!    shared key from the repository's root commit so every worktree can reuse
+//!    the same search cache; for non-Git projects, derive it from the canonical
+//!    filesystem path. Keep the previous `project_cache_key` format for
+//!    compatibility with existing caches.
 //!
 //! 3. Operation-target / lexical path handling (create-file fallback, relative
 //!    path joins) — not identity; stays local to its call sites.
@@ -58,20 +59,22 @@ fn hash16(path: &Path) -> String {
     digest[..16].to_string()
 }
 
-/// Lexically resolve `.`/`..`/`CurDir` without touching the filesystem. Mirrors
-/// the non-existent-path fallback used elsewhere so a missing root still yields
-/// a stable, traversal-safe key instead of panicking.
+/// Resolve lexical dot components without touching the filesystem. Leading
+/// relative parents remain significant; rooted paths cannot escape their root.
 fn lexical_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
 
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::ParentDir => {
-                if !result.pop() {
-                    result.push(component);
+            Component::ParentDir => match result.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    result.pop();
                 }
-            }
+                Some(Component::RootDir) => {}
+                Some(Component::Prefix(_)) if path.has_root() => {}
+                _ => result.push(component),
+            },
             Component::CurDir => {}
             other => result.push(other),
         }
@@ -83,6 +86,33 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn u01_lexical_normalization_preserves_parents_and_root_boundaries() {
+        for (input, expected) in [
+            ("../../x", "../../x"),
+            ("../a/../../x", "../../x"),
+            ("a/../b", "b"),
+            ("a/../../x", "../x"),
+        ] {
+            assert_eq!(lexical_normalize(Path::new(input)), Path::new(expected));
+        }
+        #[cfg(unix)]
+        assert_eq!(lexical_normalize(Path::new("/../../x")), Path::new("/x"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn u01_lexical_normalization_preserves_drive_relative_parents() {
+        assert_eq!(
+            lexical_normalize(Path::new(r"C:..\..\x")),
+            Path::new(r"C:..\..\x")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new(r"C:\..\..\x")),
+            Path::new(r"C:\x")
+        );
+    }
 
     /// A fresh root directory, removed when the returned guard drops.
     fn temp_root(label: &str) -> (tempfile::TempDir, PathBuf) {

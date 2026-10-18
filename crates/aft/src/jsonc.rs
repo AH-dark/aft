@@ -47,14 +47,20 @@ pub(crate) fn strip_jsonc_comments(source: &str) -> String {
                 Some('*') => {
                     chars.next();
                     let mut previous = '\0';
+                    let mut had_newline = false;
                     for next in chars.by_ref() {
                         if next == '\n' {
                             output.push('\n');
+                            had_newline = true;
                         }
                         if previous == '*' && next == '/' {
                             break;
                         }
                         previous = next;
+                    }
+                    // Comments separate JSON tokens just like whitespace.
+                    if !had_newline {
+                        output.push(' ');
                     }
                 }
                 _ => output.push(ch),
@@ -120,6 +126,20 @@ mod tests {
     use serde_json::Value;
 
     use super::{strip_jsonc, strip_jsonc_comments, strip_trailing_commas};
+
+    #[test]
+    fn u01_block_comments_do_not_join_json_tokens() {
+        for source in ["1/**/2", "tr/**/ue", "{\"n\": 1/**/2}"] {
+            assert!(
+                serde_json::from_str::<Value>(&strip_jsonc(source)).is_err(),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<Value>(&strip_jsonc("[1,/**/2]")).unwrap(),
+            serde_json::json!([1, 2])
+        );
+    }
 
     #[test]
     fn strip_jsonc_comments_preserves_comment_like_text_inside_strings() {

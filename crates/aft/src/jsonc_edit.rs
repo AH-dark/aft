@@ -187,6 +187,17 @@ pub fn pointer(path: &[&str]) -> String {
 /// flush it, then rename it over the target. A reader sees either the old or
 /// the new file, never a partial write. Existing permissions are kept.
 pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    // Dotfile managers often link configs into a separate repository. Replace
+    // the target file, not that link; a dangling link must fail without being lost.
+    let resolved;
+    let path = if std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        resolved = std::fs::canonicalize(path)?;
+        resolved.as_path()
+    } else {
+        path
+    };
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -209,7 +220,9 @@ pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
         if let Ok(metadata) = std::fs::metadata(path) {
             std::fs::set_permissions(&temp, metadata.permissions())?;
         }
-        std::fs::rename(&temp, path)
+        std::fs::rename(&temp, path)?;
+        crate::durability::sync_dir(parent)?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -317,6 +330,54 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u01_atomic_write_preserves_config_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles.jsonc");
+        let link = dir.path().join("aft.jsonc");
+        std::fs::write(&target, "old").unwrap();
+        std::os::unix::fs::symlink("dotfiles.jsonc", &link).unwrap();
+        write_atomic(&link, "new").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("dotfiles.jsonc")
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u01_atomic_write_refuses_dangling_config_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("aft.jsonc");
+        std::os::unix::fs::symlink("missing.jsonc", &link).unwrap();
+        assert!(write_atomic(&link, "new").is_err());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn u01_atomic_write_syncs_target_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aft.jsonc");
+        crate::durability::take();
+        write_atomic(&path, "new").unwrap();
+        let events = crate::durability::take();
+        assert!(events.iter().any(|(kind, path)| {
+            *kind == crate::durability::EventKind::DirectorySync && path == dir.path()
+        }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
     }
 
     #[test]

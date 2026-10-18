@@ -365,7 +365,9 @@ pub fn effective_path() -> &'static OsStr {
         .filter(|cache| cache_matches_current_shell(cache, &candidates))
         .map(|cache| {
             (
-                cache.path.map(OsString::from),
+                cache
+                    .path
+                    .and_then(|path| filter_login_path(OsStr::new(&path))),
                 ProbeSource::Cache,
                 cache.shell,
             )
@@ -494,16 +496,16 @@ fn probe_login_shell_path() -> LoginPathProbe {
             break;
         }
         let timeout = LOGIN_SHELL_PATH_PROBE_TIMEOUT.min(deadline.saturating_duration_since(now));
-        if let Some(path) = probe_login_shell_path_once(&shell, timeout) {
-            if login_path_is_acceptable(&path) {
-                // Cache against the requested shell, not a fallback that happened
-                // to answer this probe. Otherwise a hanging $SHELL would pay its
-                // timeout again on every launch before the fallback can be reused.
-                return LoginPathProbe {
-                    shell: fallback_shell,
-                    path: Some(path),
-                };
-            }
+        if let Some(path) =
+            probe_login_shell_path_once(&shell, timeout).and_then(|path| filter_login_path(&path))
+        {
+            // Cache against the requested shell, not a fallback that happened
+            // to answer this probe. Otherwise a hanging $SHELL would pay its
+            // timeout again on every launch before the fallback can be reused.
+            return LoginPathProbe {
+                shell: fallback_shell,
+                path: Some(path),
+            };
         }
     }
 
@@ -695,13 +697,18 @@ fn kill_login_shell_probe(child: &mut std::process::Child) {
 
 #[cfg(unix)]
 fn login_path_is_acceptable(path: &OsStr) -> bool {
+    filter_login_path(path).is_some()
+}
+
+#[cfg(unix)]
+fn filter_login_path(path: &OsStr) -> Option<OsString> {
     let bytes = path.as_bytes();
     if bytes.is_empty()
         || bytes
             .iter()
             .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
     {
-        return false;
+        return None;
     }
 
     if bytes.contains(&b' ') {
@@ -712,13 +719,22 @@ fn login_path_is_acceptable(path: &OsStr) -> bool {
             }
         }
         if abs_count > 1 {
-            return false;
+            return None;
         }
     }
 
-    bytes
-        .split(|byte| *byte == b':')
-        .all(|entry| entry.first() == Some(&b'/'))
+    // Relative and empty entries must not discard usable absolute tool paths.
+    let mut filtered = Vec::new();
+    for entry in bytes.split(|byte| *byte == b':') {
+        if entry.first() != Some(&b'/') {
+            continue;
+        }
+        if !filtered.is_empty() {
+            filtered.push(b':');
+        }
+        filtered.extend_from_slice(entry);
+    }
+    (!filtered.is_empty()).then(|| OsString::from_vec(filtered))
 }
 
 #[cfg(unix)]
@@ -797,7 +813,7 @@ fn cache_matches_current_shell(cache: &EffectivePathCache, candidates: &[PathBuf
             .path
             .as_deref()
             .map(|path| login_path_is_acceptable(OsStr::new(path)))
-            .unwrap_or(true)
+            .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1353,7 +1369,7 @@ eval "$2"
         let rejected = vec![
             OsString::new(),
             OsString::from("/fake/login/bin\n/usr/bin"),
-            OsString::from("/fake/login/bin:relative/bin"),
+            OsString::from("relative/bin:~/bin:"),
             OsString::from_vec(b"/fake/login/bin\0/usr/bin".to_vec()),
             OsString::from("/usr/bin /bin /opt/homebrew/bin"), // fish-shaped space-joined
         ];
@@ -1361,6 +1377,36 @@ eval "$2"
         for probe_path in rejected {
             assert!(!login_path_is_acceptable(&probe_path));
         }
+    }
+
+    #[test]
+    fn u01_login_path_mixed_probe_retains_only_absolute_entries() {
+        let _guard = crate::test_env::process_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("shell");
+        write_executable_shim(&shell, "#!/bin/sh\nprintf '%s' '__AFT_PATH_BEGIN__/custom/bin:./local:~/bin::/usr/bin:__AFT_PATH_END__'\n");
+        let _candidates =
+            EnvVarGuard::set("AFT_TEST_LOGIN_SHELL_CANDIDATES", shell.to_str().unwrap());
+        assert_eq!(
+            probe_login_shell_path().path,
+            Some(OsString::from("/custom/bin:/usr/bin"))
+        );
+    }
+
+    #[test]
+    fn u01_login_path_failed_cache_is_not_authoritative() {
+        let _guard = crate::test_env::process_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", dir.path().to_str().unwrap());
+        let shell = PathBuf::from("/bin/bash");
+        let cache = EffectivePathCache {
+            schema: EFFECTIVE_PATH_CACHE_SCHEMA,
+            shell: shell.to_string_lossy().into_owned(),
+            path: None,
+            probed_at_unix: unix_timestamp_secs(),
+            inputs: shell_startup_inputs(&shell),
+        };
+        assert!(!cache_matches_current_shell(&cache, &[shell]));
     }
 
     #[test]

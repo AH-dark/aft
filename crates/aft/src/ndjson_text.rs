@@ -17,6 +17,11 @@ pub fn build_ndjson_text(
     list_id: Option<&str>,
     is_text_surface: bool,
 ) -> String {
+    if is_text_surface {
+        // Commands such as bash already include the list-truncation trailer
+        // in base_text. Parsing their list metadata cannot change the reply.
+        return base_text.to_string();
+    }
     let Some(id) = list_id else {
         return base_text.to_string();
     };
@@ -39,12 +44,6 @@ pub fn build_ndjson_text(
         return base_text.to_string();
     };
 
-    if is_text_surface {
-        // For text surfaces such as bash, the trailer is already integrated
-        // into the text payload; pass through unchanged.
-        return base_text.to_string();
-    }
-
     if let Some(trailer) = render_trailer(&envelope) {
         if base_text.is_empty() {
             trailer
@@ -53,5 +52,23 @@ pub fn build_ndjson_text(
         }
     } else {
         base_text.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn u01_text_surface_does_not_allocate_for_envelope_lookup() {
+        let data = serde_json::json!({"bash_list_envelope": {"irrelevant": "x".repeat(8192)}});
+        let (text, allocations) =
+            crate::test_allocations::count(|| build_ndjson_text("", &data, Some("bash"), true));
+        assert_eq!(text, "");
+        assert_eq!(allocations, 0);
+        assert_eq!(
+            build_ndjson_text("unchanged", &data, Some("bash"), true),
+            "unchanged"
+        );
     }
 }

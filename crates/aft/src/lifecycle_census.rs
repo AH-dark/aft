@@ -168,15 +168,22 @@ pub(crate) fn thread_class(name: Option<&str>) -> &'static str {
     let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
         return "unnamed";
     };
+    // Linux exposes at most 15 bytes in /proc task comm, even when the
+    // thread builder was given a longer name. Match that exact truncation,
+    // not arbitrary short prefixes that could belong to unrelated workers.
+    let matches = |prefix: &str| {
+        name.starts_with(prefix)
+            || (cfg!(target_os = "linux") && prefix.len() > 15 && name == &prefix[..15])
+    };
     if name.starts_with("aft-inspect-") {
         "aft-inspect"
-    } else if name.starts_with("aft-fs-lock-heartbeat") {
+    } else if matches("aft-fs-lock-heartbeat") {
         "aft-fs-lock-heartbeat"
     } else if name.starts_with("aft-lsp-") {
         "aft-lsp"
-    } else if name.starts_with("notify-rs fsevents loop") {
+    } else if matches("notify-rs fsevents loop") {
         "notify-rs fsevents loop"
-    } else if name.starts_with("reqwest-internal-sync-runtime") {
+    } else if matches("reqwest-internal-sync-runtime") {
         "reqwest-internal-sync-runtime"
     } else if name.starts_with("tokio-rt-worker") {
         "tokio-rt-worker"
@@ -184,7 +191,7 @@ pub(crate) fn thread_class(name: Option<&str>) -> &'static str {
         "aft-callgraph"
     } else if name.starts_with("aft-mem-") {
         "aft-mem"
-    } else if name.starts_with("aft-health-rollup") {
+    } else if matches("aft-health-rollup") {
         "aft-health-rollup"
     } else {
         "unnamed"
@@ -413,6 +420,28 @@ fn soft_fd_limit() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::thread_class;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn u01_thread_class_recognizes_linux_comm_truncation() {
+        for (full, expected) in [
+            ("aft-fs-lock-heartbeat", "aft-fs-lock-heartbeat"),
+            ("aft-health-rollup", "aft-health-rollup"),
+            (
+                "reqwest-internal-sync-runtime",
+                "reqwest-internal-sync-runtime",
+            ),
+        ] {
+            let comm = std::thread::Builder::new()
+                .name(full.to_string())
+                .spawn(|| std::fs::read_to_string("/proc/thread-self/comm").unwrap())
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(thread_class(Some(&comm)), expected, "name={full}");
+        }
+        assert_eq!(thread_class(Some("aft-fs-lock")), "unnamed");
+    }
 
     #[test]
     fn thread_class_parser_buckets_known_prefixes_and_unnamed_threads() {
