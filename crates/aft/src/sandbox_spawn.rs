@@ -4297,8 +4297,39 @@ pub(crate) fn detached_command_for_plan(
     // Session setup requires pre_exec, so execvp can resolve the final child PATH.
     let mut command = crate::effective_path::new_command(program).build_unresolved();
     command.args(args);
-    crate::bash_background::process::start_new_session(&mut command);
     Ok((command, profile_handle))
+}
+
+#[cfg(unix)]
+pub(crate) fn spawn_detached_for_plan(
+    plan: &SpawnPlan,
+    command: &mut Command,
+    environment: &HashMap<String, String>,
+    io: &crate::posix_spawn::PipeIo<'_>,
+) -> std::io::Result<crate::posix_spawn::Child> {
+    command.env_remove(crate::privacy_spawn::CONTROL_ENV);
+    if let Some(result) = crate::posix_spawn::try_spawn(
+        command,
+        isolated_environment_for_plan(plan, environment).is_some(),
+        crate::privacy_spawn::requested(environment),
+        io,
+    ) {
+        return result;
+    }
+    // Old libcs cannot express the session/fd contract through file actions.
+    // Keep their existing fork path rather than weaken isolation or break bash.
+    crate::bash_background::process::start_new_session(command);
+    apply_marker_fd_allowlist(command, io.exit, io.failure).map_err(std::io::Error::other)?;
+    command
+        .stdin(if io.gated_stdin {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(io.stdout.try_clone()?)
+        .stderr(io.stderr.try_clone()?);
+    disclaim_command_for_plan(plan, command, environment).map_err(std::io::Error::other)?;
+    command.spawn().map(Into::into)
 }
 
 fn isolated_environment_for_plan(

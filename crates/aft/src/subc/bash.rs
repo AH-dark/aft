@@ -200,7 +200,7 @@ mod default_kill_tests {
             .spawn()
             .unwrap();
         task.state.lock().unwrap().runtime =
-            crate::bash_background::registry::TaskRuntime::Piped(Some(child));
+            crate::bash_background::registry::TaskRuntime::Piped(Some(child.into()));
         let registry = ctx.bash_background();
         let observation = observe_deferred_bash_wait(
             registry.clone(),
@@ -241,7 +241,7 @@ mod default_kill_tests {
             .spawn()
             .unwrap();
         task.state.lock().unwrap().runtime =
-            crate::bash_background::registry::TaskRuntime::Piped(Some(child));
+            crate::bash_background::registry::TaskRuntime::Piped(Some(child.into()));
         let registry = ctx.bash_background();
         let snapshots_before = registry.inner.snapshots_built.load(Ordering::Relaxed);
         let mut finished = 0;

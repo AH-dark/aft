@@ -76,7 +76,7 @@ fn watchdog_cost_live_children_open_no_artifacts() {
         let task = registry.task(&paths.task_id).unwrap();
         std::mem::swap(
             &mut task.state.lock().unwrap().runtime,
-            &mut TaskRuntime::Piped(Some(child)),
+            &mut TaskRuntime::Piped(Some(child.into())),
         );
         tasks.push((index % 30, task));
     }

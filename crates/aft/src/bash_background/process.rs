@@ -365,20 +365,27 @@ pub fn terminate_process(child: &mut Child) {
 
 #[cfg(unix)]
 pub fn terminate_pgid(pgid: i32, mut child: Option<&mut Child>) {
+    terminate_pgid_with(pgid, || {
+        child
+            .as_deref_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+    });
+}
+
+#[cfg(unix)]
+pub(crate) fn terminate_pgid_with(pgid: i32, mut leader_exited: impl FnMut() -> bool) {
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
     }
     let grace_started = Instant::now();
     while grace_started.elapsed() < TERMINATE_GRACE {
-        if let Some(child) = child.as_deref_mut() {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                // The direct child (process-group leader) exited. Stop waiting,
-                // but still SIGKILL the whole group below — a descendant that
-                // ignored SIGTERM can outlive the leader (the wrapper-shell /
-                // CLI-spawns-child orphan class). killpg on an already-empty
-                // group is a harmless ESRCH.
-                break;
-            }
+        if leader_exited() {
+            // The direct child (process-group leader) exited. Stop waiting,
+            // but still SIGKILL the whole group below — a descendant that
+            // ignored SIGTERM can outlive the leader (the wrapper-shell /
+            // CLI-spawns-child orphan class). killpg on an already-empty
+            // group is a harmless ESRCH.
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }

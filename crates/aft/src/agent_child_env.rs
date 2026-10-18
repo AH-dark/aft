@@ -2198,7 +2198,11 @@ mod tests {
             .unwrap();
         let sandbox = include_str!("sandbox_spawn.rs");
 
-        let detached_spawns = registry.matches(".spawn()").count();
+        // Unix uses the native/fallback adapter; Windows retains Command::spawn.
+        let detached_spawns = registry.matches(".spawn()").count()
+            + registry
+                .matches("sandbox_spawn::spawn_detached_for_plan(")
+                .count();
         assert_eq!(detached_spawns, 2, "agent detached spawn inventory drifted");
         assert_eq!(
             registry
@@ -2209,8 +2213,8 @@ mod tests {
         );
 
         let pty_spawns = pty.matches(".spawn_command(").count();
-        // The macOS opt-in branch uses posix_spawn; these two inherited
-        // alternatives are mutually exclusive cfg paths.
+        // The macOS opt-in branch has its own privacy-aware fork/exec setup;
+        // these inherited alternatives are mutually exclusive cfg paths.
         assert_eq!(pty_spawns, 2, "agent PTY spawn inventory drifted");
         assert_eq!(
             pty.matches("sandbox_spawn::pty_command_for_plan(").count(),

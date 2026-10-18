@@ -522,6 +522,10 @@ impl AppContext {
             "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total
                 .pages_or_bytes_written_60s,
         });
+        #[cfg(unix)]
+        {
+            runtime["bash_spawn"] = crate::posix_spawn::health();
+        }
         if callgraph_write_metrics.commits_60s > 0 {
             runtime["callgraph_commits_60s"] =
                 serde_json::json!(callgraph_write_metrics.commits_60s);
