@@ -4291,6 +4291,21 @@ impl BgTaskRegistry {
         self.replay_session_inner(storage_dir, session_id, Some(project_root))
     }
 
+    pub(crate) fn repair_legacy_root_tasks(&self, storage_root: &Path, harness: Harness) {
+        let root_tasks = storage_root.join("bash-tasks");
+        // Replayed tasks pin their artifact directories, including after exit.
+        // Defer their migration to a later daemon rather than invalidate those
+        // handles during a repeated configure in this daemon.
+        if self
+            .task_arcs()
+            .iter()
+            .any(|task| task.paths.dir.starts_with(&root_tasks))
+        {
+            return;
+        }
+        super::repair_legacy_root_tasks(storage_root, harness);
+    }
+
     fn retire_orphaned_watch_tombstones(&self, binding_session_id: &str) -> Result<(), String> {
         // Every harness seen on this root: an orphan written by one harness's
         // route must be retired even after another harness configured it.

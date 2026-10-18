@@ -2909,8 +2909,18 @@ impl BackupStore {
     }
 
     fn session_dir(&self, session: &str) -> Option<PathBuf> {
-        self.backups_dir()
-            .map(|d| d.join(Self::session_hash(session)))
+        let direct = self.backups_dir()?.join(Self::session_hash(session));
+        if !direct.exists() && self.effective_storage_harness().is_some() {
+            let legacy = self
+                .storage_dir
+                .as_ref()?
+                .join("backups")
+                .join(Self::session_hash(session));
+            if legacy.exists() {
+                return Some(legacy);
+            }
+        }
+        Some(direct)
     }
 
     fn session_hash(session: &str) -> String {
@@ -2964,68 +2974,39 @@ impl BackupStore {
             return;
         }
         let harness_backups = storage_dir.join(harness).join("backups");
-        if dir_has_entries(&harness_backups) {
+        if let Err(error) = create_private_durable_dir(&harness_backups) {
+            crate::slog_warn!(
+                "cannot create harness backup dir {}: {error}",
+                harness_backups.display()
+            );
             return;
         }
-        if let Some(parent) = harness_backups.parent() {
-            if let Err(error) = create_private_durable_dir(parent) {
-                crate::slog_warn!(
-                    "failed to create harness backup dir {}: {}",
-                    parent.display(),
-                    error
-                );
-                return;
+        let Ok(entries) = std::fs::read_dir(&root_backups) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let source = entry.path();
+            let target = harness_backups.join(entry.file_name());
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || target.exists() {
+                continue;
             }
-        }
-        if harness_backups.exists() {
-            let _ = std::fs::remove_dir(&harness_backups);
-        }
-        // The harness folder and the root normally share a volume, but a move
-        // that crosses volumes falls back to a copy instead of failing.
-        match crate::cross_volume::move_path(&root_backups, &harness_backups) {
-            Ok(_) => {
-                crate::slog_info!(
-                    "moved legacy root backups into harness namespace: {}",
-                    harness_backups.display()
-                );
-            }
-            Err(error) => {
+            // Use the same admission gate and stack leases as stale-session GC:
+            // a paused writer must finish before copy+unlink can move its files.
+            let Ok(Some(_gate)) = session_gc_gate(&source, false) else {
+                continue;
+            };
+            let Ok(Some(leases)) = acquire_inactive_session_leases(&source) else {
+                continue;
+            };
+            // The gate prevents new leases. Close probe handles before moving
+            // the session, and keep stable gate files in their original parent.
+            drop(leases);
+            if let Err(error) = crate::cross_volume::move_path(&source, &target) {
                 crate::slog_warn!(
-                    "failed to move legacy root backups into {}: {}; trying child merge",
-                    harness_backups.display(),
-                    error
+                    "legacy backup {} kept in place: cannot move it to {}: {error}",
+                    source.display(),
+                    target.display()
                 );
-                if let Err(error) = create_private_durable_dir(&harness_backups) {
-                    crate::slog_warn!(
-                        "legacy root backups kept in {}: cannot create {}: {}",
-                        root_backups.display(),
-                        harness_backups.display(),
-                        error
-                    );
-                    return;
-                }
-                if let Ok(entries) = std::fs::read_dir(&root_backups) {
-                    for entry in entries.flatten() {
-                        let source = entry.path();
-                        let target = harness_backups.join(entry.file_name());
-                        if target.exists() {
-                            continue;
-                        }
-                        if let Err(error) = crate::cross_volume::move_path(&source, &target) {
-                            // A backup that cannot be moved stays in the root
-                            // `backups/` folder; log the move failure instead
-                            // of dropping it.
-                            crate::slog_warn!(
-                                "legacy backup {} kept in place: cannot move it to {}: {}",
-                                source.display(),
-                                target.display(),
-                                error
-                            );
-                        }
-                    }
-                }
-                // Removes the legacy folder only when every backup left it.
-                let _ = std::fs::remove_dir(&root_backups);
             }
         }
     }
@@ -3503,6 +3484,12 @@ impl BackupStore {
             path: gate_path.display().to_string(),
             message: error.to_string(),
         })?;
+        if self.session_dir(session).as_ref() != Some(&session_dir) {
+            // Repair may have migrated an inactive session while we waited for
+            // its gate. Resolve again instead of recreating its legacy folder.
+            drop(_gate);
+            return self.acquire_stack_disk_lock(session, key);
+        }
         create_private_durable_dir(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
             message: error.to_string(),
@@ -5627,6 +5614,40 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cross_volume_legacy_backup_repair_keeps_active_stack_writer() {
+        use std::io::Write;
+        let storage = tempfile::tempdir().unwrap();
+        let mut writer = BackupStore::new();
+        writer.set_storage_dir(storage.path().to_path_buf(), 72);
+        let session = "legacy-writer";
+        let key = storage.path().join("source.txt");
+        let lock = writer.acquire_stack_disk_lock(session, &key).unwrap();
+        let legacy = writer.session_dir(session).unwrap();
+        let mut output = std::fs::File::create(legacy.join("payload")).unwrap();
+        output.write_all(b"before").unwrap();
+        let mut repair = BackupStore::new();
+        repair.set_storage_dir_for_harness(
+            storage.path().to_path_buf(),
+            crate::harness::Harness::Opencode,
+            72,
+        );
+        let harness = storage.path().join("opencode");
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(&harness, u64::MAX - 20);
+        repair.repair_root_backups_if_needed();
+        output.write_all(b"after").unwrap();
+        drop(output);
+        assert_eq!(fs::read(legacy.join("payload")).unwrap(), b"beforeafter");
+        assert_eq!(repair.session_dir(session), Some(legacy.clone()));
+        drop(lock);
+        repair.repair_root_backups_if_needed();
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read(repair.session_dir(session).unwrap().join("payload")).unwrap(),
+            b"beforeafter"
+        );
+    }
+
+    #[test]
     fn stale_session_gc_preserves_active_stack_lease() {
         let storage = tempfile::tempdir().unwrap();
         let mut writer = BackupStore::new();
@@ -7107,8 +7128,8 @@ mod tests {
             "the backup history must reach the harness folder"
         );
         assert!(
-            !root_backups.exists(),
-            "the legacy folder is removed after the copy"
+            !root_backups.join("session-a").exists(),
+            "the session is removed after the copy; stable admission gates stay"
         );
     }
 

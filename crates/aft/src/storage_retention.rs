@@ -1215,7 +1215,14 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<boo
                 entries.collect::<io::Result<Vec<_>>>()?
             }
             Ok(_) => return Err(io::Error::other("non-directory retention trash retained")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if mount_local {
+                    // A previous pass may have unlinked the container but failed
+                    // to make that deletion durable. Retry the parent barrier.
+                    crate::durability::sync_dir(trash.parent().unwrap())?;
+                }
+                return Ok(false);
+            }
             Err(error) => return Err(error),
         }
     };
@@ -1258,6 +1265,14 @@ fn reap_trash(storage: &Path, trash: &Path, mount_local: bool) -> io::Result<boo
         // have populated it since the snapshot. An empty-directory unlink is
         // safe outside admission and leaves any new tombstones for a later pass.
         let _ = fs::remove_dir(trash);
+        // Flush the remaining container's unlinks, then the container's own
+        // deletion in its mount-local parent before clearing the durable hint.
+        match crate::durability::sync_dir(trash) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        crate::durability::sync_dir(trash.parent().unwrap())?;
     }
     Ok(pending)
 }
@@ -3842,6 +3857,59 @@ mod storage_retention_tests {
         assert!(foreign.join("important").exists());
         assert!(!emptied_mount_point(&path));
         assert!(marker.exists(), "unreaped tombstones keep the marker");
+    }
+
+    fn mount_trash_sync_failure_keeps_marker(keep_container: bool) {
+        let (temp, _, _, path) = due_cache_fixture();
+        let _views = crate::walk_boundary::simulated_volumes::simulate(
+            &temp.path().join("views"),
+            u64::MAX - 10,
+        );
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&path, u64::MAX - 11);
+        {
+            let _admission = barrier(temp.path()).unwrap();
+            retire_directory(temp.path(), &path).unwrap();
+        }
+        let trash = path.join(".retention-trash");
+        if keep_container {
+            fs::write(trash.join("unknown"), b"keep unrecognized entries").unwrap();
+        }
+        let sync_path = if keep_container { &trash } else { &path };
+        let marker = temp.path().join("retention/mount-trash-pending");
+        let generation = fs::read(&marker).unwrap();
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| {
+            *slot.borrow_mut() = Some(sync_path.to_path_buf());
+        });
+        let result = reap_retired(temp.path());
+        crate::durability::FAIL_DIRECTORY_SYNC.with(|slot| slot.borrow_mut().take());
+        assert!(
+            result.is_err(),
+            "mount-local sync failure must defer reaping"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), generation);
+        assert_eq!(trash.exists(), keep_container);
+
+        crate::durability::take();
+        reap_retired(temp.path()).unwrap();
+        assert!(!marker.exists(), "a durable reap clears the pending marker");
+        #[cfg(unix)]
+        {
+            let events = crate::durability::take();
+            assert!(events.contains(&(crate::durability::EventKind::DirectorySync, path)));
+            if keep_container {
+                assert!(events.contains(&(crate::durability::EventKind::DirectorySync, trash)));
+            }
+        }
+    }
+
+    #[test]
+    fn retention_mount_trash_parent_sync_failure_keeps_marker() {
+        mount_trash_sync_failure_keeps_marker(false);
+    }
+
+    #[test]
+    fn retention_mount_trash_container_sync_failure_keeps_marker() {
+        mount_trash_sync_failure_keeps_marker(true);
     }
 
     #[test]

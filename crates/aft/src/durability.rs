@@ -95,6 +95,18 @@ pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DIRECTORY_SYNC.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_deref() == Some(path) {
+            slot.take();
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(io::Error::other("injected directory sync failure"));
+    }
     #[cfg(unix)]
     {
         File::open(path)?.sync_all()?;
@@ -119,6 +131,9 @@ pub(crate) enum EventKind {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static FAIL_DIRECTORY_SYNC: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
     static EVENTS: std::cell::RefCell<Vec<(EventKind, std::path::PathBuf)>> = const {
         std::cell::RefCell::new(Vec::new())
     };
