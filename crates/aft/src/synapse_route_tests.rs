@@ -8,6 +8,7 @@ pub(crate) struct Counts {
     pub opens: usize,
     pub active: usize,
     pub queries: usize,
+    pub connections: usize,
 }
 
 pub(crate) struct Daemon {
@@ -16,10 +17,11 @@ pub(crate) struct Daemon {
     pub counts: Arc<(Mutex<Counts>, Condvar)>,
     stop: tokio::sync::oneshot::Sender<()>,
     server: std::thread::JoinHandle<()>,
+    release: tokio::sync::watch::Sender<bool>,
 }
 
 impl Daemon {
-    pub fn start(query_group: usize, fail_first_group: bool) -> Self {
+    pub fn start(query_group: usize, disconnect_first_group: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("connection.json");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -45,6 +47,7 @@ impl Daemon {
         let counts = Arc::new((Mutex::new(Counts::default()), Condvar::new()));
         let recorded = counts.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::watch::channel(false);
         let server = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -57,13 +60,27 @@ impl Daemon {
                             let (mut stream, _) = accepted.unwrap();
                             let key = key.clone();
                             let counts = recorded.clone();
+                            let mut released = released.clone();
                             tasks.spawn(async move {
                                 subc_transport::authenticate_server(&mut stream, &key, &daemon_id, "route-test", Duration::from_secs(2)).await.unwrap();
+                                counts.0.lock().unwrap().connections += 1;
                                 let mut active = 0;
                                 let mut pending = Vec::new();
-                                let mut failed = false;
+                                let mut held = Vec::new();
                                 let mut generation = 0;
-                                while let Ok(Some(request)) = subc_transport::read_frame(&mut stream).await {
+                                loop {
+                                    let request = tokio::select! {
+                                        request = subc_transport::read_frame(&mut stream) => match request {
+                                            Ok(Some(request)) => request,
+                                            _ => break,
+                                        },
+                                        Ok(()) = released.changed() => {
+                                            for (request, value) in held.drain(..) {
+                                                respond(&mut stream, &request, query_reply(&value), false).await;
+                                            }
+                                            continue;
+                                        }
+                                    };
                                     if request.header.ty == FrameType::Goodbye {
                                         active -= 1;
                                         counts.0.lock().unwrap().active -= 1;
@@ -75,7 +92,7 @@ impl Daemon {
                                     let reply = match value["op"].as_str() {
                                         Some("catalog.list") => json!({"op":"catalog.list","generation":1,"modules":[{
                                             "module_id":"synapse","module_version":"1","roles":[{"role":"management_surface",
-                                            "operations":[{"name":"models.list","kind":"query"},{"name":"embed.query","kind":"query"},{"name":"embed.batch","kind":"query"}],
+                                            "operations":[{"name":"models.list","kind":"query"},{"name":"embed.query","kind":"query"},{"name":"embed.batch","kind":"query"},{"name":"rerank.score","kind":"query"}],
                                             "config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}],"subc_ops":["catalog.list","route.open"]}),
                                         Some("route.open") => {
                                             let mut count = counts.0.lock().unwrap();
@@ -86,21 +103,41 @@ impl Daemon {
                                             json!({"op":"route.open","route_channel":7,"route_epoch":1})
                                         },
                                         _ if value["method"] == MODELS_LIST_OPERATION => json!({"models":[{"model":pause_test_support::MODEL,"fingerprint":"pinned","table_epoch":1,"dims":2,"recommended_batch":{"rows":100,"token_budget":8192}}]}),
-                                        _ if value["method"] == QUERY_OPERATION => {
+                                        _ if value["method"] == QUERY_OPERATION || value["method"] == "rerank.score" => {
                                             counts.0.lock().unwrap().queries += 1;
+                                            counts.1.notify_all();
+                                            match value["params"]["text"].as_str() {
+                                                Some("timeout") => continue,
+                                                Some("held") if !*released.borrow() => {
+                                                    held.push((request, value));
+                                                    continue;
+                                                },
+                                                Some("module-error") => {
+                                                    respond(&mut stream, &request, json!({"code":"test_refused","message":"request rejected"}), true).await;
+                                                    continue;
+                                                },
+                                                Some("malformed") => {
+                                                    let frame = Frame::build(FrameType::Response, Flags::new(false, Priority::Interactive, false), request.header.channel, request.header.epoch, request.header.corr, b"{".to_vec()).unwrap();
+                                                    subc_transport::write_frame(&mut stream, &frame).await.unwrap();
+                                                    continue;
+                                                },
+                                                Some("application-error") => {
+                                                    respond(&mut stream, &request, json!({"error":{"code":"test_rejected","message":"application rejected"}}), false).await;
+                                                    continue;
+                                                },
+                                                _ => {}
+                                            }
                                             pending.push((request, value));
                                             if pending.len() < query_group { continue; }
                                             // The real consumer enforces its 1024-request route window.
                                             // Holding these replies proves requests overlap on the wire.
-                                            for (request, value) in pending.drain(..) {
-                                                let reply = if fail_first_group && generation == 1 && !failed {
-                                                    json!({"code":"test_transport_failure","message":"retry this connection"})
-                                                } else {
-                                                    json!({"fingerprint":"pinned","table_epoch":1,"vectors":[{"id":value["params"]["id"],"content_sha256":value["params"]["content_sha256"],"vector":[1.0,0.0]}]})
-                                                };
-                                                respond(&mut stream, &request, reply, fail_first_group && generation == 1 && !failed).await;
+                                            if disconnect_first_group && generation == 1 {
+                                                // Drop the socket with all callers pending, without a terminal reply.
+                                                break;
                                             }
-                                            failed = true;
+                                            for (request, value) in pending.drain(..) {
+                                                respond(&mut stream, &request, query_reply(&value), false).await;
+                                            }
                                             continue;
                                         },
                                         _ if value["method"] == "consent.test_timeout" => {
@@ -131,6 +168,7 @@ impl Daemon {
             counts,
             stop,
             server,
+            release,
         }
     }
 
@@ -159,10 +197,30 @@ impl Daemon {
         assert_eq!(count.active, 0, "completed clients left routes open");
     }
 
+    fn wait_queries(&self, queries: usize) {
+        let (counts, _) = self
+            .counts
+            .1
+            .wait_timeout_while(
+                self.counts.0.lock().unwrap(),
+                Duration::from_secs(2),
+                |counts| counts.queries < queries,
+            )
+            .unwrap();
+        assert!(
+            counts.queries >= queries,
+            "expected requests did not reach the wire"
+        );
+    }
+
     pub fn finish(self) {
         let _ = self.stop.send(());
         self.server.join().unwrap();
     }
+}
+
+fn query_reply(value: &Value) -> Value {
+    json!({"fingerprint":"pinned","table_epoch":1,"vectors":[{"id":value["params"]["id"],"content_sha256":value["params"]["content_sha256"],"vector":[1.0,0.0]}]})
 }
 
 async fn respond(stream: &mut tokio::net::TcpStream, request: &Frame, value: Value, error: bool) {
@@ -272,6 +330,7 @@ fn synapse_shared_reset_reconnects_once_without_serializing_callers() {
             "one failed generation must cause only one reconnect"
         );
         assert_eq!(daemon.counts.0.lock().unwrap().queries, CALLERS * 2);
+        assert_eq!(daemon.counts.0.lock().unwrap().connections, 2);
         let replacement = shared
             .runtime
             .block_on(clients[0].state.ensure_route())
@@ -293,4 +352,203 @@ fn synapse_shared_reset_reconnects_once_without_serializing_callers() {
     drop(shared);
     daemon.wait_closed();
     daemon.finish();
+}
+
+#[test]
+fn synapse_request_timeout_does_not_reset_another_roots_inflight_request() {
+    let daemon = Daemon::start(1, false);
+    let mut impatient = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let mut patient = SynapseEmbeddingClient::from_config(&daemon.config(1)).unwrap();
+    let shared = Arc::clone(&impatient.state.connection);
+    let original = shared
+        .runtime
+        .block_on(impatient.state.ensure_route())
+        .unwrap();
+    std::thread::scope(|scope| {
+        let answer = scope.spawn(move || {
+            let result = patient.embed_query("held", Duration::from_secs(10));
+            (patient, result)
+        });
+        daemon.wait_queries(1);
+        let result = impatient.embed_query("timeout", Duration::from_millis(100));
+        daemon.release.send(true).unwrap();
+        let (patient, answer) = answer.join().unwrap();
+        assert!(matches!(result, Err(SynapseEmbeddingError::CircuitOpen)));
+        assert_eq!(
+            impatient.state.consecutive_timeouts,
+            CIRCUIT_TIMEOUT_THRESHOLD
+        );
+        assert_eq!(patient.state.consecutive_timeouts, 0);
+        assert!(patient.state.circuit_open_until.is_none());
+        assert_eq!(answer.unwrap(), vec![1.0, 0.0]);
+        let current = shared
+            .runtime
+            .block_on(patient.state.ensure_route())
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&original, &current),
+            "a request timeout reset a healthy shared connection"
+        );
+        assert_eq!(daemon.counts.0.lock().unwrap().opens, 1);
+        assert_eq!(daemon.counts.0.lock().unwrap().connections, 1);
+        assert_eq!(
+            daemon.counts.0.lock().unwrap().queries,
+            1 + CIRCUIT_TIMEOUT_THRESHOLD
+        );
+    });
+    drop(original);
+    drop(impatient);
+    drop(shared);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
+fn synapse_module_and_application_errors_leave_shared_connection_up() {
+    let daemon = Daemon::start(1, false);
+    let mut first = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let mut second = SynapseEmbeddingClient::from_config(&daemon.config(1)).unwrap();
+    let shared = Arc::clone(&first.state.connection);
+    let original = shared.runtime.block_on(first.state.ensure_route()).unwrap();
+    for (text, message) in [
+        ("module-error", "test_refused: request rejected"),
+        ("application-error", "test_rejected: application rejected"),
+    ] {
+        let error = first.embed_query(text, Duration::from_secs(1)).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(
+            second
+                .embed_query("healthy", Duration::from_secs(1))
+                .unwrap(),
+            vec![1.0, 0.0]
+        );
+        let current = shared
+            .runtime
+            .block_on(second.state.ensure_route())
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&original, &current),
+            "a module reply reset a healthy shared connection"
+        );
+    }
+    assert_eq!(daemon.counts.0.lock().unwrap().opens, 1);
+    assert_eq!(
+        daemon.counts.0.lock().unwrap().queries,
+        4,
+        "module replies must not be retried"
+    );
+    drop(original);
+    drop(first);
+    drop(second);
+    drop(shared);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
+fn synapse_rerank_request_errors_and_timeouts_keep_the_route() {
+    let daemon = Daemon::start(1, false);
+    let mut transport = SynapseRerankTransport::new(&daemon.config(0)).unwrap();
+    let original = transport
+        .runtime
+        .block_on(transport.state.ensure_route())
+        .unwrap();
+    assert!(matches!(
+        transport.call(
+            "rerank.score",
+            json!({"text":"timeout"}),
+            Instant::now() + Duration::from_millis(100)
+        ),
+        Err(SynapseEmbeddingError::Timeout(_))
+    ));
+    let error = transport
+        .call(
+            "rerank.score",
+            json!({"text":"module-error"}),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("test_refused: request rejected"));
+    let error = transport
+        .call(
+            "rerank.score",
+            json!({"text":"malformed"}),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(matches!(error, SynapseEmbeddingError::InvalidEnvelope(_)));
+    let reply = transport
+        .call(
+            "rerank.score",
+            json!({"text":"application-error"}),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(reply["error"]["code"], "test_rejected");
+    transport
+        .call(
+            "rerank.score",
+            json!({"text":"healthy"}),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+    let current = transport
+        .runtime
+        .block_on(transport.state.ensure_route())
+        .unwrap();
+    assert!(Arc::ptr_eq(&original, &current));
+    assert_eq!(daemon.counts.0.lock().unwrap().opens, 1);
+    assert_eq!(daemon.counts.0.lock().unwrap().queries, 5);
+    drop(original);
+    drop(current);
+    drop(transport);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
+fn synapse_closed_consumer_replaces_the_stale_route() {
+    let daemon = Daemon::start(1, false);
+    let mut client = SynapseEmbeddingClient::from_config(&daemon.config(0)).unwrap();
+    let original = client
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    client.runtime.block_on(original.consumer.close());
+    assert_eq!(
+        client
+            .embed_query("healthy", Duration::from_secs(1))
+            .unwrap(),
+        vec![1.0, 0.0]
+    );
+    let current = client
+        .runtime
+        .block_on(client.state.ensure_route())
+        .unwrap();
+    assert!(!Arc::ptr_eq(&original, &current));
+    assert_eq!(daemon.counts.0.lock().unwrap().opens, 2);
+    drop(original);
+    drop(current);
+    drop(client);
+    daemon.wait_closed();
+    daemon.finish();
+}
+
+#[test]
+fn synapse_untyped_not_sent_and_unknown_outcomes_do_not_imply_a_dead_route() {
+    let not_sent = CallError::NotSent(
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "writer closed: request timed out",
+        )
+        .into(),
+    );
+    let unknown = CallError::OutcomeUnknown(
+        std::io::Error::new(std::io::ErrorKind::Other, "connection failed").into(),
+    );
+    assert!(!connection_is_gone(&not_sent));
+    assert!(!connection_is_gone(&unknown));
+    assert!(connection_is_gone(&CallError::StaleRouteHandle(
+        RouteHandle::detached(7, 1)
+    )));
 }

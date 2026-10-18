@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use subc_client_rs::{CallOptions, ConsumerOptions, RouteHandle, SubcConsumer};
+use subc_client_rs::{
+    CallError, CallOptions, ConsumerOptions, OutcomeUnknownCause, RouteHandle, SubcConsumer,
+};
 use subc_protocol::manifest::ProviderRole;
 use subc_protocol::{BindIdentity, RouteTarget};
 
@@ -370,6 +372,23 @@ struct SynapseState {
 struct ActiveConnection {
     consumer: SubcConsumer,
     route: RouteHandle,
+}
+
+fn connection_is_gone(error: &CallError) -> bool {
+    // The SDK distinguishes lost routes/writers from request deadlines and
+    // module replies. Bare NotSent errors also include flow-control timeouts,
+    // so only a typed close reason proves that their route has ended.
+    matches!(error, CallError::StaleRouteHandle(_))
+        || error.close_reason().is_some()
+        || matches!(
+            error.outcome_cause(),
+            Some(
+                OutcomeUnknownCause::WriterClosed
+                    | OutcomeUnknownCause::ConsumerClosed
+                    | OutcomeUnknownCause::ConnectionFailed
+                    | OutcomeUnknownCause::RouteEnded
+            )
+        )
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -845,13 +864,25 @@ impl SynapseState {
                             return result;
                         }
                         Ok(Err(error)) => {
+                            if matches!(error, CallError::Module(_)) {
+                                return Err(SynapseEmbeddingError::DaemonUnavailable(
+                                    error.to_string(),
+                                ));
+                            }
                             last_error = error.to_string();
-                            self.connection.reset(&connection).await;
+                            if connection_is_gone(&error) {
+                                self.connection.reset(&connection).await;
+                            } else if error.outcome_cause() == Some(OutcomeUnknownCause::Deadline) {
+                                self.note_timeout();
+                                if self.circuit_open_until.is_some() {
+                                    return Err(SynapseEmbeddingError::CircuitOpen);
+                                }
+                                last_error = format!("{operation} timed out");
+                            }
                         }
                         Err(_) => {
                             last_error = format!("{operation} timed out");
                             self.note_timeout();
-                            self.connection.reset(&connection).await;
                             if self.circuit_open_until.is_some() {
                                 return Err(SynapseEmbeddingError::CircuitOpen);
                             }
@@ -1668,18 +1699,24 @@ impl SynapseRerankTransport {
             .filter(|time| !time.is_zero())
             .ok_or_else(|| SynapseEmbeddingError::Timeout(operation.into()))?;
         self.runtime.block_on(async {
-            let mut used_connection = None;
             // Include connect, catalog lookup, and route opening in the total budget.
             let result = tokio::time::timeout(remaining, async {
                 let connection = self.state.ensure_route().await?;
-                used_connection = Some(Arc::clone(&connection));
                 let body = serde_json::to_vec(&json!({"method":operation, "params":params}))
                     .map_err(|error| SynapseEmbeddingError::InvalidEnvelope(error.to_string()))?;
-                let response = connection
+                let response = match connection
                     .consumer
                     .request(&connection.route, body, CallOptions::default())
                     .await
-                    .map_err(|error| SynapseEmbeddingError::DaemonUnavailable(error.to_string()))?;
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if connection_is_gone(&error) {
+                            self.state.connection.reset(&connection).await;
+                        }
+                        return Err(SynapseEmbeddingError::DaemonUnavailable(error.to_string()));
+                    }
+                };
                 if response.len() > MAX_RESULT_PAGE_BYTES {
                     return Err(SynapseEmbeddingError::InvalidEnvelope(
                         "rerank.score response exceeded 512KiB".into(),
@@ -1690,20 +1727,8 @@ impl SynapseRerankTransport {
             })
             .await;
             match result {
-                Ok(result) => {
-                    if result.is_err() {
-                        if let Some(connection) = &used_connection {
-                            self.state.connection.reset(connection).await;
-                        }
-                    }
-                    result
-                }
-                Err(_) => {
-                    if let Some(connection) = &used_connection {
-                        self.state.connection.reset(connection).await;
-                    }
-                    Err(SynapseEmbeddingError::Timeout(operation.into()))
-                }
+                Ok(result) => result,
+                Err(_) => Err(SynapseEmbeddingError::Timeout(operation.into())),
             }
         })
     }
