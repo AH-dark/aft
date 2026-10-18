@@ -771,29 +771,154 @@ fn read_directory_scope(grant: &AccessGrant) -> AccessGrant {
     read_directory_scope_with(grant, directory_is_root_alias)
 }
 
+const DIRECTORY_SCOPE_PROBE_BUDGET: Duration = Duration::from_millis(250);
+const DIRECTORY_SCOPE_MEMO_TTL: Duration = Duration::from_secs(60);
+type DirectoryScopeAnswer = Result<bool, &'static str>;
+
+#[derive(Default)]
+struct DirectoryScopeProbe {
+    answer: std::sync::Mutex<Option<(Instant, DirectoryScopeAnswer)>>,
+    ready: std::sync::Condvar,
+}
+
+impl DirectoryScopeProbe {
+    fn reusable(&self) -> bool {
+        self.answer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|(at, answer)| answer.is_ok() && at.elapsed() < DIRECTORY_SCOPE_MEMO_TTL)
+    }
+
+    fn wait(&self, deadline: Instant) -> DirectoryScopeAnswer {
+        let answer = self.answer.lock().unwrap();
+        let (answer, _) = self
+            .ready
+            .wait_timeout_while(
+                answer,
+                deadline.saturating_duration_since(Instant::now()),
+                |answer| answer.is_none(),
+            )
+            .unwrap();
+        answer
+            .filter(|(at, _)| *at <= deadline)
+            .map(|(_, answer)| answer)
+            .unwrap_or(Err("shared directory probe timed out"))
+    }
+
+    fn finish(&self, result: DirectoryScopeAnswer) {
+        *self.answer.lock().unwrap() = Some((Instant::now(), result));
+        self.ready.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct DirectoryScopeProbes {
+    probes: HashMap<PathBuf, Arc<DirectoryScopeProbe>>,
+    logged: HashMap<(PathBuf, &'static str), Instant>,
+    last_pruned: Option<Instant>,
+}
+
+impl DirectoryScopeProbes {
+    fn get(&mut self, directory: &Path) -> (Arc<DirectoryScopeProbe>, bool) {
+        if self
+            .last_pruned
+            .is_none_or(|at| at.elapsed() >= DIRECTORY_SCOPE_MEMO_TTL)
+        {
+            self.probes.retain(|_, probe| probe.reusable());
+            self.logged
+                .retain(|_, at| at.elapsed() < DIRECTORY_SCOPE_MEMO_TTL);
+            self.last_pruned = Some(Instant::now());
+        }
+        // Ask grants already contain canonical policy identities. Do not resolve
+        // the candidate again outside the bounded filesystem helper.
+        if let Some(probe) = self.probes.get(directory).filter(|probe| probe.reusable()) {
+            return (Arc::clone(probe), false);
+        }
+        let probe = Arc::new(DirectoryScopeProbe::default());
+        self.probes
+            .insert(directory.to_path_buf(), Arc::clone(&probe));
+        (probe, true)
+    }
+
+    fn note_fallback(&mut self, directory: &Path, reason: &'static str) -> bool {
+        match self.logged.entry((directory.to_path_buf(), reason)) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().elapsed() < DIRECTORY_SCOPE_MEMO_TTL {
+                    return false;
+                }
+                entry.insert(Instant::now());
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Instant::now());
+            }
+        }
+        true
+    }
+}
+
+static DIRECTORY_SCOPE_PROBES: LazyLock<std::sync::Mutex<DirectoryScopeProbes>> =
+    LazyLock::new(|| std::sync::Mutex::new(DirectoryScopeProbes::default()));
+
 fn read_directory_scope_with<F>(grant: &AccessGrant, root_alias_check: F) -> AccessGrant
 where
     F: Fn(&Path, &Path) -> Option<bool> + Send + Sync + 'static,
 {
-    const PROBE_BUDGET: Duration = Duration::from_millis(250);
+    let deadline = Instant::now() + DIRECTORY_SCOPE_PROBE_BUDGET;
     if grant.operation != AccessOperation::Read || grant.kind != GrantKind::File {
         return grant.clone();
     }
     let Some(parent) = grant.path.parent() else {
         return grant.clone();
     };
-    let Some(permit) = DIRECTORY_SCOPE_PROBE_LIMITER.try_acquire() else {
-        return grant.clone();
+    let (probe, leader) = DIRECTORY_SCOPE_PROBES.lock().unwrap().get(parent);
+    let answer = if leader {
+        let result = if let Some(permit) = DIRECTORY_SCOPE_PROBE_LIMITER.acquire_until(deadline) {
+            // Keep the slot with filesystem work even after its caller times
+            // out, so stalled probes cannot exhaust the shared helper pool.
+            crate::bounded_io::run(parent, Some(deadline), move |directory| {
+                let _permit = permit;
+                Ok(probe_directory_scope_with(&directory, root_alias_check))
+            })
+            .unwrap_or(Err(
+                "directory probe timed out or filesystem helper unavailable",
+            ))
+        } else {
+            Err("directory probe permit timed out")
+        };
+        // Only an answer delivered within this request's budget is memoized;
+        // a helper completing after timeout cannot populate the memo later.
+        let result = if Instant::now() <= deadline {
+            result
+        } else {
+            Err("directory probe timed out")
+        };
+        probe.finish(result);
+        result
+    } else {
+        probe.wait(deadline)
     };
-    let probing = grant.clone();
-    // Home canonicalization and volume checks can stall before alias scanning.
-    // Keep the slot with the filesystem work even after its caller times out,
-    // so repeated permission requests cannot exhaust the shared helper pool.
-    crate::bounded_io::run(parent, Some(Instant::now() + PROBE_BUDGET), move |_| {
-        let _permit = permit;
-        Ok(probe_directory_scope_with(&probing, root_alias_check))
-    })
-    .unwrap_or_else(|_| grant.clone())
+    match answer {
+        Ok(true) => AccessGrant {
+            path: parent.to_path_buf(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+        Ok(false) => grant.clone(),
+        Err(reason) => {
+            let should_log = DIRECTORY_SCOPE_PROBES
+                .lock()
+                .unwrap()
+                .note_fallback(parent, reason);
+            if should_log {
+                log::warn!(
+                    "consent directory scope fell back to file-only for {}: {reason}",
+                    parent.display()
+                );
+            }
+            grant.clone()
+        }
+    }
 }
 
 async fn scope_before_db(grant: &AccessGrant) -> AccessGrant {
@@ -806,40 +931,41 @@ async fn scope_before_db(grant: &AccessGrant) -> AccessGrant {
 }
 
 fn probe_directory_scope_with(
-    grant: &AccessGrant,
+    parent: &Path,
     root_alias_check: impl Fn(&Path, &Path) -> Option<bool>,
-) -> AccessGrant {
-    if grant.operation == AccessOperation::Read && grant.kind == GrantKind::File {
-        if let Some(parent) = grant.path.parent() {
-            let home = crate::environment::non_empty_os_var("HOME")
-                .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .map(|path| {
-                    #[cfg(all(test, unix))]
-                    crate::bounded_io::stall_helper_if_requested(&path);
-                    crate::access_policy::policy_path(&path)
-                });
-            if let (Some(home), Some((volume, _))) =
-                (home, crate::storage_retention::volume_anchor(parent))
-            {
-                let volume = crate::access_policy::policy_path(&volume);
-                let root = parent.ancestors().last().unwrap_or(parent);
-                if directory_scope_is_narrow(parent, &home, &volume)
-                    && directory_is_protected_alias(parent, &home, &volume) == Some(false)
-                    && root_alias_check(parent, root) == Some(false)
-                    && (root == volume || root_alias_check(parent, &volume) == Some(false))
-                {
-                    return AccessGrant {
-                        path: parent.to_path_buf(),
-                        kind: GrantKind::Subtree,
-                        operation: AccessOperation::Read,
-                    };
-                }
-            }
-        }
+) -> DirectoryScopeAnswer {
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map(|path| {
+            #[cfg(all(test, unix))]
+            crate::bounded_io::stall_helper_if_requested(&path);
+            crate::access_policy::policy_path(&path)
+        })
+        .ok_or("home identity unknown")?;
+    let (volume, _) =
+        crate::storage_retention::volume_anchor(parent).ok_or("volume identity unknown")?;
+    let volume = crate::access_policy::policy_path(&volume);
+    let root = parent.ancestors().last().unwrap_or(parent);
+    if !directory_scope_is_narrow(parent, &home, &volume) {
+        return Ok(false);
     }
-    grant.clone()
+    if directory_is_protected_alias(parent, &home, &volume)
+        .ok_or("protected alias identity unknown")?
+    {
+        return Ok(false);
+    }
+    if root_alias_check(parent, root).ok_or("root alias identity unknown or scan unavailable")? {
+        return Ok(false);
+    }
+    if root != volume
+        && root_alias_check(parent, &volume)
+            .ok_or("volume alias identity unknown or scan unavailable")?
+    {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Inputs are canonical policy identities, including home aliases and native
@@ -884,12 +1010,14 @@ const ROOT_ALIAS_SCAN_BUDGET: Duration = Duration::from_millis(250);
 
 struct ScopeProbeLimiter {
     in_flight: Arc<std::sync::atomic::AtomicBool>,
+    available: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
 impl ScopeProbeLimiter {
     fn new() -> Self {
         Self {
             in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            available: Arc::default(),
         }
     }
 
@@ -902,7 +1030,19 @@ impl ScopeProbeLimiter {
                 std::sync::atomic::Ordering::Acquire,
             )
             .ok()
-            .map(|_| ScopeProbePermit(Arc::clone(&self.in_flight)))
+            .map(|_| ScopeProbePermit(Arc::clone(&self.in_flight), Arc::clone(&self.available)))
+    }
+
+    fn acquire_until(&self, deadline: Instant) -> Option<ScopeProbePermit> {
+        let (mutex, available) = &*self.available;
+        let mut guard = mutex.lock().unwrap();
+        loop {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            if let Some(permit) = self.try_acquire() {
+                return Some(permit);
+            }
+            (guard, _) = available.wait_timeout(guard, remaining).unwrap();
+        }
     }
 
     fn scan<F>(&self, scan: F) -> Option<bool>
@@ -929,11 +1069,17 @@ impl ScopeProbeLimiter {
     }
 }
 
-struct ScopeProbePermit(Arc<std::sync::atomic::AtomicBool>);
+struct ScopeProbePermit(
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+);
 
 impl Drop for ScopeProbePermit {
     fn drop(&mut self) {
+        let (mutex, available) = &*self.1;
+        let _guard = mutex.lock().unwrap();
         self.0.store(false, std::sync::atomic::Ordering::Release);
+        available.notify_all();
     }
 }
 
